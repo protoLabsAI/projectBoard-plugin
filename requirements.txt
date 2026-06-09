@@ -1,0 +1,3 @@
+# No pip deps — the host (protoAgent) provides langchain-core + fastapi. The only
+# external requirement is the `br` (beads) CLI on PATH (https://github.com/steveyegge/beads),
+# plus git + an authenticated `gh` CLI. See README.

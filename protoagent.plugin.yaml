@@ -1,0 +1,57 @@
+id: project_board
+name: Project Board (coding orchestration)
+version: 0.1.0
+description: >-
+  A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
+  → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
+  ACP **spawn loop**, an adversarial **planning layer**, and a Kanban/list **console
+  view**. The lead agent is the orchestrator: it pulls `ready` features, dispatches a
+  coder (`acp` delegate, e.g. `proto`) into a disposable per-feature git worktree,
+  opens a PR, and a merge webhook sets `done` — the single external Done edge.
+
+  Composes the already-built `delegates` plugin (ADR 0024/0025) — it does NOT
+  reimplement the spawn primitive. The board is a projection over beads (no separate
+  store to drift). Planning is two reasoning subagents (`decompose` + `antagonist`)
+  driven by the `decompose-project` skill. Requires the **`br`** (beads) CLI on PATH
+  and `plugins.enabled: [delegates]` with an `acp` coder declared.
+
+  Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
+enabled: false
+repository: https://github.com/protoLabsAI/projectBoard-plugin
+min_protoagent_version: "0.27.0"   # console views (ADR 0026) + the delegate teardown (#715/#727)
+
+# Plugin config (read from `project_board:` in langgraph-config.yaml).
+config_section: project_board
+config:
+  coder: proto              # acp delegate name the loop dispatches builds to
+  # Escalation is OPT-IN and only meaningful with >1 distinct coder. Leave this
+  # out for a single-ACP-agent setup (no tier ladder, no redundant retries —
+  # one dispatch, then Blocked on failure; `difficulty` is then ignored).
+  # coders:                 # tier → delegate; difficulty picks the starting rung
+  #   fast: proto
+  #   smart: proto-smart
+  #   reasoning: claude-acp
+  reviewer: quinn           # a2a delegate for explicit PR review (only used if review_dispatch)
+  review_dispatch: false    # OPT-IN. Off = rely on the fleet PR-review pipeline (it reviews
+                            # PRs on open). On = also delegate_to(reviewer) — for repos with
+                            # no pipeline; needs a reachable `reviewer` a2a delegate.
+  repo: "."                 # repo the coders work in (worktrees branch off it)
+  base_branch: main         # base branch worktrees/PRs target
+  worktrees_root: .worktrees
+  loop_enabled: false       # the background puller; off until a board exists
+  loop_interval_s: 30       # how often the puller wakes
+  max_concurrent: 1         # worktree/coder concurrency cap (token + merge cost)
+  db_path: ""               # beads db path; blank → br auto-discovers .beads/*.db
+  webhook_secret: ""        # GitHub webhook HMAC secret for /webhook/pr (the Done
+                            # edge). Blank → signature NOT verified (dev only); set
+                            # it (or PROJECT_BOARD_WEBHOOK_SECRET) before exposing.
+
+# Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
+# The list/Kanban view is a projection over the /features API (no separate store).
+views:
+  - { id: board, label: "Board", icon: LayoutGrid, path: /plugins/project_board/board }
+
+# Declarative only (transparency in the console).
+capabilities:
+  network: ["*"]            # br (beads) + gh pr create + delegate_to(reviewer) over A2A
+  filesystem: worktree      # creates/removes git worktrees under worktrees_root; beads in .beads/

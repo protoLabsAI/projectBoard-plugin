@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.beads/
+.beads-demo/
+.worktrees/
+.venv/

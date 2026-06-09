@@ -1,0 +1,25 @@
+[project]
+name = "project-board"
+version = "0.1.0"
+description = "Board-driven coding-orchestration plugin for protoAgent (beads board + ACP spawn loop + planning layer + console view)."
+requires-python = ">=3.11"
+
+# Runtime deps come from the protoAgent host (langchain-core, fastapi) — this plugin
+# adds none. The only external dependency is the `br` (beads) CLI on PATH, plus
+# git + the gh CLI. So `requires_pip` in the manifest is empty.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E402", "E501", "E702", "E731", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]
