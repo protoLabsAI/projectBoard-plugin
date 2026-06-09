@@ -56,6 +56,10 @@ class BoardLoop:
                               base_branch=self.cfg.get("base_branch", "main"))
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # The in-flight build's worktree, so shutdown can reap it (a cancel mid-drive
+        # would otherwise orphan the worktree; the coder subprocess is reaped by
+        # dispatch_coder's finally). (repo, worktree_path, branch) or None.
+        self._active: tuple[str, str, str] | None = None
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -78,6 +82,16 @@ class BoardLoop:
                 await self._task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # Reap an interrupted build's worktree (a drive cancelled mid-flight leaves
+        # self._active set; a completed/blocked drive clears it). Best-effort.
+        act, self._active = self._active, None
+        if act:
+            repo, wt, branch = act
+            try:
+                await worktree.remove_worktree(repo, wt, branch or "")
+                log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
+            except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
+                log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
@@ -125,6 +139,7 @@ class BoardLoop:
                     return
                 # Fresh worktree per attempt (a failed attempt may leave partial work).
                 wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
+                self._active = (repo, wt, branch)   # track for shutdown reaping
                 try:
                     result = await worktree.dispatch_coder(coder, wt, prompt)  # reaps subprocess
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title,
@@ -144,6 +159,7 @@ class BoardLoop:
                     store.flag_blocked(fid, str(exc))
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
+                    self._active = None
                     return
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
@@ -153,15 +169,18 @@ class BoardLoop:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
                 # on a terminal block above, and the coder subprocess is already reaped.
+                self._active = None   # built OK — not an interrupted build to reap
                 return
         except BoardError as exc:
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
             store.flag_blocked(fid, str(exc))
+            self._active = None
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
             store.flag_blocked(fid, f"unexpected: {type(exc).__name__}: {exc}")
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
+            self._active = None
 
     async def _request_review(self, fid: str, pr_url: str):
         """Hand the PR to the reviewer (an a2a delegate, e.g. quinn). Best-effort:
