@@ -13,6 +13,18 @@ backlog → ready → in_progress → in_review → done
                       └── blocked  (a flag, not a lane)
 ```
 
+## See it running — a working board-driven agent
+
+Want a complete, working example of an agent built around this plugin?
+**[roxy](https://github.com/protoLabsAI/roxy)** is a protoLabs operator/orchestrator
+agent that installs this plugin as its coding-orchestration layer — it's the
+reference host. It consumes this repo exactly the way you would (`plugin install` +
+a pinned `plugins.lock`), enables it, and ships the surrounding agent (the A2A
+server, the React console the **Board** view renders in, the delegate roster the
+loop dispatches against, persona, evals). Read it to see how a board-driven coding
+agent is wired end to end — including a live run shipping real features through the
+board to a PR — or fork it as a starting point.
+
 ## What it does
 
 - **Board = a projection over beads** (`.beads/*.db` + git-committed JSONL) — no
