@@ -86,9 +86,12 @@ project_board:
   `board_mark_ready`, `board_list`.
 - **Plan a project:** the `decompose-project` skill ("decompose <idea>") runs the
   adversarial pipeline and populates the board.
-- **HTTP API** (`/plugins/project_board/*`): `epics`, `milestones`, `features`,
-  `features/{id}/{ready,dep,block,unblock,ci}`, and `/webhook/pr` (the Done edge).
-- **Watch it:** the **Board** console view (left-rail) — Kanban + list, live-refreshing.
+- **HTTP API** (`/api/plugins/project_board/*`, gated): `epics`, `milestones`,
+  `features`, `features/{id}/{ready,dep,block,unblock,ci}`, and `/webhook/pr` (the
+  Done edge).
+- **Watch it:** the **Board** console view (left-rail) at
+  `/api/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
+  same router as the API (so the declared view path is genuinely mounted).
 
 ## Layout
 

@@ -1,39 +1,31 @@
 """Board console view (ADR 0026, D5) — the deferred-until-now UI.
 
-A self-contained page served at ``/plugins/project_board/board`` that renders the
-board two ways (Kanban columns = the 6 states, and a dense list), toggled — two
-projections of the same features over the already-proven ``/features`` API. The
-console renders a left-rail icon (manifest ``views:``) whose panel iframes this
-page; on load the console ``postMessage``s a bearer token + theme tokens (the ADR
-0026 handshake), which the page applies for its same-origin API calls.
+A self-contained page served at ``/api/plugins/project_board/board`` (by the API
+router in api.py — see __init__.register) that renders the board two ways (Kanban
+columns = the 6 states, and a dense list), toggled — two projections of the same
+features over the already-proven ``/features`` API. The console renders a left-rail
+icon (manifest ``views:``) whose panel iframes this page; on load the console
+``postMessage``s a bearer token + theme tokens (the ADR 0026 handshake), which the
+page applies for its same-origin API calls.
+
+FLEET-PROXY-SAFE (ADR 0042): the iframe loads at /api/plugins/project_board/board on
+the host window, but at /agents/<slug>/api/plugins/project_board/board when this
+agent is viewed through the fleet proxy. So the page derives ``base`` from its own
+path (= "" on host, "/agents/<slug>" when proxied) and prefixes EVERY fetch + asset
+with it — never hardcode an absolute "/api/...", "/plugins/...", or
+"http://localhost:PORT" (that breaks the proxy + the same-origin postMessage token).
 
 No build step — vanilla JS + inline SVG, so the whole plugin stays a drop-in
 package. The page reads the board; it never mutates it (mutation stays the loop +
-the tools + the API).
+the tools + the API). ``BOARD_PAGE`` is the HTML; api.py serves it on GET /board.
 """
 
 from __future__ import annotations
 
 
-def build_board_view_router(cfg: dict | None):
-    """A FastAPI router for the board page. The data comes from the existing
-    ``/plugins/project_board/features`` endpoint (api.py) — this only serves HTML."""
-    from fastapi import APIRouter
-    from fastapi.responses import HTMLResponse
-
-    router = APIRouter()
-
-    @router.get("/board")
-    async def _board():
-        return HTMLResponse(_PAGE)
-
-    return router
-
-
-_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Board</title>
-<link rel="stylesheet" href="/_ds/plugin-kit.css">
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
@@ -59,7 +51,17 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .hide{display:none}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
-</style></head><body><div class="wrap">
+</style>
+<script>
+// ── Slug-aware base (ADR 0042): "" on the host window, "/agents/<slug>" when proxied.
+// Split on the gated prefix this page is served under so EVERY asset + fetch stays
+// same-origin and reaches THIS agent (never the host) through the fleet proxy.
+var BASE = location.pathname.split("/api/plugins/")[0];
+// Link the DS kit same-origin off BASE (rule 4) — --pl-* tokens, never hardcode hex.
+(function(){ var l=document.createElement("link"); l.rel="stylesheet";
+  l.href=BASE+"/_ds/plugin-kit.css"; document.head.appendChild(l); })();
+</script>
+</head><body><div class="wrap">
   <div class="top">
     <h1>Board</h1>
     <p class="sub" id="sub">project_board — a projection over beads</p>
@@ -88,7 +90,9 @@ const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
 const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-status-success)",
   in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
   done:"var(--pl-color-fg-muted)", blocked:"var(--pl-color-status-error)"};
-const api = (p) => fetch(p, TOKEN ? {headers:{Authorization:"Bearer "+TOKEN}} : {}).then(r => r.json());
+// Slug-aware, same-origin fetch (rule 3): prefix the gated API path with BASE so the
+// proxied window talks to ITS agent — never hardcode an absolute "/api/..." path.
+const api = (p) => fetch(BASE + p, TOKEN ? {headers:{Authorization:"Bearer "+TOKEN}} : {}).then(r => r.json());
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -140,7 +144,7 @@ function render(){
 
 async function load(){
   try {
-    const r = await api("/plugins/project_board/features");
+    const r = await api("/api/plugins/project_board/features");
     // the /features API field is `board_state`; normalize to `state` for the views.
     FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
       .sort((a,b) => a.priority - b.priority || a.id.localeCompare(b.id));

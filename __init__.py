@@ -25,19 +25,18 @@ log = logging.getLogger("protoagent.plugins.project_board")
 def register(registry) -> None:
     cfg = registry.config or {}
 
-    # Board HTTP API (namespaced /plugins/project_board/*).
+    # Board HTTP API + console view, mounted as ONE router under the GATED prefix
+    # /api/plugins/project_board (inherits the operator bearer gate; it serves
+    # board/user data + the iframe page). The board view's GET /board route is
+    # folded into this same router so the declared view path
+    # (/api/plugins/project_board/board) is genuinely served. We must NOT register a
+    # second router at the same prefix: the host dedupes routers by
+    # (plugin_id, prefix), so a second one would be silently dropped → the view 404s.
     try:
         from .api import build_router
-        registry.register_router(build_router(cfg))
+        registry.register_router(build_router(cfg), prefix="/api/plugins/project_board")
     except Exception:  # noqa: BLE001 — API is best-effort
-        log.exception("[project_board] mounting board API failed")
-
-    # Board console view (ADR 0026 / D5) — Kanban + list over the /features API.
-    try:
-        from .board_view import build_board_view_router
-        registry.register_router(build_board_view_router(cfg))
-    except Exception:  # noqa: BLE001 — the view is best-effort; the API still serves
-        log.exception("[project_board] mounting board view failed")
+        log.exception("[project_board] mounting board API + view failed")
 
     # Background orchestration loop (off unless project_board.loop_enabled).
     try:
