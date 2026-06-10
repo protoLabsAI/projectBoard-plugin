@@ -1,6 +1,6 @@
 """Board console view (ADR 0026, D5) — the deferred-until-now UI.
 
-A self-contained page served at ``/api/plugins/project_board/board`` (by the API
+A self-contained page served at ``/plugins/project_board/board`` (by the API
 router in api.py — see __init__.register) that renders the board two ways (Kanban
 columns = the 6 states, and a dense list), toggled — two projections of the same
 features over the already-proven ``/features`` API. The console renders a left-rail
@@ -8,8 +8,8 @@ icon (manifest ``views:``) whose panel iframes this page; on load the console
 ``postMessage``s a bearer token + theme tokens (the ADR 0026 handshake), which the
 page applies for its same-origin API calls.
 
-FLEET-PROXY-SAFE (ADR 0042): the iframe loads at /api/plugins/project_board/board on
-the host window, but at /agents/<slug>/api/plugins/project_board/board when this
+FLEET-PROXY-SAFE (ADR 0042): the iframe loads at /plugins/project_board/board on
+the host window, but at /agents/<slug>/plugins/project_board/board when this
 agent is viewed through the fleet proxy. So the page derives ``base`` from its own
 path (= "" on host, "/agents/<slug>" when proxied) and prefixes EVERY fetch + asset
 with it — never hardcode an absolute "/api/...", "/plugins/...", or
@@ -54,9 +54,9 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 </style>
 <script>
 // ── Slug-aware base (ADR 0042): "" on the host window, "/agents/<slug>" when proxied.
-// Split on the gated prefix this page is served under so EVERY asset + fetch stays
+// Split on the prefix this page is served under so EVERY asset + fetch stays
 // same-origin and reaches THIS agent (never the host) through the fleet proxy.
-var BASE = location.pathname.split("/api/plugins/")[0];
+var BASE = location.pathname.split("/plugins/")[0];
 // Link the DS kit same-origin off BASE (rule 4) — --pl-* tokens, never hardcode hex.
 (function(){ var l=document.createElement("link"); l.rel="stylesheet";
   l.href=BASE+"/_ds/plugin-kit.css"; document.head.appendChild(l); })();
@@ -90,8 +90,8 @@ const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
 const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-status-success)",
   in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
   done:"var(--pl-color-fg-muted)", blocked:"var(--pl-color-status-error)"};
-// Slug-aware, same-origin fetch (rule 3): prefix the gated API path with BASE so the
-// proxied window talks to ITS agent — never hardcode an absolute "/api/..." path.
+// Slug-aware, same-origin fetch (rule 3): prefix the API path with BASE so the
+// proxied window talks to ITS agent — never hardcode an absolute "/plugins/..." path.
 const api = (p) => fetch(BASE + p, TOKEN ? {headers:{Authorization:"Bearer "+TOKEN}} : {}).then(r => r.json());
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -144,7 +144,7 @@ function render(){
 
 async function load(){
   try {
-    const r = await api("/api/plugins/project_board/features");
+    const r = await api("/plugins/project_board/features");
     // the /features API field is `board_state`; normalize to `state` for the views.
     FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
       .sort((a,b) => a.priority - b.priority || a.id.localeCompare(b.id));

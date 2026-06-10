@@ -1,11 +1,13 @@
 """Board HTTP API + console view (D5).
 
-Mounted under the GATED prefix ``/api/plugins/project_board`` (see __init__.register)
-so the routes inherit the operator bearer gate — same posture as the notes/devkit
-plugins. Localhost-default bind + bearer-when-exposed. The whole flow — create
-project → features → Ready gate → (loop dispatches) → in_review → merge webhook →
-done — is drivable here, headlessly. The Kanban/list page (GET ``/board``) rides
-THIS router so its declared view path is genuinely served.
+Mounted under the UNGATED prefix ``/plugins/project_board`` (see __init__.register),
+matching the sibling agent-browser/doom plugins. Localhost-default bind +
+bearer-when-exposed (the host's posture), but ungated because two routes are browser
+navigations that can't carry a bearer: GET ``/board`` is loaded as an iframe src, and
+POST ``/webhook/pr`` is hit by GitHub (whose public URL must stay stable). The whole
+flow — create project → features → Ready gate → (loop dispatches) → in_review → merge
+webhook → done — is drivable here, headlessly. The Kanban/list page (GET ``/board``)
+rides THIS router so its declared view path is genuinely served.
 
 The ``/webhook/pr`` endpoint is the SINGLE external Done edge: a merged-PR event
 sets ``done`` and nothing else does (invariant #2). Poll is the fallback.
@@ -39,7 +41,7 @@ def build_router(cfg: dict):
 
     # ── console view (ADR 0026) — the Kanban/list page the left-rail icon iframes.
     # Served by THIS router (not a second one) so the declared view path
-    # /api/plugins/project_board/board is genuinely mounted; the host dedupes
+    # /plugins/project_board/board is genuinely mounted; the host dedupes
     # routers by (plugin_id, prefix), so a second router here would be dropped.
     @router.get("/board", response_class=HTMLResponse)
     async def _board():
