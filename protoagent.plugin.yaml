@@ -48,6 +48,11 @@ config:
 
 # Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
 # The list/Kanban view is a projection over the /features API (no separate store).
+# Served by the SAME router as the API (build_router, prefix /plugins/project_board)
+# so the declared path is genuinely mounted — a second router at the same prefix would
+# be silently dropped by the host's (plugin_id, prefix) router-dedupe. UNGATED prefix
+# (/plugins/<id>, like the sibling agent-browser/doom plugins) because the iframe src
+# is a browser navigation that can't attach a bearer.
 views:
   - { id: board, label: "Board", icon: LayoutGrid, path: /plugins/project_board/board }
 

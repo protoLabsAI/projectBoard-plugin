@@ -25,19 +25,21 @@ log = logging.getLogger("protoagent.plugins.project_board")
 def register(registry) -> None:
     cfg = registry.config or {}
 
-    # Board HTTP API (namespaced /plugins/project_board/*).
+    # Board HTTP API + console view, mounted as ONE router under the UNGATED prefix
+    # /plugins/project_board (matching the sibling agent-browser/doom plugins, whose
+    # browser-loaded views are also ungated). UNGATED because two of these routes are
+    # browser navigations that can't attach a bearer: GET /board is loaded as an
+    # iframe src, and POST /webhook/pr is hit by GitHub (which can't send a bearer and
+    # whose public URL must not change). The board view's GET /board route is folded
+    # into this same router so the declared view path (/plugins/project_board/board)
+    # is genuinely served. We must NOT register a second router at the same prefix:
+    # the host dedupes routers by (plugin_id, prefix), so a second one would be
+    # silently dropped → the view 404s.
     try:
         from .api import build_router
-        registry.register_router(build_router(cfg))
+        registry.register_router(build_router(cfg), prefix="/plugins/project_board")
     except Exception:  # noqa: BLE001 — API is best-effort
-        log.exception("[project_board] mounting board API failed")
-
-    # Board console view (ADR 0026 / D5) — Kanban + list over the /features API.
-    try:
-        from .board_view import build_board_view_router
-        registry.register_router(build_board_view_router(cfg))
-    except Exception:  # noqa: BLE001 — the view is best-effort; the API still serves
-        log.exception("[project_board] mounting board view failed")
+        log.exception("[project_board] mounting board API + view failed")
 
     # Background orchestration loop (off unless project_board.loop_enabled).
     try:

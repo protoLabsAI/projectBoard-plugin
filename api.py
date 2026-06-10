@@ -1,9 +1,13 @@
-"""Board HTTP API (API-first — D5 UI is deferred).
+"""Board HTTP API + console view (D5).
 
-Mounted under ``/plugins/project_board`` (the namespaced default). Same posture as
-the delegates/config surfaces: localhost-default bind + bearer-when-exposed, no
-per-route auth. The whole flow — create project → features → Ready gate → (loop
-dispatches) → in_review → merge webhook → done — is drivable here, headlessly.
+Mounted under the UNGATED prefix ``/plugins/project_board`` (see __init__.register),
+matching the sibling agent-browser/doom plugins. Localhost-default bind +
+bearer-when-exposed (the host's posture), but ungated because two routes are browser
+navigations that can't carry a bearer: GET ``/board`` is loaded as an iframe src, and
+POST ``/webhook/pr`` is hit by GitHub (whose public URL must stay stable). The whole
+flow — create project → features → Ready gate → (loop dispatches) → in_review → merge
+webhook → done — is drivable here, headlessly. The Kanban/list page (GET ``/board``)
+rides THIS router so its declared view path is genuinely served.
 
 The ``/webhook/pr`` endpoint is the SINGLE external Done edge: a merged-PR event
 sets ``done`` and nothing else does (invariant #2). Poll is the fallback.
@@ -29,8 +33,19 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 def build_router(cfg: dict):
     from fastapi import APIRouter, Body, HTTPException
+    from fastapi.responses import HTMLResponse
+
+    from .board_view import BOARD_PAGE
 
     router = APIRouter()
+
+    # ── console view (ADR 0026) — the Kanban/list page the left-rail icon iframes.
+    # Served by THIS router (not a second one) so the declared view path
+    # /plugins/project_board/board is genuinely mounted; the host dedupes
+    # routers by (plugin_id, prefix), so a second router here would be dropped.
+    @router.get("/board", response_class=HTMLResponse)
+    async def _board():
+        return HTMLResponse(BOARD_PAGE)
     store_kw = dict(db=(cfg or {}).get("db_path") or None, repo=(cfg or {}).get("repo", "."),
                     base_branch=(cfg or {}).get("base_branch", "main"))
     escalate_on = escalation_enabled(cfg)
