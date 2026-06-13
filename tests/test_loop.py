@@ -85,7 +85,7 @@ def test_build_prompt_is_imperative_and_lists_the_files():
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 
-async def _drive_with(monkeypatch, *, open_pr, coder=object()):
+async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions."""
     store = FakeLoopStore()
@@ -94,18 +94,18 @@ async def _drive_with(monkeypatch, *, open_pr, coder=object()):
     async def _create(repo, base, fid, root):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
-    async def _dispatch(c, wt, prompt):
+    async def _default_dispatch(c, wt, prompt, *, timeout=None):
         return "the coder's reply"
 
     async def _remove(repo, wt, branch=""):
         return None
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
-    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "dispatch_coder", dispatch or _default_dispatch)
     monkeypatch.setattr(worktree, "open_pr", open_pr)
     monkeypatch.setattr(worktree, "remove_worktree", _remove)
 
-    loop = BoardLoop({"coder": "proto"})
+    loop = BoardLoop(cfg or {"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: coder)
     await loop._drive(FEATURE)
     return loop, store
@@ -188,6 +188,28 @@ async def test_drive_blocks_immediately_on_a_terminal_failure(monkeypatch):
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
     assert "flag_blocked" in store.names()
     assert calls["n"] == 1  # auth is terminal → no retry
+
+
+# ── _drive: the stuck-coder watchdog (CoderTimeout) ─────────────────────────────
+
+
+async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch):
+    calls = {"n": 0}
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        calls["n"] += 1
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise AssertionError("open_pr should not run after a coder timeout")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch)
+    # A timeout matches "timed out" in classify (transient), but it's a CAPABILITY
+    # failure → it must NOT be transient-retried: blocked after a single attempt.
+    assert calls["n"] == 1
+    assert "flag_blocked" in store.names()
+    assert loop._inflight == {}
 
 
 # ── concurrency: _spawn_ready claims up to max_concurrent ────────────────────────

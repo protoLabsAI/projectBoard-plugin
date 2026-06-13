@@ -33,6 +33,13 @@ class NoChangesError(WorktreeError):
     treating as an infra error to block on."""
 
 
+class CoderTimeout(WorktreeError):
+    """The coder ran past its time budget (``coder_timeout_s``) and was killed — a
+    *capability* failure (didn't deliver in the budget). The loop escalates it when a
+    ladder exists, else Blocks; it is NOT transient-retried (re-running the same coder
+    on the same prompt would likely hang again)."""
+
+
 async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, str]:
     """Run a git command in ``repo``; return (rc, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -109,7 +116,13 @@ async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | 
     adapter = ADAPTERS["acp"]
     scoped = dataclasses.replace(coder, workdir=worktree)
     try:
-        return await adapter.dispatch(scoped, prompt, timeout=timeout)
+        # Hard-bound the dispatch so a hung coder can't hold a worktree/slot forever.
+        # On timeout asyncio.wait_for cancels the dispatch — the finally below reaps
+        # the subprocess — and we raise CoderTimeout (capability, not transient).
+        coro = adapter.dispatch(scoped, prompt, timeout=timeout)
+        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
+    except asyncio.TimeoutError:
+        raise CoderTimeout(f"coder timed out after {timeout}s")
     except DelegateError as exc:
         raise WorktreeError(f"coder dispatch failed: {exc}")
     finally:
