@@ -65,10 +65,13 @@ to fan out, but keep the propose→attack pairing for each.
    call `board_create_feature(title, spec=<imperative requirements summary>,
    acceptance_criteria=<the EARS list>, files_to_modify="<comma-separated paths to
    create/modify>", design=<design summary>, parent=<epic/milestone id>, priority=…,
-   difficulty=…, depends_on="<blocking feature ids>")`. **`files_to_modify` is
-   required by the Ready gate** — name the exact paths, and write the spec
-   imperatively (a vague task makes a coder produce nothing). Foundation edges are
-   just `depends_on` on the foundation feature.
+   difficulty=…, depends_on="<blocking feature ids>", foundation=<true|false>)`.
+   **`files_to_modify` is required by the Ready gate** — name the exact paths, and
+   write the spec imperatively (a vague task makes a coder produce nothing).
+   Foundation edges are just `depends_on` on the foundation feature; set
+   `foundation=True` on a shared-structure feature so dependents always gate on its
+   **merge** (under `dep_gate: review`, non-foundation blockers release dependents at
+   in_review — foundations never do).
 4. **HUMAN GATE (per epic):** summarize the epic's features (titles, acceptance
    criteria, deps, which are foundations) and call `request_user_input` to ask the
    operator to approve, amend, or reject **before any feature goes `ready`**. This is

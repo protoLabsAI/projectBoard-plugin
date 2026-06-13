@@ -243,3 +243,65 @@ def test_record_merge_does_not_reclose_a_done_feature(make_board, monkeypatch):
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
     b.record_merge(pr_url=url)
     assert br.cmds("close") == []  # already done → idempotent, no second close
+
+
+# ── foundation flag + the relaxed (review) dependency gate ───────────────────────
+
+
+def test_project_exposes_the_foundation_flag(make_board):
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "open", "labels": ["foundation"]})["foundation"] is True
+    assert b._project({"id": "y", "status": "open", "labels": []})["foundation"] is False
+
+
+def test_create_feature_labels_foundation(make_board):
+    br = Br({"create": "bd-1", "show": [{"id": "bd-1", "status": "open", "labels": ["foundation"]}]})
+    b = make_board(br)
+    f = b.create_feature("t", spec="s", acceptance_criteria="a", files_to_modify=["x.py"], foundation=True)
+    assert f["foundation"] is True
+    assert any(c[0] == "update" and "foundation" in c for c in br.calls)
+
+
+def test_open_blockers_keeps_open_blocks_drops_closed_and_nonblocks(make_board):
+    bead = {
+        "id": "bd-1",
+        "dependencies": [
+            {"id": "a", "dependency_type": "blocks", "status": "in_progress"},
+            {"id": "b", "dependency_type": "blocks", "status": "closed"},  # merged → no longer gates
+            {"id": "c", "dependency_type": "parent-child", "status": "open"},  # not a blocks edge
+        ],
+    }
+    b = make_board(Br({"show": [bead]}))
+    assert b._open_blockers("bd-1") == ["a"]
+
+
+def test_ready_queue_relaxed_releases_only_nonfoundation_in_review_blockers(make_board):
+    # Three dependents, each blocked by a different kind of blocker.
+    all_features = [
+        {"id": "bd-f", "issue_type": "feature", "status": "in_progress", "labels": ["in-review"]},
+        {"id": "bd-found", "issue_type": "feature", "status": "in_progress", "labels": ["in-review", "foundation"]},
+        {"id": "bd-ip", "issue_type": "feature", "status": "in_progress", "labels": []},
+        {"id": "bd-dep1", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+        {"id": "bd-dep2", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+        {"id": "bd-dep3", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+    ]
+    show = {
+        "bd-dep1": [
+            {"id": "bd-dep1", "dependencies": [{"id": "bd-f", "dependency_type": "blocks", "status": "in_progress"}]}
+        ],
+        "bd-dep2": [
+            {
+                "id": "bd-dep2",
+                "dependencies": [{"id": "bd-found", "dependency_type": "blocks", "status": "in_progress"}],
+            }
+        ],
+        "bd-dep3": [
+            {"id": "bd-dep3", "dependencies": [{"id": "bd-ip", "dependency_type": "blocks", "status": "in_progress"}]}
+        ],
+    }
+    b = make_board(Br({"ready": [], "list": all_features, "show": lambda args: show.get(args[1], [])}))
+    # relaxed: only bd-dep1 releases (blocker non-foundation AND in_review).
+    assert {f["id"] for f in b.ready_queue(relaxed=True)} == {"bd-dep1"}
+    # bd-dep2 (foundation blocker) and bd-dep3 (blocker only in_progress) stay gated.
+    # The default gate adds nothing beyond `br ready` (empty here).
+    assert b.ready_queue() == []

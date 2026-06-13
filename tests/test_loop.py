@@ -223,8 +223,10 @@ class _ClaimStore:
         self._features = [dict(f) for f in features]
         self._in_review = in_review
         self.claimed = []
+        self.last_relaxed = None
 
-    def ready_queue(self):
+    def ready_queue(self, relaxed=False):
+        self.last_relaxed = relaxed
         return [f for f in self._features if f["id"] not in self.claimed]
 
     def claim(self, fid, assignee=""):
@@ -511,3 +513,24 @@ async def test_sweep_off_when_interval_zero(monkeypatch):
     monkeypatch.setattr(loop, "_sweep", lambda: called.append(1))
     await loop._maybe_sweep()
     assert called == []  # disabled → never sweeps
+
+
+# ── dependency gate (merge vs review) ───────────────────────────────────────────
+
+
+def test_dep_gate_config_defaults_to_merge():
+    assert BoardLoop({}).relaxed_gate is False
+    assert BoardLoop({"dep_gate": "merge"}).relaxed_gate is False
+    assert BoardLoop({"dep_gate": "review"}).relaxed_gate is True
+
+
+async def test_spawn_ready_passes_the_dep_gate_to_ready_queue(monkeypatch):
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"dep_gate": "review", "max_concurrent": 1})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        loop._spawn_ready()
+        assert store.last_relaxed is True  # the relaxed gate reaches ready_queue
+    finally:
+        await finish()
