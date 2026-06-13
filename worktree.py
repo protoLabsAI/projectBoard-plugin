@@ -206,13 +206,13 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str,
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
 
 
-async def pr_is_merged(pr_url: str, *, cwd: str = ".") -> bool:
-    """True iff the PR has merged — the merge poll's probe (a fallback to the
-    webhook for deployments with no public webhook URL). A non-zero ``gh`` /
-    transient failure returns False so the next poll simply retries; this never
-    raises into the loop."""
+async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
+    """The PR's state — ``MERGED`` / ``CLOSED`` / ``OPEN`` — or ``""`` on a ``gh``
+    failure (the next poll just retries; this never raises into the loop). The PR
+    reconcile drives the board's Done/closed edges off this (the fallback to the
+    webhook for deployments with no public webhook URL)."""
     rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd)
-    return rc == 0 and out.strip() == "MERGED"
+    return out.strip() if rc == 0 else ""
 
 
 async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:

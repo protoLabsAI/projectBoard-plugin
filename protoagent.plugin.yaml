@@ -58,11 +58,12 @@ config:
                             # in_review (more parallelism, but builds on un-merged code).
                             # Mark shared-structure features foundation=True; those
                             # always gate on merge regardless.
-  merge_poll: true          # poll merged PRs as a fallback to the /webhook/pr Done
-                            # edge — for deployments GitHub can't post a webhook to
-                            # (no public URL). The Done edge stays idempotent either
+  merge_poll: true          # poll in_review PRs and reconcile the board to their real
+                            # state (merged → done, closed-unmerged → blocked) — the
+                            # fallback to /webhook/pr for deployments GitHub can't post
+                            # a webhook to (no public URL). Done stays idempotent either
                             # way; set false to rely on the webhook alone.
-  merge_poll_interval_s: 60 # how often the loop polls in_review PRs for a merge
+  merge_poll_interval_s: 60 # how often the loop reconciles in_review PRs
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.

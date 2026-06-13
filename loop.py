@@ -16,9 +16,10 @@ merge webhook (``api.record_merge``), the single external edge (invariant #2).
 
 CI status arrives out-of-band via the board API (``api.py``). ``done`` is set by
 the merge webhook (``api.record_merge``) — or, when no public webhook URL is
-reachable, by the loop's **merge poll** (``merge_poll``), which asks ``gh`` whether
-each ``in_review`` PR has merged and runs the same idempotent Done edge. Up to
-``max_concurrent`` features build concurrently, each in its own worktree.
+reachable, by the loop's **PR reconcile** (``merge_poll``), which asks ``gh`` for
+each ``in_review`` PR's state and drives the terminal edges: merged → done (the same
+idempotent edge), closed-unmerged → blocked. Up to ``max_concurrent`` features build
+concurrently, each in its own worktree.
 """
 
 from __future__ import annotations
@@ -214,7 +215,7 @@ class BoardLoop:
         while not self._stop.is_set():
             spawned = False
             try:
-                await self._maybe_poll_merges()
+                await self._maybe_reconcile()
                 await self._maybe_sweep()
                 spawned = self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
@@ -273,9 +274,9 @@ class BoardLoop:
 
         return _cb
 
-    # ── the merge poll (Done-edge fallback to the webhook) ─────────────────────
-    async def _maybe_poll_merges(self):
-        """Run the merge poll at most once per ``merge_poll_interval`` (and only when
+    # ── the PR reconcile (terminal-edge fallback to the webhook) ───────────────
+    async def _maybe_reconcile(self):
+        """Run the PR reconcile at most once per ``merge_poll_interval`` (and only when
         enabled) — cheap, but no reason to hammer ``gh`` every busy tick."""
         if not self.merge_poll:
             return
@@ -283,28 +284,34 @@ class BoardLoop:
         if now - self._last_poll < self.merge_poll_interval:
             return
         self._last_poll = now
-        await self._poll_merges()
+        await self._reconcile_prs()
 
-    async def _poll_merges(self):
-        """Ask ``gh`` whether each ``in_review`` PR has merged and run the idempotent
-        Done edge for any that have — the fallback for deployments GitHub can't post
-        a webhook to (otherwise a merged feature would sit in_review forever)."""
+    async def _reconcile_prs(self):
+        """Reconcile each ``in_review`` feature against its PR's real state — the
+        fallback to the webhook and the active half of the terminal edges (for
+        deployments GitHub can't post a webhook to, where a feature would otherwise
+        sit in_review forever): ``MERGED`` → done (+reap); ``CLOSED`` unmerged →
+        Blocked for triage (+reap; the work was rejected, don't silently re-dispatch);
+        ``OPEN`` → leave it in review."""
         store = self._store()
         repo = self._store_kw["repo"]
         for f in store.list_features(state="in_review"):
+            fid = f["id"]
             pr_url = f.get("pr_url")
             if not pr_url:
                 continue
             try:
-                if not await worktree.pr_is_merged(pr_url, cwd=repo):
-                    continue
-                done = store.record_merge(pr_url=pr_url)
-            except Exception:  # noqa: BLE001 — a poll error must never kill the loop
-                log.warning("[project_board] merge poll for %s failed", f["id"], exc_info=True)
-                continue
-            if done:
-                await worktree.reap_feature_worktree(repo, self.root, f["id"])
-                log.info("[project_board] merge poll → done: %s (%s)", f["id"], pr_url)
+                state = await worktree.pr_state(pr_url, cwd=repo)
+                if state == "MERGED":
+                    if store.record_merge(pr_url=pr_url):
+                        await worktree.reap_feature_worktree(repo, self.root, fid)
+                        log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
+                elif state == "CLOSED":
+                    store.flag_blocked(fid, f"PR closed without merging — needs triage: {pr_url}")
+                    await worktree.reap_feature_worktree(repo, self.root, fid)
+                    log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
+            except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
+                log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
 
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by

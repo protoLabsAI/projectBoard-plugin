@@ -320,13 +320,14 @@ async def test_drive_done_releases_its_files(monkeypatch):
     assert loop._drives == set()
 
 
-# ── the merge poll (Done-edge fallback) ─────────────────────────────────────────
+# ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────
 
 
-class _PollStore:
+class _ReconcileStore:
     def __init__(self, in_review):
         self._in_review = in_review
         self.merged = []
+        self.blocked = []
 
     def list_features(self, state=None):
         return self._in_review if state == "in_review" else []
@@ -335,57 +336,67 @@ class _PollStore:
         self.merged.append(pr_url)
         return {"id": "x", "board_state": "done"}
 
+    def flag_blocked(self, fid, reason):
+        self.blocked.append((fid, reason))
 
-async def test_poll_merges_runs_done_edge_for_merged_only(monkeypatch):
-    store = _PollStore(
+
+async def test_reconcile_drives_merged_to_done_and_closed_to_blocked(monkeypatch):
+    store = _ReconcileStore(
         [
-            {"id": "bd-1", "pr_url": "https://example/pr/1"},
-            {"id": "bd-2", "pr_url": "https://example/pr/2"},
-            {"id": "bd-3", "pr_url": ""},  # no PR → skipped entirely
+            {"id": "bd-merged", "pr_url": "https://example/pr/1"},
+            {"id": "bd-closed", "pr_url": "https://example/pr/2"},
+            {"id": "bd-open", "pr_url": "https://example/pr/3"},
+            {"id": "bd-nopr", "pr_url": ""},  # no PR → skipped entirely
         ]
     )
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    states = {
+        "https://example/pr/1": "MERGED",
+        "https://example/pr/2": "CLOSED",
+        "https://example/pr/3": "OPEN",
+    }
 
-    async def _is_merged(url, *, cwd="."):
-        return url.endswith("/1")  # only PR 1 has merged
+    async def _pr_state(url, *, cwd="."):
+        return states[url]
 
     reaped = []
 
     async def _reap(repo, root, fid):
         reaped.append(fid)
 
-    monkeypatch.setattr(worktree, "pr_is_merged", _is_merged)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
 
-    await BoardLoop({})._poll_merges()
-    assert store.merged == ["https://example/pr/1"]  # the unmerged + PR-less ones skipped
-    assert reaped == ["bd-1"]  # the merged feature's worktree is reaped
+    await BoardLoop({})._reconcile_prs()
+    assert store.merged == ["https://example/pr/1"]  # merged → done
+    assert [b[0] for b in store.blocked] == ["bd-closed"]  # closed-unmerged → blocked
+    assert set(reaped) == {"bd-merged", "bd-closed"}  # both terminal states reap; open kept
 
 
-async def test_maybe_poll_is_rate_limited(monkeypatch):
+async def test_maybe_reconcile_is_rate_limited(monkeypatch):
     loop = BoardLoop({"merge_poll": True, "merge_poll_interval_s": 60})
     calls = []
 
-    async def _poll():
+    async def _reconcile():
         calls.append(1)
 
-    monkeypatch.setattr(loop, "_poll_merges", _poll)
+    monkeypatch.setattr(loop, "_reconcile_prs", _reconcile)
     clock = {"t": 1000.0}
     monkeypatch.setattr("project_board.loop.time.monotonic", lambda: clock["t"])
 
-    await loop._maybe_poll_merges()  # first → polls
-    await loop._maybe_poll_merges()  # immediately again → rate-limited, skipped
+    await loop._maybe_reconcile()  # first → reconciles
+    await loop._maybe_reconcile()  # immediately → rate-limited
     clock["t"] += 61
-    await loop._maybe_poll_merges()  # interval elapsed → polls again
+    await loop._maybe_reconcile()  # interval elapsed → reconciles again
     assert len(calls) == 2
 
 
-async def test_merge_poll_off_never_polls(monkeypatch):
+async def test_merge_poll_off_never_reconciles(monkeypatch):
     loop = BoardLoop({"merge_poll": False})
     called = []
-    monkeypatch.setattr(loop, "_poll_merges", lambda: called.append(1))
-    await loop._maybe_poll_merges()
-    assert called == []  # disabled → the poll is never reached
+    monkeypatch.setattr(loop, "_reconcile_prs", lambda: called.append(1))
+    await loop._maybe_reconcile()
+    assert called == []  # disabled → never reconciles
 
 
 # ── crash recovery on boot ──────────────────────────────────────────────────────
