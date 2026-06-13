@@ -1,0 +1,9 @@
+# Test-only deps. At runtime langchain-core + fastapi are provided by the host
+# (protoAgent); these let the suite run standalone in CI. The plugin itself adds
+# no runtime pip deps (its only externals are the `br`, `git`, and `gh` CLIs).
+fastapi>=0.110
+langchain-core>=0.2
+pyyaml>=6
+httpx>=0.27
+pytest>=8
+pytest-asyncio>=0.23
