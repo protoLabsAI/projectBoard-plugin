@@ -34,6 +34,11 @@ from .store import BoardError, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
+_GOAL_VERIFY_SYS = (
+    "You are a strict code reviewer verifying a diff against acceptance criteria. "
+    "Only answer PASS if EVERY criterion is demonstrably met by the diff; otherwise FAIL."
+)
+
 
 class BoardLoop:
     def __init__(self, cfg: dict):
@@ -46,6 +51,12 @@ class BoardLoop:
         # the merge webhook gate it. Turn this on only for repos NOT covered by a
         # PR-review pipeline (then a reachable `reviewer` a2a delegate is required).
         self.review_dispatch = bool(self.cfg.get("review_dispatch", False))
+        # Goal-verification gate (OPT-IN, default off). When on, an independent model
+        # call checks the coder's diff against the feature's acceptance_criteria BEFORE
+        # opening the PR — catching a plausible-but-wrong or partial diff early, where a
+        # FAIL escalates/blocks instead of opening a PR for unfinished work. Borrowed
+        # from MiMo-Code's long-horizon harness. Adds one model call + latency per drive.
+        self.goal_verify = bool(self.cfg.get("goal_verify", False))
         self.interval = float(self.cfg.get("loop_interval_s", 30))
         self.root = self.cfg.get("worktrees_root", ".worktrees")
         self.enabled = bool(self.cfg.get("loop_enabled", False))
@@ -341,6 +352,13 @@ class BoardLoop:
                     result = await worktree.dispatch_coder(
                         coder, wt, prompt, timeout=self.coder_timeout or None
                     )  # reaps subprocess; CoderTimeout if it overruns
+                    # Goal-verification gate: confirm the diff meets the acceptance
+                    # criteria before opening a PR. A gap is a capability failure (the
+                    # coder didn't deliver) → escalate/block, don't open the PR.
+                    if self.goal_verify:
+                        gap = await self._verify_goal(feature, wt, base)
+                        if gap:
+                            raise worktree.WorktreeError(f"goal verification failed: {gap}")
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
@@ -348,9 +366,11 @@ class BoardLoop:
                     # error / timed out). Those are NOT transient-retried (re-running the
                     # same coder won't help) — they escalate a tier or block. Only true
                     # infra failures (push/fetch/gh network/rate-limit) get the backoff.
-                    capability = isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout)) or str(
-                        exc
-                    ).startswith("coder dispatch failed")
+                    capability = (
+                        isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout))
+                        or str(exc).startswith("coder dispatch failed")
+                        or str(exc).startswith("goal verification failed")
+                    )
                     # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
                     #    off the latest base also clears a merge conflict).
                     if policy.retryable and not capability and retries < policy.max_attempts - 1:
@@ -434,6 +454,49 @@ class BoardLoop:
         if d is None or d.type != expect_type:
             return None
         return d
+
+    async def _verify_goal(self, feature: dict, wt: str, base: str) -> str | None:
+        """MiMo-style goal verification: an independent model call checks the
+        worktree diff against the feature's ``acceptance_criteria``. Returns a short
+        gap string when the work doesn't satisfy the criteria, else ``None``.
+
+        Best-effort and **fails open** (returns ``None``) when there are no criteria,
+        no diff, or the verifier itself errors — so it never blocks a good PR on infra.
+        Uses the host's bare one-shot LLM primitive (``graph.sdk.complete``)."""
+        ac = (feature.get("acceptance_criteria") or "").strip()
+        if not ac:
+            return None
+        try:
+            await worktree._git(wt, "add", "-A")
+            _rc, diff, _err = await worktree._git(wt, "diff", "--cached", f"origin/{base}")
+        except Exception:  # noqa: BLE001 — verification is best-effort
+            return None
+        if not (diff or "").strip():
+            return None  # an empty diff is open_pr's NoChangesError job, not ours
+        files = ", ".join(feature.get("files_to_modify") or []) or "(unspecified)"
+        prompt = (
+            f"A coding agent was asked to satisfy these acceptance criteria:\n\n{ac}\n\n"
+            f"Declared files to modify: {files}\n\n"
+            f"Its diff:\n\n```diff\n{diff[:8000]}\n```\n\n"
+            "Does the diff satisfy EVERY acceptance criterion? Reply with PASS or FAIL "
+            "on the first line. If FAIL, add one line naming the specific unmet "
+            "criterion or gap."
+        )
+        try:
+            from graph.sdk import complete
+
+            verdict = (await complete(prompt, system=_GOAL_VERIFY_SYS) or "").strip()
+        except Exception as exc:  # noqa: BLE001 — never block a PR on a verifier error
+            log.warning(
+                "[project_board] %s goal-verify errored (failing open): %s",
+                feature.get("id"), exc,
+            )
+            return None
+        lines = [ln.strip() for ln in verdict.splitlines() if ln.strip()]
+        if not lines or lines[0].upper().startswith("PASS"):
+            return None
+        gap = " ".join(lines[1:]).strip() or lines[0]
+        return gap[:300]
 
     def _build_prompt(self, feature: dict) -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A

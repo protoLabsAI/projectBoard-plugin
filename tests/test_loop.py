@@ -131,6 +131,89 @@ async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
     assert loop._inflight == {}
 
 
+# ── goal-verification gate (MiMo-borrowed; opt-in `goal_verify`) ─────────────────
+
+
+async def test_goal_verify_pass_opens_the_pr(monkeypatch):
+    async def _ok(self, feature, wt, base):
+        return None  # PASS — no gap
+
+    monkeypatch.setattr(BoardLoop, "_verify_goal", _ok)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/9"
+
+    loop, store = await _drive_with(
+        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True}
+    )
+    assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
+
+
+async def test_goal_verify_fail_skips_pr_and_blocks(monkeypatch):
+    async def _gap(self, feature, wt, base):
+        return "AC #1 unmet: multiply() missing"
+
+    monkeypatch.setattr(BoardLoop, "_verify_goal", _gap)
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append(True)
+        return "https://example/pr/x"
+
+    loop, store = await _drive_with(
+        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True}
+    )
+    assert not opened  # the gate stopped the PR from being opened
+    # A gap is a capability failure → single coder (no ladder) → block, no PR.
+    assert "flag_blocked" in store.names()
+    assert "open_review" not in store.names()
+
+
+async def test_goal_verify_off_by_default_skips_the_gate(monkeypatch):
+    called = []
+
+    async def _spy(self, feature, wt, base):
+        called.append(True)
+        return "would fail if invoked"
+
+    monkeypatch.setattr(BoardLoop, "_verify_goal", _spy)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/3"
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # default cfg → off
+    assert not called  # the gate is never invoked when goal_verify is off
+    assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
+
+
+async def test_verify_goal_parses_pass_and_fail(monkeypatch):
+    loop = BoardLoop({"goal_verify": True})
+
+    async def _git(repo, *args, timeout=60):
+        return (0, "diff --git a/calc.py b/calc.py\n+def multiply(a, b):\n+    return a * b", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _pass(prompt, *, system=None, model_name=None):
+        return "PASS"
+
+    monkeypatch.setattr("graph.sdk.complete", _pass)
+    assert await loop._verify_goal(FEATURE, "/wt", "main") is None
+
+    async def _fail(prompt, *, system=None, model_name=None):
+        return "FAIL\nAC #2 unmet: no error handling"
+
+    monkeypatch.setattr("graph.sdk.complete", _fail)
+    gap = await loop._verify_goal(FEATURE, "/wt", "main")
+    assert gap and "AC #2" in gap
+
+
+async def test_verify_goal_fails_open_when_no_criteria(monkeypatch):
+    loop = BoardLoop({"goal_verify": True})
+    # No acceptance_criteria → gate must not even shell out / call the model.
+    assert await loop._verify_goal({"id": "x", "acceptance_criteria": ""}, "/wt", "main") is None
+
+
 async def test_drive_blocks_when_the_coder_is_not_configured(monkeypatch):
     async def _open_pr(wt, branch, *, base, title, body):
         raise AssertionError("open_pr should not be reached")
