@@ -10,10 +10,15 @@ reused on a re-dispatch.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import sys
+import types
+
 import pytest
 
 from project_board import worktree
-from project_board.worktree import NoChangesError, WorktreeError
+from project_board.worktree import CoderTimeout, NoChangesError, WorktreeError
 
 
 class FakeGit:
@@ -159,3 +164,60 @@ async def test_reap_feature_worktree_computes_path_and_branch(monkeypatch):
     monkeypatch.setattr(worktree, "remove_worktree", _remove)
     await worktree.reap_feature_worktree("/repo", ".worktrees", "bd-7")
     assert calls == [("/repo", "/repo/.worktrees/feat-bd-7", "feat/bd-7")]
+
+
+# ── dispatch_coder: the stuck-coder watchdog (hard timeout + reap) ──────────────
+
+
+def _inject_fake_delegates(monkeypatch, acp):
+    """Stand in for the host's `plugins.delegates.adapters` (absent in the suite),
+    which dispatch_coder imports lazily."""
+
+    class _DelegateError(Exception):
+        pass
+
+    mod = types.ModuleType("plugins.delegates.adapters")
+    mod.ADAPTERS = {"acp": acp}
+    mod.DelegateError = _DelegateError
+    pkg = types.ModuleType("plugins")
+    sub = types.ModuleType("plugins.delegates")
+    pkg.delegates = sub
+    sub.adapters = mod
+    monkeypatch.setitem(sys.modules, "plugins", pkg)
+    monkeypatch.setitem(sys.modules, "plugins.delegates", sub)
+    monkeypatch.setitem(sys.modules, "plugins.delegates.adapters", mod)
+    return _DelegateError
+
+
+@dataclasses.dataclass
+class _Coder:
+    workdir: str = ""
+
+
+async def test_dispatch_coder_raises_coder_timeout_and_reaps_on_overrun(monkeypatch):
+    teardowns = []
+
+    class _Acp:
+        async def dispatch(self, scoped, prompt, timeout=None):
+            await asyncio.sleep(3600)  # hang well past the timeout
+
+        async def teardown(self, scoped):
+            teardowns.append(scoped)
+
+    _inject_fake_delegates(monkeypatch, _Acp())
+    with pytest.raises(CoderTimeout):
+        await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=0.01)
+    assert teardowns  # the hung subprocess is still reaped (the finally ran)
+
+
+async def test_dispatch_coder_returns_result_within_budget(monkeypatch):
+    class _Acp:
+        async def dispatch(self, scoped, prompt, timeout=None):
+            return "built it"
+
+        async def teardown(self, scoped):
+            pass
+
+    _inject_fake_delegates(monkeypatch, _Acp())
+    out = await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=5)
+    assert out == "built it"

@@ -58,6 +58,11 @@ class BoardLoop:
         # worktree. 1 (the default) = serial — the safe default for token + merge-
         # integration cost; raise it on a repo that parallelizes cleanly.
         self.max_concurrent = max(1, int(self.cfg.get("max_concurrent", 1)))
+        # Stuck-drive watchdog: hard cap on a single coder dispatch (the only
+        # otherwise-unbounded await in a drive — git/gh calls already self-time-out).
+        # 0 disables it. A timeout reaps the coder subprocess and is a capability
+        # failure (escalate-or-block), not a transient retry.
+        self.coder_timeout = float(self.cfg.get("coder_timeout_s", 1800))
         # Merge poll: a fallback to the /webhook/pr Done edge for deployments with no
         # public webhook URL. On by default (cheap; only probes `in_review` PRs).
         self.merge_poll = bool(self.cfg.get("merge_poll", True))
@@ -86,12 +91,14 @@ class BoardLoop:
             return None
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
         log.info(
-            "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, merge_poll=%s)",
+            "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
+            "merge_poll=%s, coder_timeout=%ss)",
             self.coder_name,
             self.reviewer_name,
             self.interval,
             self.max_concurrent,
             self.merge_poll,
+            self.coder_timeout,
         )
         return self._task
 
@@ -210,14 +217,22 @@ class BoardLoop:
                 wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
                 self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                 try:
-                    result = await worktree.dispatch_coder(coder, wt, prompt)  # reaps subprocess
+                    result = await worktree.dispatch_coder(
+                        coder, wt, prompt, timeout=self.coder_timeout or None
+                    )  # reaps subprocess; CoderTimeout if it overruns
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
-                    # 1. Transient infra (rate-limit / network / merge-conflict) → back
-                    #    off and retry the SAME tier. A stronger model can't clear a rate
-                    #    limit, and a re-dispatch off the latest base clears a conflict.
-                    if policy.retryable and retries < policy.max_attempts - 1:
+                    # A capability failure = the coder didn't deliver (no diff / dispatch
+                    # error / timed out). Those are NOT transient-retried (re-running the
+                    # same coder won't help) — they escalate a tier or block. Only true
+                    # infra failures (push/fetch/gh network/rate-limit) get the backoff.
+                    capability = isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout)) or str(
+                        exc
+                    ).startswith("coder dispatch failed")
+                    # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
+                    #    off the latest base also clears a merge conflict).
+                    if policy.retryable and not capability and retries < policy.max_attempts - 1:
                         retries += 1
                         log.info(
                             "[project_board] %s %s — retry %d/%d in %ss: %s",
@@ -230,11 +245,7 @@ class BoardLoop:
                         )
                         await asyncio.sleep(policy.base_delay_s)
                         continue
-                    # 2. Capability failure (coder errored / no diff) + a ladder → climb
-                    #    a model tier (fresh retry budget at the new tier).
-                    capability = isinstance(exc, worktree.NoChangesError) or str(exc).startswith(
-                        "coder dispatch failed"
-                    )
+                    # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
                         nxt = store.escalate(fid, str(exc)[:200])
                         if nxt:
