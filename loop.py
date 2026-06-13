@@ -11,17 +11,21 @@ merge webhook (``api.record_merge``), the single external edge (invariant #2).
        └──▶ in_review  ──delegate_to(reviewer)──▶  (CI + review on the PR)
                  │
    merge webhook ▼                 CI fail ▼                 any failure ▼
-              done                in_progress (bounce)     blocked (flag + reason)
+   /merge poll                in_progress (bounce)     blocked (flag + reason)
+              done
 
-CI status + merge arrive out-of-band via the board API (``api.py``), not here.
-Concurrency is capped at 1 (token + merge-integration cost); the cap is where
-parallelism lands later.
+CI status arrives out-of-band via the board API (``api.py``). ``done`` is set by
+the merge webhook (``api.record_merge``) — or, when no public webhook URL is
+reachable, by the loop's **merge poll** (``merge_poll``), which asks ``gh`` whether
+each ``in_review`` PR has merged and runs the same idempotent Done edge. Up to
+``max_concurrent`` features build concurrently, each in its own worktree.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from . import worktree
 from .store import BoardError, escalation_enabled, get_store
@@ -49,6 +53,14 @@ class BoardLoop:
         # and we never write redundant tier/attempt labels.
         self.coders = {str(k): str(v) for k, v in (self.cfg.get("coders") or {}).items()}
         self.escalation_on = escalation_enabled(self.cfg)
+        # Concurrency: drive up to `max_concurrent` features at once, each in its own
+        # worktree. 1 (the default) = serial — the safe default for token + merge-
+        # integration cost; raise it on a repo that parallelizes cleanly.
+        self.max_concurrent = max(1, int(self.cfg.get("max_concurrent", 1)))
+        # Merge poll: a fallback to the /webhook/pr Done edge for deployments with no
+        # public webhook URL. On by default (cheap; only probes `in_review` PRs).
+        self.merge_poll = bool(self.cfg.get("merge_poll", True))
+        self.merge_poll_interval = float(self.cfg.get("merge_poll_interval_s", 60))
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -56,10 +68,12 @@ class BoardLoop:
         )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        # The in-flight build's worktree, so shutdown can reap it (a cancel mid-drive
-        # would otherwise orphan the worktree; the coder subprocess is reaped by
-        # dispatch_coder's finally). (repo, worktree_path, branch) or None.
-        self._active: tuple[str, str, str] | None = None
+        # The running drive tasks, and the worktrees they hold (fid → (repo, wt,
+        # branch)) so shutdown can reap any a cancel mid-drive would orphan; the coder
+        # subprocess itself is reaped by dispatch_coder's finally.
+        self._drives: set[asyncio.Task] = set()
+        self._inflight: dict[str, tuple[str, str, str]] = {}
+        self._last_poll = 0.0  # monotonic ts of the last merge poll
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -71,10 +85,12 @@ class BoardLoop:
             return None
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
         log.info(
-            "[project_board] loop started (coder=%s reviewer=%s every %ss)",
+            "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, merge_poll=%s)",
             self.coder_name,
             self.reviewer_name,
             self.interval,
+            self.max_concurrent,
+            self.merge_poll,
         )
         return self._task
 
@@ -86,11 +102,16 @@ class BoardLoop:
                 await self._task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        # Reap an interrupted build's worktree (a drive cancelled mid-flight leaves
-        # self._active set; a completed/blocked drive clears it). Best-effort.
-        act, self._active = self._active, None
-        if act:
-            repo, wt, branch = act
+        # Cancel any in-flight drives and await them out. A drive cancelled mid-flight
+        # can't run its own cleanup, so its worktree stays in self._inflight — reaped
+        # below. (A completed/blocked drive already popped itself.)
+        drives, self._drives = list(self._drives), set()
+        for t in drives:
+            t.cancel()
+        if drives:
+            await asyncio.gather(*drives, return_exceptions=True)
+        inflight, self._inflight = dict(self._inflight), {}
+        for fid, (repo, wt, branch) in inflight.items():
             try:
                 await worktree.remove_worktree(repo, wt, branch or "")
                 log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
@@ -100,26 +121,68 @@ class BoardLoop:
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
         while not self._stop.is_set():
+            spawned = False
             try:
-                worked = await self._tick()
+                await self._maybe_poll_merges()
+                spawned = self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
                 log.exception("[project_board] loop tick failed")
-                worked = False
-            # If we did work, loop again immediately (drain Ready); else sleep.
-            if not worked:
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
-                except asyncio.TimeoutError:
-                    pass
+            # Idle (nothing started, nothing running) → sleep the full interval. Busy
+            # → re-check soon so a freed concurrency slot refills and merges land
+            # promptly (the poll itself stays rate-limited by merge_poll_interval).
+            idle = not spawned and not self._drives
+            timeout = self.interval if idle else min(self.interval, 3.0)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
 
-    async def _tick(self) -> bool:
-        """Claim and drive at most one Ready feature. Returns True if it claimed
-        one (so the runner can drain), False if Ready was empty."""
-        feature = self._store().claim_next_ready(assignee=self.coder_name)
-        if feature is None:
-            return False
-        await self._drive(feature)
-        return True
+    def _spawn_ready(self) -> bool:
+        """Claim Ready features up to the concurrency cap and spawn a drive task for
+        each. Returns True if it started at least one (so the runner stays hot)."""
+        spawned = False
+        while len(self._drives) < self.max_concurrent:
+            feature = self._store().claim_next_ready(assignee=self.coder_name)
+            if feature is None:
+                break
+            task = asyncio.create_task(self._drive(feature), name=f"pb-drive-{feature['id']}")
+            self._drives.add(task)
+            task.add_done_callback(self._drives.discard)
+            spawned = True
+        return spawned
+
+    # ── the merge poll (Done-edge fallback to the webhook) ─────────────────────
+    async def _maybe_poll_merges(self):
+        """Run the merge poll at most once per ``merge_poll_interval`` (and only when
+        enabled) — cheap, but no reason to hammer ``gh`` every busy tick."""
+        if not self.merge_poll:
+            return
+        now = time.monotonic()
+        if now - self._last_poll < self.merge_poll_interval:
+            return
+        self._last_poll = now
+        await self._poll_merges()
+
+    async def _poll_merges(self):
+        """Ask ``gh`` whether each ``in_review`` PR has merged and run the idempotent
+        Done edge for any that have — the fallback for deployments GitHub can't post
+        a webhook to (otherwise a merged feature would sit in_review forever)."""
+        store = self._store()
+        repo = self._store_kw["repo"]
+        for f in store.list_features(state="in_review"):
+            pr_url = f.get("pr_url")
+            if not pr_url:
+                continue
+            try:
+                if not await worktree.pr_is_merged(pr_url, cwd=repo):
+                    continue
+                done = store.record_merge(pr_url=pr_url)
+            except Exception:  # noqa: BLE001 — a poll error must never kill the loop
+                log.warning("[project_board] merge poll for %s failed", f["id"], exc_info=True)
+                continue
+            if done:
+                await worktree.reap_feature_worktree(repo, self.root, f["id"])
+                log.info("[project_board] merge poll → done: %s (%s)", f["id"], pr_url)
 
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
@@ -143,7 +206,7 @@ class BoardLoop:
                     return
                 # Fresh worktree per attempt (a failed attempt may leave partial work).
                 wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
-                self._active = (repo, wt, branch)  # track for shutdown reaping
+                self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                 try:
                     result = await worktree.dispatch_coder(coder, wt, prompt)  # reaps subprocess
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
@@ -163,7 +226,7 @@ class BoardLoop:
                     store.flag_blocked(fid, str(exc))
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
-                    self._active = None
+                    self._inflight.pop(fid, None)
                     return
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
@@ -173,18 +236,18 @@ class BoardLoop:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
                 # on a terminal block above, and the coder subprocess is already reaped.
-                self._active = None  # built OK — not an interrupted build to reap
+                self._inflight.pop(fid, None)  # built OK — not an interrupted build to reap
                 return
         except BoardError as exc:
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
             store.flag_blocked(fid, str(exc))
-            self._active = None
+            self._inflight.pop(fid, None)
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
             store.flag_blocked(fid, f"unexpected: {type(exc).__name__}: {exc}")
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
-            self._active = None
+            self._inflight.pop(fid, None)
 
     async def _request_review(self, fid: str, pr_url: str):
         """Hand the PR to the reviewer (an a2a delegate, e.g. quinn). Best-effort:

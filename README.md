@@ -31,8 +31,10 @@ board to a PR — or fork it as a starting point.
   separate store, so the work graph can't drift out of sync.
 - **The loop** pulls the top-priority `ready` feature → creates a disposable
   `git worktree` off `origin/<base>` → dispatches a coder (`acp` delegate) scoped to
-  it → commits/pushes → opens a PR → `in_review`. A **merge webhook** is the single
-  edge that sets `done` (and reaps the worktree).
+  it → commits/pushes → opens a PR → `in_review`. A **merge webhook** sets `done`
+  (and reaps the worktree); where GitHub can't reach a webhook URL, a **merge poll**
+  (`merge_poll`, on by default) runs the same idempotent Done edge. Set
+  `max_concurrent > 1` to build several features in parallel, each in its own worktree.
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
@@ -76,6 +78,8 @@ project_board:
   repo: ~/dev/my-repo
   base_branch: main
   loop_enabled: false        # flip true to start the background puller
+  max_concurrent: 1          # >1 builds features in parallel (each its own worktree)
+  merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   # webhook_secret: "..."    # set before exposing /webhook/pr publicly
 ```
 

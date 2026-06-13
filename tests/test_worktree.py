@@ -127,3 +127,35 @@ async def test_create_worktree_falls_back_to_local_base_without_a_remote(monkeyp
     assert branch == "feat/bd-2"
     add = next(a for a in git.calls if a[:2] == ("worktree", "add"))
     assert add[-1] == "main"  # fell back to the local branch
+
+
+# ── pr_is_merged: the merge-poll probe ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "gh_state,expected",
+    [
+        ((0, "MERGED", ""), True),
+        ((0, "OPEN", ""), False),
+        ((0, "CLOSED", ""), False),  # closed-unmerged is NOT done
+        ((1, "", "no pr found"), False),  # a gh failure → False, the poll retries
+    ],
+)
+async def test_pr_is_merged(monkeypatch, gh_state, expected):
+    gh = FakeGh({"view": gh_state})
+    _install(monkeypatch, FakeGit(), gh)
+    assert await worktree.pr_is_merged("https://example/pr/1", cwd="/repo") is expected
+
+
+# ── reap_feature_worktree: the shared id → worktree/branch reap ──────────────────
+
+
+async def test_reap_feature_worktree_computes_path_and_branch(monkeypatch):
+    calls = []
+
+    async def _remove(repo, wt, branch=""):
+        calls.append((repo, wt, branch))
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    await worktree.reap_feature_worktree("/repo", ".worktrees", "bd-7")
+    assert calls == [("/repo", "/repo/.worktrees/feat-bd-7", "feat/bd-7")]

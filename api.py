@@ -138,9 +138,7 @@ def build_router(cfg: dict):
         try:
             from . import worktree
 
-            repo = store_kw["repo"]
-            wt = os.path.join(repo, worktrees_root, f"feat-{f['id']}")
-            await worktree.remove_worktree(repo, wt, f"feat/{f['id']}")
+            await worktree.reap_feature_worktree(store_kw["repo"], worktrees_root, f["id"])
         except Exception:  # noqa: BLE001 — reaping is best-effort; done is already set
             log.warning("[project_board] worktree reap for %s failed", f["id"], exc_info=True)
         log.info("[project_board] merge webhook → done: %s (%s)", f["id"], pr_url)
