@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from . import worktree
@@ -37,6 +38,12 @@ log = logging.getLogger("protoagent.plugins.project_board")
 _GOAL_VERIFY_SYS = (
     "You are a strict code reviewer verifying a diff against acceptance criteria. "
     "Only answer PASS if EVERY criterion is demonstrably met by the diff; otherwise FAIL."
+)
+
+_MAX_MODE_JUDGE_SYS = (
+    "You are a strict code reviewer choosing the best of several diffs for the same "
+    "task. Pick the one that most completely and correctly satisfies the acceptance "
+    "criteria. Answer with ONLY the candidate number."
 )
 
 
@@ -57,6 +64,11 @@ class BoardLoop:
         # FAIL escalates/blocks instead of opening a PR for unfinished work. Borrowed
         # from MiMo-Code's long-horizon harness. Adds one model call + latency per drive.
         self.goal_verify = bool(self.cfg.get("goal_verify", False))
+        # Max-Mode (MiMo Tier-2, OPT-IN, default 1 = off). When >1, a hard feature is
+        # attempted with N parallel candidates and `_judge_candidates` picks the best
+        # diff. Costs N× tokens, so gate it to hard work. The parallel-dispatch wiring
+        # is tracked in #21; this ships the reusable best-of-N judge it composes.
+        self.max_mode_n = max(1, int(self.cfg.get("max_mode_n", 1) or 1))
         self.interval = float(self.cfg.get("loop_interval_s", 30))
         self.root = self.cfg.get("worktrees_root", ".worktrees")
         self.enabled = bool(self.cfg.get("loop_enabled", False))
@@ -489,7 +501,8 @@ class BoardLoop:
         except Exception as exc:  # noqa: BLE001 — never block a PR on a verifier error
             log.warning(
                 "[project_board] %s goal-verify errored (failing open): %s",
-                feature.get("id"), exc,
+                feature.get("id"),
+                exc,
             )
             return None
         lines = [ln.strip() for ln in verdict.splitlines() if ln.strip()]
@@ -497,6 +510,57 @@ class BoardLoop:
             return None
         gap = " ".join(lines[1:]).strip() or lines[0]
         return gap[:300]
+
+    async def _judge_candidates(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
+        """Max-Mode best-of-N judge: given N candidate worktrees for the same feature,
+        pick the index whose diff best satisfies the ``acceptance_criteria``. Returns
+        the winning index, or ``None`` when there's no non-empty candidate.
+
+        Reuses the goal-verify diff+``complete()`` seam. Best-effort: candidates with no
+        diff are skipped; if the judge errors or is unparseable, falls back to the first
+        non-empty candidate (never returns a worse-than-arbitrary answer). The N-parallel
+        dispatch that produces ``worktrees`` is tracked in #21; this is the judge it calls."""
+        ac = (feature.get("acceptance_criteria") or "").strip()
+        diffs: list[str] = []
+        for wt in worktrees:
+            try:
+                await worktree._git(wt, "add", "-A")
+                _rc, d, _err = await worktree._git(wt, "diff", "--cached", f"origin/{base}")
+            except Exception:  # noqa: BLE001 — judging is best-effort
+                d = ""
+            diffs.append((d or "").strip())
+
+        nonempty = [i for i, d in enumerate(diffs) if d]
+        if not nonempty:
+            return None
+        if len(nonempty) == 1:
+            return nonempty[0]
+
+        blocks = "\n\n".join(f"### Candidate {i}\n```diff\n{diffs[i][:4000]}\n```" for i in nonempty)
+        prompt = (
+            f"{len(nonempty)} coding agents each attempted the same task.\n\n"
+            f"Acceptance criteria:\n{ac or '(none given)'}\n\n"
+            f"{blocks}\n\n"
+            "Which candidate BEST satisfies every acceptance criterion (most correct, "
+            "complete, and clean)? Reply with ONLY the candidate number."
+        )
+        try:
+            from graph.sdk import complete
+
+            verdict = (await complete(prompt, system=_MAX_MODE_JUDGE_SYS) or "").strip()
+        except Exception as exc:  # noqa: BLE001 — never fail the build on the judge
+            log.warning(
+                "[project_board] %s max-mode judge errored (using first candidate): %s",
+                feature.get("id"),
+                exc,
+            )
+            return nonempty[0]
+
+        for tok in re.findall(r"\d+", verdict):
+            idx = int(tok)
+            if idx in nonempty:
+                return idx
+        return nonempty[0]  # judge unclear → first non-empty candidate
 
     def _build_prompt(self, feature: dict) -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A

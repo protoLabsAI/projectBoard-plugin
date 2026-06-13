@@ -38,6 +38,10 @@ config:
   goal_verify: false        # OPT-IN. On = an independent model call checks the coder's diff
                             # against the feature's acceptance_criteria BEFORE opening the PR;
                             # a gap escalates/blocks instead of opening a PR for unfinished work.
+  max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 runs
+                            # N coders on the same feature; a low-temp judge picks the diff that
+                            # best satisfies acceptance_criteria. The N-parallel dispatch is WIP
+                            # (#21); the judge (_judge_candidates) ships + is unit-tested now.
   repo: "."                 # repo the coders work in (worktrees branch off it)
   base_branch: main         # base branch worktrees/PRs target
   worktrees_root: .worktrees

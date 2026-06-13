@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,25 @@ if PKG not in sys.modules:
     _module = importlib.util.module_from_spec(_spec)
     sys.modules[PKG] = _module
     _spec.loader.exec_module(_module)
+
+# `graph.sdk.complete` is the host LLM seam the goal-verify gate + max-mode judge
+# reach lazily (`from graph.sdk import complete`). protoAgent provides it at runtime
+# but it's not a pip dep, so the standalone CI env has no `graph` package — which made
+# `monkeypatch.setattr("graph.sdk.complete", …)` raise ModuleNotFoundError at patch
+# time. Register a stub package so those tests can patch the seam; the default impl
+# raises so a test that forgets to patch fails loudly rather than hitting a real model.
+if "graph" not in sys.modules:
+    _graph = types.ModuleType("graph")
+    _graph.__path__ = []  # mark as a package so `graph.sdk` resolves as a submodule
+    _graph_sdk = types.ModuleType("graph.sdk")
+
+    async def _unpatched_complete(*_a, **_k):  # pragma: no cover — tests must patch this
+        raise RuntimeError("graph.sdk.complete must be monkeypatched in tests")
+
+    _graph_sdk.complete = _unpatched_complete
+    _graph.sdk = _graph_sdk
+    sys.modules["graph"] = _graph
+    sys.modules["graph.sdk"] = _graph_sdk
 
 
 @pytest.fixture

@@ -95,6 +95,7 @@ project_board:
   max_concurrent: 1          # >1 builds features in parallel (each its own worktree)
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
+  max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, a judge keeps the best diff (#21, WIP)
   # webhook_secret: "..."    # set before exposing /webhook/pr publicly
 ```
 
