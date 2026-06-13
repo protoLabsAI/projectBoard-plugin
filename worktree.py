@@ -104,6 +104,18 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> Non
     await remove_worktree(repo, wt, f"feat/{fid}")
 
 
+def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:
+    """The feature ids that currently have a ``feat-<id>`` worktree dir under
+    ``<repo>/<worktrees_root>`` — for the health sweep's orphan check. Sync (a quick
+    dir listing); returns ``[]`` if the dir is absent."""
+    base = os.path.join(repo, worktrees_root)
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    return [n[len("feat-") :] for n in names if n.startswith("feat-") and os.path.isdir(os.path.join(base, n))]
+
+
 async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | None = None) -> str:
     """Dispatch the coder (an ``acp`` Delegate) scoped to ``worktree``.
 

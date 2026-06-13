@@ -71,6 +71,9 @@ class BoardLoop:
         # public webhook URL. On by default (cheap; only probes `in_review` PRs).
         self.merge_poll = bool(self.cfg.get("merge_poll", True))
         self.merge_poll_interval = float(self.cfg.get("merge_poll_interval_s", 60))
+        # Health sweep: periodic self-heal (reclaim slots from dead drives, reap
+        # orphaned worktrees). 0 disables it.
+        self.sweep_interval = float(self.cfg.get("health_sweep_interval_s", 300))
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -87,6 +90,7 @@ class BoardLoop:
         # (don't run two parallel coders that edit the same file → sure conflict).
         self._inflight_files: dict[str, set[str]] = {}
         self._last_poll = 0.0  # monotonic ts of the last merge poll
+        self._last_sweep = 0.0  # monotonic ts of the last health sweep
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -134,27 +138,67 @@ class BoardLoop:
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
 
     # ── crash recovery (runs once, before the puller claims new work) ──────────
+    async def _reconcile_orphan(self, fid: str):
+        """A claimed feature with no live drive: if its PR actually got opened (a crash
+        between ``open_pr`` and ``open_review``) adopt it → ``in_review``; otherwise
+        reset it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
+        puller re-claims it). Shared by boot recovery and the health sweep."""
+        store = self._store()
+        pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=self._store_kw["repo"])
+        if pr_url:
+            store.open_review(fid, pr_url=pr_url)
+            log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
+        else:
+            store.requeue(fid)
+            log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
+
     async def _recover(self):
-        """Reconcile features the previous run left mid-drive. A drive doesn't survive
-        a restart, so every ``in_progress`` feature is orphaned (claimed, no PR yet):
-        if its PR actually got opened (a crash between ``open_pr`` and ``open_review``)
-        adopt it → ``in_review``; otherwise reset it to ``ready`` for a clean rebuild
-        (any stale worktree is cleaned when the puller re-claims it). ``in_review``
-        features are NOT touched — they have a PR and the webhook/poll resolves them."""
+        """On boot, reconcile every ``in_progress`` feature the previous run left
+        mid-drive (a drive doesn't survive a restart). ``in_review`` features are NOT
+        touched — they have a PR and the webhook/poll resolves them."""
+        for f in self._store().list_features(state="in_progress"):
+            try:
+                await self._reconcile_orphan(f["id"])
+            except Exception:  # noqa: BLE001 — recovery is best-effort, per feature
+                log.warning("[project_board] recovery for %s failed", f["id"], exc_info=True)
+
+    # ── periodic health sweep (self-heal during the run) ───────────────────────
+    async def _maybe_sweep(self):
+        """Run the health sweep at most once per ``health_sweep_interval`` (0 = off)."""
+        if not self.sweep_interval:
+            return
+        now = time.monotonic()
+        if now - self._last_sweep < self.sweep_interval:
+            return
+        self._last_sweep = now
+        await self._sweep()
+
+    async def _sweep(self):
+        """Self-heal: (a) reset ``in_progress`` features that no live drive owns (a
+        drive died without finishing) — same reconcile as boot recovery; (b) reap
+        ``feat-<id>`` worktrees whose feature is gone or already ``done`` (a missed
+        reap). Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
         repo = self._store_kw["repo"]
         for f in store.list_features(state="in_progress"):
             fid = f["id"]
+            if fid in self._inflight_files:
+                continue  # a live drive owns it
             try:
-                pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=repo)
-                if pr_url:
-                    store.open_review(fid, pr_url=pr_url)
-                    log.info("[project_board] recovery: %s already had a PR → in_review (%s)", fid, pr_url)
-                else:
-                    store.requeue(fid)
-                    log.info("[project_board] recovery: %s reset to ready (no PR — rebuild fresh)", fid)
-            except Exception:  # noqa: BLE001 — recovery is best-effort, per feature
-                log.warning("[project_board] recovery for %s failed", fid, exc_info=True)
+                log.info("[project_board] sweep: %s in_progress with no live drive", fid)
+                await self._reconcile_orphan(fid)
+            except Exception:  # noqa: BLE001
+                log.warning("[project_board] sweep reconcile for %s failed", fid, exc_info=True)
+        for fid in worktree.list_feature_worktrees(repo, self.root):
+            if fid in self._inflight_files:
+                continue  # a live drive owns this worktree
+            try:
+                f = store.get_feature(fid)
+                if f is None or f["board_state"] == "done":
+                    await worktree.reap_feature_worktree(repo, self.root, fid)
+                    log.info("[project_board] sweep: reaped orphaned worktree feat-%s", fid)
+            except Exception:  # noqa: BLE001
+                log.warning("[project_board] sweep reap for %s failed", fid, exc_info=True)
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
@@ -166,6 +210,7 @@ class BoardLoop:
             spawned = False
             try:
                 await self._maybe_poll_merges()
+                await self._maybe_sweep()
                 spawned = self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
                 log.exception("[project_board] loop tick failed")

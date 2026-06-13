@@ -433,3 +433,81 @@ async def test_recover_is_resilient_to_a_per_feature_error(monkeypatch):
     # bd-1 errored and was skipped; bd-2 still recovered.
     assert ("requeue", "bd-2") in store.calls
     assert all(c[1] != "bd-1" for c in store.calls)
+
+
+# ── periodic health sweep ───────────────────────────────────────────────────────
+
+
+class _SweepStore:
+    def __init__(self, in_progress=(), features=None):
+        self._in_progress = list(in_progress)
+        self._features = features or {}  # fid -> board_state
+        self.requeued = []
+
+    def list_features(self, state=None):
+        return [{"id": f} for f in self._in_progress] if state == "in_progress" else []
+
+    def requeue(self, fid):
+        self.requeued.append(fid)
+
+    def open_review(self, fid, *, pr_url):
+        pass
+
+    def get_feature(self, fid):
+        st = self._features.get(fid)
+        return {"id": fid, "board_state": st} if st else None
+
+
+async def test_sweep_reconciles_in_progress_with_no_live_drive(monkeypatch):
+    store = _SweepStore(in_progress=["bd-1", "bd-2"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
+
+    async def _no_pr(branch, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    loop = BoardLoop({})
+    loop._inflight_files = {"bd-2": {"a.py"}}  # bd-2 has a live drive → skip
+    await loop._sweep()
+    assert store.requeued == ["bd-1"]  # bd-1 (no PR, no drive) reset; bd-2 left alone
+
+
+async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
+    store = _SweepStore(features={"bd-done": "done", "bd-rev": "in_review"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: ["bd-done", "bd-rev", "bd-gone"])
+    reaped = []
+
+    async def _reap(repo, root, fid):
+        reaped.append(fid)
+
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    await BoardLoop({})._sweep()
+    # done + missing feature → reaped; in_review keeps its worktree (CI-fail re-dispatch).
+    assert set(reaped) == {"bd-done", "bd-gone"}
+
+
+async def test_maybe_sweep_is_rate_limited(monkeypatch):
+    loop = BoardLoop({"health_sweep_interval_s": 300})
+    calls = []
+
+    async def _sweep():
+        calls.append(1)
+
+    monkeypatch.setattr(loop, "_sweep", _sweep)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("project_board.loop.time.monotonic", lambda: clock["t"])
+    await loop._maybe_sweep()  # first → sweeps
+    await loop._maybe_sweep()  # immediately → rate-limited
+    clock["t"] += 301
+    await loop._maybe_sweep()  # interval elapsed → sweeps again
+    assert len(calls) == 2
+
+
+async def test_sweep_off_when_interval_zero(monkeypatch):
+    loop = BoardLoop({"health_sweep_interval_s": 0})
+    called = []
+    monkeypatch.setattr(loop, "_sweep", lambda: called.append(1))
+    await loop._maybe_sweep()
+    assert called == []  # disabled → never sweeps
