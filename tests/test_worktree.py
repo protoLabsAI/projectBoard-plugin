@@ -162,6 +162,22 @@ async def test_pr_url_for_branch_found_and_absent(monkeypatch):
     assert await worktree.pr_url_for_branch("feat/bd-9", cwd="/repo") == ""
 
 
+# ── list_feature_worktrees: the health sweep's orphan enumeration ───────────────
+
+
+def test_list_feature_worktrees(tmp_path):
+    root = tmp_path / "wt"
+    (root / "feat-bd-1").mkdir(parents=True)
+    (root / "feat-bd-2").mkdir()
+    (root / "other-dir").mkdir()  # not a feat- dir
+    (root / "feat-stray-file").write_text("x")  # a file, not a worktree dir
+    assert set(worktree.list_feature_worktrees(str(tmp_path), "wt")) == {"bd-1", "bd-2"}
+
+
+def test_list_feature_worktrees_absent_dir(tmp_path):
+    assert worktree.list_feature_worktrees(str(tmp_path), "does-not-exist") == []
+
+
 # ── reap_feature_worktree: the shared id → worktree/branch reap ──────────────────
 
 

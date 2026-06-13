@@ -57,6 +57,9 @@ config:
                             # (no public URL). The Done edge stays idempotent either
                             # way; set false to rely on the webhook alone.
   merge_poll_interval_s: 60 # how often the loop polls in_review PRs for a merge
+  health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
+                            # (in_progress with no live drive → ready) + reap orphaned
+                            # feat-<id> worktrees (feature gone/done). 0 disables it.
   db_path: ""               # beads db path; blank → br auto-discovers .beads/*.db
   webhook_secret: ""        # GitHub webhook HMAC secret for /webhook/pr (the Done
                             # edge). Blank → signature NOT verified (dev only); set
