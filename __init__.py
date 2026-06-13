@@ -1,8 +1,10 @@
 """project_board — lean 6-state coding board + ACP spawn loop.
 
-Composition over construction: the board is a SQLite data model + an HTTP API +
-the orchestration loop, and the loop dispatches through the already-built
-``delegates`` plugin (ADR 0024/0025) — it does NOT reimplement the spawn primitive.
+Composition over construction: the board is a **projection over beads** (`br`) — no
+separate store of its own (store.py shells the `br` CLI; beads owns the `.beads/*.db`
++ JSONL) — plus an HTTP API and the orchestration loop, which dispatches through the
+already-built ``delegates`` plugin (ADR 0024/0025) — it does NOT reimplement the
+spawn primitive.
 
 Reach used (no core edits): ``register_router`` (the board API), ``register_surface``
 (the background puller), ``register_tool`` (board ops the agent can drive headlessly).

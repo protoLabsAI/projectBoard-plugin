@@ -1,7 +1,7 @@
 # Project Board — coding orchestration plugin
 
 A **protoAgent plugin** that turns an idea into merged PRs: a lean 6-state board
-backed by [beads](https://github.com/steveyegge/beads) (`br`), an **ACP spawn loop**
+backed by [beads-rust](https://github.com/Dicklesworthstone/beads_rust) (`br`), an **ACP spawn loop**
 that dispatches a coding agent per feature into an isolated git worktree, an
 adversarial **planning layer**, and a Kanban/list **console view**.
 
@@ -57,7 +57,10 @@ spawn primitive — it does not reimplement it.
 ## Requirements
 
 - **protoAgent ≥ 0.27.0** (console views + the ACP delegate teardown).
-- The **`br`** (beads) CLI on `PATH` — the board's DAG/status store.
+- **beads-rust** — the **`br`** CLI on `PATH`, the board's DAG/status store. Install
+  with `cargo install beads_rust`. NOT the stale homebrew `bd` (a different, write-
+  broken package); the `bd-`/`br-` prefix in issue ids is just the workspace
+  namespace. Override the binary with `BR_BIN` if needed.
 - `git` + the **`gh`** CLI (authenticated) for branch push + PR creation.
 - The **`delegates`** plugin enabled, with an **`acp`** coder delegate declared
   (e.g. `proto`). A reviewer `a2a` delegate is optional (review dispatch is off by
