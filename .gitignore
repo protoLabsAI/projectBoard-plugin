@@ -4,3 +4,5 @@ __pycache__/
 .beads-demo/
 .worktrees/
 .venv/
+.pytest_cache/
+.ruff_cache/
