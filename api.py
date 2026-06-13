@@ -1,13 +1,13 @@
 """Board HTTP API + console view (D5).
 
-Mounted under the UNGATED prefix ``/plugins/project_board`` (see __init__.register),
-matching the sibling agent-browser/doom plugins. Localhost-default bind +
-bearer-when-exposed (the host's posture), but ungated because two routes are browser
-navigations that can't carry a bearer: GET ``/board`` is loaded as an iframe src, and
-POST ``/webhook/pr`` is hit by GitHub (whose public URL must stay stable). The whole
-flow — create project → features → Ready gate → (loop dispatches) → in_review → merge
-webhook → done — is drivable here, headlessly. The Kanban/list page (GET ``/board``)
-rides THIS router so its declared view path is genuinely served.
+TWO routers (plugin-view rule 2): ``build_router`` carries the public-of-necessity
+surface on ``/plugins/project_board`` — GET ``/board`` (an iframe src can't carry a
+bearer), POST ``/webhook/pr`` (GitHub signs with HMAC, and its public URL must stay
+stable), and POST ``/features/{fid}/ci`` (a CI-infra edge). ``build_data_router``
+carries the operator CRUD/transition routes on ``/api/plugins/project_board``, where
+they inherit the host's operator bearer gate. The whole flow — create project →
+features → Ready gate → (loop dispatches) → in_review → merge webhook → done — is
+drivable here, headlessly.
 
 The ``/webhook/pr`` endpoint is the SINGLE external Done edge: a merged-PR event
 sets ``done`` and nothing else does (invariant #2). Poll is the fallback.
@@ -64,52 +64,13 @@ def build_router(cfg: dict):
         except BoardError as e:
             raise HTTPException(400, str(e))
 
-    # ── hierarchy (epic → milestone → feature) ────────────────────────────────
-    @router.post("/epics")
-    async def _create_epic(body: dict = Body(...)):
-        return _guard(lambda: store().create_epic(body.get("title", ""), body.get("description", "")))
-
-    @router.post("/milestones")
-    async def _create_milestone(body: dict = Body(...)):
-        return _guard(lambda: store().create_milestone(
-            body.get("title", ""), body.get("epic_id", ""), body.get("description", "")))
-
-    # ── features ──────────────────────────────────────────────────────────────
-    @router.get("/features")
-    async def _features(state: str | None = None):
-        return {"features": store().list_features(state=state)}
-
-    @router.get("/features/{fid}")
-    async def _feature(fid: str):
-        f = store().get_feature(fid)
-        if f is None:
-            raise HTTPException(404, f"unknown feature {fid!r}")
-        return f
-
-    @router.post("/features")
-    async def _create_feature(body: dict = Body(...)):
-        return _guard(lambda: store().create_feature(**body))
-
-    @router.post("/features/{fid}/dep")
-    async def _dep(fid: str, body: dict = Body(...)):
-        """Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done.
-        (Foundation gating is just a blocks-edge on the foundation feature.)"""
-        return _guard(lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))),
-                               store().get_feature(fid))[1])
-
-    # ── transitions ───────────────────────────────────────────────────────────
-    @router.post("/features/{fid}/ready")
-    async def _ready(fid: str):
-        """The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing."""
-        return _guard(lambda: store().mark_ready(fid))
-
-    @router.post("/features/{fid}/block")
-    async def _block(fid: str, body: dict = Body(...)):
-        return _guard(lambda: store().flag_blocked(fid, str(body.get("reason", ""))))
-
-    @router.post("/features/{fid}/unblock")
-    async def _unblock(fid: str):
-        return _guard(lambda: store().clear_blocked(fid))
+    # The operator CRUD/transition routes moved to build_data_router — gated under
+    # /api/plugins/project_board (plugin-view rule 2). What stays here is the
+    # PUBLIC-of-necessity surface: the /board page (an iframe page-load can't
+    # carry a bearer) and the CI-infra edges — /webhook/pr (GitHub signs with
+    # HMAC, not the operator bearer) and /features/{fid}/ci (posted by CI
+    # runners; carries bounded semantics, its own auth story tracked with the
+    # webhook-signature TODO above).
 
     @router.post("/features/{fid}/ci")
     async def _ci(fid: str, body: dict = Body(...)):
@@ -177,5 +138,76 @@ def build_router(cfg: dict):
             log.warning("[project_board] worktree reap for %s failed", f["id"], exc_info=True)
         log.info("[project_board] merge webhook → done: %s (%s)", f["id"], pr_url)
         return {"ok": True, "feature": f}
+
+    return router
+
+
+def build_data_router(cfg: dict):
+    """The operator CRUD/transition routes — mounted under
+    ``/api/plugins/project_board`` so they inherit the operator bearer gate
+    (plugin-view rule 2). Previously these lived under the public ``/plugins/``
+    prefix: on a token-gated deployment anyone who could reach the port could
+    create/transition features without the bearer."""
+    from fastapi import APIRouter, Body, HTTPException
+
+    router = APIRouter()
+    store_kw = dict(db=(cfg or {}).get("db_path") or None, repo=(cfg or {}).get("repo", "."),
+                    base_branch=(cfg or {}).get("base_branch", "main"))
+
+    def store():
+        return get_store(**store_kw)
+
+    def _guard(fn):
+        try:
+            return fn()
+        except BoardError as e:
+            raise HTTPException(400, str(e))
+
+    # ── hierarchy (epic → milestone → feature) ────────────────────────────────
+    @router.post("/epics")
+    async def _create_epic(body: dict = Body(...)):
+        return _guard(lambda: store().create_epic(body.get("title", ""), body.get("description", "")))
+
+    @router.post("/milestones")
+    async def _create_milestone(body: dict = Body(...)):
+        return _guard(lambda: store().create_milestone(
+            body.get("title", ""), body.get("epic_id", ""), body.get("description", "")))
+
+    # ── features ──────────────────────────────────────────────────────────────
+    @router.get("/features")
+    async def _features(state: str | None = None):
+        return {"features": store().list_features(state=state)}
+
+    @router.get("/features/{fid}")
+    async def _feature(fid: str):
+        f = store().get_feature(fid)
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        return f
+
+    @router.post("/features")
+    async def _create_feature(body: dict = Body(...)):
+        return _guard(lambda: store().create_feature(**body))
+
+    @router.post("/features/{fid}/dep")
+    async def _dep(fid: str, body: dict = Body(...)):
+        """Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done.
+        (Foundation gating is just a blocks-edge on the foundation feature.)"""
+        return _guard(lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))),
+                               store().get_feature(fid))[1])
+
+    # ── transitions ───────────────────────────────────────────────────────────
+    @router.post("/features/{fid}/ready")
+    async def _ready(fid: str):
+        """The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing."""
+        return _guard(lambda: store().mark_ready(fid))
+
+    @router.post("/features/{fid}/block")
+    async def _block(fid: str, body: dict = Body(...)):
+        return _guard(lambda: store().flag_blocked(fid, str(body.get("reason", ""))))
+
+    @router.post("/features/{fid}/unblock")
+    async def _unblock(fid: str):
+        return _guard(lambda: store().clear_blocked(fid))
 
     return router

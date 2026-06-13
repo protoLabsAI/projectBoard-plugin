@@ -76,23 +76,24 @@ var BASE = location.pathname.split("/plugins/")[0];
     <th>ID</th><th>Title</th><th>State</th><th>Pri</th><th>Flags</th><th>PR</th></tr></thead>
     <tbody id="rows"></tbody></table>
 </div>
-<script>
-// ── ADR 0038 handshake: bearer token + curated theme bridged onto --pl-* tokens.
-const TMAP={bg:["--pl-color-bg"],bgPanel:["--pl-color-bg-raised","--pl-color-bg-subtle"],fg:["--pl-color-fg"],fgMuted:["--pl-color-fg-muted"],brand:["--pl-color-accent"],border:["--pl-color-border"]};
-let TOKEN=null;
-function applyTheme(t){const r=document.documentElement;for(const[k,v] of Object.entries(t||{}))(TMAP[k]||(k.startsWith("--pl-")?[k]:[])).forEach(p=>v&&r.style.setProperty(p,v));}
-window.addEventListener("message",(e)=>{const d=e.data||{};
-  if(d.type==="protoagent:init"){if(d.token)TOKEN=d.token;applyTheme(d.theme);load();}
-  else if(d.type==="protoagent:theme")applyTheme(d.theme);});
+<script type="module">
+// The DS plugin-kit owns the protoagent:init handshake (bearer + theme, incl. live
+// re-themes onto the --pl-* tokens) and slug-aware authed fetches — replacing the
+// hand-rolled TMAP/listener this page carried. plugin-kit.js is an ES MODULE, so it
+// loads via dynamic import (a classic <script src> throws on its exports; see
+// protoAgent docs/how-to/build-a-plugin-view.md). Older host without /_ds: fall
+// back to a tokenless same-origin shim.
+let kit;
+try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
+catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
 
 const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
 // State → DS status token. (blocked → error, dag/deps → warning handled in flags.)
 const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-status-success)",
   in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
   done:"var(--pl-color-fg-muted)", blocked:"var(--pl-color-status-error)"};
-// Slug-aware, same-origin fetch (rule 3): prefix the API path with BASE so the
-// proxied window talks to ITS agent — never hardcode an absolute "/plugins/..." path.
-const api = (p) => fetch(BASE + p, TOKEN ? {headers:{Authorization:"Bearer "+TOKEN}} : {}).then(r => r.json());
+// Slug-aware authed fetch via the kit (rules 2+3) — pass a bare /api/... path.
+const api = (p) => kit.apiFetch(p).then(r => r.json());
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -144,7 +145,7 @@ function render(){
 
 async function load(){
   try {
-    const r = await api("/plugins/project_board/features");
+    const r = await api("/api/plugins/project_board/features");
     // the /features API field is `board_state`; normalize to `state` for the views.
     FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
       .sort((a,b) => a.priority - b.priority || a.id.localeCompare(b.id));
@@ -156,7 +157,14 @@ async function load(){
   }
 }
 
+// Module scripts are scoped — expose the view-toggle's inline onclick handlers.
+window.setView = setView;
 setView(VIEW);   // sync the toggle + visibility to the initial view (list on mobile)
-load();
-setInterval(load, 10000);   // live-ish; the loop moves features under us
+// Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
+// protoagent:init, so the gated /features pull authenticates) or a short timer
+// for the no-handshake case (standalone page / older host).
+let booted = false;
+function boot(){ if (booted) return; booted = true; load(); setInterval(load, 10000); }
+kit.initPluginView(boot);
+setTimeout(boot, 800);
 </script></body></html>"""
