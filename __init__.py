@@ -35,9 +35,13 @@ def register(registry) -> None:
     # is genuinely served. We must NOT register a second router at the same prefix:
     # the host dedupes routers by (plugin_id, prefix), so a second one would be
     # silently dropped → the view 404s.
+    # …and the operator CRUD/transition routes ride a SECOND router at the gated
+    # /api/plugins/project_board prefix (rule 2) — distinct prefixes, so the host's
+    # (plugin_id, prefix) de-dupe keeps both.
     try:
-        from .api import build_router
+        from .api import build_data_router, build_router
         registry.register_router(build_router(cfg), prefix="/plugins/project_board")
+        registry.register_router(build_data_router(cfg), prefix="/api/plugins/project_board")
     except Exception:  # noqa: BLE001 — API is best-effort
         log.exception("[project_board] mounting board API + view failed")
 
