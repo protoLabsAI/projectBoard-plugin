@@ -143,9 +143,7 @@ async def test_goal_verify_pass_opens_the_pr(monkeypatch):
     async def _open_pr(wt, branch, *, base, title, body):
         return "https://example/pr/9"
 
-    loop, store = await _drive_with(
-        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True}
-    )
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True})
     assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
 
 
@@ -160,9 +158,7 @@ async def test_goal_verify_fail_skips_pr_and_blocks(monkeypatch):
         opened.append(True)
         return "https://example/pr/x"
 
-    loop, store = await _drive_with(
-        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True}
-    )
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True})
     assert not opened  # the gate stopped the PR from being opened
     # A gap is a capability failure → single coder (no ladder) → block, no PR.
     assert "flag_blocked" in store.names()
@@ -628,3 +624,71 @@ async def test_spawn_ready_passes_the_dep_gate_to_ready_queue(monkeypatch):
         assert store.last_relaxed is True  # the relaxed gate reaches ready_queue
     finally:
         await finish()
+
+
+# ── max-mode best-of-N judge (#21) ───────────────────────────────────────────────
+
+
+async def test_judge_candidates_returns_the_model_pick(monkeypatch):
+    loop = BoardLoop({"max_mode_n": 2})
+
+    async def _git(wt, *args, timeout=60):
+        # distinct non-empty diff per worktree so every candidate competes
+        return (0, f"diff for {wt}", "") if args[0] == "diff" else (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _judge(prompt, *, system=None, model_name=None):
+        assert "WHEN x THE SYSTEM SHALL y" in prompt  # acceptance criteria reach the judge
+        return "Candidate 1 is the most complete."
+
+    monkeypatch.setattr("graph.sdk.complete", _judge)
+    assert await loop._judge_candidates(FEATURE, "main", ["/wt/a", "/wt/b"]) == 1
+
+
+async def test_judge_candidates_none_when_all_empty(monkeypatch):
+    loop = BoardLoop({"max_mode_n": 2})
+
+    async def _git(wt, *args, timeout=60):
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _boom(*a, **k):
+        raise AssertionError("judge must not run when there is nothing to judge")
+
+    monkeypatch.setattr("graph.sdk.complete", _boom)
+    assert await loop._judge_candidates(FEATURE, "main", ["/wt/a", "/wt/b"]) is None
+
+
+async def test_judge_candidates_single_nonempty_skips_the_model(monkeypatch):
+    loop = BoardLoop({"max_mode_n": 2})
+
+    async def _git(wt, *args, timeout=60):
+        if args[0] == "diff" and wt == "/wt/b":
+            return (0, "real diff", "")
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _boom(*a, **k):
+        raise AssertionError("judge must not run for a single candidate")
+
+    monkeypatch.setattr("graph.sdk.complete", _boom)
+    assert await loop._judge_candidates(FEATURE, "main", ["/wt/a", "/wt/b"]) == 1
+
+
+async def test_judge_candidates_fails_open_to_first_when_judge_errors(monkeypatch):
+    loop = BoardLoop({"max_mode_n": 2})
+
+    async def _git(wt, *args, timeout=60):
+        return (0, f"diff for {wt}", "") if args[0] == "diff" else (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _err(prompt, *, system=None, model_name=None):
+        raise RuntimeError("model offline")
+
+    monkeypatch.setattr("graph.sdk.complete", _err)
+    # both candidates non-empty → first non-empty index wins when the judge dies
+    assert await loop._judge_candidates(FEATURE, "main", ["/wt/a", "/wt/b"]) == 0
