@@ -140,16 +140,16 @@ async def test_create_worktree_falls_back_to_local_base_without_a_remote(monkeyp
 @pytest.mark.parametrize(
     "gh_state,expected",
     [
-        ((0, "MERGED", ""), True),
-        ((0, "OPEN", ""), False),
-        ((0, "CLOSED", ""), False),  # closed-unmerged is NOT done
-        ((1, "", "no pr found"), False),  # a gh failure → False, the poll retries
+        ((0, "MERGED", ""), "MERGED"),
+        ((0, "OPEN", ""), "OPEN"),
+        ((0, "CLOSED", ""), "CLOSED"),
+        ((1, "", "no pr found"), ""),  # a gh failure → "", the reconcile retries
     ],
 )
-async def test_pr_is_merged(monkeypatch, gh_state, expected):
+async def test_pr_state(monkeypatch, gh_state, expected):
     gh = FakeGh({"view": gh_state})
     _install(monkeypatch, FakeGit(), gh)
-    assert await worktree.pr_is_merged("https://example/pr/1", cwd="/repo") is expected
+    assert await worktree.pr_state("https://example/pr/1", cwd="/repo") == expected
 
 
 # ── pr_url_for_branch: the crash-recovery probe ─────────────────────────────────

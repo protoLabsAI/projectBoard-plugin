@@ -32,9 +32,10 @@ board to a PR — or fork it as a starting point.
 - **The loop** pulls the top-priority `ready` feature → creates a disposable
   `git worktree` off `origin/<base>` → dispatches a coder (`acp` delegate) scoped to
   it → commits/pushes → opens a PR → `in_review`. A **merge webhook** sets `done`
-  (and reaps the worktree); where GitHub can't reach a webhook URL, a **merge poll**
-  (`merge_poll`, on by default) runs the same idempotent Done edge. Set
-  `max_concurrent > 1` to build several features in parallel, each in its own worktree.
+  (and reaps the worktree); where GitHub can't reach a webhook URL, a **PR reconcile
+  poll** (`merge_poll`, on by default) drives the terminal edges itself — merged →
+  `done`, closed-unmerged → `blocked`. Set `max_concurrent > 1` to build several
+  features in parallel, each in its own worktree.
 - **Resilience** — every `await` in a drive is bounded (a coder dispatch is hard-capped
   by `coder_timeout_s`); **transient** failures (rate-limit / network / merge-conflict)
   retry with backoff while **capability** failures (no diff / timeout) escalate a tier
