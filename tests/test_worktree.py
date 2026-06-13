@@ -152,6 +152,16 @@ async def test_pr_is_merged(monkeypatch, gh_state, expected):
     assert await worktree.pr_is_merged("https://example/pr/1", cwd="/repo") is expected
 
 
+# ── pr_url_for_branch: the crash-recovery probe ─────────────────────────────────
+
+
+async def test_pr_url_for_branch_found_and_absent(monkeypatch):
+    _install(monkeypatch, FakeGit(), FakeGh({"view": (0, "https://example/pr/9", "")}))
+    assert await worktree.pr_url_for_branch("feat/bd-9", cwd="/repo") == "https://example/pr/9"
+    _install(monkeypatch, FakeGit(), FakeGh({"view": (1, "", "no pull requests found")}))
+    assert await worktree.pr_url_for_branch("feat/bd-9", cwd="/repo") == ""
+
+
 # ── reap_feature_worktree: the shared id → worktree/branch reap ──────────────────
 
 

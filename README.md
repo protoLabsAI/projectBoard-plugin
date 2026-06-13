@@ -35,6 +35,11 @@ board to a PR — or fork it as a starting point.
   (and reaps the worktree); where GitHub can't reach a webhook URL, a **merge poll**
   (`merge_poll`, on by default) runs the same idempotent Done edge. Set
   `max_concurrent > 1` to build several features in parallel, each in its own worktree.
+- **Resilience** — every `await` in a drive is bounded (a coder dispatch is hard-capped
+  by `coder_timeout_s`); **transient** failures (rate-limit / network / merge-conflict)
+  retry with backoff while **capability** failures (no diff / timeout) escalate a tier
+  or block; and on restart the loop **recovers** features stranded mid-build (adopt an
+  already-opened PR → `in_review`, else reset → `ready`).
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
