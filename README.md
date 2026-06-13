@@ -62,9 +62,14 @@ spawn primitive — it does not reimplement it.
   broken package); the `bd-`/`br-` prefix in issue ids is just the workspace
   namespace. Override the binary with `BR_BIN` if needed.
 - `git` + the **`gh`** CLI (authenticated) for branch push + PR creation.
-- The **`delegates`** plugin enabled, with an **`acp`** coder delegate declared
-  (e.g. `proto`). A reviewer `a2a` delegate is optional (review dispatch is off by
-  default — most fleets review PRs via a pipeline on open).
+- The **`delegates`** plugin enabled, with an **`acp`** coder delegate declared.
+  **[`proto`](https://github.com/protoLabsAI/protoCLI) is the first-class coder** —
+  it's the purpose-built protoLabs coding agent, speaks ACP natively (`proto --acp`),
+  and runs its full long-horizon harness (durable session-memory checkpoint,
+  compaction, memory consolidation) over ACP, so it holds context across a long
+  feature build. Any ACP agent works (Claude Code, Codex, Gemini CLI), but **proto is
+  the recommended default**. A reviewer `a2a` delegate is optional (review dispatch is
+  off by default — most fleets review PRs via a pipeline on open).
 
 ## Install
 
@@ -83,12 +88,13 @@ delegates:
   - { name: proto, type: acp, command: proto, args: ["--acp"], workdir: ~/dev/my-repo, permissions: allowlist }
 
 project_board:
-  coder: proto
+  coder: proto               # the first-class ACP coder (protoCLI)
   repo: ~/dev/my-repo
   base_branch: main
   loop_enabled: false        # flip true to start the background puller
   max_concurrent: 1          # >1 builds features in parallel (each its own worktree)
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
+  goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   # webhook_secret: "..."    # set before exposing /webhook/pr publicly
 ```
 

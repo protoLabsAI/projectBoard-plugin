@@ -35,6 +35,9 @@ config:
   review_dispatch: false    # OPT-IN. Off = rely on the fleet PR-review pipeline (it reviews
                             # PRs on open). On = also delegate_to(reviewer) — for repos with
                             # no pipeline; needs a reachable `reviewer` a2a delegate.
+  goal_verify: false        # OPT-IN. On = an independent model call checks the coder's diff
+                            # against the feature's acceptance_criteria BEFORE opening the PR;
+                            # a gap escalates/blocks instead of opening a PR for unfinished work.
   repo: "."                 # repo the coders work in (worktrees branch off it)
   base_branch: main         # base branch worktrees/PRs target
   worktrees_root: .worktrees
