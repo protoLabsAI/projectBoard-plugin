@@ -49,8 +49,7 @@ LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
-DIFFICULTY_TIER = {"small": "fast", "medium": "smart", "large": "reasoning",
-                   "architectural": "reasoning"}
+DIFFICULTY_TIER = {"small": "fast", "medium": "smart", "large": "reasoning", "architectural": "reasoning"}
 TIER_LADDER = ["fast", "smart", "reasoning"]
 
 
@@ -62,8 +61,7 @@ class BeadsBoard:
     """Wraps the `br` CLI. One process-wide instance (the loop, API, and tools share
     it). `br` auto-discovers `.beads/*.db`; pass ``db`` to pin a workspace."""
 
-    def __init__(self, db: str | None = None, actor: str = "agent",
-                 repo: str = ".", base_branch: str = "main"):
+    def __init__(self, db: str | None = None, actor: str = "agent", repo: str = ".", base_branch: str = "main"):
         if not shutil.which(BR):
             raise BoardError(f"beads CLI {BR!r} not on PATH — install beads or set BR_BIN")
         self.db = db or None
@@ -90,8 +88,16 @@ class BeadsBoard:
         except json.JSONDecodeError as exc:
             raise BoardError(f"`br {args[0]}` returned non-JSON: {exc} :: {out[:200]}")
 
-    def _create(self, title: str, *, itype: str, parent: str = "", priority: int = 2,
-                description: str = "", external_ref: str = "") -> str:
+    def _create(
+        self,
+        title: str,
+        *,
+        itype: str,
+        parent: str = "",
+        priority: int = 2,
+        description: str = "",
+        external_ref: str = "",
+    ) -> str:
         args = ["create", title, "--type", itype, "-p", str(priority), "--silent"]
         if parent:
             args += ["--parent", parent]
@@ -109,18 +115,26 @@ class BeadsBoard:
         return self.get_feature(self._create(title, itype="epic", description=description))
 
     def create_milestone(self, title: str, epic_id: str, description: str = "") -> dict:
-        return self.get_feature(self._create(title, itype="milestone", parent=epic_id,
-                                             description=description))
+        return self.get_feature(self._create(title, itype="milestone", parent=epic_id, description=description))
 
-    def create_feature(self, title: str, *, spec: str = "", acceptance_criteria: str = "",
-                        design: str = "", files_to_modify=(), parent: str = "", priority: int = 2,
-                        difficulty: str = "", depends_on=()) -> dict:
+    def create_feature(
+        self,
+        title: str,
+        *,
+        spec: str = "",
+        acceptance_criteria: str = "",
+        design: str = "",
+        files_to_modify=(),
+        parent: str = "",
+        priority: int = 2,
+        difficulty: str = "",
+        depends_on=(),
+    ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
         pass the Ready gate (ProtoMaker's spec-quality discipline — vague tasks make
         a coder produce nothing)."""
-        fid = self._create(title, itype="feature", parent=parent, priority=priority,
-                           description=spec)
+        fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
         upd = []
         if acceptance_criteria:
             upd += ["--acceptance-criteria", acceptance_criteria]
@@ -166,8 +180,7 @@ class BeadsBoard:
         `in_progress`. Returns None if nothing is ready. (`br ready` is priority-
         ordered; we filter `feature` in Python to dodge the --type+--label quirk.)"""
         ready = self._run("ready", "--label", LABEL_READY, want_json=True) or []
-        feats = [b for b in ready if b.get("issue_type") == "feature"
-                 and LABEL_BLOCKED not in (b.get("labels") or [])]
+        feats = [b for b in ready if b.get("issue_type") == "feature" and LABEL_BLOCKED not in (b.get("labels") or [])]
         if not feats:
             return None
         fid = feats[0]["id"]
@@ -204,8 +217,18 @@ class BeadsBoard:
         self._require(fid)
         # Clear the assignee too — without it `br update --claim` on the re-pull
         # fails ("already assigned to <actor>") and the feature can't be re-dispatched.
-        self._run("update", fid, "--status", "open", "--assignee", "",
-                  "--add-label", LABEL_READY, "--remove-label", LABEL_IN_REVIEW)
+        self._run(
+            "update",
+            fid,
+            "--status",
+            "open",
+            "--assignee",
+            "",
+            "--add-label",
+            LABEL_READY,
+            "--remove-label",
+            LABEL_IN_REVIEW,
+        )
         return self.get_feature(fid)
 
     def block_from_review(self, fid: str, reason: str) -> dict:
@@ -295,9 +318,23 @@ class BeadsBoard:
     def list_features(self, state: str | None = None) -> list[dict]:
         # All statuses — `br list` defaults to open/in_progress, but the board view
         # needs `closed` features too (that's the Done column).
-        rows = self._run("list", "--type", "feature", "--status", "open", "--status",
-                         "in_progress", "--status", "closed", "--status", "deferred",
-                         want_json=True) or []
+        rows = (
+            self._run(
+                "list",
+                "--type",
+                "feature",
+                "--status",
+                "open",
+                "--status",
+                "in_progress",
+                "--status",
+                "closed",
+                "--status",
+                "deferred",
+                want_json=True,
+            )
+            or []
+        )
         out = [self._project(r) for r in rows]
         # `br list` omits dependencies, so mark dag_blocked by cross-referencing the
         # puller: a `ready` feature the puller WON'T claim is blocked by an open dep.
@@ -351,15 +388,17 @@ class BeadsBoard:
         """A `br` bead → the board's feature view (stable shape for the loop/API)."""
         labels = bead.get("labels") or []
         diff = next((l.split(":", 1)[1] for l in labels if l.startswith("diff:")), "")
-        attempts = sorted(int(l.split(":", 1)[1]) for l in labels if l.startswith("attempt:")
-                          and l.split(":", 1)[1].isdigit())
+        attempts = sorted(
+            int(l.split(":", 1)[1]) for l in labels if l.startswith("attempt:") and l.split(":", 1)[1].isdigit()
+        )
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
         state = self.board_state(bead)
         dag_blocked = state == "ready" and any(
             d.get("dependency_type") == "blocks" and d.get("status") != "closed"
-            for d in (bead.get("dependencies") or []))
+            for d in (bead.get("dependencies") or [])
+        )
         return {
             "id": bead.get("id"),
             "title": bead.get("title", ""),

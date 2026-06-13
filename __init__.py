@@ -40,6 +40,7 @@ def register(registry) -> None:
     # (plugin_id, prefix) de-dupe keeps both.
     try:
         from .api import build_data_router, build_router
+
         registry.register_router(build_router(cfg), prefix="/plugins/project_board")
         registry.register_router(build_data_router(cfg), prefix="/api/plugins/project_board")
     except Exception:  # noqa: BLE001 — API is best-effort
@@ -48,6 +49,7 @@ def register(registry) -> None:
     # Background orchestration loop (off unless project_board.loop_enabled).
     try:
         from .loop import BoardLoop
+
         loop = BoardLoop(cfg)
         registry.register_surface(loop.start, stop=loop.stop, name="project-board-loop")
     except Exception:  # noqa: BLE001 — loop is best-effort; the API still serves
@@ -61,21 +63,26 @@ def register(registry) -> None:
     # skill that turns an idea into the docs tree + the board (per-epic human gate).
     try:
         from .subagents import ANTAGONIST_CONFIG, DECOMPOSE_CONFIG
+
         registry.register_subagent(DECOMPOSE_CONFIG)
         registry.register_subagent(ANTAGONIST_CONFIG)
         registry.register_skill_dir("skills")
     except Exception:  # noqa: BLE001 — planning layer is best-effort
         log.exception("[project_board] registering planning subagents/skill failed")
 
-    log.info("[project_board] registered board API + loop + tools + planning (coder=%s reviewer=%s)",
-             cfg.get("coder", "proto"), cfg.get("reviewer", "quinn"))
+    log.info(
+        "[project_board] registered board API + loop + tools + planning (coder=%s reviewer=%s)",
+        cfg.get("coder", "proto"),
+        cfg.get("reviewer", "quinn"),
+    )
 
 
 def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
-    store_kw = dict(db=cfg.get("db_path") or None, repo=cfg.get("repo", "."),
-                    base_branch=cfg.get("base_branch", "main"))
+    store_kw = dict(
+        db=cfg.get("db_path") or None, repo=cfg.get("repo", "."), base_branch=cfg.get("base_branch", "main")
+    )
 
     @tool
     def board_create_epic(title: str, description: str = "") -> str:
@@ -87,9 +94,17 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_create_feature(title: str, spec: str = "", acceptance_criteria: str = "",
-                             files_to_modify: str = "", design: str = "", parent: str = "",
-                             priority: int = 2, difficulty: str = "", depends_on: str = "") -> str:
+    def board_create_feature(
+        title: str,
+        spec: str = "",
+        acceptance_criteria: str = "",
+        files_to_modify: str = "",
+        design: str = "",
+        parent: str = "",
+        priority: int = 2,
+        difficulty: str = "",
+        depends_on: str = "",
+    ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
         AND `files_to_modify` (comma-separated paths to create/modify — vague tasks
@@ -100,9 +115,16 @@ def _board_tools(cfg: dict):
             deps = [d.strip() for d in depends_on.split(",") if d.strip()]
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
             f = get_store(**store_kw).create_feature(
-                title, spec=spec, acceptance_criteria=acceptance_criteria, design=design,
-                files_to_modify=files, parent=parent, priority=priority,
-                difficulty=difficulty, depends_on=deps)
+                title,
+                spec=spec,
+                acceptance_criteria=acceptance_criteria,
+                design=design,
+                files_to_modify=files,
+                parent=parent,
+                priority=priority,
+                difficulty=difficulty,
+                depends_on=deps,
+            )
             return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
         except BoardError as exc:
             return f"Error: {exc}"
@@ -122,11 +144,20 @@ def _board_tools(cfg: dict):
         """List board features, optionally filtered by board `state` (backlog/ready/
         in_progress/in_review/done/blocked). Priority order."""
         feats = get_store(**store_kw).list_features(state=state or None)
-        return json.dumps([
-            {"id": f["id"], "title": f["title"], "state": f["board_state"],
-             "blocked": f["blocked"], "dag_blocked": f.get("dag_blocked", False),
-             "pr_url": f["pr_url"], "priority": f["priority"], "difficulty": f["difficulty"]}
-            for f in feats
-        ])
+        return json.dumps(
+            [
+                {
+                    "id": f["id"],
+                    "title": f["title"],
+                    "state": f["board_state"],
+                    "blocked": f["blocked"],
+                    "dag_blocked": f.get("dag_blocked", False),
+                    "pr_url": f["pr_url"],
+                    "priority": f["priority"],
+                    "difficulty": f["difficulty"],
+                }
+                for f in feats
+            ]
+        )
 
     return [board_create_epic, board_create_feature, board_mark_ready, board_list]

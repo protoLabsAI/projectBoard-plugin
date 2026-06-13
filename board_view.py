@@ -1,4 +1,4 @@
-"""Board console view (ADR 0026, D5) — the deferred-until-now UI.
+"""Board console view (ADR 0026, D5) — the Kanban/list board UI.
 
 A self-contained page served at ``/plugins/project_board/board`` (by the API
 router in api.py — see __init__.register) that renders the board two ways (Kanban
