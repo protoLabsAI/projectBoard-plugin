@@ -89,6 +89,14 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> None:
         await _git(repo, "branch", "-D", branch)
 
 
+async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> None:
+    """Remove the worktree + branch a feature owns, by its id — the one place that
+    knows the ``feat-<id>`` / ``feat/<id>`` naming. Shared by the merge webhook and
+    the merge poll (both reap once a feature reaches ``done``)."""
+    wt = os.path.join(repo, worktrees_root, f"feat-{fid}")
+    await remove_worktree(repo, wt, f"feat/{fid}")
+
+
 async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | None = None) -> str:
     """Dispatch the coder (an ``acp`` Delegate) scoped to ``worktree``.
 
@@ -171,3 +179,12 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str,
         if vrc == 0 and vout.strip():
             return vout.strip()
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
+
+
+async def pr_is_merged(pr_url: str, *, cwd: str = ".") -> bool:
+    """True iff the PR has merged — the merge poll's probe (a fallback to the
+    webhook for deployments with no public webhook URL). A non-zero ``gh`` /
+    transient failure returns False so the next poll simply retries; this never
+    raises into the loop."""
+    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd)
+    return rc == 0 and out.strip() == "MERGED"
