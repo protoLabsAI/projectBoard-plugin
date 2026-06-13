@@ -52,6 +52,12 @@ config:
   max_pending_reviews: 5    # back-pressure: pause claiming new work while this many
                             # PRs already await review (don't pile up faster than they
                             # merge). 0 = unlimited.
+  dep_gate: merge           # how a blocks-dependency gates its dependents: "merge"
+                            # (default, safe) — wait for the blocker to merge (done);
+                            # "review" — a NON-foundation blocker releases dependents at
+                            # in_review (more parallelism, but builds on un-merged code).
+                            # Mark shared-structure features foundation=True; those
+                            # always gate on merge regardless.
   merge_poll: true          # poll merged PRs as a fallback to the /webhook/pr Done
                             # edge — for deployments GitHub can't post a webhook to
                             # (no public URL). The Done edge stays idempotent either

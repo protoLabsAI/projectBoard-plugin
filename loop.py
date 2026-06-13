@@ -62,6 +62,11 @@ class BoardLoop:
         # review, so the loop can't pile up PRs faster than they merge (flooding CI /
         # reviewers). 0 = unlimited.
         self.max_pending_reviews = int(self.cfg.get("max_pending_reviews", 5))
+        # Dependency gate: "merge" (default) — a dependent waits for every blocker to
+        # merge (done); "review" — a NON-foundation blocker releases its dependents at
+        # in_review (more parallelism, at the risk of building on un-merged code).
+        # Foundation blockers always gate on merge.
+        self.relaxed_gate = str(self.cfg.get("dep_gate", "merge")).lower() == "review"
         # Stuck-drive watchdog: hard cap on a single coder dispatch (the only
         # otherwise-unbounded await in a drive — git/gh calls already self-time-out).
         # 0 disables it. A timeout reaps the coder subprocess and is a capability
@@ -239,7 +244,7 @@ class BoardLoop:
             return False
         spawned = False
         busy = set().union(*self._inflight_files.values()) if self._inflight_files else set()
-        for candidate in store.ready_queue():  # priority order, dep-unblocked
+        for candidate in store.ready_queue(relaxed=self.relaxed_gate):  # priority order, dep-unblocked
             if len(self._drives) >= self.max_concurrent:
                 break
             if candidate.get("board_state") != "ready" or candidate.get("blocked"):

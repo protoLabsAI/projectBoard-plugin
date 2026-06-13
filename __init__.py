@@ -104,13 +104,15 @@ def _board_tools(cfg: dict):
         priority: int = 2,
         difficulty: str = "",
         depends_on: str = "",
+        foundation: bool = False,
     ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
         AND `files_to_modify` (comma-separated paths to create/modify — vague tasks
         make a coding agent produce nothing). `parent` is the epic/milestone id;
         `difficulty` (small|medium|large) seeds the model tier; `depends_on` is a
-        comma-separated list of blocking feature ids."""
+        comma-separated list of blocking feature ids; set `foundation=True` for a
+        feature others build on (dependents gate on its merge, never its review)."""
         try:
             deps = [d.strip() for d in depends_on.split(",") if d.strip()]
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
@@ -124,6 +126,7 @@ def _board_tools(cfg: dict):
                 priority=priority,
                 difficulty=difficulty,
                 depends_on=deps,
+                foundation=foundation,
             )
             return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
         except BoardError as exc:

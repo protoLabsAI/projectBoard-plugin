@@ -47,6 +47,10 @@ BR = os.environ.get("BR_BIN", "br")
 LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
+# A feature others build *on*: dependents gate on its MERGE, never its review (vs a
+# non-foundation blocker, which can release dependents at in_review under dep_gate:
+# review). Inert under the default dep_gate: merge (then every blocker gates on merge).
+LABEL_FOUNDATION = "foundation"
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "fast", "medium": "smart", "large": "reasoning", "architectural": "reasoning"}
@@ -129,11 +133,13 @@ class BeadsBoard:
         priority: int = 2,
         difficulty: str = "",
         depends_on=(),
+        foundation: bool = False,
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
         pass the Ready gate (ProtoMaker's spec-quality discipline — vague tasks make
-        a coder produce nothing)."""
+        a coder produce nothing). Mark `foundation=True` for a feature others build on
+        (dependents gate on its merge, never its review)."""
         fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
         upd = []
         if acceptance_criteria:
@@ -145,6 +151,8 @@ class BeadsBoard:
             upd += ["--notes", "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())]
         if difficulty:
             upd += ["--add-label", f"diff:{difficulty.strip().lower()}"]
+        if foundation:
+            upd += ["--add-label", LABEL_FOUNDATION]
         if upd:
             self._run("update", fid, *upd)
         for dep in depends_on or ():
@@ -363,9 +371,42 @@ class BeadsBoard:
         out.sort(key=lambda f: (f["priority"], f["id"]))
         return out
 
-    def ready_queue(self) -> list[dict]:
+    def ready_queue(self, relaxed: bool = False) -> list[dict]:
+        """Board-`ready`, dep-unblocked **features** (priority order) — the puller's
+        queue. `br ready` already excludes a feature with any OPEN `blocks` dep, so by
+        default a dependent waits for its blockers to **close** (merge). With
+        ``relaxed`` (``dep_gate: review``) also release a dep-blocked feature whose
+        every still-open blocker is a NON-foundation feature already at ``in_review``
+        — build on code that's in review, not merged. Foundation blockers always gate
+        on merge."""
         ready = self._run("ready", "--label", LABEL_READY, want_json=True) or []
-        return [self._project(b) for b in ready if b.get("issue_type") == "feature"]
+        out = [self._project(b) for b in ready if b.get("issue_type") == "feature"]
+        if not relaxed:
+            return out
+        have = {f["id"] for f in out}
+        by_id = {f["id"]: f for f in self.list_features()}
+        for fid, f in by_id.items():
+            if fid in have or f["board_state"] != "ready" or f["blocked"]:
+                continue
+            blockers = [by_id.get(d) for d in self._open_blockers(fid)]
+            if blockers and all(
+                b is not None and not b["foundation"] and b["board_state"] == "in_review" for b in blockers
+            ):
+                out.append(f)
+        return out
+
+    def _open_blockers(self, fid: str) -> list[str]:
+        """The ids of `fid`'s still-open `blocks` dependencies (`br list` omits deps,
+        so this needs `br show`). A closed blocker has merged → it no longer gates."""
+        rows = self._run("show", fid, want_json=True)
+        if not rows:
+            return []
+        bead = rows[0] if isinstance(rows, list) else rows
+        return [
+            d["id"]
+            for d in (bead.get("dependencies") or [])
+            if d.get("dependency_type") == "blocks" and d.get("status") != "closed"
+        ]
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _comment(self, fid: str, text: str) -> None:
@@ -431,6 +472,7 @@ class BeadsBoard:
             "pr_url": bead.get("external_ref", ""),
             "assignee": bead.get("assignee", ""),
             "blocked": LABEL_BLOCKED in labels,
+            "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
             "attempts": attempts,
             "labels": labels,
