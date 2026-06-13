@@ -139,6 +139,57 @@ async def test_drive_blocks_when_the_coder_is_not_configured(monkeypatch):
     assert store.names() == ["flag_blocked"]  # blocked before any worktree work
 
 
+# ── _drive: failure classification + backoff (no real sleeps) ───────────────────
+
+
+async def _no_sleep(_delay):
+    return None
+
+
+async def test_drive_retries_a_transient_failure_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise worktree.WorktreeError("git push failed: connection reset by peer")
+        return "https://example/pr/1"
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert calls["n"] == 2  # one transient retry, then success
+    assert "flag_blocked" not in store.names()
+    assert loop._inflight == {}
+
+
+async def test_drive_blocks_after_exhausting_transient_retries(monkeypatch):
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        calls["n"] += 1
+        raise worktree.WorktreeError("gh pr create failed: 503 service unavailable")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert "flag_blocked" in store.names()
+    assert calls["n"] == 3  # transient policy = 3 attempts, then Blocked
+    assert loop._inflight == {}
+
+
+async def test_drive_blocks_immediately_on_a_terminal_failure(monkeypatch):
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        calls["n"] += 1
+        raise worktree.WorktreeError("gh pr create failed: 403 forbidden — bad credential")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert "flag_blocked" in store.names()
+    assert calls["n"] == 1  # auth is terminal → no retry
+
+
 # ── concurrency: _spawn_ready claims up to max_concurrent ────────────────────────
 
 
