@@ -13,11 +13,9 @@ merge webhook (``api.record_merge``), the single external edge (invariant #2).
    merge webhook ▼                 CI fail ▼                 any failure ▼
               done                in_progress (bounce)     blocked (flag + reason)
 
-STUBBED for review: CI status + merge arrive via webhook/poll (api.py), not here;
-``open_pr`` is sketched (worktree.py). The loop's claim/dispatch/teardown/error
-paths below are the thing to review before hardening. Concurrency is capped at 1
-for the first cut (token + merge-integration cost); the cap is where parallelism
-lands later.
+CI status + merge arrive out-of-band via the board API (``api.py``), not here.
+Concurrency is capped at 1 (token + merge-integration cost); the cap is where
+parallelism lands later.
 """
 
 from __future__ import annotations
@@ -51,9 +49,11 @@ class BoardLoop:
         # and we never write redundant tier/attempt labels.
         self.coders = {str(k): str(v) for k, v in (self.cfg.get("coders") or {}).items()}
         self.escalation_on = escalation_enabled(self.cfg)
-        self._store_kw = dict(db=self.cfg.get("db_path") or None,
-                              repo=self.cfg.get("repo", "."),
-                              base_branch=self.cfg.get("base_branch", "main"))
+        self._store_kw = dict(
+            db=self.cfg.get("db_path") or None,
+            repo=self.cfg.get("repo", "."),
+            base_branch=self.cfg.get("base_branch", "main"),
+        )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         # The in-flight build's worktree, so shutdown can reap it (a cancel mid-drive
@@ -70,8 +70,12 @@ class BoardLoop:
             log.info("[project_board] loop disabled (project_board.loop_enabled=false) — board API still serves")
             return None
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
-        log.info("[project_board] loop started (coder=%s reviewer=%s every %ss)",
-                 self.coder_name, self.reviewer_name, self.interval)
+        log.info(
+            "[project_board] loop started (coder=%s reviewer=%s every %ss)",
+            self.coder_name,
+            self.reviewer_name,
+            self.interval,
+        )
         return self._task
 
     async def stop(self):
@@ -139,16 +143,16 @@ class BoardLoop:
                     return
                 # Fresh worktree per attempt (a failed attempt may leave partial work).
                 wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
-                self._active = (repo, wt, branch)   # track for shutdown reaping
+                self._active = (repo, wt, branch)  # track for shutdown reaping
                 try:
                     result = await worktree.dispatch_coder(coder, wt, prompt)  # reaps subprocess
-                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title,
-                                                    body=(result or "")[:4000])
+                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     # Capability failure (coder errored / no diff) → escalate when a
                     # ladder exists; an infra failure (push/gh) is not escalable → block.
-                    capability = isinstance(exc, worktree.NoChangesError) or \
-                        str(exc).startswith("coder dispatch failed")
+                    capability = isinstance(exc, worktree.NoChangesError) or str(exc).startswith(
+                        "coder dispatch failed"
+                    )
                     if self.escalation_on and capability:
                         nxt = store.escalate(fid, str(exc)[:200])
                         if nxt:
@@ -169,7 +173,7 @@ class BoardLoop:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
                 # on a terminal block above, and the coder subprocess is already reaped.
-                self._active = None   # built OK — not an interrupted build to reap
+                self._active = None  # built OK — not an interrupted build to reap
                 return
         except BoardError as exc:
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
@@ -191,6 +195,7 @@ class BoardLoop:
             log.info("[project_board] no reviewer %r configured — skipping review dispatch", self.reviewer_name)
             return
         from plugins.delegates.adapters import ADAPTERS
+
         try:
             msg = f"Please review this PR for correctness and acceptance: {pr_url}"
             await ADAPTERS["a2a"].dispatch(reviewer, msg)
@@ -206,6 +211,7 @@ class BoardLoop:
         try:
             from plugins.delegates.registry import DelegateRegistry
             from plugins.delegates.store import merged_delegates
+
             d = DelegateRegistry(merged_delegates()).get(name)
         except Exception:  # noqa: BLE001 — delegates plugin may be disabled
             return None
@@ -218,8 +224,9 @@ class BoardLoop:
         passive 'implement this feature' + a vague spec makes a coder produce
         nothing; naming the files + a direct 'make the edits now' makes it act."""
         files = feature.get("files_to_modify") or []
-        files_block = "\n".join(f"- {f}" for f in files) if files else \
-            "(none listed — create the files the task requires)"
+        files_block = (
+            "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
+        )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
         return (

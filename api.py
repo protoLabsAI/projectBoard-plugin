@@ -10,10 +10,8 @@ features → Ready gate → (loop dispatches) → in_review → merge webhook �
 drivable here, headlessly.
 
 The ``/webhook/pr`` endpoint is the SINGLE external Done edge: a merged-PR event
-sets ``done`` and nothing else does (invariant #2). Poll is the fallback.
-
-STUB note: webhook signature verification (GitHub HMAC) is TODO — wire it before
-exposing the endpoint publicly. Review the payload→record_merge mapping below.
+sets ``done`` and nothing else does (invariant #2). The raw body is HMAC-verified
+against ``X-Hub-Signature-256`` whenever a ``webhook_secret`` is configured.
 """
 
 from __future__ import annotations
@@ -46,14 +44,19 @@ def build_router(cfg: dict):
     @router.get("/board", response_class=HTMLResponse)
     async def _board():
         return HTMLResponse(BOARD_PAGE)
-    store_kw = dict(db=(cfg or {}).get("db_path") or None, repo=(cfg or {}).get("repo", "."),
-                    base_branch=(cfg or {}).get("base_branch", "main"))
+
+    store_kw = dict(
+        db=(cfg or {}).get("db_path") or None,
+        repo=(cfg or {}).get("repo", "."),
+        base_branch=(cfg or {}).get("base_branch", "main"),
+    )
     escalate_on = escalation_enabled(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
     # GitHub webhook secret (HMAC-SHA256). From config or env; blank ⇒ verification
     # disabled (dev only) — a warning fires per unsigned request.
-    webhook_secret = str((cfg or {}).get("webhook_secret") or
-                         os.environ.get("PROJECT_BOARD_WEBHOOK_SECRET", "")).strip()
+    webhook_secret = str(
+        (cfg or {}).get("webhook_secret") or os.environ.get("PROJECT_BOARD_WEBHOOK_SECRET", "")
+    ).strip()
 
     def store():
         return get_store(**store_kw)
@@ -69,8 +72,7 @@ def build_router(cfg: dict):
     # PUBLIC-of-necessity surface: the /board page (an iframe page-load can't
     # carry a bearer) and the CI-infra edges — /webhook/pr (GitHub signs with
     # HMAC, not the operator bearer) and /features/{fid}/ci (posted by CI
-    # runners; carries bounded semantics, its own auth story tracked with the
-    # webhook-signature TODO above).
+    # runners; a CI-infra edge with bounded semantics).
 
     @router.post("/features/{fid}/ci")
     async def _ci(fid: str, body: dict = Body(...)):
@@ -88,14 +90,16 @@ def build_router(cfg: dict):
         def _handle():
             s = store()
             if not escalate_on:
-                return {"requeued": False, "escalated": False,
-                        "feature": s.bounce_ci_fail(fid, reason)}
+                return {"requeued": False, "escalated": False, "feature": s.bounce_ci_fail(fid, reason)}
             nxt = s.escalate(fid, f"ci-fail: {reason}" if reason else "ci-fail")
             if nxt is None:
-                return {"requeued": False, "escalated": True, "exhausted": True,
-                        "feature": s.block_from_review(fid, f"ci-fail: {reason}")}
-            return {"requeued": True, "escalated": True, "next_tier": nxt,
-                    "feature": s.requeue(fid)}
+                return {
+                    "requeued": False,
+                    "escalated": True,
+                    "exhausted": True,
+                    "feature": s.block_from_review(fid, f"ci-fail: {reason}"),
+                }
+            return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": s.requeue(fid)}
 
         return _guard(_handle)
 
@@ -113,8 +117,10 @@ def build_router(cfg: dict):
             if not hmac.compare_digest(expected, sig):
                 raise HTTPException(401, "invalid webhook signature")
         else:
-            log.warning("[project_board] webhook signature NOT verified — set "
-                        "project_board.webhook_secret (or PROJECT_BOARD_WEBHOOK_SECRET)")
+            log.warning(
+                "[project_board] webhook signature NOT verified — set "
+                "project_board.webhook_secret (or PROJECT_BOARD_WEBHOOK_SECRET)"
+            )
         try:
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
@@ -131,6 +137,7 @@ def build_router(cfg: dict):
         # Reap the feature's worktree now that it's merged → done (stop accumulation).
         try:
             from . import worktree
+
             repo = store_kw["repo"]
             wt = os.path.join(repo, worktrees_root, f"feat-{f['id']}")
             await worktree.remove_worktree(repo, wt, f"feat/{f['id']}")
@@ -151,8 +158,11 @@ def build_data_router(cfg: dict):
     from fastapi import APIRouter, Body, HTTPException
 
     router = APIRouter()
-    store_kw = dict(db=(cfg or {}).get("db_path") or None, repo=(cfg or {}).get("repo", "."),
-                    base_branch=(cfg or {}).get("base_branch", "main"))
+    store_kw = dict(
+        db=(cfg or {}).get("db_path") or None,
+        repo=(cfg or {}).get("repo", "."),
+        base_branch=(cfg or {}).get("base_branch", "main"),
+    )
 
     def store():
         return get_store(**store_kw)
@@ -170,8 +180,11 @@ def build_data_router(cfg: dict):
 
     @router.post("/milestones")
     async def _create_milestone(body: dict = Body(...)):
-        return _guard(lambda: store().create_milestone(
-            body.get("title", ""), body.get("epic_id", ""), body.get("description", "")))
+        return _guard(
+            lambda: store().create_milestone(
+                body.get("title", ""), body.get("epic_id", ""), body.get("description", "")
+            )
+        )
 
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
@@ -193,8 +206,9 @@ def build_data_router(cfg: dict):
     async def _dep(fid: str, body: dict = Body(...)):
         """Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done.
         (Foundation gating is just a blocks-edge on the foundation feature.)"""
-        return _guard(lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))),
-                               store().get_feature(fid))[1])
+        return _guard(
+            lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))), store().get_feature(fid))[1]
+        )
 
     # ── transitions ───────────────────────────────────────────────────────────
     @router.post("/features/{fid}/ready")

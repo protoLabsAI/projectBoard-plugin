@@ -25,10 +25,7 @@ jobs:
         run: pip install -r requirements-dev.txt ruff
 
       - name: Lint
-        # Lint the whole repo; format-check only the test suite (the plugin's
-        # existing source predates a ruff-format pass — normalizing it is a
-        # separate cleanup, out of scope for the test add).
-        run: ruff check . && ruff format --check tests/
+        run: ruff check . && ruff format --check .
 
       - name: Test
         run: pytest -q

@@ -36,8 +36,12 @@ class NoChangesError(WorktreeError):
 async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, str]:
     """Run a git command in ``repo``; return (rc, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "-C", repo, *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        "git",
+        "-C",
+        repo,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -110,8 +114,11 @@ async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | 
 
 async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
-        "gh", *args, cwd=cwd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        "gh",
+        *args,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -133,8 +140,7 @@ async def commit_worktree(worktree: str, message: str) -> None:
         raise WorktreeError(f"commit failed: {(e or o).strip()[:200]}")
 
 
-async def open_pr(worktree: str, branch: str, *, base: str = "main",
-                  title: str, body: str = "") -> str:
+async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str, body: str = "") -> str:
     """Commit + push the worktree's branch and open (or reuse) a PR; return its URL.
 
     Operates **inside the worktree** (the confinement boundary). Raises
@@ -155,13 +161,13 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main",
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
-    rc, out, err = await _gh("pr", "create", "--head", branch, "--base", base,
-                             "--title", title, "--body", body or title, cwd=worktree)
+    rc, out, err = await _gh(
+        "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body or title, cwd=worktree
+    )
     if rc == 0:
         return out.strip()
     if "already exists" in err.lower() or "already exists" in out.lower():
-        vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url",
-                                   "--jq", ".url", cwd=worktree)
+        vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
             return vout.strip()
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
