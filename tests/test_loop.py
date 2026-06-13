@@ -216,37 +216,59 @@ async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch
 
 
 class _ClaimStore:
-    """Yields a fixed sequence of features (then None) from claim_next_ready, and
-    counts the claims so a test can prove the cap stops the puller."""
+    """A peekable ready queue + atomic claim(fid), mirroring the store API _spawn_ready
+    now uses. Records claims so a test can prove the caps/gates stop the puller."""
 
-    def __init__(self, features):
-        self._queue = list(features)
-        self.claims = 0
+    def __init__(self, features, in_review=0):
+        self._features = [dict(f) for f in features]
+        self._in_review = in_review
+        self.claimed = []
 
-    def claim_next_ready(self, assignee=""):
-        self.claims += 1
-        return self._queue.pop(0) if self._queue else None
+    def ready_queue(self):
+        return [f for f in self._features if f["id"] not in self.claimed]
+
+    def claim(self, fid, assignee=""):
+        if fid in self.claimed:
+            return None
+        self.claimed.append(fid)
+        return next((f for f in self._features if f["id"] == fid), None)
+
+    def list_features(self, state=None):
+        return [{"id": f"rev-{i}"} for i in range(self._in_review)] if state == "in_review" else []
 
 
-async def test_spawn_ready_claims_up_to_max_concurrent(monkeypatch):
-    store = _ClaimStore([{"id": "bd-1"}, {"id": "bd-2"}, {"id": "bd-3"}])
-    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-    loop = BoardLoop({"max_concurrent": 2})
+def _ready(fid, files):
+    return {"id": fid, "board_state": "ready", "files_to_modify": files}
 
+
+async def _hold_drives(loop, monkeypatch):
+    """Replace _drive with a coroutine that blocks, so spawned tasks stay 'running'.
+    Returns a finalizer the test calls to release + await them."""
     release = asyncio.Event()
 
     async def _hold(feature):
-        await release.wait()  # keep the drive task "running" so the slot stays taken
+        await release.wait()
 
     monkeypatch.setattr(loop, "_drive", _hold)
-    spawned = loop._spawn_ready()
-    try:
-        assert spawned is True
-        assert len(loop._drives) == 2  # capped at max_concurrent
-        assert store.claims == 2  # stopped claiming once full (no 3rd claim)
-    finally:
+
+    async def _finish():
         release.set()
         await asyncio.gather(*loop._drives, return_exceptions=True)
+
+    return _finish
+
+
+async def test_spawn_ready_claims_up_to_max_concurrent(monkeypatch):
+    store = _ClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"]), _ready("bd-3", ["c.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert loop._spawn_ready() is True
+        assert len(loop._drives) == 2  # capped at max_concurrent
+        assert store.claimed == ["bd-1", "bd-2"]  # stopped claiming once full
+    finally:
+        await finish()
 
 
 async def test_spawn_ready_is_false_when_nothing_ready(monkeypatch):
@@ -254,6 +276,45 @@ async def test_spawn_ready_is_false_when_nothing_ready(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     loop = BoardLoop({"max_concurrent": 2})
     assert loop._spawn_ready() is False
+    assert loop._drives == set()
+
+
+async def test_spawn_ready_skips_a_file_conflicting_candidate(monkeypatch):
+    # bd-1 + bd-2 both touch shared.py; bd-3 touches other.py.
+    store = _ClaimStore([_ready("bd-1", ["shared.py"]), _ready("bd-2", ["shared.py"]), _ready("bd-3", ["other.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 3})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        loop._spawn_ready()
+        # bd-1 claimed; bd-2 deferred (overlaps bd-1's file); bd-3 claimed (disjoint).
+        assert store.claimed == ["bd-1", "bd-3"]
+        assert loop._inflight_files == {"bd-1": {"shared.py"}, "bd-3": {"other.py"}}
+    finally:
+        await finish()
+
+
+async def test_spawn_ready_respects_the_review_wip_limit(monkeypatch):
+    store = _ClaimStore([_ready("bd-1", ["a.py"])], in_review=5)  # already at the cap
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "max_pending_reviews": 5})
+    assert loop._spawn_ready() is False
+    assert store.claimed == []  # paused: too many PRs await review
+
+
+async def test_drive_done_releases_its_files(monkeypatch):
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1})
+
+    async def _quick(feature):
+        return None
+
+    monkeypatch.setattr(loop, "_drive", _quick)
+    loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)  # let the done-callbacks run
+    assert loop._inflight_files == {}  # files released when the drive finished
     assert loop._drives == set()
 
 

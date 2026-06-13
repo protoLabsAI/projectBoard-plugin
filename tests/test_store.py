@@ -190,6 +190,33 @@ def test_claim_next_ready_returns_none_when_empty(make_board):
     assert b.claim_next_ready() is None
 
 
+def test_claim_claims_a_specific_ready_feature(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    claimed = b.claim("bd-5", assignee="proto")
+    assert claimed["id"] == "bd-5"
+    assert ("update", "bd-5", "--claim", "--remove-label", "ready") in br.calls
+    assert ("update", "bd-5", "--assignee", "proto") in br.calls
+
+
+def test_claim_returns_none_when_not_ready(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_progress"})
+    assert b.claim("bd-5") is None
+
+
+def test_claim_returns_none_on_a_claim_race(make_board, monkeypatch):
+    def run_impl(*args, want_json=False):
+        if args and args[0] == "update" and "--claim" in args:
+            raise BoardError("already assigned to agent")
+        return [] if want_json else ""
+
+    b = make_board(run_impl)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    assert b.claim("bd-5") is None  # br --claim rejected → lost the race
+
+
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
 
 
