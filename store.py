@@ -67,7 +67,10 @@ class BeadsBoard:
 
     def __init__(self, db: str | None = None, actor: str = "agent", repo: str = ".", base_branch: str = "main"):
         if not shutil.which(BR):
-            raise BoardError(f"beads CLI {BR!r} not on PATH — install beads or set BR_BIN")
+            raise BoardError(
+                f"beads CLI {BR!r} not on PATH — install beads-rust (`cargo install beads_rust`), "
+                "not the homebrew `bd`, or set BR_BIN"
+            )
         self.db = db or None
         self.actor = actor
         self.repo = repo
