@@ -201,3 +201,11 @@ async def pr_is_merged(pr_url: str, *, cwd: str = ".") -> bool:
     raises into the loop."""
     rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd)
     return rc == 0 and out.strip() == "MERGED"
+
+
+async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
+    """The URL of the PR whose head is ``branch``, or ``""`` if there is none — used
+    by crash recovery to tell a feature that already opened a PR (and just needs
+    adopting → in_review) from one that needs a fresh rebuild."""
+    rc, out, _err = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=cwd)
+    return out.strip() if rc == 0 else ""

@@ -323,3 +323,52 @@ async def test_merge_poll_off_never_polls(monkeypatch):
     monkeypatch.setattr(loop, "_poll_merges", lambda: called.append(1))
     await loop._maybe_poll_merges()
     assert called == []  # disabled → the poll is never reached
+
+
+# ── crash recovery on boot ──────────────────────────────────────────────────────
+
+
+class _RecoverStore:
+    def __init__(self, in_progress):
+        self._in_progress = in_progress
+        self.calls = []
+
+    def list_features(self, state=None):
+        return self._in_progress if state == "in_progress" else []
+
+    def open_review(self, fid, *, pr_url):
+        self.calls.append(("open_review", fid, pr_url))
+
+    def requeue(self, fid):
+        self.calls.append(("requeue", fid))
+
+
+async def test_recover_adopts_an_open_pr_else_resets_to_ready(monkeypatch):
+    store = _RecoverStore([{"id": "bd-1"}, {"id": "bd-2"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_url(branch, *, cwd="."):
+        return "https://example/pr/1" if branch == "feat/bd-1" else ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _pr_url)
+    await BoardLoop({})._recover()
+    # bd-1 already had a PR (crash between open_pr and open_review) → adopt → in_review.
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    # bd-2 has no PR → reset to ready for a clean rebuild.
+    assert ("requeue", "bd-2") in store.calls
+
+
+async def test_recover_is_resilient_to_a_per_feature_error(monkeypatch):
+    store = _RecoverStore([{"id": "bd-1"}, {"id": "bd-2"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_url(branch, *, cwd="."):
+        if branch == "feat/bd-1":
+            raise RuntimeError("gh exploded")
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _pr_url)
+    await BoardLoop({})._recover()  # must not raise
+    # bd-1 errored and was skipped; bd-2 still recovered.
+    assert ("requeue", "bd-2") in store.calls
+    assert all(c[1] != "bd-1" for c in store.calls)

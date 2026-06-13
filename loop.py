@@ -126,8 +126,35 @@ class BoardLoop:
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
 
+    # ── crash recovery (runs once, before the puller claims new work) ──────────
+    async def _recover(self):
+        """Reconcile features the previous run left mid-drive. A drive doesn't survive
+        a restart, so every ``in_progress`` feature is orphaned (claimed, no PR yet):
+        if its PR actually got opened (a crash between ``open_pr`` and ``open_review``)
+        adopt it → ``in_review``; otherwise reset it to ``ready`` for a clean rebuild
+        (any stale worktree is cleaned when the puller re-claims it). ``in_review``
+        features are NOT touched — they have a PR and the webhook/poll resolves them."""
+        store = self._store()
+        repo = self._store_kw["repo"]
+        for f in store.list_features(state="in_progress"):
+            fid = f["id"]
+            try:
+                pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=repo)
+                if pr_url:
+                    store.open_review(fid, pr_url=pr_url)
+                    log.info("[project_board] recovery: %s already had a PR → in_review (%s)", fid, pr_url)
+                else:
+                    store.requeue(fid)
+                    log.info("[project_board] recovery: %s reset to ready (no PR — rebuild fresh)", fid)
+            except Exception:  # noqa: BLE001 — recovery is best-effort, per feature
+                log.warning("[project_board] recovery for %s failed", fid, exc_info=True)
+
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
+        try:
+            await self._recover()
+        except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
+            log.exception("[project_board] crash recovery failed")
         while not self._stop.is_set():
             spawned = False
             try:
