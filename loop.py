@@ -58,6 +58,10 @@ class BoardLoop:
         # worktree. 1 (the default) = serial — the safe default for token + merge-
         # integration cost; raise it on a repo that parallelizes cleanly.
         self.max_concurrent = max(1, int(self.cfg.get("max_concurrent", 1)))
+        # Review-queue WIP limit: pause new claims when this many PRs already await
+        # review, so the loop can't pile up PRs faster than they merge (flooding CI /
+        # reviewers). 0 = unlimited.
+        self.max_pending_reviews = int(self.cfg.get("max_pending_reviews", 5))
         # Stuck-drive watchdog: hard cap on a single coder dispatch (the only
         # otherwise-unbounded await in a drive — git/gh calls already self-time-out).
         # 0 disables it. A timeout reaps the coder subprocess and is a capability
@@ -79,6 +83,9 @@ class BoardLoop:
         # subprocess itself is reaped by dispatch_coder's finally.
         self._drives: set[asyncio.Task] = set()
         self._inflight: dict[str, tuple[str, str, str]] = {}
+        # files_to_modify of each in-flight feature, for the hot-file overlap guard
+        # (don't run two parallel coders that edit the same file → sure conflict).
+        self._inflight_files: dict[str, set[str]] = {}
         self._last_poll = 0.0  # monotonic ts of the last merge poll
 
     def _store(self):
@@ -173,18 +180,48 @@ class BoardLoop:
                 pass
 
     def _spawn_ready(self) -> bool:
-        """Claim Ready features up to the concurrency cap and spawn a drive task for
-        each. Returns True if it started at least one (so the runner stays hot)."""
+        """Claim Ready features up to the concurrency cap and spawn a drive for each,
+        with two back-pressure gates: pause when too many PRs already await review
+        (``max_pending_reviews``), and skip a candidate whose ``files_to_modify``
+        overlap an in-flight build (the hot-file guard — two parallel coders editing
+        the same file are a guaranteed merge conflict). Returns True if it started at
+        least one drive (so the runner stays hot)."""
+        if len(self._drives) >= self.max_concurrent:
+            return False
+        store = self._store()
+        # Review-queue WIP limit — don't claim new work while the review queue is full.
+        if self.max_pending_reviews and len(store.list_features(state="in_review")) >= self.max_pending_reviews:
+            return False
         spawned = False
-        while len(self._drives) < self.max_concurrent:
-            feature = self._store().claim_next_ready(assignee=self.coder_name)
-            if feature is None:
+        busy = set().union(*self._inflight_files.values()) if self._inflight_files else set()
+        for candidate in store.ready_queue():  # priority order, dep-unblocked
+            if len(self._drives) >= self.max_concurrent:
                 break
-            task = asyncio.create_task(self._drive(feature), name=f"pb-drive-{feature['id']}")
+            if candidate.get("board_state") != "ready" or candidate.get("blocked"):
+                continue  # a blocked-flagged feature can carry the `ready` label too
+            files = set(candidate.get("files_to_modify") or [])
+            if files & busy:
+                continue  # would edit a file an in-flight build owns → defer a tick
+            claimed = store.claim(candidate["id"], assignee=self.coder_name)
+            if claimed is None:
+                continue  # raced / no longer ready
+            self._inflight_files[claimed["id"]] = files
+            task = asyncio.create_task(self._drive(claimed), name=f"pb-drive-{claimed['id']}")
             self._drives.add(task)
-            task.add_done_callback(self._drives.discard)
+            task.add_done_callback(self._make_drive_done_cb(claimed["id"]))
+            busy |= files
             spawned = True
         return spawned
+
+    def _make_drive_done_cb(self, fid: str):
+        """A drive task's done-callback: drop it from the running set and release the
+        files it held (so a deferred file-conflicting candidate can be claimed next)."""
+
+        def _cb(task: asyncio.Task):
+            self._drives.discard(task)
+            self._inflight_files.pop(fid, None)
+
+        return _cb
 
     # ── the merge poll (Done-edge fallback to the webhook) ─────────────────────
     async def _maybe_poll_merges(self):

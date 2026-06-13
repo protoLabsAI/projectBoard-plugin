@@ -46,7 +46,12 @@ config:
                             # 0 disables the cap.
   max_concurrent: 1         # worktree/coder concurrency cap (token + merge cost).
                             # >1 drives that many features in parallel, each in its
-                            # own worktree; 1 = serial (the safe default).
+                            # own worktree; 1 = serial (the safe default). Parallel
+                            # builds whose files_to_modify overlap are serialized (the
+                            # hot-file guard) to avoid sure merge conflicts.
+  max_pending_reviews: 5    # back-pressure: pause claiming new work while this many
+                            # PRs already await review (don't pile up faster than they
+                            # merge). 0 = unlimited.
   merge_poll: true          # poll merged PRs as a fallback to the /webhook/pr Done
                             # edge — for deployments GitHub can't post a webhook to
                             # (no public URL). The Done edge stays idempotent either

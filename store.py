@@ -191,6 +191,22 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
+    def claim(self, fid: str, assignee: str = "") -> dict | None:
+        """Atomically claim a SPECIFIC ready feature → `in_progress` (vs
+        ``claim_next_ready``, which takes the top of the queue). The loop uses this to
+        skip a candidate whose files overlap an in-flight build. Returns the feature,
+        or None if it's no longer claimable (changed state, or lost the claim race)."""
+        f = self.get_feature(fid)
+        if f is None or f["board_state"] != "ready":
+            return None
+        try:
+            self._run("update", fid, "--claim", "--remove-label", LABEL_READY)
+        except BoardError:
+            return None  # raced — `br --claim` rejects an already-assigned bead
+        if assignee:
+            self._run("update", fid, "--assignee", assignee)
+        return self.get_feature(fid)
+
     # ── In Progress → In Review ───────────────────────────────────────────────
     def open_review(self, fid: str, *, pr_url: str) -> dict:
         f = self._require(fid)
