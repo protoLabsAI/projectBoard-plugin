@@ -28,6 +28,7 @@ import logging
 import time
 
 from . import worktree
+from .failures import classify
 from .store import BoardError, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -196,6 +197,7 @@ class BoardLoop:
         title = f"feat: {feature['title']}"
         prompt = self._build_prompt(feature)
         tier = store.current_tier(fid) if self.escalation_on else ""
+        retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
         try:
             while True:
@@ -211,8 +213,25 @@ class BoardLoop:
                     result = await worktree.dispatch_coder(coder, wt, prompt)  # reaps subprocess
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
-                    # Capability failure (coder errored / no diff) → escalate when a
-                    # ladder exists; an infra failure (push/gh) is not escalable → block.
+                    policy = classify(str(exc))
+                    # 1. Transient infra (rate-limit / network / merge-conflict) → back
+                    #    off and retry the SAME tier. A stronger model can't clear a rate
+                    #    limit, and a re-dispatch off the latest base clears a conflict.
+                    if policy.retryable and retries < policy.max_attempts - 1:
+                        retries += 1
+                        log.info(
+                            "[project_board] %s %s — retry %d/%d in %ss: %s",
+                            fid,
+                            policy.category,
+                            retries + 1,
+                            policy.max_attempts,
+                            policy.base_delay_s,
+                            exc,
+                        )
+                        await asyncio.sleep(policy.base_delay_s)
+                        continue
+                    # 2. Capability failure (coder errored / no diff) + a ladder → climb
+                    #    a model tier (fresh retry budget at the new tier).
                     capability = isinstance(exc, worktree.NoChangesError) or str(exc).startswith(
                         "coder dispatch failed"
                     )
@@ -221,9 +240,11 @@ class BoardLoop:
                         if nxt:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
                             tier = nxt
+                            retries = 0
                             continue
-                    log.warning("[project_board] %s blocked: %s", fid, exc)
-                    store.flag_blocked(fid, str(exc))
+                    # 3. Terminal, or retries/ladder exhausted → Blocked.
+                    log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
+                    store.flag_blocked(fid, f"{policy.category}: {exc}")
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
