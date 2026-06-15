@@ -82,6 +82,26 @@ def test_build_prompt_is_imperative_and_lists_the_files():
     assert "make all the edits here, now" in prompt.lower()
 
 
+def test_build_prompt_requires_tests():
+    """The coder's definition of done includes writing tests — the #897 lesson:
+    a feature merged testless because nothing in the prompt or gate mandated it."""
+    prompt = BoardLoop({})._build_prompt(FEATURE).lower()
+    assert "automated tests" in prompt
+    assert "definition of done" in prompt
+    assert "rejected before the pr opens" in prompt
+
+
+def test_goal_verify_sys_mandates_test_coverage():
+    """The goal-verify gate fails a code change that ships without test coverage,
+    even when the acceptance criteria don't list it explicitly."""
+    from project_board.loop import _GOAL_VERIFY_SYS
+
+    low = _GOAL_VERIFY_SYS.lower()
+    assert "test coverage" in low
+    assert "mandatory" in low
+    assert "fail" in low
+
+
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 
