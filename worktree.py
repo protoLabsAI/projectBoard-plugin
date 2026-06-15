@@ -233,6 +233,18 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
+    """The PR's unified diff, truncated — the prior attempt's actual work, carried
+    into the next (escalated) re-dispatch's prompt so a stronger coder FIXES the
+    specific code that failed CI instead of re-deriving from scratch (fresh-both
+    keeps a fresh session, but the lesson travels). Best-effort: "" on any gh error."""
+    rc, out, _err = await _gh("pr", "diff", pr_url, cwd=cwd)
+    if rc != 0 or not out.strip():
+        return ""
+    out = out.strip()
+    return out if len(out) <= max_chars else out[:max_chars] + "\n…(diff truncated)"
+
+
 async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) -> tuple[str, str]:
     """The PR's CI rollup → ``("passing" | "failing" | "pending" | "none", summary)``.
 
