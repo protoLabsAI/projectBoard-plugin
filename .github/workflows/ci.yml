@@ -22,7 +22,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dev deps
-        run: pip install -r requirements-dev.txt ruff
+        # Pin ruff — an unpinned `ruff` floats to latest, which formats differently
+        # than the dev's ruff, so `ruff format --check` fails on already-formatted
+        # files (main carried this mismatch). Pin both sides to keep them in step.
+        run: pip install -r requirements-dev.txt ruff==0.15.10
 
       - name: Lint
         run: ruff check . && ruff format --check .
