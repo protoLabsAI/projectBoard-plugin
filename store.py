@@ -383,7 +383,17 @@ class BeadsBoard:
         — build on code that's in review, not merged. Foundation blockers always gate
         on merge."""
         ready = self._run("ready", "--label", LABEL_READY, want_json=True) or []
-        out = [self._project(b) for b in ready if b.get("issue_type") == "feature"]
+        # `br ready --json` omits the labels field (beads-rust ≤0.1.23), so projecting
+        # its rows directly makes board_state() see no `ready` label → "backlog", and
+        # the puller's `board_state != "ready"` guard self-rejects every candidate (the
+        # loop ticks forever but silently never claims). Re-fetch each via get_feature
+        # — `br show` carries labels — so board_state/blocked/diff/dag_blocked project
+        # correctly. `br ready` is priority-ordered; iterating it preserves that.
+        out = [
+            f
+            for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") == "feature")
+            if f is not None
+        ]
         if not relaxed:
             return out
         have = {f["id"] for f in out}

@@ -190,6 +190,30 @@ def test_claim_next_ready_returns_none_when_empty(make_board):
     assert b.claim_next_ready() is None
 
 
+def test_ready_queue_projects_label_less_br_ready_rows_as_ready(make_board, monkeypatch):
+    """beads-rust ≤0.1.23: `br ready --json` returns rows WITHOUT a `labels` field.
+    ready_queue must still project candidates as board_state='ready' (re-fetching via
+    `br show`, which carries labels) — otherwise board_state() reads no `ready` label,
+    returns 'backlog', and the puller's `board_state != "ready"` guard self-rejects
+    every ready feature and the loop silently never claims. Regression for the live
+    dogfood finding."""
+    # What real `br ready --json` hands back: a feature with NO labels key.
+    br = Br({"ready": [{"id": "bd-1", "title": "T", "status": "open", "issue_type": "feature"}]})
+    b = make_board(br)
+    # get_feature (br show) IS label-bearing — project from it, not the bare ready row.
+    monkeypatch.setattr(
+        b, "get_feature",
+        lambda fid: b._project({
+            "id": fid, "title": "T", "status": "open", "issue_type": "feature",
+            "labels": ["ready", "diff:small"], "description": "spec",
+            "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+        }),
+    )
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-1"]
+    assert q[0]["board_state"] == "ready"  # the bug projected this as "backlog"
+
+
 def test_claim_claims_a_specific_ready_feature(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
