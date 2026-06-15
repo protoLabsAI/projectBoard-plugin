@@ -202,12 +202,19 @@ def test_ready_queue_projects_label_less_br_ready_rows_as_ready(make_board, monk
     b = make_board(br)
     # get_feature (br show) IS label-bearing — project from it, not the bare ready row.
     monkeypatch.setattr(
-        b, "get_feature",
-        lambda fid: b._project({
-            "id": fid, "title": "T", "status": "open", "issue_type": "feature",
-            "labels": ["ready", "diff:small"], "description": "spec",
-            "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
-        }),
+        b,
+        "get_feature",
+        lambda fid: b._project(
+            {
+                "id": fid,
+                "title": "T",
+                "status": "open",
+                "issue_type": "feature",
+                "labels": ["ready", "diff:small"],
+                "description": "spec",
+                "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+            }
+        ),
     )
     q = b.ready_queue()
     assert [f["id"] for f in q] == ["bd-1"]

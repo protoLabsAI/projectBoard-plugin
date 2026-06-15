@@ -247,3 +247,58 @@ async def test_dispatch_coder_returns_result_within_budget(monkeypatch):
     _inject_fake_delegates(monkeypatch, _Acp())
     out = await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=5)
     assert out == "built it"
+
+
+# ── pr_ci_status: the closed-loop verify rollup ─────────────────────────────────
+
+
+def _ci_gh(rollup, log_out=""):
+    """A `_gh` stub for pr_ci_status: returns the statusCheckRollup JSON for the
+    `pr view` call, and a failing-log for the follow-up `run view --log-failed`."""
+
+    async def _gh(*args, cwd, timeout=60):
+        if "statusCheckRollup" in args:
+            return (0, rollup, "")
+        if args and args[0] == "run":
+            return (0, log_out, "")
+        return (0, "", "")
+
+    return _gh
+
+
+async def test_pr_ci_status_passing(monkeypatch):
+    rollup = '[{"name":"Lint","conclusion":"SUCCESS"},{"name":"Tests","conclusion":"SUCCESS"}]'
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "passing" and summary == ""
+
+
+async def test_pr_ci_status_pending(monkeypatch):
+    rollup = '[{"name":"Tests","status":"IN_PROGRESS"},{"name":"Lint","conclusion":"SUCCESS"}]'
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, _ = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "pending"
+
+
+async def test_pr_ci_status_failing_includes_name_and_log(monkeypatch):
+    rollup = (
+        '[{"name":"Web E2E","conclusion":"FAILURE",'
+        '"detailsUrl":"https://github.com/o/r/actions/runs/123/job/456"},'
+        '{"name":"Lint","conclusion":"SUCCESS"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup, log_out="settings.spec.ts:71 element(s) not found"))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "failing"
+    assert "Web E2E: FAILURE" in summary
+    assert "element(s) not found" in summary  # the failing-run log got pulled in
+
+
+async def test_pr_ci_status_none_when_no_checks_or_gh_error(monkeypatch):
+    monkeypatch.setattr(worktree, "_gh", _ci_gh("[]"))
+    assert await worktree.pr_ci_status("https://example/pr/1", cwd="/repo") == ("none", "")
+
+    async def _err(*args, cwd, timeout=60):
+        return (1, "", "no pr")
+
+    monkeypatch.setattr(worktree, "_gh", _err)
+    assert await worktree.pr_ci_status("https://example/pr/1", cwd="/repo") == ("none", "")

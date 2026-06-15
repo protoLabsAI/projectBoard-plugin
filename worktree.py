@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 
@@ -188,8 +189,13 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str,
     if n == 0:
         raise NoChangesError("coder produced no commits vs base — nothing to PR")
 
-    # 2. Push the branch from the worktree.
-    rc, _o, err = await _git(worktree, "push", "-u", "origin", branch, timeout=180)
+    # 2. Push the branch from the worktree. `--force-with-lease`: a re-dispatch
+    #    (CI-fail bounce) builds a FRESH worktree off origin/<base>, so its history
+    #    diverges from the remote `feat/<id>` branch the first attempt pushed — a
+    #    plain push would be rejected (non-fast-forward) and the re-dispatch would
+    #    never land. The branch is the loop's own throwaway; lease-guarded force is
+    #    safe (and a no-op on the first push when the branch is new).
+    rc, _o, err = await _git(worktree, "push", "-u", "--force-with-lease", "origin", branch, timeout=180)
     if rc != 0:
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
 
@@ -213,6 +219,60 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     webhook for deployments with no public webhook URL)."""
     rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd)
     return out.strip() if rc == 0 else ""
+
+
+async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) -> tuple[str, str]:
+    """The PR's CI rollup → ``("passing" | "failing" | "pending" | "none", summary)``.
+
+    The closed-loop verify edge: the reconcile poll uses this to bounce a feature
+    whose checks FAILED back to the coder with the failure as feedback (vs the old
+    behavior — a red PR sat in_review forever). Best-effort: any ``gh`` failure
+    returns ``("none", "")`` so the caller just leaves the PR alone (never raises
+    into the loop). For a failing rollup, ``summary`` names the failing checks and,
+    best-effort, includes a truncated excerpt of the first failing run's log so the
+    coder can actually fix it (edit-only — it can't re-run the checks itself)."""
+    rc, out, _err = await _gh(
+        "pr", "view", pr_url, "--json", "statusCheckRollup", "--jq", ".statusCheckRollup", cwd=cwd
+    )
+    if rc != 0 or not out.strip():
+        return "none", ""
+    try:
+        checks = json.loads(out) or []
+    except json.JSONDecodeError:
+        return "none", ""
+    if not checks:
+        return "none", ""
+
+    _FAIL = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+    _PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED", ""}
+
+    def _conclusion(c: dict) -> str:
+        # GH Actions checks carry `conclusion` (+ `status` while running); legacy
+        # status contexts carry `state`. Normalize to an upper-case token.
+        return str(c.get("conclusion") or c.get("status") or c.get("state") or "").upper()
+
+    def _name(c: dict) -> str:
+        return str(c.get("name") or c.get("context") or c.get("workflowName") or "check")
+
+    failing = [c for c in checks if _conclusion(c) in _FAIL]
+    if not failing:
+        pending = [c for c in checks if _conclusion(c) in _PENDING and _conclusion(c) != "SUCCESS"]
+        # SUCCESS/NEUTRAL/SKIPPED all count as not-blocking → passing once nothing pends.
+        return ("pending", "") if pending else ("passing", "")
+
+    lines = [f"- {_name(c)}: {_conclusion(c)}" for c in failing]
+    summary = "Failing checks:\n" + "\n".join(lines)
+    # Best-effort: pull the first failing GH-Actions run's failed-step log so the
+    # coder sees the actual error, not just the check name.
+    detail_url = next((str(c.get("detailsUrl") or "") for c in failing if c.get("detailsUrl")), "")
+    run_id = ""
+    if "/actions/runs/" in detail_url:
+        run_id = detail_url.split("/actions/runs/", 1)[1].split("/", 1)[0]
+    if run_id.isdigit():
+        lrc, lout, _le = await _gh("run", "view", run_id, "--log-failed", cwd=cwd, timeout=60)
+        if lrc == 0 and lout.strip():
+            summary += f"\n\nFailing log (truncated):\n{lout.strip()[-log_chars:]}"
+    return "failing", summary
 
 
 async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
