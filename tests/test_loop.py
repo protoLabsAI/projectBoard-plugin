@@ -460,10 +460,12 @@ async def test_reconcile_drives_merged_to_done_and_closed_to_blocked(monkeypatch
 
 
 class _CiStore:
-    def __init__(self, feature):
+    def __init__(self, feature, escalate_tiers=None):
         self._feature = feature
         self.requeued = []
         self.blocked = []
+        self.escalated = []
+        self._escalate_tiers = list(escalate_tiers or [])
 
     def list_features(self, state=None):
         return [self._feature] if state == "in_review" else []
@@ -478,66 +480,95 @@ class _CiStore:
     def flag_blocked(self, fid, reason):
         self.blocked.append((fid, reason))
 
+    def escalate(self, fid, reason):
+        self.escalated.append((fid, reason))
+        return self._escalate_tiers.pop(0) if self._escalate_tiers else None
 
-async def test_reconcile_ci_bounces_failing_pr_then_blocks(monkeypatch):
-    store = _CiStore({"id": "bd-ci", "pr_url": "https://example/pr/9"})
-    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
+async def _stub_ci_worktree(monkeypatch, *, ci, diff="- a\n+ b"):
     async def _pr_state(url, *, cwd="."):
         return "OPEN"
 
     async def _pr_ci(url, *, cwd=".", log_chars=3000):
-        return ("failing", "Failing checks:\n- Web E2E: FAILURE\n\nFailing log:\nelement not found")
+        return ci() if callable(ci) else ci
+
+    async def _pr_diff(url, *, cwd=".", max_chars=4000):
+        return diff
 
     async def _reap(repo, root, fid):
         return None
 
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
+    monkeypatch.setattr(worktree, "pr_diff", _pr_diff)
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
 
-    loop = BoardLoop({"ci_fix_max": 2})
-    # 1st + 2nd failing reconcile → re-dispatch (requeue + feedback stored), NOT blocked.
+
+async def test_reconcile_ci_bounces_failing_pr_then_blocks(monkeypatch):
+    """No coder ladder (single coder) → bounded same-tier retry capped by ci_fix_max."""
+    store = _CiStore({"id": "bd-ci", "pr_url": "https://example/pr/9"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(
+        monkeypatch, ci=("failing", "Failing checks:\n- Web E2E: FAILURE\n\nFailing log:\nelement not found")
+    )
+
+    loop = BoardLoop({"ci_fix_max": 2})  # no `coders` → escalation_on is False
+    assert not loop.escalation_on
     await loop._reconcile_prs()
     await loop._reconcile_prs()
     assert store.requeued == ["bd-ci", "bd-ci"]
-    assert store.blocked == []
+    assert store.blocked == [] and store.escalated == []
     assert "element not found" in loop._ci_feedback["bd-ci"]
     assert loop._ci_fix_attempts["bd-ci"] == 2
-    # 3rd (cap=2 exhausted) → blocked for triage, no further requeue.
+    # cap=2 exhausted → blocked, no further requeue.
     await loop._reconcile_prs()
-    assert store.requeued == ["bd-ci", "bd-ci"]  # unchanged
+    assert store.requeued == ["bd-ci", "bd-ci"]
     assert [b[0] for b in store.blocked] == ["bd-ci"]
+
+
+async def test_reconcile_ci_escalates_through_tiers_then_blocks(monkeypatch):
+    """With a coder ladder, each CI failure climbs a tier (stronger model) carrying
+    the prior diff; the top tier failing → Blocked (the ladder is the bound)."""
+    store = _CiStore({"id": "bd-esc", "pr_url": "https://example/pr/7"}, escalate_tiers=["smart", "reasoning"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Tests: FAILURE"), diff="- old\n+ new")
+
+    loop = BoardLoop({"coders": {"fast": "a", "smart": "b", "reasoning": "c"}})
+    assert loop.escalation_on
+    # CI failures climb tiers (escalate), requeue, NOT blocked, carrying the prior diff.
+    await loop._reconcile_prs()
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-esc", "bd-esc"]
+    assert [e[0] for e in store.escalated] == ["bd-esc", "bd-esc"]
+    assert store.blocked == []
+    assert "- old" in loop._ci_prior_diff["bd-esc"]
+    # top tier exhausted (escalate → None) → blocked.
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-esc", "bd-esc"]
+    assert [b[0] for b in store.blocked] == ["bd-esc"]
 
 
 async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
     store = _CiStore({"id": "bd-ok", "pr_url": "https://example/pr/8"})
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-
-    async def _pr_state(url, *, cwd="."):
-        return "OPEN"
-
     statuses = iter([("pending", ""), ("passing", "")])
-
-    async def _pr_ci(url, *, cwd=".", log_chars=3000):
-        return next(statuses)
-
-    monkeypatch.setattr(worktree, "pr_state", _pr_state)
-    monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
+    await _stub_ci_worktree(monkeypatch, ci=lambda: next(statuses))
 
     await BoardLoop({})._reconcile_prs()  # pending → leave
     await BoardLoop({})._reconcile_prs()  # passing → leave
     assert store.requeued == [] and store.blocked == []
 
 
-def test_build_prompt_injects_ci_feedback():
+def test_build_prompt_injects_ci_feedback_and_prior_diff():
     loop = BoardLoop({})
     feature = {"id": "bd-ci", "title": "T", "spec": "do it", "acceptance_criteria": "AC", "files_to_modify": ["a.py"]}
     assert "previous PR FAILED CI" not in loop._build_prompt(feature)  # none stored → no block
     loop._ci_feedback["bd-ci"] = "Failing checks:\n- Web E2E: FAILURE\nelement not found"
+    loop._ci_prior_diff["bd-ci"] = "--- a/x.tsx\n+++ b/x.tsx\n+ bad code"
     prompt = loop._build_prompt(feature)
     assert "previous PR FAILED CI" in prompt
     assert "element not found" in prompt
+    assert "bad code" in prompt  # the prior diff is carried forward
 
 
 async def test_maybe_reconcile_is_rate_limited(monkeypatch):

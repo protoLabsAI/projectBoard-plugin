@@ -130,6 +130,7 @@ class BoardLoop:
         # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
         # into the re-dispatch prompt) and fid → count of CI-fix re-dispatches so far.
         self._ci_feedback: dict[str, str] = {}
+        self._ci_prior_diff: dict[str, str] = {}
         self._ci_fix_attempts: dict[str, int] = {}
 
     def _store(self):
@@ -355,26 +356,53 @@ class BoardLoop:
 
     async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
         """Closed-loop verify edge: an OPEN ``in_review`` PR whose checks FAILED is
-        bounced back to the coder with the failure injected as feedback (the missing
-        OODA correction — before this, a red PR sat in_review forever). Bounded by
-        ``ci_fix_max``: past it, the feature is blocked for human triage (a real bug,
-        not a self-fixable nit). Passing/pending/no-checks → left in review (the merge
-        edge resolves it)."""
+        bounced back to the coder — and the re-dispatch *improves on the last try*
+        rather than blindly repeating it (the missing OODA correction; before this a
+        red PR sat in_review forever, then a same-model retry re-made the same mistake).
+
+        Two improvement levers, both ProtoMaker-style:
+        - **Carry the lesson forward** — inject the CI failure summary AND the prior
+          attempt's diff into the next prompt (fresh-both keeps a fresh session, but
+          the coder sees what it tried and why it failed).
+        - **Escalate the model** — with a `coders` ladder configured, climb a tier per
+          CI failure (fast→smart→reasoning); the ladder itself is the bound (top tier
+          fails → Blocked). Without a ladder, fall back to a same-tier retry capped by
+          ``ci_fix_max``.
+
+        Passing/pending/no-checks → left in review (the merge edge resolves it)."""
         status, summary = await worktree.pr_ci_status(pr_url, cwd=repo)
         if status != "failing":
             return
+        # Carry the lesson: the CI error + the diff that failed it (best-effort).
+        self._ci_feedback[fid] = summary
+        self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
+
+        def _block(reason: str):
+            store.flag_blocked(fid, reason)
+            self._ci_feedback.pop(fid, None)
+            self._ci_prior_diff.pop(fid, None)
+            self._ci_fix_attempts.pop(fid, None)
+
+        # Escalation ladder (preferred): each CI failure climbs a model tier.
+        if self.escalation_on:
+            nxt = store.escalate(fid, f"CI failed: {summary.splitlines()[0] if summary else 'checks red'}")
+            if not nxt:
+                _block(f"CI failing at the top model tier — needs triage: {pr_url}")
+                await worktree.reap_feature_worktree(repo, self.root, fid)
+                log.warning("[project_board] reconcile → blocked (CI fails at top tier): %s", fid)
+                return
+            store.requeue(fid)
+            log.info("[project_board] reconcile → escalate to %s + re-dispatch (CI failed): %s", nxt, fid)
+            return
+
+        # No ladder (single coder): bounded same-tier retry with the lesson carried.
         attempts = self._ci_fix_attempts.get(fid, 0)
         if attempts >= self.ci_fix_max:
-            store.flag_blocked(fid, f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
+            _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
             await worktree.reap_feature_worktree(repo, self.root, fid)
-            self._ci_feedback.pop(fid, None)
-            self._ci_fix_attempts.pop(fid, None)
             log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
             return
         self._ci_fix_attempts[fid] = attempts + 1
-        self._ci_feedback[fid] = summary
-        # in_review → ready; the puller re-claims and _drive re-builds, _build_prompt
-        # injecting the CI failure. open_pr force-pushes onto the existing PR → CI re-runs.
         store.requeue(fid)
         log.info(
             "[project_board] reconcile → re-dispatch (CI failed, attempt %d/%d): %s",
@@ -623,10 +651,19 @@ class BoardLoop:
         # CI; lead with the failure so the coder FIXES it this pass (it can't run the
         # checks itself — edit-only). Also widen scope: the fix may touch tests/files
         # the original `files_to_modify` didn't list (the #1053 lesson).
-        ci = self._ci_feedback.get(feature.get("id", ""))
+        fid = feature.get("id", "")
+        ci = self._ci_feedback.get(fid)
+        prior = self._ci_prior_diff.get(fid)
+        prior_block = (
+            f"\n### The diff that failed (your previous attempt — fix it, don't restart from scratch)\n"
+            f"```diff\n{prior}\n```\n"
+            if prior
+            else ""
+        )
         ci_block = (
             "\n## ⚠ Your previous PR FAILED CI — fix it this attempt\n"
             f"{ci}\n"
+            f"{prior_block}"
             "Address every failing check. This may require editing files beyond the "
             "list below (e.g. an e2e/unit test that assumed the old behavior).\n"
             if ci
