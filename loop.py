@@ -37,7 +37,10 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 _GOAL_VERIFY_SYS = (
     "You are a strict code reviewer verifying a diff against acceptance criteria. "
-    "Only answer PASS if EVERY criterion is demonstrably met by the diff; otherwise FAIL."
+    "Only answer PASS if EVERY criterion is demonstrably met by the diff; otherwise FAIL. "
+    "Treat automated test coverage as a MANDATORY criterion even when it is not listed: "
+    "if the diff changes code behavior but adds or updates no test that exercises that "
+    "behavior, answer FAIL. Pure docs/config/comment changes are exempt."
 )
 
 _MAX_MODE_JUDGE_SYS = (
@@ -565,9 +568,10 @@ class BoardLoop:
             f"A coding agent was asked to satisfy these acceptance criteria:\n\n{ac}\n\n"
             f"Declared files to modify: {files}\n\n"
             f"Its diff:\n\n```diff\n{diff[:8000]}\n```\n\n"
-            "Does the diff satisfy EVERY acceptance criterion? Reply with PASS or FAIL "
-            "on the first line. If FAIL, add one line naming the specific unmet "
-            "criterion or gap."
+            "Does the diff satisfy EVERY acceptance criterion AND include automated "
+            "tests covering the changed behavior? Reply with PASS or FAIL on the first "
+            "line. If FAIL, add one line naming the specific unmet criterion or the "
+            "missing test coverage."
         )
         try:
             from graph.sdk import complete
@@ -683,6 +687,12 @@ class BoardLoop:
             f"## Rules\n"
             f"- Make the edits directly in the working tree NOW — actually write the files.\n"
             f"- Touch only the files this task needs; mirror the surrounding code's style.\n"
-            f"- You cannot run shell commands (edit-only); tests run in CI on the PR.\n"
-            f"- You are done when the listed files exist and satisfy every acceptance criterion."
+            f"- **Write automated tests** covering the new/changed behavior (a new or "
+            f"updated test file, matching the repo's existing test conventions). This is "
+            f"part of the definition of done, not optional — a code change with no test "
+            f"will be rejected before the PR opens.\n"
+            f"- You cannot run shell commands (edit-only); the tests you write run in CI "
+            f"on the PR, so they must be correct and self-contained.\n"
+            f"- You are done when the listed files exist, tests cover the change, and "
+            f"every acceptance criterion is satisfied."
         )
