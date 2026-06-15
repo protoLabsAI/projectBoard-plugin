@@ -103,6 +103,13 @@ class BoardLoop:
         # Health sweep: periodic self-heal (reclaim slots from dead drives, reap
         # orphaned worktrees). 0 disables it.
         self.sweep_interval = float(self.cfg.get("health_sweep_interval_s", 300))
+        # CI-feedback edge (closed-loop verify): poll in_review PRs' check-runs and,
+        # on a FAILING rollup, bounce the feature back to the coder with the failure
+        # injected as feedback (vs the old open-loop: a red PR sat in_review forever).
+        # Rides the merge-poll cadence. `ci_fix_max` caps re-dispatches before the
+        # feature is blocked for human triage (a real bug, not a self-fixable nit).
+        self.ci_poll = bool(self.cfg.get("ci_poll", self.merge_poll))
+        self.ci_fix_max = max(0, int(self.cfg.get("ci_fix_max", 2)))
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -120,6 +127,10 @@ class BoardLoop:
         self._inflight_files: dict[str, set[str]] = {}
         self._last_poll = 0.0  # monotonic ts of the last merge poll
         self._last_sweep = 0.0  # monotonic ts of the last health sweep
+        # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
+        # into the re-dispatch prompt) and fid → count of CI-fix re-dispatches so far.
+        self._ci_feedback: dict[str, str] = {}
+        self._ci_fix_attempts: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -328,13 +339,49 @@ class BoardLoop:
                 if state == "MERGED":
                     if store.record_merge(pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
+                        self._ci_feedback.pop(fid, None)
+                        self._ci_fix_attempts.pop(fid, None)
                         log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                 elif state == "CLOSED":
                     store.flag_blocked(fid, f"PR closed without merging — needs triage: {pr_url}")
                     await worktree.reap_feature_worktree(repo, self.root, fid)
+                    self._ci_feedback.pop(fid, None)
+                    self._ci_fix_attempts.pop(fid, None)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
+                elif state == "OPEN" and self.ci_poll:
+                    await self._reconcile_ci(store, fid, pr_url, repo)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
+
+    async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
+        """Closed-loop verify edge: an OPEN ``in_review`` PR whose checks FAILED is
+        bounced back to the coder with the failure injected as feedback (the missing
+        OODA correction — before this, a red PR sat in_review forever). Bounded by
+        ``ci_fix_max``: past it, the feature is blocked for human triage (a real bug,
+        not a self-fixable nit). Passing/pending/no-checks → left in review (the merge
+        edge resolves it)."""
+        status, summary = await worktree.pr_ci_status(pr_url, cwd=repo)
+        if status != "failing":
+            return
+        attempts = self._ci_fix_attempts.get(fid, 0)
+        if attempts >= self.ci_fix_max:
+            store.flag_blocked(fid, f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
+            await worktree.reap_feature_worktree(repo, self.root, fid)
+            self._ci_feedback.pop(fid, None)
+            self._ci_fix_attempts.pop(fid, None)
+            log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
+            return
+        self._ci_fix_attempts[fid] = attempts + 1
+        self._ci_feedback[fid] = summary
+        # in_review → ready; the puller re-claims and _drive re-builds, _build_prompt
+        # injecting the CI failure. open_pr force-pushes onto the existing PR → CI re-runs.
+        store.requeue(fid)
+        log.info(
+            "[project_board] reconcile → re-dispatch (CI failed, attempt %d/%d): %s",
+            attempts + 1,
+            self.ci_fix_max,
+            fid,
+        )
 
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
@@ -572,12 +619,26 @@ class BoardLoop:
         )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
+        # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
+        # CI; lead with the failure so the coder FIXES it this pass (it can't run the
+        # checks itself — edit-only). Also widen scope: the fix may touch tests/files
+        # the original `files_to_modify` didn't list (the #1053 lesson).
+        ci = self._ci_feedback.get(feature.get("id", ""))
+        ci_block = (
+            "\n## ⚠ Your previous PR FAILED CI — fix it this attempt\n"
+            f"{ci}\n"
+            "Address every failing check. This may require editing files beyond the "
+            "list below (e.g. an e2e/unit test that assumed the old behavior).\n"
+            if ci
+            else ""
+        )
         return (
             f"You are implementing ONE feature in this repository. Your working "
             f"directory is an isolated git worktree — **make all the edits here, now**. "
             f"Do not ask questions or just describe a plan; if something is ambiguous, "
             f"make the most reasonable choice and write the code.\n\n"
             f"# {feature['title']}\n\n"
+            f"{ci_block}"
             f"## Task\n{feature.get('spec', '')}\n\n"
             f"## Files to create / modify\n{files_block}\n"
             f"{design_block}\n"

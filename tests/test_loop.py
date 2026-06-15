@@ -443,13 +443,101 @@ async def test_reconcile_drives_merged_to_done_and_closed_to_blocked(monkeypatch
     async def _reap(repo, root, fid):
         reaped.append(fid)
 
+    async def _pr_ci(url, *, cwd=".", log_chars=3000):
+        return ("passing", "")  # the OPEN PR's CI is green → left in review
+
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
 
     await BoardLoop({})._reconcile_prs()
     assert store.merged == ["https://example/pr/1"]  # merged → done
     assert [b[0] for b in store.blocked] == ["bd-closed"]  # closed-unmerged → blocked
     assert set(reaped) == {"bd-merged", "bd-closed"}  # both terminal states reap; open kept
+
+
+# ── the CI-feedback edge (closed-loop verify) ────────────────────────────────────
+
+
+class _CiStore:
+    def __init__(self, feature):
+        self._feature = feature
+        self.requeued = []
+        self.blocked = []
+
+    def list_features(self, state=None):
+        return [self._feature] if state == "in_review" else []
+
+    def record_merge(self, *, pr_url):
+        return None
+
+    def requeue(self, fid):
+        self.requeued.append(fid)
+        return {"id": fid}
+
+    def flag_blocked(self, fid, reason):
+        self.blocked.append((fid, reason))
+
+
+async def test_reconcile_ci_bounces_failing_pr_then_blocks(monkeypatch):
+    store = _CiStore({"id": "bd-ci", "pr_url": "https://example/pr/9"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _pr_ci(url, *, cwd=".", log_chars=3000):
+        return ("failing", "Failing checks:\n- Web E2E: FAILURE\n\nFailing log:\nelement not found")
+
+    async def _reap(repo, root, fid):
+        return None
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"ci_fix_max": 2})
+    # 1st + 2nd failing reconcile → re-dispatch (requeue + feedback stored), NOT blocked.
+    await loop._reconcile_prs()
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-ci", "bd-ci"]
+    assert store.blocked == []
+    assert "element not found" in loop._ci_feedback["bd-ci"]
+    assert loop._ci_fix_attempts["bd-ci"] == 2
+    # 3rd (cap=2 exhausted) → blocked for triage, no further requeue.
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-ci", "bd-ci"]  # unchanged
+    assert [b[0] for b in store.blocked] == ["bd-ci"]
+
+
+async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
+    store = _CiStore({"id": "bd-ok", "pr_url": "https://example/pr/8"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    statuses = iter([("pending", ""), ("passing", "")])
+
+    async def _pr_ci(url, *, cwd=".", log_chars=3000):
+        return next(statuses)
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
+
+    await BoardLoop({})._reconcile_prs()  # pending → leave
+    await BoardLoop({})._reconcile_prs()  # passing → leave
+    assert store.requeued == [] and store.blocked == []
+
+
+def test_build_prompt_injects_ci_feedback():
+    loop = BoardLoop({})
+    feature = {"id": "bd-ci", "title": "T", "spec": "do it", "acceptance_criteria": "AC", "files_to_modify": ["a.py"]}
+    assert "previous PR FAILED CI" not in loop._build_prompt(feature)  # none stored → no block
+    loop._ci_feedback["bd-ci"] = "Failing checks:\n- Web E2E: FAILURE\nelement not found"
+    prompt = loop._build_prompt(feature)
+    assert "previous PR FAILED CI" in prompt
+    assert "element not found" in prompt
 
 
 async def test_maybe_reconcile_is_rate_limited(monkeypatch):

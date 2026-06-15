@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.4.1
+version: 0.5.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -71,6 +71,14 @@ config:
                             # a webhook to (no public URL). Done stays idempotent either
                             # way; set false to rely on the webhook alone.
   merge_poll_interval_s: 60 # how often the loop reconciles in_review PRs
+  ci_poll: true             # closed-loop verify: poll in_review PRs' CI check-runs and,
+                            # on a FAILING rollup, bounce the feature back to the coder
+                            # with the failure injected as feedback (vs the old open-loop:
+                            # a red PR sat in_review forever). Rides the merge-poll cadence.
+                            # Defaults to merge_poll's value; set false to disable.
+  ci_fix_max: 2             # cap on CI-fix re-dispatches before the feature is Blocked for
+                            # human triage (a real bug, not a self-fixable nit). 0 = never
+                            # auto-fix (block on the first CI failure).
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.
