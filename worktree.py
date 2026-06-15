@@ -123,11 +123,23 @@ async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | 
     Builds a per-feature copy with the worktree as workdir (registry untouched),
     dispatches via the adapter, and ALWAYS tears the ACP subprocess down — the
     cache keys on workdir, so each feature owns a distinct client that must be
-    reaped here, not left to pile up."""
+    reaped here, not left to pile up.
+
+    Fresh-both: every attempt gets a freshly recreated worktree (``create_worktree``
+    wipes + rebuilds it off the base), so the coder must also start a FRESH ACP
+    session. Otherwise a re-dispatch (CI-fail bounce, tier escalation, crash
+    recovery) would ``session/load``-resume a thread whose memory references a diff
+    the wiped tree no longer has — the coder thinks it's already done (→ no diff) or
+    edits against stale assumptions. Forgetting the session first keeps its memory in
+    step with the empty tree. (A first attempt has no session to forget → no-op.)"""
     from plugins.delegates.adapters import ADAPTERS, DelegateError
 
     adapter = ADAPTERS["acp"]
     scoped = dataclasses.replace(coder, workdir=worktree)
+    try:
+        await adapter.forget_session(scoped)
+    except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build
+        log.warning("[project_board] forget_session failed for %s", worktree, exc_info=True)
     try:
         # Hard-bound the dispatch so a hung coder can't hold a worktree/slot forever.
         # On timeout asyncio.wait_for cancels the dispatch — the finally below reaps

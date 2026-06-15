@@ -302,3 +302,27 @@ async def test_pr_ci_status_none_when_no_checks_or_gh_error(monkeypatch):
 
     monkeypatch.setattr(worktree, "_gh", _err)
     assert await worktree.pr_ci_status("https://example/pr/1", cwd="/repo") == ("none", "")
+
+
+async def test_dispatch_coder_forgets_session_before_dispatch(monkeypatch):
+    """Fresh-both: the worktree is recreated per attempt, so dispatch_coder must
+    forget the ACP session BEFORE dispatching (else a resumed thread's memory would
+    reference a wiped diff). Assert the order: forget → dispatch → teardown."""
+    order = []
+
+    class _Acp:
+        async def forget_session(self, scoped):
+            order.append("forget")
+            return True
+
+        async def dispatch(self, scoped, prompt, *, timeout=None):
+            order.append("dispatch")
+            return "built it"
+
+        async def teardown(self, scoped):
+            order.append("teardown")
+
+    _inject_fake_delegates(monkeypatch, _Acp())
+    out = await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=5)
+    assert out == "built it"
+    assert order == ["forget", "dispatch", "teardown"]
