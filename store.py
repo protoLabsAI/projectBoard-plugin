@@ -390,9 +390,7 @@ class BeadsBoard:
         # — `br show` carries labels — so board_state/blocked/diff/dag_blocked project
         # correctly. `br ready` is priority-ordered; iterating it preserves that.
         out = [
-            f
-            for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") == "feature")
-            if f is not None
+            f for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") == "feature") if f is not None
         ]
         if not relaxed:
             return out
