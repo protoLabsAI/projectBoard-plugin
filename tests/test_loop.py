@@ -103,6 +103,24 @@ def test_is_test_path_classification():
     assert not _is_code_path("README.md") and not _is_code_path("config.yaml")
 
 
+def test_format_cmd_parsed_from_config():
+    assert BoardLoop({}).format_cmd == ""  # off by default
+    assert BoardLoop({"format_cmd": "ruff check --fix ."}).format_cmd == "ruff check --fix ."
+
+
+async def test_run_fixups_noop_when_unset(monkeypatch):
+    """No format_cmd → _run_fixups must not shell out (it's the pre-PR auto-fix hook)."""
+    loop = BoardLoop({})
+    shelled = []
+
+    async def _spy(*a, **k):
+        shelled.append(1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _spy)
+    await loop._run_fixups("/wt")
+    assert not shelled
+
+
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 

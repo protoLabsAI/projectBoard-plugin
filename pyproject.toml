@@ -1,6 +1,6 @@
 [project]
 name = "project-board"
-version = "0.10.1"
+version = "0.11.0"
 description = "Board-driven coding-orchestration plugin for protoAgent (beads board + ACP spawn loop + planning layer + console view)."
 requires-python = ">=3.11"
 

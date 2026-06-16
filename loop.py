@@ -127,6 +127,12 @@ class BoardLoop:
         # `goal_fix_max`, BEFORE escalating/blocking (else a top-tier diff:large
         # feature blocks on attempt 1 with no chance to add the tests).
         self.goal_fix_max = max(0, int(self.cfg.get("goal_fix_max", 2)))
+        # Auto-fix command run in the worktree BEFORE opening the PR (e.g.
+        # "ruff check --fix . && ruff format ."). The coder is edit-only — it can't run
+        # the repo's linter/formatter, so trivial lint/format nits would otherwise fail
+        # CI and burn a whole bounce/escalation (bd-2fd: a full opus fix blocked on one
+        # unused import). Best-effort; CI is still the real gate. Empty = off.
+        self.format_cmd = str(self.cfg.get("format_cmd", "")).strip()
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -505,6 +511,9 @@ class BoardLoop:
                                 keep_wt = True  # reuse the worktree (impl intact) on the retry
                                 continue
                             raise worktree.WorktreeError(f"goal verification failed: {gap}")
+                    # Auto-fix lint/format before the PR — the coder can't run the repo's
+                    # formatter (edit-only), so this clears trivial nits that would fail CI.
+                    await self._run_fixups(wt)
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
@@ -605,6 +614,25 @@ class BoardLoop:
         if d is None or d.type != expect_type:
             return None
         return d
+
+    async def _run_fixups(self, wt: str) -> None:
+        """Run the repo's auto-fix command (``format_cmd``, e.g.
+        ``ruff check --fix . && ruff format .``) in the worktree before opening the PR.
+        The coder is edit-only — it can't run the linter/formatter, so trivial lint/format
+        nits would otherwise fail CI and burn a bounce/escalation. Best-effort: no command
+        configured, or any error/timeout, just proceeds (CI is still the real lint gate)."""
+        if not self.format_cmd:
+            return
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                self.format_cmd,
+                cwd=wt,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=180)
+        except Exception as exc:  # noqa: BLE001 — best-effort; CI still gates lint
+            log.info("[project_board] fixups command failed (proceeding — CI still gates): %s", exc)
 
     async def _verify_goal(self, feature: dict, wt: str, base: str, coder_reply: str = "") -> str | None:
         """Pre-PR gate — DETERMINISTIC: no LLM, no diff dump. The one thing it adds over
