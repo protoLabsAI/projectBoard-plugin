@@ -1,0 +1,87 @@
+name: Release
+
+# The fleet release ritual via protoLabsAI/release-tools: tag → LLM-themed release
+# notes → Discord embed → GitHub release body. Fires on a deliberate
+# `chore: release vX.Y.Z` commit to main (the version in protoagent.plugin.yaml /
+# pyproject.toml is bumped in lockstep by feature PRs; the release commit is the cut
+# that batches them into one release) or a manual dispatch. Idempotent: a re-run on a
+# version whose tag already exists skips the tag + release-creation steps.
+#
+# Requires two secrets (org-level across the fleet): GATEWAY_API_KEY (protoLabs LLM
+# gateway, for the notes) and DISCORD_RELEASE_WEBHOOK (the release channel).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the tag + the GitHub release
+
+jobs:
+  release:
+    name: Tag + release notes + Discord
+    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    timeout-minutes: 10
+    if: >-
+      github.repository == 'protoLabsAI/projectBoard-plugin' &&
+      (github.event_name == 'workflow_dispatch' ||
+       startsWith(github.event.head_commit.message, 'chore: release v'))
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: the notes diff range + previous-tag detection
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version + previous tag
+        id: v
+        run: |
+          # The manifest version is canonical (pyproject mirrors it via the lockstep test).
+          VERSION=$(grep -E '^version:' protoagent.plugin.yaml | head -1 | sed -E 's/^version:[[:space:]]*//')
+          TAG="v$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Previous release = the latest existing vX.Y.Z tag (this version isn't tagged
+          # yet); fall back to the root commit for the very first automated release.
+          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.' | head -1)
+          [ -z "$PREV" ] && PREV=$(git rev-list --max-parents=0 HEAD | head -1)
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG already tagged — skipping (idempotent re-run)."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Releasing $TAG (notes from $PREV)"
+
+      - name: Create tag + GitHub release
+        if: steps.v.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.v.outputs.tag }}"
+          git push origin "${{ steps.v.outputs.tag }}"
+          gh release create "${{ steps.v.outputs.tag }}" \
+            --title "${{ steps.v.outputs.tag }}" \
+            --notes "Generating release notes…"
+
+      - name: Generate notes + post to Discord
+        if: steps.v.outputs.exists == 'false'
+        uses: protoLabsAI/release-tools@v1
+        with:
+          version: ${{ steps.v.outputs.tag }}
+          previous-version: ${{ steps.v.outputs.prev }}
+          out-file: .release-notes.md
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+
+      - name: Set the GitHub release body to the generated notes
+        if: steps.v.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -s .release-notes.md ]; then
+            gh release edit "${{ steps.v.outputs.tag }}" --notes-file .release-notes.md
+          else
+            echo "::warning::no notes file produced — leaving the placeholder release body."
+          fi
