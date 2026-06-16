@@ -239,9 +239,7 @@ async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     failure. ``BEHIND`` = stale base, no conflict (a clean rebase fixes it); ``DIRTY``
     = a real conflict with base; ``BLOCKED`` = checks not satisfied (the CI reconcile's
     job, not the rebase's). Never raises into the loop."""
-    rc, out, _err = await _gh(
-        "pr", "view", pr_url, "--json", "mergeStateStatus", "--jq", ".mergeStateStatus", cwd=cwd
-    )
+    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "mergeStateStatus", "--jq", ".mergeStateStatus", cwd=cwd)
     return out.strip() if rc == 0 else ""
 
 

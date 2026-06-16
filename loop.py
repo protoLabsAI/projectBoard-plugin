@@ -435,12 +435,16 @@ class BoardLoop:
             log.info("[project_board] %s auto-rebased onto %s (was %s) — force-pushed", fid, base, mss)
             return True
         if outcome == "error":
-            log.warning("[project_board] %s auto-rebase hit infra trouble (%s) — next poll retries: %s", fid, mss, detail)
+            log.warning(
+                "[project_board] %s auto-rebase hit infra trouble (%s) — next poll retries: %s", fid, mss, detail
+            )
             return False  # transient — don't burn the coder budget on an infra blip
         # outcome == "conflict": a real merge conflict only the coder can resolve.
         n = self._rebase_attempts.get(fid, 0)
         if n >= self.rebase_fix_max:
-            store.flag_blocked(fid, f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}")
+            store.flag_blocked(
+                fid, f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}"
+            )
             await worktree.reap_feature_worktree(repo, self.root, fid)
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
             return True
