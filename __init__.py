@@ -165,4 +165,26 @@ def _board_tools(cfg: dict):
             ]
         )
 
-    return [board_create_epic, board_create_feature, board_mark_ready, board_list]
+    @tool
+    def board_retro() -> str:
+        """Retro the board: mine the attempt/outcome history of completed + blocked
+        features into recurring failure CLASSES + flow stats (escalation / block /
+        multi-attempt rates + the blocked features and why). The loop-retro skill
+        reads this to distill durable grounding (PROTO.md gotchas) so the next runs
+        stop repeating known failures. Read-only."""
+        from . import retro
+
+        d = retro.summarize(get_store(**store_kw).raw_features_with_comments())
+        return json.dumps(
+            {
+                "n_features": d["n_features"],
+                "recurring_classes": d["recurring_classes"],
+                "escalation_rate": d["escalation_rate"],
+                "block_rate": d["block_rate"],
+                "multi_attempt_rate": d["multi_attempt_rate"],
+                "blocked_features": d["blocked_features"],
+            },
+            indent=2,
+        )
+
+    return [board_create_epic, board_create_feature, board_mark_ready, board_list, board_retro]
