@@ -388,6 +388,20 @@ class BeadsBoard:
         out.sort(key=lambda f: (f["priority"], f["id"]))
         return out
 
+    def raw_features_with_comments(self, states: tuple[str, ...] = ("done", "blocked")) -> list[dict]:
+        """Raw ``br`` dicts (WITH ``comments``) for features in the given board states
+        — the loop-retro's data source. ``list_features`` projects comments away and
+        ``br list`` omits them, so re-fetch each terminal feature via ``br show`` (which
+        carries the full comment history — the attempt/outcome record the retro mines).
+        Defaults to the terminal states (done + blocked = completed + failed work)."""
+        ids = [f["id"] for f in self.list_features() if f.get("board_state") in states]
+        raw: list[dict] = []
+        for fid in ids:
+            rows = self._run("show", fid, want_json=True)
+            if rows:
+                raw.append(rows[0] if isinstance(rows, list) else rows)
+        return raw
+
     def ready_queue(self, relaxed: bool = False) -> list[dict]:
         """Board-`ready`, dep-unblocked **features** (priority order) — the puller's
         queue. `br ready` already excludes a feature with any OPEN `blocks` dep, so by
