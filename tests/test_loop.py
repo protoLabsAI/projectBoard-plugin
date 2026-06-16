@@ -840,6 +840,63 @@ def test_ci_failure_reason_keeps_the_classifiable_error_not_the_header():
     assert "Failing checks:" not in r and len(r) <= 500
 
 
+# ── KG lessons injected into the coder prompt (flywheel read half) ───────────────
+
+
+def test_kg_lessons_config_defaults():
+    loop = BoardLoop({})
+    assert loop.kg_lessons is True and loop.kg_lessons_k == 3 and loop.kg_lessons_domain == "loop-lessons"
+    assert BoardLoop({"kg_lessons": False}).kg_lessons is False
+
+
+async def test_fetch_kg_lessons_disabled_never_queries(monkeypatch):
+    called = []
+
+    async def _search(*a, **k):
+        called.append(1)
+        return [{"preview": "x"}]
+
+    monkeypatch.setattr("graph.sdk.knowledge_search", _search)
+    assert await BoardLoop({"kg_lessons": False})._fetch_kg_lessons(FEATURE) == ""
+    assert not called
+
+
+async def test_fetch_kg_lessons_formats_hits_and_scopes_query(monkeypatch):
+    captured = {}
+
+    async def _search(query, *, k=5, domain=None):
+        captured.update(query=query, k=k, domain=domain)
+        return [{"preview": "golden-map: also update settings_schema.FIELDS"}, {"content": "F841: no unused vars"}]
+
+    monkeypatch.setattr("graph.sdk.knowledge_search", _search)
+    out = await BoardLoop({"kg_lessons_k": 2})._fetch_kg_lessons(FEATURE)
+    assert "- golden-map: also update settings_schema.FIELDS" in out
+    assert "- F841: no unused vars" in out
+    assert captured["domain"] == "loop-lessons" and captured["k"] == 2
+    assert "Add a thing" in captured["query"] and "a.py" in captured["query"]  # title + files
+
+
+async def test_fetch_kg_lessons_empty_or_error_returns_empty(monkeypatch):
+    async def _empty(*a, **k):
+        return []
+
+    monkeypatch.setattr("graph.sdk.knowledge_search", _empty)
+    assert await BoardLoop({})._fetch_kg_lessons(FEATURE) == ""
+
+    async def _boom(*a, **k):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr("graph.sdk.knowledge_search", _boom)
+    assert await BoardLoop({})._fetch_kg_lessons(FEATURE) == ""  # error → best-effort ""
+
+
+def test_build_prompt_injects_lessons_block_only_when_present():
+    loop = BoardLoop({})
+    assert "Known gotchas for this area" not in loop._build_prompt(FEATURE)
+    p = loop._build_prompt(FEATURE, lessons="- always update the golden map")
+    assert "Known gotchas for this area" in p and "always update the golden map" in p
+
+
 # ── auto-rebase on conflict (bd-2gu) ─────────────────────────────────────────────
 
 
