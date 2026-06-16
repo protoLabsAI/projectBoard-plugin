@@ -258,6 +258,7 @@ class BoardLoop:
             await self._recover()
         except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
             log.exception("[project_board] crash recovery failed")
+        log.info("[project_board] recovery done — entering tick loop")
         while not self._stop.is_set():
             spawned = False
             try:
