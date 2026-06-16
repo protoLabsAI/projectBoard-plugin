@@ -123,7 +123,26 @@ project_board:
 | `worktree.py` | per-feature worktree lifecycle, scoped coder dispatch, `open_pr` |
 | `api.py` | the HTTP API + the `/webhook/pr` Done edge (HMAC-verified) |
 | `board_view.py` | the Kanban/list console view |
-| `subagents.py` + `skills/` | the decompose/antagonist planning layer |
+| `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
+| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `loop-retro` distill skill |
 | `__init__.py` | `register()` — wires it all |
 
 Ships **disabled**; nothing runs until you enable it and declare a coder.
+
+## Releasing
+
+Releases follow the fleet cadence via [`protoLabsAI/release-tools`](https://github.com/protoLabsAI/release-tools):
+**tag → LLM-themed release notes → Discord embed → GitHub release body**, wired in
+`.github/workflows/release.yml`.
+
+The version lives in `protoagent.plugin.yaml` + `pyproject.toml` (kept in lockstep by a
+test) and is bumped per feature PR. To **cut a release** that batches the bumped changes
+since the last tag, either:
+
+- push a `chore: release vX.Y.Z` commit to `main`, or
+- run the **Release** workflow manually — `gh workflow run release.yml` (or the Actions tab).
+
+It tags the current version, generates notes for the range since the previous tag, posts
+them to the release Discord channel, and sets the GitHub release body — idempotent
+(a re-run on an already-tagged version is a no-op). Requires the org secrets
+`GATEWAY_API_KEY` + `DISCORD_RELEASE_WEBHOOK`.
