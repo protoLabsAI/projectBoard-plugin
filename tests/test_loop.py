@@ -704,9 +704,13 @@ async def _stub_ci_worktree(monkeypatch, *, ci, diff="- a\n+ b"):
     async def _reap(repo, root, fid):
         return None
 
+    async def _merge_state(url, *, cwd="."):
+        return "CLEAN"  # not BEHIND/DIRTY → auto-rebase no-ops, leaving the CI path under test
+
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
     monkeypatch.setattr(worktree, "pr_diff", _pr_diff)
+    monkeypatch.setattr(worktree, "pr_merge_state", _merge_state)
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
 
 
@@ -813,6 +817,107 @@ def test_build_prompt_injects_ci_feedback_and_prior_diff():
     assert "previous attempt was REJECTED" in prompt
     assert "element not found" in prompt
     assert "bad code" in prompt  # the prior diff is carried forward
+
+
+# ── auto-rebase on conflict (bd-2gu) ─────────────────────────────────────────────
+
+
+def _aret(val):
+    async def _f(*a, **k):
+        return val
+
+    return _f
+
+
+def test_auto_rebase_config_defaults():
+    assert BoardLoop({}).auto_rebase is True  # defaults to merge_poll (True)
+    assert BoardLoop({"merge_poll": False}).auto_rebase is False
+    assert BoardLoop({"auto_rebase": False}).auto_rebase is False
+    assert BoardLoop({}).rebase_fix_max == 1
+
+
+async def test_maybe_rebase_skips_when_not_behind_or_dirty(monkeypatch):
+    """CLEAN / BLOCKED(checks) / UNKNOWN → not the rebase's job; never touches git."""
+    monkeypatch.setattr(worktree, "pr_merge_state", _aret("CLEAN"))
+    rebased = []
+    monkeypatch.setattr(worktree, "rebase_onto_base", lambda *a, **k: rebased.append(1))
+    store = _CiStore({"id": "bd-1"})
+    assert await BoardLoop({"coder": "proto"})._maybe_rebase(store, FEATURE, "pr", "/repo") is False
+    assert not rebased
+
+
+async def test_maybe_rebase_behind_does_clean_rebase_no_coder(monkeypatch):
+    """BEHIND → a clean rebase + force-push; no requeue, no block, no coder."""
+    monkeypatch.setattr(worktree, "pr_merge_state", _aret("BEHIND"))
+    monkeypatch.setattr(worktree, "rebase_onto_base", _aret(("clean", "")))
+    store = _CiStore({"id": "bd-1"})
+    loop = BoardLoop({"coder": "proto"})
+    assert await loop._maybe_rebase(store, FEATURE, "pr", "/repo") is True
+    assert store.requeued == [] and store.blocked == []
+    assert loop._rebase_attempts.get("bd-1", 0) == 0
+
+
+async def test_maybe_rebase_conflict_redispatches_then_blocks(monkeypatch):
+    """DIRTY + a real conflict → re-dispatch the coder (requeue, conflicting file in
+    the feedback) up to rebase_fix_max, then Block for a manual rebase."""
+    monkeypatch.setattr(worktree, "pr_merge_state", _aret("DIRTY"))
+    monkeypatch.setattr(worktree, "rebase_onto_base", _aret(("conflict", "graph/x.py")))
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+    store = _CiStore({"id": "bd-1"})
+    loop = BoardLoop({"coder": "proto", "rebase_fix_max": 1})
+    # 1st conflict → re-dispatch, carrying the conflicting file into the feedback.
+    assert await loop._maybe_rebase(store, FEATURE, "pr", "/repo") is True
+    assert store.requeued == ["bd-1"]
+    assert "graph/x.py" in loop._ci_feedback["bd-1"]
+    assert loop._rebase_attempts["bd-1"] == 1
+    # budget (1) exhausted → block, no second requeue.
+    assert await loop._maybe_rebase(store, FEATURE, "pr", "/repo") is True
+    assert store.requeued == ["bd-1"]
+    assert [b[0] for b in store.blocked] == ["bd-1"]
+
+
+async def test_maybe_rebase_infra_error_is_noop(monkeypatch):
+    """A fetch/push/worktree error degrades to no-op (next poll retries) — no block."""
+    monkeypatch.setattr(worktree, "pr_merge_state", _aret("BEHIND"))
+    monkeypatch.setattr(worktree, "rebase_onto_base", _aret(("error", "fetch failed")))
+    store = _CiStore({"id": "bd-1"})
+    assert await BoardLoop({"coder": "proto"})._maybe_rebase(store, FEATURE, "pr", "/repo") is False
+    assert store.requeued == [] and store.blocked == []
+
+
+async def test_reconcile_prs_rebase_acts_skips_ci(monkeypatch):
+    """An OPEN PR the rebase handled skips the CI reconcile this pass (a rebase
+    force-pushes + re-runs CI, so the stale head's CI would be thrown away)."""
+    store = _CiStore({"id": "bd-1", "pr_url": "https://e/pr/1"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = BoardLoop({"merge_poll": True})
+    ci = []
+
+    async def _ci_spy(*a, **k):
+        ci.append(1)
+
+    monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+    monkeypatch.setattr(loop, "_maybe_rebase", _aret(True))
+    await loop._reconcile_prs()
+    assert ci == []  # rebase acted → CI reconcile skipped
+
+
+async def test_reconcile_prs_no_rebase_runs_ci(monkeypatch):
+    """An OPEN PR the rebase left alone still gets the CI reconcile."""
+    store = _CiStore({"id": "bd-1", "pr_url": "https://e/pr/1"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = BoardLoop({"merge_poll": True})
+    ci = []
+
+    async def _ci_spy(*a, **k):
+        ci.append(1)
+
+    monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+    monkeypatch.setattr(loop, "_maybe_rebase", _aret(False))
+    await loop._reconcile_prs()
+    assert ci == [1]  # nothing to rebase → CI reconcile runs
 
 
 async def test_maybe_reconcile_is_rate_limited(monkeypatch):

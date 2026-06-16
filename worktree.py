@@ -233,6 +233,52 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
+    """The PR's ``mergeStateStatus`` — ``CLEAN`` / ``BEHIND`` / ``DIRTY`` / ``BLOCKED``
+    / ``UNSTABLE`` / ``UNKNOWN`` / ``DRAFT`` / ``HAS_HOOKS`` — or ``""`` on a gh
+    failure. ``BEHIND`` = stale base, no conflict (a clean rebase fixes it); ``DIRTY``
+    = a real conflict with base; ``BLOCKED`` = checks not satisfied (the CI reconcile's
+    job, not the rebase's). Never raises into the loop."""
+    rc, out, _err = await _gh(
+        "pr", "view", pr_url, "--json", "mergeStateStatus", "--jq", ".mergeStateStatus", cwd=cwd
+    )
+    return out.strip() if rc == 0 else ""
+
+
+async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".worktrees") -> tuple[str, str]:
+    """Rebase ``origin/<branch>`` onto ``origin/<base>`` in a throwaway DETACHED
+    worktree, then force-push the result. Returns:
+
+    - ``("clean", "")``       — rebased + pushed; the PR is fresh against base again
+    - ``("conflict", files)`` — the rebase hit conflicts (aborted; remote untouched)
+    - ``("error", msg)``      — an infra failure (fetch / worktree / push)
+
+    DETACHED (``origin/<branch>`` at a detached HEAD) so it never collides with the
+    feature's own checked-out ``feat-<id>`` worktree — a branch can't be checked out
+    twice. The force-push is lease-guarded and the branch is the loop's throwaway."""
+    rel = os.path.join(root, f".rebase-{branch.replace('/', '-')}")
+    path = os.path.join(repo, rel)
+    await _git(repo, "worktree", "remove", "--force", rel)  # clear a stale leftover
+    rc, _o, err = await _git(repo, "fetch", "origin", base, branch, timeout=120)
+    if rc != 0:
+        return ("error", f"fetch failed: {err.strip()[:200]}")
+    rc, _o, err = await _git(repo, "worktree", "add", "--detach", "--force", rel, f"origin/{branch}", timeout=60)
+    if rc != 0:
+        return ("error", f"worktree add failed: {err.strip()[:200]}")
+    try:
+        rc, out, err = await _git(path, "-c", "rebase.autoStash=false", "rebase", f"origin/{base}", timeout=180)
+        if rc != 0:
+            _rc, files, _e = await _git(path, "diff", "--name-only", "--diff-filter=U")
+            await _git(path, "rebase", "--abort")
+            return ("conflict", files.strip() or (out or err).strip()[:300])
+        rc, _o, err = await _git(path, "push", "--force-with-lease", "origin", f"HEAD:{branch}", timeout=180)
+        if rc != 0:
+            return ("error", f"push failed: {err.strip()[:200]}")
+        return ("clean", "")
+    finally:
+        await _git(repo, "worktree", "remove", "--force", rel)
+
+
 async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
     """The PR's unified diff, truncated — the prior attempt's actual work, carried
     into the next (escalated) re-dispatch's prompt so a stronger coder FIXES the
