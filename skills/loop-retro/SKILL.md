@@ -24,6 +24,12 @@ on its beads; you mine that history for what KEEPS going wrong and turn it into 
 on a schedule, so the bias is **propose over create** — you write a report, you do
 NOT edit PROTO.md or commit anything. **You never write code.**
 
+> **The report is produced by a `write_file` CALL — not by your reply.** A scheduled
+> run has NO ONE reading chat, so a report that lives only in your final message is
+> lost. Make `write_file` to `docs/dev/loop-retros/<date>.md` your deliverable; your
+> reply is just a one-line pointer ("wrote docs/dev/loop-retros/<date>.md — N classes,
+> M proposed"). If you skip the `write_file`, the retro accomplished nothing.
+
 ## Procedure
 
 1. **Mine.** Call `board_retro`. You get `n_features`, `recurring_classes`
