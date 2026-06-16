@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from project_board import worktree
-from project_board.loop import BoardLoop
+from project_board.loop import BoardLoop, _ci_failure_reason
 
 
 class FakeLoopStore:
@@ -817,6 +817,27 @@ def test_build_prompt_injects_ci_feedback_and_prior_diff():
     assert "previous attempt was REJECTED" in prompt
     assert "element not found" in prompt
     assert "bad code" in prompt  # the prior diff is carried forward
+
+
+# ── CI failure reason (sharpen the retro signal) ─────────────────────────────────
+
+
+def test_ci_failure_reason_keeps_the_classifiable_error_not_the_header():
+    assert _ci_failure_reason("") == "checks red"
+    # checks-only (no log excerpt) → the failing check names, not "Failing checks:"
+    r = _ci_failure_reason("Failing checks:\n- Python tests: FAILURE\n- Lint: FAILURE")
+    assert "Python tests" in r and "Lint" in r and "Failing checks:" not in r
+    # with a log excerpt → the SPECIFIC error survives so the retro can bucket it
+    summary = (
+        "Failing checks:\n- Python tests: FAILURE\n\n"
+        "Failing log (truncated):\n"
+        "    def test_golden(): ...\n"
+        "E   AssertionError: golden field map is out of sync\n"
+        "FAILED tests/test_config_roundtrip.py::test_golden - golden field map is out of sync\n"
+    )
+    r = _ci_failure_reason(summary)
+    assert "golden field map" in r  # the classifiable signal is preserved
+    assert "Failing checks:" not in r and len(r) <= 500
 
 
 # ── auto-rebase on conflict (bd-2gu) ─────────────────────────────────────────────
