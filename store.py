@@ -53,8 +53,8 @@ LABEL_BLOCKED = "blocked"
 LABEL_FOUNDATION = "foundation"
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
-DIFFICULTY_TIER = {"small": "fast", "medium": "smart", "large": "reasoning", "architectural": "reasoning"}
-TIER_LADDER = ["fast", "smart", "reasoning"]
+DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
+TIER_LADDER = ["smart", "reasoning", "opus"]
 
 
 class BoardError(Exception):

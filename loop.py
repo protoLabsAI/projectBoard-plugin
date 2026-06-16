@@ -531,6 +531,10 @@ class BoardLoop:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
                             tier = nxt
                             retries = 0
+                            # Fresh goal-fix budget at the new tier — otherwise a tier that
+                            # exhausted its goal-fix retries hands the next (stronger) tier a
+                            # spent budget, so it blocks on its first gap without a real shot.
+                            self._goal_fix_attempts.pop(fid, None)
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
