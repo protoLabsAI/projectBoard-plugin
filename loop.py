@@ -133,6 +133,19 @@ class BoardLoop:
         # CI and burn a whole bounce/escalation (bd-2fd: a full opus fix blocked on one
         # unused import). Best-effort; CI is still the real gate. Empty = off.
         self.format_cmd = str(self.cfg.get("format_cmd", "")).strip()
+        # Pre-PR LOCAL GATE: the repo's real check command(s) run in the worktree
+        # AFTER fixups and BEFORE open_pr (e.g. "ruff check . && uv run --no-sync pytest
+        # tests/ -q"). The coder is edit-only — it can't run the suite — so a failure on
+        # a knowable fact (a lint nit, a golden-map test, a wrong schema/column, version
+        # drift) only surfaces in CI, then thrashes the bounce/escalation ladder. Running
+        # it here hands the SAME coder the actual output to fix in-worktree, so the PR
+        # opens already-green. Best-effort early filter: if it can't pass within
+        # local_gate_max same-tier tries, the PR opens anyway (CI + the ci-fix budget
+        # stay the backstop) — a flaky/misconfigured gate never blocks good work. Empty = off.
+        self.local_gate_cmd = str(self.cfg.get("local_gate_cmd", "")).strip()
+        self.local_gate_max = max(0, int(self.cfg.get("local_gate_max", 2)))
+        self.local_gate_timeout = float(self.cfg.get("local_gate_timeout_s", 600))
+        self.local_gate_output_chars = max(500, int(self.cfg.get("local_gate_output_chars", 4000)))
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -157,6 +170,8 @@ class BoardLoop:
         self._ci_fix_attempts: dict[str, int] = {}
         # Pre-PR goal-verify gap re-dispatches so far (fid → count), same-tier.
         self._goal_fix_attempts: dict[str, int] = {}
+        # Pre-PR local-gate failure re-dispatches so far (fid → count), same-tier.
+        self._gate_fix_attempts: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -526,6 +541,35 @@ class BoardLoop:
                     # Auto-fix lint/format before the PR — the coder can't run the repo's
                     # formatter (edit-only), so this clears trivial nits that would fail CI.
                     await self._run_fixups(wt)
+                    # Pre-PR local gate: run the repo's real checks in the worktree and, on
+                    # failure, hand the coder the actual output to fix IN-WORKTREE before a PR
+                    # (and a CI round-trip) ever opens. Same-tier, keep-worktree, bounded by
+                    # local_gate_max; on exhaustion open the PR anyway (CI is the backstop).
+                    gate_out = await self._run_local_gate(wt)
+                    if gate_out is not None:
+                        n = self._gate_fix_attempts.get(fid, 0)
+                        if n < self.local_gate_max:
+                            self._gate_fix_attempts[fid] = n + 1
+                            self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
+                            self._ci_feedback[fid] = (
+                                "Your changes are ALREADY in this worktree's files, but the pre-PR "
+                                "gate failed. FIX what it reports in the existing files, then stop — "
+                                "the loop opens the PR. Do NOT rewrite working code. Gate output:\n\n" + gate_out
+                            )
+                            log.info(
+                                "[project_board] %s pre-PR gate failed — re-dispatch %d/%d (tier=%s, keep worktree)",
+                                fid,
+                                n + 1,
+                                self.local_gate_max,
+                                tier or "default",
+                            )
+                            keep_wt = True
+                            continue
+                        log.warning(
+                            "[project_board] %s pre-PR gate still failing after %d fix(es) — opening PR anyway (CI backstop)",
+                            fid,
+                            n,
+                        )
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
@@ -564,6 +608,7 @@ class BoardLoop:
                             # exhausted its goal-fix retries hands the next (stronger) tier a
                             # spent budget, so it blocks on its first gap without a real shot.
                             self._goal_fix_attempts.pop(fid, None)
+                            self._gate_fix_attempts.pop(fid, None)  # fresh local-gate budget too
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
@@ -577,6 +622,7 @@ class BoardLoop:
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
                 store.open_review(fid, pr_url=pr_url)
                 self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
+                self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
                 if self.review_dispatch:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
@@ -645,6 +691,44 @@ class BoardLoop:
             await asyncio.wait_for(proc.communicate(), timeout=180)
         except Exception as exc:  # noqa: BLE001 — best-effort; CI still gates lint
             log.info("[project_board] fixups command failed (proceeding — CI still gates): %s", exc)
+
+    async def _run_local_gate(self, wt: str) -> str | None:
+        """Run the pre-PR local gate (``local_gate_cmd``) in the worktree.
+
+        Returns ``None`` when the gate passes (exit 0), when no gate is configured,
+        or when the gate itself couldn't run (timeout / unlaunchable command) — a
+        broken or flaky gate must never block otherwise-good work, so those degrade
+        to "pass" (CI is still the real gate). Returns the captured output (tail,
+        truncated to ``local_gate_output_chars``) on a CLEAN non-zero exit, so the
+        caller can hand it to the coder to fix."""
+        cmd = self.local_gate_cmd
+        if not cmd:
+            return None
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=wt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.local_gate_timeout)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                log.warning("[project_board] pre-PR gate timed out (%ss) — treating as pass", self.local_gate_timeout)
+                return None
+            if proc.returncode == 0:
+                return None
+            text = (out or b"").decode("utf-8", "replace").strip()
+            if len(text) > self.local_gate_output_chars:
+                text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
+            return text or f"gate command exited {proc.returncode} with no output"
+        except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block
+            log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
+            return None
 
     async def _verify_goal(self, feature: dict, wt: str, base: str, coder_reply: str = "") -> str | None:
         """Pre-PR gate — DETERMINISTIC: no LLM, no diff dump. The one thing it adds over

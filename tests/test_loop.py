@@ -121,10 +121,49 @@ async def test_run_fixups_noop_when_unset(monkeypatch):
     assert not shelled
 
 
+# ── pre-PR local gate (bd-xbh) ───────────────────────────────────────────────────
+
+
+def test_local_gate_config_parsed():
+    assert BoardLoop({}).local_gate_cmd == ""  # off by default
+    assert BoardLoop({}).local_gate_max == 2
+    loop = BoardLoop({"local_gate_cmd": "ruff check .", "local_gate_max": 1})
+    assert loop.local_gate_cmd == "ruff check ." and loop.local_gate_max == 1
+
+
+async def test_run_local_gate_noop_when_unset(monkeypatch):
+    """No local_gate_cmd → never shells out."""
+    shelled = []
+
+    async def _spy(*a, **k):
+        shelled.append(1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _spy)
+    assert await BoardLoop({})._run_local_gate("/wt") is None
+    assert not shelled
+
+
+async def test_run_local_gate_passes_and_captures_failure(tmp_path):
+    """Exit 0 → None (pass); non-zero → captured output for the coder."""
+    assert await BoardLoop({"local_gate_cmd": "exit 0"})._run_local_gate(str(tmp_path)) is None
+    out = await BoardLoop({"local_gate_cmd": "echo boom 1>&2; exit 1"})._run_local_gate(str(tmp_path))
+    assert out is not None and "boom" in out
+
+
+async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
+    """A gate that can't even spawn must not block — it degrades to pass (CI gates)."""
+
+    async def _boom(*a, **k):
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _boom)
+    assert await BoardLoop({"local_gate_cmd": "anything"})._run_local_gate("/wt") is None
+
+
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 
-async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None):
+async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions."""
     store = FakeLoopStore()
@@ -150,6 +189,8 @@ async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cf
 
     loop = BoardLoop(cfg or {"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: coder)
+    if gate is not None:
+        monkeypatch.setattr(loop, "_run_local_gate", gate)
     await loop._drive(FEATURE)
     return loop, store
 
@@ -161,6 +202,64 @@ async def test_drive_opens_review_on_a_clean_build(monkeypatch):
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
     assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
     assert loop._inflight == {}  # a completed drive leaves nothing to reap
+
+
+async def test_drive_local_gate_failure_redispatches_then_opens(monkeypatch):
+    """A pre-PR gate failure re-dispatches the SAME tier with the output injected,
+    REUSING the worktree (one create), then opens the PR once the gate passes."""
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        prompts.append(prompt)
+        return "reply"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/1"
+
+    gate_seq = iter(["FAILED tests/test_config.py::golden - boom", None])
+
+    async def _gate(wt):
+        return next(gate_seq)
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_dispatch,
+        gate=_gate,
+        cfg={"coder": "proto", "local_gate_cmd": "x", "local_gate_max": 2},
+    )
+    assert len(prompts) == 2  # initial + 1 gate-fix re-dispatch
+    assert store.creates == ["bd-1"]  # keep-worktree → only one worktree created
+    assert "boom" in prompts[1]  # the gate output was carried into the retry prompt
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert loop._gate_fix_attempts.get("bd-1", 0) == 0  # budget reset once the PR opened
+
+
+async def test_drive_local_gate_exhausted_opens_pr_anyway(monkeypatch):
+    """A persistent gate failure opens the PR after local_gate_max tries — never
+    blocks (CI + the ci-fix budget are the backstop)."""
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        prompts.append(prompt)
+        return "reply"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/2"
+
+    async def _gate(wt):
+        return "still red"
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_dispatch,
+        gate=_gate,
+        cfg={"coder": "proto", "local_gate_cmd": "x", "local_gate_max": 1},
+    )
+    assert len(prompts) == 2  # initial + 1 (local_gate_max) then opens anyway
+    assert ("open_review", "bd-1", "https://example/pr/2") in store.calls
+    assert not any(c[0] == "flag_blocked" for c in store.calls)  # never blocked
 
 
 async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
