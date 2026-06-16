@@ -121,6 +121,15 @@ class BoardLoop:
         # feature is blocked for human triage (a real bug, not a self-fixable nit).
         self.ci_poll = bool(self.cfg.get("ci_poll", self.merge_poll))
         self.ci_fix_max = max(0, int(self.cfg.get("ci_fix_max", 2)))
+        # Auto-rebase a stale/conflicting in_review PR onto base. Parallel PRs branch
+        # off the SAME base, and the hot-file guard serializes DISPATCH not the branch
+        # BASE — so each merge re-stales the others (a sibling's change lands in the
+        # same files). On BEHIND (stale, no conflict) a clean rebase + force-push fixes
+        # it with NO coder; on DIRTY (a real conflict) the rebase aborts and the coder
+        # is re-dispatched to re-resolve, bounded by rebase_fix_max. Rides the
+        # merge-poll cadence; defaults to merge_poll's value.
+        self.auto_rebase = bool(self.cfg.get("auto_rebase", self.merge_poll))
+        self.rebase_fix_max = max(0, int(self.cfg.get("rebase_fix_max", 1)))
         # Pre-PR goal-verify gap: a rejected diff (e.g. missing tests) is fixable by
         # the SAME coder told what's missing — NOT a model-capability failure. So
         # carry the gap as feedback + re-dispatch the same tier, bounded by
@@ -172,6 +181,9 @@ class BoardLoop:
         self._goal_fix_attempts: dict[str, int] = {}
         # Pre-PR local-gate failure re-dispatches so far (fid → count), same-tier.
         self._gate_fix_attempts: dict[str, int] = {}
+        # Rebase-conflict re-dispatches so far (fid → count) when a sibling merge
+        # leaves a PR with a real (non-clean) conflict against base.
+        self._rebase_attempts: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -383,17 +395,76 @@ class BoardLoop:
                         await worktree.reap_feature_worktree(repo, self.root, fid)
                         self._ci_feedback.pop(fid, None)
                         self._ci_fix_attempts.pop(fid, None)
+                        self._rebase_attempts.pop(fid, None)
                         log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                 elif state == "CLOSED":
                     store.flag_blocked(fid, f"PR closed without merging — needs triage: {pr_url}")
                     await worktree.reap_feature_worktree(repo, self.root, fid)
                     self._ci_feedback.pop(fid, None)
                     self._ci_fix_attempts.pop(fid, None)
+                    self._rebase_attempts.pop(fid, None)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
-                elif state == "OPEN" and self.ci_poll:
-                    await self._reconcile_ci(store, fid, pr_url, repo)
+                elif state == "OPEN":
+                    # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
+                    # sibling merge re-stales the others off the shared base, and a rebase
+                    # force-pushes + re-runs CI — so checking CI on the stale head first
+                    # would just be thrown away.
+                    if self.auto_rebase and await self._maybe_rebase(store, f, pr_url, repo):
+                        continue
+                    if self.ci_poll:
+                        await self._reconcile_ci(store, fid, pr_url, repo)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
+
+    async def _maybe_rebase(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """If a sibling merge left this in_review PR BEHIND/DIRTY vs base, refresh it.
+
+        Returns True if it acted (rebased / re-dispatched / blocked) so the caller skips
+        the CI reconcile this pass; False when there's nothing to do (CLEAN, a checks-only
+        BLOCKED, an UNKNOWN still computing, or a transient gh/infra hiccup → next poll
+        retries). BEHIND (stale, no conflict) → a clean rebase + force-push, NO coder.
+        DIRTY (a real conflict) → the rebase aborts, so re-dispatch the coder to re-resolve
+        off the fresh base, bounded by rebase_fix_max, then Blocked for a manual rebase."""
+        fid = feature["id"]
+        mss = await worktree.pr_merge_state(pr_url, cwd=repo)
+        if mss not in ("BEHIND", "DIRTY"):
+            return False  # CLEAN / BLOCKED(checks) / UNKNOWN(computing) / DRAFT → not ours
+        base = feature.get("base_branch") or self._store_kw.get("base_branch") or "main"
+        outcome, detail = await worktree.rebase_onto_base(repo, f"feat/{fid}", base, root=self.root)
+        if outcome == "clean":
+            log.info("[project_board] %s auto-rebased onto %s (was %s) — force-pushed", fid, base, mss)
+            return True
+        if outcome == "error":
+            log.warning(
+                "[project_board] %s auto-rebase hit infra trouble (%s) — next poll retries: %s", fid, mss, detail
+            )
+            return False  # transient — don't burn the coder budget on an infra blip
+        # outcome == "conflict": a real merge conflict only the coder can resolve.
+        n = self._rebase_attempts.get(fid, 0)
+        if n >= self.rebase_fix_max:
+            store.flag_blocked(
+                fid, f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}"
+            )
+            await worktree.reap_feature_worktree(repo, self.root, fid)
+            log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
+            return True
+        self._rebase_attempts[fid] = n + 1
+        self._ci_prior_diff.pop(fid, None)
+        self._ci_feedback[fid] = (
+            f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
+            f"file(s): {detail}. Re-apply your change onto the latest `{base}` and resolve the "
+            "conflict, keeping BOTH sides' intent. Then stop."
+        )
+        store.requeue(fid)
+        log.info(
+            "[project_board] %s rebase conflict — re-dispatch %d/%d to resolve (%s): %s",
+            fid,
+            n + 1,
+            self.rebase_fix_max,
+            mss,
+            detail,
+        )
+        return True
 
     async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
         """Closed-loop verify edge: an OPEN ``in_review`` PR whose checks FAILED is

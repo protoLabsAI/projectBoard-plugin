@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.13.0
+version: 0.14.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -94,6 +94,16 @@ config:
   ci_fix_max: 2             # cap on CI-fix re-dispatches before the feature is Blocked for
                             # human triage (a real bug, not a self-fixable nit). 0 = never
                             # auto-fix (block on the first CI failure).
+  auto_rebase: true         # keep stale in_review PRs mergeable (v0.14.0, bd-2gu). Parallel
+                            # PRs branch off the SAME base and the hot-file guard serializes
+                            # DISPATCH not the branch BASE, so each merge re-stales the others.
+                            # BEHIND (stale, no conflict) → a clean rebase + force-push, NO
+                            # coder; DIRTY (a real conflict) → re-dispatch the coder to resolve
+                            # off the fresh base. Rides the merge-poll cadence; defaults to
+                            # merge_poll's value; set false to disable.
+  rebase_fix_max: 1         # cap on coder re-dispatches to resolve a real rebase CONFLICT
+                            # before the feature is Blocked for a manual rebase. 0 = block on
+                            # the first conflict (clean BEHIND rebases still run — they need no coder).
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.
