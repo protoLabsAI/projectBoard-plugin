@@ -109,15 +109,19 @@ async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cf
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions."""
     store = FakeLoopStore()
+    store.creates = []  # fids create_worktree was called for (a goal-fix retry reuses, so won't re-create)
+    store.removes = []  # worktrees remove_worktree was called for
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _create(repo, base, fid, root):
+        store.creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _default_dispatch(c, wt, prompt, *, timeout=None):
         return "the coder's reply"
 
     async def _remove(repo, wt, branch=""):
+        store.removes.append(wt)
         return None
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
@@ -194,7 +198,10 @@ async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
     )
     assert ("open_review", "bd-1", "https://example/pr/77") in store.calls  # opened after the retry
     assert len(dispatched) == 2  # initial + 1 same-tier re-dispatch
-    assert "REJECTED" in dispatched[1] and "missing tests" in dispatched[1]  # gap carried into the retry prompt
+    # keep-worktree: the retry REUSES the worktree (impl intact) — created once, never removed
+    assert store.creates == ["bd-1"]  # NOT re-created for the retry
+    assert store.removes == []  # not wiped between attempts
+    assert "ALREADY in this worktree" in dispatched[1] and "missing tests" in dispatched[1]  # add-to-existing feedback
     assert loop._goal_fix_attempts.get("bd-1") is None  # reset once the gate passes
 
 
@@ -225,6 +232,7 @@ async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
     )
     assert not opened  # the gate stopped the PR from being opened
     assert len(dispatched) == 3  # initial + goal_fix_max (2) same-tier retries
+    assert store.creates == ["bd-1"]  # keep-worktree: created ONCE, reused across both retries
     assert "flag_blocked" in store.names()  # then blocked for triage
     assert "open_review" not in store.names()
 
