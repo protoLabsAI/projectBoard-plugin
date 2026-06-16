@@ -50,6 +50,39 @@ def _is_code_path(p: str) -> bool:
     return p.endswith(_CODE_EXTS)
 
 
+# Error/summary lines worth keeping from a failing CI log — the ones that name the
+# ACTUAL failure (pytest's "FAILED … - AssertionError: golden field map …", ruff's
+# "F841"/"would reformat", a conflict, version drift) so the attempt comment the retro
+# mines is CLASSIFIABLE, not a generic "checks red".
+_CI_SIGNAL_RE = re.compile(
+    r"FAILED|Error|assert|\bF\d{3}\b|reformat|no column|out of sync|conflict|drift|lint-imports", re.I
+)
+
+
+def _ci_failure_reason(summary: str, max_chars: int = 500) -> str:
+    """Distill a CI summary into a compact but classifiable failure reason for the
+    attempt comment (the loop-retro mines these to bucket recurring failures).
+
+    The useful signal is NOT the ``Failing checks:`` header — it's the failing check
+    NAMES plus the tail of the failing log, where pytest/ruff print the real error.
+    Falls back to the header / ``checks red`` when there's nothing better."""
+    if not summary:
+        return "checks red"
+    checks = [ln[2:].strip() for ln in summary.splitlines() if ln.startswith("- ")]
+    head = "; ".join(checks) if checks else summary.splitlines()[0].strip()
+    detail = ""
+    if "Failing log" in summary:
+        log = summary.split("Failing log", 1)[1]
+        errs = [ln.strip() for ln in log.splitlines() if ln.strip() and _CI_SIGNAL_RE.search(ln)]
+        if errs:
+            detail = " · ".join(errs[-4:])
+        else:
+            tail = [ln.strip() for ln in log.splitlines() if ln.strip()]
+            detail = tail[-1] if tail else ""
+    reason = f"{head} — {detail}" if detail else head
+    return reason[:max_chars]
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -520,7 +553,7 @@ class BoardLoop:
         # Same-tier budget exhausted. With a ladder, climb a model tier and reset the
         # per-tier budget so the new rung gets its own fix attempts; without one, block.
         if self.escalation_on:
-            nxt = store.escalate(fid, f"CI failed: {summary.splitlines()[0] if summary else 'checks red'}")
+            nxt = store.escalate(fid, f"CI failed: {_ci_failure_reason(summary)}")
             if not nxt:
                 _block(f"CI failing at the top model tier after {attempts} same-tier fix(es) — needs triage: {pr_url}")
                 await worktree.reap_feature_worktree(repo, self.root, fid)
