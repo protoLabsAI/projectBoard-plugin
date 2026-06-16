@@ -65,23 +65,25 @@ jobs:
             --notes "Generating release notes…"
 
       - name: Generate notes + post to Discord
+        id: notes
         if: steps.v.outputs.exists == 'false'
         uses: protoLabsAI/release-tools@v1
         with:
           version: ${{ steps.v.outputs.tag }}
           previous-version: ${{ steps.v.outputs.prev }}
-          out-file: .release-notes.md
         env:
           GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
           DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
 
       - name: Set the GitHub release body to the generated notes
-        if: steps.v.outputs.exists == 'false'
+        if: steps.v.outputs.exists == 'false' && steps.notes.outputs.notes != ''
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          NOTES: ${{ steps.notes.outputs.notes }}
         run: |
-          if [ -s .release-notes.md ]; then
-            gh release edit "${{ steps.v.outputs.tag }}" --notes-file .release-notes.md
-          else
-            echo "::warning::no notes file produced — leaving the placeholder release body."
-          fi
+          # The action exposes the generated markdown as the `notes` step output (it
+          # logs "Wrote notes + highlights to $GITHUB_OUTPUT"); the `out-file` input is
+          # NOT supported at @v1. Write the output to a file and set the body from it —
+          # safe for multi-line content.
+          printf '%s' "$NOTES" > .release-notes.md
+          gh release edit "${{ steps.v.outputs.tag }}" --notes-file .release-notes.md
