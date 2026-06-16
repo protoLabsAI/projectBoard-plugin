@@ -25,7 +25,7 @@ def test_mine_feature_extracts_attempts_tiers_and_blocked():
     feat = {
         "id": "bd-x",
         "title": "do a thing",
-        "status": "closed",
+        "status": "open",  # terminally blocked = OPEN + blocked label (a closed one is done)
         "labels": ["diff:medium", "blocked"],
         "comments": [
             _c("attempt 1 (tier=reasoning): CI failed: golden field map out of sync"),
@@ -51,12 +51,31 @@ def test_mine_feature_clean_build_has_no_attempts_or_classes():
     assert m["classes"] == []
 
 
+def test_mine_feature_done_with_stale_blocked_label_is_not_blocked():
+    """A shipped (closed) feature that kept a stale `blocked` label from a parked
+    phase is DONE, not blocked — but its attempt failures are still mined as classes."""
+    feat = {
+        "id": "bd-shipped",
+        "title": "shipped after a rough ride",
+        "status": "closed",  # it merged
+        "labels": ["diff:medium", "blocked"],  # stale label, never cleared
+        "comments": [
+            _c("attempt 1 (tier=reasoning): CI failed: golden field map out of sync"),
+            _c("blocked: CI failing at the top model tier"),
+        ],
+    }
+    m = mine_feature(feat)
+    assert m["blocked"] is False  # closed → done, the stale label doesn't count
+    assert m["blocked_reason"] is None
+    assert m["classes"] == ["golden-map / config field"]  # failure still mined
+
+
 def test_summarize_ranks_recurring_classes_with_examples_and_rates():
     feats = [
-        {  # golden-map, escalated, blocked
+        {  # golden-map, escalated, terminally blocked (OPEN + blocked label)
             "id": "a",
             "title": "A",
-            "status": "closed",
+            "status": "open",
             "labels": ["blocked"],
             "comments": [
                 _c("attempt 1 (tier=reasoning): CI failed: golden field map out of sync"),

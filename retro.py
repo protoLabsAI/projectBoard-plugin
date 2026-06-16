@@ -76,6 +76,13 @@ def mine_feature(feat: dict) -> dict:
     if not classes and outcomes:
         classes = ["other"]
     tiers = [a["tier"] for a in attempts]
+    # A DONE (closed) feature shipped — it is NOT blocked, even if it carries a stale
+    # `blocked` label from a phase the loop parked it in. Only an OPEN feature with the
+    # label (or a recorded block reason) is terminally blocked. (Its attempt comments
+    # are still mined for failure classes — failures on an eventually-done feature are
+    # exactly the recurring lessons worth grounding.)
+    is_done = (feat.get("status") or "").lower() in ("closed", "done")
+    blocked = (not is_done) and (blocked_reason is not None or "blocked" in (feat.get("labels") or []))
     return {
         "id": feat.get("id"),
         "title": feat.get("title"),
@@ -84,8 +91,8 @@ def mine_feature(feat: dict) -> dict:
         "n_attempts": len(attempts),
         "tiers": tiers,
         "escalated": len(set(tiers)) > 1,
-        "blocked": blocked_reason is not None or "blocked" in (feat.get("labels") or []),
-        "blocked_reason": blocked_reason,
+        "blocked": blocked,
+        "blocked_reason": blocked_reason if blocked else None,
         "classes": classes,
         "outcomes": outcomes,
         "created_at": feat.get("created_at"),
