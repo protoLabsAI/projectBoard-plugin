@@ -73,10 +73,12 @@ def test_escalation_enabled_needs_two_distinct_coders(cfg, expected):
 
 def test_next_tier_walks_then_stops_at_the_top(make_board):
     b = make_board(Br())
-    assert b.next_tier("fast") == "smart"
+    # Ladder: smart → reasoning → opus (fast dropped — protolabs/fast too weak).
     assert b.next_tier("smart") == "reasoning"
-    assert b.next_tier("reasoning") is None
-    assert b.next_tier("nonsense") == store.TIER_LADDER[0]
+    assert b.next_tier("reasoning") == "opus"
+    assert b.next_tier("opus") is None  # top of the ladder → caller blocks
+    assert b.next_tier("nonsense") == store.TIER_LADDER[0]  # stale/unknown tier → floor (smart)
+    assert b.next_tier("fast") == store.TIER_LADDER[0]  # a now-removed tier falls back to the floor
 
 
 # ── _project: the bead → feature view mapping ───────────────────────────────────
