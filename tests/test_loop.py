@@ -634,13 +634,14 @@ async def test_reconcile_ci_bounces_failing_pr_then_blocks(monkeypatch):
 
 
 async def test_reconcile_ci_escalates_through_tiers_then_blocks(monkeypatch):
-    """With a coder ladder, each CI failure climbs a tier (stronger model) carrying
-    the prior diff; the top tier failing → Blocked (the ladder is the bound)."""
+    """With a coder ladder AND no same-tier budget (ci_fix_max=0), each CI failure
+    climbs a tier (stronger model) carrying the prior diff; the top tier failing →
+    Blocked (the ladder is the bound)."""
     store = _CiStore({"id": "bd-esc", "pr_url": "https://example/pr/7"}, escalate_tiers=["smart", "reasoning"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Tests: FAILURE"), diff="- old\n+ new")
 
-    loop = BoardLoop({"coders": {"fast": "a", "smart": "b", "reasoning": "c"}})
+    loop = BoardLoop({"coders": {"fast": "a", "smart": "b", "reasoning": "c"}, "ci_fix_max": 0})
     assert loop.escalation_on
     # CI failures climb tiers (escalate), requeue, NOT blocked, carrying the prior diff.
     await loop._reconcile_prs()
@@ -653,6 +654,43 @@ async def test_reconcile_ci_escalates_through_tiers_then_blocks(monkeypatch):
     await loop._reconcile_prs()
     assert store.requeued == ["bd-esc", "bd-esc"]
     assert [b[0] for b in store.blocked] == ["bd-esc"]
+
+
+async def test_reconcile_ci_spends_same_tier_budget_before_escalating(monkeypatch):
+    """With a ladder AND ci_fix_max>0, a CI failure first spends same-tier fix
+    attempts (cheap nits — lint, a golden-map update) before climbing a model tier,
+    and the per-tier budget RESETS at the new rung. Without this, a one-line F841
+    burned reasoning→opus and then blocked."""
+    store = _CiStore({"id": "bd-b", "pr_url": "https://example/pr/5"}, escalate_tiers=["reasoning"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Lint: F841 unused variable"))
+
+    loop = BoardLoop({"coders": {"smart": "a", "reasoning": "b"}, "ci_fix_max": 2})
+    assert loop.escalation_on
+
+    # First two failures: same-tier CI-fix (requeue), no escalation.
+    await loop._reconcile_prs()
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-b", "bd-b"]
+    assert store.escalated == []
+    assert loop._ci_fix_attempts["bd-b"] == 2
+
+    # Budget exhausted → escalate ONE tier and reset the per-tier budget.
+    await loop._reconcile_prs()
+    assert [e[0] for e in store.escalated] == ["bd-b"]
+    assert store.requeued == ["bd-b", "bd-b", "bd-b"]
+    assert loop._ci_fix_attempts.get("bd-b", 0) == 0  # fresh budget at the new rung
+
+    # The new rung gets its own same-tier attempts before the ladder is exhausted.
+    await loop._reconcile_prs()
+    await loop._reconcile_prs()
+    assert store.requeued == ["bd-b", "bd-b", "bd-b", "bd-b", "bd-b"]
+    assert [e[0] for e in store.escalated] == ["bd-b"]  # still just the one climb
+    assert loop._ci_fix_attempts["bd-b"] == 2
+
+    # Budget exhausted again → escalate returns None (ladder top) → blocked.
+    await loop._reconcile_prs()
+    assert [b[0] for b in store.blocked] == ["bd-b"]
 
 
 async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
