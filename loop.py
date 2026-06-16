@@ -113,6 +113,12 @@ class BoardLoop:
         # feature is blocked for human triage (a real bug, not a self-fixable nit).
         self.ci_poll = bool(self.cfg.get("ci_poll", self.merge_poll))
         self.ci_fix_max = max(0, int(self.cfg.get("ci_fix_max", 2)))
+        # Pre-PR goal-verify gap: a rejected diff (e.g. missing tests) is fixable by
+        # the SAME coder told what's missing — NOT a model-capability failure. So
+        # carry the gap as feedback + re-dispatch the same tier, bounded by
+        # `goal_fix_max`, BEFORE escalating/blocking (else a top-tier diff:large
+        # feature blocks on attempt 1 with no chance to add the tests).
+        self.goal_fix_max = max(0, int(self.cfg.get("goal_fix_max", 2)))
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -135,6 +141,8 @@ class BoardLoop:
         self._ci_feedback: dict[str, str] = {}
         self._ci_prior_diff: dict[str, str] = {}
         self._ci_fix_attempts: dict[str, int] = {}
+        # Pre-PR goal-verify gap re-dispatches so far (fid → count), same-tier.
+        self._goal_fix_attempts: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -424,12 +432,15 @@ class BoardLoop:
         repo = feature.get("repo") or "."
         base = feature.get("base_branch") or "main"
         title = f"feat: {feature['title']}"
-        prompt = self._build_prompt(feature)
         tier = store.current_tier(fid) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
         try:
             while True:
+                # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
+                # goal-verify gap, or tier escalation) picks up the latest
+                # _ci_feedback + _ci_prior_diff.
+                prompt = self._build_prompt(feature)
                 coder_name = self.coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
@@ -448,6 +459,29 @@ class BoardLoop:
                     if self.goal_verify:
                         gap = await self._verify_goal(feature, wt, base)
                         if gap:
+                            # A goal-verify gap (e.g. the coder skipped tests) is
+                            # fixable by the SAME coder told what's missing — not a
+                            # model-capability failure. Carry the gap (+ the rejected
+                            # diff, stashed by _verify_goal) as feedback and re-dispatch
+                            # the same tier, bounded by goal_fix_max, BEFORE escalating.
+                            n = self._goal_fix_attempts.get(fid, 0)
+                            if n < self.goal_fix_max:
+                                self._goal_fix_attempts[fid] = n + 1
+                                self._ci_feedback[fid] = (
+                                    "A reviewer REJECTED your previous diff before it could open a "
+                                    f"PR — keep the working code and fix this: {gap}"
+                                )
+                                log.info(
+                                    "[project_board] %s goal-verify gap — re-dispatch %d/%d (tier=%s): %s",
+                                    fid,
+                                    n + 1,
+                                    self.goal_fix_max,
+                                    tier or "default",
+                                    gap,
+                                )
+                                await worktree.remove_worktree(repo, wt, branch or "")
+                                self._inflight.pop(fid, None)
+                                continue  # same tier, fresh worktree, gap carried into the prompt
                             raise worktree.WorktreeError(f"goal verification failed: {gap}")
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
@@ -495,6 +529,7 @@ class BoardLoop:
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
                 store.open_review(fid, pr_url=pr_url)
+                self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
                 if self.review_dispatch:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
@@ -588,6 +623,10 @@ class BoardLoop:
         if not lines or lines[0].upper().startswith("PASS"):
             return None
         gap = " ".join(lines[1:]).strip() or lines[0]
+        # Stash the rejected diff so a re-dispatch carries it forward: under
+        # fresh-both the coder rebuilds from scratch, and the prior diff + the gap
+        # tell it what to add (esp. the missing tests it skipped).
+        self._ci_prior_diff[feature.get("id", "")] = diff[:8000]
         return gap[:300]
 
     async def _judge_candidates(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
@@ -665,11 +704,12 @@ class BoardLoop:
             else ""
         )
         ci_block = (
-            "\n## ⚠ Your previous PR FAILED CI — fix it this attempt\n"
+            "\n## ⚠ Your previous attempt was REJECTED — fix it this attempt\n"
             f"{ci}\n"
             f"{prior_block}"
-            "Address every failing check. This may require editing files beyond the "
-            "list below (e.g. an e2e/unit test that assumed the old behavior).\n"
+            "Address the problem above. This may require editing files beyond the list "
+            "below — e.g. ADD the missing tests, or update an e2e/unit test that assumed "
+            "the old behavior.\n"
             if ci
             else ""
         )
