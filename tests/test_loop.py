@@ -91,15 +91,16 @@ def test_build_prompt_requires_tests():
     assert "rejected before the pr opens" in prompt
 
 
-def test_goal_verify_sys_mandates_test_coverage():
-    """The goal-verify gate fails a code change that ships without test coverage,
-    even when the acceptance criteria don't list it explicitly."""
-    from project_board.loop import _GOAL_VERIFY_SYS
+def test_is_test_path_classification():
+    """The deterministic gate's path classifier — what counts as a test vs code."""
+    from project_board.loop import _is_code_path, _is_test_path
 
-    low = _GOAL_VERIFY_SYS.lower()
-    assert "test coverage" in low
-    assert "mandatory" in low
-    assert "fail" in low
+    for p in ("tests/test_inbox.py", "test_x.py", "inbox/foo_test.py", "conftest.py", "web/x.test.tsx"):
+        assert _is_test_path(p), p
+    for p in ("inbox/store.py", "README.md", "config.yaml"):
+        assert not _is_test_path(p), p
+    assert _is_code_path("inbox/store.py") and _is_code_path("web/x.tsx")
+    assert not _is_code_path("README.md") and not _is_code_path("config.yaml")
 
 
 # ── _drive: the state machine ───────────────────────────────────────────────────
@@ -159,7 +160,7 @@ async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
 
 
 async def test_goal_verify_pass_opens_the_pr(monkeypatch):
-    async def _ok(self, feature, wt, base):
+    async def _ok(self, feature, wt, base, coder_reply=""):
         return None  # PASS — no gap
 
     monkeypatch.setattr(BoardLoop, "_verify_goal", _ok)
@@ -176,7 +177,7 @@ async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
     gap carried into the prompt — and opens the PR once the coder fixes it."""
     calls = {"n": 0}
 
-    async def _verify(self, feature, wt, base):
+    async def _verify(self, feature, wt, base, coder_reply=""):
         calls["n"] += 1
         return "missing tests for the new behavior" if calls["n"] == 1 else None  # gap once, then PASS
 
@@ -208,7 +209,7 @@ async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
 async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
     """A persistent gap exhausts goal_fix_max same-tier retries, then blocks — no PR."""
 
-    async def _gap(self, feature, wt, base):
+    async def _gap(self, feature, wt, base, coder_reply=""):
         return "AC #1 unmet: multiply() missing"
 
     monkeypatch.setattr(BoardLoop, "_verify_goal", _gap)
@@ -254,26 +255,42 @@ async def test_goal_verify_off_by_default_skips_the_gate(monkeypatch):
     assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
 
 
-async def test_verify_goal_parses_pass_and_fail(monkeypatch):
+async def test_verify_goal_requires_a_test_deterministically(monkeypatch):
+    """The gate is path-based — no LLM, no diff. A code change with no test file → gap;
+    with a test → pass; docs/config-only → pass. Immune to diff truncation (the bug that
+    made the old LLM verifier false-reject tests that sorted past the cap)."""
     loop = BoardLoop({"goal_verify": True})
 
-    async def _git(repo, *args, timeout=60):
-        return (0, "diff --git a/calc.py b/calc.py\n+def multiply(a, b):\n+    return a * b", "")
+    def _git_listing(names):
+        async def _git(wt, *args, timeout=60):
+            # `add -A` → empty; `diff --cached --name-only` → the changed-file list
+            return (0, names if "--name-only" in args else "", "")
 
-    monkeypatch.setattr(worktree, "_git", _git)
+        return _git
 
-    async def _pass(prompt, *, system=None, model_name=None):
-        return "PASS"
+    # code changed, NO test → gap
+    monkeypatch.setattr(worktree, "_git", _git_listing("inbox/store.py\ngraph/config.py"))
+    gap = await loop._verify_goal(FEATURE, "/wt", "main")
+    assert gap and "no test" in gap.lower()
 
-    monkeypatch.setattr("graph.sdk.complete", _pass)
+    # code changed WITH a test → pass (this is the case the old verifier wrongly blocked)
+    monkeypatch.setattr(worktree, "_git", _git_listing("inbox/store.py\ntests/test_inbox.py"))
     assert await loop._verify_goal(FEATURE, "/wt", "main") is None
 
-    async def _fail(prompt, *, system=None, model_name=None):
-        return "FAIL\nAC #2 unmet: no error handling"
+    # code changed, no test, but the coder declared NO_TEST_NEEDED → pass (escape hatch)
+    monkeypatch.setattr(worktree, "_git", _git_listing("inbox/store.py"))
+    reply = "Pure rename refactor.\nNO_TEST_NEEDED: behavior unchanged, covered by existing tests"
+    assert await loop._verify_goal(FEATURE, "/wt", "main", reply) is None
+    # ...but without the declaration, the same change is still a gap
+    assert await loop._verify_goal(FEATURE, "/wt", "main", "I changed inbox/store.py") is not None
 
-    monkeypatch.setattr("graph.sdk.complete", _fail)
-    gap = await loop._verify_goal(FEATURE, "/wt", "main")
-    assert gap and "AC #2" in gap
+    # docs/config only → pass (no code change → no test required)
+    monkeypatch.setattr(worktree, "_git", _git_listing("README.md\ndocs/x.md\nconfig.yaml"))
+    assert await loop._verify_goal(FEATURE, "/wt", "main") is None
+
+    # empty diff → None (open_pr's NoChangesError job, not the gate's)
+    monkeypatch.setattr(worktree, "_git", _git_listing(""))
+    assert await loop._verify_goal(FEATURE, "/wt", "main") is None
 
 
 async def test_verify_goal_fails_open_when_no_criteria(monkeypatch):
