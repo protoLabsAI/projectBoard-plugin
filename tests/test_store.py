@@ -248,6 +248,19 @@ def test_claim_returns_none_on_a_claim_race(make_board, monkeypatch):
     assert b.claim("bd-5") is None  # br --claim rejected → lost the race
 
 
+def test_flag_blocked_clears_the_assignee(make_board, monkeypatch):
+    """A blocked feature is unassigned with the block so a later reset-to-ready can be
+    re-claimed: `br update --claim` rejects an already-assigned bead, which was a SILENT
+    no-claim trap (loop ticks forever, never claims, logs nothing) — the 2026-06-15 debug."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid})
+    monkeypatch.setattr(b, "_comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-9", "boom")
+    assert ("update", "bd-9", "--add-label", "blocked", "--assignee", "") in br.calls
+
+
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
 
 

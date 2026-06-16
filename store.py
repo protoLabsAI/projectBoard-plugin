@@ -212,8 +212,17 @@ class BeadsBoard:
             return None
         try:
             self._run("update", fid, "--claim", "--remove-label", LABEL_READY)
-        except BoardError:
-            return None  # raced — `br --claim` rejects an already-assigned bead
+        except BoardError as exc:
+            # `br --claim` rejects an already-assigned bead. This was a SILENT skip (the
+            # loop never claims + logs nothing — a nasty trap); log it so it's visible.
+            log.info(
+                "[project_board] %s not claimable (likely already assigned — "
+                'clear with `br update %s --assignee ""`): %s',
+                fid,
+                fid,
+                exc,
+            )
+            return None
         if assignee:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
@@ -281,7 +290,12 @@ class BeadsBoard:
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
     def flag_blocked(self, fid: str, reason: str) -> dict:
         self._require(fid)
-        self._run("update", fid, "--add-label", LABEL_BLOCKED)
+        # Clear the assignee with the block: `br update --claim` rejects an already-
+        # assigned bead, so a later reset-to-ready would be SILENTLY un-claimable (the
+        # loop ticks forever, never claims, logs nothing). A blocked feature is terminal
+        # until requeued, so dropping the assignee here is safe — and lets a requeue
+        # (`--status open --add-label ready`) be re-claimed without a manual unassign.
+        self._run("update", fid, "--add-label", LABEL_BLOCKED, "--assignee", "")
         if reason:
             self._comment(fid, f"blocked: {reason}")
         return self.get_feature(fid)
