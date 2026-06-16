@@ -436,6 +436,7 @@ class BoardLoop:
         tier = store.current_tier(fid) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
+        keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
         try:
             while True:
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
@@ -447,8 +448,15 @@ class BoardLoop:
                 if coder is None:
                     store.flag_blocked(fid, f"coder delegate {coder_name!r} not configured/enabled")
                     return
-                # Fresh worktree per attempt (a failed attempt may leave partial work).
-                wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
+                # A goal-fix retry REUSES the worktree — the implementation is already
+                # there, the coder just adds what the reviewer flagged (usually tests).
+                # Rebuilding on a fresh worktree throws the impl away (the coder then
+                # spends its budget re-implementing and never reaches the tests — the
+                # bd-2fd/bd-3cj block). Otherwise: a fresh worktree per attempt.
+                if keep_wt and wt is not None:
+                    keep_wt = False  # consume the reuse
+                else:
+                    wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
                 self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                 try:
                     result = await worktree.dispatch_coder(
@@ -468,21 +476,26 @@ class BoardLoop:
                             n = self._goal_fix_attempts.get(fid, 0)
                             if n < self.goal_fix_max:
                                 self._goal_fix_attempts[fid] = n + 1
+                                # KEEP the worktree (the impl is in its files); the coder
+                                # only ADDS what the reviewer flagged. The diff is on disk,
+                                # so don't also carry it as prompt text (redundant/confusing).
+                                self._ci_prior_diff.pop(fid, None)
                                 self._ci_feedback[fid] = (
-                                    "A reviewer REJECTED your previous diff before it could open a "
-                                    f"PR — keep the working code and fix this: {gap}"
+                                    "Your implementation from the previous attempt is ALREADY in this "
+                                    "worktree's files. A reviewer rejected it before it could open a PR "
+                                    f"for: {gap}. ADD what's missing to the existing files (usually the "
+                                    "tests) — do NOT rewrite or delete the working implementation. Then stop."
                                 )
                                 log.info(
-                                    "[project_board] %s goal-verify gap — re-dispatch %d/%d (tier=%s): %s",
+                                    "[project_board] %s goal-verify gap — re-dispatch %d/%d (tier=%s, keep worktree): %s",
                                     fid,
                                     n + 1,
                                     self.goal_fix_max,
                                     tier or "default",
                                     gap,
                                 )
-                                await worktree.remove_worktree(repo, wt, branch or "")
-                                self._inflight.pop(fid, None)
-                                continue  # same tier, fresh worktree, gap carried into the prompt
+                                keep_wt = True  # reuse the worktree (impl intact) on the retry
+                                continue
                             raise worktree.WorktreeError(f"goal verification failed: {gap}")
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
