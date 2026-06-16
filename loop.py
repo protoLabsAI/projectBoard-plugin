@@ -35,13 +35,20 @@ from .store import BoardError, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
-_GOAL_VERIFY_SYS = (
-    "You are a strict code reviewer verifying a diff against acceptance criteria. "
-    "Only answer PASS if EVERY criterion is demonstrably met by the diff; otherwise FAIL. "
-    "Treat automated test coverage as a MANDATORY criterion even when it is not listed: "
-    "if the diff changes code behavior but adds or updates no test that exercises that "
-    "behavior, answer FAIL. Pure docs/config/comment changes are exempt."
-)
+# Deterministic test-coverage gate (path-based — no LLM, no diff). A code change must
+# ship a test; checking the changed-file LIST is instant and immune to the truncation
+# that made the old LLM-eyeballs-the-diff verifier false-reject tests it couldn't see.
+_TEST_PATH_RE = re.compile(r"(^|/)tests?/|(^|/)(test_[^/]+|conftest)\.py$|(^|/)[^/]+_test\.py$|\.(test|spec)\.[jt]sx?$")
+_CODE_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".go", ".rs")
+
+
+def _is_test_path(p: str) -> bool:
+    return bool(_TEST_PATH_RE.search(p))
+
+
+def _is_code_path(p: str) -> bool:
+    return p.endswith(_CODE_EXTS)
+
 
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
@@ -61,11 +68,12 @@ class BoardLoop:
         # the merge webhook gate it. Turn this on only for repos NOT covered by a
         # PR-review pipeline (then a reachable `reviewer` a2a delegate is required).
         self.review_dispatch = bool(self.cfg.get("review_dispatch", False))
-        # Goal-verification gate (OPT-IN, default off). When on, an independent model
-        # call checks the coder's diff against the feature's acceptance_criteria BEFORE
-        # opening the PR — catching a plausible-but-wrong or partial diff early, where a
-        # FAIL escalates/blocks instead of opening a PR for unfinished work. Borrowed
-        # from MiMo-Code's long-horizon harness. Adds one model call + latency per drive.
+        # Goal-verification gate (OPT-IN, default off). When on, a DETERMINISTIC pre-PR
+        # check (no LLM, no diff dump): a code change must ship a test — CI runs tests but
+        # can't require their presence, so the gate does. A miss → re-dispatch/escalate
+        # instead of opening a testless PR; correctness itself is CI's job. (Was an
+        # LLM-eyeballs-the-diff check — it false-rejected tests it couldn't see past the
+        # diff truncation, burning whole tier ladders on phantom gaps; see _verify_goal.)
         self.goal_verify = bool(self.cfg.get("goal_verify", False))
         # Max-Mode (MiMo Tier-2, OPT-IN, default 1 = off). When >1, a hard feature is
         # attempted with N parallel candidates and `_judge_candidates` picks the best
@@ -466,7 +474,7 @@ class BoardLoop:
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
                     if self.goal_verify:
-                        gap = await self._verify_goal(feature, wt, base)
+                        gap = await self._verify_goal(feature, wt, base, result or "")
                         if gap:
                             # A goal-verify gap (e.g. the coder skipped tests) is
                             # fixable by the SAME coder told what's missing — not a
@@ -598,54 +606,49 @@ class BoardLoop:
             return None
         return d
 
-    async def _verify_goal(self, feature: dict, wt: str, base: str) -> str | None:
-        """MiMo-style goal verification: an independent model call checks the
-        worktree diff against the feature's ``acceptance_criteria``. Returns a short
-        gap string when the work doesn't satisfy the criteria, else ``None``.
+    async def _verify_goal(self, feature: dict, wt: str, base: str, coder_reply: str = "") -> str | None:
+        """Pre-PR gate — DETERMINISTIC: no LLM, no diff dump. The one thing it adds over
+        CI is requiring a test to EXIST for a code change (CI runs tests but can't require
+        their presence). So it just checks the changed-file LIST for a test file — cheap,
+        instant, and immune to the truncation that made the old "LLM eyeballs the diff"
+        version false-reject tests it couldn't see (smart/reasoning/opus each "failed" on
+        tests they'd actually written — tests sort LAST by path and fell off the cap, ~40
+        min of cycles wasted). CORRECTNESS is CI's job — it runs the tests the coder wrote;
+        a wrong diff fails CI and the CI-feedback edge bounces it back.
 
-        Best-effort and **fails open** (returns ``None``) when there are no criteria,
-        no diff, or the verifier itself errors — so it never blocks a good PR on infra.
-        Uses the host's bare one-shot LLM primitive (``graph.sdk.complete``)."""
+        ESCAPE HATCH: not every code change needs a test (a pure refactor, config/docs-as-
+        code, a constant tweak). The coder — which saw the actual change — can declare
+        ``NO_TEST_NEEDED: <reason>`` in its reply; we log the reason and pass, rather than
+        burning retries on a test that doesn't apply. Returns a gap string (→ re-dispatch/
+        escalate) or None. Fails OPEN on any error (never blocks a good PR on infra)."""
         ac = (feature.get("acceptance_criteria") or "").strip()
         if not ac:
             return None
         try:
             await worktree._git(wt, "add", "-A")
-            _rc, diff, _err = await worktree._git(wt, "diff", "--cached", f"origin/{base}")
-        except Exception:  # noqa: BLE001 — verification is best-effort
+            _rc, names, _err = await worktree._git(wt, "diff", "--cached", "--name-only", f"origin/{base}")
+        except Exception:  # noqa: BLE001 — best-effort
             return None
-        if not (diff or "").strip():
+        changed = [n for n in (names or "").split() if n]
+        if not changed:
             return None  # an empty diff is open_pr's NoChangesError job, not ours
-        files = ", ".join(feature.get("files_to_modify") or []) or "(unspecified)"
-        prompt = (
-            f"A coding agent was asked to satisfy these acceptance criteria:\n\n{ac}\n\n"
-            f"Declared files to modify: {files}\n\n"
-            f"Its diff:\n\n```diff\n{diff[:8000]}\n```\n\n"
-            "Does the diff satisfy EVERY acceptance criterion AND include automated "
-            "tests covering the changed behavior? Reply with PASS or FAIL on the first "
-            "line. If FAIL, add one line naming the specific unmet criterion or the "
-            "missing test coverage."
-        )
-        try:
-            from graph.sdk import complete
-
-            verdict = (await complete(prompt, system=_GOAL_VERIFY_SYS) or "").strip()
-        except Exception as exc:  # noqa: BLE001 — never block a PR on a verifier error
-            log.warning(
-                "[project_board] %s goal-verify errored (failing open): %s",
-                feature.get("id"),
-                exc,
+        code = [n for n in changed if _is_code_path(n) and not _is_test_path(n)]
+        if code and not any(_is_test_path(n) for n in changed):
+            if "NO_TEST_NEEDED" in (coder_reply or ""):
+                reason = (coder_reply.split("NO_TEST_NEEDED", 1)[1].lstrip(": ").splitlines() or [""])[0].strip()
+                log.info(
+                    "[project_board] %s no-test accepted (coder declared): %s",
+                    feature.get("id"),
+                    reason[:200] or "(no reason given)",
+                )
+                return None
+            head = ", ".join(code[:6]) + ("…" if len(code) > 6 else "")
+            return (
+                "no test was added/updated for the code change — add a test covering the new "
+                f"behavior, or declare `NO_TEST_NEEDED: <reason>` if a test genuinely doesn't "
+                f"apply (refactor/config/docs) (code: {head})"
             )
-            return None
-        lines = [ln.strip() for ln in verdict.splitlines() if ln.strip()]
-        if not lines or lines[0].upper().startswith("PASS"):
-            return None
-        gap = " ".join(lines[1:]).strip() or lines[0]
-        # Stash the rejected diff so a re-dispatch carries it forward: under
-        # fresh-both the coder rebuilds from scratch, and the prior diff + the gap
-        # tell it what to add (esp. the missing tests it skipped).
-        self._ci_prior_diff[feature.get("id", "")] = diff[:8000]
-        return gap[:300]
+        return None
 
     async def _judge_candidates(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
         """Max-Mode best-of-N judge: given N candidate worktrees for the same feature,
@@ -748,7 +751,9 @@ class BoardLoop:
             f"- **Write automated tests** covering the new/changed behavior (a new or "
             f"updated test file, matching the repo's existing test conventions). This is "
             f"part of the definition of done, not optional — a code change with no test "
-            f"will be rejected before the PR opens.\n"
+            f"is rejected before the PR opens. If a test GENUINELY doesn't apply (a pure "
+            f"refactor, config/docs-as-code, or a change with no behavior to exercise), "
+            f"write a single line `NO_TEST_NEEDED: <reason>` in your final message instead.\n"
             f"- You cannot run shell commands (edit-only); the tests you write run in CI "
             f"on the PR, so they must be correct and self-contained.\n"
             f"- You are done when the listed files exist, tests cover the change, and "
