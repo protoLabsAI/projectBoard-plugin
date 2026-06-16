@@ -390,10 +390,15 @@ class BoardLoop:
         - **Carry the lesson forward** — inject the CI failure summary AND the prior
           attempt's diff into the next prompt (fresh-both keeps a fresh session, but
           the coder sees what it tried and why it failed).
-        - **Escalate the model** — with a `coders` ladder configured, climb a tier per
-          CI failure (fast→smart→reasoning); the ladder itself is the bound (top tier
-          fails → Blocked). Without a ladder, fall back to a same-tier retry capped by
-          ``ci_fix_max``.
+        - **Same-tier fix, THEN escalate** — a red check is usually a fixable nit (a
+          lint error, a golden-map update, a flaky assertion) the current tier can
+          self-correct once it SEES the error, not a model-capability ceiling. So
+          spend ``ci_fix_max`` same-tier retries first; only when those are exhausted
+          does a configured `coders` ladder climb a tier (smart→reasoning→opus, the
+          ladder is the bound → top tier fails → Blocked). Without a ladder the
+          exhausted budget blocks directly. (Escalating on the FIRST failure burned
+          the expensive tiers on one-line lint fixes — the goal-fix budget already
+          learned this lesson; the CI path now mirrors it.)
 
         Passing/pending/no-checks → left in review (the merge edge resolves it)."""
         status, summary = await worktree.pr_ci_status(pr_url, cwd=repo)
@@ -409,33 +414,40 @@ class BoardLoop:
             self._ci_prior_diff.pop(fid, None)
             self._ci_fix_attempts.pop(fid, None)
 
-        # Escalation ladder (preferred): each CI failure climbs a model tier.
+        # Same-tier CI-fix budget FIRST (both ladder and single-coder): a red check
+        # is usually a fixable nit the current tier can correct once it sees the
+        # error — don't burn a stronger model on a one-line lint fix. The CI error +
+        # prior diff are already injected above, so the re-dispatch improves on the
+        # last try rather than repeating it.
+        attempts = self._ci_fix_attempts.get(fid, 0)
+        if attempts < self.ci_fix_max:
+            self._ci_fix_attempts[fid] = attempts + 1
+            store.requeue(fid)
+            log.info(
+                "[project_board] reconcile → same-tier CI-fix (attempt %d/%d): %s",
+                attempts + 1,
+                self.ci_fix_max,
+                fid,
+            )
+            return
+
+        # Same-tier budget exhausted. With a ladder, climb a model tier and reset the
+        # per-tier budget so the new rung gets its own fix attempts; without one, block.
         if self.escalation_on:
             nxt = store.escalate(fid, f"CI failed: {summary.splitlines()[0] if summary else 'checks red'}")
             if not nxt:
-                _block(f"CI failing at the top model tier — needs triage: {pr_url}")
+                _block(f"CI failing at the top model tier after {attempts} same-tier fix(es) — needs triage: {pr_url}")
                 await worktree.reap_feature_worktree(repo, self.root, fid)
                 log.warning("[project_board] reconcile → blocked (CI fails at top tier): %s", fid)
                 return
+            self._ci_fix_attempts.pop(fid, None)  # fresh same-tier budget at the new rung
             store.requeue(fid)
             log.info("[project_board] reconcile → escalate to %s + re-dispatch (CI failed): %s", nxt, fid)
             return
 
-        # No ladder (single coder): bounded same-tier retry with the lesson carried.
-        attempts = self._ci_fix_attempts.get(fid, 0)
-        if attempts >= self.ci_fix_max:
-            _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
-            await worktree.reap_feature_worktree(repo, self.root, fid)
-            log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
-            return
-        self._ci_fix_attempts[fid] = attempts + 1
-        store.requeue(fid)
-        log.info(
-            "[project_board] reconcile → re-dispatch (CI failed, attempt %d/%d): %s",
-            attempts + 1,
-            self.ci_fix_max,
-            fid,
-        )
+        _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
+        await worktree.reap_feature_worktree(repo, self.root, fid)
+        log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
 
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
