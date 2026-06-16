@@ -167,7 +167,40 @@ async def test_goal_verify_pass_opens_the_pr(monkeypatch):
     assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
 
 
-async def test_goal_verify_fail_skips_pr_and_blocks(monkeypatch):
+async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
+    """A goal-verify gap (e.g. missing tests) re-dispatches the SAME coder with the
+    gap carried into the prompt — and opens the PR once the coder fixes it."""
+    calls = {"n": 0}
+
+    async def _verify(self, feature, wt, base):
+        calls["n"] += 1
+        return "missing tests for the new behavior" if calls["n"] == 1 else None  # gap once, then PASS
+
+    monkeypatch.setattr(BoardLoop, "_verify_goal", _verify)
+    dispatched = []
+
+    async def _disp(c, wt, prompt, *, timeout=None):
+        dispatched.append(prompt)
+        return "reply"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/77"
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_disp,
+        cfg={"coder": "proto", "goal_verify": True, "goal_fix_max": 2},
+    )
+    assert ("open_review", "bd-1", "https://example/pr/77") in store.calls  # opened after the retry
+    assert len(dispatched) == 2  # initial + 1 same-tier re-dispatch
+    assert "REJECTED" in dispatched[1] and "missing tests" in dispatched[1]  # gap carried into the retry prompt
+    assert loop._goal_fix_attempts.get("bd-1") is None  # reset once the gate passes
+
+
+async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
+    """A persistent gap exhausts goal_fix_max same-tier retries, then blocks — no PR."""
+
     async def _gap(self, feature, wt, base):
         return "AC #1 unmet: multiply() missing"
 
@@ -178,10 +211,21 @@ async def test_goal_verify_fail_skips_pr_and_blocks(monkeypatch):
         opened.append(True)
         return "https://example/pr/x"
 
-    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True})
+    dispatched = []
+
+    async def _disp(c, wt, prompt, *, timeout=None):
+        dispatched.append(prompt)
+        return "reply"
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_disp,
+        cfg={"coder": "proto", "goal_verify": True, "goal_fix_max": 2},
+    )
     assert not opened  # the gate stopped the PR from being opened
-    # A gap is a capability failure → single coder (no ladder) → block, no PR.
-    assert "flag_blocked" in store.names()
+    assert len(dispatched) == 3  # initial + goal_fix_max (2) same-tier retries
+    assert "flag_blocked" in store.names()  # then blocked for triage
     assert "open_review" not in store.names()
 
 
@@ -582,11 +626,11 @@ async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
 def test_build_prompt_injects_ci_feedback_and_prior_diff():
     loop = BoardLoop({})
     feature = {"id": "bd-ci", "title": "T", "spec": "do it", "acceptance_criteria": "AC", "files_to_modify": ["a.py"]}
-    assert "previous PR FAILED CI" not in loop._build_prompt(feature)  # none stored → no block
+    assert "previous attempt was REJECTED" not in loop._build_prompt(feature)  # none stored → no block
     loop._ci_feedback["bd-ci"] = "Failing checks:\n- Web E2E: FAILURE\nelement not found"
     loop._ci_prior_diff["bd-ci"] = "--- a/x.tsx\n+++ b/x.tsx\n+ bad code"
     prompt = loop._build_prompt(feature)
-    assert "previous PR FAILED CI" in prompt
+    assert "previous attempt was REJECTED" in prompt
     assert "element not found" in prompt
     assert "bad code" in prompt  # the prior diff is carried forward
 
