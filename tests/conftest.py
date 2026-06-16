@@ -43,7 +43,11 @@ if "graph" not in sys.modules:
     async def _unpatched_complete(*_a, **_k):  # pragma: no cover — tests must patch this
         raise RuntimeError("graph.sdk.complete must be monkeypatched in tests")
 
+    async def _default_knowledge_search(*_a, **_k):
+        return []  # default: no lessons (tests patch this to inject hits)
+
     _graph_sdk.complete = _unpatched_complete
+    _graph_sdk.knowledge_search = _default_knowledge_search
     _graph.sdk = _graph_sdk
     sys.modules["graph"] = _graph
     sys.modules["graph.sdk"] = _graph_sdk

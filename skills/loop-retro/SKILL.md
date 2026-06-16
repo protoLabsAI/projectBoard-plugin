@@ -3,17 +3,20 @@ name: loop-retro
 description: >-
   Use to run a retro on the coding loop's own track record and distill the lessons
   into durable grounding. Mines the board's attempt/outcome history (board_retro) for
-  RECURRING failure classes + flow stats, then PROPOSES concise, actionable gotchas
-  for the repo's agent-instructions file (PROTO.md) in a dated retro report — so future
-  coders stop repeating known failures. The self-improving half of the flywheel.
+  RECURRING failure classes + flow stats, then (a) WRITES each new lesson to the
+  knowledge graph (domain "loop-lessons") — which the coding loop injects into coder
+  prompts at build time — and (b) PROPOSES the same gotchas for PROTO.md in a dated
+  retro report for a human to apply. The self-improving half of the flywheel.
   Runs unsupervised on a schedule (the dream/distill pattern) — it PROPOSES, it does
   not auto-edit PROTO.md or commit; a human applies the report. Does NOT write code.
 tools:
-  - board_retro    # the mined digest: recurring failure classes + rates + blocked features
-  - read_file      # read the current PROTO.md (don't re-propose what's already grounded)
-  - find_files     # locate PROTO.md / the agent-instructions file
-  - write_file     # write the dated retro report (the proposal); never PROTO.md itself
-  - check_inbox    # (optional) if an inbox exists, leave a note pointing at the report
+  - board_retro      # the mined digest: recurring failure classes + rates + blocked features
+  - read_file        # read the current PROTO.md (don't re-propose what's already grounded)
+  - find_files       # locate PROTO.md / the agent-instructions file
+  - write_file       # write the dated retro report (the proposal); never PROTO.md itself
+  - memory_recall    # check the loop-lessons KG bucket so you don't write a duplicate
+  - memory_remember  # write each NEW lesson to the KG (domain "loop-lessons") — coders read it
+  - check_inbox      # (optional) if an inbox exists, leave a note pointing at the report
 ---
 
 # Loop retro → propose lessons for PROTO.md
@@ -67,20 +70,34 @@ NOT edit PROTO.md or commit anything. **You never write code.**
    Do NOT edit PROTO.md and do NOT commit — the report IS the proposal; a human (or an
    interactive follow-up) applies it. (The agent has no git anyway.)
 
-6. **Notify + report.** If `check_inbox`/an inbox is available, leave a one-line note
-   pointing at the report path. Then summarize to the caller: the headline stats, what
-   you proposed, and — most important — any class **recurring despite already being
-   grounded**: call that out as "needs a mechanism/loop fix (a real bug or missing
-   guardrail), not another doc line." That signal is the flywheel telling you the
-   *codebase or the loop* must change, not the grounding.
+6. **Write the lessons to the knowledge graph.** This is what reaches the coders —
+   the loop injects relevant `loop-lessons` chunks into each coder's prompt at build
+   time. For each NEW lesson (the step-4 bullets):
+   - **Dedup first:** `memory_recall` the lesson's key phrase scoped to the
+     `loop-lessons` domain. If a near-identical chunk already exists, SKIP it.
+   - **Write it:** `memory_remember` the gotcha with `domain="loop-lessons"` and a
+     `heading` = the failure class. Keep the body self-contained (the failure + the
+     fix + the file/command) — a coder sees only this chunk, not the whole report.
+   Unlike PROTO.md (which a human applies), the KG write is safe to do unsupervised:
+   it's additive, deduped, searchable, and decays via normal memory curation.
+
+7. **Notify + report.** If `check_inbox`/an inbox is available, leave a one-line note
+   pointing at the report path. Then summarize to the caller: the headline stats, how
+   many lessons you wrote to the KG, and — most important — any class **recurring
+   despite already being grounded**: call that out as "needs a mechanism/loop fix (a
+   real bug or missing guardrail), not another doc line." That signal is the flywheel
+   telling you the *codebase or the loop* must change, not the grounding.
 
 ## Rules
-- **Propose, never apply.** Unsupervised → write the report only; never edit PROTO.md
-  or commit. A human (or an explicit, supervised follow-up) applies the additions.
-- **Recurring only** (`count >= 2`); rank by count; never propose the `other` bucket.
-- **Don't re-propose** an existing PROTO.md lesson — read it first.
+- **PROTO.md: propose, never apply.** Unsupervised → write the report only; never edit
+  PROTO.md or commit. **The KG: write directly** (deduped) — it's additive + searchable
+  + the channel that reaches coders, so it doesn't need the human gate PROTO.md does.
+- **Recurring only** (`count >= 2`); rank by count; never propose/write the `other` bucket.
+- **Dedup the KG** (`memory_recall` before `memory_remember`) and **don't re-propose** an
+  existing PROTO.md lesson — read both first.
 - **Name specifics** (file, command, the golden structures) — a vague gotcha is noise.
 - **Trends are the point:** a class that recurs *after* grounding is an escalation to a
   mechanism fix — surface it, don't re-document it.
-- File-grounding (PROTO.md) is the channel today; writing lessons into the searchable
-  knowledge graph is a planned follow-up (needs the plugin↔knowledge channel).
+- Two channels, complementary: **PROTO.md** = always-on baseline every worktree carries
+  (human-applied); the **knowledge graph** (`loop-lessons`) = searchable + injected
+  per-feature into coder prompts by the loop (you write it here).

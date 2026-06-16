@@ -188,6 +188,15 @@ class BoardLoop:
         self.local_gate_max = max(0, int(self.cfg.get("local_gate_max", 2)))
         self.local_gate_timeout = float(self.cfg.get("local_gate_timeout_s", 600))
         self.local_gate_output_chars = max(500, int(self.cfg.get("local_gate_output_chars", 4000)))
+        # KG lessons (the flywheel READ half): before dispatching a coder, query the
+        # knowledge graph (via graph.sdk) for distilled lessons relevant to THIS feature
+        # and inject them into the prompt — so the coder heeds this area's known failure
+        # modes on attempt 1. The loop-retro writes those lessons (domain `loop-lessons`).
+        # Best-effort: any SDK/store error → no injection (never blocks a build). Off when
+        # kg_lessons is false or no store is configured.
+        self.kg_lessons = bool(self.cfg.get("kg_lessons", True))
+        self.kg_lessons_k = max(1, int(self.cfg.get("kg_lessons_k", 3)))
+        self.kg_lessons_domain = str(self.cfg.get("kg_lessons_domain", "loop-lessons")).strip()
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -586,8 +595,10 @@ class BoardLoop:
             while True:
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
-                # _ci_feedback + _ci_prior_diff.
-                prompt = self._build_prompt(feature)
+                # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
+                # from the KG (best-effort, async) and inject them — the flywheel READ.
+                lessons = await self._fetch_kg_lessons(feature)
+                prompt = self._build_prompt(feature, lessons=lessons)
                 coder_name = self.coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
@@ -929,10 +940,48 @@ class BoardLoop:
                 return idx
         return nonempty[0]  # judge unclear → first non-empty candidate
 
-    def _build_prompt(self, feature: dict) -> str:
+    async def _fetch_kg_lessons(self, feature: dict) -> str:
+        """Query the knowledge graph (via graph.sdk) for lessons relevant to THIS
+        feature — the read half of the flywheel. Builds the query from the feature's
+        title + files (the area it touches), pulls the top-``kg_lessons_k`` chunks from
+        the ``kg_lessons_domain`` bucket, and returns them as a markdown bullet list for
+        ``_build_prompt`` to inject. Best-effort: returns "" if disabled, no store, no
+        SDK, or any error — a retrieval hiccup must never block a build."""
+        if not self.kg_lessons:
+            return ""
+        query = " ".join(
+            p
+            for p in (
+                feature.get("title", ""),
+                " ".join(feature.get("files_to_modify") or []),
+                feature.get("difficulty", ""),
+            )
+            if p
+        ).strip()
+        if not query:
+            return ""
+        try:
+            from graph.sdk import knowledge_search
+
+            hits = await knowledge_search(query, k=self.kg_lessons_k, domain=self.kg_lessons_domain or None)
+        except Exception as exc:  # noqa: BLE001 — retrieval is best-effort; never block a build
+            log.info("[project_board] kg-lessons fetch skipped (%s)", exc)
+            return ""
+        lines = []
+        for h in hits or []:
+            text = (h.get("preview") or h.get("content") or "").strip()
+            if text:
+                lines.append(f"- {text}")
+        return "\n".join(lines)
+
+    def _build_prompt(self, feature: dict, lessons: str = "") -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
-        nothing; naming the files + a direct 'make the edits now' makes it act."""
+        nothing; naming the files + a direct 'make the edits now' makes it act.
+
+        ``lessons`` (distilled gotchas from the knowledge graph, fetched async in
+        ``_drive``) is injected so a coder gets this area's known failure modes on
+        attempt 1 — the read half of the flywheel (retro grounds → coder heeds)."""
         files = feature.get("files_to_modify") or []
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
@@ -962,6 +1011,11 @@ class BoardLoop:
             if ci
             else ""
         )
+        lessons_block = (
+            f"\n## Known gotchas for this area (distilled from past retros — heed them)\n{lessons.strip()}\n"
+            if lessons.strip()
+            else ""
+        )
         return (
             f"You are implementing ONE feature in this repository. Your working "
             f"directory is an isolated git worktree — **make all the edits here, now**. "
@@ -969,6 +1023,7 @@ class BoardLoop:
             f"make the most reasonable choice and write the code.\n\n"
             f"# {feature['title']}\n\n"
             f"{ci_block}"
+            f"{lessons_block}"
             f"## Task\n{feature.get('spec', '')}\n\n"
             f"## Files to create / modify\n{files_block}\n"
             f"{design_block}\n"
