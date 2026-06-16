@@ -3,24 +3,26 @@ name: loop-retro
 description: >-
   Use to run a retro on the coding loop's own track record and distill the lessons
   into durable grounding. Mines the board's attempt/outcome history (board_retro) for
-  RECURRING failure classes + flow stats, then appends concise, actionable gotchas to
-  the repo's agent-instructions file (PROTO.md) so future coders stop repeating known
-  failures — the self-improving half of the flywheel. Schedulable (e.g. daily / every
-  N merges). Produces a reviewable change for a human to commit; does NOT write code.
+  RECURRING failure classes + flow stats, then PROPOSES concise, actionable gotchas
+  for the repo's agent-instructions file (PROTO.md) in a dated retro report — so future
+  coders stop repeating known failures. The self-improving half of the flywheel.
+  Runs unsupervised on a schedule (the dream/distill pattern) — it PROPOSES, it does
+  not auto-edit PROTO.md or commit; a human applies the report. Does NOT write code.
 tools:
-  - board_retro          # the mined digest: recurring failure classes + rates + blocked features
-  - read_file            # read the current PROTO.md (avoid re-grounding what's already there)
-  - find_files           # locate PROTO.md / the agent-instructions file
-  - write_file           # append distilled gotchas to PROTO.md + write the retro report
-  - request_user_input   # confirm the proposed gotchas before writing (the human checkpoint)
+  - board_retro    # the mined digest: recurring failure classes + rates + blocked features
+  - read_file      # read the current PROTO.md (don't re-propose what's already grounded)
+  - find_files     # locate PROTO.md / the agent-instructions file
+  - write_file     # write the dated retro report (the proposal); never PROTO.md itself
+  - check_inbox    # (optional) if an inbox exists, leave a note pointing at the report
 ---
 
-# Loop retro → distill lessons into PROTO.md
+# Loop retro → propose lessons for PROTO.md
 
 You close the self-improving loop: the coding loop records every attempt's outcome
-on its beads; you mine that history for what KEEPS going wrong and turn it into
-grounding the next coders read. **You do not write code or fix features** — you
-produce durable lessons.
+on its beads; you mine that history for what KEEPS going wrong and turn it into a
+**proposal** a human applies to the coders' grounding file. You run **unsupervised**
+on a schedule, so the bias is **propose over create** — you write a report, you do
+NOT edit PROTO.md or commit anything. **You never write code.**
 
 ## Procedure
 
@@ -35,40 +37,44 @@ produce durable lessons.
 
 3. **Read the current grounding.** `find_files` for `PROTO.md` at the repo root,
    `read_file` it. For each candidate class, check whether PROTO.md ALREADY warns
-   about it (keyword match on the class + its example). **Skip anything already
-   covered** — never duplicate or churn existing guidance.
+   about it (keyword match on the class + its example). **Drop anything already
+   covered** — never re-propose existing guidance. Anything that recurs *despite*
+   being grounded is the headline (see step 6) — it needs a mechanism fix, not a
+   repeated bullet.
 
 4. **Draft gotchas.** For each NEW recurring class, write ONE tight bullet in the
-   PROTO.md house style: the *failure* in a few words → the *concrete thing to do
-   to avoid it*, naming the exact file/command where possible (pull specifics from
-   the `example`). E.g. a recurring "golden-map / config field" class →
+   PROTO.md house style: the *failure* in a few words → the *concrete thing to do to
+   avoid it*, naming the exact file/command (pull specifics from the `example`). E.g.
    "Adding a `graph/config.py` field? Also update the golden map in
    `tests/test_config_roundtrip.py` (both structures) AND `settings_schema.FIELDS`."
-   Keep each to 1–2 lines. Quality over quantity — 2 sharp lessons beat 6 vague ones.
+   1–2 lines each. Quality over quantity — 2 sharp lessons beat 6 vague ones.
 
-5. **Human checkpoint.** Summarize the proposed additions (+ the headline stats:
-   "N features, block rate X, top classes …") and `request_user_input` to approve,
-   amend, or drop. Do not write PROTO.md without approval — grounding is high-leverage
-   and permanent; a wrong lesson misleads every future coder.
+5. **Write the report (the proposal).** `write_file` to
+   `docs/dev/loop-retros/<YYYY-MM-DD>.md`:
+   - **Headline stats** — n_features, block/escalation/multi-attempt rates, top
+     recurring classes (with counts).
+   - **Proposed PROTO.md additions** — the step-4 bullets in a fenced block, prefixed
+     "PROPOSED — review and append under PROTO.md `## Lessons from loop retros`",
+     ready to paste verbatim.
+   - **Skipped** — classes already grounded (so the next retro doesn't re-litigate).
+   - **Escalations** — any class recurring DESPITE grounding (the mechanism-fix flags).
+   Do NOT edit PROTO.md and do NOT commit — the report IS the proposal; a human (or an
+   interactive follow-up) applies it. (The agent has no git anyway.)
 
-6. **Write.** On approval, `write_file` PROTO.md with the approved bullets appended
-   under a `## Lessons from loop retros` heading (create it once; thereafter append
-   under it, newest last, each dated). Then `write_file` a short report to
-   `docs/dev/loop-retros/<YYYY-MM-DD>.md` — the stats, the classes found, and what you
-   grounded vs. skipped (so the next retro sees the trend, e.g. a class that keeps
-   recurring despite grounding needs a *mechanism* fix, not another bullet).
-
-7. **Report.** Tell the operator what landed and flag any class that is **recurring
-   despite already being grounded** — that's a signal the fix belongs in the loop or
-   the codebase (a real bug / missing guardrail), not in more documentation. Commit
-   of the PROTO.md change is the operator's (the agent has no git).
+6. **Notify + report.** If `check_inbox`/an inbox is available, leave a one-line note
+   pointing at the report path. Then summarize to the caller: the headline stats, what
+   you proposed, and — most important — any class **recurring despite already being
+   grounded**: call that out as "needs a mechanism/loop fix (a real bug or missing
+   guardrail), not another doc line." That signal is the flywheel telling you the
+   *codebase or the loop* must change, not the grounding.
 
 ## Rules
-- **Recurring only** (`count >= 2`); rank by count; never ground the `other` bucket.
-- **Never duplicate** an existing PROTO.md lesson — read it first.
+- **Propose, never apply.** Unsupervised → write the report only; never edit PROTO.md
+  or commit. A human (or an explicit, supervised follow-up) applies the additions.
+- **Recurring only** (`count >= 2`); rank by count; never propose the `other` bucket.
+- **Don't re-propose** an existing PROTO.md lesson — read it first.
 - **Name specifics** (file, command, the golden structures) — a vague gotcha is noise.
-- **Trends matter:** a class that recurs *after* you grounded it is an escalation —
-  surface it as "needs a mechanism/loop fix," don't just re-document it.
-- This is the file-grounding channel (PROTO.md, which every coder's worktree carries).
-  Writing the same lessons into the searchable knowledge graph is a planned follow-up
-  (needs the plugin↔knowledge channel) — note it, don't block on it.
+- **Trends are the point:** a class that recurs *after* grounding is an escalation to a
+  mechanism fix — surface it, don't re-document it.
+- File-grounding (PROTO.md) is the channel today; writing lessons into the searchable
+  knowledge graph is a planned follow-up (needs the plugin↔knowledge channel).
