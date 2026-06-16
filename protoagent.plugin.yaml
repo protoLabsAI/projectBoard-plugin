@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.12.0
+version: 0.13.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -41,6 +41,18 @@ config:
   goal_fix_max: 2           # a goal-verify gap (e.g. missing tests) carries the gap as feedback
                             # + re-dispatches the SAME tier this many times before escalating/
                             # blocking — a missing-tests gap is fixable, not a capability failure.
+  local_gate_cmd: ""        # OPT-IN pre-PR gate. The repo's real check command(s) run in the
+                            # worktree AFTER fixups and BEFORE opening the PR (e.g.
+                            # "ruff check . && uv run --no-sync pytest tests/ -q"). The coder is
+                            # edit-only and can't run the suite, so failures on knowable facts
+                            # (lint, a golden-map test, a wrong column, version drift) otherwise
+                            # only surface in CI and thrash the bounce/escalation ladder. On
+                            # failure the SAME coder is handed the output to fix in-worktree
+                            # (keep-worktree) so the PR opens already-green. Empty = off.
+  local_gate_max: 2         # same-tier in-worktree fix attempts on a gate failure before the PR
+                            # opens ANYWAY (CI + ci_fix_max stay the backstop — a flaky or
+                            # misconfigured gate never blocks good work).
+  local_gate_timeout_s: 600 # hard cap on one gate run; a timeout degrades to "pass" (CI gates).
   max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 runs
                             # N coders on the same feature; a low-temp judge picks the diff that
                             # best satisfies acceptance_criteria. The N-parallel dispatch is WIP
