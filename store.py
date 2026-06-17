@@ -83,7 +83,11 @@ class BeadsBoard:
             cmd += ["--db", self.db]
         if want_json:
             cmd += ["--json"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # Run `br` IN the configured repo so its `.beads/*.db` auto-discovery resolves
+        # to THIS board's workspace, not the server's process cwd (ADR 0055 P0). With a
+        # per-team-agent `repo` (or an explicit `db`), the board is deterministically
+        # pinned to its repo instead of polluting whatever dir the host launched from.
+        proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             raise BoardError(f"`br {' '.join(args)}` failed: {proc.stderr.strip()[:300]}")
         if not want_json:
@@ -529,12 +533,19 @@ def escalation_enabled(cfg: dict) -> bool:
     return len({str(v) for v in coders.values()}) > 1
 
 
-# Process-wide singleton (the loop, API, and tools share one board).
-_BOARD: BeadsBoard | None = None
+# Board cache keyed by workspace (db, repo, base_branch). The loop, API, and tools
+# that share a workspace still share one BeadsBoard, but a DIFFERENT db/repo gets
+# its own — so a configured `db_path` actually pins the workspace and a config
+# reload with a new db gets a fresh board. The old single global ignored its kwargs
+# after the first call, collapsing every board onto whichever db the first caller
+# happened to use — defeating db_path and any per-instance isolation (ADR 0055 P0).
+_BOARDS: dict[tuple[str | None, str, str], BeadsBoard] = {}
 
 
 def get_store(db: str | None = None, **kw) -> BeadsBoard:
-    global _BOARD
-    if _BOARD is None:
-        _BOARD = BeadsBoard(db, **kw)
-    return _BOARD
+    key = (db or None, kw.get("repo", "."), kw.get("base_branch", "main"))
+    board = _BOARDS.get(key)
+    if board is None:
+        board = BeadsBoard(db, **kw)
+        _BOARDS[key] = board
+    return board
