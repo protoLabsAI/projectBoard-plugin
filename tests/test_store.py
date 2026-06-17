@@ -351,3 +351,57 @@ def test_ready_queue_relaxed_releases_only_nonfoundation_in_review_blockers(make
     # bd-dep2 (foundation blocker) and bd-dep3 (blocker only in_progress) stay gated.
     # The default gate adds nothing beyond `br ready` (empty here).
     assert b.ready_queue() == []
+
+
+# ── workspace pinning (ADR 0055 P0) ─────────────────────────────────────────────
+# The board must be deterministically pinned to ITS workspace (a configured `db` or
+# `repo`), not the host process's cwd — so a per-team-agent board (scale-out) writes
+# to its own repo's `.beads` and never pollutes the dir the server launched from.
+
+
+@pytest.fixture
+def _have_br(monkeypatch):
+    # BeadsBoard.__init__ refuses to build without the `br` CLI on PATH — stub it.
+    monkeypatch.setattr(store.shutil, "which", lambda _x: "/usr/bin/br")
+
+
+@pytest.fixture(autouse=True)
+def _clear_boards():
+    store._BOARDS.clear()
+    yield
+    store._BOARDS.clear()
+
+
+def test_get_store_keys_by_workspace(_have_br):
+    a1 = store.get_store(db="/tmp/a.db", repo="/repo/a")
+    a2 = store.get_store(db="/tmp/a.db", repo="/repo/a")
+    b = store.get_store(db="/tmp/b.db", repo="/repo/b")
+    assert a1 is a2  # same workspace → one shared board (loop/API/tools share it)
+    assert a1 is not b  # different db/repo → distinct board (db_path now genuinely pins)
+    assert a1.db == "/tmp/a.db" and a1.repo == "/repo/a"
+    assert b.db == "/tmp/b.db" and b.repo == "/repo/b"
+
+
+def test_get_store_distinguishes_repo_even_without_db(_have_br):
+    # No explicit db (auto-discovery), but two repos must NOT collapse onto one board.
+    assert store.get_store(repo="/repo/x") is not store.get_store(repo="/repo/y")
+
+
+def test_run_executes_in_the_configured_repo(monkeypatch, _have_br):
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        captured["cwd"] = kw.get("cwd")
+        return _Proc()
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    store.BeadsBoard(repo="/my/team/repo")._run("list")
+    assert captured["cwd"] == "/my/team/repo"  # br runs in the repo, not the host cwd
+
+    store.BeadsBoard()._run("list")
+    assert captured["cwd"] == "."  # default repo → process cwd, unchanged behavior
