@@ -71,6 +71,9 @@ class FakeStore:
     def clear_blocked(self, fid):
         return self._rec("clear_blocked", fid)
 
+    def cancel_feature(self, fid, reason=""):
+        return self._rec("cancel_feature", fid, reason)
+
     def bounce_ci_fail(self, fid, reason):
         return self._rec("bounce_ci_fail", fid, reason)
 
@@ -151,6 +154,20 @@ def test_ready_gate_rejection_surfaces_as_400(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     r = c.post("/api/plugins/project_board/features/bad/ready")
     assert r.status_code == 400 and "Ready gate" in r.json()["detail"]
+
+
+def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
+    """POST /features/{fid}/cancel — the second terminal edge (#47). Carries the
+    optional reason through; works with no body too."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "duplicate"})
+    assert r.status_code == 200
+    assert ("cancel_feature", ("bd-7", "duplicate"), {}) in store.calls
+    # No body → cancels with an empty reason (still a valid request, not a 422).
+    r2 = c.post("/api/plugins/project_board/features/bd-8/cancel")
+    assert r2.status_code == 200
+    assert ("cancel_feature", ("bd-8", ""), {}) in store.calls
 
 
 # ── the single Done edge: the merge webhook ─────────────────────────────────────

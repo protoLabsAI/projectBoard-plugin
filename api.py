@@ -222,4 +222,12 @@ def build_data_router(cfg: dict):
     async def _unblock(fid: str):
         return _guard(lambda: store().clear_blocked(fid))
 
+    @router.post("/features/{fid}/cancel")
+    async def _cancel(fid: str, body: dict = Body(default={})):
+        """Cancel a feature created in error — the second terminal edge (#47). Closes
+        the bead with an audit reason and tags it `cancelled` (a distinct state, not
+        `done`), so a bad decomposition/duplicate leaves the board cleanly instead of
+        being deleted out-of-band (which desyncs the board ↔ JSONL)."""
+        return _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
+
     return router
