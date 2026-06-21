@@ -253,6 +253,26 @@ def test_cancel_feature_unknown_id_raises(make_board, monkeypatch):
         b.cancel_feature("nope")
 
 
+def test_delete_feature_tombstones_with_reason(make_board, monkeypatch):
+    """The harder sibling of cancel: `br delete` (tombstone) with an audit reason, run
+    THROUGH the board so board↔JSONL stay in step. Returns the pre-delete snapshot."""
+    br = Br()
+    b = make_board(br)
+    snapshot = {"id": "bd-9", "board_state": "backlog", "title": "oops"}
+    monkeypatch.setattr(b, "get_feature", lambda fid: snapshot)
+    f = b.delete_feature("bd-9", "duplicate")
+    delete = next(c for c in br.calls if c[0] == "delete")
+    assert delete[:2] == ("delete", "bd-9") and "--reason" in delete and "deleted: duplicate" in delete
+    assert f == snapshot  # the API echoes what was removed
+
+
+def test_delete_feature_unknown_id_raises(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: None)
+    with pytest.raises(BoardError, match="unknown feature"):
+        b.delete_feature("nope")
+
+
 def test_mark_ready_rejects_a_feature_already_past_backlog(make_board, monkeypatch):
     b = make_board(Br())
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_progress"})

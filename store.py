@@ -351,6 +351,19 @@ class BeadsBoard:
         self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
         return self.get_feature(fid)
 
+    def delete_feature(self, fid: str, reason: str = "") -> dict:
+        """Hard-delete a feature (a `br` tombstone) — the harder sibling of
+        ``cancel_feature``. For a feature that should leave NO trace on the board (a pure
+        mistake / duplicate), vs a cancel which keeps a visible, reopenable `cancelled`
+        lane. Still goes THROUGH the board (not a raw `br` reach-around) so board ↔ JSONL
+        stay in step; `br delete` tombstones in the JSONL (recoverable) rather than
+        nuking history. Refuses (BoardError, via `br`'s non-zero exit) when the feature
+        has dependents — deleting it would orphan them; cancel or re-point them first.
+        Returns the deleted feature's last projection (the API echo)."""
+        f = self._require(fid)
+        self._run("delete", fid, "--reason", f"deleted: {reason}" if reason else "deleted")
+        return f
+
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
     def flag_blocked(self, fid: str, reason: str) -> dict:
         self._require(fid)

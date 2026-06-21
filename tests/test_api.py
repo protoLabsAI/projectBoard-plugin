@@ -74,6 +74,9 @@ class FakeStore:
     def cancel_feature(self, fid, reason=""):
         return self._rec("cancel_feature", fid, reason)
 
+    def delete_feature(self, fid, reason=""):
+        return self._rec("delete_feature", fid, reason)
+
     def bounce_ci_fail(self, fid, reason):
         return self._rec("bounce_ci_fail", fid, reason)
 
@@ -168,6 +171,19 @@ def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
     r2 = c.post("/api/plugins/project_board/features/bd-8/cancel")
     assert r2.status_code == 200
     assert ("cancel_feature", ("bd-8", ""), {}) in store.calls
+
+
+def test_delete_route_calls_delete_feature(monkeypatch):
+    """DELETE /features/{fid} — the hard-delete sibling of cancel (#47). Carries an
+    optional reason; works with no body too."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.request("DELETE", "/api/plugins/project_board/features/bd-7", json={"reason": "mistake"})
+    assert r.status_code == 200
+    assert ("delete_feature", ("bd-7", "mistake"), {}) in store.calls
+    r2 = c.delete("/api/plugins/project_board/features/bd-8")
+    assert r2.status_code == 200
+    assert ("delete_feature", ("bd-8", ""), {}) in store.calls
 
 
 # ── the single Done edge: the merge webhook ─────────────────────────────────────

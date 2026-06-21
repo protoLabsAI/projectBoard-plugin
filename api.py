@@ -230,4 +230,12 @@ def build_data_router(cfg: dict):
         being deleted out-of-band (which desyncs the board ↔ JSONL)."""
         return _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
 
+    @router.delete("/features/{fid}")
+    async def _delete(fid: str, body: dict = Body(default={})):
+        """Hard-delete a feature created in error — a `br` tombstone (the harder sibling
+        of POST …/cancel). Goes through the board so board ↔ JSONL stay consistent;
+        refuses (400) if the feature has dependents (deleting would orphan them). Prefer
+        cancel to keep a visible, reopenable audit lane; use delete to leave no trace."""
+        return _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
+
     return router
