@@ -49,6 +49,15 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   a.pr{color:var(--pl-color-status-info);text-decoration:none}
   a.pr:hover{text-decoration:underline}
   .hide{display:none}
+  /* List view — collapsible per-state group headers (#26). Token-driven, mirrors the
+     Kanban column grouping as sections in the dense list. */
+  #list tr.grp{cursor:pointer;user-select:none}
+  #list tr.grp>td{background:var(--pl-color-bg-raised);text-transform:uppercase;
+    letter-spacing:.06em;font-size:11px;font-weight:600;color:var(--pl-color-fg-muted);
+    padding:var(--pl-space-2) 4px}
+  #list tr.grp:hover>td{color:var(--pl-color-fg)}
+  #list tr.grp .tw{display:inline-block;width:1.1em;text-align:center}
+  #list tr.grp .gl{margin-right:var(--pl-space-2)}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
 </style>
@@ -118,6 +127,14 @@ function pr(f){ return f.pr_url ? '<a class="pr" href="'+esc(f.pr_url)+'" target
 // State → DS dot variant (for the list view chip).
 const DOT_VARIANT = {ready:"pl-dot--success", in_review:"pl-dot--info", blocked:"pl-dot--error"};
 
+// List view sections: the Kanban columns + the `blocked` flag-state + `cancelled`
+// (the second terminal edge, #47), rendered as collapsible groups in COLS order (#26).
+const LIST_SECTIONS = [...COLS, "blocked", "cancelled"];
+// States the user has collapsed — module-scoped so the 10s auto-reload re-render
+// doesn't re-expand what they closed.
+const COLLAPSED = new Set();
+function toggleGroup(state){ COLLAPSED.has(state) ? COLLAPSED.delete(state) : COLLAPSED.add(state); render(); }
+
 function render(){
   if (VIEW === "kanban"){
     $("kanban").innerHTML = COLS.map(state => {
@@ -134,12 +151,30 @@ function render(){
         + '<span class="pl-badge">'+items.length+'</span></div>'+cards+'</div>';
     }).join("");
   } else {
-    $("rows").innerHTML = FEATURES.map(f =>
+    // List: group rows under a collapsible per-state header (COLS order + blocked +
+    // cancelled), mirroring the Kanban's grouping so a dense board stays scannable (#26).
+    const row = (f) =>
       '<tr><td class="id">'+esc(f.id)+'</td><td>'+esc(f.title)+'</td>'
       + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
       + '<span class="pl-dot-row__label">'+esc(f.state)+'</span></span></td>'
-      + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+pr(f)+'</td></tr>'
-    ).join("") || '<tr><td colspan="6"><div class="pl-empty">No features yet — create some via the board tools or API.</div></td></tr>';
+      + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+pr(f)+'</td></tr>';
+    const byState = {};
+    FEATURES.forEach(f => (byState[f.state] = byState[f.state] || []).push(f));
+    // COLS order + blocked + cancelled; any unexpected state lands in its own group last.
+    const order = LIST_SECTIONS.slice();
+    Object.keys(byState).forEach(s => { if (!order.includes(s)) order.push(s); });
+    let html = "";
+    order.forEach(state => {
+      const items = byState[state] || [];
+      if (!items.length) return;  // omit empty sections
+      const collapsed = COLLAPSED.has(state);
+      html += '<tr class="grp" data-state="'+esc(state)+'" onclick="toggleGroup(this.dataset.state)">'
+        + '<td colspan="6"><span class="tw">'+(collapsed?"▸":"▾")+'</span>'
+        + '<span class="gl">'+esc(state.replace("_"," "))+'</span>'
+        + '<span class="pl-badge">'+items.length+'</span></td></tr>';
+      if (!collapsed) html += items.map(row).join("");  // collapsed → header only (rows omitted)
+    });
+    $("rows").innerHTML = html || '<tr><td colspan="6"><div class="pl-empty">No features yet — create some via the board tools or API.</div></td></tr>';
   }
 }
 
@@ -157,8 +192,10 @@ async function load(){
   }
 }
 
-// Module scripts are scoped — expose the view-toggle's inline onclick handlers.
+// Module scripts are scoped — expose the inline onclick handlers (view toggle +
+// the list's per-state collapse).
 window.setView = setView;
+window.toggleGroup = toggleGroup;
 setView(VIEW);   // sync the toggle + visibility to the initial view (list on mobile)
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated /features pull authenticates) or a short timer
