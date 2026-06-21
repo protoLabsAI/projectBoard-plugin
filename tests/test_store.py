@@ -45,10 +45,13 @@ class Br:
         ({"status": "in_progress", "labels": []}, "in_progress"),
         ({"status": "in_progress", "labels": ["in-review"]}, "in_review"),
         ({"status": "closed", "labels": []}, "done"),
+        ({"status": "closed", "labels": ["cancelled"]}, "cancelled"),  # the second terminal edge (#47)
         ({"status": "deferred", "labels": []}, "backlog"),
         ({"status": "open", "labels": ["blocked"]}, "blocked"),
         # precedence: closed beats a stray blocked label; blocked beats in-review.
         ({"status": "closed", "labels": ["blocked", "ready"]}, "done"),
+        # a cancelled+closed bead is `cancelled`, not `done`, even with other labels.
+        ({"status": "closed", "labels": ["cancelled", "blocked"]}, "cancelled"),
         ({"status": "in_progress", "labels": ["blocked", "in-review"]}, "blocked"),
     ],
 )
@@ -224,6 +227,30 @@ def test_mark_ready_rejects_an_underspecced_feature(make_board, monkeypatch, mis
     with pytest.raises(BoardError, match=field):
         b.mark_ready("bd-1")
     assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+# ── cancel_feature: the second terminal edge (#47) ──────────────────────────────
+
+
+def test_cancel_feature_tags_cancelled_and_closes_with_reason(make_board, monkeypatch):
+    """Tag `cancelled` + clear the assignee, then close with an audit reason — so the
+    projection reads `cancelled` (distinct from `done`), audit-preserved (not deleted)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "cancelled", "cancelled": True})
+    f = b.cancel_feature("bd-9", "duplicate")
+    update = next(c for c in br.calls if c[0] == "update")
+    assert "--add-label" in update and "cancelled" in update and "--assignee" in update
+    close = next(c for c in br.calls if c[0] == "close")
+    assert close[:2] == ("close", "bd-9") and "cancelled: duplicate" in close
+    assert f["board_state"] == "cancelled" and f["cancelled"] is True
+
+
+def test_cancel_feature_unknown_id_raises(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: None)
+    with pytest.raises(BoardError, match="unknown feature"):
+        b.cancel_feature("nope")
 
 
 def test_mark_ready_rejects_a_feature_already_past_backlog(make_board, monkeypatch):

@@ -47,6 +47,11 @@ BR = os.environ.get("BR_BIN", "br")
 LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
+# A SECOND terminal edge (#47): a feature closed because it was created in error
+# (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
+# projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
+# for shipped work. Preserves the one-Done-edge invariant (only record_merge → `done`).
+LABEL_CANCELLED = "cancelled"
 # A feature others build *on*: dependents gate on its MERGE, never its review (vs a
 # non-foundation blocker, which can release dependents at in_review under dep_gate:
 # review). Inert under the default dep_gate: merge (then every blocker gates on merge).
@@ -328,6 +333,24 @@ class BeadsBoard:
             self._run("close", f["id"], "-r", f"merged: {pr_url}")
         return self.get_feature(f["id"])
 
+    # ── the second terminal edge: cancel (not merge) ──────────────────────────
+    def cancel_feature(self, fid: str, reason: str = "") -> dict:
+        """Cancel a feature created in error (bad decomposition, duplicate, scope cut).
+
+        Modeled DELIBERATELY as a second terminal edge so it doesn't break the
+        one-Done-edge invariant: it tags the bead `cancelled` and closes it with an
+        auditable reason (`br close -r`). The `cancelled` label makes the projection show
+        a distinct `cancelled` state — NOT `done` — so the merge/CI reconcilers (which
+        only touch `in_review`) and the loop-retro (which mines done/blocked) never
+        mistake a cancel for shipped or regressed work. Audit-preserving (the bead + its
+        history survive), vs a hard `br delete` tombstone. Clears the assignee so a
+        revived id could be re-claimed. Idempotent-ish: re-cancelling a cancelled feature
+        just re-closes it."""
+        self._require(fid)
+        self._run("update", fid, "--add-label", LABEL_CANCELLED, "--assignee", "")
+        self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
+        return self.get_feature(fid)
+
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
     def flag_blocked(self, fid: str, reason: str) -> dict:
         self._require(fid)
@@ -512,7 +535,9 @@ class BeadsBoard:
         labels = set(bead.get("labels") or [])
         status = bead.get("status")
         if status == "closed":
-            return "done"
+            # A closed bead is `done` UNLESS it was cancelled (the second terminal edge):
+            # a cancel keeps it closed + auditable but distinct from shipped work (#47).
+            return "cancelled" if LABEL_CANCELLED in labels else "done"
         if LABEL_BLOCKED in labels:
             return "blocked"
         if status == "in_progress":
@@ -552,6 +577,7 @@ class BeadsBoard:
             "pr_url": bead.get("external_ref", ""),
             "assignee": bead.get("assignee", ""),
             "blocked": LABEL_BLOCKED in labels,
+            "cancelled": LABEL_CANCELLED in labels,
             "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
             "attempts": attempts,
