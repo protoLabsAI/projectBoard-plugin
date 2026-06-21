@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.19.1
+version: 0.20.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -53,10 +53,13 @@ config:
                             # opens ANYWAY (CI + ci_fix_max stay the backstop — a flaky or
                             # misconfigured gate never blocks good work).
   local_gate_timeout_s: 600 # hard cap on one gate run; a timeout degrades to "pass" (CI gates).
-  max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 runs
-                            # N coders on the same feature; a low-temp judge picks the diff that
-                            # best satisfies acceptance_criteria. The N-parallel dispatch is WIP
-                            # (#21); the judge (_judge_candidates) ships + is unit-tested now.
+  max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 builds a
+                            # feature N ways in parallel (N candidate worktrees, all dispatched at
+                            # once), a low-temp judge picks the diff that best satisfies
+                            # acceptance_criteria, the winner is promoted to the canonical branch
+                            # and the losers reaped (#21). Costs N× tokens — gate it to hard work;
+                            # only a FROM-SCRATCH build fans out (a CI/goal-fix re-dispatch fixes
+                            # the existing diff with one coder). Bound N × max_concurrent to the host.
   repo: "."                 # repo the coders work in (worktrees branch off it)
   base_branch: main         # base branch worktrees/PRs target
   worktrees_root: .worktrees

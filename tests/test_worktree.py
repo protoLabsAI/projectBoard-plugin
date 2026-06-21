@@ -159,6 +159,33 @@ async def test_create_worktree_falls_back_to_local_base_without_a_remote(monkeyp
     assert add[-1] == "main"  # fell back to the local branch
 
 
+# ── promote_worktree: the Max-Mode winner takes the canonical name (#21) ─────────
+
+
+async def test_promote_worktree_moves_dir_and_renames_branch(monkeypatch):
+    git = FakeGit()
+    monkeypatch.setattr(worktree, "_git", git)
+    canon_wt, canon_branch = await worktree.promote_worktree(
+        "/repo", "/repo/.worktrees/feat-bd-1.c2", "feat/bd-1.c2", "bd-1", root=".worktrees"
+    )
+    assert canon_branch == "feat/bd-1"
+    assert canon_wt.endswith("/.worktrees/feat-bd-1")
+    move = next(a for a in git.calls if a[:2] == ("worktree", "move"))
+    assert move[2].endswith("/.worktrees/feat-bd-1.c2") and move[3].endswith("/.worktrees/feat-bd-1")
+    rename = next(a for a in git.calls if a[:1] == ("branch",) and "-m" in a)
+    assert rename == ("branch", "-m", "feat/bd-1.c2", "feat/bd-1")
+
+
+async def test_promote_worktree_is_a_noop_when_already_canonical(monkeypatch):
+    git = FakeGit()
+    monkeypatch.setattr(worktree, "_git", git)
+    _wt, branch = await worktree.promote_worktree(
+        "/repo", "/repo/.worktrees/feat-bd-1", "feat/bd-1", "bd-1", root=".worktrees"
+    )
+    assert branch == "feat/bd-1"
+    assert not git.ran("move") and not [a for a in git.calls if a[:1] == ("worktree",)]
+
+
 # ── pr_is_merged: the merge-poll probe ──────────────────────────────────────────
 
 
