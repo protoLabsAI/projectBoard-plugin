@@ -9,6 +9,8 @@ replaced by the ``make_board`` fixture — no CLI, no DB.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from project_board import store
@@ -69,6 +71,68 @@ def test_board_state_projection(bead, expected):
 )
 def test_escalation_enabled_needs_two_distinct_coders(cfg, expected):
     assert escalation_enabled(cfg) is expected
+
+
+# ── _ensure_workspace: pin to the repo's own .beads/ (no walk-up escape, #48) ────
+
+
+def _ok():
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _board(monkeypatch, *, db=None, repo="/repo"):
+    """A BeadsBoard with the `br` PATH check stubbed (so __init__ passes) but the REAL
+    _ensure_workspace intact — for exercising the workspace-pin logic directly."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    return BeadsBoard(db=db, repo=repo)
+
+
+def test_ensure_workspace_noop_with_explicit_db(monkeypatch):
+    """An explicit db_path is the hard pin — never br-init, never walk up."""
+    calls = []
+    monkeypatch.setattr(store.subprocess, "run", lambda *a, **k: calls.append(a) or _ok())
+    b = _board(monkeypatch, db="/somewhere/.beads/beads.db")
+    b._ensure_workspace()
+    assert calls == [] and b._workspace_ready  # no init shelled
+
+
+def test_ensure_workspace_noop_when_repo_has_beads(monkeypatch):
+    """Repo already has its own .beads/ → cwd-discovery resolves locally; no init."""
+    monkeypatch.setattr(store.os.path, "isdir", lambda p: p.endswith(".beads"))
+    calls = []
+    monkeypatch.setattr(store.subprocess, "run", lambda *a, **k: calls.append(a) or _ok())
+    _board(monkeypatch)._ensure_workspace()
+    assert calls == []
+
+
+def test_ensure_workspace_br_inits_a_repo_with_no_beads(monkeypatch):
+    """Repo with no .beads/ → `br init` it ONCE, then the pin is ready and not re-run."""
+    state = {"beads": False}
+    monkeypatch.setattr(store.os.path, "isdir", lambda p: state["beads"] and p.endswith(".beads"))
+    inits = []
+
+    def _run(cmd, **k):
+        inits.append(cmd)
+        state["beads"] = True  # init created .beads/
+        return _ok()
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    b = _board(monkeypatch, repo="/fresh")
+    b._ensure_workspace()
+    assert len(inits) == 1 and inits[0][:2] == [store.BR, "init"] and b._workspace_ready
+    b._ensure_workspace()  # idempotent — guarded by _workspace_ready, no second init
+    assert len(inits) == 1
+
+
+def test_ensure_workspace_raises_a_clear_error_when_init_fails(monkeypatch):
+    """No .beads/ and `br init` fails (still none) → an actionable BoardError, NOT a
+    silent escape to a parent db."""
+    monkeypatch.setattr(store.os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(
+        store.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+    )
+    with pytest.raises(BoardError, match="has no beads workspace"):
+        _board(monkeypatch, repo="/ro")._ensure_workspace()
 
 
 def test_next_tier_walks_then_stops_at_the_top(make_board):

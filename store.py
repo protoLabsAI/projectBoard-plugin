@@ -75,9 +75,46 @@ class BeadsBoard:
         self.actor = actor
         self.repo = repo
         self.base_branch = base_branch
+        self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
+
+    # ── workspace pin (ADR 0055 P0, #48) ──────────────────────────────────────
+    def _ensure_workspace(self) -> None:
+        """Pin the board to THIS repo's beads workspace so `br` can't walk UP the tree
+        and silently adopt a parent/ancestor `.beads/` (the cross-repo bleed of #48).
+
+        `br` discovers `.beads/` by walking UP from cwd. With `cwd=self.repo` it stops at
+        the repo's own `.beads/` when one exists — but a repo with NONE escapes to whatever
+        ancestor happens to have one, polluting a shared db with the wrong id prefix. So:
+        an explicit `db` is the hard pin (nothing to do); otherwise, if the repo has no
+        `.beads/`, run `br init` there to give it its own — after which cwd-discovery
+        resolves locally and never walks up (matches the operator's manual workaround).
+        Lazy + idempotent (runs once, guarded by `_workspace_ready`)."""
+        if self._workspace_ready or self.db:
+            self._workspace_ready = True
+            return
+        repo = self.repo or "."
+        if not os.path.isdir(os.path.join(repo, ".beads")):
+            log.warning(
+                "[project_board] repo %r has no .beads/ workspace — running `br init` to pin the "
+                "board here (else `br` walks up and adopts a parent db, polluting it with the wrong "
+                "id prefix; ADR 0055 isolation)",
+                repo,
+            )
+            # NB: a direct subprocess, NOT self._run — that would recurse here, and we want
+            # a precise error rather than the generic `br … failed` wrapper.
+            proc = subprocess.run(
+                [BR, "init", "--actor", self.actor], cwd=repo, capture_output=True, text=True, timeout=30
+            )
+            if proc.returncode != 0 and not os.path.isdir(os.path.join(repo, ".beads")):
+                raise BoardError(
+                    f"repo {repo!r} has no beads workspace and `br init` failed "
+                    f"({proc.stderr.strip()[:200]}) — run `br init` there, or set project_board.db_path"
+                )
+        self._workspace_ready = True
 
     # ── br invocation ─────────────────────────────────────────────────────────
     def _run(self, *args: str, want_json: bool = False):
+        self._ensure_workspace()  # pin to the repo's own .beads/ before any br op (#48)
         cmd = [BR, *args, "--actor", self.actor]
         if self.db:
             cmd += ["--db", self.db]
