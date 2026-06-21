@@ -112,6 +112,31 @@ async def test_commit_worktree_stages_and_commits_a_dirty_tree(monkeypatch):
     assert git.ran("add") and git.ran("commit")
 
 
+# ── stage_all: keep the coder's own scratch out of the PR (#49) ──────────────────
+
+
+async def test_stage_all_excludes_coder_scratch(monkeypatch):
+    git = FakeGit()
+    monkeypatch.setattr(worktree, "_git", git)
+    await worktree.stage_all("/wt")
+    (add,) = git.ran("add")
+    # `add -A` over a positive `.` with an exclude pathspec per scratch path — so the
+    # coder's `.proto/` session notes + `.cursor` cache never get staged into the commit.
+    assert add[:4] == ("add", "-A", "--", ".")
+    excludes = set(add[4:])
+    assert excludes == {f":(exclude){p}" for p in worktree.CODER_SCRATCH}
+    assert ":(exclude).proto" in excludes
+
+
+async def test_commit_worktree_stages_without_the_scratch(monkeypatch):
+    """The commit path stages via stage_all, so the dirty-tree commit excludes scratch."""
+    git = FakeGit({"status": (0, " M f.py\n?? .proto/", "")})
+    _install(monkeypatch, git, FakeGh())
+    await worktree.commit_worktree("/wt", "msg")
+    (add,) = git.ran("add")
+    assert ":(exclude).proto" in add and git.ran("commit")
+
+
 # ── create_worktree: branch off the freshest base ───────────────────────────────
 
 

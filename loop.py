@@ -864,7 +864,7 @@ class BoardLoop:
         if not ac:
             return None
         try:
-            await worktree._git(wt, "add", "-A")
+            await worktree.stage_all(wt)
             _rc, names, _err = await worktree._git(wt, "diff", "--cached", "--name-only", f"origin/{base}")
         except Exception:  # noqa: BLE001 — best-effort
             return None
@@ -902,7 +902,7 @@ class BoardLoop:
         diffs: list[str] = []
         for wt in worktrees:
             try:
-                await worktree._git(wt, "add", "-A")
+                await worktree.stage_all(wt)
                 _rc, d, _err = await worktree._git(wt, "diff", "--cached", f"origin/{base}")
             except Exception:  # noqa: BLE001 — judging is best-effort
                 d = ""

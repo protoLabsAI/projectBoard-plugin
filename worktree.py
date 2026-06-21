@@ -59,6 +59,26 @@ async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, st
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
+# Paths the coder writes as its OWN session scratch — the ACP/`proto` coder's private
+# state (`.proto/`: session notes + memory) and editor caches (`.cursor`) — into the
+# per-feature worktree (its cwd). They must never ride into the feature PR: they make the
+# reviewer-facing diff noisy and leak the agent's internal session notes into the target
+# repo's history (#49). ``stage_all`` excludes them so a plain ``add -A`` skips them.
+CODER_SCRATCH = (".proto", ".cursor")
+
+
+async def stage_all(worktree: str) -> tuple[int, str, str]:
+    """``git add -A`` over the worktree, MINUS the coder's own scratch (``CODER_SCRATCH``).
+
+    The single staging seam — shared by the commit path and the verify/judge diff probes
+    — so all three see the same intended-only file set. Excludes scratch via a pathspec
+    (``:(exclude)…``) rather than ``.git/info/exclude``, so it mutates nothing in the repo
+    and depends on no target-repo ``.gitignore`` entry: the exclusion is scoped to this one
+    staging call. The leading ``.`` is the positive pathspec the excludes subtract from."""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    return await _git(worktree, "add", "-A", "--", ".", *excludes)
+
+
 async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktrees") -> tuple[str, str]:
     """``git worktree add <root>/feat-<id> -b feat/<id> <base>``.
 
@@ -180,7 +200,7 @@ async def commit_worktree(worktree: str, message: str) -> None:
     _rc, out, _err = await _git(worktree, "status", "--porcelain")
     if not out.strip():
         return
-    await _git(worktree, "add", "-A")
+    await stage_all(worktree)
     rc, o, e = await _git(worktree, "commit", "-m", message)
     if rc != 0 and "nothing to commit" not in (o + e).lower():
         raise WorktreeError(f"commit failed: {(e or o).strip()[:200]}")
