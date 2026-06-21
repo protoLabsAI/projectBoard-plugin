@@ -125,6 +125,38 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> Non
     await remove_worktree(repo, wt, f"feat/{fid}")
 
 
+async def promote_worktree(
+    repo: str, src_wt: str, src_branch: str, fid: str, root: str = ".worktrees"
+) -> tuple[str, str]:
+    """Promote a Max-Mode candidate worktree to the canonical ``feat-<id>`` /
+    ``feat/<id>`` name (#21). The N candidates build in throwaway ``feat-<id>.c<k>``
+    worktrees; the winner has to take over the canonical name so the rest of the
+    lifecycle — the CI-fail bounce, crash recovery (``pr_url_for_branch(feat/<id>)``),
+    and reaping (``reap_feature_worktree(<id>)``) — all of which key off the canonical
+    names — works unchanged.
+
+    Moves the worktree dir and renames its branch IN PLACE, so the coder's still-
+    uncommitted changes ride along (verified: ``git worktree move`` + ``branch -m``
+    preserve the dirty tree). Idempotently clears a stale canonical worktree/branch
+    first so ``move`` has a free destination. A winner already at the canonical path is
+    a no-op. Returns (canonical_path, canonical_branch)."""
+    canon_branch = f"feat/{fid}"
+    canon_rel = os.path.join(root, f"feat-{fid}")
+    canon_path = os.path.join(repo, canon_rel)
+    if os.path.abspath(src_wt) == os.path.abspath(canon_path):
+        return os.path.abspath(canon_path), canon_branch
+    # Free the destination: drop any stale canonical worktree/branch leftover.
+    await _git(repo, "worktree", "remove", "--force", canon_rel)
+    await _git(repo, "branch", "-D", canon_branch)
+    rc, _o, err = await _git(repo, "worktree", "move", os.path.abspath(src_wt), os.path.abspath(canon_path))
+    if rc != 0:
+        raise WorktreeError(f"worktree move failed: {err.strip()[:200]}")
+    rc, _o, err = await _git(canon_path, "branch", "-m", src_branch, canon_branch)
+    if rc != 0:
+        raise WorktreeError(f"branch rename failed: {err.strip()[:200]}")
+    return os.path.abspath(canon_path), canon_branch
+
+
 def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:
     """The feature ids that currently have a ``feat-<id>`` worktree dir under
     ``<repo>/<worktrees_root>`` — for the health sweep's orphan check. Sync (a quick

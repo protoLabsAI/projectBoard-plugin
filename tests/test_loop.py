@@ -70,6 +70,12 @@ def test_max_concurrent_floors_at_one():
     assert BoardLoop({"max_concurrent": 4}).max_concurrent == 4
 
 
+def test_max_mode_n_parsing():
+    assert BoardLoop({}).max_mode_n == 1  # off by default
+    assert BoardLoop({"max_mode_n": 5}).max_mode_n == 5
+    assert BoardLoop({"max_mode_n": 0}).max_mode_n == 1  # floors at 1 (never < 1)
+
+
 # ── the coder prompt (ProtoMaker discipline: name the files, demand the diff) ────
 
 
@@ -163,12 +169,19 @@ async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 
-async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None):
+async def _drive_with(
+    monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None, judge=None, seed=None
+):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
-    Returns the FakeLoopStore so the test can assert the recorded transitions."""
+    Returns the FakeLoopStore so the test can assert the recorded transitions.
+
+    ``judge`` stubs ``_judge_candidates`` (Max-Mode best-of-N); ``seed`` is a callable
+    run on the loop before the drive (e.g. to pre-seed _ci_feedback for a CI-bounce test)."""
     store = FakeLoopStore()
     store.creates = []  # fids create_worktree was called for (a goal-fix retry reuses, so won't re-create)
     store.removes = []  # worktrees remove_worktree was called for
+    store.reaps = []  # fids reap_feature_worktree was called for (Max-Mode loser teardown)
+    store.promotes = []  # (src_wt, src_branch, fid) the Max-Mode winner was promoted with
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _create(repo, base, fid, root):
@@ -182,15 +195,28 @@ async def _drive_with(monkeypatch, *, open_pr, coder=object(), dispatch=None, cf
         store.removes.append(wt)
         return None
 
+    async def _reap(repo, root, fid):
+        store.reaps.append(fid)
+
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+        store.promotes.append((src_wt, src_branch, fid))
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
     monkeypatch.setattr(worktree, "create_worktree", _create)
     monkeypatch.setattr(worktree, "dispatch_coder", dispatch or _default_dispatch)
     monkeypatch.setattr(worktree, "open_pr", open_pr)
     monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    monkeypatch.setattr(worktree, "promote_worktree", _promote)
 
     loop = BoardLoop(cfg or {"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: coder)
     if gate is not None:
         monkeypatch.setattr(loop, "_run_local_gate", gate)
+    if judge is not None:
+        monkeypatch.setattr(loop, "_judge_candidates", judge)
+    if seed is not None:
+        seed(loop)
     await loop._drive(FEATURE)
     return loop, store
 
@@ -202,6 +228,91 @@ async def test_drive_opens_review_on_a_clean_build(monkeypatch):
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
     assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
     assert loop._inflight == {}  # a completed drive leaves nothing to reap
+
+
+# ── Max-Mode: N parallel candidates → judge → promote winner → ship (#21) ────────
+
+
+async def test_drive_max_mode_fans_out_and_ships_the_winner(monkeypatch):
+    """max_mode_n=3 → 3 candidate worktrees built + dispatched in parallel, the judge
+    picks one, the winner is promoted to the canonical name, the losers are reaped, and
+    ONLY the winner's PR opens (on the canonical branch)."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append((wt, branch))
+        return "https://example/pr/7"
+
+    dispatched = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        dispatched.append(wt)
+        return f"reply from {wt}"
+
+    async def _judge(feature, base, worktrees):
+        assert len(worktrees) == 3  # the judge sees every candidate
+        return 2  # candidate index 2 wins
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_dispatch,
+        judge=_judge,
+        cfg={"coder": "proto", "max_mode_n": 3},
+    )
+    # Three candidate worktrees, suffixed so none collides with the canonical name.
+    assert store.creates == ["bd-1.c0", "bd-1.c1", "bd-1.c2"]
+    assert len(dispatched) == 3  # all three coders ran
+    # The winner (c2) is promoted to canonical; the two losers are reaped (winner is not).
+    assert store.promotes == [("/wt/feat-bd-1.c2", "feat/bd-1.c2", "bd-1")]
+    assert set(store.reaps) == {"bd-1.c0", "bd-1.c1"}
+    # Only the winner's PR opens, on the canonical branch.
+    assert opened == [("/wt/feat-bd-1", "feat/bd-1")]
+    assert ("open_review", "bd-1", "https://example/pr/7") in store.calls
+    assert loop._inflight == {}
+
+
+async def test_drive_max_mode_all_empty_reaps_all_and_blocks(monkeypatch):
+    """Every candidate empty → judge returns None → all candidates reaped, no PR, and
+    the feature blocks (NoChangesError, single coder with no ladder)."""
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise AssertionError("no PR should open when every candidate is empty")
+
+    async def _judge(feature, base, worktrees):
+        return None  # nothing to ship
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        judge=_judge,
+        cfg={"coder": "proto", "max_mode_n": 3},
+    )
+    assert set(store.reaps) == {"bd-1.c0", "bd-1.c1", "bd-1.c2"}  # every candidate torn down
+    assert store.promotes == []  # nothing promoted
+    assert "flag_blocked" in store.names()
+
+
+async def test_drive_max_mode_skips_fanout_on_a_carried_forward_fix(monkeypatch):
+    """A re-dispatch carrying _ci_feedback (a CI bounce / goal-fix / gate-fix) FIXES the
+    existing diff with ONE coder — Max-Mode must not re-fan-out N candidates."""
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/9"
+
+    async def _judge(feature, base, worktrees):
+        raise AssertionError("the judge must not run on a single-candidate carried-forward fix")
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        judge=_judge,
+        cfg={"coder": "proto", "max_mode_n": 3},
+        seed=lambda lp: lp._ci_feedback.__setitem__("bd-1", "CI failed: lint"),
+    )
+    assert store.creates == ["bd-1"]  # one canonical worktree, NOT N suffixed candidates
+    assert store.promotes == [] and store.reaps == []
+    assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
 
 
 async def test_drive_local_gate_failure_redispatches_then_opens(monkeypatch):

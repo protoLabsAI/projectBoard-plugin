@@ -604,20 +604,31 @@ class BoardLoop:
                 if coder is None:
                     store.flag_blocked(fid, f"coder delegate {coder_name!r} not configured/enabled")
                     return
-                # A goal-fix retry REUSES the worktree — the implementation is already
-                # there, the coder just adds what the reviewer flagged (usually tests).
-                # Rebuilding on a fresh worktree throws the impl away (the coder then
-                # spends its budget re-implementing and never reaches the tests — the
-                # bd-2fd/bd-3cj block). Otherwise: a fresh worktree per attempt.
-                if keep_wt and wt is not None:
-                    keep_wt = False  # consume the reuse
-                else:
-                    wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
-                self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                 try:
-                    result = await worktree.dispatch_coder(
-                        coder, wt, prompt, timeout=self.coder_timeout or None
-                    )  # reaps subprocess; CoderTimeout if it overruns
+                    # How this attempt gets its worktree + coder result:
+                    #  • keep_wt  → REUSE the kept worktree (impl intact), one re-dispatch.
+                    #    A goal-fix/gate-fix retry must not throw the implementation away —
+                    #    the coder only ADDS what the reviewer flagged (usually tests); a
+                    #    fresh rebuild makes it re-implement and never reach the tests (the
+                    #    bd-2fd/bd-3cj block).
+                    #  • max-mode → N parallel candidates, judge, promote the winner (#21).
+                    #    ONLY for a from-scratch build: a carried-forward re-dispatch (a CI
+                    #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
+                    #    the existing diff with one coder, so it must NOT re-fan-out N.
+                    #  • otherwise → one fresh worktree, one dispatch.
+                    if keep_wt and wt is not None:
+                        keep_wt = False  # consume the reuse
+                        self._inflight[fid] = (repo, wt, branch)
+                        result = await worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None)
+                    elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
+                        wt, branch, result = await self._dispatch_max_mode(feature, coder, prompt, repo, base, fid)
+                        self._inflight[fid] = (repo, wt, branch)
+                    else:
+                        wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
+                        self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
+                        result = await worktree.dispatch_coder(
+                            coder, wt, prompt, timeout=self.coder_timeout or None
+                        )  # reaps subprocess; CoderTimeout if it overruns
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -939,6 +950,54 @@ class BoardLoop:
             if idx in nonempty:
                 return idx
         return nonempty[0]  # judge unclear → first non-empty candidate
+
+    async def _dispatch_max_mode(
+        self, feature: dict, coder, prompt: str, repo: str, base: str, fid: str
+    ) -> tuple[str, str, str]:
+        """Max-Mode (#21): build the feature N ways in parallel and ship the best diff.
+
+        Creates ``max_mode_n`` throwaway candidate worktrees off the same base (suffixed
+        ``feat-<id>.c<k>`` so none collides with the canonical name), dispatches the coder
+        into ALL of them concurrently — each keeps its own ``coder_timeout`` watchdog +
+        ``finally`` subprocess teardown (``dispatch_coder``), and ``return_exceptions``
+        means one candidate timing out / erroring leaves an empty tree the judge skips
+        rather than sinking the batch. ``_judge_candidates`` (the best-of-N judge that
+        landed in #22) picks the winning index; the winner is PROMOTED into the canonical
+        ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
+        unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
+        ``_drive`` escalates/blocks exactly like a single coder that produced nothing.
+
+        Returns (canonical_wt, canonical_branch, winner_reply). The fan-out is bounded by
+        ``max_concurrent`` × ``max_mode_n`` coders; size those to the host."""
+        n = self.max_mode_n
+        cand_ids = [f"{fid}.c{i}" for i in range(n)]
+        # Create the N worktrees sequentially (git serializes worktree-list writes); the
+        # slow part — the coder dispatch — is what we then fan out in parallel.
+        cands: list[tuple[str, str]] = []
+        for cid in cand_ids:
+            cands.append(await worktree.create_worktree(repo, base, cid, self.root))
+        log.info("[project_board] %s max-mode: dispatching %d parallel candidates", fid, n)
+        results = await asyncio.gather(
+            *(worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None) for wt, _b in cands),
+            return_exceptions=True,
+        )
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                log.info("[project_board] %s max-mode candidate %d failed (skipped): %s", fid, i, r)
+        idx = await self._judge_candidates(feature, base, [wt for wt, _b in cands])
+        if idx is None:
+            for cid in cand_ids:
+                await worktree.reap_feature_worktree(repo, self.root, cid)
+            raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
+        log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
+        win_wt, win_branch = cands[idx]
+        canon_wt, canon_branch = await worktree.promote_worktree(repo, win_wt, win_branch, fid, self.root)
+        # Reap the losers (the winner was moved out of its candidate name by promote).
+        for i, cid in enumerate(cand_ids):
+            if i != idx:
+                await worktree.reap_feature_worktree(repo, self.root, cid)
+        winner_reply = results[idx] if not isinstance(results[idx], Exception) else ""
+        return canon_wt, canon_branch, winner_reply
 
     async def _fetch_kg_lessons(self, feature: dict) -> str:
         """Query the knowledge graph (via graph.sdk) for lessons relevant to THIS
