@@ -378,3 +378,39 @@ async def test_dispatch_coder_forgets_session_before_dispatch(monkeypatch):
     out = await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=5)
     assert out == "built it"
     assert order == ["forget", "dispatch", "teardown"]
+
+
+# ── link_node_modules: share the main repo's deps with the worktree ────────────────
+
+
+def test_link_node_modules_symlinks_root_and_monorepo_packages(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "node_modules" / "react").mkdir(parents=True)  # root deps
+    (repo / "packages" / "ui" / "node_modules" / "vite").mkdir(parents=True)  # workspace deps
+    (repo / "src").mkdir()
+    wt = tmp_path / "wt"
+    (wt / "packages" / "ui").mkdir(parents=True)  # the worktree checkout has the source tree
+    n = worktree.link_node_modules(str(repo), str(wt))
+    assert n == 2
+    assert (wt / "node_modules").is_symlink()
+    assert (wt / "node_modules" / "react").is_dir()  # resolves through the symlink
+    assert (wt / "packages" / "ui" / "node_modules").is_symlink()
+    assert (wt / "packages" / "ui" / "node_modules" / "vite").is_dir()
+
+
+def test_link_node_modules_noop_for_a_non_node_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)  # no node_modules
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    assert worktree.link_node_modules(str(repo), str(wt)) == 0
+    assert not (wt / "node_modules").exists()
+
+
+def test_link_node_modules_does_not_descend_into_node_modules(tmp_path):
+    """A nested node_modules/<pkg>/node_modules must NOT be separately linked (pruned)."""
+    repo = tmp_path / "repo"
+    (repo / "node_modules" / "a" / "node_modules" / "b").mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    assert worktree.link_node_modules(str(repo), str(wt)) == 1  # only the top-level one

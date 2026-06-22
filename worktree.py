@@ -104,7 +104,41 @@ async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktree
     rc, _out, err = await _git(repo, "worktree", "add", rel, "-b", branch, start)
     if rc != 0:
         raise WorktreeError(f"worktree add failed: {err.strip()[:300]}")
-    return os.path.abspath(path), branch
+    abspath = os.path.abspath(path)
+    # A fresh worktree is a bare checkout with NO node_modules, so an npm/pnpm pre-PR gate
+    # (or the coder running the build) can't resolve deps. Symlink the main repo's
+    # node_modules in (best-effort, no-op for non-node repos) rather than a slow/offline
+    # per-worktree install.
+    await asyncio.to_thread(link_node_modules, repo, abspath)
+    return abspath, branch
+
+
+def link_node_modules(repo: str, worktree: str) -> int:
+    """Symlink every ``node_modules`` dir in the main repo into the worktree at the same
+    relative path (handles monorepos — root + each workspace package). The worktree shares
+    the repo's installed deps, so npm/pnpm gates + builds resolve without a per-worktree
+    install. Best-effort: a non-node repo (no node_modules) is a no-op; symlink failures are
+    skipped. Build output (dist/, etc.) still lands in the worktree — only the deps are
+    shared. Returns the number linked."""
+    linked = 0
+    try:
+        for root, dirs, _files in os.walk(repo):
+            if "node_modules" in dirs:
+                rel = os.path.relpath(os.path.join(root, "node_modules"), repo)
+                src = os.path.join(repo, rel)
+                dst = os.path.join(worktree, rel)
+                try:
+                    if not os.path.lexists(dst):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.symlink(src, dst)
+                        linked += 1
+                except OSError:
+                    pass
+            # Don't descend into node_modules / git internals / sibling worktrees.
+            dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", ".worktrees")]
+    except OSError:
+        pass
+    return linked
 
 
 async def remove_worktree(repo: str, worktree: str, branch: str = "") -> None:
