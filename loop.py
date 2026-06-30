@@ -951,6 +951,59 @@ class BoardLoop:
                 return idx
         return nonempty[0]  # judge unclear → first non-empty candidate
 
+    async def _candidate_diff_indices(self, base: str, worktrees: list[str]) -> list[int]:
+        """Indices of candidates that produced a non-empty staged diff vs ``origin/<base>``.
+        Cheap name-only check; best-effort (a candidate we can't stage/diff is skipped)."""
+        out: list[int] = []
+        for i, wt in enumerate(worktrees):
+            try:
+                await worktree.stage_all(wt)
+                _rc, names, _err = await worktree._git(wt, "diff", "--cached", "--name-only", f"origin/{base}")
+            except Exception:  # noqa: BLE001 — best-effort, like _judge_candidates
+                names = ""
+            if (names or "").strip():
+                out.append(i)
+        return out
+
+    async def _select_candidate(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
+        """Pick the winning Max-Mode candidate — EXECUTION-GROUNDED (ADR 0064).
+
+        When a pre-PR gate (``local_gate_cmd``) is configured, PREFER candidates whose
+        gate actually PASSES: run the candidates, don't just judge their diffs. An LLM
+        judge of code rewards plausible-looking diffs and can't catch subtle wrongness —
+        only running the tests discriminates. The judge (``_judge_candidates``) then only
+        breaks ties among the PASSING set (quality among the correct), or decides when no
+        gate is configured / none pass. With no gate this is exactly the old behavior.
+
+        Returns the winning index, or ``None`` when no candidate produced a diff."""
+        # No oracle → judge exactly as before (it does its own emptiness handling and
+        # returns None when every candidate is empty). Avoids a redundant diff pass.
+        if not self.local_gate_cmd:
+            return await self._judge_candidates(feature, base, worktrees)
+
+        nonempty = await self._candidate_diff_indices(base, worktrees)
+        if not nonempty:
+            return None
+        if len(nonempty) == 1:
+            return nonempty[0]
+
+        fid = feature.get("id")
+        gates = await asyncio.gather(*(self._run_local_gate(worktrees[i]) for i in nonempty))
+        passing = [i for i, gap in zip(nonempty, gates) if gap is None]
+        if not passing:
+            log.info(
+                "[project_board] %s execution-select: 0/%d candidates pass the gate — judging diffs", fid, len(nonempty)
+            )
+            return await self._judge_candidates(feature, base, worktrees)
+        log.info(
+            "[project_board] %s execution-select: %d/%d candidates pass the gate", fid, len(passing), len(nonempty)
+        )
+        if len(passing) == 1:
+            return passing[0]
+        # Tie-break among the PASSING (correct) candidates by quality, via the judge.
+        j = await self._judge_candidates(feature, base, [worktrees[i] for i in passing])
+        return passing[j] if j is not None else passing[0]
+
     async def _dispatch_max_mode(
         self, feature: dict, coder, prompt: str, repo: str, base: str, fid: str
     ) -> tuple[str, str, str]:
@@ -960,9 +1013,10 @@ class BoardLoop:
         ``feat-<id>.c<k>`` so none collides with the canonical name), dispatches the coder
         into ALL of them concurrently — each keeps its own ``coder_timeout`` watchdog +
         ``finally`` subprocess teardown (``dispatch_coder``), and ``return_exceptions``
-        means one candidate timing out / erroring leaves an empty tree the judge skips
-        rather than sinking the batch. ``_judge_candidates`` (the best-of-N judge that
-        landed in #22) picks the winning index; the winner is PROMOTED into the canonical
+        means one candidate timing out / erroring leaves an empty tree the selector skips
+        rather than sinking the batch. ``_select_candidate`` picks the winning index —
+        EXECUTION-GROUNDED when a pre-PR gate is configured (prefer candidates whose tests
+        pass; ADR 0064), else the best-of-N LLM judge; the winner is PROMOTED into the canonical
         ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
         unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
         ``_drive`` escalates/blocks exactly like a single coder that produced nothing.
@@ -984,7 +1038,7 @@ class BoardLoop:
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 log.info("[project_board] %s max-mode candidate %d failed (skipped): %s", fid, i, r)
-        idx = await self._judge_candidates(feature, base, [wt for wt, _b in cands])
+        idx = await self._select_candidate(feature, base, [wt for wt, _b in cands])
         if idx is None:
             for cid in cand_ids:
                 await worktree.reap_feature_worktree(repo, self.root, cid)
