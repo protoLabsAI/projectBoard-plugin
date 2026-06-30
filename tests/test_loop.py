@@ -1349,3 +1349,96 @@ async def test_judge_candidates_fails_open_to_first_when_judge_errors(monkeypatc
     monkeypatch.setattr("graph.sdk.complete", _err)
     # both candidates non-empty → first non-empty index wins when the judge dies
     assert await loop._judge_candidates(FEATURE, "main", ["/wt/a", "/wt/b"]) == 0
+
+
+# ── execution-grounded candidate selection (ADR 0064) ────────────────────────────
+
+
+def _git_nonempty_for(nonempty_wts):
+    """A worktree._git stub: name-only diff is non-empty only for the given worktrees."""
+
+    async def _git(wt, *args, timeout=60):
+        if args and args[0] == "diff":
+            return (0, ("solution.py" if wt in nonempty_wts else ""), "")
+        return (0, "", "")
+
+    return _git
+
+
+async def test_select_candidate_prefers_passing_gate(monkeypatch):
+    """With a gate, the candidate whose gate PASSES wins even if the judge would pick another."""
+    loop = BoardLoop({"local_gate_cmd": "pytest", "max_mode_n": 3})
+    wts = ["/c0", "/c1", "/c2"]
+    monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))  # all have a diff
+
+    async def gate(wt):
+        return None if wt == "/c2" else "boom"  # only c2 passes
+
+    async def judge(*a, **k):
+        return 0  # the judge would (wrongly) pick c0 — must be overridden
+
+    monkeypatch.setattr(loop, "_run_local_gate", gate)
+    monkeypatch.setattr(loop, "_judge_candidates", judge)
+    assert await loop._select_candidate(FEATURE, "main", wts) == 2
+
+
+async def test_select_candidate_judges_only_among_passing(monkeypatch):
+    """Multiple candidates pass → the judge breaks the tie among the PASSING set only."""
+    loop = BoardLoop({"local_gate_cmd": "pytest", "max_mode_n": 3})
+    wts = ["/c0", "/c1", "/c2"]
+    monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
+
+    async def gate(wt):
+        return None if wt in ("/c0", "/c2") else "boom"  # c0 + c2 pass, c1 fails
+
+    async def judge(feature, base, sub):
+        assert sub == ["/c0", "/c2"]  # judge sees only the passing candidates
+        return 1  # picks the 2nd of the sublist → original index 2
+
+    monkeypatch.setattr(loop, "_run_local_gate", gate)
+    monkeypatch.setattr(loop, "_judge_candidates", judge)
+    assert await loop._select_candidate(FEATURE, "main", wts) == 2
+
+
+async def test_select_candidate_falls_back_to_judge_when_none_pass(monkeypatch):
+    loop = BoardLoop({"local_gate_cmd": "pytest", "max_mode_n": 2})
+    wts = ["/c0", "/c1"]
+    monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
+
+    async def gate(wt):
+        return "boom"  # none pass
+
+    async def judge(feature, base, sub):
+        assert sub == wts  # judges over ALL candidates
+        return 1
+
+    monkeypatch.setattr(loop, "_run_local_gate", gate)
+    monkeypatch.setattr(loop, "_judge_candidates", judge)
+    assert await loop._select_candidate(FEATURE, "main", wts) == 1
+
+
+async def test_select_candidate_no_gate_uses_judge_and_never_runs_gate(monkeypatch):
+    loop = BoardLoop({"max_mode_n": 2})  # no local_gate_cmd
+    wts = ["/c0", "/c1"]
+    monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
+
+    async def gate(wt):
+        raise AssertionError("the gate must not run when local_gate_cmd is unset")
+
+    async def judge(*a, **k):
+        return 0
+
+    monkeypatch.setattr(loop, "_run_local_gate", gate)
+    monkeypatch.setattr(loop, "_judge_candidates", judge)
+    assert await loop._select_candidate(FEATURE, "main", wts) == 0
+
+
+async def test_select_candidate_none_when_no_diff(monkeypatch):
+    loop = BoardLoop({"local_gate_cmd": "pytest", "max_mode_n": 2})
+    monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set()))  # all empty
+
+    async def gate(wt):
+        raise AssertionError("no diffs → nothing to gate")
+
+    monkeypatch.setattr(loop, "_run_local_gate", gate)
+    assert await loop._select_candidate(FEATURE, "main", ["/c0", "/c1"]) is None
