@@ -136,6 +136,26 @@ def test_data_routes_live_on_the_gated_prefix(monkeypatch):
     assert c.get("/plugins/project_board/features").status_code == 404
 
 
+def test_unusable_board_reads_surface_as_json_400_not_500(monkeypatch):
+    """An unusable board (no repo bound, no .beads, br missing) raises BoardError
+    on ANY read — that must reach the view as JSON 400 carrying the actionable
+    message, not escape as a text/plain 500 the page can only show as a
+    JSON-parse error."""
+
+    class BrokenStore(FakeStore):
+        def list_features(self, state=None):
+            raise BoardError("repo '.' has no beads workspace — set project_board.repo")
+
+        def get_feature(self, fid):
+            raise BoardError("repo '.' has no beads workspace — set project_board.repo")
+
+    c = _client(monkeypatch, BrokenStore())
+    for path in ("/api/plugins/project_board/features", "/api/plugins/project_board/features/bd-1"):
+        r = c.get(path)
+        assert r.status_code == 400, path
+        assert "beads workspace" in r.json()["detail"], path
+
+
 # ── CRUD + the Ready gate surfacing as 400 ──────────────────────────────────────
 
 
