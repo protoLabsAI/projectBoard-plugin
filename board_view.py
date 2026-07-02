@@ -102,7 +102,14 @@ const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-s
   in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
   done:"var(--pl-color-fg-muted)", blocked:"var(--pl-color-status-error)"};
 // Slug-aware authed fetch via the kit (rules 2+3) — pass a bare /api/... path.
-const api = (p) => kit.apiFetch(p).then(r => r.json());
+// Errors become READABLE: a JSON error body surfaces its `detail` (the actionable
+// BoardError message), a non-JSON body its HTTP status — never a raw parse error.
+const api = async (p) => {
+  const r = await kit.apiFetch(p);
+  const d = await r.json().catch(() => { throw new Error("HTTP " + r.status + " (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+  return d;
+};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 

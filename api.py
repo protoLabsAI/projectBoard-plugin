@@ -187,11 +187,15 @@ def build_data_router(cfg: dict):
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
     async def _features(state: str | None = None):
-        return {"features": store().list_features(state=state)}
+        # _guard, like every other store-touching route: an unusable board (no repo
+        # bound, no .beads, br missing) must reach the view as JSON 400 with the
+        # actionable BoardError message — an escaped BoardError is a text/plain 500
+        # the view can only render as a JSON-parse error.
+        return _guard(lambda: {"features": store().list_features(state=state)})
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):
-        f = store().get_feature(fid)
+        f = _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
         return f
