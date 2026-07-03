@@ -234,6 +234,14 @@ class BoardLoop:
         self.coder_solve_budget = max(1, int(self.cfg.get("coder_solve_budget", 6)))
         self.coder_solve_k = max(1, int(self.cfg.get("coder_solve_k", 3)))
         self.coder_solve_tree_depth = max(0, int(self.cfg.get("coder_solve_tree_depth", 2)))
+        # Rung 4 (ADR 0064 P3): a richer generator for the HARDEST features — reached
+        # only after greedy AND best-of-k AND tree-search all fail their tests. Fusion
+        # can't tool-call (it's a plain completion, not an ACP session), so it's an
+        # `openai`-type delegate name, resolved per-dispatch in `_drive` (mirroring how
+        # `coder`/`reviewer` are resolved) — never here, this is just config plumbing.
+        # Blank ⇒ no fusion rung; the ladder stops at tree-search exactly as before.
+        self.coder_solve_fusion_delegate = str(self.cfg.get("coder_solve_fusion_delegate", "")).strip()
+        self.coder_solve_fusion_k = max(1, int(self.cfg.get("coder_solve_fusion_k", 2)))
         # KG lessons (the flywheel READ half): before dispatching a coder, query the
         # knowledge graph (via graph.sdk) for distilled lessons relevant to THIS feature
         # and inject them into the prompt — so the coder heeds this area's known failure
@@ -673,6 +681,11 @@ class BoardLoop:
                         self._inflight[fid] = (repo, wt, branch)
                         result = await worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None)
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
+                        fusion = (
+                            self._resolve_delegate(self.coder_solve_fusion_delegate, "openai")
+                            if self.coder_solve_fusion_delegate
+                            else None
+                        )
                         wt, branch, result = await coder_seam.dispatch(
                             task=prompt,
                             coder=coder,
@@ -687,6 +700,9 @@ class BoardLoop:
                             k=self.coder_solve_k,
                             tree_depth=self.coder_solve_tree_depth,
                             record_gens=lambda n: store.record_gens_spent(fid, n),
+                            fusion_delegate=fusion,
+                            fusion_k=self.coder_solve_fusion_k,
+                            files_to_modify=feature.get("files_to_modify") or [],
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):

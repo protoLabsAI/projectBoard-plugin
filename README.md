@@ -46,16 +46,23 @@ board to a PR — or fork it as a starting point.
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
 - **Escalation (opt-in)** — with a `coders` map of >1 distinct delegate, a capability
   failure climbs a model tier (`fast→smart→reasoning`) and blocks at the top.
-- **coder.solve() board seam (ADR 0064 P2)** — on a fresh build, when the
+- **coder.solve() board seam (ADR 0064 P2/P3)** — on a fresh build, when the
   [`coder`](https://github.com/protoLabsAI/protoAgent/tree/main/plugins/coder) plugin
   is enabled AND the feature has acceptance criteria AND `coder_solve_test_cmd` (or
   `local_gate_cmd`) is set, the loop dispatches through `coder.solve()`'s
-  execution-grounded ladder (greedy → best-of-k → tree-search) instead of a single
-  `delegate_to(acp)` shot — gated on the feature's acceptance tests actually PASSING
-  in a real candidate worktree, never an LLM judge. Composes WITH the tier ladder
-  above (solve() searches *within* a tier; a search that never passes escalates a
-  tier, or blocks, exactly like a no-diff dispatch). Missing coder/acceptance/test
-  command ⇒ honest degrade to the single shot — see `coder_seam.py`.
+  execution-grounded ladder — greedy → best-of-k → tree-search → **fusion** — instead
+  of a single `delegate_to(acp)` shot, gated on the feature's acceptance tests
+  actually PASSING in a real candidate worktree, never an LLM judge. **Fusion** (rung
+  4, opt-in via `coder_solve_fusion_delegate`) is a richer *generator* for the
+  hardest features the cheaper rungs couldn't pass — it can't tool-call (a plain
+  completion, e.g. `protolabs/fusion`, not an ACP session), so `coder_seam.py` hands
+  it the current content of the feature's declared files and writes its reply's
+  files into a fresh worktree itself; the SAME `verify()` oracle judges it. Composes
+  WITH the tier ladder above (solve() searches *within* a tier; a search that never
+  passes escalates a tier, or blocks, exactly like a no-diff dispatch). Missing
+  coder/acceptance/test command ⇒ honest degrade to the single shot; missing
+  `coder_solve_fusion_delegate` ⇒ the ladder simply stops at tree-search — see
+  `coder_seam.py`.
 - **Planning layer** — two reasoning subagents (`decompose` + `antagonist`) driven by
   the `decompose-project` skill: idea → outline → MADR ADRs → epics › milestones ›
   features, hardened by an adversary, with a per-epic human gate.
@@ -114,6 +121,10 @@ project_board:
                              # acceptance criteria + a test command — see "What it does").
   coder_solve_test_cmd: "pytest tests/ -q"  # solve()'s verify() oracle; falls back to
                              # local_gate_cmd if blank, else the seam honest-degrades.
+  coder_solve_fusion_delegate: ""  # rung 4 (ADR 0064 P3), opt-in: an `openai`-type
+                             # delegate name (e.g. protolabs/fusion) for the hardest
+                             # features. Blank (default) = ladder stops at tree-search.
+  coder_solve_fusion_k: 2    # candidates fusion generates when reached
   # webhook_secret: "..."    # set before exposing /webhook/pr publicly
 ```
 

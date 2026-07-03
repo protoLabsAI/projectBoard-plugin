@@ -478,6 +478,9 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         k,
         tree_depth,
         record_gens=None,
+        fusion_delegate=None,
+        fusion_k=2,
+        files_to_modify=None,
     ):
         seen["fid"] = fid
         seen["test_cmd"] = test_cmd

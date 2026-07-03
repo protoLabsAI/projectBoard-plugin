@@ -1,7 +1,8 @@
 """The P2 board seam (ADR 0064): dispatch a feature's build through the `coder`
 plugin's execution-grounded ``solve()`` ladder instead of a single
-``delegate_to(acp)`` shot — greedy → best-of-k → tree-search, gated on the
-feature's acceptance tests actually PASSING in a real worktree, never an LLM judge.
+``delegate_to(acp)`` shot — greedy → best-of-k → tree-search → fusion, gated on
+the feature's acceptance tests actually PASSING in a real worktree, never an LLM
+judge.
 
 **Composes** `plugins.coder.solve` (a separate, git-URL-installed plugin — imported
 lazily/best-effort so this repo carries no hard dependency on it and no import-time
@@ -28,18 +29,95 @@ the coder is already prompted (``loop._build_prompt``) to write tests satisfying
 the acceptance criteria as part of its definition of done; this module's ``verify``
 just RUNS whatever tests exist in a candidate's worktree via the configured command
 and gates on its exit code — real execution, no fabricated grounding.
-"""
+
+**Rung 4 — fusion (ADR 0064 P3).** Fusion (e.g. ``protolabs/fusion``) is a strong
+*generator* but, per the ADR, it **can't tool-call** — unlike the ``acp`` coder
+(a real edit/verify session in the worktree), it can only return a plain chat
+completion. So its candidate generation is a DIFFERENT shape from the ACP rungs:
+``_fusion_prompt`` hands it the task + the CURRENT content of the feature's
+declared ``files_to_modify`` (read from the base repo — fusion has no tool access
+to look these up itself) and asks for the complete, final content of every file it
+creates or changes; ``_parse_fusion_files`` extracts ``{path: content}`` from the
+reply; ``_WorktreeSolveAdapter.generate_fusion`` writes those files into a fresh
+worktree (the same throwaway-per-candidate discipline as the ACP rungs) and hands
+the path to the SAME ``verify()`` — real acceptance tests, same oracle, no separate
+judge. Wholesale file replacement (not a unified diff) is deliberate: an LLM
+completion reliably reproduces a full file; a hand-rolled patch with drifted
+context lines is a common failure mode `git apply` doesn't forgive. Only reached
+when a ``fusion_delegate`` is configured (an ``openai``-type Delegate, already
+resolved by the caller) — absent that, ``solve()`` gets ``fusion_generate=None``
+and stops at tree-search exactly as before (honest degrade, unchanged)."""
 
 from __future__ import annotations
 
 import asyncio
 import importlib
 import logging
+import re
+from pathlib import Path
 from typing import Callable
 
 from . import worktree
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+# ``### path/to/file.py`` header, then a fenced block (any/no language hint) holding
+# that file's COMPLETE new content. Deliberately simple/strict: a fusion completion
+# that doesn't follow the format parses to no files, which just fails verify() like
+# any other empty candidate — never a silent partial/mangled write.
+_FUSION_FILE_RE = re.compile(r"^###\s+(\S.+?)\s*$\n```[^\n]*\n(.*?)```", re.MULTILINE | re.DOTALL)
+
+_FUSION_READ_MAX_CHARS = 20_000  # per-file context cap — fusion sees enough to edit, not a dump
+
+
+def _parse_fusion_files(reply: str) -> dict[str, str]:
+    """Extract ``{relative path: full file content}`` from a fusion completion. No
+    match ⇒ empty dict — the caller writes nothing, and the untouched worktree just
+    fails ``verify()`` like any other candidate that didn't address the task."""
+    return {path.strip(): content for path, content in _FUSION_FILE_RE.findall(reply or "")}
+
+
+def _fusion_prompt(task: str, *, feedback: str | None, repo: str, files_to_modify: list[str]) -> str:
+    """Build fusion's prompt. Fusion can't read the repo itself (no tool-calling), so
+    this hands it the CURRENT content of every file the feature declares — read from
+    the base repo, best-effort (a listed-but-not-yet-created file is noted as new)."""
+    file_blocks = []
+    for rel in files_to_modify:
+        p = Path(repo) / rel
+        try:
+            text = p.read_text(errors="replace")[:_FUSION_READ_MAX_CHARS]
+            file_blocks.append(f"### {rel} (current content)\n```\n{text}\n```")
+        except OSError:
+            file_blocks.append(f"### {rel} (does not exist yet — you are creating it)")
+    files_section = (
+        "\n\n".join(file_blocks) if file_blocks else "(no existing files listed — create what the task needs)"
+    )
+    parts = [
+        "Implement the task below. You have NO tool access — you cannot read or run "
+        "anything else, so work only from what's given here.",
+        "",
+        "## Task",
+        task.strip(),
+        "",
+        "## Current file contents",
+        files_section,
+        "",
+        "## Your reply format — REQUIRED, exactly this shape per file",
+        "For every file you create or change, return its COMPLETE, FINAL content "
+        "(never a partial diff or `...` elisions) as:",
+        "### relative/path/to/file.py",
+        "```",
+        "<the file's entire new content>",
+        "```",
+        "Only include files you're actually creating or changing. No prose outside the file blocks.",
+    ]
+    if feedback:
+        parts += [
+            "",
+            "## Your previous attempt FAILED the acceptance tests — fix exactly this",
+            feedback.strip(),
+        ]
+    return "\n".join(parts)
 
 
 class SolveExhausted(worktree.WorktreeError):
@@ -118,6 +196,9 @@ class _WorktreeSolveAdapter:
         test_cmd: str,
         test_timeout: float,
         verdict_cls,
+        fusion_delegate=None,
+        files_to_modify: list[str] | None = None,
+        _fusion_dispatch=None,
     ):
         self.repo = repo
         self.base = base
@@ -128,6 +209,12 @@ class _WorktreeSolveAdapter:
         self.test_cmd = test_cmd
         self.test_timeout = test_timeout
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
+        self.fusion_delegate = fusion_delegate  # a resolved `openai`-type Delegate, or None
+        self.files_to_modify = files_to_modify or []
+        # Test-injection seam (mirrors `_solve`/`_budget_cls`/`_verdict_cls` on
+        # `dispatch()`): production never passes this — the real lazy
+        # `ADAPTERS["openai"].dispatch` import happens in `generate_fusion` below.
+        self._fusion_dispatch = _fusion_dispatch
         self.candidates: list[tuple[str, str]] = []  # (worktree_path, branch)
         # `git worktree add` against the SAME repo must not run concurrently (best-
         # of-k dispatches `generate()` via asyncio.gather) — serialize just that
@@ -135,13 +222,55 @@ class _WorktreeSolveAdapter:
         self._wt_lock = asyncio.Lock()
         self._n = 0
 
-    async def generate(self, task: str, *, feedback: str | None = None) -> str:
+    async def _new_candidate_worktree(self) -> tuple[str, str]:
         self._n += 1
         cid = f"{self.fid}.g{self._n}"
         async with self._wt_lock:
             wt, branch = await worktree.create_worktree(self.repo, self.base, cid, self.root)
         self.candidates.append((wt, branch))
+        return wt, branch
+
+    async def generate(self, task: str, *, feedback: str | None = None) -> str:
+        wt, _branch = await self._new_candidate_worktree()
         await worktree.dispatch_coder(self.coder, wt, _augment_prompt(task, feedback), timeout=self.dispatch_timeout)
+        return wt
+
+    async def generate_fusion(self, task: str, *, feedback: str | None = None) -> str:
+        """Rung 4 (ADR 0064 P3): fusion can't tool-call, so instead of dispatching an
+        ACP session into the worktree, get a plain completion and write its files into
+        one. Same candidate bookkeeping (``candidates``/``_wt_lock``) as ``generate``,
+        so promote/reap treats a fusion winner identically to an ACP one."""
+        if self._fusion_dispatch is not None:
+            openai_dispatch = self._fusion_dispatch
+        else:
+            from plugins.delegates.adapters import ADAPTERS
+
+            openai_dispatch = ADAPTERS["openai"].dispatch
+
+        prompt = _fusion_prompt(task, feedback=feedback, repo=self.repo, files_to_modify=self.files_to_modify)
+        reply = await openai_dispatch(self.fusion_delegate, prompt, timeout=self.dispatch_timeout)
+        files = _parse_fusion_files(reply)
+        wt, _branch = await self._new_candidate_worktree()
+        wt_root = Path(wt).resolve()
+        written = 0
+        for rel, content in files.items():
+            # `rel` comes from a model completion — an absolute path or a `../` climb
+            # would otherwise write outside the worktree (Path.__truediv__ with an
+            # absolute right-hand side even discards the left side entirely). Resolve
+            # and require containment; skip (don't crash the candidate) on a miss.
+            dest = (wt_root / rel).resolve()
+            if wt_root not in dest.parents and dest != wt_root:
+                log.warning(
+                    "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
+                )
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+            written += 1
+        if not written:
+            log.warning(
+                "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
+            )
         return wt
 
     async def verify(self, candidate_wt: str):
@@ -215,9 +344,13 @@ async def dispatch(
     k: int,
     tree_depth: int,
     record_gens: RecordGens | None = None,
+    fusion_delegate=None,
+    fusion_k: int = 2,
+    files_to_modify: list[str] | None = None,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
+    _fusion_dispatch=None,
 ) -> tuple[str, str, str]:
     """Run the execution-grounded ladder for one feature build.
 
@@ -233,6 +366,14 @@ async def dispatch(
     ``solve()``/``Budget``/``Verdict``; production callers never pass them (the real
     import happens here, deferred so this module carries no hard dependency on the
     `coder` plugin).
+
+    ``fusion_delegate`` (a resolved ``openai``-type Delegate, or ``None``) gates rung
+    4 (ADR 0064 P3) — the caller resolves it (mirroring how ``coder`` itself is
+    resolved), so this module never does delegate lookup. ``None`` (unconfigured) ⇒
+    ``solve()`` gets ``fusion_generate=None`` and stops at tree-search, unchanged from
+    before this rung existed. ``files_to_modify`` feeds fusion's prompt (it can't read
+    the repo itself, unlike the ACP rungs) — the same list the feature's Ready gate
+    already required.
 
     **``solve()`` itself can raise.** The ladder (`coder`'s own ``solve.py``) has no
     try/except around ``generate``/``verify`` — it assumes a candidate attempt never
@@ -263,6 +404,9 @@ async def dispatch(
         test_cmd=test_cmd,
         test_timeout=test_timeout,
         verdict_cls=Verdict,
+        fusion_delegate=fusion_delegate,
+        files_to_modify=files_to_modify,
+        _fusion_dispatch=_fusion_dispatch,
     )
     try:
         result = await solve(
@@ -272,6 +416,8 @@ async def dispatch(
             budget=Budget(budget),
             k=k,
             tree_depth=tree_depth,
+            fusion_generate=adapter.generate_fusion if fusion_delegate is not None else None,
+            fusion_k=fusion_k,
         )
     except Exception as exc:
         for wt, branch in adapter.candidates:
