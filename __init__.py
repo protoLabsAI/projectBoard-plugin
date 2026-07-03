@@ -79,6 +79,40 @@ def register(registry) -> None:
     )
 
 
+# Board states where a feature is DONE and can't be a live duplicate — a new
+# creation of the same title is legitimately re-doing closed work. Everything else
+# (backlog/ready/in_progress/in_review/blocked) is "open" and a same-title create
+# would stack (mirrors portfolio-plugin's _TERMINAL_LANES/#25 dedup precedent — this
+# is the same class of bug one layer down: an agent's OWN reasoning calling
+# board_create_feature twice for one task, not just a PM re-dispatching).
+_TERMINAL_STATES = {"done", "cancelled"}
+
+
+def _norm_title(t: str) -> str:
+    """Normalize a feature title for duplicate comparison: trimmed, lowercased,
+    internal whitespace collapsed. Exact-after-normalize only — no fuzzy match (a
+    false positive silently drops a real task, worse than an occasional missed
+    near-dup)."""
+    return " ".join(str(t or "").strip().lower().split())
+
+
+def _open_duplicate(features: list, title: str) -> dict | None:
+    """The first OPEN board feature whose title matches ``title`` (normalized), or
+    None. A board's own agent (onboarding, or its own reasoning about a dispatched
+    task) can call board_create_feature more than once for the same piece of work
+    within a single turn — this catches it at the tool boundary, same as
+    portfolio_dispatch's dedup guards the PM's re-dispatch one tier up."""
+    want = _norm_title(title)
+    if not want:
+        return None
+    for f in features or []:
+        if str(f.get("board_state", "")).lower() in _TERMINAL_STATES:
+            continue
+        if _norm_title(f.get("title", "")) == want:
+            return f
+    return None
+
+
 def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
@@ -107,6 +141,7 @@ def _board_tools(cfg: dict):
         difficulty: str = "",
         depends_on: str = "",
         foundation: bool = False,
+        force: bool = False,
     ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
@@ -114,11 +149,32 @@ def _board_tools(cfg: dict):
         make a coding agent produce nothing). `parent` is the epic/milestone id;
         `difficulty` (small|medium|large) seeds the model tier; `depends_on` is a
         comma-separated list of blocking feature ids; set `foundation=True` for a
-        feature others build on (dependents gate on its merge, never its review)."""
+        feature others build on (dependents gate on its merge, never its review).
+
+        DEDUP: refuses to create when a feature with the same title is already OPEN
+        on this board (backlog/ready/in_progress/in_review/blocked) — calling this
+        twice for the same task (e.g. reconsidering mid-turn) stacks a duplicate the
+        loop then churns on. Pass `force=true` to create a second copy anyway. A
+        store read failure never blocks creation (better a possible dup than a
+        stuck board)."""
         try:
+            store = get_store(**store_kw)
+            if not force:
+                try:
+                    existing = store.list_features()
+                except BoardError:
+                    existing = []  # can't check → don't block creation on a read failure
+                dup = _open_duplicate(existing, title)
+                if dup is not None:
+                    return (
+                        f"Skipped — a feature titled {title!r} is already open on this board "
+                        f"({dup.get('id', '?')}, {dup.get('board_state', 'open')}). It's likely "
+                        "the same work; re-check the board before creating again, or pass "
+                        "force=true to create a second copy anyway."
+                    )
             deps = [d.strip() for d in depends_on.split(",") if d.strip()]
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
-            f = get_store(**store_kw).create_feature(
+            f = store.create_feature(
                 title,
                 spec=spec,
                 acceptance_criteria=acceptance_criteria,
