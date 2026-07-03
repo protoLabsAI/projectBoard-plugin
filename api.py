@@ -242,4 +242,84 @@ def build_data_router(cfg: dict):
         cancel to keep a visible, reopenable audit lane; use delete to leave no trace."""
         return _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
 
+    # ── coder.solve() rung diagnostic (ADR 0064) — OPERATOR ONLY, deliberately no
+    #    @tool wrapper: same boundary this router already draws around cancel/
+    #    block/delete — the board's own lead agent has no tool to reach this.
+    @router.post("/features/{fid}/test-rung")
+    async def _test_rung(fid: str, body: dict = Body(...)):
+        """Run exactly ONE named rung of coder.solve() against this feature's REAL
+        acceptance tests, in a throwaway worktree that's ALWAYS reaped — never
+        promoted, no PR opened, no board state touched. For verifying a rung
+        actually works (fusion especially — otherwise only reached after three
+        cheaper rungs fail) without contriving a task that fails its way there.
+
+        Body: ``{"rung": "greedy"|"best-of-k"|"tree-search"|"fusion", "coder": "<delegate
+        name>"}`` (``coder`` optional, defaults to ``project_board.coder``)."""
+        rung = str(body.get("rung", "")).strip()
+        if rung not in ("greedy", "best-of-k", "tree-search", "fusion"):
+            raise HTTPException(400, "rung must be one of: greedy, best-of-k, tree-search, fusion")
+
+        f = _guard(lambda: store().get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        if not str(f.get("acceptance_criteria") or "").strip():
+            raise HTTPException(400, f"feature {fid!r} has no acceptance_criteria — nothing to verify a rung against")
+
+        from . import coder_seam
+
+        if coder_seam._import_solve() is None:
+            raise HTTPException(400, "the `coder` plugin isn't installed/enabled on this host")
+
+        test_cmd = (
+            str((cfg or {}).get("coder_solve_test_cmd") or "").strip()
+            or str((cfg or {}).get("local_gate_cmd") or "").strip()
+        )
+        if not test_cmd:
+            raise HTTPException(400, "no coder_solve_test_cmd or local_gate_cmd configured — nothing to run tests with")
+
+        coder_name = str(body.get("coder") or (cfg or {}).get("coder", "proto"))
+        coder = coder_seam.resolve_delegate(coder_name, "acp")
+        if coder is None:
+            raise HTTPException(400, f"acp delegate {coder_name!r} not found — check `delegates:`")
+
+        fusion_delegate = None
+        if rung == "fusion":
+            fusion_name = str((cfg or {}).get("coder_solve_fusion_delegate") or "").strip()
+            if not fusion_name:
+                raise HTTPException(400, "rung='fusion' requires project_board.coder_solve_fusion_delegate")
+            fusion_delegate = coder_seam.resolve_delegate(fusion_name, "openai")
+            if fusion_delegate is None:
+                raise HTTPException(400, f"openai delegate {fusion_name!r} not found — check `delegates:`")
+
+        task = (
+            f"# {f.get('title', '')}\n\n"
+            f"## Task\n{f.get('spec', '')}\n\n"
+            f"## Files to create / modify\n"
+            + ("\n".join(f"- {p}" for p in (f.get("files_to_modify") or [])) or "(none listed)")
+            + f"\n\n## Acceptance criteria (definition of done)\n{f.get('acceptance_criteria', '')}\n"
+        )
+
+        try:
+            result = await coder_seam.test_rung(
+                rung=rung,
+                task=task,
+                coder=coder,
+                repo=(cfg or {}).get("repo", "."),
+                base=(cfg or {}).get("base_branch", "main"),
+                root=(cfg or {}).get("worktrees_root", ".worktrees"),
+                fid=fid,
+                dispatch_timeout=float((cfg or {}).get("coder_timeout_s", 1800)) or None,
+                test_cmd=test_cmd,
+                test_timeout=float((cfg or {}).get("coder_solve_test_timeout_s", 300)),
+                budget=max(1, int((cfg or {}).get("coder_solve_budget", 6))),
+                k=max(1, int((cfg or {}).get("coder_solve_k", 3))),
+                tree_depth=max(0, int((cfg or {}).get("coder_solve_tree_depth", 2))),
+                fusion_delegate=fusion_delegate,
+                fusion_k=max(1, int((cfg or {}).get("coder_solve_fusion_k", 2))),
+                files_to_modify=f.get("files_to_modify") or [],
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as a 400, not a raw 500
+            raise HTTPException(400, f"test-rung failed: {exc}") from exc
+        return result
+
     return router

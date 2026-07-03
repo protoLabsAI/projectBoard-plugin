@@ -63,6 +63,14 @@ board to a PR — or fork it as a starting point.
   coder/acceptance/test command ⇒ honest degrade to the single shot; missing
   `coder_solve_fusion_delegate` ⇒ the ladder simply stops at tree-search — see
   `coder_seam.py`.
+- **Rung diagnostic — `POST /api/plugins/project_board/features/{id}/test-rung`**
+  (operator-only, no `@tool` wrapper): runs exactly ONE named rung
+  (`greedy`/`best-of-k`/`tree-search`/`fusion`) against a feature's real acceptance
+  tests, in a throwaway worktree that's ALWAYS reaped — never promoted, no PR, no
+  board state touched. Verifying a specific rung — fusion especially, only
+  otherwise reached after three cheaper rungs fail — shouldn't require contriving a
+  task hard enough to fail its way there. `{"rung": "fusion"}` in the body; `coder`
+  optional (defaults to `project_board.coder`).
 - **Planning layer** — two reasoning subagents (`decompose` + `antagonist`) driven by
   the `decompose-project` skill: idea → outline → MADR ADRs → epics › milestones ›
   features, hardened by an adversary, with a per-epic human gate.
@@ -138,7 +146,9 @@ project_board:
 - **HTTP API** (`/plugins/project_board/*`): `epics`, `milestones`, `features`,
   `features/{id}/{ready,dep,block,unblock,ci}`, and `/webhook/pr` (the Done edge —
   a stable public URL GitHub posts to; ungated so GitHub, which can't send a bearer,
-  reaches it).
+  reaches it). `features/{id}/{cancel,test-rung}` and `DELETE features/{id}` are
+  **operator-only** — no `@tool` wrapper, so the board's own lead agent has no way
+  to call them.
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).

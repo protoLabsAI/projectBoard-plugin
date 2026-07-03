@@ -849,3 +849,214 @@ async def test_dispatch_without_a_fusion_delegate_passes_none_through(monkeypatc
         _verdict_cls=_FakeVerdict,
     )
     assert seen["fusion_generate"] is None
+
+
+# ── test_rung(): operator-only diagnostic — always reaps, never promotes ────────
+
+
+async def test_test_rung_always_reaps_even_on_a_pass(monkeypatch, tmp_path):
+    """A passing test_rung() candidate must still be reaped — this is a diagnostic
+    dry-run, never a real dispatch. (dispatch() PROMOTES a winner; test_rung() must
+    not, or a 'just checking fusion works' call would silently ship a feature.)"""
+    removed = []
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        return "reply"
+
+    async def _remove(repo, wt, branch=""):
+        removed.append(wt)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+
+    async def _fake_solve(
+        task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2, force_rung=None
+    ):
+        assert force_rung == "greedy"  # test_rung must pass force_rung through
+        c = await generate(task, feedback=None)
+        return _FakeResult(solution=c, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    result = await coder_seam.test_rung(
+        rung="greedy",
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert result == {
+        "rung": "greedy",
+        "passed": True,
+        "gens_spent": 1,
+        "candidates_tried": 1,
+        "note": "",
+        "verdict_output": "",
+    }
+    assert len(removed) == 1  # the winning candidate was reaped, NOT promoted
+
+
+async def test_test_rung_reaps_on_a_fail_too(monkeypatch, tmp_path):
+    removed = []
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        return "reply"
+
+    async def _remove(repo, wt, branch=""):
+        removed.append(wt)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+
+    async def _fake_solve(
+        task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2, force_rung=None
+    ):
+        c = await generate(task, feedback=None)
+        v = _FakeVerdict(passed=False, total=2, failed=1, output="1 failed")
+        return _FakeResult(
+            solution=c,
+            passed=False,
+            rung="greedy",
+            gens_spent=1,
+            candidates_tried=1,
+            verdict=v,
+            note="forced greedy (test) — 1/2 failing",
+        )
+
+    result = await coder_seam.test_rung(
+        rung="greedy",
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert result["passed"] is False
+    assert result["verdict_output"] == "1 failed"
+    assert len(removed) == 1  # still reaped despite the fail
+
+
+async def test_test_rung_reaps_even_if_solve_raises(monkeypatch, tmp_path):
+    removed = []
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        return "reply"
+
+    async def _remove(repo, wt, branch=""):
+        removed.append(wt)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+
+    async def _fake_solve(
+        task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2, force_rung=None
+    ):
+        await generate(task, feedback=None)
+        raise worktree.CoderTimeout("boom")
+
+    try:
+        await coder_seam.test_rung(
+            rung="greedy",
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-1",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raise AssertionError("expected CoderTimeout to propagate")
+    except worktree.CoderTimeout:
+        pass
+    assert len(removed) == 1  # reaped even though solve() raised
+
+
+async def test_test_rung_forwards_fusion_and_files_to_modify(monkeypatch, tmp_path):
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+    monkeypatch.setattr(worktree, "remove_worktree", lambda *a, **k: _noop())
+
+    async def _noop():
+        return None
+
+    seen = {}
+
+    async def _fake_solve(
+        task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2, force_rung=None
+    ):
+        seen["force_rung"] = force_rung
+        seen["fusion_generate_is_none"] = fusion_generate is None
+        seen["fusion_k"] = fusion_k
+        return _FakeResult(solution="x", passed=True, rung="fusion", gens_spent=1, candidates_tried=1)
+
+    await coder_seam.test_rung(
+        rung="fusion",
+        task="t",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        fusion_delegate=object(),
+        fusion_k=5,
+        files_to_modify=["a.py"],
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+        _fusion_dispatch=lambda *a, **k: _noop(),
+    )
+    assert seen["force_rung"] == "fusion"
+    assert seen["fusion_generate_is_none"] is False  # fusion_delegate given → wired through
+    assert seen["fusion_k"] == 5
+
+
+# ── resolve_delegate: shared by loop.py and api.py's test-rung route ─────────────
+
+
+def test_resolve_delegate_returns_none_when_delegates_plugin_absent():
+    """`plugins.delegates` is genuinely absent in this standalone test env — the
+    honest-degrade case in production too when the plugin's disabled."""
+    assert coder_seam.resolve_delegate("anything", "acp") is None

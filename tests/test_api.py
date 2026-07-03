@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from project_board import api
+from project_board import api, coder_seam
 from project_board.store import BoardError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -302,3 +302,151 @@ def test_ci_fail_with_a_single_coder_bounces_to_in_progress(monkeypatch):
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is False
     assert any(call[0] == "bounce_ci_fail" for call in store.calls)
+
+
+# ── /features/{fid}/test-rung — operator-only diagnostic (ADR 0064) ─────────────
+# No @tool wrapper anywhere in coder_seam.py/api.py exposes this to the board's
+# own lead agent — these tests only exercise the HTTP route directly, mirroring
+# how an operator (console/curl) would reach it.
+
+
+def _feature_with_ac(fid="bd-7", files=None):
+    return {
+        "id": fid,
+        "title": "T",
+        "spec": "do the thing",
+        "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+        "files_to_modify": files or ["a.py"],
+        "board_state": "ready",
+    }
+
+
+def test_test_rung_rejects_an_unknown_rung_name(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "nonsense"})
+    assert r.status_code == 400
+    assert "rung must be one of" in r.json()["detail"]
+
+
+def test_test_rung_404s_on_an_unknown_feature(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/missing/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 404
+
+
+def test_test_rung_400s_without_acceptance_criteria(monkeypatch):
+    store = FakeStore()  # get_feature returns {"id": fid, "board_state": "ready"} — no AC
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "acceptance_criteria" in r.json()["detail"]
+
+
+def test_test_rung_400s_when_coder_plugin_unavailable(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: None)
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "coder` plugin" in r.json()["detail"]
+
+
+def test_test_rung_400s_without_a_test_command(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    c = _client(monkeypatch, store, cfg={})  # no coder_solve_test_cmd, no local_gate_cmd
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "test_cmd" in r.json()["detail"] or "gate_cmd" in r.json()["detail"]
+
+
+def test_test_rung_400s_when_the_coder_delegate_is_missing(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: None)
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "acp delegate" in r.json()["detail"]
+
+
+def test_test_rung_fusion_400s_without_a_configured_fusion_delegate(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})  # no coder_solve_fusion_delegate
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "fusion"})
+    assert r.status_code == 400
+    assert "coder_solve_fusion_delegate" in r.json()["detail"]
+
+
+def test_test_rung_happy_path_calls_coder_seam_test_rung_and_returns_its_result(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+
+    resolved = {}
+
+    def _resolve(name, expect_type):
+        resolved[expect_type] = name
+        return object()
+
+    monkeypatch.setattr(coder_seam, "resolve_delegate", _resolve)
+
+    seen_kwargs = {}
+
+    async def _fake_test_rung(**kwargs):
+        seen_kwargs.update(kwargs)
+        return {
+            "rung": "greedy",
+            "passed": True,
+            "gens_spent": 1,
+            "candidates_tried": 1,
+            "note": "ok",
+            "verdict_output": "",
+        }
+
+    monkeypatch.setattr(coder_seam, "test_rung", _fake_test_rung)
+
+    c = _client(
+        monkeypatch,
+        store,
+        cfg={"coder_solve_test_cmd": "pytest -q", "coder": "proto", "repo": "/repo", "base_branch": "main"},
+    )
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 200
+    assert r.json() == {
+        "rung": "greedy",
+        "passed": True,
+        "gens_spent": 1,
+        "candidates_tried": 1,
+        "note": "ok",
+        "verdict_output": "",
+    }
+    assert resolved == {"acp": "proto"}
+    assert seen_kwargs["rung"] == "greedy"
+    assert seen_kwargs["repo"] == "/repo"
+    assert "WHEN x THE SYSTEM SHALL y" in seen_kwargs["task"]
+    assert seen_kwargs["files_to_modify"] == ["a.py"]
+
+
+def test_test_rung_surfaces_a_solve_failure_as_400_not_500(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
+
+    async def _boom(**kwargs):
+        raise RuntimeError("worktree op failed")
+
+    monkeypatch.setattr(coder_seam, "test_rung", _boom)
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "test-rung failed" in r.json()["detail"]
