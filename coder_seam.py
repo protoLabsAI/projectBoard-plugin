@@ -46,7 +46,15 @@ completion reliably reproduces a full file; a hand-rolled patch with drifted
 context lines is a common failure mode `git apply` doesn't forgive. Only reached
 when a ``fusion_delegate`` is configured (an ``openai``-type Delegate, already
 resolved by the caller) — absent that, ``solve()`` gets ``fusion_generate=None``
-and stops at tree-search exactly as before (honest degrade, unchanged)."""
+and stops at tree-search exactly as before (honest degrade, unchanged).
+
+**``test_rung`` (operator-only diagnostic).** Verifying a specific rung — fusion
+especially, only otherwise reached after three cheaper rungs fail — shouldn't
+require contriving a task hard enough to fail its way there. ``test_rung`` runs
+ONE named rung once against a feature's real acceptance tests in a throwaway
+worktree that's ALWAYS reaped, win or lose — never promoted, no PR. Exposed via
+api.py's ``test-rung`` route with no ``@tool`` wrapper, so it's operator-only,
+not something the board's own lead agent can reach for itself."""
 
 from __future__ import annotations
 
@@ -60,6 +68,24 @@ from typing import Callable
 from . import worktree
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+def resolve_delegate(name: str, expect_type: str):
+    """Look up a live delegate by name from the delegates registry. Returns the
+    Delegate or None (not configured / wrong type / plugin disabled). Shared by
+    ``loop.py`` (coder/reviewer/fusion resolution in the real dispatch path) and
+    ``api.py`` (the operator-only test-rung route) — one lookup, not two copies."""
+    try:
+        from plugins.delegates.registry import DelegateRegistry
+        from plugins.delegates.store import merged_delegates
+
+        d = DelegateRegistry(merged_delegates()).get(name)
+    except Exception:  # noqa: BLE001 — delegates plugin may be disabled
+        return None
+    if d is None or d.type != expect_type:
+        return None
+    return d
+
 
 # ``### path/to/file.py`` header, then a fenced block (any/no language hint) holding
 # that file's COMPLETE new content. Deliberately simple/strict: a fusion completion
@@ -475,3 +501,85 @@ async def dispatch(
     )
     result_text = f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
     return canon_wt, canon_branch, result_text
+
+
+async def test_rung(
+    *,
+    rung: str,
+    task: str,
+    coder,
+    repo: str,
+    base: str,
+    root: str,
+    fid: str,
+    dispatch_timeout: float | None,
+    test_cmd: str,
+    test_timeout: float,
+    budget: int = 10,
+    k: int = 3,
+    tree_depth: int = 2,
+    fusion_delegate=None,
+    fusion_k: int = 2,
+    files_to_modify: list[str] | None = None,
+    _solve=None,
+    _budget_cls=None,
+    _verdict_cls=None,
+    _fusion_dispatch=None,
+) -> dict:
+    """Operator-only diagnostic (ADR 0064): run exactly ONE named rung of
+    ``coder.solve()`` against a feature's REAL acceptance tests, in a throwaway
+    worktree that is ALWAYS reaped afterward — never promoted, no PR opened, no
+    board state touched. For verifying a rung actually works (especially fusion,
+    only otherwise reached after three cheaper rungs fail) without contriving a
+    task hard enough to fail its way there.
+
+    Deliberately separate from ``dispatch()``: that function's contract (promote
+    the winner, raise ``SolveExhausted`` on exhaustion) is shaped for the board's
+    real per-feature build — mixing test semantics into it would risk the real
+    dispatch path. This is exposed to operators only via api.py's ``test-rung``
+    route, which carries NO ``@tool`` wrapper — the board's own lead agent has no
+    way to call this itself (see api.py's docstring for the same boundary the
+    plugin already draws around ``/features/{id}/cancel`` etc.)."""
+    if _solve is not None:
+        solve, Budget, Verdict = _solve, _budget_cls, _verdict_cls
+    else:
+        from plugins.coder.solve import Budget, Verdict, solve
+
+    adapter = _WorktreeSolveAdapter(
+        repo=repo,
+        base=base,
+        root=root,
+        fid=f"{fid}.test",
+        coder=coder,
+        dispatch_timeout=dispatch_timeout,
+        test_cmd=test_cmd,
+        test_timeout=test_timeout,
+        verdict_cls=Verdict,
+        fusion_delegate=fusion_delegate,
+        files_to_modify=files_to_modify,
+        _fusion_dispatch=_fusion_dispatch,
+    )
+    try:
+        result = await solve(
+            task,
+            generate=adapter.generate,
+            verify=adapter.verify,
+            budget=Budget(budget),
+            k=k,
+            tree_depth=tree_depth,
+            fusion_generate=adapter.generate_fusion if fusion_delegate is not None else None,
+            fusion_k=fusion_k,
+            force_rung=rung,
+        )
+    finally:
+        # ALWAYS reap — pass or fail, this is a diagnostic run, never a real build.
+        for wt, branch in adapter.candidates:
+            await worktree.remove_worktree(repo, wt, branch)
+    return {
+        "rung": result.rung,
+        "passed": result.passed,
+        "gens_spent": result.gens_spent,
+        "candidates_tried": result.candidates_tried,
+        "note": result.note,
+        "verdict_output": result.verdict.output if result.verdict else "",
+    }

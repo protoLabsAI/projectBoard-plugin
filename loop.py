@@ -891,17 +891,10 @@ class BoardLoop:
 
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the
-        Delegate or None (not configured / wrong type / plugin disabled)."""
-        try:
-            from plugins.delegates.registry import DelegateRegistry
-            from plugins.delegates.store import merged_delegates
-
-            d = DelegateRegistry(merged_delegates()).get(name)
-        except Exception:  # noqa: BLE001 — delegates plugin may be disabled
-            return None
-        if d is None or d.type != expect_type:
-            return None
-        return d
+        Delegate or None (not configured / wrong type / plugin disabled). Thin
+        wrapper — the real lookup is shared with api.py's test-rung route via
+        ``coder_seam.resolve_delegate``."""
+        return coder_seam.resolve_delegate(name, expect_type)
 
     async def _run_fixups(self, wt: str) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.
