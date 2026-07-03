@@ -1240,6 +1240,12 @@ class BoardLoop:
             f"write a single line `NO_TEST_NEEDED: <reason>` in your final message instead.\n"
             f"- You cannot run shell commands (edit-only); the tests you write run in CI "
             f"on the PR, so they must be correct and self-contained.\n"
+            f"- **Your FINAL message becomes the PR description, verbatim.** End with a "
+            f"short, clean summary for a reviewer — what changed and why, 2-6 sentences "
+            f"or a few bullet points. Do NOT narrate your process: no step-by-step "
+            f'exploration, no "I first looked at..."/"Let me...", no restating these '
+            f"instructions or the acceptance criteria back. If you used scratch "
+            f"reasoning to get here, leave it out of this message entirely.\n"
             f"- You are done when the listed files exist, tests cover the change, and "
             f"every acceptance criterion is satisfied."
         )
