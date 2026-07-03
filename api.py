@@ -282,6 +282,9 @@ def build_data_router(cfg: dict):
         if coder is None:
             raise HTTPException(400, f"acp delegate {coder_name!r} not found — check `delegates:`")
 
+        fusion_max_file_chars = max(
+            1, int((cfg or {}).get("coder_solve_fusion_max_file_chars", coder_seam.FUSION_MAX_FILE_CHARS_DEFAULT))
+        )
         fusion_delegate = None
         if rung == "fusion":
             fusion_name = str((cfg or {}).get("coder_solve_fusion_delegate") or "").strip()
@@ -290,6 +293,22 @@ def build_data_router(cfg: dict):
             fusion_delegate = coder_seam.resolve_delegate(fusion_name, "openai")
             if fusion_delegate is None:
                 raise HTTPException(400, f"openai delegate {fusion_name!r} not found — check `delegates:`")
+            # Same gate `_drive` applies before a real dispatch — fusion can't
+            # tool-call and returns whole-file replacements, so this diagnostic
+            # must refuse the same oversized files a real build would skip.
+            viable, reason = coder_seam.fusion_viable_for_files(
+                (cfg or {}).get("repo", "."),
+                f.get("files_to_modify") or [],
+                max_file_chars=fusion_max_file_chars,
+                max_total_chars=max(
+                    1,
+                    int(
+                        (cfg or {}).get("coder_solve_fusion_max_total_chars", coder_seam.FUSION_MAX_TOTAL_CHARS_DEFAULT)
+                    ),
+                ),
+            )
+            if not viable:
+                raise HTTPException(400, f"rung='fusion' not viable for this feature's files: {reason}")
 
         task = (
             f"# {f.get('title', '')}\n\n"
@@ -317,6 +336,7 @@ def build_data_router(cfg: dict):
                 fusion_delegate=fusion_delegate,
                 fusion_k=max(1, int((cfg or {}).get("coder_solve_fusion_k", 2))),
                 files_to_modify=f.get("files_to_modify") or [],
+                fusion_max_file_chars=fusion_max_file_chars,
             )
         except Exception as exc:  # noqa: BLE001 — surface as a 400, not a raw 500
             raise HTTPException(400, f"test-rung failed: {exc}") from exc

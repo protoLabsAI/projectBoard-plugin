@@ -48,6 +48,24 @@ when a ``fusion_delegate`` is configured (an ``openai``-type Delegate, already
 resolved by the caller) — absent that, ``solve()`` gets ``fusion_generate=None``
 and stops at tree-search exactly as before (honest degrade, unchanged).
 
+**Fusion + large files — honest-degrade, not silent truncation.** Whole-file
+replacement only works when a real completion can (a) see the WHOLE current file
+and (b) reproduce the WHOLE new one — and the tighter constraint is usually the
+OUTPUT side: a delegate's own ``max_tokens`` (often ~1024 by default, ~4K chars)
+can truncate the response well before a merely-medium file's size, and
+``OpenAiAdapter.dispatch`` doesn't surface ``finish_reason`` to tell a caller that
+happened. So this module never attempts a full-file rewrite it can't stand behind:
+``fusion_viable_for_files`` gates on the feature's ACTUAL on-disk file sizes
+(per-file and combined) BEFORE fusion is ever dispatched — callers (``loop.py``,
+``api.py``) check it and treat "not viable" exactly like "no fusion_delegate
+configured" (``fusion_delegate=None`` for that dispatch). As a defensive backstop
+(in case a caller skips the gate — direct ``test_rung`` callers, say)
+``generate_fusion`` ALSO refuses to write a candidate file back over a
+significantly larger original — a shrunk "complete" rewrite is far more likely a
+truncated one than an honest tiny file than a real edit, so that file is left
+unwritten (verify() then judges the candidate on what's actually there) rather
+than risking data loss.
+
 **``test_rung`` (operator-only diagnostic).** Verifying a specific rung — fusion
 especially, only otherwise reached after three cheaper rungs fail — shouldn't
 require contriving a task hard enough to fail its way there. ``test_rung`` runs
@@ -93,7 +111,55 @@ def resolve_delegate(name: str, expect_type: str):
 # any other empty candidate — never a silent partial/mangled write.
 _FUSION_FILE_RE = re.compile(r"^###\s+(\S.+?)\s*$\n```[^\n]*\n(.*?)```", re.MULTILINE | re.DOTALL)
 
-_FUSION_READ_MAX_CHARS = 20_000  # per-file context cap — fusion sees enough to edit, not a dump
+# Defaults for `fusion_viable_for_files` — deliberately conservative. The binding
+# constraint is usually the OUTPUT side (a delegate's own `max_tokens`, often
+# ~1024 ⇒ ~4K chars, silently truncating a reply the adapter doesn't even expose
+# `finish_reason` for), not this repo's own read logic — these caps exist so
+# fusion is refused for a feature's files BEFORE a doomed rewrite is attempted,
+# not tuned to "how much can Python read." Configurable per-board — see loop.py's
+# `coder_solve_fusion_max_file_chars` / `_max_total_chars`.
+FUSION_MAX_FILE_CHARS_DEFAULT = 8_000
+FUSION_MAX_TOTAL_CHARS_DEFAULT = 16_000
+
+# Defense-in-depth for `generate_fusion`'s write guard: a returned file under this
+# fraction of the ORIGINAL file's size is treated as a likely-truncated rewrite,
+# not a legitimately smaller edit, and is refused. Only applies above a minimum
+# original size (`_SHRINK_GUARD_MIN_ORIGINAL_CHARS`) — a real small edit to a
+# small file (e.g. a 40-char file trimmed to 10) shouldn't trip a "big shrink"
+# heuristic meant to catch multi-KB truncation.
+_SHRINK_GUARD_RATIO = 0.5
+_SHRINK_GUARD_MIN_ORIGINAL_CHARS = 500
+
+
+def fusion_viable_for_files(
+    repo: str,
+    files_to_modify: list[str],
+    *,
+    max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
+    max_total_chars: int = FUSION_MAX_TOTAL_CHARS_DEFAULT,
+) -> tuple[bool, str]:
+    """Gate fusion on the feature's files BEFORE ever dispatching to it — whole-file
+    replacement only works when a real completion can see the whole current file
+    and reproduce the whole new one. Checks actual on-disk size (``os.path.getsize``,
+    never reads the file into memory just to measure it). Returns ``(True, "")`` when
+    every file is small enough (or doesn't exist yet — nothing to be too large),
+    else ``(False, reason)``. Callers treat ``False`` exactly like "no
+    fusion_delegate configured": honest degrade, not a silent truncated attempt."""
+    import os
+
+    total = 0
+    for rel in files_to_modify:
+        p = Path(repo) / rel
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue  # doesn't exist yet — nothing to be too large
+        if size > max_file_chars:
+            return False, f"{rel} is {size} chars, over the {max_file_chars}-char per-file cap for a full rewrite"
+        total += size
+    if total > max_total_chars:
+        return False, f"files_to_modify total {total} chars, over the {max_total_chars}-char combined cap"
+    return True, ""
 
 
 def _parse_fusion_files(reply: str) -> dict[str, str]:
@@ -103,18 +169,41 @@ def _parse_fusion_files(reply: str) -> dict[str, str]:
     return {path.strip(): content for path, content in _FUSION_FILE_RE.findall(reply or "")}
 
 
-def _fusion_prompt(task: str, *, feedback: str | None, repo: str, files_to_modify: list[str]) -> str:
+def _fusion_prompt(
+    task: str,
+    *,
+    feedback: str | None,
+    repo: str,
+    files_to_modify: list[str],
+    max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
+) -> str:
     """Build fusion's prompt. Fusion can't read the repo itself (no tool-calling), so
     this hands it the CURRENT content of every file the feature declares — read from
-    the base repo, best-effort (a listed-but-not-yet-created file is noted as new)."""
+    the base repo, best-effort (a listed-but-not-yet-created file is noted as new).
+
+    Callers are expected to have already checked ``fusion_viable_for_files`` (the
+    real gate) so a genuinely oversized file should never reach here — this
+    truncation is a DEFENSIVE backstop only (e.g. a direct ``test_rung`` call that
+    skipped the gate), and unlike the gate it's never silent: a truncated file is
+    marked as such so fusion knows not to claim a full-file replacement for it."""
     file_blocks = []
     for rel in files_to_modify:
         p = Path(repo) / rel
         try:
-            text = p.read_text(errors="replace")[:_FUSION_READ_MAX_CHARS]
-            file_blocks.append(f"### {rel} (current content)\n```\n{text}\n```")
+            raw = p.read_text(errors="replace")
         except OSError:
             file_blocks.append(f"### {rel} (does not exist yet — you are creating it)")
+            continue
+        if len(raw) > max_file_chars:
+            text = raw[:max_file_chars]
+            file_blocks.append(
+                f"### {rel} (current content — TRUNCATED at {max_file_chars} chars, "
+                f"real file is {len(raw)} chars — do NOT return this as a complete "
+                "replacement; skip this file instead)\n```\n"
+                f"{text}\n```"
+            )
+        else:
+            file_blocks.append(f"### {rel} (current content)\n```\n{raw}\n```")
     files_section = (
         "\n\n".join(file_blocks) if file_blocks else "(no existing files listed — create what the task needs)"
     )
@@ -224,6 +313,7 @@ class _WorktreeSolveAdapter:
         verdict_cls,
         fusion_delegate=None,
         files_to_modify: list[str] | None = None,
+        fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
         _fusion_dispatch=None,
     ):
         self.repo = repo
@@ -237,6 +327,7 @@ class _WorktreeSolveAdapter:
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         self.fusion_delegate = fusion_delegate  # a resolved `openai`-type Delegate, or None
         self.files_to_modify = files_to_modify or []
+        self.fusion_max_file_chars = fusion_max_file_chars
         # Test-injection seam (mirrors `_solve`/`_budget_cls`/`_verdict_cls` on
         # `dispatch()`): production never passes this — the real lazy
         # `ADAPTERS["openai"].dispatch` import happens in `generate_fusion` below.
@@ -273,7 +364,13 @@ class _WorktreeSolveAdapter:
 
             openai_dispatch = ADAPTERS["openai"].dispatch
 
-        prompt = _fusion_prompt(task, feedback=feedback, repo=self.repo, files_to_modify=self.files_to_modify)
+        prompt = _fusion_prompt(
+            task,
+            feedback=feedback,
+            repo=self.repo,
+            files_to_modify=self.files_to_modify,
+            max_file_chars=self.fusion_max_file_chars,
+        )
         reply = await openai_dispatch(self.fusion_delegate, prompt, timeout=self.dispatch_timeout)
         files = _parse_fusion_files(reply)
         wt, _branch = await self._new_candidate_worktree()
@@ -290,6 +387,36 @@ class _WorktreeSolveAdapter:
                     "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
                 )
                 continue
+            # Fusion has no tool access — it can only ever act on the files we showed
+            # it. A path outside the feature's declared set means it hallucinated a
+            # file (or the parser mis-split the reply); writing it would silently
+            # touch unrelated code with no test coverage backing the change.
+            if self.files_to_modify and rel not in self.files_to_modify:
+                log.warning("[project_board] %s fusion tried to write an undeclared path: %r — skipped", self.fid, rel)
+                continue
+            # Fusion returns whole-file replacements with no diff to sanity-check.
+            # A reply that's drastically smaller than the file it claims to replace
+            # is far more likely a truncated completion (see FUSION_MAX_FILE_CHARS_DEFAULT
+            # and the delegate's own max_tokens ceiling) than an intentional big
+            # deletion — refuse it rather than risk silent data loss.
+            if dest.exists():
+                try:
+                    original_size = dest.stat().st_size
+                except OSError:
+                    original_size = 0
+                if (
+                    original_size > _SHRINK_GUARD_MIN_ORIGINAL_CHARS
+                    and len(content) < original_size * _SHRINK_GUARD_RATIO
+                ):
+                    log.warning(
+                        "[project_board] %s fusion's rewrite of %r (%d chars) is suspiciously smaller than "
+                        "the original (%d chars) — refusing, likely truncated",
+                        self.fid,
+                        rel,
+                        len(content),
+                        original_size,
+                    )
+                    continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content)
             written += 1
@@ -373,6 +500,7 @@ async def dispatch(
     fusion_delegate=None,
     fusion_k: int = 2,
     files_to_modify: list[str] | None = None,
+    fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -432,6 +560,7 @@ async def dispatch(
         verdict_cls=Verdict,
         fusion_delegate=fusion_delegate,
         files_to_modify=files_to_modify,
+        fusion_max_file_chars=fusion_max_file_chars,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:
@@ -521,6 +650,7 @@ async def test_rung(
     fusion_delegate=None,
     fusion_k: int = 2,
     files_to_modify: list[str] | None = None,
+    fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -557,6 +687,7 @@ async def test_rung(
         verdict_cls=Verdict,
         fusion_delegate=fusion_delegate,
         files_to_modify=files_to_modify,
+        fusion_max_file_chars=fusion_max_file_chars,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:

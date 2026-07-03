@@ -637,6 +637,43 @@ def test_parse_fusion_files_no_match_returns_empty():
     assert coder_seam._parse_fusion_files("") == {}
 
 
+def test_fusion_viable_for_files_true_when_under_both_caps(tmp_path):
+    (tmp_path / "a.py").write_text("x" * 100)
+    (tmp_path / "b.py").write_text("y" * 100)
+    ok, reason = coder_seam.fusion_viable_for_files(
+        str(tmp_path), ["a.py", "b.py"], max_file_chars=1_000, max_total_chars=1_000
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_fusion_viable_for_files_false_over_per_file_cap(tmp_path):
+    (tmp_path / "huge.py").write_text("x" * 500)
+    ok, reason = coder_seam.fusion_viable_for_files(
+        str(tmp_path), ["huge.py"], max_file_chars=100, max_total_chars=10_000
+    )
+    assert ok is False
+    assert "huge.py" in reason
+    assert "100-char per-file cap" in reason
+
+
+def test_fusion_viable_for_files_false_over_combined_cap(tmp_path):
+    (tmp_path / "a.py").write_text("x" * 100)
+    (tmp_path / "b.py").write_text("y" * 100)
+    ok, reason = coder_seam.fusion_viable_for_files(
+        str(tmp_path), ["a.py", "b.py"], max_file_chars=1_000, max_total_chars=150
+    )
+    assert ok is False
+    assert "combined cap" in reason
+
+
+def test_fusion_viable_for_files_skips_files_that_do_not_exist_yet(tmp_path):
+    # A feature creating a brand-new file has nothing on disk to be too large yet.
+    ok, reason = coder_seam.fusion_viable_for_files(str(tmp_path), ["not_yet_created.py"])
+    assert ok is True
+    assert reason == ""
+
+
 def test_fusion_prompt_includes_task_and_existing_file_content(tmp_path):
     (tmp_path / "existing.py").write_text("def old(): pass\n")
     prompt = coder_seam._fusion_prompt(
@@ -658,6 +695,27 @@ def test_fusion_prompt_includes_feedback_when_refining(tmp_path):
     )
     assert "FAILED the acceptance tests" in prompt
     assert "AssertionError" in prompt
+
+
+def test_fusion_prompt_truncation_is_visible_not_silent(tmp_path):
+    """Defensive backstop only (real callers gate via `fusion_viable_for_files`
+    first) — but if a caller ever skips that gate, a truncated read must tell
+    fusion to skip the file rather than let it return a "complete" replacement
+    of content it never actually saw in full."""
+    (tmp_path / "big.py").write_text("x = 1\n" * 10)
+    prompt = coder_seam._fusion_prompt(
+        "fix it", feedback=None, repo=str(tmp_path), files_to_modify=["big.py"], max_file_chars=10
+    )
+    assert "TRUNCATED at 10 chars" in prompt
+    assert "do NOT return this as a complete replacement" in prompt
+
+
+def test_fusion_prompt_no_truncation_marker_when_file_fits(tmp_path):
+    (tmp_path / "small.py").write_text("x = 1\n")
+    prompt = coder_seam._fusion_prompt(
+        "fix it", feedback=None, repo=str(tmp_path), files_to_modify=["small.py"], max_file_chars=10_000
+    )
+    assert "TRUNCATED" not in prompt
 
 
 async def test_generate_fusion_writes_parsed_files_into_a_fresh_worktree(monkeypatch, tmp_path):
@@ -729,6 +787,112 @@ async def test_generate_fusion_rejects_a_path_traversal_attempt(monkeypatch, tmp
     assert (Path(wt) / "legit.py").read_text() == "fine\n"
     assert not (Path(wt).parent / "etc").exists()
     assert not Path("/etc/shadow_THIS_MUST_NOT_EXIST_pwned2").exists()
+
+
+async def test_generate_fusion_restricts_writes_to_declared_files_to_modify(monkeypatch, tmp_path):
+    """Fusion has no tool access — it only ever sees the files we showed it. A
+    path outside the feature's declared `files_to_modify` means a hallucinated
+    file (or a parser mis-split); writing it would silently touch unrelated
+    code with no test coverage backing the change."""
+    _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### declared.py\n```\nfine\n```\n\n### undeclared.py\n```\nsneaky\n```"
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),
+        files_to_modify=["declared.py"],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    wt = await adapter.generate_fusion("do the thing")
+    assert (Path(wt) / "declared.py").read_text() == "fine\n"
+    assert not (Path(wt) / "undeclared.py").exists()
+
+
+async def test_generate_fusion_shrink_guard_refuses_a_suspiciously_smaller_rewrite(monkeypatch, tmp_path):
+    """A whole-file "complete replacement" that comes back drastically smaller
+    than the file it claims to replace is far more likely a truncated
+    completion (delegate max_tokens ceiling) than an intentional big deletion."""
+    _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### big.py\n```\nx\n```"  # a few chars back for a 1000-char original
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "big.py").write_text("x = 1\n" * 200)  # 1200 chars, well over the min-original floor
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),
+        files_to_modify=["big.py"],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    wt = await adapter.generate_fusion("do the thing")
+    # refused — the pre-existing (larger) content must survive untouched
+    assert (Path(wt) / "big.py").read_text() == "x = 1\n" * 200
+
+
+async def test_generate_fusion_shrink_guard_allows_a_legitimately_smaller_edit(monkeypatch, tmp_path):
+    """The guard only kicks in above `_SHRINK_GUARD_MIN_ORIGINAL_CHARS` and below
+    `_SHRINK_GUARD_RATIO` — a real, modest trim must still go through."""
+    _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### small.py\n```\nx = 1\n```"
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "small.py").write_text("x = 1\ny = 2\n")  # tiny original, under the min-original floor
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),
+        files_to_modify=["small.py"],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    wt = await adapter.generate_fusion("do the thing")
+    assert (Path(wt) / "small.py").read_text() == "x = 1\n"
 
 
 async def test_generate_fusion_empty_reply_writes_nothing_and_does_not_crash(monkeypatch, tmp_path):
