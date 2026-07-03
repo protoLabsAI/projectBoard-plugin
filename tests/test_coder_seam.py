@@ -10,6 +10,7 @@ needs the (separate, git-URL-installed) `coder` plugin to be present."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from project_board import coder_seam, worktree
 from project_board.coder_seam import SolveExhausted, _WorktreeSolveAdapter, dispatch, should_use_solve
@@ -113,7 +114,7 @@ def _stub_worktree(monkeypatch, *, created=None, removed=None, promoted=None):
 async def test_dispatch_promotes_the_winner_and_reaps_the_losers(monkeypatch):
     created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         # exercise the adapter for real: two candidates, the second "wins".
         await generate(task, feedback=None)
         c1 = await generate(task, feedback=None)
@@ -149,7 +150,7 @@ async def test_dispatch_promotes_the_winner_and_reaps_the_losers(monkeypatch):
 async def test_dispatch_records_gens_even_on_a_single_greedy_win(monkeypatch):
     _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         c0 = await generate(task, feedback=None)
         return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
 
@@ -182,7 +183,7 @@ async def test_dispatch_promotes_the_winner_even_if_record_gens_raises(monkeypat
     already-verified winning candidate or leak it un-promoted."""
     created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         c0 = await generate(task, feedback=None)
         return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
 
@@ -218,7 +219,7 @@ async def test_dispatch_promotes_the_winner_even_if_record_gens_raises(monkeypat
 async def test_dispatch_raises_solve_exhausted_and_reaps_every_candidate(monkeypatch):
     created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         await generate(task, feedback=None)
         c1 = await generate(task, feedback="prior failure")
         v = _FakeVerdict(passed=False, total=1, failed=1, output="AssertionError: nope")
@@ -260,7 +261,7 @@ async def test_dispatch_exhausted_with_no_candidates_at_all(monkeypatch):
     dispatch() must still raise cleanly with nothing to reap."""
     _created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         return _FakeResult(
             solution=None, passed=None, rung="none", gens_spent=0, candidates_tried=0, note="budget exhausted"
         )
@@ -296,7 +297,7 @@ async def test_dispatch_still_reaps_and_raises_solve_exhausted_when_record_gens_
     the (honest) `SolveExhausted` the caller needs to see."""
     created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         await generate(task, feedback=None)
         c1 = await generate(task, feedback="prior failure")
         v = _FakeVerdict(passed=False, total=1, failed=1, output="AssertionError: nope")
@@ -361,7 +362,7 @@ async def test_dispatch_reaps_candidates_when_solve_raises_and_reraises_original
 
     monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         await generate(task, feedback=None)  # candidate 1: dispatch succeeds
         await generate(task, feedback=None)  # candidate 2: dispatch raises — uncaught by solve()
 
@@ -414,7 +415,7 @@ async def test_dispatch_reraises_the_original_mid_ladder_exception_even_if_recor
 
     monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         await generate(task, feedback=None)
         await generate(task, feedback=None)
 
@@ -458,7 +459,7 @@ async def test_dispatch_raise_with_no_candidates_created_yet_skips_record_gens(m
     class _Boom(RuntimeError):
         pass
 
-    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
         raise _Boom("blew up before any generation")
 
     gens = []
@@ -616,3 +617,235 @@ async def test_adapter_verify_times_out_as_failed_not_silently_passed(monkeypatc
     v = await adapter.verify("/wt/feat-bd-1.g1")
     assert v.passed is False
     assert "timed out" in v.output
+
+
+# ── rung 4: fusion (ADR 0064 P3) — a plain completion, not an ACP session ────────
+
+
+def test_parse_fusion_files_single_file():
+    reply = "### foo/bar.py\n```python\nprint('hi')\n```"
+    assert coder_seam._parse_fusion_files(reply) == {"foo/bar.py": "print('hi')\n"}
+
+
+def test_parse_fusion_files_multiple_files():
+    reply = "### a.py\n```\nAAA\n```\n\nsome prose in between\n\n### b/c.py\n```\nBBB\n```"
+    assert coder_seam._parse_fusion_files(reply) == {"a.py": "AAA\n", "b/c.py": "BBB\n"}
+
+
+def test_parse_fusion_files_no_match_returns_empty():
+    assert coder_seam._parse_fusion_files("I looked at it but didn't change anything.") == {}
+    assert coder_seam._parse_fusion_files("") == {}
+
+
+def test_fusion_prompt_includes_task_and_existing_file_content(tmp_path):
+    (tmp_path / "existing.py").write_text("def old(): pass\n")
+    prompt = coder_seam._fusion_prompt(
+        "fix the thing", feedback=None, repo=str(tmp_path), files_to_modify=["existing.py"]
+    )
+    assert "fix the thing" in prompt
+    assert "def old(): pass" in prompt
+    assert "existing.py" in prompt
+
+
+def test_fusion_prompt_notes_a_not_yet_created_file(tmp_path):
+    prompt = coder_seam._fusion_prompt("add new.py", feedback=None, repo=str(tmp_path), files_to_modify=["new.py"])
+    assert "does not exist yet" in prompt
+
+
+def test_fusion_prompt_includes_feedback_when_refining(tmp_path):
+    prompt = coder_seam._fusion_prompt(
+        "fix it", feedback="2/3 failing: AssertionError", repo=str(tmp_path), files_to_modify=[]
+    )
+    assert "FAILED the acceptance tests" in prompt
+    assert "AssertionError" in prompt
+
+
+async def test_generate_fusion_writes_parsed_files_into_a_fresh_worktree(monkeypatch, tmp_path):
+    created, *_ = _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### sub/dir/new.py\n```\nCONTENT\n```"
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),  # any non-None placeholder — resolution is the caller's job
+        files_to_modify=[],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+
+    # `_stub_worktree`'s fake `create_worktree` always returns "/wt/feat-<cid>" — redirect
+    # it to a real tmp_path so the write actually lands somewhere we can inspect.
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    wt = await adapter.generate_fusion("do the thing")
+    assert (Path(wt) / "sub" / "dir" / "new.py").read_text() == "CONTENT\n"
+    assert adapter.candidates == [(wt, "feat/bd-1.g1")]  # tracked like any other candidate
+
+
+async def test_generate_fusion_rejects_a_path_traversal_attempt(monkeypatch, tmp_path):
+    _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return (
+            "### ../../etc/passwd\n```\npwned\n```\n\n### /etc/shadow\n```\npwned2\n```\n\n### legit.py\n```\nfine\n```"
+        )
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),
+        files_to_modify=[],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    wt = await adapter.generate_fusion("do the thing")
+    # only the legitimate relative path was written; nothing escaped the worktree
+    assert (Path(wt) / "legit.py").read_text() == "fine\n"
+    assert not (Path(wt).parent / "etc").exists()
+    assert not Path("/etc/shadow_THIS_MUST_NOT_EXIST_pwned2").exists()
+
+
+async def test_generate_fusion_empty_reply_writes_nothing_and_does_not_crash(monkeypatch, tmp_path):
+    _stub_worktree(monkeypatch)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "I looked at the task but have no changes."
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        fusion_delegate=object(),
+        files_to_modify=[],
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    wt = await adapter.generate_fusion("do the thing")
+    assert list(Path(wt).iterdir()) == []  # untouched — will just fail verify() like any empty candidate
+
+
+# ── dispatch(): fusion end-to-end + honest degrade ───────────────────────────────
+
+
+async def test_dispatch_reaches_fusion_when_cheaper_rungs_fail(monkeypatch, tmp_path):
+    """A `_fake_solve` standing in for the REAL ladder: simulates greedy/best-of-k/
+    tree-search all failing, then calls `fusion_generate` and wins — proving
+    `dispatch()` wires `fusion_generate`/`fusion_k` through to `solve()` and that a
+    fusion-produced candidate promotes exactly like an ACP one."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### fixed.py\n```\nfixed content\n```"
+
+    seen_fusion_k = {}
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        seen_fusion_k["k"] = fusion_k
+        assert fusion_generate is not None  # dispatch() must have wired it through
+        c = await fusion_generate(task, feedback="2/2 failing")
+        return _FakeResult(solution=c, passed=True, rung="fusion", gens_spent=5, candidates_tried=5)
+
+    gens = []
+    wt, branch, result = await dispatch(
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        record_gens=gens.append,
+        fusion_delegate=object(),
+        fusion_k=4,
+        files_to_modify=[],
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    assert seen_fusion_k["k"] == 4
+    assert "fusion" in result and "gens=5" in result
+    assert promoted and promoted[0][2] == "bd-1"
+    assert gens == [5]
+
+
+async def test_dispatch_without_a_fusion_delegate_passes_none_through(monkeypatch):
+    """Honest degrade (unchanged from before this rung existed): no fusion_delegate
+    configured ⇒ solve() gets fusion_generate=None ⇒ the ladder stops at tree-search."""
+    _stub_worktree(monkeypatch)
+    seen = {}
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        seen["fusion_generate"] = fusion_generate
+        c = await generate(task, feedback=None)
+        return _FakeResult(solution=c, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    await dispatch(
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        # fusion_delegate omitted — defaults to None
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert seen["fusion_generate"] is None
