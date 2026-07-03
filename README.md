@@ -169,6 +169,32 @@ project_board:
 
 Ships **disabled**; nothing runs until you enable it and declare a coder.
 
+## Standalone scripts (outside pytest)
+
+`from project_board import coder_seam` resolves under `pytest` because
+`tests/conftest.py` registers this repo's root `__init__.py` under the name
+`project_board` directly in `sys.modules` (`importlib.util.spec_from_file_location`,
+`submodule_search_locations=[ROOT]`) — the repo's own directory name
+(`projectBoard-plugin`) doesn't matter; no symlink, no rename needed. That
+registration only happens when `conftest.py` loads, so a plain script
+(`python some_smoke_test.py`, not `pytest`) needs the same few lines up front:
+
+```python
+import importlib.util
+import sys
+from pathlib import Path
+
+ROOT = Path("/path/to/projectBoard-plugin")
+spec = importlib.util.spec_from_file_location("project_board", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+sys.modules["project_board"] = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sys.modules["project_board"])
+
+from project_board import coder_seam, worktree  # now resolves
+```
+
+Handy for a one-off live smoke test (e.g. exercising `coder_seam.test_rung()`
+against a real repo + a real delegate) without standing up a whole plugin host.
+
 ## Releasing
 
 Releases follow the fleet cadence via [`protoLabsAI/release-tools`](https://github.com/protoLabsAI/release-tools):
