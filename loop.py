@@ -242,6 +242,17 @@ class BoardLoop:
         # Blank ⇒ no fusion rung; the ladder stops at tree-search exactly as before.
         self.coder_solve_fusion_delegate = str(self.cfg.get("coder_solve_fusion_delegate", "")).strip()
         self.coder_solve_fusion_k = max(1, int(self.cfg.get("coder_solve_fusion_k", 2)))
+        # Fusion can't tool-call and returns whole-file replacements with no diff —
+        # a file over this cap risks a silent truncated "complete" rewrite (see
+        # coder_seam.fusion_viable_for_files). Gated BEFORE dispatch, not after:
+        # an oversized feature just skips the fusion rung (fusion_delegate=None
+        # for that dispatch), it never gets to attempt-and-corrupt.
+        self.coder_solve_fusion_max_file_chars = max(
+            1, int(self.cfg.get("coder_solve_fusion_max_file_chars", coder_seam.FUSION_MAX_FILE_CHARS_DEFAULT))
+        )
+        self.coder_solve_fusion_max_total_chars = max(
+            1, int(self.cfg.get("coder_solve_fusion_max_total_chars", coder_seam.FUSION_MAX_TOTAL_CHARS_DEFAULT))
+        )
         # KG lessons (the flywheel READ half): before dispatching a coder, query the
         # knowledge graph (via graph.sdk) for distilled lessons relevant to THIS feature
         # and inject them into the prompt — so the coder heeds this area's known failure
@@ -681,11 +692,27 @@ class BoardLoop:
                         self._inflight[fid] = (repo, wt, branch)
                         result = await worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None)
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
+                        files_to_modify = feature.get("files_to_modify") or []
                         fusion = (
                             self._resolve_delegate(self.coder_solve_fusion_delegate, "openai")
                             if self.coder_solve_fusion_delegate
                             else None
                         )
+                        if fusion is not None:
+                            # Gate BEFORE dispatch: fusion can't tool-call and returns
+                            # whole-file replacements, so an oversized file risks a
+                            # silent truncated rewrite (coder_seam.fusion_viable_for_files).
+                            # Not viable ⇒ this dispatch just skips the fusion rung — the
+                            # ladder still runs greedy/best-of-k/tree-search unchanged.
+                            viable, reason = coder_seam.fusion_viable_for_files(
+                                repo,
+                                files_to_modify,
+                                max_file_chars=self.coder_solve_fusion_max_file_chars,
+                                max_total_chars=self.coder_solve_fusion_max_total_chars,
+                            )
+                            if not viable:
+                                log.info("[project_board] %s fusion rung skipped for this dispatch: %s", fid, reason)
+                                fusion = None
                         wt, branch, result = await coder_seam.dispatch(
                             task=prompt,
                             coder=coder,
@@ -702,7 +729,8 @@ class BoardLoop:
                             record_gens=lambda n: store.record_gens_spent(fid, n),
                             fusion_delegate=fusion,
                             fusion_k=self.coder_solve_fusion_k,
-                            files_to_modify=feature.get("files_to_modify") or [],
+                            files_to_modify=files_to_modify,
+                            fusion_max_file_chars=self.coder_solve_fusion_max_file_chars,
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):

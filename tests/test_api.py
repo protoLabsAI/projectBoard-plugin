@@ -386,6 +386,36 @@ def test_test_rung_fusion_400s_without_a_configured_fusion_delegate(monkeypatch)
     assert "coder_solve_fusion_delegate" in r.json()["detail"]
 
 
+def test_test_rung_fusion_400s_when_files_are_oversized(monkeypatch, tmp_path):
+    """Same gate `_drive` applies before a real dispatch: fusion can't tool-call
+    and returns whole-file replacements, so an oversized declared file must be
+    refused here too, before ever reaching coder_seam.test_rung."""
+    (tmp_path / "big.py").write_text("x" * 1000)
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid, files=["big.py"]))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
+
+    async def _boom(**kwargs):
+        raise AssertionError("coder_seam.test_rung must not be reached when fusion isn't viable")
+
+    monkeypatch.setattr(coder_seam, "test_rung", _boom)
+    c = _client(
+        monkeypatch,
+        store,
+        cfg={
+            "coder_solve_test_cmd": "pytest -q",
+            "coder_solve_fusion_delegate": "fusion-model",
+            "coder_solve_fusion_max_file_chars": 10,
+            "repo": str(tmp_path),
+        },
+    )
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "fusion"})
+    assert r.status_code == 400
+    assert "not viable" in r.json()["detail"]
+    assert "big.py" in r.json()["detail"]
+
+
 def test_test_rung_happy_path_calls_coder_seam_test_rung_and_returns_its_result(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))

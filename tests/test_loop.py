@@ -481,6 +481,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         fusion_delegate=None,
         fusion_k=2,
         files_to_modify=None,
+        fusion_max_file_chars=None,
     ):
         seen["fid"] = fid
         seen["test_cmd"] = test_cmd
@@ -502,6 +503,42 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     assert store.gens_spent.get("bd-1") == 4
     assert ("open_review", "bd-1", "https://example/pr/42") in store.calls
     assert store.creates == []  # solve()'s own per-candidate worktrees replaced the single create
+
+
+async def test_drive_skips_fusion_for_a_dispatch_when_files_are_oversized(monkeypatch, tmp_path):
+    """Fusion can't tool-call and returns whole-file replacements — an oversized
+    file must gate BEFORE dispatch (fusion_delegate=None for that dispatch), not
+    get attempted and risk a silently truncated rewrite. The ladder still runs
+    (greedy/best-of-k/tree-search), it just skips the fusion rung."""
+    from project_board import coder_seam
+
+    (tmp_path / "big.py").write_text("x" * 1000)
+    seen = {}
+
+    async def _fake_dispatch(*, fusion_delegate=None, **kw):
+        seen["fusion_delegate"] = fusion_delegate
+        return (f"/wt/feat-{kw['fid']}", f"feat/{kw['fid']}", "[coder.solve rung=greedy gens=1] solved")
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "dispatch", _fake_dispatch)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/42"
+
+    feature = {**FEATURE, "repo": str(tmp_path), "files_to_modify": ["big.py"]}
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        cfg={
+            "coder": "proto",
+            "local_gate_cmd": "pytest -q",
+            "coder_solve_fusion_delegate": "fusion-model",
+            "coder_solve_fusion_max_file_chars": 10,
+        },
+        gate=_pass_gate,
+        feature=feature,
+    )
+    assert seen["fusion_delegate"] is None  # gated out before dispatch, not attempted
 
 
 async def test_drive_falls_back_to_single_shot_without_acceptance_criteria(monkeypatch):
