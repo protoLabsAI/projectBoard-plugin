@@ -148,6 +148,28 @@ def test_next_tier_walks_then_stops_at_the_top(make_board):
     assert b.next_tier("fast") == store.TIER_LADDER[0]  # a now-removed tier falls back to the floor
 
 
+# ── coder.solve() cost accounting (ADR 0064 P2 board seam) ──────────────────────
+
+
+def test_record_gens_spent_adds_a_fresh_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "gens_spent": 0, "labels": []})
+    b.record_gens_spent("bd-1", 3)
+    assert ("update", "bd-1", "--add-label", "gens:3") in br.calls
+
+
+def test_record_gens_spent_accumulates_and_replaces_the_old_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "gens_spent": 5, "labels": ["gens:5", "ready"]})
+    b.record_gens_spent("bd-1", 4)
+    # the stale gens:5 label is removed and replaced by the new cumulative total
+    assert ("update", "bd-1", "--remove-label", "gens:5", "--add-label", "gens:9") in br.calls
+
+
 # ── _project: the bead → feature view mapping ───────────────────────────────────
 
 
@@ -171,6 +193,12 @@ def test_project_maps_labels_notes_and_external_ref(make_board):
     assert f["attempts"] == [1, 2]  # sorted ints
     assert f["pr_url"] == "https://example/pr/1"
     assert f["repo"] == "/repo" and f["base_branch"] == "main"
+    assert f["gens_spent"] == 0  # no gens: label → coder.solve() never touched this feature
+
+
+def test_project_exposes_gens_spent_from_the_label(make_board):
+    b = make_board(Br())
+    assert b._project({"id": "bd-2", "status": "open", "labels": ["gens:11"]})["gens_spent"] == 11
 
 
 def test_project_marks_dag_blocked_when_a_blocks_dep_is_open(make_board):

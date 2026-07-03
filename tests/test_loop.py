@@ -19,6 +19,7 @@ from project_board.loop import BoardLoop, _ci_failure_reason
 class FakeLoopStore:
     def __init__(self):
         self.calls = []
+        self.gens_spent = {}  # fid -> cumulative gens (record_gens_spent)
 
     def current_tier(self, fid):
         return "fast"
@@ -29,6 +30,10 @@ class FakeLoopStore:
 
     def flag_blocked(self, fid, reason):
         self.calls.append(("flag_blocked", fid, reason))
+        return {"id": fid}
+
+    def record_gens_spent(self, fid, n):
+        self.gens_spent[fid] = self.gens_spent.get(fid, 0) + n
         return {"id": fid}
 
     def names(self):
@@ -170,7 +175,7 @@ async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
 
 
 async def _drive_with(
-    monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None, judge=None, seed=None
+    monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None, judge=None, seed=None, feature=None
 ):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions.
@@ -217,7 +222,7 @@ async def _drive_with(
         monkeypatch.setattr(loop, "_judge_candidates", judge)
     if seed is not None:
         seed(loop)
-    await loop._drive(FEATURE)
+    await loop._drive(feature if feature is not None else FEATURE)
     return loop, store
 
 
@@ -382,6 +387,227 @@ async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
     assert "flag_blocked" in store.names()
     assert "open_review" not in store.names()
     assert loop._inflight == {}
+
+
+# ── coder.solve() board seam (ADR 0064 P2) ───────────────────────────────────────
+
+
+def test_coder_solve_config_defaults():
+    loop = BoardLoop({})
+    assert loop.coder_solve is True  # opt-OUT valve; the real gate is coder_seam
+    assert loop.coder_solve_test_cmd == ""  # no local_gate_cmd to fall back to either
+    assert loop.coder_solve_budget == 6
+    assert loop.coder_solve_k == 3
+    assert loop.coder_solve_tree_depth == 2
+    assert loop.coder_solve_test_timeout == 300
+
+
+def test_coder_solve_test_cmd_falls_back_to_local_gate_cmd():
+    assert BoardLoop({"local_gate_cmd": "pytest -q"}).coder_solve_test_cmd == "pytest -q"
+    loop = BoardLoop({"local_gate_cmd": "pytest -q", "coder_solve_test_cmd": "pytest tests/unit -q"})
+    assert loop.coder_solve_test_cmd == "pytest tests/unit -q"  # explicit wins over the fallback
+
+
+def test_use_coder_solve_requires_the_opt_out_flag_plus_the_seam_gate(monkeypatch):
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())  # pretend `coder` is installed
+    on = BoardLoop({"local_gate_cmd": "pytest -q"})
+    assert on._use_coder_solve({"acceptance_criteria": "WHEN x THE SYSTEM SHALL y"}) is True
+    assert on._use_coder_solve({"acceptance_criteria": ""}) is False  # no oracle → degrade
+
+    off = BoardLoop({"local_gate_cmd": "pytest -q", "coder_solve": False})
+    assert off._use_coder_solve({"acceptance_criteria": "WHEN x THE SYSTEM SHALL y"}) is False  # opted out
+
+
+def test_use_coder_solve_false_when_coder_plugin_unavailable(monkeypatch):
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: None)  # coder plugin absent/disabled
+    loop = BoardLoop({"local_gate_cmd": "pytest -q"})
+    assert loop._use_coder_solve({"acceptance_criteria": "WHEN x THE SYSTEM SHALL y"}) is False
+
+
+def test_use_coder_solve_false_without_a_test_command(monkeypatch):
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    loop = BoardLoop({})  # no local_gate_cmd, no coder_solve_test_cmd
+    assert loop._use_coder_solve({"acceptance_criteria": "WHEN x THE SYSTEM SHALL y"}) is False
+
+
+async def _pass_gate(wt):
+    """A stand-in for `_run_local_gate` — pass immediately. These tests set
+    `local_gate_cmd` (needed as the coder_solve_test_cmd fallback) but the drive's
+    fake worktree paths don't exist on disk, so the REAL gate would just shell out
+    against a bogus cwd; stub it rather than rely on that degrading to a pass."""
+    return None
+
+
+async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatch):
+    """coder available + acceptance present + a test command → the solve path runs
+    INSTEAD of the single delegate_to(acp) shot, and gens-spent lands on the feature
+    via store.record_gens_spent (so portfolio_rollup can read it)."""
+    from project_board import coder_seam
+
+    seen = {}
+
+    async def _fake_dispatch(
+        *,
+        task,
+        coder,
+        repo,
+        base,
+        root,
+        fid,
+        dispatch_timeout,
+        test_cmd,
+        test_timeout,
+        budget,
+        k,
+        tree_depth,
+        record_gens=None,
+    ):
+        seen["fid"] = fid
+        seen["test_cmd"] = test_cmd
+        seen["task"] = task
+        record_gens(4)
+        return (f"/wt/feat-{fid}", f"feat/{fid}", "[coder.solve rung=best-of-k gens=4] solved")
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "dispatch", _fake_dispatch)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/42"
+
+    loop, store = await _drive_with(
+        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "local_gate_cmd": "pytest -q"}, gate=_pass_gate
+    )
+    assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
+    assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
+    assert store.gens_spent.get("bd-1") == 4
+    assert ("open_review", "bd-1", "https://example/pr/42") in store.calls
+    assert store.creates == []  # solve()'s own per-candidate worktrees replaced the single create
+
+
+async def test_drive_falls_back_to_single_shot_without_acceptance_criteria(monkeypatch):
+    """Honest degrade: even with the coder plugin available and a test command
+    configured, a feature with NO acceptance criteria takes today's single
+    delegate_to(acp) shot — never a silent best-of-k."""
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+
+    async def _boom(**kw):
+        raise AssertionError("coder.solve must not run without acceptance criteria")
+
+    monkeypatch.setattr(coder_seam, "dispatch", _boom)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/1"
+
+    feature = dict(FEATURE, acceptance_criteria="")
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        cfg={"coder": "proto", "local_gate_cmd": "pytest -q"},
+        feature=feature,
+        gate=_pass_gate,
+    )
+    assert store.creates == ["bd-1"]  # the plain single-worktree path ran
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+
+
+async def test_drive_falls_back_to_single_shot_when_coder_plugin_unavailable(monkeypatch):
+    """Honest degrade: acceptance criteria + a test command present, but `coder`
+    itself isn't installed/enabled — still the single shot, never a fake ladder."""
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: None)
+
+    async def _boom(**kw):
+        raise AssertionError("coder.solve must not run when the coder plugin is unavailable")
+
+    monkeypatch.setattr(coder_seam, "dispatch", _boom)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/2"
+
+    loop, store = await _drive_with(
+        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "local_gate_cmd": "pytest -q"}, gate=_pass_gate
+    )
+    assert store.creates == ["bd-1"]
+    assert ("open_review", "bd-1", "https://example/pr/2") in store.calls
+
+
+async def test_drive_falls_back_to_single_shot_without_a_test_command(monkeypatch):
+    """Honest degrade: `coder` available + acceptance present, but NO test command
+    configured (no coder_solve_test_cmd, no local_gate_cmd) — no runnable oracle, so
+    the single shot runs rather than fake grounding."""
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+
+    async def _boom(**kw):
+        raise AssertionError("coder.solve must not run with no runnable test command")
+
+    monkeypatch.setattr(coder_seam, "dispatch", _boom)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/3"
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto"})  # no test cmd anywhere
+    assert store.creates == ["bd-1"]
+    assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
+
+
+async def test_drive_coder_solve_exhausted_blocks_like_a_capability_failure(monkeypatch):
+    """A SolveExhausted (no candidate passed the acceptance tests) is treated exactly
+    like NoChangesError/CoderTimeout — blocked immediately with no ladder configured."""
+    from project_board import coder_seam
+
+    async def _exhausted(**kw):
+        raise coder_seam.SolveExhausted("coder.solve exhausted after 6 generation(s) (rung=best-partial): 1/3 failing")
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "dispatch", _exhausted)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise AssertionError("open_pr should not run — no candidate passed")
+
+    loop, store = await _drive_with(
+        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "local_gate_cmd": "pytest -q"}
+    )
+    assert "flag_blocked" in store.names()
+    assert "open_review" not in store.names()
+    assert loop._inflight == {}
+
+
+async def test_drive_coder_solve_skipped_on_a_carried_forward_ci_bounce(monkeypatch):
+    """A CI-bounce re-dispatch (signalled by _ci_feedback) fixes the EXISTING diff
+    with the single coder — coder.solve must not re-fan-out on that retry, same rule
+    as Max-Mode."""
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+
+    async def _boom(**kw):
+        raise AssertionError("coder.solve must not run on a carried-forward re-dispatch")
+
+    monkeypatch.setattr(coder_seam, "dispatch", _boom)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/9"
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        cfg={"coder": "proto", "local_gate_cmd": "pytest -q"},
+        seed=lambda lp: lp._ci_feedback.__setitem__("bd-1", "CI failed: lint"),
+        gate=_pass_gate,
+    )
+    assert store.creates == ["bd-1"]  # the plain single-worktree path ran, not solve()
+    assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
 
 
 # ── goal-verification gate (MiMo-borrowed; opt-in `goal_verify`) ─────────────────

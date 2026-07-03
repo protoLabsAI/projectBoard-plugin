@@ -56,6 +56,10 @@ LABEL_CANCELLED = "cancelled"
 # non-foundation blocker, which can release dependents at in_review under dep_gate:
 # review). Inert under the default dep_gate: merge (then every blocker gates on merge).
 LABEL_FOUNDATION = "foundation"
+# Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
+# seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
+# single label always carries the running total for `portfolio_rollup` to read.
+LABEL_GENS_PREFIX = "gens:"
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
@@ -426,6 +430,24 @@ class BeadsBoard:
             return TIER_LADDER[0]
         return TIER_LADDER[i + 1] if i + 1 < len(TIER_LADDER) else None
 
+    # ── coder.solve() cost accounting (ADR 0064 P2 board seam) ────────────────
+    def record_gens_spent(self, fid: str, n: int) -> dict:
+        """Accumulate `n` more generations `coder.solve()` spent on this feature onto
+        its `gens:<total>` label — a single, replaced label so `portfolio_rollup` (the
+        PM tier) can read the running cost without raw reads, per the ADR's cost-v1
+        ethos. Called once per `solve()` run, win or lose (a failed search still spent
+        gens). Best-effort in the sense that a `br` hiccup here must never fail the
+        build the way a missing PR would — callers should treat it as fire-and-forget."""
+        f = self._require(fid)
+        total = int(f.get("gens_spent", 0)) + max(0, int(n))
+        stale = [l for l in f.get("labels") or [] if l.startswith(LABEL_GENS_PREFIX)]
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        args += ["--add-label", f"{LABEL_GENS_PREFIX}{total}"]
+        self._run(*args)
+        return self.get_feature(fid)
+
     # ── reads (the projection) ────────────────────────────────────────────────
     def get_feature(self, fid: str) -> dict | None:
         rows = self._run("show", fid, want_json=True)
@@ -566,6 +588,16 @@ class BeadsBoard:
         attempts = sorted(
             int(l.split(":", 1)[1]) for l in labels if l.startswith("attempt:") and l.split(":", 1)[1].isdigit()
         )
+        # coder.solve()'s cumulative generation cost (ADR 0064 P2), read from the
+        # single replaced `gens:<total>` label — 0 for a feature the seam never touched.
+        gens_spent = next(
+            (
+                int(l[len(LABEL_GENS_PREFIX) :])
+                for l in labels
+                if l.startswith(LABEL_GENS_PREFIX) and l[len(LABEL_GENS_PREFIX) :].isdigit()
+            ),
+            0,
+        )
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
@@ -594,6 +626,7 @@ class BeadsBoard:
             "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
             "attempts": attempts,
+            "gens_spent": gens_spent,
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,

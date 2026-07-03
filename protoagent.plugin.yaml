@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.25.0
+version: 0.26.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -53,6 +53,38 @@ config:
                             # opens ANYWAY (CI + ci_fix_max stay the backstop — a flaky or
                             # misconfigured gate never blocks good work).
   local_gate_timeout_s: 600 # hard cap on one gate run; a timeout degrades to "pass" (CI gates).
+  coder_solve: true         # OPT-OUT valve for the ADR 0064 P2 board seam (default on;
+                            # the real gate is coder_seam.should_use_solve — see below).
+                            # On a FRESH build (not a keep-worktree/CI-bounce re-dispatch),
+                            # when the `coder` plugin is importable AND the feature has
+                            # acceptance_criteria AND coder_solve_test_cmd (or
+                            # local_gate_cmd) is set, the loop dispatches through
+                            # coder.solve()'s execution-grounded ladder (greedy →
+                            # best-of-k → tree-search) instead of a single
+                            # delegate_to(acp) shot — gated on the feature's acceptance
+                            # tests actually PASSING in a real worktree, never an LLM
+                            # judge. Missing any of those three ⇒ honest degrade to
+                            # today's single shot (non-regressing by default: the
+                            # `coder` plugin ships disabled, and this needs a test
+                            # command configured too). Composes WITH the `coders`-map
+                            # tier ladder: solve() searches WITHIN a tier; a search
+                            # that never passes escalates a tier (or blocks) exactly
+                            # like a no-diff dispatch.
+  coder_solve_test_cmd: ""  # the command that runs THIS feature's (coder-authored)
+                            # acceptance tests in a candidate worktree, e.g.
+                            # "pytest tests/ -q" — solve()'s verify() oracle. Blank
+                            # falls back to local_gate_cmd (many repos already
+                            # configure that as the real test command); still blank
+                            # ⇒ no runnable oracle ⇒ honest degrade to the single shot.
+  coder_solve_test_timeout_s: 300  # hard cap on one candidate's acceptance-test run;
+                            # a timeout is a FAILED verdict (never a silent pass —
+                            # this is the ladder's own search oracle, unlike the
+                            # fail-open pre-PR local_gate_cmd above).
+  coder_solve_budget: 6     # hard cap on total candidate generations across the
+                            # whole ladder for one feature build.
+  coder_solve_k: 3          # best-of-k width (rung 2): candidates generated (each in
+                            # its own throwaway worktree) before execution-select.
+  coder_solve_tree_depth: 2 # refine-on-failing-tests depth (rung 3).
   max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 builds a
                             # feature N ways in parallel (N candidate worktrees, all dispatched at
                             # once), a low-temp judge picks the diff that best satisfies

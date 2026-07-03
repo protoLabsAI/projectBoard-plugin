@@ -20,6 +20,17 @@ reachable, by the loop's **PR reconcile** (``merge_poll``), which asks ``gh`` fo
 each ``in_review`` PR's state and drives the terminal edges: merged → done (the same
 idempotent edge), closed-unmerged → blocked. Up to ``max_concurrent`` features build
 concurrently, each in its own worktree.
+
+**coder.solve() board seam (ADR 0064 P2, opt-in, see ``coder_seam.py``).** On a
+fresh build (not a keep-worktree/CI-bounce re-dispatch), when the `coder` plugin is
+importable AND the feature has acceptance criteria AND a runnable acceptance-test
+command is configured, ``delegate_to(coder)`` is replaced by
+``coder_seam.dispatch()`` — an execution-grounded ladder (greedy → best-of-k →
+tree-search) that runs the feature's acceptance tests in real candidate worktrees
+and gates on them actually PASSING, never an LLM judge. It composes WITH the
+`coders`-map tier ladder below (search happens WITHIN a tier; a search that never
+passes is a capability failure that escalates/blocks exactly like a no-diff
+dispatch). Missing any of the three gates ⇒ honest degrade to the single shot above.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ import logging
 import re
 import time
 
-from . import worktree
+from . import coder_seam, worktree
 from .failures import classify
 from .store import BoardError, escalation_enabled, get_store
 
@@ -188,6 +199,31 @@ class BoardLoop:
         self.local_gate_max = max(0, int(self.cfg.get("local_gate_max", 2)))
         self.local_gate_timeout = float(self.cfg.get("local_gate_timeout_s", 600))
         self.local_gate_output_chars = max(500, int(self.cfg.get("local_gate_output_chars", 4000)))
+        # ── coder.solve() board seam (ADR 0064 P2, opt-in) ─────────────────────────
+        # Route a FRESH build (not a keep-worktree/CI-bounce re-dispatch) through the
+        # `coder` plugin's execution-grounded solve() ladder (greedy → best-of-k →
+        # tree-search) instead of a single delegate_to(acp) shot — gated on the
+        # feature's acceptance tests actually PASSING in a real worktree, never an
+        # LLM judge. HONEST DEGRADE (coder_seam.should_use_solve): only fires when
+        # the `coder` plugin is importable (host has it enabled) AND this feature
+        # carries acceptance_criteria AND a runnable test command is configured
+        # below — missing any of the three falls back to today's single shot, so an
+        # existing deployment can't regress just by upgrading. Composes WITH (does
+        # NOT replace) the coders-map tier ladder: solve() searches within the
+        # CURRENT tier; a search that never passes raises SolveExhausted, which
+        # `_drive` treats as the same capability failure as a no-diff dispatch
+        # (escalate a tier, or block) — the tier ladder still climbs when search
+        # itself stalls.
+        self.coder_solve = bool(self.cfg.get("coder_solve", True))
+        # The ladder's verifier: the command that runs THIS feature's (coder-
+        # authored) acceptance tests in a candidate worktree, e.g. "pytest tests/ -q".
+        # Blank ⇒ falls back to local_gate_cmd (many repos already configure that as
+        # the real test command); still blank ⇒ no runnable oracle ⇒ honest degrade.
+        self.coder_solve_test_cmd = str(self.cfg.get("coder_solve_test_cmd", "")).strip() or self.local_gate_cmd
+        self.coder_solve_test_timeout = float(self.cfg.get("coder_solve_test_timeout_s", 300))
+        self.coder_solve_budget = max(1, int(self.cfg.get("coder_solve_budget", 6)))
+        self.coder_solve_k = max(1, int(self.cfg.get("coder_solve_k", 3)))
+        self.coder_solve_tree_depth = max(0, int(self.cfg.get("coder_solve_tree_depth", 2)))
         # KG lessons (the flywheel READ half): before dispatching a coder, query the
         # knowledge graph (via graph.sdk) for distilled lessons relevant to THIS feature
         # and inject them into the prompt — so the coder heeds this area's known failure
@@ -611,6 +647,10 @@ class BoardLoop:
                     #    the coder only ADDS what the reviewer flagged (usually tests); a
                     #    fresh rebuild makes it re-implement and never reach the tests (the
                     #    bd-2fd/bd-3cj block).
+                    #  • coder.solve (ADR 0064 P2, opt-in) → the execution-grounded
+                    #    ladder over the feature's acceptance tests (coder_seam.py).
+                    #    Same "from-scratch build only" rule as max-mode: a carried-
+                    #    forward re-dispatch FIXES the existing diff with one coder.
                     #  • max-mode → N parallel candidates, judge, promote the winner (#21).
                     #    ONLY for a from-scratch build: a carried-forward re-dispatch (a CI
                     #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
@@ -620,6 +660,23 @@ class BoardLoop:
                         keep_wt = False  # consume the reuse
                         self._inflight[fid] = (repo, wt, branch)
                         result = await worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None)
+                    elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
+                        wt, branch, result = await coder_seam.dispatch(
+                            task=prompt,
+                            coder=coder,
+                            repo=repo,
+                            base=base,
+                            root=self.root,
+                            fid=fid,
+                            dispatch_timeout=self.coder_timeout or None,
+                            test_cmd=self.coder_solve_test_cmd,
+                            test_timeout=self.coder_solve_test_timeout,
+                            budget=self.coder_solve_budget,
+                            k=self.coder_solve_k,
+                            tree_depth=self.coder_solve_tree_depth,
+                            record_gens=lambda n: store.record_gens_spent(fid, n),
+                        )
+                        self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
                         wt, branch, result = await self._dispatch_max_mode(feature, coder, prompt, repo, base, fid)
                         self._inflight[fid] = (repo, wt, branch)
@@ -704,7 +761,7 @@ class BoardLoop:
                     # same coder won't help) — they escalate a tier or block. Only true
                     # infra failures (push/fetch/gh network/rate-limit) get the backoff.
                     capability = (
-                        isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout))
+                        isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
                         or str(exc).startswith("coder dispatch failed")
                         or str(exc).startswith("goal verification failed")
                     )
@@ -785,6 +842,15 @@ class BoardLoop:
             log.warning("[project_board] review dispatch for %s failed: %s", fid, exc)
 
     # ── helpers ───────────────────────────────────────────────────────────────
+    def _use_coder_solve(self, feature: dict) -> bool:
+        """The P2 board-seam dispatch decision (ADR 0064) — see coder_seam.py.
+        `coder_solve` is this repo's own opt-out valve (default on); the actual
+        grounding gate (coder plugin importable + acceptance criteria + a runnable
+        test command) lives in ``coder_seam.should_use_solve``."""
+        if not self.coder_solve:
+            return False
+        return coder_seam.should_use_solve(feature, test_cmd=self.coder_solve_test_cmd)
+
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the
         Delegate or None (not configured / wrong type / plugin disabled)."""
