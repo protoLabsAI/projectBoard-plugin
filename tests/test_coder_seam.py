@@ -253,6 +253,108 @@ async def test_dispatch_exhausted_with_no_candidates_at_all(monkeypatch):
     assert removed == [] and promoted == []
 
 
+# ── dispatch(): solve() itself raises mid-ladder (not just returns unpassed) ────
+
+
+async def test_dispatch_reaps_candidates_when_solve_raises_and_reraises_original(monkeypatch):
+    """`solve()` (the `coder` plugin's ladder) has no try/except of its own around
+    `generate`/`verify` — a real candidate failure (e.g. `CoderTimeout` on one
+    best-of-k candidate, or a worktree op erroring) propagates straight out instead
+    of being scored as a loss. Every worktree already created before the raise must
+    still be reaped — untracked in `_inflight` until `dispatch()` returns, and
+    invisible to the health sweep (a `.gN` id isn't a real board feature) — or a
+    single flaky candidate leaks a worktree forever. The original exception must
+    surface unchanged so the loop's existing capability-failure handling classifies
+    it correctly (e.g. a `CoderTimeout` still escalates/blocks like it always has)."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+
+    class _Boom(RuntimeError):
+        pass
+
+    calls = {"n": 0}
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _Boom("candidate coder timed out")
+        return "ok"
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+        await generate(task, feedback=None)  # candidate 1: dispatch succeeds
+        await generate(task, feedback=None)  # candidate 2: dispatch raises — uncaught by solve()
+
+    gens = []
+    try:
+        await dispatch(
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-5",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            budget=6,
+            k=3,
+            tree_depth=2,
+            record_gens=gens.append,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raised = False
+    except _Boom:
+        raised = True
+    assert raised  # the ORIGINAL exception surfaces, not something dispatch() invented
+    assert created == ["bd-5.g1", "bd-5.g2"]
+    assert set(removed) == {"/wt/feat-bd-5.g1", "/wt/feat-bd-5.g2"}  # both reaped, none leaked
+    assert promoted == []
+    assert gens == [2]  # the attempted-candidate count still surfaces as spent cost
+
+
+async def test_dispatch_raise_with_no_candidates_created_yet_skips_record_gens(monkeypatch):
+    """A raise before any `generate()` call completed (e.g. `Budget()` itself blew
+    up) has nothing to reap and nothing real to cost-account — `record_gens` must
+    not be called with a bogus zero."""
+    _created, removed, promoted = _stub_worktree(monkeypatch)
+
+    class _Boom(RuntimeError):
+        pass
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+        raise _Boom("blew up before any generation")
+
+    gens = []
+    try:
+        await dispatch(
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-6",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            budget=6,
+            k=3,
+            tree_depth=2,
+            record_gens=gens.append,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raised = False
+    except _Boom:
+        raised = True
+    assert raised
+    assert removed == [] and promoted == []
+    assert gens == []  # nothing attempted — never fabricate a cost
+
+
 # ── the adapter itself: generate() creates a worktree per candidate, verify() runs
 #    the acceptance-test command and reports real pass/fail ─────────────────────
 

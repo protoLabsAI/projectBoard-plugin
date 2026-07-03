@@ -33,8 +33,9 @@ and gates on its exit code — real execution, no fabricated grounding.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
-from typing import Callable, Optional
+from typing import Callable
 
 from . import worktree
 
@@ -56,8 +57,6 @@ def _import_solve():
     dependency of this one, and it ships DISABLED by default, so absent/disabled is
     the expected common case (not an error worth logging)."""
     try:
-        import importlib
-
         return importlib.import_module("plugins.coder.solve")
     except Exception:  # noqa: BLE001 — coder plugin absent/disabled → honest degrade
         return None
@@ -81,7 +80,7 @@ def should_use_solve(feature: dict, *, test_cmd: str, _solve_mod=None) -> bool:
     return True
 
 
-def _augment_prompt(task: str, feedback: Optional[str]) -> str:
+def _augment_prompt(task: str, feedback: str | None) -> str:
     """Fold the ladder's failing-test feedback into the next candidate's prompt.
     Every candidate gets a FRESH worktree off base (see ``_WorktreeSolveAdapter`` —
     the same "fresh-both" discipline ``worktree.dispatch_coder`` already documents
@@ -115,7 +114,7 @@ class _WorktreeSolveAdapter:
         root: str,
         fid: str,
         coder,
-        dispatch_timeout: Optional[float],
+        dispatch_timeout: float | None,
         test_cmd: str,
         test_timeout: float,
         verdict_cls,
@@ -136,7 +135,7 @@ class _WorktreeSolveAdapter:
         self._wt_lock = asyncio.Lock()
         self._n = 0
 
-    async def generate(self, task: str, *, feedback: Optional[str] = None) -> str:
+    async def generate(self, task: str, *, feedback: str | None = None) -> str:
         self._n += 1
         cid = f"{self.fid}.g{self._n}"
         async with self._wt_lock:
@@ -193,13 +192,13 @@ async def dispatch(
     base: str,
     root: str,
     fid: str,
-    dispatch_timeout: Optional[float],
+    dispatch_timeout: float | None,
     test_cmd: str,
     test_timeout: float,
     budget: int,
     k: int,
     tree_depth: int,
-    record_gens: Optional[RecordGens] = None,
+    record_gens: RecordGens | None = None,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -217,7 +216,22 @@ async def dispatch(
     ``_solve``/``_budget_cls``/``_verdict_cls`` are test-injection seams for
     ``solve()``/``Budget``/``Verdict``; production callers never pass them (the real
     import happens here, deferred so this module carries no hard dependency on the
-    `coder` plugin)."""
+    `coder` plugin).
+
+    **``solve()`` itself can raise.** The ladder (`coder`'s own ``solve.py``) has no
+    try/except around ``generate``/``verify`` — it assumes a candidate attempt never
+    errors, only that it might fail its tests. A REAL dispatch can still raise
+    (``CoderTimeout`` on one best-of-k candidate, a worktree op erroring) and that
+    propagates straight out of ``solve()`` uncaught. Every worktree ``generate()``
+    already created for THIS run is tracked in ``adapter.candidates`` (appended right
+    after ``create_worktree`` returns, before the dispatch that might fail) but would
+    otherwise leak forever: it's untracked in the loop's ``_inflight`` map until this
+    function returns, and invisible to the health sweep (a `.gN` candidate id isn't a
+    real board feature, so the sweep's own ``get_feature`` lookup raises and the sweep
+    skips it rather than reaping). So any exception here reaps every candidate seen so
+    far, surfaces the attempted cost, and re-raises the ORIGINAL exception unchanged —
+    the loop's existing capability-failure handling (retry/escalate/block) still
+    applies to whatever it actually was."""
     if _solve is not None:
         solve, Budget, Verdict = _solve, _budget_cls, _verdict_cls
     else:
@@ -234,14 +248,30 @@ async def dispatch(
         test_timeout=test_timeout,
         verdict_cls=Verdict,
     )
-    result = await solve(
-        task,
-        generate=adapter.generate,
-        verify=adapter.verify,
-        budget=Budget(budget),
-        k=k,
-        tree_depth=tree_depth,
-    )
+    try:
+        result = await solve(
+            task,
+            generate=adapter.generate,
+            verify=adapter.verify,
+            budget=Budget(budget),
+            k=k,
+            tree_depth=tree_depth,
+        )
+    except Exception as exc:
+        for wt, branch in adapter.candidates:
+            await worktree.remove_worktree(repo, wt, branch)
+        if record_gens is not None and adapter._n:
+            # `solve()` never got to return a `gens_spent` count — the attempted
+            # generation count is the honest stand-in (a failed dispatch still spent
+            # the gen; ADR 0064's cost accounting doesn't get to look the other way).
+            record_gens(adapter._n)
+        log.warning(
+            "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
+            fid,
+            len(adapter.candidates),
+            exc,
+        )
+        raise
     if record_gens is not None:
         record_gens(result.gens_spent)
 
