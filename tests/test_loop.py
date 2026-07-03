@@ -610,6 +610,42 @@ async def test_drive_coder_solve_skipped_on_a_carried_forward_ci_bounce(monkeypa
     assert ("open_review", "bd-1", "https://example/pr/9") in store.calls
 
 
+async def test_drive_max_mode_wins_precedence_over_coder_solve_when_both_configured(monkeypatch):
+    """A board already running Max-Mode (`max_mode_n>1`) must keep fanning out N
+    candidates and judging, NOT silently switch to coder.solve's ladder, even once
+    the `coder` plugin becomes importable and every one of
+    coder_seam.should_use_solve's gates (acceptance criteria + a runnable test
+    command) is satisfied. Pins the fix for the precedence bug: coder.solve only
+    preempts Max-Mode when max_mode_n<=1. (Uses `coder_solve_test_cmd`, not
+    `local_gate_cmd`, to satisfy the test-command gate without also flipping
+    Max-Mode's OWN candidate-selection strategy from judge to execution-grounded —
+    that's an orthogonal knob this test isn't about.)"""
+    from project_board import coder_seam
+
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())  # coder plugin available
+
+    async def _boom(**kw):
+        raise AssertionError("coder.solve must not run — Max-Mode has precedence when max_mode_n>1")
+
+    monkeypatch.setattr(coder_seam, "dispatch", _boom)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/11"
+
+    async def _judge(feature, base, worktrees):
+        assert len(worktrees) == 3  # Max-Mode's fan-out ran, not solve()
+        return 0
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        judge=_judge,
+        cfg={"coder": "proto", "max_mode_n": 3, "coder_solve_test_cmd": "pytest -q"},
+    )
+    assert store.creates == ["bd-1.c0", "bd-1.c1", "bd-1.c2"]  # Max-Mode's candidates, not solve()'s
+    assert ("open_review", "bd-1", "https://example/pr/11") in store.calls
+
+
 # ── goal-verification gate (MiMo-borrowed; opt-in `goal_verify`) ─────────────────
 
 

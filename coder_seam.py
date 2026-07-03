@@ -184,6 +184,22 @@ class _WorktreeSolveAdapter:
 RecordGens = Callable[[int], None]
 
 
+def _record_gens_best_effort(record_gens: RecordGens, fid: str, n: int) -> None:
+    """Call ``record_gens(n)`` and swallow any exception it raises.
+
+    ``store.record_gens_spent`` documents itself as fire-and-forget ("a br hiccup
+    here must never fail the build the way a missing PR would") — a transient `br`
+    failure (lock contention, a flaky CLI invocation, a race with a concurrent
+    label write) must never propagate out of ``dispatch()``. Left unguarded, it
+    would surface as an unrelated ``BoardError`` past every capability-failure
+    handler in the caller's loop, discarding an already-verified (or already-
+    reaped) candidate purely because of a bookkeeping label write."""
+    try:
+        record_gens(n)
+    except Exception:  # noqa: BLE001 — fire-and-forget cost accounting, never fails the build
+        log.warning("[project_board] %s record_gens(%d) failed (ignored — fire-and-forget)", fid, n, exc_info=True)
+
+
 async def dispatch(
     *,
     task: str,
@@ -264,7 +280,11 @@ async def dispatch(
             # `solve()` never got to return a `gens_spent` count — the attempted
             # generation count is the honest stand-in (a failed dispatch still spent
             # the gen; ADR 0064's cost accounting doesn't get to look the other way).
-            record_gens(adapter._n)
+            # Best-effort per store.record_gens_spent's own contract ("a br hiccup
+            # here must never fail the build"): the worktrees above are ALREADY
+            # reaped and the original exception below is what the loop must see —
+            # a transient `br` failure recording the spend must never mask it.
+            _record_gens_best_effort(record_gens, fid, adapter._n)
         log.warning(
             "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
             fid,
@@ -273,7 +293,10 @@ async def dispatch(
         )
         raise
     if record_gens is not None:
-        record_gens(result.gens_spent)
+        # Same fire-and-forget contract as above: a bookkeeping failure here must
+        # never discard a candidate that ALREADY exists on disk (test-verified or
+        # not) — the promote/reap logic below still has to run either way.
+        _record_gens_best_effort(record_gens, fid, result.gens_spent)
 
     if not result.passed or not result.solution:
         for wt, branch in adapter.candidates:

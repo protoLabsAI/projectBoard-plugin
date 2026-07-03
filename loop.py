@@ -214,6 +214,16 @@ class BoardLoop:
         # `_drive` treats as the same capability failure as a no-diff dispatch
         # (escalate a tier, or block) — the tier ladder still climbs when search
         # itself stalls.
+        #
+        # Precedence vs. Max-Mode (`max_mode_n>1`, below): coder_solve ONLY preempts
+        # Max-Mode when Max-Mode itself is off (`max_mode_n<=1`) — see
+        # `_use_coder_solve`. Without this, a board already running the README's own
+        # execution-grounded Max-Mode recipe (`max_mode_n>1` + `local_gate_cmd`) would
+        # silently stop using Max-Mode the moment the separate `coder` plugin became
+        # importable for any unrelated reason, with zero change to THIS board's own
+        # config — and unlike Max-Mode's LLM-judge fallback (which always ships a
+        # best-effort PR), an exhausted solve() ladder blocks the feature outright.
+        # That's a behavior change an operator must opt into, not inherit for free.
         self.coder_solve = bool(self.cfg.get("coder_solve", True))
         # The ladder's verifier: the command that runs THIS feature's (coder-
         # authored) acceptance tests in a candidate worktree, e.g. "pytest tests/ -q".
@@ -651,6 +661,8 @@ class BoardLoop:
                     #    ladder over the feature's acceptance tests (coder_seam.py).
                     #    Same "from-scratch build only" rule as max-mode: a carried-
                     #    forward re-dispatch FIXES the existing diff with one coder.
+                    #    Only preempts max-mode when max_mode_n<=1 (_use_coder_solve) —
+                    #    a board already running Max-Mode keeps that behavior.
                     #  • max-mode → N parallel candidates, judge, promote the winner (#21).
                     #    ONLY for a from-scratch build: a carried-forward re-dispatch (a CI
                     #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
@@ -846,8 +858,18 @@ class BoardLoop:
         """The P2 board-seam dispatch decision (ADR 0064) — see coder_seam.py.
         `coder_solve` is this repo's own opt-out valve (default on); the actual
         grounding gate (coder plugin importable + acceptance criteria + a runnable
-        test command) lives in ``coder_seam.should_use_solve``."""
+        test command) lives in ``coder_seam.should_use_solve``.
+
+        Max-Mode takes precedence when both are configured (`max_mode_n>1`): a
+        board already relying on Max-Mode's judge-fallback (always ships a
+        best-effort PR) must not have that silently swapped for solve()'s harder
+        "block if nothing passes" behavior just because the separate `coder`
+        plugin became importable. Enabling coder.solve on such a board is a
+        deliberate config change (set `max_mode_n<=1`), never a side effect of
+        installing `coder` for something else."""
         if not self.coder_solve:
+            return False
+        if self.max_mode_n > 1:
             return False
         return coder_seam.should_use_solve(feature, test_cmd=self.coder_solve_test_cmd)
 

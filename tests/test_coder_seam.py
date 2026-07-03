@@ -175,6 +175,43 @@ async def test_dispatch_records_gens_even_on_a_single_greedy_win(monkeypatch):
     assert gens == [1]
 
 
+async def test_dispatch_promotes_the_winner_even_if_record_gens_raises(monkeypatch):
+    """`store.record_gens_spent` documents itself as fire-and-forget ("a br hiccup
+    here must never fail the build the way a missing PR would") — a `BoardError`
+    (lock contention, a flaky `br` call) out of `record_gens` must never discard an
+    already-verified winning candidate or leak it un-promoted."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+        c0 = await generate(task, feedback=None)
+        return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    def _boom_record(n):
+        raise RuntimeError("br hiccup: lock contention")
+
+    wt, branch, result = await dispatch(
+        task="t",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-10",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        record_gens=_boom_record,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert created == ["bd-10.g1"]
+    assert promoted == [("/wt/feat-bd-10.g1", "feat/bd-10.g1", "bd-10")]  # still promoted
+    assert (wt, branch) == ("/wt/feat-bd-10", "feat/bd-10")  # dispatch() itself never raised
+
+
 # ── dispatch(): the exhausted (no passing candidate) path ───────────────────────
 
 
@@ -253,6 +290,49 @@ async def test_dispatch_exhausted_with_no_candidates_at_all(monkeypatch):
     assert removed == [] and promoted == []
 
 
+async def test_dispatch_still_reaps_and_raises_solve_exhausted_when_record_gens_raises(monkeypatch):
+    """Same fire-and-forget contract on the exhausted path: a `record_gens` failure
+    must not prevent every reaped candidate from actually being reaped, nor swallow
+    the (honest) `SolveExhausted` the caller needs to see."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+        await generate(task, feedback=None)
+        c1 = await generate(task, feedback="prior failure")
+        v = _FakeVerdict(passed=False, total=1, failed=1, output="AssertionError: nope")
+        return _FakeResult(solution=c1, passed=False, rung="best-partial", gens_spent=2, candidates_tried=2, verdict=v)
+
+    def _boom_record(n):
+        raise RuntimeError("br hiccup: flaky CLI invocation")
+
+    try:
+        await dispatch(
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-11",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            budget=6,
+            k=3,
+            tree_depth=2,
+            record_gens=_boom_record,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raised = False
+    except SolveExhausted:
+        raised = True
+    assert raised  # the honest SolveExhausted still surfaces, not the record_gens RuntimeError
+    assert created == ["bd-11.g1", "bd-11.g2"]
+    assert set(removed) == {"/wt/feat-bd-11.g1", "/wt/feat-bd-11.g2"}  # both still reaped
+    assert promoted == []
+
+
 # ── dispatch(): solve() itself raises mid-ladder (not just returns unpassed) ────
 
 
@@ -313,6 +393,60 @@ async def test_dispatch_reaps_candidates_when_solve_raises_and_reraises_original
     assert set(removed) == {"/wt/feat-bd-5.g1", "/wt/feat-bd-5.g2"}  # both reaped, none leaked
     assert promoted == []
     assert gens == [2]  # the attempted-candidate count still surfaces as spent cost
+
+
+async def test_dispatch_reraises_the_original_mid_ladder_exception_even_if_record_gens_also_raises(monkeypatch):
+    """If `record_gens` itself blows up (e.g. `BoardError` from a `br` hiccup) while
+    handling a REAL mid-ladder failure, the original exception must still be what
+    the caller sees — not the bookkeeping failure, and not silently swallowed."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+
+    class _Boom(RuntimeError):
+        pass
+
+    calls = {"n": 0}
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _Boom("candidate coder timed out")
+        return "ok"
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth):
+        await generate(task, feedback=None)
+        await generate(task, feedback=None)
+
+    def _boom_record(n):
+        raise RuntimeError("br hiccup: concurrent label write")
+
+    try:
+        await dispatch(
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-12",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            budget=6,
+            k=3,
+            tree_depth=2,
+            record_gens=_boom_record,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raised_boom = False
+    except _Boom:
+        raised_boom = True
+    assert raised_boom  # the ORIGINAL _Boom surfaces, not record_gens's RuntimeError
+    assert created == ["bd-12.g1", "bd-12.g2"]
+    assert set(removed) == {"/wt/feat-bd-12.g1", "/wt/feat-bd-12.g2"}  # still reaped
+    assert promoted == []
 
 
 async def test_dispatch_raise_with_no_candidates_created_yet_skips_record_gens(monkeypatch):
