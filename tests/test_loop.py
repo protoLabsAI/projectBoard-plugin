@@ -102,6 +102,17 @@ def test_build_prompt_requires_tests():
     assert "rejected before the pr opens" in prompt
 
 
+def test_build_prompt_asks_for_a_clean_pr_summary_not_raw_reasoning():
+    """The coder's final reply is used VERBATIM as the PR body (loop.py's
+    `open_pr(..., body=(result or "")[:4000])`) with no post-processing — so an
+    un-briefed coder narrating its whole thought process ships that straight into
+    the PR description. The prompt must say so explicitly and ask for a short,
+    clean summary instead."""
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    assert "final message becomes the pr description" in prompt.lower()
+    assert "do not narrate your process" in prompt.lower()
+
+
 def test_is_test_path_classification():
     """The deterministic gate's path classifier — what counts as a test vs code."""
     from project_board.loop import _is_code_path, _is_test_path
