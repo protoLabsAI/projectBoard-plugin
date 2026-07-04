@@ -143,8 +143,56 @@ async def test_dispatch_promotes_the_winner_and_reaps_the_losers(monkeypatch):
     assert promoted == [("/wt/feat-bd-1.g2", "feat/bd-1.g2", "bd-1")]
     assert removed == ["/wt/feat-bd-1.g1"]  # only the loser reaped
     assert (wt, branch) == ("/wt/feat-bd-1", "feat/bd-1")  # canonical name
-    assert "best-of-k" in result and "gens=2" in result
+    # The winning candidate's OWN reply is the result — not an internal rung/gens
+    # diagnostic string. loop.py uses this verbatim as the PR body; _verify_goal
+    # reads it for the NO_TEST_NEEDED escape hatch. Losing candidate g1's reply
+    # must NOT leak through — only g2 (the winner) is used.
+    assert result == "reply from /wt/feat-bd-1.g2"
     assert gens == [2]  # cost surfaced exactly once
+
+
+async def test_dispatch_falls_back_to_a_diagnostic_string_when_the_winner_has_no_reply(monkeypatch, tmp_path):
+    """A fusion win (a plain completion, not a summary) — or any candidate whose
+    reply somehow never got captured — has nothing human-authored to report, so
+    dispatch() falls back to the rung/gens diagnostic string rather than an empty
+    PR body."""
+    _, removed, promoted = _stub_worktree(monkeypatch)
+
+    async def _create_in_tmp(repo, base, cid, root):
+        d = tmp_path / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return (str(d), f"feat/{cid}")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create_in_tmp)
+
+    async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
+        return "### x.py\n```\nhi\n```"
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        c0 = await fusion_generate(task, feedback=None)  # the REAL adapter.generate_fusion
+        return _FakeResult(solution=c0, passed=True, rung="fusion", gens_spent=1, candidates_tried=1, note="solved")
+
+    _wt, _branch, result = await dispatch(
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-2",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        fusion_delegate=object(),
+        record_gens=lambda n: None,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+        _fusion_dispatch=_fake_openai_dispatch,
+    )
+    assert result == "[coder.solve rung=fusion gens=1] solved"
 
 
 async def test_dispatch_records_gens_even_on_a_single_greedy_win(monkeypatch):

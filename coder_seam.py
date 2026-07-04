@@ -338,6 +338,13 @@ class _WorktreeSolveAdapter:
         # step; the slow part (the coder dispatch) still runs in parallel.
         self._wt_lock = asyncio.Lock()
         self._n = 0
+        # worktree_path -> the coder's own final reply (its clean PR summary, per
+        # `loop._build_prompt`'s "your FINAL message becomes the PR description"
+        # contract) — captured so `dispatch()` can use the WINNING candidate's real
+        # summary as the PR body instead of an internal rung/gens diagnostic string.
+        # Also what `_verify_goal`'s NO_TEST_NEEDED escape hatch reads. Fusion has no
+        # such reply (a plain completion, not a summary) — absent for fusion wins.
+        self._replies: dict[str, str] = {}
 
     async def _new_candidate_worktree(self) -> tuple[str, str]:
         self._n += 1
@@ -349,7 +356,11 @@ class _WorktreeSolveAdapter:
 
     async def generate(self, task: str, *, feedback: str | None = None) -> str:
         wt, _branch = await self._new_candidate_worktree()
-        await worktree.dispatch_coder(self.coder, wt, _augment_prompt(task, feedback), timeout=self.dispatch_timeout)
+        reply = await worktree.dispatch_coder(
+            self.coder, wt, _augment_prompt(task, feedback), timeout=self.dispatch_timeout
+        )
+        if (reply or "").strip():
+            self._replies[wt] = reply
         return wt
 
     async def generate_fusion(self, task: str, *, feedback: str | None = None) -> str:
@@ -510,7 +521,10 @@ async def dispatch(
 
     Returns ``(worktree, branch, result_text)`` on a passing candidate — the SAME
     3-tuple shape ``_dispatch_max_mode`` returns, so the caller's downstream drive
-    (fixups, local gate, ``open_pr``) is unchanged. Raises :class:`SolveExhausted`
+    (fixups, local gate, ``open_pr``) is unchanged. ``result_text`` is the WINNING
+    candidate's own reply (its clean PR summary) when the ladder reached it via an
+    ACP rung; only a fusion win (no natural-language reply, just file content) falls
+    back to an internal rung/gens diagnostic string. Raises :class:`SolveExhausted`
     (a capability failure) when the budget is spent with no passing candidate, after
     reaping every candidate worktree it created.
 
@@ -628,7 +642,14 @@ async def dispatch(
         result.gens_spent,
         budget,
     )
-    result_text = f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
+    # The winning candidate's own reply (its clean PR summary, per the "your FINAL
+    # message becomes the PR description" contract every coder dispatch is given) is
+    # the real result — `loop.py` uses this verbatim as the PR body, and `_verify_goal`
+    # reads it for the NO_TEST_NEEDED escape hatch. Only fusion (a plain completion,
+    # no such reply) or an unexpectedly-empty one falls back to the diagnostic string.
+    result_text = (
+        adapter._replies.get(win_wt) or f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
+    )
     return canon_wt, canon_branch, result_text
 
 
