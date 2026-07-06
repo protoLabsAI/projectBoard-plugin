@@ -229,7 +229,8 @@ def test_mark_ready_adds_the_label_when_fully_specced(make_board, monkeypatch):
     }
     monkeypatch.setattr(b, "get_feature", lambda fid: ready_feature)
     b.mark_ready("bd-1")
-    assert ("update", "bd-1", "--add-label", "ready") in br.calls
+    # adds `ready` (and clears a `designing` parking label in the same update)
+    assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
 
 
 @pytest.mark.parametrize(
@@ -255,6 +256,83 @@ def test_mark_ready_rejects_an_underspecced_feature(make_board, monkeypatch, mis
     with pytest.raises(BoardError, match=field):
         b.mark_ready("bd-1")
     assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+# ── the DESIGN gate (plan M6): large/architectural needs design + ADR ref ───────
+
+
+def _design_feature(**over):
+    base = {
+        "id": "bd-9",
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        "files_to_modify": ["a.py"],
+        "difficulty": "large",
+        "design": "",
+    }
+    base.update(over)
+    return base
+
+
+def test_design_gate_rejects_large_feature_with_no_design(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _design_feature())
+    with pytest.raises(BoardError, match="Design gate.*no\\s+`design`"):
+        b.mark_ready("bd-9")
+    assert br.cmds("update") == []
+
+
+def test_design_gate_rejects_a_design_without_an_adr_reference(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "get_feature", lambda fid: _design_feature(difficulty="architectural", design="we will use a queue")
+    )
+    with pytest.raises(BoardError, match="references no ADR"):
+        b.mark_ready("bd-9")
+    assert br.cmds("update") == []
+
+
+@pytest.mark.parametrize(
+    "design",
+    [
+        "Per ADR 0077, findings gate the merge edge.",
+        "see adr-0064 for the ladder",
+        "decision recorded in docs/adr/0076-managed-git-acp-delegates.md",
+        "ADR/0055 isolation applies",
+    ],
+)
+def test_design_gate_accepts_designs_citing_an_adr(make_board, monkeypatch, design):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _design_feature(design=design))
+    b.mark_ready("bd-9")
+    assert br.cmds("update")  # gate passed → the ready label update ran
+
+
+def test_design_gate_ignores_small_and_medium_features(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _design_feature(difficulty="medium"))
+    b.mark_ready("bd-9")  # no design, but medium → gate not applied
+    assert br.cmds("update")
+
+
+def test_mark_designing_parks_and_mark_ready_unparks(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _design_feature())
+    b.mark_designing("bd-9", note="running due diligence")
+    assert ("update", "bd-9", "--add-label", "designing", "--remove-label", "ready") in br.calls
+
+
+def test_mark_designing_rejects_in_flight_features(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_progress"})
+    with pytest.raises(BoardError, match="can't mark designing"):
+        b.mark_designing("bd-9")
 
 
 # ── cancel_feature: the second terminal edge (#47) ──────────────────────────────
