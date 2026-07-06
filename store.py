@@ -56,6 +56,13 @@ LABEL_CANCELLED = "cancelled"
 # non-foundation blocker, which can release dependents at in_review under dep_gate:
 # review). Inert under the default dep_gate: merge (then every blocker gates on merge).
 LABEL_FOUNDATION = "foundation"
+# Review-gate sub-states of `in_review` (plan M5, blocking review). `review-pending`
+# marks a PR whose adversarial review is running (or was interrupted — the PR
+# reconcile finishes it); `changes-requested` marks a feature bounced back to the
+# coder with findings (it rides through the requeue so the board shows WHY the
+# feature went back). Both are inert when the review gate is off.
+LABEL_REVIEW_PENDING = "review-pending"
+LABEL_CHANGES_REQUESTED = "changes-requested"
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
@@ -283,6 +290,23 @@ class BeadsBoard:
         if f["board_state"] != "in_progress":
             raise BoardError(f"open_review expects in_progress, got {f['board_state']!r}")
         self._run("update", fid, "--add-label", LABEL_IN_REVIEW, "--external-ref", pr_url)
+        return self.get_feature(fid)
+
+    def set_review_substate(self, fid: str, label: str | None, note: str = "") -> dict:
+        """Swap the review-gate sub-state labels (``review-pending`` /
+        ``changes-requested``) — exactly one (or none) at a time. ``note`` (the
+        findings block, a clean-review line) is recorded as a comment so the
+        review history lives on the bead."""
+        self._require(fid)
+        args = ["update", fid]
+        for known in (LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED):
+            if known != label:
+                args += ["--remove-label", known]
+        if label:
+            args += ["--add-label", label]
+        self._run(*args)
+        if note:
+            self._comment(fid, note)
         return self.get_feature(fid)
 
     def bounce_ci_fail(self, fid: str, reason: str = "") -> dict:

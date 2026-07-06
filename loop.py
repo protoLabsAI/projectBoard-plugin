@@ -42,7 +42,13 @@ import time
 
 from . import coder_seam, worktree
 from .failures import classify
-from .store import BoardError, escalation_enabled, get_store
+from .store import (
+    LABEL_CHANGES_REQUESTED,
+    LABEL_REVIEW_PENDING,
+    BoardError,
+    escalation_enabled,
+    get_store,
+)
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -94,6 +100,16 @@ def _ci_failure_reason(summary: str, max_chars: int = 500) -> str:
     return reason[:max_chars]
 
 
+_PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+
+
+def _parse_pr_url(pr_url: str) -> tuple[str, str]:
+    """``https://github.com/owner/name/pull/123`` → ``("123", "owner/name")``;
+    ``("", "")`` when it doesn't look like a GitHub PR url."""
+    m = _PR_URL_RE.search(pr_url or "")
+    return (m.group(2), m.group(1)) if m else ("", "")
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -112,6 +128,16 @@ class BoardLoop:
         # the merge webhook gate it. Turn this on only for repos NOT covered by a
         # PR-review pipeline (then a reachable `reviewer` a2a delegate is required).
         self.review_dispatch = bool(self.cfg.get("review_dispatch", False))
+        # BLOCKING review gate (plan M5, OPT-IN, default off — review_dispatch stays
+        # the advisory alternative). After open_review the loop runs the host's
+        # adversarial `code-review` workflow (ADR 0077) on the PR, parses the findings
+        # convention, and: clean → the feature stays in_review for the merge edge;
+        # blocking findings → bounce back to the coder with the findings injected into
+        # the retry prompt, EXACTLY like the CI bounce, bounded by `review_fix_max`
+        # (mirror of ci_fix_max); exhaustion → flag_blocked — never a silent merge.
+        self.review_gate = bool(self.cfg.get("review_gate", False))
+        self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
+        self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
         # Goal-verification gate (OPT-IN, default off). When on, a DETERMINISTIC pre-PR
         # check (no LLM, no diff dump): a code change must ship a test — CI runs tests but
         # can't require their presence, so the gate does. A miss → re-dispatch/escalate
@@ -291,6 +317,9 @@ class BoardLoop:
         # Rebase-conflict re-dispatches so far (fid → count) when a sibling merge
         # leaves a PR with a real (non-clean) conflict against base.
         self._rebase_attempts: dict[str, int] = {}
+        # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
+        # review sibling of _ci_fix_attempts (plan M5).
+        self._review_fix_attempts: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -503,6 +532,16 @@ class BoardLoop:
                         self._ci_feedback.pop(fid, None)
                         self._ci_fix_attempts.pop(fid, None)
                         self._rebase_attempts.pop(fid, None)
+                        self._review_fix_attempts.pop(fid, None)
+                        # A merge with the gate still unhappy is a human override —
+                        # reality wins, but it must be visible, not silent.
+                        if self.review_gate and LABEL_CHANGES_REQUESTED in (f.get("labels") or []):
+                            log.warning(
+                                "[project_board] %s merged with review changes-requested still set "
+                                "(human override): %s",
+                                fid,
+                                pr_url,
+                            )
                         log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                 elif state == "CLOSED":
                     store.flag_blocked(fid, f"PR closed without merging — needs triage: {pr_url}")
@@ -510,6 +549,7 @@ class BoardLoop:
                     self._ci_feedback.pop(fid, None)
                     self._ci_fix_attempts.pop(fid, None)
                     self._rebase_attempts.pop(fid, None)
+                    self._review_fix_attempts.pop(fid, None)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                 elif state == "OPEN":
                     # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
@@ -520,6 +560,16 @@ class BoardLoop:
                         continue
                     if self.ci_poll:
                         await self._reconcile_ci(store, fid, pr_url, repo)
+                    # The merge-edge half of the review gate (M5): an in_review PR still
+                    # marked review-pending had its gate interrupted (host restart, dead
+                    # workflow run) — finish it here so the gate can't silently lapse into
+                    # advisory. Skip when the CI reconcile just requeued the feature.
+                    if (
+                        self.review_gate
+                        and LABEL_REVIEW_PENDING in (f.get("labels") or [])
+                        and store.get_feature(fid).get("board_state") == "in_review"
+                    ):
+                        await self._review_gate(store, fid, pr_url, repo)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
 
@@ -862,7 +912,11 @@ class BoardLoop:
                 store.open_review(fid, pr_url=pr_url)
                 self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
                 self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
-                if self.review_dispatch:
+                if self.review_gate:
+                    # Blocking adversarial review (M5). May requeue the feature with
+                    # findings injected — the next drive carries them in the prompt.
+                    await self._review_gate(store, fid, pr_url, repo)
+                elif self.review_dispatch:
                     await self._request_review(fid, pr_url)
                 # Keep the worktree (a CI-fail bounce re-dispatches); reaping happens
                 # on a terminal block above, and the coder subprocess is already reaped.
@@ -896,6 +950,143 @@ class BoardLoop:
             # failure (DelegateError, httpx/connection, anything) must NEVER block a
             # feature whose PR already opened. CI + the merge webhook are the gate.
             log.warning("[project_board] review dispatch for %s failed: %s", fid, exc)
+
+    # ── blocking review gate (plan M5) ────────────────────────────────────────
+    async def _review_gate(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """Run the adversarial review workflow on the just-opened PR and act on the
+        findings — the review sibling of the CI bounce:
+
+        - **clean** (no blocker/major surviving the verify pass) → clear the review
+          sub-state; the feature stays in_review for the merge edge.
+        - **blocking findings** → store them on the bead (comment), inject them into
+          the retry prompt via ``_ci_feedback`` (+ the PR diff via ``_ci_prior_diff``
+          — the same carry-the-lesson levers), label ``changes-requested``, and
+          requeue — bounded by ``review_fix_max``.
+        - **budget exhausted** → ``flag_blocked`` for human review. NEVER a silent
+          merge, and never a silent pass: a gate that can't run (no workflow runner,
+          no parser, no reviewer) leaves the feature in_review with a warning — the
+          same posture as CI being unreachable.
+
+        Sequencing (ADR 0064): this is deliberately a single call-site-agnostic
+        method — when the board face of execution-grounded selection lands, moving
+        the gate after test-passing candidate selection is a one-line move.
+        """
+        store.set_review_substate(fid, LABEL_REVIEW_PENDING)
+        output = await self._run_review_workflow(fid, pr_url)
+        if output is None:
+            # Could not review (no runner + no reviewer, or the run itself died).
+            # Leave review-pending set — the PR reconcile retries the gate next poll,
+            # so a transient host hiccup doesn't quietly demote the gate to advisory.
+            log.warning("[project_board] %s review gate could not run — will retry on the next poll", fid)
+            return
+        findings = self._parse_findings(output)
+        if findings is None:
+            # Host predates the findings convention (ADR 0077) — the gate can't
+            # judge, so it must not pretend to. Record and leave in review.
+            store.set_review_substate(fid, None, note="review gate: host lacks graph.review.findings — gate inert")
+            log.warning("[project_board] %s review gate inert (no findings parser on this host)", fid)
+            return
+        blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
+        if not blocking:
+            store.set_review_substate(
+                fid,
+                None,
+                note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
+            )
+            self._review_fix_attempts.pop(fid, None)
+            log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
+            return
+
+        rendered = self._render_findings(blocking)
+        n = self._review_fix_attempts.get(fid, 0)
+        if n >= self.review_fix_max:
+            store.set_review_substate(fid, None, note=rendered)
+            store.flag_blocked(
+                fid,
+                f"review findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
+            )
+            self._ci_feedback.pop(fid, None)
+            self._ci_prior_diff.pop(fid, None)
+            self._review_fix_attempts.pop(fid, None)
+            log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
+            return
+        self._review_fix_attempts[fid] = n + 1
+        # Carry the lesson exactly like the CI bounce: findings as the rejection
+        # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
+        self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
+        self._ci_feedback[fid] = (
+            "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
+            "below in the existing branch (the PR updates on push) — do not rewrite "
+            "unrelated code.\n\n" + rendered
+        )
+        store.set_review_substate(fid, LABEL_CHANGES_REQUESTED, note=rendered)
+        store.requeue(fid)
+        log.info(
+            "[project_board] %s review gate bounce %d/%d (%d blocking finding(s))",
+            fid,
+            n + 1,
+            self.review_fix_max,
+            len(blocking),
+        )
+
+    async def _run_review_workflow(self, fid: str, pr_url: str) -> str | None:
+        """Produce the raw review output for a PR: the host's workflow runner
+        (``runtime.state.STATE.workflow_run`` — published by the workflows plugin,
+        no plugin import needed) running ``review_workflow``, else the configured
+        a2a reviewer told to emit the findings convention. None = could not review."""
+        number, repo_slug = _parse_pr_url(pr_url)
+        runner = None
+        try:
+            from runtime.state import STATE
+
+            runner = getattr(STATE, "workflow_run", None)
+        except Exception:  # noqa: BLE001 — non-protoAgent host (tests) → try the reviewer
+            runner = None
+        if runner is not None and number:
+            try:
+                result = await runner(self.review_workflow, {"pr": number, "repo": repo_slug})
+                return str((result or {}).get("output") or "") or None
+            except Exception as exc:  # noqa: BLE001 — a dead workflow ≠ a dead loop
+                log.warning("[project_board] %s review workflow %r failed: %s", fid, self.review_workflow, exc)
+                # fall through to the reviewer alternative
+        reviewer = self._resolve_delegate(self.reviewer_name, "a2a")
+        if reviewer is None:
+            return None
+        from plugins.delegates.adapters import ADAPTERS
+
+        try:
+            msg = (
+                f"Adversarially review this pull request: {pr_url}\n\n"
+                "Read the diff, verify each suspicion against the code, and report ONLY "
+                "evidence-backed findings as a fenced ```json array of objects "
+                '{"file", "line", "severity" (blocker|major|minor|nit), "category", '
+                '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '
+                "No findings → an empty array []."
+            )
+            return await ADAPTERS["a2a"].dispatch(reviewer, msg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[project_board] %s reviewer fallback failed: %s", fid, exc)
+            return None
+
+    @staticmethod
+    def _parse_findings(output: str):
+        """The findings convention parser (ADR 0077), imported from the HOST lazily —
+        the contract both this gate and the craft skill consume. None = the host
+        doesn't ship it (gate goes inert rather than guessing at prose)."""
+        try:
+            from graph.review.findings import parse_findings
+        except ImportError:
+            return None
+        return parse_findings(output or "")
+
+    @staticmethod
+    def _render_findings(findings) -> str:
+        try:
+            from graph.review.findings import render_findings_markdown
+
+            return render_findings_markdown(findings, title="Review findings (blocking)")
+        except ImportError:  # unreachable when _parse_findings succeeded; belt+braces
+            return "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in findings)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _use_coder_solve(self, feature: dict) -> bool:
