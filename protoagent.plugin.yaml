@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.29.3
+version: 0.30.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -31,10 +31,23 @@ config:
   #   fast: proto
   #   smart: proto-smart
   #   reasoning: claude-acp
-  reviewer: quinn           # a2a delegate for explicit PR review (only used if review_dispatch)
-  review_dispatch: false    # OPT-IN. Off = rely on the fleet PR-review pipeline (it reviews
-                            # PRs on open). On = also delegate_to(reviewer) — for repos with
-                            # no pipeline; needs a reachable `reviewer` a2a delegate.
+  reviewer: quinn           # a2a delegate for explicit PR review (review_dispatch, and the
+                            # review_gate's fallback when the host has no workflow runner)
+  review_dispatch: false    # OPT-IN, advisory. Off = rely on the fleet PR-review pipeline (it
+                            # reviews PRs on open). On = also delegate_to(reviewer) — for repos
+                            # with no pipeline; needs a reachable `reviewer` a2a delegate.
+  review_gate: false        # OPT-IN, BLOCKING (plan M5). On = after open_review the loop runs
+                            # the host's adversarial `code-review` workflow (ADR 0077) on the
+                            # PR, parses the findings convention, and bounces blocking findings
+                            # (blocker/major) back to the coder with the findings injected into
+                            # the retry prompt — the CI-bounce loop, for review. Sub-states ride
+                            # as labels: review-pending / changes-requested. Exhausted budget →
+                            # Blocked for human review; never a silent merge. Takes precedence
+                            # over review_dispatch when both are on.
+  review_workflow: code-review  # the host workflow recipe the gate runs (run_workflow name)
+  review_fix_max: 2         # review-bounce re-dispatches before the feature is Blocked
+                            # (mirrors ci_fix_max; same-tier — findings are fixable, not a
+                            # model-capability ceiling)
   goal_verify: false        # OPT-IN. On = an independent model call checks the coder's diff
                             # against the feature's acceptance_criteria (test coverage is
                             # mandatory even when unlisted) BEFORE opening the PR.

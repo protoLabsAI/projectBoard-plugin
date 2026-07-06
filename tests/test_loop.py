@@ -1755,3 +1755,170 @@ async def test_select_candidate_none_when_no_diff(monkeypatch):
 
     monkeypatch.setattr(loop, "_run_local_gate", gate)
     assert await loop._select_candidate(FEATURE, "main", ["/c0", "/c1"]) is None
+
+
+# ── the blocking review gate (plan M5): bounce / budget / exhaustion ─────────────
+
+
+class _GateStore(FakeLoopStore):
+    """FakeLoopStore + the review-gate surface (sub-state labels, requeue, lookup)."""
+
+    def __init__(self):
+        super().__init__()
+        self.review_states = []  # (label, note) history
+        self.state = "in_review"
+
+    def set_review_substate(self, fid, label, note=""):
+        self.calls.append(("set_review_substate", fid, label))
+        self.review_states.append((label, note))
+        return {"id": fid}
+
+    def requeue(self, fid):
+        self.calls.append(("requeue", fid))
+        self.state = "ready"
+        return {"id": fid}
+
+    def get_feature(self, fid):
+        return {"id": fid, "board_state": self.state}
+
+
+def _inject_fake_findings(monkeypatch):
+    """Stand in for the HOST's graph.review.findings (absent in this suite) — the
+    ADR 0077 contract _review_gate imports lazily. Parses any fenced/bare JSON
+    array into finding-shaped objects."""
+    import json as _json
+    import types as _types
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class _Finding:
+        file: str = ""
+        line: int = 0
+        severity: str = "minor"
+        category: str = ""
+        claim: str = ""
+        evidence: str = ""
+        verdict: str = ""
+        note: str = field(default="")
+
+    def parse_findings(text):
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end <= start:
+            return []
+        try:
+            items = _json.loads(text[start : end + 1])
+        except _json.JSONDecodeError:
+            return []
+        return [
+            _Finding(**{k: v for k, v in it.items() if k in _Finding.__dataclass_fields__})
+            for it in items
+            if isinstance(it, dict) and it.get("claim")
+        ]
+
+    def render_findings_markdown(findings, title="Review findings"):
+        return f"## {title}\n" + "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in findings)
+
+    mod = _types.ModuleType("graph.review.findings")
+    mod.parse_findings = parse_findings
+    mod.render_findings_markdown = render_findings_markdown
+    pkg = _types.ModuleType("graph")
+    sub = _types.ModuleType("graph.review")
+    pkg.review = sub
+    sub.findings = mod
+    import sys as _sys
+
+    monkeypatch.setitem(_sys.modules, "graph", pkg)
+    monkeypatch.setitem(_sys.modules, "graph.review", sub)
+    monkeypatch.setitem(_sys.modules, "graph.review.findings", mod)
+
+
+def _gate_loop(monkeypatch, output, cfg=None):
+    """A review_gate loop whose review-workflow run returns ``output`` (None = the
+    run could not happen) and whose PR-diff fetch is stubbed."""
+    loop = BoardLoop({"review_gate": True, **(cfg or {})})
+
+    async def _run(fid, pr_url):
+        return output
+
+    async def _diff(pr_url, cwd="."):
+        return "diff --git a/x b/x"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    return loop
+
+
+def test_review_gate_config():
+    loop = BoardLoop({})
+    assert loop.review_gate is False and loop.review_workflow == "code-review" and loop.review_fix_max == 2
+    assert BoardLoop({"review_gate": True, "review_fix_max": 0}).review_fix_max == 0
+    assert BoardLoop({"review_workflow": " my-review "}).review_workflow == "my-review"
+
+
+_BLOCKER = '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "confirmed"}]'
+_MINOR = '[{"file": "a.py", "line": 3, "severity": "nit", "claim": "naming", "evidence": "x", "verdict": "confirmed"}]'
+_REFUTED = '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "refuted"}]'
+
+
+async def test_review_gate_bounces_with_findings_in_the_retry_prompt(monkeypatch):
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert ("requeue", "bd-1") in store.calls
+    # sub-state walked pending → changes-requested, findings recorded on the bead
+    assert store.review_states[0][0] == "review-pending"
+    assert store.review_states[-1][0] == "changes-requested"
+    assert "drops data" in store.review_states[-1][1]
+    # the retry prompt carries the findings + the reviewed diff (the CI-bounce levers)
+    assert "REQUESTED CHANGES" in loop._ci_feedback["bd-1"]
+    assert "drops data" in loop._ci_feedback["bd-1"]
+    assert loop._ci_prior_diff["bd-1"].startswith("diff --git")
+    assert loop._review_fix_attempts["bd-1"] == 1
+    # and the injected feedback lands in the next build prompt
+    prompt = loop._build_prompt({**FEATURE})
+    assert "REQUESTED CHANGES" in prompt and "drops data" in prompt
+
+
+async def test_review_gate_clean_and_nonblocking_findings_pass(monkeypatch):
+    _inject_fake_findings(monkeypatch)
+    for output in ("clean.\n```json\n[]\n```", _MINOR, _REFUTED):
+        store = _GateStore()
+        loop = _gate_loop(monkeypatch, output)
+        await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+        assert ("requeue", "bd-1") not in store.calls
+        assert not any(c[0] == "flag_blocked" for c in store.calls)
+        assert store.review_states[-1][0] is None  # sub-state cleared
+        assert "bd-1" not in loop._ci_feedback
+
+
+async def test_review_gate_exhausted_budget_blocks_never_merges_silently(monkeypatch):
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, _BLOCKER, cfg={"review_fix_max": 1})
+    loop._review_fix_attempts["bd-1"] = 1  # budget already spent
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "needs human review" in blocked[0][2]
+    assert ("requeue", "bd-1") not in store.calls
+    assert "bd-1" not in loop._review_fix_attempts  # budget cleared with the block
+
+
+async def test_review_gate_unrunnable_leaves_pending_for_the_reconcile_retry(monkeypatch):
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, None)  # no runner + no reviewer
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert store.review_states == [("review-pending", "")]  # left pending — retried next poll
+    assert ("requeue", "bd-1") not in store.calls
+    assert not any(c[0] == "flag_blocked" for c in store.calls)
+
+
+def test_parse_pr_url():
+    from project_board.loop import _parse_pr_url
+
+    assert _parse_pr_url("https://github.com/protoLabsAI/protoContent/pull/421") == (
+        "421",
+        "protoLabsAI/protoContent",
+    )
+    assert _parse_pr_url("https://example.com/not-a-pr") == ("", "")
