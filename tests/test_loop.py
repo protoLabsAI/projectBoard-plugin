@@ -1857,7 +1857,9 @@ def test_review_gate_config():
 
 _BLOCKER = '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "confirmed"}]'
 _MINOR = '[{"file": "a.py", "line": 3, "severity": "nit", "claim": "naming", "evidence": "x", "verdict": "confirmed"}]'
-_REFUTED = '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "refuted"}]'
+_REFUTED = (
+    '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "refuted"}]'
+)
 
 
 async def test_review_gate_bounces_with_findings_in_the_retry_prompt(monkeypatch):
