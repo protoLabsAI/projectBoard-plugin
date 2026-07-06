@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 
@@ -63,6 +64,18 @@ LABEL_FOUNDATION = "foundation"
 # feature went back). Both are inert when the review gate is off.
 LABEL_REVIEW_PENDING = "review-pending"
 LABEL_CHANGES_REQUESTED = "changes-requested"
+# Pre-ready DESIGN state (plan M6, optional): a large/architectural feature parked
+# while its design/due-diligence is worked out (`mark_designing`). Informational for
+# the projection/console — the HARD gate is in `mark_ready` (a design referencing an
+# ADR is required at that size before the feature can go ready).
+LABEL_DESIGNING = "designing"
+
+# Difficulties whose blast radius demands a written design + an ADR reference before
+# the feature may go ready (the M6 DESIGN gate in `mark_ready`).
+DESIGN_GATED_DIFFICULTIES = ("large", "architectural")
+# What counts as "references an ADR": `ADR 0076` / `ADR-76` / `adr/0076` /
+# a `docs/adr/0076-…` path — case-insensitive, number required.
+ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
@@ -239,7 +252,38 @@ class BeadsBoard:
                 "Ready only with a spec, testable acceptance criteria, and the explicit files "
                 "to create/modify (a junior — or a coding agent — could pick it up and finish)."
             )
-        self._run("update", fid, "--add-label", LABEL_READY)
+        # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
+        # a task — it may not go ready until its `design` field exists AND references
+        # the ADR that records the decision (run /due-diligence, write the ADR, cite
+        # it). Small/medium features are untouched.
+        if str(f.get("difficulty", "")).strip().lower() in DESIGN_GATED_DIFFICULTIES:
+            design = str(f.get("design", "")).strip()
+            if not design:
+                raise BoardError(
+                    f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} but has no "
+                    "`design` — at this blast radius the decision must be designed first (run the "
+                    "due-diligence workflow, record the decision as an ADR, and put the design + "
+                    "ADR reference in the feature's design field)."
+                )
+            if not ADR_REF_RE.search(design):
+                raise BoardError(
+                    f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} and has a "
+                    "design, but the design references no ADR — record the decision as an ADR and "
+                    "cite it (e.g. 'ADR 0077') so the rationale outlives this feature."
+                )
+        self._run("update", fid, "--add-label", LABEL_READY, "--remove-label", LABEL_DESIGNING)
+        return self.get_feature(fid)
+
+    def mark_designing(self, fid: str, note: str = "") -> dict:
+        """Park a pre-ready feature in the DESIGNING state (label) while its design/
+        due-diligence is worked out — the optional waiting room in front of the M6
+        design gate. Purely informational; `mark_ready` still enforces the gate."""
+        f = self._require(fid)
+        if f["board_state"] not in ("backlog", "ready"):
+            raise BoardError(f"can't mark designing from {f['board_state']!r}")
+        self._run("update", fid, "--add-label", LABEL_DESIGNING, "--remove-label", LABEL_READY)
+        if note:
+            self._comment(fid, f"designing: {note}")
         return self.get_feature(fid)
 
     # ── the puller (Ready → In Progress) ──────────────────────────────────────
