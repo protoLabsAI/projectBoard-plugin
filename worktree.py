@@ -217,11 +217,21 @@ async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | 
     recovery) would ``session/load``-resume a thread whose memory references a diff
     the wiped tree no longer has — the coder thinks it's already done (→ no diff) or
     edits against stale assumptions. Forgetting the session first keeps its memory in
-    step with the empty tree. (A first attempt has no session to forget → no-op.)"""
+    step with the empty tree. (A first attempt has no session to forget → no-op.)
+
+    The BOARD owns the git lifecycle for scoped dispatches — worktree, branch,
+    commit, push, PR (this module). A delegate configured with ``manage_git: true``
+    (ADR 0076's harness-owned lifecycle for direct ``delegate_to`` dispatches) must
+    NOT keep it here: the adapter would run a second branch/commit/push/PR on top of
+    the board's, yielding duplicate PRs. Force-disable it on the scoped copy
+    (guarded, so hosts predating the field still work)."""
     from plugins.delegates.adapters import ADAPTERS, DelegateError
 
     adapter = ADAPTERS["acp"]
-    scoped = dataclasses.replace(coder, workdir=worktree)
+    overrides: dict = {"workdir": worktree}
+    if any(f.name == "manage_git" for f in dataclasses.fields(coder)):
+        overrides["manage_git"] = False
+    scoped = dataclasses.replace(coder, **overrides)
     try:
         await adapter.forget_session(scoped)
     except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build

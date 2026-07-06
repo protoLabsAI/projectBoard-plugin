@@ -380,6 +380,56 @@ async def test_dispatch_coder_forgets_session_before_dispatch(monkeypatch):
     assert order == ["forget", "dispatch", "teardown"]
 
 
+async def test_dispatch_coder_force_disables_managed_git(monkeypatch):
+    """The board owns the git lifecycle (worktree/branch/commit/push/PR). A delegate
+    configured `manage_git: true` (ADR 0076) dispatched by the loop must reach the
+    adapter with it OFF — otherwise the adapter runs a second full git lifecycle on
+    top of the board's and every feature yields duplicate branches/PRs."""
+
+    @dataclasses.dataclass
+    class _ManagedCoder:
+        workdir: str = ""
+        manage_git: bool = True
+
+    seen = []
+
+    class _Acp:
+        async def forget_session(self, scoped):
+            return True
+
+        async def dispatch(self, scoped, prompt, *, timeout=None):
+            seen.append(scoped)
+            return "built it"
+
+        async def teardown(self, scoped):
+            pass
+
+    _inject_fake_delegates(monkeypatch, _Acp())
+    out = await worktree.dispatch_coder(_ManagedCoder(), "/wt", "do it", timeout=5)
+    assert out == "built it"
+    assert seen[0].manage_git is False  # the scoped copy, not the registry delegate
+    assert seen[0].workdir == "/wt"
+
+
+async def test_dispatch_coder_tolerates_delegates_without_manage_git(monkeypatch):
+    """Hosts predating ADR 0076 have no `manage_git` field on Delegate — the
+    force-disable must be guarded, not a blind dataclasses.replace kwarg."""
+
+    class _Acp:
+        async def forget_session(self, scoped):
+            return True
+
+        async def dispatch(self, scoped, prompt, *, timeout=None):
+            return "built it"
+
+        async def teardown(self, scoped):
+            pass
+
+    _inject_fake_delegates(monkeypatch, _Acp())
+    out = await worktree.dispatch_coder(_Coder(), "/wt", "do it", timeout=5)
+    assert out == "built it"
+
+
 # ── link_node_modules: share the main repo's deps with the worktree ────────────────
 
 
