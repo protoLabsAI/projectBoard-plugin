@@ -36,6 +36,7 @@ dispatch). Missing any of the three gates ⇒ honest degrade to the single shot 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -138,6 +139,10 @@ class BoardLoop:
         self.review_gate = bool(self.cfg.get("review_gate", False))
         self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
         self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
+        # Cap on consecutive UNRUNNABLE gate attempts (runner missing / workflow dying /
+        # panel steps failing) before escalating to the operator via flag_blocked —
+        # fail closed without re-burning the workflow every poll forever (ADR 0078 D3).
+        self.review_run_max = max(1, int(self.cfg.get("review_run_max", 3)))
         # Goal-verification gate (OPT-IN, default off). When on, a DETERMINISTIC pre-PR
         # check (no LLM, no diff dump): a code change must ship a test — CI runs tests but
         # can't require their presence, so the gate does. A miss → re-dispatch/escalate
@@ -320,6 +325,15 @@ class BoardLoop:
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
+        # Consecutive review runs that could not complete (panel step failed / no
+        # runner) — after review_run_max the feature is Blocked for the operator
+        # instead of re-burning the workflow every poll (ADR 0078 D3: fail closed,
+        # escalate; never judge from a partial panel).
+        self._review_run_failures: dict[str, int] = {}
+        # Last parsed findings JSON per fid — fed back as the recipe's
+        # prior_findings input so a bounce re-review is a DELTA review
+        # (GitHub-native review memory, ADR 0078 D5).
+        self._review_prior: dict[str, str] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -533,6 +547,8 @@ class BoardLoop:
                         self._ci_fix_attempts.pop(fid, None)
                         self._rebase_attempts.pop(fid, None)
                         self._review_fix_attempts.pop(fid, None)
+                        self._review_run_failures.pop(fid, None)
+                        self._review_prior.pop(fid, None)
                         # A merge with the gate still unhappy is a human override —
                         # reality wins, but it must be visible, not silent.
                         if self.review_gate and LABEL_CHANGES_REQUESTED in (f.get("labels") or []):
@@ -550,6 +566,8 @@ class BoardLoop:
                     self._ci_fix_attempts.pop(fid, None)
                     self._rebase_attempts.pop(fid, None)
                     self._review_fix_attempts.pop(fid, None)
+                    self._review_run_failures.pop(fid, None)
+                    self._review_prior.pop(fid, None)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                 elif state == "OPEN":
                     # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
@@ -974,11 +992,32 @@ class BoardLoop:
         store.set_review_substate(fid, LABEL_REVIEW_PENDING)
         output = await self._run_review_workflow(fid, pr_url)
         if output is None:
-            # Could not review (no runner + no reviewer, or the run itself died).
-            # Leave review-pending set — the PR reconcile retries the gate next poll,
-            # so a transient host hiccup doesn't quietly demote the gate to advisory.
-            log.warning("[project_board] %s review gate could not run — will retry on the next poll", fid)
+            # Could not review (no runner + no reviewer, a dead run, or a PARTIAL
+            # panel — a failed finder step is not a review; judging from it is how
+            # an unreviewed PR gets promoted, ADR 0078 D3). Leave review-pending so
+            # the PR reconcile retries next poll — but bounded: a persistently
+            # unrunnable gate escalates to the operator instead of re-burning the
+            # workflow every poll forever.
+            n = self._review_run_failures.get(fid, 0) + 1
+            self._review_run_failures[fid] = n
+            if n >= self.review_run_max:
+                store.set_review_substate(fid, None)
+                store.flag_blocked(
+                    fid,
+                    f"review gate could not complete after {n} attempt(s) (runner missing, "
+                    f"workflow dying, or panel steps failing) — needs operator attention: {pr_url}",
+                )
+                self._review_run_failures.pop(fid, None)
+                log.warning("[project_board] %s blocked (review gate unrunnable %d times)", fid, n)
+                return
+            log.warning(
+                "[project_board] %s review gate could not run (%d/%d) — will retry on the next poll",
+                fid,
+                n,
+                self.review_run_max,
+            )
             return
+        self._review_run_failures.pop(fid, None)
         findings = self._parse_findings(output)
         if findings is None:
             # Host predates the findings convention (ADR 0077) — the gate can't
@@ -986,6 +1025,13 @@ class BoardLoop:
             store.set_review_substate(fid, None, note="review gate: host lacks graph.review.findings — gate inert")
             log.warning("[project_board] %s review gate inert (no findings parser on this host)", fid)
             return
+        # Remember this round's findings — the next run (a bounce re-review) passes
+        # them back as the recipe's prior_findings input, making it a DELTA review
+        # (drop fixed, carry still-open) instead of a from-scratch re-litigation.
+        try:
+            self._review_prior[fid] = json.dumps([f.to_dict() for f in findings]) if findings else ""
+        except Exception:  # noqa: BLE001 — memory is an optimization, never a gate failure
+            self._review_prior.pop(fid, None)
         blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
         if not blocking:
             store.set_review_substate(
@@ -1044,7 +1090,23 @@ class BoardLoop:
             runner = None
         if runner is not None and number:
             try:
-                result = await runner(self.review_workflow, {"pr": number, "repo": repo_slug})
+                inputs: dict = {"pr": number, "repo": repo_slug}
+                prior = self._review_prior.get(fid)
+                if prior:
+                    inputs["prior_findings"] = prior
+                result = await runner(self.review_workflow, inputs)
+                failed = list((result or {}).get("failed") or [])
+                if failed:
+                    # A partial panel is NOT a review (ADR 0078 D3): a starved/errored
+                    # finder means unreviewed angles, and a verdict synthesized from
+                    # the survivors reads as clean coverage it never had.
+                    log.warning(
+                        "[project_board] %s review workflow %r had failed step(s) %s — fail closed, not a review",
+                        fid,
+                        self.review_workflow,
+                        failed,
+                    )
+                    return None
                 return str((result or {}).get("output") or "") or None
             except Exception as exc:  # noqa: BLE001 — a dead workflow ≠ a dead loop
                 log.warning("[project_board] %s review workflow %r failed: %s", fid, self.review_workflow, exc)

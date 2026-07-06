@@ -1801,6 +1801,11 @@ def _inject_fake_findings(monkeypatch):
         verdict: str = ""
         note: str = field(default="")
 
+        def to_dict(self):
+            from dataclasses import asdict
+
+            return asdict(self)
+
     def parse_findings(text):
         start, end = text.find("["), text.rfind("]")
         if start == -1 or end <= start:
@@ -1924,3 +1929,86 @@ def test_parse_pr_url():
         "protoLabsAI/protoContent",
     )
     assert _parse_pr_url("https://example.com/not-a-pr") == ("", "")
+
+
+# ── fail-closed gate + delta re-review carry (ADR 0078 Phase A2) ─────────────────
+
+
+def test_review_gate_config_run_max():
+    assert BoardLoop({}).review_run_max == 3
+    assert BoardLoop({"review_run_max": 0}).review_run_max == 1  # floor: at least one try
+
+
+async def test_review_gate_partial_panel_is_not_a_review(monkeypatch):
+    """A workflow result with failed steps must NOT be judged — the gate treats it
+    as unreviewed (fail closed): review-pending stays, no requeue, no block."""
+    _inject_fake_findings(monkeypatch)
+    import sys as _sys
+    import types as _types
+
+    calls = []
+
+    async def _runner(name, inputs):
+        calls.append(inputs)
+        return {"output": "clean.\n```json\n[]\n```", "steps": {}, "failed": ["find_crossfile"]}
+
+    rt = _types.ModuleType("runtime")
+    rt_state = _types.ModuleType("runtime.state")
+    rt_state.STATE = _types.SimpleNamespace(workflow_run=_runner)
+    rt.state = rt_state
+    monkeypatch.setitem(_sys.modules, "runtime", rt)
+    monkeypatch.setitem(_sys.modules, "runtime.state", rt_state)
+
+    store = _GateStore()
+    loop = BoardLoop({"review_gate": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)  # no reviewer fallback
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert calls, "the runner must have been invoked"
+    # Fail closed: the clean-looking partial output was NOT judged.
+    assert store.review_states == [("review-pending", "")]
+    assert ("requeue", "bd-1") not in store.calls
+    assert not any(c[0] == "flag_blocked" for c in store.calls)
+    assert loop._review_run_failures["bd-1"] == 1
+
+
+async def test_review_gate_unrunnable_escalates_after_run_max(monkeypatch):
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, None, cfg={"review_run_max": 2})
+    loop._review_run_failures["bd-1"] = 1  # one prior unrunnable attempt
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "operator attention" in blocked[0][2]
+    assert "bd-1" not in loop._review_run_failures
+
+
+async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
+    """Round 1 findings ride into round 2's workflow inputs (delta re-review)."""
+    _inject_fake_findings(monkeypatch)
+    import sys as _sys
+    import types as _types
+
+    seen_inputs = []
+
+    async def _runner(name, inputs):
+        seen_inputs.append(dict(inputs))
+        return {"output": f"```json\n{_BLOCKER}\n```", "steps": {}, "failed": []}
+
+    rt = _types.ModuleType("runtime")
+    rt_state = _types.ModuleType("runtime.state")
+    rt_state.STATE = _types.SimpleNamespace(workflow_run=_runner)
+    rt.state = rt_state
+    monkeypatch.setitem(_sys.modules, "runtime", rt)
+    monkeypatch.setitem(_sys.modules, "runtime.state", rt_state)
+
+    async def _diff(pr_url, cwd="."):
+        return "diff --git a/x b/x"
+
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    store = _GateStore()
+    loop = BoardLoop({"review_gate": True, "review_fix_max": 5})
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert "prior_findings" not in seen_inputs[0]  # first pass — nothing to carry
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert "prior_findings" in seen_inputs[1]
+    assert "drops data" in seen_inputs[1]["prior_findings"]
