@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.31.0
+version: 0.32.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -48,6 +48,9 @@ config:
   review_fix_max: 2         # review-bounce re-dispatches before the feature is Blocked
                             # (mirrors ci_fix_max; same-tier — findings are fixable, not a
                             # model-capability ceiling)
+  review_run_max: 3         # consecutive UNRUNNABLE gate attempts (no runner / dead
+                            # workflow / failed panel steps — a partial panel is NOT a
+                            # review, ADR 0078 D3) before Blocking for the operator
   goal_verify: false        # OPT-IN. On = an independent model call checks the coder's diff
                             # against the feature's acceptance_criteria (test coverage is
                             # mandatory even when unlisted) BEFORE opening the PR.
