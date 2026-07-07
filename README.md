@@ -121,6 +121,21 @@ project_board:
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
+  local_gate_cmd: "auto"     # pre-PR gate, run in each worktree before a PR opens. "auto"
+                             # = DISCOVER it from the bound repo (a package.json ci/check/
+                             # verify script → `pnpm run <it>`; a Makefile/justfile ci
+                             # target → `make/just <it>`; else the `pnpm -r --if-present
+                             # typecheck build test` superset). Prefer a repo-DECLARED
+                             # entrypoint whose OWN CI calls the same target, so local == CI
+                             # and can't drift. Give an explicit command to override; blank
+                             # = no gate. NOTE: `auto` resolves at construction — the repo
+                             # must be cloned before the loop starts.
+  preflight: true            # fail-CLOSED smoke of local_gate_cmd on the clean base before
+                             # dispatching ANY work: an UNRUNNABLE gate (missing tool, base
+                             # broken) HOLDS all ready work (visible on the board) instead of
+                             # burning generations no coder could pass. Re-checks each cycle,
+                             # releases on recovery. A slow gate times out → indeterminate →
+                             # allow (never wedge the board). Set false to skip.
   # With local_gate_cmd set, Max-Mode is EXECUTION-GROUNDED (ADR 0064): the winner is
   # picked from candidates whose gate actually PASSES; the LLM judge only breaks ties
   # among the passing set (or decides when no gate is set / none pass).

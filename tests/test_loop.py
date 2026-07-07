@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from project_board import worktree
-from project_board.loop import BoardLoop, _ci_failure_reason
+from project_board.loop import BoardLoop, _ci_failure_reason, _resolve_gate_cmd
 
 
 class FakeLoopStore:
@@ -2127,3 +2127,75 @@ async def test_preflight_recovery_releases_holds(monkeypatch):
     assert lp._preflight_state is True
     assert lp._preflight_held == set()
     assert {c[1] for c in store.calls if c[0] == "clear_blocked"} == {"bd-1", "bd-2"}
+
+
+# ── auto gate resolution (_resolve_gate_cmd) ────────────────────────────────────
+
+
+def _write(p, name, body):
+    f = p / name
+    f.write_text(body)
+    return f
+
+
+def test_resolve_gate_explicit_command_passes_through(tmp_path):
+    # An explicit gate is never rewritten, even if the repo declares a ci script.
+    _write(tmp_path, "package.json", '{"scripts": {"ci": "pnpm test"}}')
+    assert _resolve_gate_cmd("pytest -q", str(tmp_path)) == "pytest -q"
+
+
+def test_resolve_gate_blank_stays_gateless(tmp_path):
+    # Blank still means "no gate" — auto must be opt-in, never inferred from blank.
+    _write(tmp_path, "package.json", '{"scripts": {"ci": "pnpm test"}}')
+    assert _resolve_gate_cmd("", str(tmp_path)) == ""
+    assert _resolve_gate_cmd("  ", str(tmp_path)) == ""
+
+
+def test_resolve_gate_auto_prefers_declared_ci_script(tmp_path):
+    _write(tmp_path, "package.json", '{"scripts": {"ci": "pnpm typecheck && pnpm -r test", "test": "x"}}')
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run ci"
+
+
+def test_resolve_gate_auto_falls_to_check_then_verify(tmp_path):
+    _write(tmp_path, "package.json", '{"scripts": {"check": "x", "verify": "y"}}')
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run check"
+    _write(tmp_path, "package.json", '{"scripts": {"verify": "y"}}')
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run verify"
+
+
+def test_resolve_gate_auto_convention_fallback_when_no_entrypoint(tmp_path):
+    # A node repo with no ci/check/verify → the --if-present standard-checks superset.
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run"}}')
+    got = _resolve_gate_cmd("auto", str(tmp_path))
+    assert got == (
+        f"{loop_install()} && pnpm -r --if-present typecheck && pnpm -r --if-present build && pnpm -r --if-present test"
+    )
+
+
+def test_resolve_gate_auto_reads_makefile_ci_target(tmp_path):
+    _write(tmp_path, "Makefile", "build:\n\tgo build ./...\nci:\n\tgo test ./...\n")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == "make ci"
+
+
+def test_resolve_gate_auto_justfile_check_target(tmp_path):
+    _write(tmp_path, "justfile", "default:\n\techo hi\ncheck:\n\tcargo test\n")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == "just check"
+
+
+def test_resolve_gate_auto_unrecognized_repo_is_gateless(tmp_path):
+    # Nothing recognized → "" (fail-open, gateless) rather than a wrong guess.
+    _write(tmp_path, "README.md", "# a repo with no known toolchain")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == ""
+
+
+def test_resolve_gate_auto_malformed_package_json_falls_through(tmp_path):
+    # Broken package.json must not crash construction — treat as no scripts → fallback.
+    _write(tmp_path, "package.json", "{ not valid json ")
+    got = _resolve_gate_cmd("auto", str(tmp_path))
+    assert got.startswith(loop_install()) and "--if-present" in got
+
+
+def loop_install():
+    from project_board.loop import _PNPM_INSTALL
+
+    return _PNPM_INSTALL

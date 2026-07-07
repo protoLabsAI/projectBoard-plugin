@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 
@@ -52,6 +53,68 @@ from .store import (
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+# ── auto gate resolution ────────────────────────────────────────────────────────
+# The pre-PR gate is repo-specific, and hard-coding one repo's check steps into the
+# orchestrator (or the operator's dispatch) rots two ways: the repo's CI changes and
+# the transcription silently goes stale (green-locally / red-in-CI), or the same team
+# is pointed at a DIFFERENT repo and the gate is simply wrong. So ``local_gate_cmd:
+# "auto"`` asks the loop to DISCOVER the gate from the bound checkout. Precedence
+# favors a single repo-DECLARED entrypoint — the repo owns its gate, and its own CI
+# should invoke that SAME target, so local == CI by construction and can't drift —
+# and only falls back to ecosystem conventions:
+#   1. package.json script  ci / check / verify   → ``pnpm run <name>``
+#   2. Makefile / justfile   ci / check target     → ``make <name>`` / ``just <name>``
+#   3. package.json present, none declared         → ``pnpm -r --if-present typecheck build test``
+#   4. nothing recognized                          → "" (no gate; fail-open, warns)
+# An explicit command always passes through unchanged; blank still means "no gate".
+# Resolved once at construction (the coder only ever touches worktrees, so the bound
+# checkout is a stable base); the deployment clones the repo before the loop starts.
+_PNPM_INSTALL = "pnpm install --frozen-lockfile --prefer-offline"
+
+
+def _resolve_gate_cmd(raw: str, repo_path: str) -> str:
+    """Resolve ``local_gate_cmd``. Only the sentinel ``"auto"`` triggers discovery;
+    an explicit command (or blank = no gate) is returned unchanged."""
+    raw = (raw or "").strip()
+    if raw != "auto":
+        return raw
+    pkg = os.path.join(repo_path, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg, encoding="utf-8") as fh:
+                scripts = (json.load(fh) or {}).get("scripts", {}) or {}
+        except (OSError, ValueError):
+            scripts = {}
+        for name in ("ci", "check", "verify"):
+            if name in scripts:
+                return f"{_PNPM_INSTALL} && pnpm run {name}"
+        # No declared entrypoint — run the standard checks any workspace exposes.
+        # ``-r --if-present`` self-skips workspaces missing the script, so this is a
+        # safe superset: a repo with only tests runs only tests.
+        return (
+            f"{_PNPM_INSTALL} && pnpm -r --if-present typecheck "
+            "&& pnpm -r --if-present build && pnpm -r --if-present test"
+        )
+    for fname, runner in (("Makefile", "make"), ("makefile", "make"), ("justfile", "just"), ("Justfile", "just")):
+        fpath = os.path.join(repo_path, fname)
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath, encoding="utf-8") as fh:
+                    body = fh.read()
+            except OSError:
+                body = ""
+            for target in ("ci", "check"):
+                if re.search(rf"(?m)^{target}:", body):
+                    return f"{runner} {target}"
+    log.warning(
+        "[project_board] local_gate_cmd=auto but no gate could be discovered in %s "
+        "(no package.json ci/check script, no Makefile/justfile ci target) — running gateless",
+        repo_path,
+    )
+    return ""
+
 
 # Deterministic test-coverage gate (path-based — no LLM, no diff). A code change must
 # ship a test; checking the changed-file LIST is instant and immune to the truncation
@@ -226,7 +289,11 @@ class BoardLoop:
         # opens already-green. Best-effort early filter: if it can't pass within
         # local_gate_max same-tier tries, the PR opens anyway (CI + the ci-fix budget
         # stay the backstop) — a flaky/misconfigured gate never blocks good work. Empty = off.
-        self.local_gate_cmd = str(self.cfg.get("local_gate_cmd", "")).strip()
+        # ``auto`` ⇒ discover the gate from the bound repo (see _resolve_gate_cmd);
+        # an explicit command or blank (= no gate) passes through. Resolved here once,
+        # so every downstream reader (coder_solve_test_cmd, _run_local_gate, _preflight,
+        # candidate preference) sees the concrete command with no further plumbing.
+        self.local_gate_cmd = _resolve_gate_cmd(str(self.cfg.get("local_gate_cmd", "")), str(self.cfg.get("repo", ".")))
         self.local_gate_max = max(0, int(self.cfg.get("local_gate_max", 2)))
         self.local_gate_timeout = float(self.cfg.get("local_gate_timeout_s", 600))
         self.local_gate_output_chars = max(500, int(self.cfg.get("local_gate_output_chars", 4000)))
