@@ -121,15 +121,18 @@ project_board:
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
-  local_gate_cmd: "auto"     # pre-PR gate, run in each worktree before a PR opens. "auto"
-                             # = DISCOVER it from the bound repo (a package.json ci/check/
-                             # verify script → `pnpm run <it>`; a Makefile/justfile ci
-                             # target → `make/just <it>`; else the `pnpm -r --if-present
-                             # typecheck build test` superset). Prefer a repo-DECLARED
-                             # entrypoint whose OWN CI calls the same target, so local == CI
-                             # and can't drift. Give an explicit command to override; blank
+  local_gate_cmd: "auto"     # pre-PR gate (the FAST slice of CI — lint/typecheck/unit,
+                             # NOT the full suite), run in each worktree before a PR opens.
+                             # "auto" = DISCOVER it from the bound repo, ecosystem-neutral:
+                             # a package.json gate/ci/check/verify script → `pnpm run <it>`;
+                             # a Makefile/justfile gate/ci/check target → `make/just <it>`
+                             # (Python/Rust/Go); else the `pnpm -r --if-present typecheck
+                             # build test` superset. `gate` wins first so a repo can point
+                             # coders at a fast slice distinct from a heavy `ci`. Prefer a
+                             # repo-DECLARED target whose OWN CI calls the same thing, so
+                             # local == CI and can't drift. Explicit command overrides; blank
                              # = no gate. NOTE: `auto` resolves at construction — the repo
-                             # must be cloned before the loop starts.
+                             # must be cloned before the loop starts. See "The gate" below.
   preflight: true            # fail-CLOSED smoke of local_gate_cmd on the clean base before
                              # dispatching ANY work: an UNRUNNABLE gate (missing tool, base
                              # broken) HOLDS all ready work (visible on the board) instead of
@@ -167,6 +170,89 @@ project_board:
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
+
+## The gate — the coder's fast slice of CI
+
+The **pre-PR gate** (`local_gate_cmd`) is the command the loop runs in each coder's
+worktree before opening a PR, so the coder's own solve-loop iterates to **green**
+locally instead of shipping a PR that only fails in CI.
+
+### Two tiers — the gate is NOT a full-CI replica
+
+| | Local gate (this) | CI |
+|---|---|---|
+| **Question** | "is my code correct?" | "is it releasable?" |
+| **Runs** | every worktree, every attempt | once per PR |
+| **Contains** | lint + typecheck + **unit** tests — fast, hermetic, deterministic | everything: integration, cross-platform matrix, image build, release, deploy |
+| **Owner** | the coder's iterate loop | the human merge + the loop's CI-bounce re-dispatch |
+
+You **never replicate a complex CI locally**. Anything needing services, secrets, a
+matrix, network, or an image build stays CI-only — the PR still runs it, and whatever
+the local slice didn't catch comes back to the coder via the CI-bounce. The gate's job
+is to kill the cheap, common failures in seconds so the loop isn't a slow CI-bounce
+casino. Getting that slice faithful matters — the failure modes are subtle (a
+build-only gate compiles a test file but never runs it; a build+test gate still misses
+`typecheck`, since most test runners strip types without checking them).
+
+### `auto` — discover it, don't transcribe it
+
+A hand-copied gate rots the moment the repo's CI changes, and is wrong the instant a
+team is pointed at another repo. So:
+
+```yaml
+project_board:
+  local_gate_cmd: "auto"
+```
+
+`auto` **discovers** the gate from the bound repo — **ecosystem-neutral**, keyed on how
+the repo builds, always preferring a single repo-**declared** target:
+
+1. `package.json` script `gate` / `ci` / `check` / `verify` → `pnpm run <it>` *(node)*
+2. `Makefile` / `justfile` `gate` / `ci` / `check` target → `make <it>` / `just <it>`
+   *(Python / Rust / Go / anything — e.g. `make gate` = `ruff check . && pytest -q`)*
+3. `package.json`, none declared → `pnpm -r --if-present typecheck build test`
+4. nothing recognized → gateless (fail-open, warns)
+
+`gate` is checked **first**: it's the unambiguous "this is the fast coder slice", so a
+repo whose `ci` target is the whole heavy suite points coders at `gate` and the loop
+won't grab the heavy one. An explicit command overrides; blank still = no gate.
+
+### Make your repo team-ready
+
+Give the team **one gate target** — the fast slice — and have your own CI call the
+**same** target, so local == CI by construction. Node:
+
+```jsonc
+// package.json                                   ci.yml:  - run: pnpm run gate
+"scripts": { "gate": "pnpm -r typecheck && pnpm -r --if-present test" }
+```
+> Invoke it `pnpm run gate` — `pnpm ci`/`pnpm gate` shorthands can collide with pnpm builtins.
+
+Python (protoAgent-shaped: a 9-workflow CI, but only `checks.yml` — ruff + pytest — is
+the coder's concern; the matrix / docker-publish / release / deploy workflows are
+`push`/`tag`/`dispatch` triggered and never a pre-PR gate):
+
+```makefile
+# Makefile                                        checks.yml:  - run: make gate
+gate:                       ## the coder's fast slice — lint + unit tests, no services
+	ruff check .
+	pytest tests/ -q -m "not integration"
+```
+
+Same shape in a `justfile` (`just gate`), `nox` (`make gate` → `nox -s gate`), Cargo
+(`make gate` → `cargo clippy && cargo test`), etc. The heavy jobs stay in their own
+workflows; the coder never runs them.
+
+### Preflight (fail-closed)
+
+Before dispatching **any** work, the loop smoke-runs the resolved gate on the clean
+base checkout (`preflight: true`, the default). If the gate can't even launch
+(missing tool, broken deps, base already red) it **holds** all ready work — flagged
+blocked, with the reason, visible on the board — rather than burn generations no coder
+could pass, and re-checks each cycle so work resumes the moment it's fixed. A slow gate
+that times out is treated as indeterminate → allowed (a slow gate must never wedge the
+board). This is the fail-**closed** complement to the per-PR gate's fail-**open**: a
+flaky gate never blocks good work, but an *unrunnable* gate never starts bad work.
 
 ## Layout
 
