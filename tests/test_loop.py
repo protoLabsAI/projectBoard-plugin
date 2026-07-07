@@ -2115,6 +2115,10 @@ async def test_preflight_recovery_releases_holds(monkeypatch):
     lp._store_kw = {"repo": "/repo"}
     lp._preflight_state = "gate exited 1"  # previously failed
     lp._preflight_held = {"bd-1", "bd-2"}  # and it held these
+    # A recheck of a KNOWN-failed preflight is throttled by (monotonic() - _last_preflight);
+    # put the last check far enough back that the recheck fires regardless of the absolute
+    # monotonic value (a fresh CI container's clock can be < the 60s throttle window).
+    lp._last_preflight = -10_000.0
     store = _PreflightStore(ready=[])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
