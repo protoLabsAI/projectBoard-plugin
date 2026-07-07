@@ -230,6 +230,22 @@ class BoardLoop:
         self.local_gate_max = max(0, int(self.cfg.get("local_gate_max", 2)))
         self.local_gate_timeout = float(self.cfg.get("local_gate_timeout_s", 600))
         self.local_gate_output_chars = max(500, int(self.cfg.get("local_gate_output_chars", 4000)))
+        # Gate PREFLIGHT (fail-CLOSED; default on when a gate is configured). Before
+        # dispatching ANY work, smoke-run ``local_gate_cmd`` on the CLEAN base checkout.
+        # If the gate can't launch (missing tool) or fails on the untouched base, the
+        # coder environment is broken — HOLD all ready work (flag it blocked, with the
+        # reason, so the stall is visible on the board) rather than burn generations on a
+        # gate no coder could pass, and re-check each cycle so work resumes the moment
+        # it's fixed. This is the fail-CLOSED complement to ``_run_local_gate``'s per-PR
+        # fail-OPEN: a flaky gate must never block good work, but an UNRUNNABLE gate must
+        # never start bad work. A healthy repo passes instantly — nothing changes. A
+        # preflight timeout is treated as indeterminate → allow (never wedge on a slow
+        # gate). Opt out with ``preflight: false``.
+        self.preflight = bool(self.cfg.get("preflight", True))
+        self.preflight_timeout = float(self.cfg.get("preflight_timeout_s", self.local_gate_timeout))
+        self._preflight_state: bool | str | None = None  # None=unchecked, True=runnable, str=reason
+        self._last_preflight = 0.0
+        self._preflight_held: set[str] = set()
         # ── coder.solve() board seam (ADR 0064 P2, opt-in) ─────────────────────────
         # Route a FRESH build (not a keep-worktree/CI-bounce re-dispatch) through the
         # `coder` plugin's execution-grounded solve() ladder (greedy → best-of-k →
@@ -455,6 +471,7 @@ class BoardLoop:
             try:
                 await self._maybe_reconcile()
                 await self._maybe_sweep()
+                await self._maybe_preflight()  # fail-closed: hold work if the gate can't run
                 spawned = self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
                 log.exception("[project_board] loop tick failed")
@@ -476,6 +493,11 @@ class BoardLoop:
         the same file are a guaranteed merge conflict). Returns True if it started at
         least one drive (so the runner stays hot)."""
         if len(self._drives) >= self.max_concurrent:
+            return False
+        # Fail-closed gate preflight: if the gate can't run on clean base, HOLD all work
+        # (surfaced on the board) rather than dispatch coders that can never pass it.
+        if isinstance(self._preflight_state, str):
+            self._hold_ready_for_preflight()
             return False
         store = self._store()
         # Review-queue WIP limit — don't claim new work while the review queue is full.
@@ -1233,6 +1255,99 @@ class BoardLoop:
         except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block
             log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
             return None
+
+    # ── gate preflight (fail-closed: never start work a broken gate can't accept) ──
+    async def _maybe_preflight(self) -> None:
+        """Re-run the gate preflight while it hasn't passed, throttled. Once it passes it
+        stays passed for the run (a healthy env doesn't spontaneously lose its toolchain;
+        a per-PR gate failure is handled in the drive, not here)."""
+        if not self.preflight or not self.local_gate_cmd:
+            self._preflight_state = True
+            return
+        if self._preflight_state is True:
+            return
+        now = time.monotonic()
+        # First check runs immediately (state is None); re-checks of a KNOWN-failed
+        # preflight are throttled so a slow gate isn't hammered every tick.
+        if self._preflight_state is not None and (now - self._last_preflight) < max(self.interval, 60.0):
+            return
+        self._last_preflight = now
+        await self._preflight()
+
+    async def _preflight(self) -> None:
+        """Smoke-run ``local_gate_cmd`` on the CLEAN base checkout (the main repo — coders
+        only ever touch worktrees, so it stays at base). Sets ``self._preflight_state``:
+        ``True`` when the gate exits 0 (runnable), a reason string on a CLEAN non-zero exit
+        or a launch failure (broken environment → hold work). A TIMEOUT is indeterminate →
+        allow (a slow gate must not wedge the board). Releases any holds on recovery."""
+        repo = self._store_kw["repo"]
+        log.info("[project_board] preflight: smoking the gate on clean base — %s", self.local_gate_cmd)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                self.local_gate_cmd,
+                cwd=repo,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.preflight_timeout)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                log.warning(
+                    "[project_board] preflight timed out (%ss) — indeterminate, allowing dispatch",
+                    self.preflight_timeout,
+                )
+                self._preflight_state = True
+                return
+            if proc.returncode == 0:
+                if isinstance(self._preflight_state, str):
+                    log.info("[project_board] preflight RECOVERED — gate runnable again, releasing held work")
+                self._preflight_state = True
+                self._release_preflight_holds()
+                return
+            text = (out or b"").decode("utf-8", "replace").strip()
+            if len(text) > self.local_gate_output_chars:
+                text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
+            self._preflight_state = text or f"gate exited {proc.returncode} with no output"
+            log.error(
+                "[project_board] PREFLIGHT FAILED — the gate does not pass on clean base; "
+                "HOLDING all work until the environment is fixed:\n%s",
+                self._preflight_state,
+            )
+        except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
+            self._preflight_state = f"gate command could not run: {exc}"
+            log.error("[project_board] PREFLIGHT FAILED — %s; HOLDING all work until fixed.", self._preflight_state)
+
+    def _hold_ready_for_preflight(self) -> None:
+        """Flag every ready, not-already-held feature blocked with the preflight reason, so
+        the hold shows on the board instead of being a silent stall."""
+        reason = self._preflight_state if isinstance(self._preflight_state, str) else "gate preflight failed"
+        short = "gate preflight failed — the coder environment can't run the gate: " + reason.splitlines()[-1][:200]
+        store = self._store()
+        for f in store.list_features(state="ready"):
+            fid = f["id"]
+            if fid in self._preflight_held or f.get("blocked"):
+                continue
+            try:
+                store.flag_blocked(fid, short)
+                self._preflight_held.add(fid)
+                log.info("[project_board] preflight hold: flagged %s blocked (gate not runnable)", fid)
+            except Exception:  # noqa: BLE001 — a hold that can't be recorded must not kill the tick
+                log.warning("[project_board] preflight hold: flag_blocked failed for %s", fid, exc_info=True)
+
+    def _release_preflight_holds(self) -> None:
+        """Clear the blocks this loop placed for a failed preflight (only those — never
+        clobber a feature blocked for another reason)."""
+        store = self._store()
+        for fid in list(self._preflight_held):
+            try:
+                store.clear_blocked(fid)
+            except Exception:  # noqa: BLE001
+                log.warning("[project_board] preflight release: clear_blocked failed for %s", fid, exc_info=True)
+        self._preflight_held.clear()
 
     async def _verify_goal(self, feature: dict, wt: str, base: str, coder_reply: str = "") -> str | None:
         """Pre-PR gate — DETERMINISTIC: no LLM, no diff dump. The one thing it adds over

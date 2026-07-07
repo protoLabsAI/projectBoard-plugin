@@ -2012,3 +2012,118 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert "prior_findings" in seen_inputs[1]
     assert "drops data" in seen_inputs[1]["prior_findings"]
+
+
+# ── gate preflight (fail-closed: never start work a broken gate can't accept) ─────
+
+
+class _PreflightStore(FakeLoopStore):
+    """FakeLoopStore + the ready-list and clear_blocked the preflight hold/release use."""
+
+    def __init__(self, ready):
+        super().__init__()
+        self._ready = [{"id": f, "blocked": False} for f in ready]
+
+    def list_features(self, state=None):
+        return list(self._ready) if state == "ready" else []
+
+    def clear_blocked(self, fid):
+        self.calls.append(("clear_blocked", fid))
+        return {"id": fid}
+
+
+class _FakeProc:
+    def __init__(self, rc, out=b""):
+        self.returncode = rc
+        self._out = out
+
+    async def communicate(self):
+        return self._out, b""
+
+    def kill(self):
+        pass
+
+
+def test_preflight_config_defaults():
+    assert BoardLoop({}).preflight is True  # on by default
+    assert BoardLoop({})._preflight_state is None
+    assert BoardLoop({"preflight": False}).preflight is False
+
+
+async def test_preflight_noop_when_no_gate():
+    # No local_gate_cmd → nothing to smoke → treated as runnable, never shells out.
+    lp = BoardLoop({"preflight": True})
+    await lp._maybe_preflight()
+    assert lp._preflight_state is True
+
+
+async def test_preflight_passes_when_gate_exits_zero(monkeypatch):
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._store_kw = {"repo": "/repo"}
+
+    async def _shell(*a, **k):
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+    assert lp._preflight_state is True
+
+
+async def test_preflight_fails_closed_on_nonzero(monkeypatch):
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._store_kw = {"repo": "/repo"}
+
+    async def _shell(*a, **k):
+        return _FakeProc(1, b"apps/x build: sh: 1: tsc: not found")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+    assert isinstance(lp._preflight_state, str)
+    assert "tsc: not found" in lp._preflight_state
+
+
+async def test_preflight_fails_closed_when_gate_cannot_launch(monkeypatch):
+    # The exact case this exists for: the gate binary isn't installed.
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._store_kw = {"repo": "/repo"}
+
+    async def _shell(*a, **k):
+        raise FileNotFoundError("pnpm")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+    assert isinstance(lp._preflight_state, str)
+    assert "could not run" in lp._preflight_state
+
+
+def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._preflight_state = "gate exited 1: tsc: not found"  # simulate a failed preflight
+    store = _PreflightStore(ready=["bd-1", "bd-2"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    spawned = lp._spawn_ready()
+
+    assert spawned is False  # dispatched nothing
+    blocked = {c[1]: c[2] for c in store.calls if c[0] == "flag_blocked"}
+    assert set(blocked) == {"bd-1", "bd-2"}  # both held, visibly
+    assert all("preflight" in reason.lower() for reason in blocked.values())
+
+
+async def test_preflight_recovery_releases_holds(monkeypatch):
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._store_kw = {"repo": "/repo"}
+    lp._preflight_state = "gate exited 1"  # previously failed
+    lp._preflight_held = {"bd-1", "bd-2"}  # and it held these
+    store = _PreflightStore(ready=[])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _shell(*a, **k):
+        return _FakeProc(0)  # gate now passes
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+
+    assert lp._preflight_state is True
+    assert lp._preflight_held == set()
+    assert {c[1] for c in store.calls if c[0] == "clear_blocked"} == {"bd-1", "bd-2"}
