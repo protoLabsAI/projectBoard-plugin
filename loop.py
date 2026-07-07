@@ -60,18 +60,33 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # orchestrator (or the operator's dispatch) rots two ways: the repo's CI changes and
 # the transcription silently goes stale (green-locally / red-in-CI), or the same team
 # is pointed at a DIFFERENT repo and the gate is simply wrong. So ``local_gate_cmd:
-# "auto"`` asks the loop to DISCOVER the gate from the bound checkout. Precedence
-# favors a single repo-DECLARED entrypoint — the repo owns its gate, and its own CI
-# should invoke that SAME target, so local == CI by construction and can't drift —
-# and only falls back to ecosystem conventions:
-#   1. package.json script  ci / check / verify   → ``pnpm run <name>``
-#   2. Makefile / justfile   ci / check target     → ``make <name>`` / ``just <name>``
-#   3. package.json present, none declared         → ``pnpm -r --if-present typecheck build test``
-#   4. nothing recognized                          → "" (no gate; fail-open, warns)
+# "auto"`` asks the loop to DISCOVER the gate from the bound checkout.
+#
+# WHAT the gate is (and isn't): the coder's iterate-to-green loop, so it must be the
+# FAST, HERMETIC, deterministic slice of CI — lint + typecheck + unit tests, runnable
+# in a worktree in minutes with no services/secrets/matrix/image-builds. It is NOT a
+# full-CI replica. A complex CI's heavy jobs (integration, cross-platform matrix,
+# docker publish, release, deploy) stay CI-only; they run once on the PR as the human's
+# merge gate, and anything the local slice missed comes back via the CI-bounce re-
+# dispatch. So a repo with a big CI declares a dedicated ``gate`` target = that fast
+# slice, distinct from a heavy ``ci`` — which is why ``gate`` is the top precedence.
+#
+# ECOSYSTEM-NEUTRAL: node is just one case. The contract is "declare ONE gate target
+# your own CI also calls"; the runner is inferred from how the repo builds:
+#   1. package.json script  gate / ci / check / verify   → ``pnpm run <name>``   (node)
+#   2. Makefile / justfile   gate / ci / check target     → ``make <name>`` / ``just <name>``
+#      (this is the path for Python / Rust / Go / anything — e.g. `make gate` =
+#       `ruff check . && pytest -q`)
+#   3. package.json present, none declared               → ``pnpm -r --if-present typecheck build test``
+#   4. nothing recognized                                → "" (no gate; fail-open, warns)
 # An explicit command always passes through unchanged; blank still means "no gate".
 # Resolved once at construction (the coder only ever touches worktrees, so the bound
 # checkout is a stable base); the deployment clones the repo before the loop starts.
 _PNPM_INSTALL = "pnpm install --frozen-lockfile --prefer-offline"
+# Precedence of DECLARED target names. ``gate`` first: it is the unambiguous "this is
+# the pre-PR coder gate (the fast slice)", so a repo whose ``ci`` is the whole heavy
+# suite can point coders at ``gate`` without the loop grabbing the heavy target.
+_GATE_TARGET_NAMES = ("gate", "ci", "check", "verify")
 
 
 def _resolve_gate_cmd(raw: str, repo_path: str) -> str:
@@ -87,7 +102,7 @@ def _resolve_gate_cmd(raw: str, repo_path: str) -> str:
                 scripts = (json.load(fh) or {}).get("scripts", {}) or {}
         except (OSError, ValueError):
             scripts = {}
-        for name in ("ci", "check", "verify"):
+        for name in _GATE_TARGET_NAMES:
             if name in scripts:
                 return f"{_PNPM_INSTALL} && pnpm run {name}"
         # No declared entrypoint — run the standard checks any workspace exposes.
@@ -105,12 +120,14 @@ def _resolve_gate_cmd(raw: str, repo_path: str) -> str:
                     body = fh.read()
             except OSError:
                 body = ""
-            for target in ("ci", "check"):
+            for target in _GATE_TARGET_NAMES:
                 if re.search(rf"(?m)^{target}:", body):
                     return f"{runner} {target}"
     log.warning(
         "[project_board] local_gate_cmd=auto but no gate could be discovered in %s "
-        "(no package.json ci/check script, no Makefile/justfile ci target) — running gateless",
+        "(no package.json gate/ci/check script, no Makefile/justfile gate/ci target) — "
+        "running gateless. Declare a `gate` target (e.g. `make gate` = lint + unit tests) "
+        "to make this repo team-ready.",
         repo_path,
     )
     return ""

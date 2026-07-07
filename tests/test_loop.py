@@ -2176,9 +2176,22 @@ def test_resolve_gate_auto_convention_fallback_when_no_entrypoint(tmp_path):
     )
 
 
+def test_resolve_gate_auto_prefers_gate_over_ci_script(tmp_path):
+    # A complex-CI repo declares a dedicated fast `gate` alongside a heavy `ci`;
+    # the coder must gate on `gate`, not the whole `ci`.
+    _write(tmp_path, "package.json", '{"scripts": {"gate": "x", "ci": "everything"}}')
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run gate"
+
+
 def test_resolve_gate_auto_reads_makefile_ci_target(tmp_path):
     _write(tmp_path, "Makefile", "build:\n\tgo build ./...\nci:\n\tgo test ./...\n")
     assert _resolve_gate_cmd("auto", str(tmp_path)) == "make ci"
+
+
+def test_resolve_gate_auto_makefile_gate_beats_ci(tmp_path):
+    # Python/Go/Rust path: `make gate` (fast slice) wins over a heavy `make ci`.
+    _write(tmp_path, "Makefile", "ci:\n\tpytest -q -m 'integration'\ngate:\n\truff check . && pytest -q\n")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == "make gate"
 
 
 def test_resolve_gate_auto_justfile_check_target(tmp_path):
