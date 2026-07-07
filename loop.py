@@ -1408,6 +1408,11 @@ class BoardLoop:
     def _release_preflight_holds(self) -> None:
         """Clear the blocks this loop placed for a failed preflight (only those — never
         clobber a feature blocked for another reason)."""
+        if not self._preflight_held:
+            return  # nothing to release — don't build the store (it may need a CLI/DB
+            # that isn't present) just to iterate an empty set. A clean preflight (the
+            # common path) must never touch the store: the resulting error would be
+            # caught by _preflight's outer except and masquerade as a gate failure.
         store = self._store()
         for fid in list(self._preflight_held):
             try:
