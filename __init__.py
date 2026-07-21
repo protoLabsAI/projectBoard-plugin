@@ -113,6 +113,20 @@ def _open_duplicate(features: list, title: str) -> dict | None:
     return None
 
 
+def _strip_wrapping_quotes(s: str) -> str:
+    """Peel ONE symmetric layer of literal wrapping double quotes off a string arg.
+
+    Agents (and shells) sometimes hand us a value that arrives already wrapped in a
+    literal pair of double quotes — an outer pair that is part of the value, not a
+    delimiter — which, stored verbatim, then renders quoted in every downstream view
+    and can even defeat the title dedup. Strip exactly one balanced outer layer (BOTH
+    ends must be a double-quote char); inner or lopsided quotes are left untouched, and
+    a non-string passes straight through."""
+    if isinstance(s, str) and len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
 def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
@@ -159,6 +173,19 @@ def _board_tools(cfg: dict):
         stuck board)."""
         try:
             store = get_store(**store_kw)
+            # Input hygiene: an agent (or a shell one layer up) sometimes hands us a
+            # value already wrapped in a literal pair of double quotes, which — stored
+            # verbatim — renders quoted in every downstream view and even defeats the
+            # title dedup below. Peel one symmetric outer layer off each string field
+            # BEFORE anything is compared or stored.
+            title = _strip_wrapping_quotes(title)
+            spec = _strip_wrapping_quotes(spec)
+            acceptance_criteria = _strip_wrapping_quotes(acceptance_criteria)
+            files_to_modify = _strip_wrapping_quotes(files_to_modify)
+            design = _strip_wrapping_quotes(design)
+            parent = _strip_wrapping_quotes(parent)
+            difficulty = _strip_wrapping_quotes(difficulty)
+            depends_on = _strip_wrapping_quotes(depends_on)
             if not force:
                 try:
                     existing = store.list_features()
@@ -185,6 +212,42 @@ def _board_tools(cfg: dict):
                 difficulty=difficulty,
                 depends_on=deps,
                 foundation=foundation,
+            )
+            return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_update_feature(
+        feature_id: str,
+        spec: str = "",
+        acceptance_criteria: str = "",
+        files_to_modify: str = "",
+        design: str = "",
+        difficulty: str = "",
+    ) -> str:
+        """Partially update an existing feature — the REPAIR path for a bead the Ready
+        gate rejects. Only the non-empty arguments are written; every other field is left
+        as-is. Use it to fill a missing `spec`, `acceptance_criteria`, or `files_to_modify`
+        (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
+        again — no need to cancel and recreate the bead. `difficulty` (small|medium|large)
+        re-seeds the model tier. Inputs are stripped of any literal wrapping double quotes
+        before storage (same hygiene as board_create_feature)."""
+        try:
+            store = get_store(**store_kw)
+            spec = _strip_wrapping_quotes(spec)
+            acceptance_criteria = _strip_wrapping_quotes(acceptance_criteria)
+            files_to_modify = _strip_wrapping_quotes(files_to_modify)
+            design = _strip_wrapping_quotes(design)
+            difficulty = _strip_wrapping_quotes(difficulty)
+            files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
+            f = store.update_feature(
+                feature_id,
+                spec=spec or None,
+                acceptance_criteria=acceptance_criteria or None,
+                design=design or None,
+                files_to_modify=files or None,
+                difficulty=difficulty or None,
             )
             return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
         except BoardError as exc:
@@ -243,4 +306,4 @@ def _board_tools(cfg: dict):
             indent=2,
         )
 
-    return [board_create_epic, board_create_feature, board_mark_ready, board_list, board_retro]
+    return [board_create_epic, board_create_feature, board_update_feature, board_mark_ready, board_list, board_retro]
