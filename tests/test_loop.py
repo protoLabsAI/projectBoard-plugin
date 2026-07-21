@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from project_board import worktree
-from project_board.loop import BoardLoop, _ci_failure_reason, _resolve_gate_cmd
+from project_board.loop import BoardLoop, _ci_failure_reason, _pr_body, _resolve_gate_cmd
 
 
 class FakeLoopStore:
@@ -103,11 +103,9 @@ def test_build_prompt_requires_tests():
 
 
 def test_build_prompt_asks_for_a_clean_pr_summary_not_raw_reasoning():
-    """The coder's final reply is used VERBATIM as the PR body (loop.py's
-    `open_pr(..., body=(result or "")[:4000])`) with no post-processing — so an
-    un-briefed coder narrating its whole thought process ships that straight into
-    the PR description. The prompt must say so explicitly and ask for a short,
-    clean summary instead."""
+    """The coder's reply feeds the PR body through `_pr_body`, which keeps only the
+    `## Summary` section — so the prompt must ask for one explicitly, or every PR
+    falls back to the bare no-summary template."""
     prompt = BoardLoop({})._build_prompt(FEATURE)
     assert "final message becomes the pr description" in prompt.lower()
     assert "do not narrate your process" in prompt.lower()
@@ -244,6 +242,21 @@ async def test_drive_opens_review_on_a_clean_build(monkeypatch):
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
     assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
     assert loop._inflight == {}  # a completed drive leaves nothing to reap
+
+
+async def test_drive_pr_body_is_the_summary_not_the_raw_stream(monkeypatch):
+    """open_pr must receive `_pr_body`'s output, never the coder's raw reply (#56)."""
+    bodies = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        bodies.append(body)
+        return "https://example/pr/9"
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        return "I first looked at loop.py.\nLet me wire it up.\n## Summary\n\n- Wired the helper\n"
+
+    await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch)
+    assert bodies == ["## Summary\n\n- Wired the helper"]
 
 
 # ── Max-Mode: N parallel candidates → judge → promote winner → ship (#21) ────────
@@ -1262,6 +1275,46 @@ def test_ci_failure_reason_keeps_the_classifiable_error_not_the_header():
     r = _ci_failure_reason(summary)
     assert "golden field map" in r  # the classifiable signal is preserved
     assert "Failing checks:" not in r and len(r) <= 500
+
+
+# ── PR body: the coder's summary, never the raw stream (#56) ─────────────────────
+
+
+def test_pr_body_keeps_from_the_last_summary_heading():
+    """Narration before the summary is dropped, and an EARLY `## Summary` line in the
+    narration doesn't truncate the real section — the LAST heading wins."""
+    raw = (
+        "I first looked at loop.py.\n"
+        "## Summary\n(placeholder — I'll finish this at the end)\n"
+        "Let me edit the tests.\n"
+        "## Summary\n\n- Added the helper\n- Wired the call site\n"
+    )
+    body = _pr_body(raw, FEATURE)
+    assert body.startswith("## Summary")
+    assert "Added the helper" in body and "Wired the call site" in body
+    assert "I first looked" not in body and "Let me edit" not in body and "placeholder" not in body
+
+
+def test_pr_body_without_a_summary_uses_the_template_not_the_raw_stream():
+    raw = "step one: read the file\nstep two: edit it\nall done"
+    body = _pr_body(raw, FEATURE)
+    assert FEATURE["title"] in body and FEATURE["id"] in body
+    assert "See the diff for details." in body
+    assert "step one" not in body and "all done" not in body
+    assert FEATURE["title"] in _pr_body("", FEATURE)  # empty reply → same template
+
+
+def test_pr_body_drops_control_marker_lines():
+    raw = "## Summary\n\nDid the thing.\n  NO_TEST_NEEDED: covered by the existing golden\nMore detail.\n"
+    body = _pr_body(raw, FEATURE)
+    assert "NO_TEST_NEEDED" not in body
+    assert "Did the thing." in body and "More detail." in body
+
+
+def test_pr_body_caps_at_4000_chars():
+    raw = "narration first\n## Summary\n\n" + "x" * 9000
+    body = _pr_body(raw, FEATURE)
+    assert len(body) <= 4000 and body.startswith("## Summary")
 
 
 # ── KG lessons injected into the coder prompt (flywheel read half) ───────────────

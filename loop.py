@@ -191,6 +191,28 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str]:
     return (m.group(2), m.group(1)) if m else ("", "")
 
 
+# The coder is asked to END its reply with a `## Summary` section — but the reply is
+# the whole ACP message, so the summary sits after pages of step-by-step narration.
+# Match the heading at line start; keep from the LAST occurrence so an early mention
+# of the phrase mid-narration doesn't truncate the real section (#56).
+_SUMMARY_HEADING_RE = re.compile(r"^##\s*Summary\b", re.MULTILINE)
+
+
+def _pr_body(result: str, feature: dict) -> str:
+    """The feature PR's description: the coder's ``## Summary`` section, never the
+    raw output stream. Control-marker lines (``NO_TEST_NEEDED: …``) are dropped from
+    the kept text; with no summary heading at all, a short template stands in — the
+    raw reply is never the fallback."""
+    headings = list(_SUMMARY_HEADING_RE.finditer(result or ""))
+    if headings:
+        kept = result[headings[-1].start() :]
+        lines = [ln for ln in kept.splitlines() if not ln.strip().startswith("NO_TEST_NEEDED")]
+        body = "\n".join(lines).strip()
+    else:
+        body = f"## Summary\n\n{feature.get('title') or ''} (`{feature.get('id') or ''}`)\n\nSee the diff for details."
+    return body[:4000]
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -983,7 +1005,7 @@ class BoardLoop:
                             fid,
                             n,
                         )
-                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=(result or "")[:4000])
+                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=_pr_body(result, feature))
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
                     # A capability failure = the coder didn't deliver (no diff / dispatch
