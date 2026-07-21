@@ -1244,6 +1244,61 @@ async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
     assert store.requeued == [] and store.blocked == []
 
 
+# ── the merged/closed guard: never bounce a PR that already left review (bd-1zp) ──
+
+
+async def test_reconcile_ci_skips_pr_that_left_review_since_the_poll(monkeypatch):
+    """Lagged-poll guard (Test C): a PR that merged/closed between the top-level state
+    read and the CI reconcile is bailed on BEFORE the CI rollup is even read — a CI fix
+    must never dispatch against a PR that is no longer OPEN."""
+    store = _CiStore({"id": "bd-gone", "pr_url": "https://example/pr/1"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    ci_reads = []
+
+    async def _pr_state(url, *, cwd="."):
+        return "MERGED"  # merged out from under the poll
+
+    async def _pr_ci(url, *, cwd=".", log_chars=3000):
+        ci_reads.append(url)
+        return ("failing", "Failing checks:\n- Tests: FAILURE")
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_ci_status", _pr_ci)
+
+    loop = BoardLoop({"ci_fix_max": 2})
+    await loop._reconcile_ci(store, "bd-gone", "https://example/pr/1", ".")
+    assert ci_reads == []  # bailed on state before ever reading CI
+    assert store.requeued == [] and store.blocked == [] and store.escalated == []
+
+
+async def test_reconcile_prs_closed_pr_blocks_and_never_runs_ci(monkeypatch):
+    """Test D: a CLOSED PR is driven to blocked by the merge poll, and the CI reconcile
+    is never invoked against it — the closed edge, not a CI-fix re-dispatch, handles it."""
+    store = _ReconcileStore([{"id": "bd-closed", "pr_url": "https://example/pr/1"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_state(url, *, cwd="."):
+        return "CLOSED"
+
+    async def _reap(repo, root, fid):
+        return None
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({})
+    ci_called = []
+
+    async def _ci_spy(store, fid, pr_url, repo):
+        ci_called.append(fid)
+
+    monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+
+    await loop._reconcile_prs()
+    assert [b[0] for b in store.blocked] == ["bd-closed"]  # closed → blocked for triage
+    assert ci_called == []  # the CI reconcile never ran against the closed PR
+
+
 def test_build_prompt_injects_ci_feedback_and_prior_diff():
     loop = BoardLoop({})
     feature = {"id": "bd-ci", "title": "T", "spec": "do it", "acceptance_criteria": "AC", "files_to_modify": ["a.py"]}
