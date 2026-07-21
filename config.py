@@ -73,17 +73,10 @@ def sanitized_env(
     return {k: v for k, v in src.items() if k in keep or not is_host_identity_var(k)}
 
 
-def scrub_process_env(passthrough: Iterable[str] = ()) -> list[str]:
-    """Strip the host-identity/credential block from ``os.environ`` in place.
-
-    The coder is spawned through the host's ACP adapter, which the loop can't hand
-    an ``env=`` to — the adapter's subprocess simply inherits ``os.environ``. So the
-    only place to sanitize the coder's environment is the loop's own process env:
-    scrub it once before dispatching and every inheriting child (coder included) is
-    clean. Honors the ``passthrough`` whitelist; returns the names removed (for
-    logging)."""
-    keep = set(passthrough or ())
-    removed = [k for k in list(os.environ) if k not in keep and is_host_identity_var(k)]
-    for k in removed:
-        del os.environ[k]
-    return removed
+# NOTE: an in-place ``os.environ`` scrub shipped here in #81 and was REVERTED: it
+# mutated the HOST server's own environment at loop start (the host lost its
+# PROTOAGENT_HOME/instance identity — a graceful self-restart then re-execed as the
+# default instance and died). Never mutate the host env: sanitizing the CODER's
+# inherited environment needs an ``env=`` seam through the host ACP adapter instead
+# (tracked upstream). ``sanitized_env`` above stays — it covers every subprocess the
+# loop spawns directly (gate preflight, local_gate_cmd, format_cmd) without side effects.
