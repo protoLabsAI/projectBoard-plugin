@@ -42,7 +42,7 @@ import os
 import re
 import time
 
-from . import coder_seam, worktree
+from . import coder_seam, config, worktree
 from .failures import classify
 from .store import (
     LABEL_CHANGES_REQUESTED,
@@ -415,6 +415,13 @@ class BoardLoop:
         self.kg_lessons = bool(self.cfg.get("kg_lessons", True))
         self.kg_lessons_k = max(1, int(self.cfg.get("kg_lessons_k", 3)))
         self.kg_lessons_domain = str(self.cfg.get("kg_lessons_domain", "loop-lessons")).strip()
+        # Env hygiene (#78): the host identifies/authenticates THIS agent via env vars
+        # (AGENT_NAME, PROTOAGENT_*, A2A_* — see config.py). None of them belong to the
+        # gate preflight, the pre-PR local_gate_cmd, or the coder we spawn, so they're
+        # stripped from every subprocess environment. ``env_passthrough`` is the escape
+        # hatch: a deployment that legitimately needs a specific var to reach children
+        # whitelists it here (a list, or a comma/space-separated string).
+        self.env_passthrough = config.parse_env_passthrough(self.cfg)
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
@@ -459,6 +466,25 @@ class BoardLoop:
 
     def _store(self):
         return get_store(**self._store_kw)
+
+    def _child_env(self) -> dict[str, str]:
+        """The sanitized environment for a subprocess the loop spawns directly (gate
+        preflight, ``local_gate_cmd``, ``format_cmd``) — ``os.environ`` minus the host
+        identity/credential block, honoring ``env_passthrough`` (#78)."""
+        return config.sanitized_env(self.env_passthrough)
+
+    def _sanitize_process_env(self) -> None:
+        """Scrub the host identity/credential block from this process's ``os.environ``
+        once, at loop start. The coder is spawned via the host ACP adapter (which the
+        loop can't hand an ``env=`` to — it just inherits ``os.environ``), so scrubbing
+        the process env is the only way to keep those vars out of the coder (#78).
+        Idempotent and best-effort — never blocks the loop from starting."""
+        try:
+            removed = config.scrub_process_env(self.env_passthrough)
+            if removed:
+                log.info("[project_board] env hygiene: stripped %d host var(s) from coder env", len(removed))
+        except Exception:  # noqa: BLE001 — env hygiene must never stop the loop from starting
+            log.warning("[project_board] env hygiene: process-env scrub failed", exc_info=True)
 
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
@@ -567,6 +593,9 @@ class BoardLoop:
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
+        # Scrub host identity/credentials from the process env before dispatching any
+        # work — the coder (spawned via the ACP adapter) inherits this env verbatim (#78).
+        self._sanitize_process_env()
         try:
             await self._recover()
         except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
@@ -1330,6 +1359,7 @@ class BoardLoop:
             proc = await asyncio.create_subprocess_shell(
                 self.format_cmd,
                 cwd=wt,
+                env=self._child_env(),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -1353,6 +1383,7 @@ class BoardLoop:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 cwd=wt,
+                env=self._child_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -1405,6 +1436,7 @@ class BoardLoop:
             proc = await asyncio.create_subprocess_shell(
                 self.local_gate_cmd,
                 cwd=repo,
+                env=self._child_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
