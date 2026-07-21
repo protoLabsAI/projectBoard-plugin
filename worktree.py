@@ -385,6 +385,22 @@ async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
     return out if len(out) <= max_chars else out[:max_chars] + "\n…(diff truncated)"
 
 
+def _is_blocking_check(c: dict) -> bool:
+    """Whether this check's state should gate the feature — i.e. whether a FAILURE
+    here is worth bouncing the feature back to the coder.
+
+    Required checks (branch protection) and GitHub Actions runs are blocking; a
+    third-party ADVISORY status — CodeRabbit, coverage bots, etc., which post through
+    the legacy commit-status API and so arrive as a ``StatusContext`` — is NOT, so its
+    red must never burn a coder run on a signal we can't fix (bd-1zp). ``isRequired``
+    (when ``gh`` surfaces it) overrides the type: a status the repo marks required is
+    always blocking. Conservative default: an unknown shape (an older ``gh`` that omits
+    ``__typename``) is treated as blocking so a real failure is never silently dropped."""
+    if c.get("isRequired") is True:
+        return True
+    return str(c.get("__typename") or "") != "StatusContext"
+
+
 async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) -> tuple[str, str]:
     """The PR's CI rollup → ``("passing" | "failing" | "pending" | "none", summary)``.
 
@@ -394,7 +410,13 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     returns ``("none", "")`` so the caller just leaves the PR alone (never raises
     into the loop). For a failing rollup, ``summary`` names the failing checks and,
     best-effort, includes a truncated excerpt of the first failing run's log so the
-    coder can actually fix it (edit-only — it can't re-run the checks itself)."""
+    coder can actually fix it (edit-only — it can't re-run the checks itself).
+
+    Only BLOCKING checks (required checks + GitHub Actions runs, see
+    ``_is_blocking_check``) decide the rollup. A red third-party ADVISORY status
+    (CodeRabbit, a coverage bot) is ignored — it can't gate the merge, so it must not
+    trigger a CI-bounce; the rollup reads ``passing`` when every blocking check is green
+    even while an advisory one is red (bd-1zp)."""
     rc, out, _err = await _gh(
         "pr", "view", pr_url, "--json", "statusCheckRollup", "--jq", ".statusCheckRollup", cwd=cwd
     )
@@ -418,9 +440,12 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     def _name(c: dict) -> str:
         return str(c.get("name") or c.get("context") or c.get("workflowName") or "check")
 
-    failing = [c for c in checks if _conclusion(c) in _FAIL]
+    # Only checks that actually gate the merge count — a red advisory status is dropped
+    # here so it can neither read as `failing` nor hold the rollup `pending`.
+    gating = [c for c in checks if _is_blocking_check(c)]
+    failing = [c for c in gating if _conclusion(c) in _FAIL]
     if not failing:
-        pending = [c for c in checks if _conclusion(c) in _PENDING and _conclusion(c) != "SUCCESS"]
+        pending = [c for c in gating if _conclusion(c) in _PENDING and _conclusion(c) != "SUCCESS"]
         # SUCCESS/NEUTRAL/SKIPPED all count as not-blocking → passing once nothing pends.
         return ("pending", "") if pending else ("passing", "")
 

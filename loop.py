@@ -789,7 +789,20 @@ class BoardLoop:
           the expensive tiers on one-line lint fixes — the goal-fix budget already
           learned this lesson; the CI path now mirrors it.)
 
-        Passing/pending/no-checks → left in review (the merge edge resolves it)."""
+        Two guards keep this from bouncing a PR it shouldn't (bd-1zp):
+        - **Merged/closed guard** — ``_reconcile_prs`` read the PR state at the top of
+          the poll, but the rebase/`gh` round-trips since then leave a window in which
+          the PR could have merged or closed. Re-read the state right here and bail on
+          anything that is no longer ``OPEN`` — a CI fix must NEVER dispatch against a
+          PR that has already left review.
+        - **Advisory filter** — ``pr_ci_status`` only reports ``failing`` when a
+          *blocking* check (a required check or a GitHub Actions run) is red; a red
+          third-party advisory status (CodeRabbit, a coverage bot) reads ``passing`` and
+          never triggers a bounce.
+
+        Passing/pending/no-checks left in review (the merge edge resolves it)."""
+        if await worktree.pr_state(pr_url, cwd=repo) != "OPEN":
+            return  # merged/closed since the poll started -> never dispatch a CI fix
         status, summary = await worktree.pr_ci_status(pr_url, cwd=repo)
         if status != "failing":
             return

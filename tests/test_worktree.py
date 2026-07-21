@@ -356,6 +356,72 @@ async def test_pr_ci_status_none_when_no_checks_or_gh_error(monkeypatch):
     assert await worktree.pr_ci_status("https://example/pr/1", cwd="/repo") == ("none", "")
 
 
+# ── advisory-status filtering: only required checks / GH Actions gate (bd-1zp) ────
+
+
+def test_is_blocking_check_required_and_actions_block_advisory_does_not():
+    # A required check (branch protection) is blocking whatever its provider/type.
+    assert worktree._is_blocking_check({"__typename": "StatusContext", "isRequired": True})
+    # A GitHub Actions run (a CheckRun) is blocking.
+    assert worktree._is_blocking_check({"__typename": "CheckRun", "name": "Tests"})
+    # A third-party advisory status (a non-required StatusContext) is NOT.
+    assert not worktree._is_blocking_check({"__typename": "StatusContext", "context": "coderabbit"})
+    # Unknown shape (older gh with no __typename) is conservatively blocking.
+    assert worktree._is_blocking_check({"name": "Legacy", "conclusion": "FAILURE"})
+
+
+async def test_pr_ci_status_required_check_failure_is_failing(monkeypatch):
+    """A failing REQUIRED check is blocking → the rollup reads failing so the feature
+    is bounced, even when it arrives as a legacy StatusContext (Test A)."""
+    rollup = (
+        '[{"__typename":"StatusContext","context":"required-gate","state":"FAILURE","isRequired":true},'
+        '{"__typename":"CheckRun","name":"Lint","conclusion":"SUCCESS","workflowName":"CI"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "failing"
+    assert "required-gate: FAILURE" in summary
+
+
+async def test_pr_ci_status_github_action_failure_is_failing(monkeypatch):
+    """A failing GitHub Actions run (a CheckRun) is blocking → failing (Test A sibling)."""
+    rollup = (
+        '[{"__typename":"CheckRun","name":"Web E2E","conclusion":"FAILURE","workflowName":"CI",'
+        '"detailsUrl":"https://github.com/o/r/actions/runs/123/job/456"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup, log_out="settings.spec.ts:71 element(s) not found"))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "failing"
+    assert "Web E2E: FAILURE" in summary
+    assert "element(s) not found" in summary
+
+
+async def test_pr_ci_status_advisory_failure_is_ignored(monkeypatch):
+    """A red third-party ADVISORY status (CodeRabbit / a coverage bot — a non-required
+    StatusContext) must NOT read as failing while every blocking check is green, so it
+    never bounces the feature (Test B, bd-1zp)."""
+    rollup = (
+        '[{"__typename":"CheckRun","name":"Tests","conclusion":"SUCCESS","workflowName":"CI"},'
+        '{"__typename":"StatusContext","context":"coderabbit","state":"FAILURE"},'
+        '{"__typename":"StatusContext","context":"coverage/coveralls","state":"FAILURE"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "passing" and summary == ""
+
+
+async def test_pr_ci_status_advisory_pending_does_not_hold_rollup(monkeypatch):
+    """An advisory status still IN_PROGRESS can't hold the rollup pending — once every
+    blocking check is green the rollup passes regardless of the advisory one."""
+    rollup = (
+        '[{"__typename":"CheckRun","name":"Tests","conclusion":"SUCCESS","workflowName":"CI"},'
+        '{"__typename":"StatusContext","context":"coderabbit","state":"PENDING"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, _ = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "passing"
+
+
 async def test_dispatch_coder_forgets_session_before_dispatch(monkeypatch):
     """Fresh-both: the worktree is recreated per attempt, so dispatch_coder must
     forget the ACP session BEFORE dispatching (else a resumed thread's memory would
