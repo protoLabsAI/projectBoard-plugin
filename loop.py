@@ -473,19 +473,6 @@ class BoardLoop:
         identity/credential block, honoring ``env_passthrough`` (#78)."""
         return config.sanitized_env(self.env_passthrough)
 
-    def _sanitize_process_env(self) -> None:
-        """Scrub the host identity/credential block from this process's ``os.environ``
-        once, at loop start. The coder is spawned via the host ACP adapter (which the
-        loop can't hand an ``env=`` to — it just inherits ``os.environ``), so scrubbing
-        the process env is the only way to keep those vars out of the coder (#78).
-        Idempotent and best-effort — never blocks the loop from starting."""
-        try:
-            removed = config.scrub_process_env(self.env_passthrough)
-            if removed:
-                log.info("[project_board] env hygiene: stripped %d host var(s) from coder env", len(removed))
-        except Exception:  # noqa: BLE001 — env hygiene must never stop the loop from starting
-            log.warning("[project_board] env hygiene: process-env scrub failed", exc_info=True)
-
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
         if not self.enabled:
@@ -593,9 +580,6 @@ class BoardLoop:
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
-        # Scrub host identity/credentials from the process env before dispatching any
-        # work — the coder (spawned via the ACP adapter) inherits this env verbatim (#78).
-        self._sanitize_process_env()
         try:
             await self._recover()
         except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting

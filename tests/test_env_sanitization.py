@@ -21,10 +21,10 @@ from project_board.loop import BoardLoop
 def _restore_environ():
     """Snapshot and fully restore ``os.environ`` around every test in this module.
 
-    ``scrub_process_env`` deletes host vars in place — including ones the host really
-    set (``PROTOAGENT_*``/``A2A_*``), which ``monkeypatch`` doesn't know about and so
-    wouldn't restore. Snapshotting the whole env guarantees no leakage into the rest
-    of the suite (keeps criterion #3 — the existing suite — green)."""
+    Kept as belt-and-braces even though the in-place ``scrub_process_env`` was
+    reverted (it mutated the HOST's env — the regression that killed a live restart):
+    snapshotting the whole env guarantees these tests can never leak host vars into
+    the rest of the suite."""
     saved = dict(os.environ)
     try:
         yield
@@ -107,33 +107,6 @@ def test_parse_env_passthrough_accepts_list_and_string():
         "A2A_TOKEN",
         "AGENT_NAME",
     )
-
-
-def test_scrub_process_env_strips_from_os_environ(monkeypatch):
-    # The coder is spawned via the host ACP adapter, whose subprocess inherits
-    # os.environ — so proving os.environ is scrubbed proves the coder is clean.
-    monkeypatch.setenv("AGENT_NAME", "host-agent")
-    monkeypatch.setenv("PROTOAGENT_ID", "abc")
-    monkeypatch.setenv("A2A_TOKEN", "secret")
-    monkeypatch.setenv("PATH", "/usr/bin")
-
-    removed = config.scrub_process_env()
-
-    # The injected host vars were removed, and — the security property — NO host-identity
-    # var of any kind survives in the env the coder would inherit.
-    assert {"AGENT_NAME", "PROTOAGENT_ID", "A2A_TOKEN"} <= set(removed)
-    assert not any(config.is_host_identity_var(k) for k in os.environ)
-    assert os.environ["PATH"] == "/usr/bin"  # ordinary env untouched
-
-
-def test_scrub_process_env_honors_passthrough(monkeypatch):
-    monkeypatch.setenv("A2A_TOKEN", "secret")
-    monkeypatch.setenv("PROTOAGENT_ID", "abc")
-
-    config.scrub_process_env(passthrough=["A2A_TOKEN"])
-
-    assert os.environ["A2A_TOKEN"] == "secret"  # whitelisted → survives
-    assert "PROTOAGENT_ID" not in os.environ
 
 
 # ── loop.py: wiring the sanitizer into the spawn paths ─────────────────────────────
