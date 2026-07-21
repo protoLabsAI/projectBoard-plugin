@@ -238,6 +238,44 @@ class BeadsBoard:
         the foundation feature, so they only become `ready` once it merges → done."""
         self._run("dep", "add", fid, depends_on, "--type", "blocks")
 
+    # ── partial update (the repair path) ──────────────────────────────────────
+    def update_feature(
+        self,
+        fid: str,
+        *,
+        spec: str | None = None,
+        acceptance_criteria: str | None = None,
+        design: str | None = None,
+        files_to_modify=None,
+        difficulty: str | None = None,
+    ) -> dict:
+        """Partially update an existing feature's fields (a board-level `br update`).
+        Only the arguments you pass (non-``None``) are written; every other field is
+        left untouched. This is the escape from the 'unrepairable bead' trap: a feature
+        the Ready gate rejects for a missing `spec` / `acceptance_criteria` /
+        `files_to_modify` can be fixed IN PLACE and re-marked ready, instead of being
+        cancelled and recreated from scratch."""
+        f = self._require(fid)
+        args = ["update", fid]
+        if spec is not None:
+            args += ["--description", spec]
+        if acceptance_criteria is not None:
+            args += ["--acceptance-criteria", acceptance_criteria]
+        if design is not None:
+            args += ["--design", design]
+        if files_to_modify is not None:
+            # files_to_modify lives in the bead `notes` field, one path per line.
+            args += ["--notes", "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())]
+        if difficulty is not None:
+            # difficulty rides as a single `diff:` label — replace any stale one (the
+            # same single-label-replaced pattern record_gens_spent uses for `gens:`).
+            for stale in [l for l in f.get("labels") or [] if l.startswith("diff:")]:
+                args += ["--remove-label", stale]
+            args += ["--add-label", f"diff:{difficulty.strip().lower()}"]
+        if len(args) > 2:  # something to write beyond the bare `update <fid>`
+            self._run(*args)
+        return self.get_feature(fid)
+
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────
     def mark_ready(self, fid: str) -> dict:
         f = self._require(fid)
@@ -250,7 +288,9 @@ class BeadsBoard:
             raise BoardError(
                 f"Ready gate: feature {fid!r} is missing {', '.join(missing)} — a feature is "
                 "Ready only with a spec, testable acceptance criteria, and the explicit files "
-                "to create/modify (a junior — or a coding agent — could pick it up and finish)."
+                "to create/modify (a junior — or a coding agent — could pick it up and finish). "
+                f"Fill the missing field(s) in place with board_update_feature(feature_id={fid!r}, "
+                "…) and mark it ready again — no need to cancel and recreate the bead."
             )
         # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
         # a task — it may not go ready until its `design` field exists AND references
