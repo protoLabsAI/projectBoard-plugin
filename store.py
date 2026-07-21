@@ -222,8 +222,11 @@ class BeadsBoard:
         if files_to_modify:
             # files_to_modify lives in the bead `notes` field, one path per line.
             upd += ["--notes", "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())]
-        if difficulty:
-            upd += ["--add-label", f"diff:{difficulty.strip().lower()}"]
+        diff = difficulty.strip().lower()
+        if diff:
+            # normalize first, then guard: a whitespace-only difficulty must NOT stamp a
+            # malformed `diff:` label (an empty tier corrupts the escalation ladder).
+            upd += ["--add-label", f"diff:{diff}"]
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
         if upd:
@@ -269,9 +272,14 @@ class BeadsBoard:
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
-            for stale in [l for l in f.get("labels") or [] if l.startswith("diff:")]:
-                args += ["--remove-label", stale]
-            args += ["--add-label", f"diff:{difficulty.strip().lower()}"]
+            # Normalize first; a whitespace-only value collapses to empty → leave the
+            # existing label untouched (clear nothing, add nothing) rather than stamping a
+            # malformed `diff:` that would corrupt the escalation ladder's tier selection.
+            diff = difficulty.strip().lower()
+            if diff:
+                for stale in [l for l in f.get("labels") or [] if l.startswith("diff:")]:
+                    args += ["--remove-label", stale]
+                args += ["--add-label", f"diff:{diff}"]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
         return self.get_feature(fid)
