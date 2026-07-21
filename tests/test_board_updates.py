@@ -78,6 +78,18 @@ class _RecordingStore:
         return {"id": "bd-1", "title": title, "board_state": "backlog"}
 
 
+class _UpdateRecordingStore:
+    """Records the kwargs board_update_feature hands ``update_feature``, so the exact
+    (post-hygiene) ``difficulty`` value the tool forwards to the store can be asserted."""
+
+    def __init__(self):
+        self.updated = None
+
+    def update_feature(self, fid, **kw):
+        self.updated = {"fid": fid, **kw}
+        return {"id": fid, "title": "T", "board_state": "backlog"}
+
+
 def _get_tool(name, cfg=None):
     tools = {t.name: t for t in pb._board_tools(cfg or {})}
     return tools[name]
@@ -188,6 +200,88 @@ def test_update_feature_with_nothing_to_change_makes_no_update_call(make_board, 
     b.update_feature("bd-1")
 
     assert br.cmds("update") == []
+
+
+# ── whitespace-only difficulty must never stamp a malformed `diff:` label (#79/#80) ──
+
+
+def test_create_feature_trims_and_lowercases_the_difficulty_label(make_board, monkeypatch):
+    state = {"id": "bd-1", "board_state": "backlog", "labels": []}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "_create", lambda *a, **k: "bd-1")
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.create_feature("T", difficulty=" Fast ")
+
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--add-label", "diff:fast")
+
+
+def test_create_feature_with_whitespace_only_difficulty_adds_no_diff_label(make_board, monkeypatch):
+    state = {"id": "bd-1", "board_state": "backlog", "labels": []}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "_create", lambda *a, **k: "bd-1")
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    # a foundation label rides alongside, so the update call still fires — proving it's
+    # ONLY the malformed `diff:` label that's suppressed, not the whole update.
+    b.create_feature("T", difficulty="   ", foundation=True)
+
+    (call,) = br.cmds("update")
+    added = [call[i + 1] for i, a in enumerate(call) if a == "--add-label"]
+    assert added == ["foundation"]
+    assert not any(l.startswith("diff:") for l in added)
+
+
+def test_update_feature_trims_and_lowercases_the_difficulty_label(make_board, monkeypatch):
+    state = {"id": "bd-1", "board_state": "backlog", "labels": ["diff:small", "ready"]}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.update_feature("bd-1", difficulty=" Fast ")
+
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--remove-label", "diff:small", "--add-label", "diff:fast")
+
+
+def test_update_feature_with_whitespace_only_difficulty_clears_nothing_and_adds_nothing(make_board, monkeypatch):
+    state = {"id": "bd-1", "board_state": "backlog", "labels": ["diff:small", "ready"]}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.update_feature("bd-1", difficulty="   ")
+
+    # whitespace normalizes to empty → no update call at all; the stale diff:small survives.
+    assert br.cmds("update") == []
+    assert state["labels"] == ["diff:small", "ready"]
+
+
+# ── the tool coerces a whitespace-only difficulty to None before the store sees it ──
+
+
+def test_board_update_feature_tool_treats_whitespace_difficulty_as_none(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "difficulty": "   "})
+
+    # None, never "   " — a truthy blank would reach the store as a "set difficulty" signal.
+    assert fake.updated["difficulty"] is None
+
+
+def test_board_update_feature_tool_forwards_a_real_difficulty(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "difficulty": " Fast "})
+
+    assert fake.updated["difficulty"] == "Fast"
 
 
 # ── the whole flow: repair a rejected bead via the tools, then it goes ready ─────────

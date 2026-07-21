@@ -247,7 +247,9 @@ def _board_tools(cfg: dict):
                 acceptance_criteria=acceptance_criteria or None,
                 design=design or None,
                 files_to_modify=files or None,
-                difficulty=difficulty or None,
+                # strip BEFORE the truthiness check so a whitespace-only difficulty is a
+                # no-op (None), never a `"   "` that reaches the store as a "set it" signal.
+                difficulty=difficulty.strip() or None,
             )
             return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
         except BoardError as exc:
