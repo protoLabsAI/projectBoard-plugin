@@ -328,3 +328,35 @@ def test_update_tool_fills_a_missing_field_so_mark_ready_then_passes(make_board,
     out = json.loads(mark_ready.invoke({"feature_id": "bd-1"}))
     assert out["id"] == "bd-1"
     assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+class _WarningStore:
+    """create_feature returns the success-with-warning shape (post-#88 store contract)."""
+
+    def list_features(self, state=None):
+        return []
+
+    def create_feature(self, title, **kw):
+        return {
+            "id": "bd-w1",
+            "title": title,
+            "board_state": "backlog",
+            "enrichment_failed": True,
+            "missing_fields": ["acceptance_criteria", "depends_on(bd-0)"],
+            "warning": "feature bd-w1 was created but enrichment failed — repair with board_update_feature.",
+        }
+
+
+def test_create_tool_surfaces_the_success_with_warning_through_the_boundary(monkeypatch):
+    """QA panel on PR #88 (cross-file): the tool must NOT strip enrichment_failed /
+    missing_fields / warning — a clean-looking success would hide the repair contract
+    from the agent and board_update_feature would never be invoked."""
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _WarningStore())
+    create = _get_tool("board_create_feature")
+
+    out = json.loads(create.invoke({"title": "T", "spec": "s"}))
+
+    assert out["id"] == "bd-w1"
+    assert out["enrichment_failed"] is True
+    assert out["missing_fields"] == ["acceptance_criteria", "depends_on(bd-0)"]
+    assert "board_update_feature" in out["warning"]

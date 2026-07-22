@@ -213,7 +213,15 @@ def _board_tools(cfg: dict):
                 depends_on=deps,
                 foundation=foundation,
             )
-            return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
+            out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
+            if f.get("enrichment_failed"):
+                # Surface the success-with-warning contract THROUGH the tool boundary —
+                # stripping it here would show the agent a clean success for an incomplete
+                # bead and the repair path would never trigger (QA panel on #88).
+                out["enrichment_failed"] = True
+                out["missing_fields"] = f.get("missing_fields", [])
+                out["warning"] = f.get("warning", "")
+            return json.dumps(out)
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -257,7 +265,15 @@ def _board_tools(cfg: dict):
                 difficulty=difficulty.strip() or None,
                 depends_on=deps or None,
             )
-            return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
+            out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
+            if f.get("enrichment_failed"):
+                # Surface the success-with-warning contract THROUGH the tool boundary —
+                # stripping it here would show the agent a clean success for an incomplete
+                # bead and the repair path would never trigger (QA panel on #88).
+                out["enrichment_failed"] = True
+                out["missing_fields"] = f.get("missing_fields", [])
+                out["warning"] = f.get("warning", "")
+            return json.dumps(out)
         except BoardError as exc:
             return f"Error: {exc}"
 
