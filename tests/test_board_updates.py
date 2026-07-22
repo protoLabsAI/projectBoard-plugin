@@ -376,3 +376,13 @@ def test_update_feature_restores_a_dropped_foundation_flag(make_board, monkeypat
     b.update_feature("bd-1", spec="s")  # no foundation arg → label untouched
     update = next(c for c in br.calls if c and c[0] == "update")
     assert pb.store.LABEL_FOUNDATION not in update
+
+
+def test_update_tool_splits_newline_separated_deps(monkeypatch):
+    """Round-6 pin: depends_on accepts newline separators (the round-3 normalization
+    the panel requested) — both forms land as individual edges."""
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+    update.invoke({"feature_id": "bd-1", "depends_on": "bd-7\nbd-8, bd-9"})
+    assert fake.updated["depends_on"] == ["bd-7", "bd-8", "bd-9"]
