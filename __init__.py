@@ -127,6 +127,18 @@ def _strip_wrapping_quotes(s: str) -> str:
     return s
 
 
+def _feature_reply(f: dict) -> str:
+    """Serialize a store feature for a tool return — carrying the success-with-warning
+    trio through the boundary when set (QA panel on #88: stripping it hides the repair
+    contract from the agent)."""
+    out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
+    if f.get("enrichment_failed"):
+        out["enrichment_failed"] = True
+        out["missing_fields"] = f.get("missing_fields", [])
+        out["warning"] = f.get("warning", "")
+    return json.dumps(out)
+
+
 def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
@@ -199,7 +211,7 @@ def _board_tools(cfg: dict):
                         "the same work; re-check the board before creating again, or pass "
                         "force=true to create a second copy anyway."
                     )
-            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
+            deps = [d.strip() for d in depends_on.replace("\n", ",").split(",") if d.strip()]
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
             f = store.create_feature(
                 title,
@@ -213,15 +225,7 @@ def _board_tools(cfg: dict):
                 depends_on=deps,
                 foundation=foundation,
             )
-            out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
-            if f.get("enrichment_failed"):
-                # Surface the success-with-warning contract THROUGH the tool boundary —
-                # stripping it here would show the agent a clean success for an incomplete
-                # bead and the repair path would never trigger (QA panel on #88).
-                out["enrichment_failed"] = True
-                out["missing_fields"] = f.get("missing_fields", [])
-                out["warning"] = f.get("warning", "")
-            return json.dumps(out)
+            return _feature_reply(f)
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -253,7 +257,7 @@ def _board_tools(cfg: dict):
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
-            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
+            deps = [d.strip() for d in depends_on.replace("\n", ",").split(",") if d.strip()]
             f = store.update_feature(
                 feature_id,
                 spec=spec or None,
@@ -265,15 +269,7 @@ def _board_tools(cfg: dict):
                 difficulty=difficulty.strip() or None,
                 depends_on=deps or None,
             )
-            out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
-            if f.get("enrichment_failed"):
-                # Surface the success-with-warning contract THROUGH the tool boundary —
-                # stripping it here would show the agent a clean success for an incomplete
-                # bead and the repair path would never trigger (QA panel on #88).
-                out["enrichment_failed"] = True
-                out["missing_fields"] = f.get("missing_fields", [])
-                out["warning"] = f.get("warning", "")
-            return json.dumps(out)
+            return _feature_reply(f)
         except BoardError as exc:
             return f"Error: {exc}"
 

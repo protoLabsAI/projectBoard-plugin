@@ -340,7 +340,7 @@ class BeadsBoard:
         design: str | None = None,
         files_to_modify=None,
         difficulty: str | None = None,
-        depends_on=None,
+        depends_on: list[str] | None = None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
