@@ -953,6 +953,9 @@ class BoardLoop:
                             fusion_k=self.coder_solve_fusion_k,
                             files_to_modify=files_to_modify,
                             fusion_max_file_chars=self.coder_solve_fusion_max_file_chars,
+                            # #86: same host-env strip the gate/preflight/format spawns
+                            # get — keep the whitelist consistent across every subprocess.
+                            env_passthrough=self.env_passthrough,
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
