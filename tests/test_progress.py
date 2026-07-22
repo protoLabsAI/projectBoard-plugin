@@ -263,3 +263,36 @@ async def test_dispatch_records_per_gen_progress_including_the_verify_outcome(mo
     assert g["verify"]["passed"] is True
     assert g["verify"]["test_cmd"] == "pytest -q"
     assert "1 passed" in g["verify"]["tail"]
+
+
+def test_progress_end_freezes_elapsed_and_surfaces_done(monkeypatch):
+    """Panel on #89: a finished gen must be distinguishable from a running one — done
+    surfaces in the snapshot and elapsed_s freezes at progress_end."""
+    import project_board.coder_seam as cs
+
+    cs.progress_new_run("bd-t1")
+    clock = [100.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+    cs.progress_begin("bd-t1", 1, "smart")
+    clock[0] = 105.0
+    cs.progress_end("bd-t1", 1)
+    clock[0] = 999.0  # long after — a frozen clock must not keep counting
+    snap = cs.progress_snapshot("bd-t1")
+    g = snap["gens"][0]
+    assert g["done"] is True
+    assert g["elapsed_s"] == 5.0
+
+
+def test_progress_end_is_idempotent(monkeypatch):
+    """Every dispatch exit path may call progress_end — the first close wins."""
+    import project_board.coder_seam as cs
+
+    cs.progress_new_run("bd-t2")
+    clock = [10.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+    cs.progress_begin("bd-t2", 1, "smart")
+    clock[0] = 12.0
+    cs.progress_end("bd-t2", 1)
+    clock[0] = 50.0
+    cs.progress_end("bd-t2", 1)  # second close: no-op
+    assert cs.progress_snapshot("bd-t2")["gens"][0]["elapsed_s"] == 2.0

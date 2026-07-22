@@ -162,12 +162,24 @@ def _extract_locations(tool_input) -> list[str]:
 class _GenBuffer:
     """One coder generation's live state (one ACP dispatch = one gen)."""
 
-    __slots__ = ("gen", "tier", "started", "current_tool", "recent_tools", "thought_tail", "usage", "verify", "done")
+    __slots__ = (
+        "gen",
+        "tier",
+        "started",
+        "ended",
+        "current_tool",
+        "recent_tools",
+        "thought_tail",
+        "usage",
+        "verify",
+        "done",
+    )
 
     def __init__(self, gen: int, tier: str = ""):
         self.gen = int(gen)
         self.tier = tier or ""
         self.started = _monotonic()
+        self.ended: float | None = None
         self.current_tool: dict | None = None
         self.recent_tools: deque = deque(maxlen=_RECENT_TOOLS_MAX)
         self.thought_tail = ""
@@ -206,7 +218,10 @@ class _GenBuffer:
         return {
             "gen": self.gen,
             "tier": self.tier,
-            "elapsed_s": round(max(0.0, _monotonic() - self.started), 1),
+            "done": self.done,
+            # A finished gen's clock FREEZES at progress_end — otherwise the drawer can't
+            # tell a completed gen from a running one (panel finding on #89).
+            "elapsed_s": round(max(0.0, (self.ended if self.ended is not None else _monotonic()) - self.started), 1),
             "current_tool": dict(self.current_tool) if self.current_tool else None,
             "recent_tools": list(self.recent_tools),
             "thought_tail": self.thought_tail,
@@ -283,8 +298,9 @@ def progress_verify(fid: str | None, gen: int, *, test_cmd: str, output: str, pa
 
 def progress_end(fid: str | None, gen: int) -> None:
     b = _buf(fid, gen)
-    if b is not None:
+    if b is not None and not b.done:  # idempotent — every dispatch exit path may call it
         b.done = True
+        b.ended = _monotonic()
 
 
 def progress_snapshot(fid: str) -> dict:
@@ -323,7 +339,7 @@ async def _dispatch_coder_tapped(
 
         from plugins.coding_agent import _client_for, _drop_client, _make_permission
         from plugins.coding_agent.acp_client import AcpError
-        from plugins.delegates.adapters import ADAPTERS
+        from plugins.delegates.adapters import ADAPTERS, DelegateError
 
         adapter = ADAPTERS["acp"]
         overrides: dict = {"workdir": worktree_path}
@@ -332,7 +348,10 @@ async def _dispatch_coder_tapped(
         scoped = _dc.replace(coder, **overrides)
         spec = adapter._spec(scoped)
     except Exception:  # noqa: BLE001 — host internals absent/changed → untapped fallback
-        return await worktree.dispatch_coder(coder, worktree_path, prompt, timeout=timeout)
+        try:
+            return await worktree.dispatch_coder(coder, worktree_path, prompt, timeout=timeout)
+        finally:
+            progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
 
     # Fresh-both: forget any persisted session first (see worktree.dispatch_coder).
     try:
@@ -340,7 +359,11 @@ async def _dispatch_coder_tapped(
     except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build
         log.warning("[project_board] forget_session failed for %s", worktree_path, exc_info=True)
 
-    client = _client_for(spec)
+    try:
+        client = _client_for(spec)
+    except Exception as exc:  # noqa: BLE001 — adapter-layer parity: dispatch failures are WorktreeError
+        progress_end(fid, gen)
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     try:
         client._permission = _make_permission(spec)  # the adapter's by-kind policy (ADR 0024)
     except Exception:  # noqa: BLE001 — tolerate a host that resolves permissions differently
@@ -372,7 +395,11 @@ async def _dispatch_coder_tapped(
         raise
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
-    except AcpError as exc:
+    except (AcpError, DelegateError) as exc:
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 — restore the adapter path's contract: nothing
+        # below the seam propagates raw; every dispatch failure surfaces as WorktreeError
+        # (panel on #89: the client-direct tap had narrowed AcpError-only).
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     finally:
         progress_end(fid, gen)
