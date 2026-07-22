@@ -78,8 +78,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
 import re
+import time
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Callable
@@ -87,6 +90,325 @@ from typing import Callable
 from . import config, worktree
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+# ── Live coder monitoring (#84) ────────────────────────────────────────────────
+# A per-feature, per-gen in-memory ring buffer fed by the ACP client's
+# progress/thought/tool callbacks during a dispatch, and read by the board view's
+# monitor drawer over GET …/features/{fid}/progress. Purely in-process and
+# best-effort: it NEVER affects a build (a tap that can't wire falls back to an
+# untapped dispatch) and is BOUNDED — a rolling thought tail, a capped tool-
+# lifecycle history, and a lid on how many features are retained — so a long-lived
+# loop can't leak memory.
+
+_THOUGHT_TAIL_MAX = 500  # rolling thought tail, in CHARS — never a per-word accumulation
+_RECENT_TOOLS_MAX = 200  # rolling tool-lifecycle history per gen (start/end events)
+_MAX_FEATURES = 64  # features retained (LRU-evicted) so a long loop stays bounded
+
+# Patchable clock so tests can assert a deterministic elapsed_s.
+_monotonic = time.monotonic
+
+# Tool-input keys that carry a file location. The forwarded ACP tool event carries
+# the raw input but NOT the structured `locations`, so we mine path-ish keys.
+_LOCATION_KEYS = ("path", "file", "file_path", "filePath", "abs_path", "absolute_path", "filename")
+
+
+def _infer_tool_kind(name: str) -> str:
+    """Best-effort tool KIND from its name (the forwarded event has no `kind`)."""
+    n = (name or "").lower()
+    if any(w in n for w in ("read", "cat", "open", "view")):
+        return "read"
+    if any(w in n for w in ("edit", "write", "apply", "patch", "create", "update", "replace")):
+        return "edit"
+    if any(w in n for w in ("bash", "shell", "run", "exec", "terminal")):
+        return "execute"
+    if any(w in n for w in ("search", "grep", "glob", "find", "list")):
+        return "search"
+    return ""
+
+
+def _extract_locations(tool_input) -> list[str]:
+    """Best-effort file locations from a tool call's raw input (a JSON string or a
+    dict). Mines path-ish keys; never raises on an odd shape (returns [])."""
+    data = tool_input
+    if isinstance(tool_input, str):
+        s = tool_input.strip()
+        if not s:
+            return []
+        try:
+            data = json.loads(s)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(data, dict):
+        return []
+    locs: list[str] = []
+    for k in _LOCATION_KEYS:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            locs.append(v.strip())
+    for k in ("paths", "files", "locations"):
+        v = data.get(k)
+        if isinstance(v, (list, tuple)):
+            locs.extend(str(x) for x in v if isinstance(x, (str, int)))
+    seen: set = set()
+    out: list[str] = []
+    for loc in locs:  # de-dup, preserve order, cap
+        if loc not in seen:
+            seen.add(loc)
+            out.append(loc)
+    return out[:8]
+
+
+class _GenBuffer:
+    """One coder generation's live state (one ACP dispatch = one gen)."""
+
+    __slots__ = (
+        "gen",
+        "tier",
+        "started",
+        "ended",
+        "current_tool",
+        "recent_tools",
+        "thought_tail",
+        "usage",
+        "verify",
+        "done",
+    )
+
+    def __init__(self, gen: int, tier: str = ""):
+        self.gen = int(gen)
+        self.tier = tier or ""
+        self.started = _monotonic()
+        self.ended: float | None = None
+        self.current_tool: dict | None = None
+        self.recent_tools: deque = deque(maxlen=_RECENT_TOOLS_MAX)
+        self.thought_tail = ""
+        self.usage: dict | None = None
+        self.verify: dict | None = None
+        self.done = False
+
+    def add_thought(self, delta: str) -> None:
+        # Coalesce into a ROLLING tail: append the delta, then keep only the last
+        # _THOUGHT_TAIL_MAX chars. Never accumulates per-word chunks as a list.
+        if not delta:
+            return
+        self.thought_tail = (self.thought_tail + delta)[-_THOUGHT_TAIL_MAX:]
+
+    def add_tool(self, event: dict) -> None:
+        phase = str(event.get("phase") or "")
+        name = str(event.get("name") or "tool")
+        kind = str(event.get("kind") or "") or _infer_tool_kind(name)
+        tid = str(event.get("id") or name)
+        if phase == "start":
+            locs = _extract_locations(event.get("input"))
+            self.current_tool = {"id": tid, "name": name, "kind": kind, "locations": locs, "status": "running"}
+            self.recent_tools.append({"name": name, "kind": kind, "status": "start", "locations": locs})
+        elif phase == "end":
+            status = str(event.get("status") or "completed")
+            if self.current_tool and self.current_tool.get("id") == tid:
+                self.current_tool["status"] = status
+                self.current_tool["output"] = str(event.get("output") or "")[:400]
+                locs = self.current_tool.get("locations") or []
+            else:
+                locs = []
+                self.current_tool = {"id": tid, "name": name, "kind": kind, "locations": locs, "status": status}
+            self.recent_tools.append({"name": name, "kind": kind, "status": status, "locations": locs})
+
+    def snapshot(self) -> dict:
+        return {
+            "gen": self.gen,
+            "tier": self.tier,
+            "done": self.done,
+            # A finished gen's clock FREEZES at progress_end — otherwise the drawer can't
+            # tell a completed gen from a running one (panel finding on #89).
+            "elapsed_s": round(max(0.0, (self.ended if self.ended is not None else _monotonic()) - self.started), 1),
+            "current_tool": dict(self.current_tool) if self.current_tool else None,
+            "recent_tools": list(self.recent_tools),
+            "thought_tail": self.thought_tail,
+            "usage": dict(self.usage) if self.usage else None,
+            "verify": dict(self.verify) if self.verify else None,
+        }
+
+
+# fid -> {gen -> _GenBuffer}. An OrderedDict so whole features LRU-evict cheaply.
+_progress: "OrderedDict[str, OrderedDict[int, _GenBuffer]]" = OrderedDict()
+
+
+def _gens_for(fid: str | None, *, create: bool = False):
+    if not fid:
+        return None
+    gens = _progress.get(fid)
+    if gens is None:
+        if not create:
+            return None
+        gens = _progress[fid] = OrderedDict()
+        while len(_progress) > _MAX_FEATURES:  # LRU-evict the oldest feature
+            _progress.popitem(last=False)
+    _progress.move_to_end(fid)
+    return gens
+
+
+def progress_new_run(fid: str | None) -> None:
+    """Drop any prior gens for this feature — called at the start of a FRESH build
+    so the drawer shows this run, not stale gens from an earlier dispatch."""
+    if fid:
+        _progress.pop(fid, None)
+
+
+def progress_begin(fid: str | None, gen: int, tier: str = "") -> None:
+    """Register (or reset) a generation's buffer. No-op when ``fid`` is falsy — the
+    operator-only test-rung path passes None (it's a diagnostic, not a live run)."""
+    gens = _gens_for(fid, create=True)
+    if gens is not None:
+        gens[int(gen)] = _GenBuffer(gen, tier)
+
+
+def _buf(fid: str | None, gen: int) -> "_GenBuffer | None":
+    gens = _gens_for(fid)
+    return gens.get(int(gen)) if gens is not None else None
+
+
+def progress_thought(fid: str | None, gen: int, delta: str) -> None:
+    b = _buf(fid, gen)
+    if b is not None:
+        b.add_thought(delta)
+
+
+def progress_tool(fid: str | None, gen: int, event: dict) -> None:
+    b = _buf(fid, gen)
+    if b is not None:
+        b.add_tool(event)
+
+
+def progress_usage(fid: str | None, gen: int, usage: dict) -> None:
+    b = _buf(fid, gen)
+    if b is None or not usage:
+        return
+    try:
+        b.usage = {"used": int(usage.get("used") or 0), "size": int(usage.get("size") or 0)}
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
+def progress_verify(fid: str | None, gen: int, *, test_cmd: str, output: str, passed: bool) -> None:
+    b = _buf(fid, gen)
+    if b is not None:
+        b.verify = {"test_cmd": test_cmd, "passed": bool(passed), "tail": (output or "")[-1500:]}
+
+
+def progress_end(fid: str | None, gen: int) -> None:
+    b = _buf(fid, gen)
+    if b is not None and not b.done:  # idempotent — every dispatch exit path may call it
+        b.done = True
+        b.ended = _monotonic()
+
+
+def progress_snapshot(fid: str) -> dict:
+    """The board view's monitor payload for one feature — the per-gen live state,
+    gens in order. Empty-but-valid (``{"gens": []}``) when the feature has no
+    live/recent run in this process's memory."""
+    gens = _progress.get(fid)
+    if gens is not None:
+        # A feature being actively polled must stay LRU-fresh — otherwise 64 concurrent
+        # live features could evict the very one the drawer is watching (panel round 2).
+        _progress.move_to_end(fid)
+    if not gens:
+        return {"gens": []}
+    return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
+
+
+async def dispatch_coder_tapped(
+    coder, worktree_path: str, prompt: str, *, fid: str | None, gen: int, tier: str = "", timeout: float | None = None
+) -> str:
+    """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
+    — same fresh-both session discipline, same guaranteed subprocess teardown — but
+    with the client's thought/tool callbacks wired into this feature's live-
+    monitoring buffer (#84).
+
+    ``worktree.dispatch_coder`` goes through ``adapter.dispatch``, which does NOT
+    forward the ACP callbacks, so tapping them means driving the pooled ``AcpClient``
+    directly. This only READS host internals — zero protoAgent host changes. Best-
+    effort: if those internals aren't importable/shaped as expected (a standalone
+    test env, an older host), it falls back to the untapped ``worktree.dispatch_coder``
+    (the gen still records its start/tier/elapsed, just without the live stream). A
+    monitoring concern must NEVER break a build."""
+    progress_begin(fid, gen, tier)
+    try:
+        import dataclasses as _dc
+
+        from plugins.coding_agent import _client_for, _drop_client, _make_permission
+        from plugins.coding_agent.acp_client import AcpError
+        from plugins.delegates.adapters import ADAPTERS, DelegateError
+
+        adapter = ADAPTERS["acp"]
+        overrides: dict = {"workdir": worktree_path}
+        if any(f.name == "manage_git" for f in _dc.fields(coder)):
+            overrides["manage_git"] = False  # the BOARD owns git for scoped dispatches
+        scoped = _dc.replace(coder, **overrides)
+        spec = adapter._spec(scoped)
+    except Exception:  # noqa: BLE001 — host internals absent/changed → untapped fallback
+        try:
+            return await worktree.dispatch_coder(coder, worktree_path, prompt, timeout=timeout)
+        finally:
+            progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
+
+    # Fresh-both: forget any persisted session first (see worktree.dispatch_coder).
+    try:
+        await adapter.forget_session(scoped)
+    except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build
+        log.warning("[project_board] forget_session failed for %s", worktree_path, exc_info=True)
+
+    try:
+        client = _client_for(spec)
+    except Exception as exc:  # noqa: BLE001 — adapter-layer parity: dispatch failures are WorktreeError
+        progress_end(fid, gen)
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    try:
+        client._permission = _make_permission(spec)  # the adapter's by-kind policy (ADR 0024)
+    except Exception:  # noqa: BLE001 — tolerate a host that resolves permissions differently
+        pass
+
+    async def _thought_cb(delta):
+        progress_thought(fid, gen, delta)
+
+    async def _tool_cb(event):
+        progress_tool(fid, gen, event)
+        # usage_update isn't forwarded as a callback — the client folds it into
+        # last_usage as it goes, so sample it on each tool event to keep totals live.
+        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
+
+    # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
+    # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
+    # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
+    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    try:
+        coro = client.prompt(prompt, tool_callback=_tool_cb, thought_callback=_thought_cb, timeout=prompt_timeout)
+        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
+        return reply
+    except asyncio.CancelledError:
+        # Turn stopped (operator/watchdog) — drop the pooled client + SIGKILL the tree
+        # NOW (mirrors AcpAdapter._prompt) so the subprocess can't keep running detached.
+        try:
+            _drop_client(spec)
+            client.kill_now()
+        except Exception:  # noqa: BLE001 — mid-cancellation cleanup is best-effort
+            pass
+        raise
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
+    except (AcpError, DelegateError) as exc:
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 — restore the adapter path's contract: nothing
+        # below the seam propagates raw; every dispatch failure surfaces as WorktreeError
+        # (panel on #89: the client-direct tap had narrowed AcpError-only).
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    finally:
+        progress_end(fid, gen)
+        try:
+            await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess
+        except Exception:  # noqa: BLE001 — never let teardown mask the result/error
+            log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
 def resolve_delegate(name: str, expect_type: str):
@@ -316,6 +638,8 @@ class _WorktreeSolveAdapter:
         files_to_modify: list[str] | None = None,
         fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
         env_passthrough: Iterable[str] = (),
+        progress_fid: str | None = None,
+        progress_tier: str = "",
         _fusion_dispatch=None,
     ):
         self.repo = repo
@@ -323,6 +647,13 @@ class _WorktreeSolveAdapter:
         self.root = root
         self.fid = fid
         self.coder = coder
+        # Live-monitoring (#84): the REAL board feature id the drawer polls (which is
+        # NOT self.fid for the test-rung diagnostic — that appends ".test") and the
+        # current tier, so each candidate gen surfaces under the right feature. None
+        # ⇒ don't record (the operator-only test-rung path — no live board run).
+        self.progress_fid = progress_fid
+        self.progress_tier = progress_tier
+        self._gen_by_wt: dict[str, int] = {}  # candidate worktree → its gen (for verify recording)
         self.dispatch_timeout = dispatch_timeout
         self.test_cmd = test_cmd
         self.test_timeout = test_timeout
@@ -363,8 +694,17 @@ class _WorktreeSolveAdapter:
 
     async def generate(self, task: str, *, feedback: str | None = None) -> str:
         wt, _branch = await self._new_candidate_worktree()
-        reply = await worktree.dispatch_coder(
-            self.coder, wt, _augment_prompt(task, feedback), timeout=self.dispatch_timeout
+        self._gen_by_wt[wt] = self._n
+        # Tapped dispatch (#84) wires the ACP client's callbacks into this gen's live
+        # buffer; it degrades to worktree.dispatch_coder when the tap can't wire.
+        reply = await dispatch_coder_tapped(
+            self.coder,
+            wt,
+            _augment_prompt(task, feedback),
+            fid=self.progress_fid,
+            gen=self._n,
+            tier=self.progress_tier,
+            timeout=self.dispatch_timeout,
         )
         if (reply or "").strip():
             self._replies[wt] = reply
@@ -392,59 +732,105 @@ class _WorktreeSolveAdapter:
         reply = await openai_dispatch(self.fusion_delegate, prompt, timeout=self.dispatch_timeout)
         files = _parse_fusion_files(reply)
         wt, _branch = await self._new_candidate_worktree()
-        wt_root = Path(wt).resolve()
-        written = 0
-        for rel, content in files.items():
-            # `rel` comes from a model completion — an absolute path or a `../` climb
-            # would otherwise write outside the worktree (Path.__truediv__ with an
-            # absolute right-hand side even discards the left side entirely). Resolve
-            # and require containment; skip (don't crash the candidate) on a miss.
-            dest = (wt_root / rel).resolve()
-            if wt_root not in dest.parents and dest != wt_root:
-                log.warning(
-                    "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
-                )
-                continue
-            # Fusion has no tool access — it can only ever act on the files we showed
-            # it. A path outside the feature's declared set means it hallucinated a
-            # file (or the parser mis-split the reply); writing it would silently
-            # touch unrelated code with no test coverage backing the change.
-            if self.files_to_modify and rel not in self.files_to_modify:
-                log.warning("[project_board] %s fusion tried to write an undeclared path: %r — skipped", self.fid, rel)
-                continue
-            # Fusion returns whole-file replacements with no diff to sanity-check.
-            # A reply that's drastically smaller than the file it claims to replace
-            # is far more likely a truncated completion (see FUSION_MAX_FILE_CHARS_DEFAULT
-            # and the delegate's own max_tokens ceiling) than an intentional big
-            # deletion — refuse it rather than risk silent data loss.
-            if dest.exists():
-                try:
-                    original_size = dest.stat().st_size
-                except OSError:
-                    original_size = 0
-                if (
-                    original_size > _SHRINK_GUARD_MIN_ORIGINAL_CHARS
-                    and len(content) < original_size * _SHRINK_GUARD_RATIO
-                ):
+        self._gen_by_wt[wt] = self._n
+        # Fusion can't tool-call (a plain completion, not an ACP session), so there's
+        # no live tool/thought stream — still register the gen (#84) with a synthetic
+        # marker so the drawer shows a fusion candidate and its verify outcome.
+        progress_begin(self.progress_fid, self._n, self.progress_tier)
+        progress_tool(
+            self.progress_fid, self._n, {"phase": "start", "id": "fusion", "name": "fusion completion", "kind": "edit"}
+        )
+        # The whole fallible body rides one try/finally so the gen closes on EVERY
+        # exit path — the same totality dispatch_coder_tapped guarantees (panel round 2).
+        _fusion_ok = False
+        try:
+            wt_root = Path(wt).resolve()
+            written = 0
+            for rel, content in files.items():
+                # `rel` comes from a model completion — an absolute path or a `../` climb
+                # would otherwise write outside the worktree (Path.__truediv__ with an
+                # absolute right-hand side even discards the left side entirely). Resolve
+                # and require containment; skip (don't crash the candidate) on a miss.
+                dest = (wt_root / rel).resolve()
+                if wt_root not in dest.parents and dest != wt_root:
                     log.warning(
-                        "[project_board] %s fusion's rewrite of %r (%d chars) is suspiciously smaller than "
-                        "the original (%d chars) — refusing, likely truncated",
-                        self.fid,
-                        rel,
-                        len(content),
-                        original_size,
+                        "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
                     )
                     continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content)
-            written += 1
-        if not written:
-            log.warning(
-                "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
+                # Fusion has no tool access — it can only ever act on the files we showed
+                # it. A path outside the feature's declared set means it hallucinated a
+                # file (or the parser mis-split the reply); writing it would silently
+                # touch unrelated code with no test coverage backing the change.
+                if self.files_to_modify and rel not in self.files_to_modify:
+                    log.warning(
+                        "[project_board] %s fusion tried to write an undeclared path: %r — skipped", self.fid, rel
+                    )
+                    continue
+                # Fusion returns whole-file replacements with no diff to sanity-check.
+                # A reply that's drastically smaller than the file it claims to replace
+                # is far more likely a truncated completion (see FUSION_MAX_FILE_CHARS_DEFAULT
+                # and the delegate's own max_tokens ceiling) than an intentional big
+                # deletion — refuse it rather than risk silent data loss.
+                if dest.exists():
+                    try:
+                        original_size = dest.stat().st_size
+                    except OSError:
+                        original_size = 0
+                    if (
+                        original_size > _SHRINK_GUARD_MIN_ORIGINAL_CHARS
+                        and len(content) < original_size * _SHRINK_GUARD_RATIO
+                    ):
+                        log.warning(
+                            "[project_board] %s fusion's rewrite of %r (%d chars) is suspiciously smaller than "
+                            "the original (%d chars) — refusing, likely truncated",
+                            self.fid,
+                            rel,
+                            len(content),
+                            original_size,
+                        )
+                        continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
+                written += 1
+            if not written:
+                log.warning(
+                    "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
+                )
+            _fusion_ok = True
+            return wt
+        finally:
+            # The tool card must CLOSE on failure too — otherwise the drawer shows a
+            # perpetually-running "fusion completion" on a gen that is already done
+            # (panel round 3). Status derives from whether the body completed.
+            progress_tool(
+                self.progress_fid,
+                self._n,
+                {
+                    "phase": "end",
+                    "id": "fusion",
+                    "name": "fusion completion",
+                    "status": "completed" if _fusion_ok else "failed",
+                },
             )
-        return wt
+            progress_end(self.progress_fid, self._n)
 
     async def verify(self, candidate_wt: str):
+        verdict = await self._run_acceptance_tests(candidate_wt)
+        # Record the per-gen verify outcome (#84) for the live monitor — which test
+        # command ran + a tail of its output — keyed by the candidate's worktree →
+        # its gen. Best-effort; a no-op off a live board run (progress_fid None).
+        gen = self._gen_by_wt.get(candidate_wt)
+        if gen is not None and self.progress_fid:
+            progress_verify(
+                self.progress_fid,
+                gen,
+                test_cmd=self.test_cmd,
+                output=getattr(verdict, "output", "") or "",
+                passed=bool(getattr(verdict, "passed", False)),
+            )
+        return verdict
+
+    async def _run_acceptance_tests(self, candidate_wt: str):
         Verdict = self.verdict_cls
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -525,6 +911,7 @@ async def dispatch(
     files_to_modify: list[str] | None = None,
     fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
     env_passthrough: Iterable[str] = (),
+    tier: str = "",
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -595,6 +982,8 @@ async def dispatch(
         files_to_modify=files_to_modify,
         fusion_max_file_chars=fusion_max_file_chars,
         env_passthrough=env_passthrough,
+        progress_fid=fid,
+        progress_tier=tier,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:

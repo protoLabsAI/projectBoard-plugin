@@ -912,7 +912,12 @@ class BoardLoop:
                     if keep_wt and wt is not None:
                         keep_wt = False  # consume the reuse
                         self._inflight[fid] = (repo, wt, branch)
-                        result = await worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None)
+                        # Tap this re-dispatch into the live monitor (#84) — same gen 1,
+                        # continuing the current build (no progress_new_run, so the drawer
+                        # keeps the prior history rather than blanking on a keep-worktree fix).
+                        result = await coder_seam.dispatch_coder_tapped(
+                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                        )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
                         files_to_modify = feature.get("files_to_modify") or []
                         fusion = (
@@ -935,6 +940,7 @@ class BoardLoop:
                             if not viable:
                                 log.info("[project_board] %s fusion rung skipped for this dispatch: %s", fid, reason)
                                 fusion = None
+                        coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch, result = await coder_seam.dispatch(
                             task=prompt,
                             coder=coder,
@@ -956,17 +962,22 @@ class BoardLoop:
                             # #86: same host-env strip the gate/preflight/format spawns
                             # get — keep the whitelist consistent across every subprocess.
                             env_passthrough=self.env_passthrough,
+                            tier=tier,  # #84: label each solve gen with the current tier
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
-                        wt, branch, result = await self._dispatch_max_mode(feature, coder, prompt, repo, base, fid)
+                        coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
+                        wt, branch, result = await self._dispatch_max_mode(
+                            feature, coder, prompt, repo, base, fid, tier
+                        )
                         self._inflight[fid] = (repo, wt, branch)
                     else:
+                        coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
-                        result = await worktree.dispatch_coder(
-                            coder, wt, prompt, timeout=self.coder_timeout or None
-                        )  # reaps subprocess; CoderTimeout if it overruns
+                        result = await coder_seam.dispatch_coder_tapped(
+                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                        )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -1641,7 +1652,7 @@ class BoardLoop:
         return passing[j] if j is not None else passing[0]
 
     async def _dispatch_max_mode(
-        self, feature: dict, coder, prompt: str, repo: str, base: str, fid: str
+        self, feature: dict, coder, prompt: str, repo: str, base: str, fid: str, tier: str = ""
     ) -> tuple[str, str, str]:
         """Max-Mode (#21): build the feature N ways in parallel and ship the best diff.
 
@@ -1667,8 +1678,15 @@ class BoardLoop:
         for cid in cand_ids:
             cands.append(await worktree.create_worktree(repo, base, cid, self.root))
         log.info("[project_board] %s max-mode: dispatching %d parallel candidates", fid, n)
+        # Tap each candidate into the live monitor as its own gen (#84) — the drawer
+        # shows all N building in parallel; a tap that can't wire degrades per-candidate.
         results = await asyncio.gather(
-            *(worktree.dispatch_coder(coder, wt, prompt, timeout=self.coder_timeout or None) for wt, _b in cands),
+            *(
+                coder_seam.dispatch_coder_tapped(
+                    coder, wt, prompt, fid=fid, gen=i + 1, tier=tier, timeout=self.coder_timeout or None
+                )
+                for i, (wt, _b) in enumerate(cands)
+            ),
             return_exceptions=True,
         )
         for i, r in enumerate(results):

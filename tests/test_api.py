@@ -173,6 +173,45 @@ def test_unknown_feature_is_404(monkeypatch):
     assert c.get("/api/plugins/project_board/features/missing").status_code == 404
 
 
+# ── live coder-monitoring snapshot (#84): GET /features/{fid}/progress ───────────
+
+
+def test_progress_404s_on_an_unknown_feature(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    assert c.get("/api/plugins/project_board/features/missing/progress").status_code == 404
+
+
+def test_progress_is_empty_but_valid_when_no_live_run(monkeypatch):
+    coder_seam._progress.clear()
+    c = _client(monkeypatch, FakeStore())  # bd-1 is a known feature with no live run
+    r = c.get("/api/plugins/project_board/features/bd-1/progress")
+    assert r.status_code == 200
+    assert r.json() == {"gens": []}
+
+
+def test_progress_returns_the_per_gen_snapshot_contract(monkeypatch):
+    """The endpoint contract: {"gens": [{gen, tier, elapsed_s, current_tool,
+    recent_tools, thought_tail, usage}]} — fed straight from the in-memory buffer."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-1", 1, "fast")
+    coder_seam.progress_tool(
+        "bd-1", 1, {"phase": "start", "id": "t1", "name": "edit_file", "input": '{"path": "a.py"}'}
+    )
+    coder_seam.progress_thought("bd-1", 1, "planning the change")
+    coder_seam.progress_usage("bd-1", 1, {"used": 12, "size": 100})
+    c = _client(monkeypatch, FakeStore())
+    r = c.get("/api/plugins/project_board/features/bd-1/progress")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"gens"} and len(body["gens"]) == 1
+    g = body["gens"][0]
+    assert {"gen", "tier", "elapsed_s", "current_tool", "recent_tools", "thought_tail", "usage"} <= set(g)
+    assert g["gen"] == 1 and g["tier"] == "fast"
+    assert g["current_tool"]["name"] == "edit_file" and g["current_tool"]["locations"] == ["a.py"]
+    assert g["thought_tail"] == "planning the change"
+    assert g["usage"] == {"used": 12, "size": 100}
+
+
 def test_ready_gate_rejection_surfaces_as_400(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     r = c.post("/api/plugins/project_board/features/bad/ready")
