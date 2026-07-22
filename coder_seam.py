@@ -80,10 +80,11 @@ import asyncio
 import importlib
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Callable
 
-from . import worktree
+from . import config, worktree
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -314,6 +315,7 @@ class _WorktreeSolveAdapter:
         fusion_delegate=None,
         files_to_modify: list[str] | None = None,
         fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
+        env_passthrough: Iterable[str] = (),
         _fusion_dispatch=None,
     ):
         self.repo = repo
@@ -325,6 +327,11 @@ class _WorktreeSolveAdapter:
         self.test_cmd = test_cmd
         self.test_timeout = test_timeout
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
+        # The gate's env_passthrough whitelist (#86), threaded from the loop so the
+        # acceptance-test (verify) subprocess strips the SAME host identity/credential
+        # block the gate/preflight/format subprocesses already do — the host's
+        # PROTOAGENT_*/A2A_*/AGENT_NAME must never leak into a candidate's tests.
+        self.env_passthrough = tuple(env_passthrough)
         self.fusion_delegate = fusion_delegate  # a resolved `openai`-type Delegate, or None
         self.files_to_modify = files_to_modify or []
         self.fusion_max_file_chars = fusion_max_file_chars
@@ -443,6 +450,11 @@ class _WorktreeSolveAdapter:
             proc = await asyncio.create_subprocess_shell(
                 self.test_cmd,
                 cwd=candidate_wt,
+                # #86: strip the host identity/credential block from the acceptance-test
+                # env — with NO env= the child inherits os.environ verbatim (the host's
+                # PROTOAGENT_*/A2A_*/AGENT_NAME), which burned 15 solve gens on an
+                # unwinnable test. `sanitized_env` mirrors the loop's own gate spawns.
+                env=config.sanitized_env(self.env_passthrough),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -512,6 +524,7 @@ async def dispatch(
     fusion_k: int = 2,
     files_to_modify: list[str] | None = None,
     fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
+    env_passthrough: Iterable[str] = (),
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -542,6 +555,12 @@ async def dispatch(
     before this rung existed. ``files_to_modify`` feeds fusion's prompt (it can't read
     the repo itself, unlike the ACP rungs) — the same list the feature's Ready gate
     already required.
+
+    ``env_passthrough`` (#86) is the loop's env whitelist, threaded through to the
+    adapter so the acceptance-test (verify) subprocess strips the same host
+    identity/credential block (``PROTOAGENT_*``/``A2A_*``/``AGENT_NAME``) the gate and
+    preflight already strip — with no ``env=`` the verify child would inherit the host's
+    whole environment and could pass/fail on the HOST's identity, not the candidate's.
 
     **``solve()`` itself can raise.** The ladder (`coder`'s own ``solve.py``) has no
     try/except around ``generate``/``verify`` — it assumes a candidate attempt never
@@ -575,6 +594,7 @@ async def dispatch(
         fusion_delegate=fusion_delegate,
         files_to_modify=files_to_modify,
         fusion_max_file_chars=fusion_max_file_chars,
+        env_passthrough=env_passthrough,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:
@@ -672,6 +692,7 @@ async def test_rung(
     fusion_k: int = 2,
     files_to_modify: list[str] | None = None,
     fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
+    env_passthrough: Iterable[str] = (),
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -709,6 +730,7 @@ async def test_rung(
         fusion_delegate=fusion_delegate,
         files_to_modify=files_to_modify,
         fusion_max_file_chars=fusion_max_file_chars,
+        env_passthrough=env_passthrough,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:

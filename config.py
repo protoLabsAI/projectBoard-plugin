@@ -6,9 +6,10 @@ protoAgent wiring (``PROTOAGENT_*``) and its agent-to-agent credentials
 (``A2A_*``). Those belong to the HOST agent, not to anything it shells out to.
 
 Every subprocess the loop spawns — the gate preflight, the pre-PR
-``local_gate_cmd``, the auto-fix ``format_cmd``, and (via the ACP adapter, which
-inherits ``os.environ``) the coder itself — would otherwise inherit that whole
-block verbatim, handing a child process the host's identity and credentials. A
+``local_gate_cmd``, the auto-fix ``format_cmd``, the ``coder.solve()`` seam's
+acceptance-test (``verify``) run (#86), and (via the ACP adapter, which inherits
+``os.environ``) the coder itself — would otherwise inherit that whole block
+verbatim, handing a child process the host's identity and credentials. A
 coder that reads ``A2A_*`` can impersonate the host on the bus; one that reads
 ``AGENT_NAME`` mis-reports who it is. So we strip the host-identity/credential
 block from any environment handed to a child.
@@ -79,4 +80,5 @@ def sanitized_env(
 # default instance and died). Never mutate the host env: sanitizing the CODER's
 # inherited environment needs an ``env=`` seam through the host ACP adapter instead
 # (tracked upstream). ``sanitized_env`` above stays — it covers every subprocess the
-# loop spawns directly (gate preflight, local_gate_cmd, format_cmd) without side effects.
+# loop spawns directly (gate preflight, local_gate_cmd, format_cmd, and the
+# coder.solve seam's acceptance-test verify subprocess — #86) without side effects.
