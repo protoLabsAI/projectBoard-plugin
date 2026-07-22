@@ -127,6 +127,12 @@ def _strip_wrapping_quotes(s: str) -> str:
     return s
 
 
+def _split_list(raw: str) -> list[str]:
+    """Comma- or newline-separated string → clean list (the shared normalization for
+    files_to_modify and depends_on across create/update — round-4 DRY finding on #88)."""
+    return [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
+
+
 def _feature_reply(f: dict) -> str:
     """Serialize a store feature for a tool return — carrying the success-with-warning
     trio through the boundary when set (QA panel on #88: stripping it hides the repair
@@ -211,8 +217,8 @@ def _board_tools(cfg: dict):
                         "the same work; re-check the board before creating again, or pass "
                         "force=true to create a second copy anyway."
                     )
-            deps = [d.strip() for d in depends_on.replace("\n", ",").split(",") if d.strip()]
-            files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
+            deps = _split_list(depends_on)
+            files = _split_list(files_to_modify)
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -238,6 +244,7 @@ def _board_tools(cfg: dict):
         design: str = "",
         difficulty: str = "",
         depends_on: str = "",
+        foundation: bool = False,
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
@@ -256,8 +263,8 @@ def _board_tools(cfg: dict):
             design = _strip_wrapping_quotes(design)
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
-            files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
-            deps = [d.strip() for d in depends_on.replace("\n", ",").split(",") if d.strip()]
+            files = _split_list(files_to_modify)
+            deps = _split_list(depends_on)
             f = store.update_feature(
                 feature_id,
                 spec=spec or None,
@@ -268,6 +275,7 @@ def _board_tools(cfg: dict):
                 # no-op (None), never a `"   "` that reaches the store as a "set it" signal.
                 difficulty=difficulty.strip() or None,
                 depends_on=deps or None,
+                foundation=foundation or None,
             )
             return _feature_reply(f)
         except BoardError as exc:

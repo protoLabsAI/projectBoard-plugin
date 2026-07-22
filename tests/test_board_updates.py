@@ -360,3 +360,19 @@ def test_create_tool_surfaces_the_success_with_warning_through_the_boundary(monk
     assert out["enrichment_failed"] is True
     assert out["missing_fields"] == ["acceptance_criteria", "depends_on(bd-0)"]
     assert "board_update_feature" in out["warning"]
+
+
+def test_update_feature_restores_a_dropped_foundation_flag(make_board, monkeypatch):
+    """Round-4 contract completion (#88): a foundation flag lost to a failed create is
+    repairable — update_feature(foundation=True) adds the label; None/False touch nothing."""
+    br = _StatefulBr({"id": "bd-1", "labels": []})
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", foundation=True)
+    update = next(c for c in br.calls if c and c[0] == "update")
+    assert "--add-label" in update and pb.store.LABEL_FOUNDATION in update
+    br.calls.clear()
+    b.update_feature("bd-1", spec="s")  # no foundation arg → label untouched
+    update = next(c for c in br.calls if c and c[0] == "update")
+    assert pb.store.LABEL_FOUNDATION not in update

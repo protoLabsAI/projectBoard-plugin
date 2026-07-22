@@ -341,6 +341,7 @@ class BeadsBoard:
         files_to_modify=None,
         difficulty: str | None = None,
         depends_on: list[str] | None = None,
+        foundation: bool | None = None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -375,6 +376,11 @@ class BeadsBoard:
                 for stale in [l for l in f.get("labels") or [] if l.startswith("diff:")]:
                     args += ["--remove-label", stale]
                 args += ["--add-label", f"diff:{diff}"]
+        if foundation:
+            # Complete the create-repair contract: a foundation flag dropped by a failed
+            # create can be restored here (QA panel on #88, round 4 — same undeliverable-
+            # promise class as depends_on). None/False = leave the label untouched.
+            args += ["--add-label", LABEL_FOUNDATION]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
         for dep in depends_on or ():
