@@ -271,6 +271,19 @@ class BeadsBoard:
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")
+        # Dependency edges are independent of the enrichment `br update` — wire them
+        # FIRST so an enrichment failure can never silently drop them (QA panel on
+        # #88: the early success-with-warning return below used to skip the dep loop,
+        # losing edges with no repair path). A failed edge is tracked like a failed
+        # field: named in the warning, repairable via board_update_feature(depends_on=…).
+        failed_deps: list[str] = []
+        for dep in depends_on or ():
+            try:
+                self.add_dependency(fid, dep)
+            except BoardError:
+                failed_deps.append(dep)
+        if failed_deps:
+            enriched.append(f"depends_on({','.join(failed_deps)})")
         if upd:
             try:
                 self._run("update", fid, *upd)
@@ -299,8 +312,16 @@ class BeadsBoard:
                     f"board_update_feature(feature_id={fid!r}, …)."
                 )
                 return f
-        for dep in depends_on or ():
-            self.add_dependency(fid, dep)
+        if failed_deps:
+            f = self.get_feature(fid) or {"id": fid, "board_state": "backlog", "title": title}
+            f["enrichment_failed"] = True
+            f["missing_fields"] = [f"depends_on({','.join(failed_deps)})"]
+            f["warning"] = (
+                f"feature {fid} was created but these dependency edges failed: "
+                f"{', '.join(failed_deps)} — repair with board_update_feature(feature_id={fid!r}, "
+                f"depends_on=...)."
+            )
+            return f
         return self.get_feature(fid)
 
     def add_dependency(self, fid: str, depends_on: str) -> None:
@@ -319,6 +340,7 @@ class BeadsBoard:
         design: str | None = None,
         files_to_modify=None,
         difficulty: str | None = None,
+        depends_on=None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -355,6 +377,8 @@ class BeadsBoard:
                 args += ["--add-label", f"diff:{diff}"]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
+        for dep in depends_on or ():
+            self.add_dependency(fid, dep)
         return self.get_feature(fid)
 
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────

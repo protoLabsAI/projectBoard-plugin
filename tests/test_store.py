@@ -753,3 +753,41 @@ def test_run_executes_in_the_configured_repo(monkeypatch, _have_br):
 
     store.BeadsBoard()._run("list")
     assert captured["cwd"] == "."  # default repo → process cwd, unchanged behavior
+
+
+def test_create_feature_wires_deps_even_when_enrichment_fails(make_board):
+    """QA panel on PR #88: dependency edges are independent of the enrichment `br update`
+    — an enrichment failure must never silently drop them. Deps go out FIRST."""
+    calls = []
+    b = make_board(_enrich_run("bd-9", fail_update=True, calls=calls))
+    f = b.create_feature(
+        "T", spec="s", acceptance_criteria="- a", files_to_modify=["a.py"], depends_on=["bd-1", "bd-2"]
+    )
+    dep_calls = [c for c in calls if c and c[0] == "dep"]
+    assert [c[2] for c in dep_calls] == ["bd-9", "bd-9"]  # both edges attempted (fid position)
+    assert {c[3] for c in dep_calls} == {"bd-1", "bd-2"}
+    assert f["enrichment_failed"] is True  # the warning still reports the enrichment half
+    assert not any("depends_on" in m for m in f["missing_fields"])  # deps did NOT fail
+
+
+def test_create_feature_reports_failed_dep_edges_in_warning(make_board, monkeypatch):
+    """A dep edge that fails is tracked like a failed field: named in missing_fields and
+    repairable via board_update_feature(depends_on=…) — never silently lost."""
+    b = make_board(_enrich_run("bd-9"))
+    monkeypatch.setattr(b, "add_dependency", lambda fid, dep: (_ for _ in ()).throw(BoardError("no such issue")))
+    f = b.create_feature("T", spec="s", acceptance_criteria="a", files_to_modify=["a.py"], depends_on=["bd-x"])
+    assert f["enrichment_failed"] is True
+    assert any("depends_on(bd-x)" in m for m in f["missing_fields"])
+    assert "board_update_feature" in f["warning"]
+
+
+def test_update_feature_adds_dependency_edges(make_board, monkeypatch):
+    """The repair contract is deliverable: update_feature(depends_on=…) adds the blocking
+    edges a failed create-time wiring dropped (QA panel on PR #88)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", depends_on=["bd-7", "bd-8"])
+    dep_calls = [c for c in br.calls if c and c[0] == "dep"]
+    assert [(c[2], c[3]) for c in dep_calls] == [("bd-1", "bd-7"), ("bd-1", "bd-8")]

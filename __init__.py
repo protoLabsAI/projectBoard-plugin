@@ -225,14 +225,17 @@ def _board_tools(cfg: dict):
         files_to_modify: str = "",
         design: str = "",
         difficulty: str = "",
+        depends_on: str = "",
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
         as-is. Use it to fill a missing `spec`, `acceptance_criteria`, or `files_to_modify`
         (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
         again — no need to cancel and recreate the bead. `difficulty` (small|medium|large)
-        re-seeds the model tier. Inputs are stripped of any literal wrapping double quotes
-        before storage (same hygiene as board_create_feature)."""
+        re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
+        edges — the repair for dependencies dropped by a create-time failure. Inputs are
+        stripped of any literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
         try:
             store = get_store(**store_kw)
             spec = _strip_wrapping_quotes(spec)
@@ -240,7 +243,9 @@ def _board_tools(cfg: dict):
             files_to_modify = _strip_wrapping_quotes(files_to_modify)
             design = _strip_wrapping_quotes(design)
             difficulty = _strip_wrapping_quotes(difficulty)
+            depends_on = _strip_wrapping_quotes(depends_on)
             files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
+            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
             f = store.update_feature(
                 feature_id,
                 spec=spec or None,
@@ -250,6 +255,7 @@ def _board_tools(cfg: dict):
                 # strip BEFORE the truthiness check so a whitespace-only difficulty is a
                 # no-op (None), never a `"   "` that reaches the store as a "set it" signal.
                 difficulty=difficulty.strip() or None,
+                depends_on=deps or None,
             )
             return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
         except BoardError as exc:
