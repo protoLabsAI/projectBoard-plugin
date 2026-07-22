@@ -386,3 +386,25 @@ def test_update_tool_splits_newline_separated_deps(monkeypatch):
     update = _get_tool("board_update_feature")
     update.invoke({"feature_id": "bd-1", "depends_on": "bd-7\nbd-8, bd-9"})
     assert fake.updated["depends_on"] == ["bd-7", "bd-8", "bd-9"]
+
+
+def test_update_feature_applies_good_deps_and_names_the_failed_one(make_board, monkeypatch):
+    """Round-7 pin: a bad dep id in a batch must not abort the rest — good edges land,
+    the failure is named in the same success-with-warning contract create uses."""
+    br = _StatefulBr({"id": "bd-1", "labels": []})
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "backlog", "title": "T", "labels": []})
+    real_add = b.add_dependency
+
+    def flaky_add(fid, dep):
+        if dep == "bd-bad":
+            raise BoardError("no such issue")
+        return real_add(fid, dep)
+
+    monkeypatch.setattr(b, "add_dependency", flaky_add)
+    f = b.update_feature("bd-1", depends_on=["bd-7", "bd-bad", "bd-8"])
+    dep_calls = [c for c in br.calls if c and c[0] == "dep"]
+    assert {c[3] for c in dep_calls} == {"bd-7", "bd-8"}  # good edges landed
+    assert f["enrichment_failed"] is True
+    assert any("depends_on(bd-bad)" in m for m in f["missing_fields"])

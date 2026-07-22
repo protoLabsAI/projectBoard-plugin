@@ -385,9 +385,25 @@ class BeadsBoard:
             args += ["--add-label", LABEL_FOUNDATION]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
+        # Same partial-failure contract as create_feature (panel round 7): one bad id
+        # must not abort the batch after earlier edges landed — apply what applies,
+        # name what failed, and let the tool boundary surface it for another repair.
+        failed_deps: list[str] = []
         for dep in depends_on or ():
-            self.add_dependency(fid, dep)
-        return self.get_feature(fid)
+            try:
+                self.add_dependency(fid, dep)
+            except BoardError:
+                failed_deps.append(dep)
+        f = self.get_feature(fid)
+        if failed_deps and f is not None:
+            f["enrichment_failed"] = True
+            f["missing_fields"] = [f"depends_on({','.join(failed_deps)})"]
+            f["warning"] = (
+                f"feature {fid} was updated but these dependency edges failed: "
+                f"{', '.join(failed_deps)} — repair with board_update_feature(feature_id={fid!r}, "
+                f"depends_on=...)."
+            )
+        return f
 
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────
     def mark_ready(self, fid: str) -> dict:
