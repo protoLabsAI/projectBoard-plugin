@@ -182,7 +182,7 @@ def test_progress_404s_on_an_unknown_feature(monkeypatch):
 
 
 def test_progress_is_empty_but_valid_when_no_live_run(monkeypatch):
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     c = _client(monkeypatch, FakeStore())  # bd-1 is a known feature with no live run
     r = c.get("/api/plugins/project_board/features/bd-1/progress")
     assert r.status_code == 200
@@ -192,7 +192,7 @@ def test_progress_is_empty_but_valid_when_no_live_run(monkeypatch):
 def test_progress_returns_the_per_gen_snapshot_contract(monkeypatch):
     """The endpoint contract: {"gens": [{gen, tier, elapsed_s, current_tool,
     recent_tools, thought_tail, usage}]} — fed straight from the in-memory buffer."""
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("bd-1", 1, "fast")
     coder_seam.progress_tool(
         "bd-1", 1, {"phase": "start", "id": "t1", "name": "edit_file", "input": '{"path": "a.py"}'}

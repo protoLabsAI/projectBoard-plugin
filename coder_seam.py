@@ -308,14 +308,13 @@ def progress_snapshot(fid: str) -> dict:
     gens in order. Empty-but-valid (``{"gens": []}``) when the feature has no
     live/recent run in this process's memory."""
     gens = _progress.get(fid)
+    if gens is not None:
+        # A feature being actively polled must stay LRU-fresh — otherwise 64 concurrent
+        # live features could evict the very one the drawer is watching (panel round 2).
+        _progress.move_to_end(fid)
     if not gens:
         return {"gens": []}
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
-
-
-def _progress_reset() -> None:
-    """Test helper — clear the whole registry between cases."""
-    _progress.clear()
 
 
 async def _dispatch_coder_tapped(
@@ -378,7 +377,10 @@ async def _dispatch_coder_tapped(
         # last_usage as it goes, so sample it on each tool event to keep totals live.
         progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
 
-    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 600.0
+    # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
+    # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
+    # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
+    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
     try:
         coro = client.prompt(prompt, tool_callback=_tool_cb, thought_callback=_thought_cb, timeout=prompt_timeout)
         reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
@@ -738,63 +740,69 @@ class _WorktreeSolveAdapter:
         progress_tool(
             self.progress_fid, self._n, {"phase": "start", "id": "fusion", "name": "fusion completion", "kind": "edit"}
         )
-        wt_root = Path(wt).resolve()
-        written = 0
-        for rel, content in files.items():
-            # `rel` comes from a model completion — an absolute path or a `../` climb
-            # would otherwise write outside the worktree (Path.__truediv__ with an
-            # absolute right-hand side even discards the left side entirely). Resolve
-            # and require containment; skip (don't crash the candidate) on a miss.
-            dest = (wt_root / rel).resolve()
-            if wt_root not in dest.parents and dest != wt_root:
-                log.warning(
-                    "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
-                )
-                continue
-            # Fusion has no tool access — it can only ever act on the files we showed
-            # it. A path outside the feature's declared set means it hallucinated a
-            # file (or the parser mis-split the reply); writing it would silently
-            # touch unrelated code with no test coverage backing the change.
-            if self.files_to_modify and rel not in self.files_to_modify:
-                log.warning("[project_board] %s fusion tried to write an undeclared path: %r — skipped", self.fid, rel)
-                continue
-            # Fusion returns whole-file replacements with no diff to sanity-check.
-            # A reply that's drastically smaller than the file it claims to replace
-            # is far more likely a truncated completion (see FUSION_MAX_FILE_CHARS_DEFAULT
-            # and the delegate's own max_tokens ceiling) than an intentional big
-            # deletion — refuse it rather than risk silent data loss.
-            if dest.exists():
-                try:
-                    original_size = dest.stat().st_size
-                except OSError:
-                    original_size = 0
-                if (
-                    original_size > _SHRINK_GUARD_MIN_ORIGINAL_CHARS
-                    and len(content) < original_size * _SHRINK_GUARD_RATIO
-                ):
+        # The whole fallible body rides one try/finally so the gen closes on EVERY
+        # exit path — the same totality _dispatch_coder_tapped guarantees (panel round 2).
+        try:
+            wt_root = Path(wt).resolve()
+            written = 0
+            for rel, content in files.items():
+                # `rel` comes from a model completion — an absolute path or a `../` climb
+                # would otherwise write outside the worktree (Path.__truediv__ with an
+                # absolute right-hand side even discards the left side entirely). Resolve
+                # and require containment; skip (don't crash the candidate) on a miss.
+                dest = (wt_root / rel).resolve()
+                if wt_root not in dest.parents and dest != wt_root:
                     log.warning(
-                        "[project_board] %s fusion's rewrite of %r (%d chars) is suspiciously smaller than "
-                        "the original (%d chars) — refusing, likely truncated",
-                        self.fid,
-                        rel,
-                        len(content),
-                        original_size,
+                        "[project_board] %s fusion tried to write outside its worktree: %r — skipped", self.fid, rel
                     )
                     continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content)
-            written += 1
-        if not written:
-            log.warning(
-                "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
+                # Fusion has no tool access — it can only ever act on the files we showed
+                # it. A path outside the feature's declared set means it hallucinated a
+                # file (or the parser mis-split the reply); writing it would silently
+                # touch unrelated code with no test coverage backing the change.
+                if self.files_to_modify and rel not in self.files_to_modify:
+                    log.warning(
+                        "[project_board] %s fusion tried to write an undeclared path: %r — skipped", self.fid, rel
+                    )
+                    continue
+                # Fusion returns whole-file replacements with no diff to sanity-check.
+                # A reply that's drastically smaller than the file it claims to replace
+                # is far more likely a truncated completion (see FUSION_MAX_FILE_CHARS_DEFAULT
+                # and the delegate's own max_tokens ceiling) than an intentional big
+                # deletion — refuse it rather than risk silent data loss.
+                if dest.exists():
+                    try:
+                        original_size = dest.stat().st_size
+                    except OSError:
+                        original_size = 0
+                    if (
+                        original_size > _SHRINK_GUARD_MIN_ORIGINAL_CHARS
+                        and len(content) < original_size * _SHRINK_GUARD_RATIO
+                    ):
+                        log.warning(
+                            "[project_board] %s fusion's rewrite of %r (%d chars) is suspiciously smaller than "
+                            "the original (%d chars) — refusing, likely truncated",
+                            self.fid,
+                            rel,
+                            len(content),
+                            original_size,
+                        )
+                        continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
+                written += 1
+            if not written:
+                log.warning(
+                    "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
+                )
+            progress_tool(
+                self.progress_fid,
+                self._n,
+                {"phase": "end", "id": "fusion", "name": "fusion completion", "status": "completed"},
             )
-        progress_tool(
-            self.progress_fid,
-            self._n,
-            {"phase": "end", "id": "fusion", "name": "fusion completion", "status": "completed"},
-        )
-        progress_end(self.progress_fid, self._n)
-        return wt
+            return wt
+        finally:
+            progress_end(self.progress_fid, self._n)
 
     async def verify(self, candidate_wt: str):
         verdict = await self._run_acceptance_tests(candidate_wt)

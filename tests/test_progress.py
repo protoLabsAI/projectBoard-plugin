@@ -21,14 +21,14 @@ from project_board import coder_seam, worktree
 
 
 def test_snapshot_unknown_feature_is_empty_but_valid():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     assert coder_seam.progress_snapshot("nope") == {"gens": []}
 
 
 def test_progress_functions_noop_on_a_falsy_fid():
     """The operator-only test-rung path passes fid=None — recording must be a no-op,
     never a crash and never a stray entry under an empty key."""
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin(None, 1, "fast")
     coder_seam.progress_tool(None, 1, {"phase": "start", "name": "x"})
     coder_seam.progress_thought(None, 1, "hi")
@@ -37,7 +37,7 @@ def test_progress_functions_noop_on_a_falsy_fid():
 
 
 def test_tool_start_then_end_updates_current_tool_and_history():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1, "smart")
     coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t1", "name": "read_file", "input": '{"path": "x.py"}'})
     g = coder_seam.progress_snapshot("f")["gens"][0]
@@ -54,7 +54,7 @@ def test_tool_start_then_end_updates_current_tool_and_history():
 
 
 def test_recent_tools_history_is_capped():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1)
     for i in range(300):
         coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t%d" % i, "name": "n%d" % i})
@@ -64,7 +64,7 @@ def test_recent_tools_history_is_capped():
 def test_thought_tail_is_a_rolling_500_char_string_never_per_word():
     """The bound is the whole point (#84): a coalesced rolling tail, NOT a growing
     list of per-word chunks — the last N chars, ending on the most recent thought."""
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1)
     for i in range(1000):
         coder_seam.progress_thought("f", 1, "word%d " % i)
@@ -76,14 +76,14 @@ def test_thought_tail_is_a_rolling_500_char_string_never_per_word():
 
 
 def test_usage_records_used_and_size():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1)
     coder_seam.progress_usage("f", 1, {"used": 5, "size": 50})
     assert coder_seam.progress_snapshot("f")["gens"][0]["usage"] == {"used": 5, "size": 50}
 
 
 def test_verify_outcome_is_recorded_per_gen():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1)
     coder_seam.progress_verify("f", 1, test_cmd="pytest -q", output="1 passed", passed=True)
     v = coder_seam.progress_snapshot("f")["gens"][0]["verify"]
@@ -91,7 +91,7 @@ def test_verify_outcome_is_recorded_per_gen():
 
 
 def test_snapshot_orders_gens_ascending():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 3)
     coder_seam.progress_begin("f", 1)
     coder_seam.progress_begin("f", 2)
@@ -99,7 +99,7 @@ def test_snapshot_orders_gens_ascending():
 
 
 def test_progress_new_run_clears_prior_gens():
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     coder_seam.progress_begin("f", 1)
     coder_seam.progress_begin("f", 2)
     assert len(coder_seam.progress_snapshot("f")["gens"]) == 2
@@ -110,7 +110,7 @@ def test_progress_new_run_clears_prior_gens():
 def test_registry_evicts_the_oldest_features_beyond_the_cap():
     """A long-lived loop can't leak memory — the registry keeps only the most
     recent _MAX_FEATURES features, LRU-evicting the oldest."""
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     n = coder_seam._MAX_FEATURES
     for i in range(n + 5):
         coder_seam.progress_begin("f%d" % i, 1)
@@ -119,7 +119,7 @@ def test_registry_evicts_the_oldest_features_beyond_the_cap():
 
 
 def test_elapsed_s_is_monotonic_and_nonnegative(monkeypatch):
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     clock = {"t": 100.0}
     monkeypatch.setattr(coder_seam, "_monotonic", lambda: clock["t"])
     coder_seam.progress_begin("f", 1)
@@ -152,7 +152,7 @@ async def test_dispatch_coder_tapped_falls_back_and_still_records_the_gen(monkey
     """No protoAgent host here (the standalone CI case), so the tap can't wire the
     ACP callbacks — it must fall back to worktree.dispatch_coder and STILL register
     the gen (start/tier) so the drawer shows the run even without a live stream."""
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
     seen = {}
 
     async def _fake(coder, wt, prompt, *, timeout=None):
@@ -202,7 +202,7 @@ class _FakeBudget:
 
 
 async def test_dispatch_records_per_gen_progress_including_the_verify_outcome(monkeypatch):
-    coder_seam._progress_reset()
+    coder_seam._progress.clear()
 
     async def _create(repo, base, cid, root):
         return (f"/wt/feat-{cid}", f"feat/{cid}")

@@ -317,7 +317,6 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMonit
 // the list's per-state collapse).
 window.setView = setView;
 window.toggleGroup = toggleGroup;
-window.openMonitor = openMonitor;
 setView(VIEW);   // sync the toggle + visibility to the initial view (list on mobile)
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated /features pull authenticates) or a short timer

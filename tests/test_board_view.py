@@ -60,4 +60,6 @@ def test_monitor_polls_the_progress_endpoint_and_closes_on_esc_or_click_away():
     assert '"/progress"' in BOARD_PAGE  # hits …/features/{fid}/progress
     assert 'e.key === "Escape"' in BOARD_PAGE  # Esc closes
     assert '$("scrim").addEventListener("click", closeMonitor)' in BOARD_PAGE  # click-away closes
-    assert "window.openMonitor = openMonitor;" in BOARD_PAGE  # exposed past the module scope
+    # Delegated listener via data-mon — no dead window.* global (panel round 2 on #89).
+    assert "data-mon" in BOARD_PAGE
+    assert 'openMonitor(el.getAttribute("data-mon"))' in BOARD_PAGE
