@@ -252,7 +252,9 @@ def _board_tools(cfg: dict):
         (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
         again — no need to cancel and recreate the bead. `difficulty` (small|medium|large)
         re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
-        edges — the repair for dependencies dropped by a create-time failure. Inputs are
+        edges, and `foundation=True` restores the foundation flag — the repairs for
+        dependencies/foundation dropped by a create-time failure (False = leave as-is;
+        this tool never removes the flag). Inputs are
         stripped of any literal wrapping double quotes before storage (same hygiene as
         board_create_feature)."""
         try:

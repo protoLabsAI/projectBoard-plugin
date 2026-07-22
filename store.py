@@ -348,7 +348,9 @@ class BeadsBoard:
         left untouched. This is the escape from the 'unrepairable bead' trap: a feature
         the Ready gate rejects for a missing `spec` / `acceptance_criteria` /
         `files_to_modify` can be fixed IN PLACE and re-marked ready, instead of being
-        cancelled and recreated from scratch."""
+        cancelled and recreated from scratch. ``depends_on`` ADDS blocking edges and
+        ``foundation=True`` adds the foundation label (None/False = untouched) — the
+        repair half of create's success-with-warning contract."""
         f = self._require(fid)
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
