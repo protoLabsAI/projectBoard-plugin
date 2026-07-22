@@ -44,18 +44,26 @@ class _StatefulBr:
         if args and args[0] == "update":
             i = 2
             while i < len(args):
-                flag = args[i]
-                if flag in self._FIELD_FLAGS and i + 1 < len(args):
-                    self.state[self._FIELD_FLAGS[flag]] = args[i + 1]
-                    i += 2
-                elif flag == "--notes" and i + 1 < len(args):
-                    self.state["files_to_modify"] = [p.strip() for p in args[i + 1].splitlines() if p.strip()]
-                    i += 2
-                elif flag == "--add-label" and i + 1 < len(args):
-                    self.state.setdefault("labels", []).append(args[i + 1])
-                    i += 2
+                tok = args[i]
+                # Fields arrive either as plain `--flag value` (labels) or the leading-dash-
+                # safe `--flag=value` form the value fields now use (#85). Normalize both.
+                if tok.startswith("--") and "=" in tok:
+                    flag, _, val = tok.partition("=")
+                    step = 1
+                elif tok in self._FIELD_FLAGS or tok in ("--notes", "--add-label"):
+                    flag = tok
+                    val = args[i + 1] if i + 1 < len(args) else ""
+                    step = 2
                 else:
                     i += 1
+                    continue
+                if flag in self._FIELD_FLAGS:
+                    self.state[self._FIELD_FLAGS[flag]] = val
+                elif flag == "--notes":
+                    self.state["files_to_modify"] = [p.strip() for p in val.splitlines() if p.strip()]
+                elif flag == "--add-label":
+                    self.state.setdefault("labels", []).append(val)
+                i += step
         return [] if want_json else ""
 
     def cmds(self, name):
@@ -176,7 +184,8 @@ def test_update_feature_writes_only_the_passed_fields(make_board, monkeypatch):
     b.update_feature("bd-1", acceptance_criteria="AC", files_to_modify=["x.py", "y.py"])
 
     (call,) = br.cmds("update")
-    assert call == ("update", "bd-1", "--acceptance-criteria", "AC", "--notes", "x.py\ny.py")
+    # value fields ride in the leading-dash-safe `--flag=value` form (#85)
+    assert call == ("update", "bd-1", "--acceptance-criteria=AC", "--notes=x.py\ny.py")
 
 
 def test_update_feature_replaces_a_stale_difficulty_label(make_board, monkeypatch):

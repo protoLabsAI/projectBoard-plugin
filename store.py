@@ -39,10 +39,20 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
 BR = os.environ.get("BR_BIN", "br")
+
+# `br` surfaces a DATABASE_ERROR (SQLite `database is locked`/`busy`) when two br
+# processes write the same `.beads/*.db` concurrently (the loop + a tool call, say) —
+# transient contention that clears on a short retry. Retry ONLY that class (a bad-arg
+# failure is not going to fix itself) with a small exponential backoff so a create/
+# update isn't lost to a lock it merely lost the race for.
+_DB_RETRY_ATTEMPTS = 4
+_DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4)
+_DB_CONTENTION_RE = re.compile(r"DATABASE_ERROR|database is (?:locked|busy)", re.IGNORECASE)
 
 # Labels that encode board state / escalation (everything else is free-form).
 LABEL_READY = "ready"
@@ -153,9 +163,27 @@ class BeadsBoard:
         # to THIS board's workspace, not the server's process cwd (ADR 0055 P0). With a
         # per-team-agent `repo` (or an explicit `db`), the board is deterministically
         # pinned to its repo instead of polluting whatever dir the host launched from.
-        proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise BoardError(f"`br {' '.join(args)}` failed: {proc.stderr.strip()[:300]}")
+        # A transient DATABASE_ERROR (SQLite contention) is retried with a short backoff;
+        # any other non-zero exit raises immediately.
+        delay = _DB_RETRY_DELAY
+        for attempt in range(_DB_RETRY_ATTEMPTS):
+            proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                break
+            err = proc.stderr.strip()
+            if attempt < _DB_RETRY_ATTEMPTS - 1 and _DB_CONTENTION_RE.search(err):
+                log.warning(
+                    "[project_board] `br %s` hit DB contention (attempt %d/%d) — backing off %.2fs: %s",
+                    args[0] if args else "",
+                    attempt + 1,
+                    _DB_RETRY_ATTEMPTS,
+                    delay,
+                    err[:120],
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise BoardError(f"`br {' '.join(args)}` failed: {err[:300]}")
         if not want_json:
             return proc.stdout.strip()
         # `br` prefixes some JSON with INFO log lines on stderr; stdout is clean JSON.
@@ -214,23 +242,63 @@ class BeadsBoard:
         a coder produce nothing). Mark `foundation=True` for a feature others build on
         (dependents gate on its merge, never its review)."""
         fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
+        # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
+        # with a follow-up `br update`. Free-text VALUES ride in `--flag=value` form so a
+        # value that STARTS WITH '-' (a markdown bullet in acceptance_criteria, e.g.
+        # "- do X") can never be mis-parsed as a CLI option and blow up the update (#85);
+        # labels never start with '-', so they stay in the plain `--add-label <v>` form the
+        # rest of the code (and its tests) pin. `enriched` names the fields this update
+        # carries so a failure can report exactly what still needs writing.
         upd = []
+        enriched = []
         if acceptance_criteria:
-            upd += ["--acceptance-criteria", acceptance_criteria]
+            upd += [f"--acceptance-criteria={acceptance_criteria}"]
+            enriched.append("acceptance_criteria")
         if design:
-            upd += ["--design", design]
+            upd += [f"--design={design}"]
+            enriched.append("design")
         if files_to_modify:
             # files_to_modify lives in the bead `notes` field, one path per line.
-            upd += ["--notes", "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())]
+            notes = "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())
+            upd += [f"--notes={notes}"]
+            enriched.append("files_to_modify")
         diff = difficulty.strip().lower()
         if diff:
             # normalize first, then guard: a whitespace-only difficulty must NOT stamp a
             # malformed `diff:` label (an empty tier corrupts the escalation ladder).
             upd += ["--add-label", f"diff:{diff}"]
+            enriched.append("difficulty")
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
+            enriched.append("foundation")
         if upd:
-            self._run("update", fid, *upd)
+            try:
+                self._run("update", fid, *upd)
+            except BoardError as exc:
+                # The create SUCCEEDED but enrichment didn't — NEVER re-raise here. Raising
+                # would bury the id of a bead that already exists on the board, leaving an
+                # orphan behind an error that hides it (the #85 trap). Return the feature (so
+                # the caller HAS the id) flagged with the fields that still need writing, so
+                # the model can finish the job in place with board_update_feature instead of
+                # leaking an unreachable bead.
+                log.warning(
+                    "[project_board] feature %s created but enrichment failed (%s) — returning "
+                    "success-with-warning (repair via board_update_feature); missing: %s",
+                    fid,
+                    exc,
+                    ", ".join(enriched),
+                )
+                # get_feature should always resolve a just-created bead; the fallback keeps
+                # the id + the tool's echo keys present even in the impossible None case.
+                f = self.get_feature(fid) or {"id": fid, "board_state": "backlog", "title": title}
+                f["enrichment_failed"] = True
+                f["missing_fields"] = enriched
+                f["warning"] = (
+                    f"feature {fid} was created but enrichment failed ({exc}); its "
+                    f"{', '.join(enriched)} still need writing — repair in place with "
+                    f"board_update_feature(feature_id={fid!r}, …)."
+                )
+                return f
         for dep in depends_on or ():
             self.add_dependency(fid, dep)
         return self.get_feature(fid)
@@ -260,15 +328,20 @@ class BeadsBoard:
         cancelled and recreated from scratch."""
         f = self._require(fid)
         args = ["update", fid]
+        # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
+        # markdown bullet, a leading-dash path) can't be mis-parsed as a CLI option and
+        # fail the update (#85) — the same hardening as create_feature's enrichment. Labels
+        # never start with '-', so `--add/remove-label` stay in the plain form below.
         if spec is not None:
-            args += ["--description", spec]
+            args += [f"--description={spec}"]
         if acceptance_criteria is not None:
-            args += ["--acceptance-criteria", acceptance_criteria]
+            args += [f"--acceptance-criteria={acceptance_criteria}"]
         if design is not None:
-            args += ["--design", design]
+            args += [f"--design={design}"]
         if files_to_modify is not None:
             # files_to_modify lives in the bead `notes` field, one path per line.
-            args += ["--notes", "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())]
+            notes = "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())
+            args += [f"--notes={notes}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
