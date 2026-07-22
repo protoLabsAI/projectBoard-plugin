@@ -58,6 +58,43 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   #list tr.grp:hover>td{color:var(--pl-color-fg)}
   #list tr.grp .tw{display:inline-block;width:1.1em;text-align:center}
   #list tr.grp .gl{margin-right:var(--pl-space-2)}
+  /* in_progress cards/rows open the live monitor drawer (#84) — cue it's clickable. */
+  .card--live{cursor:pointer}
+  .card--live:hover{border-color:var(--pl-color-accent)}
+  #list tr[data-mon]{cursor:pointer}
+  /* ── Live monitor drawer (#84): a slide-over mirroring the console goal-detail-drawer
+     UX — a right-edge panel over a click-away scrim, polling the per-feature progress
+     snapshot while open. Vanilla + token-driven; this page is an iframe, so it owns its
+     own HTML/JS and imports NO console components. */
+  #scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;
+    transition:opacity .15s ease;z-index:40}
+  #scrim.open{opacity:1;pointer-events:auto}
+  #drawer{position:fixed;top:0;right:0;height:100%;width:min(460px,92vw);z-index:41;
+    background:var(--pl-color-bg-raised);border-left:var(--pl-border-width) solid var(--pl-color-border);
+    box-shadow:-8px 0 24px rgba(0,0,0,.25);transform:translateX(100%);transition:transform .18s ease;
+    display:flex;flex-direction:column;overflow:hidden}
+  #drawer.open{transform:translateX(0)}
+  #drawer .dh{display:flex;align-items:center;gap:var(--pl-space-2);padding:var(--pl-space-3) var(--pl-space-4);
+    border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
+  #drawer .dh h2{font-size:14px;margin:0;flex:1;color:var(--pl-color-accent)}
+  #drawer .dx{cursor:pointer;background:none;border:none;color:var(--pl-color-fg-muted);font-size:18px;line-height:1}
+  #drawer .dx:hover{color:var(--pl-color-fg)}
+  #drawer .db{padding:var(--pl-space-3) var(--pl-space-4);overflow:auto;flex:1}
+  .gen{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
+    padding:var(--pl-space-3);margin-bottom:var(--pl-space-3)}
+  .gen .gh{display:flex;align-items:center;gap:var(--pl-space-2);margin-bottom:var(--pl-space-2);flex-wrap:wrap}
+  .gen .gh .gn{font-weight:600}
+  .gen .lbl{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted);
+    margin:var(--pl-space-2) 0 2px}
+  .gen .cur{font-family:var(--pl-font-mono);font-size:11.5px;word-break:break-word}
+  .gen .loc{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px}
+  .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:11.5px;color:var(--pl-color-fg-muted);
+    max-height:120px;overflow:auto}
+  .gen ul.tools{list-style:none;margin:0;padding:0;max-height:150px;overflow:auto}
+  .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .st-completed{color:var(--pl-color-status-success)}
+  .st-failed{color:var(--pl-color-status-error)}
+  .st-running{color:var(--pl-color-accent)}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
 </style>
@@ -84,6 +121,13 @@ var BASE = location.pathname.split("/plugins/")[0];
   <table id="list" class="pl-table hide"><thead><tr>
     <th>ID</th><th>Title</th><th>State</th><th>Pri</th><th>Flags</th><th>PR</th></tr></thead>
     <tbody id="rows"></tbody></table>
+</div>
+<!-- Live monitor drawer (#84): a slide-over over a click-away scrim. -->
+<div id="scrim"></div>
+<div id="drawer" role="dialog" aria-modal="true" aria-label="Coder monitor">
+  <div class="dh"><h2 id="drawer-title">Coder monitor</h2>
+    <button class="dx" id="drawer-close" aria-label="Close">✕</button></div>
+  <div class="db" id="drawer-body"></div>
 </div>
 <script type="module">
 // The DS plugin-kit owns the protoagent:init handshake (bearer + theme, incl. live
@@ -148,7 +192,10 @@ function render(){
       const items = FEATURES.filter(f => f.state === state);
       const cards = items.map(f => {
         const color = f.blocked ? "var(--pl-color-status-error)" : (f.dag_blocked ? "var(--pl-color-status-warning)" : (STATE_COLOR[state]||"var(--pl-color-accent)"));
-        return '<div class="card" style="border-left-color:'+color+'">'
+        // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
+        const live = state === "in_progress";
+        return '<div class="card'+(live?" card--live":"")+'"'+(live?' data-mon="'+esc(f.id)+'"':"")
+          + ' style="border-left-color:'+color+'">'
           + '<div class="t">'+esc(f.title)+'</div>'
           + '<div class="m"><span class="id">'+esc(f.id)+'</span><span>P'+f.priority+'</span>'
           + flags(f)+' '+pr(f)+'</div></div>';
@@ -161,7 +208,8 @@ function render(){
     // List: group rows under a collapsible per-state header (COLS order + blocked +
     // cancelled), mirroring the Kanban's grouping so a dense board stays scannable (#26).
     const row = (f) =>
-      '<tr><td class="id">'+esc(f.id)+'</td><td>'+esc(f.title)+'</td>'
+      '<tr'+(f.state==="in_progress"?' data-mon="'+esc(f.id)+'"':"")+'>'  // in_progress → opens the monitor (#84)
+      + '<td class="id">'+esc(f.id)+'</td><td>'+esc(f.title)+'</td>'
       + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
       + '<span class="pl-dot-row__label">'+esc(f.state)+'</span></span></td>'
       + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+pr(f)+'</td></tr>';
@@ -199,10 +247,77 @@ async function load(){
   }
 }
 
+// ── Live coder monitor drawer (#84) ────────────────────────────────────────────
+// Clicking an in_progress card/row opens a right-edge slide-over that polls the
+// per-feature progress snapshot every ~3s, mirroring the console's goal-detail-
+// drawer UX in this page's OWN vanilla HTML/JS (an iframe — no console imports).
+const MON_POLL_MS = 3000;
+let MON_FID = null, MON_TIMER = null;
+
+function toolLine(t){
+  const st = esc(t.status||"");
+  const loc = (t.locations && t.locations.length) ? " <span class=\"loc\">"+esc(t.locations.join(", "))+"</span>" : "";
+  return '<li><span class="st-'+st+'">'+st+'</span> '+esc(t.name||"tool")
+    + (t.kind?' <span class="loc">['+esc(t.kind)+']</span>':"")+loc+'</li>';
+}
+function genCard(g){
+  let h = '<div class="gen"><div class="gh"><span class="gn">gen '+esc(String(g.gen))+'</span>'
+    + (g.tier?'<span class="pl-badge">'+esc(g.tier)+'</span>':"")
+    + '<span class="pl-badge">'+esc(String(g.elapsed_s))+'s</span>'
+    + (g.usage?'<span class="pl-badge">'+esc(String(g.usage.used))+'/'+esc(String(g.usage.size))+' tok</span>':"")
+    + '</div>';
+  const cur = g.current_tool;
+  h += '<div class="lbl">current tool</div><div class="cur">'
+    + (cur ? '<span class="st-'+esc(cur.status||"")+'">'+esc(cur.status||"")+'</span> '+esc(cur.name||"")
+        + (cur.locations&&cur.locations.length?' <span class="loc">'+esc(cur.locations.join(", "))+'</span>':"")
+       : "—") + '</div>';
+  if (g.thought_tail){ h += '<div class="lbl">thinking</div><div class="thought">'+esc(g.thought_tail)+'</div>'; }
+  const rt = (g.recent_tools||[]).slice(-30).reverse();
+  if (rt.length){ h += '<div class="lbl">recent tools</div><ul class="tools">'+rt.map(toolLine).join("")+'</ul>'; }
+  if (g.verify){ h += '<div class="lbl">verify</div><div class="cur"><span class="st-'
+    + (g.verify.passed?"completed":"failed")+'">'+(g.verify.passed?"passed":"failed")+'</span> '
+    + esc(g.verify.test_cmd||"")+'</div>'; }
+  return h + '</div>';
+}
+function renderMonitor(data){
+  const gens = (data && data.gens) || [];
+  $("drawer-body").innerHTML = gens.length
+    ? gens.map(genCard).join("")
+    : '<div class="pl-empty">No live coder run for this feature right now.</div>';
+}
+async function pollMonitor(){
+  if (!MON_FID) return;
+  try { renderMonitor(await api("/api/plugins/project_board/features/"+encodeURIComponent(MON_FID)+"/progress")); }
+  catch (e) { $("drawer-body").innerHTML = '<div class="pl-callout pl-callout--error">'+esc(""+e)+'</div>'; }
+}
+function openMonitor(fid){
+  MON_FID = fid;
+  $("drawer-title").textContent = "Coder monitor — " + fid;
+  $("drawer").classList.add("open"); $("scrim").classList.add("open");
+  $("drawer-body").innerHTML = '<div class="pl-empty">Loading…</div>';
+  pollMonitor();
+  if (MON_TIMER) clearInterval(MON_TIMER);
+  MON_TIMER = setInterval(pollMonitor, MON_POLL_MS);
+}
+function closeMonitor(){
+  MON_FID = null;
+  if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
+  $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
+}
+// Delegate clicks: any [data-mon] element (in_progress card or row) opens the drawer.
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-mon]");
+  if (el) openMonitor(el.getAttribute("data-mon"));
+});
+$("scrim").addEventListener("click", closeMonitor);              // click-away closes
+$("drawer-close").addEventListener("click", closeMonitor);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMonitor(); });  // Esc closes
+
 // Module scripts are scoped — expose the inline onclick handlers (view toggle +
 // the list's per-state collapse).
 window.setView = setView;
 window.toggleGroup = toggleGroup;
+window.openMonitor = openMonitor;
 setView(VIEW);   // sync the toggle + visibility to the initial view (list on mobile)
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated /features pull authenticates) or a short timer

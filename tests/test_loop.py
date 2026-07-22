@@ -496,11 +496,13 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         files_to_modify=None,
         fusion_max_file_chars=None,
         env_passthrough=(),
+        tier="",
     ):
         seen["fid"] = fid
         seen["test_cmd"] = test_cmd
         seen["task"] = task
         seen["env_passthrough"] = env_passthrough
+        seen["tier"] = tier
         record_gens(4)
         return (f"/wt/feat-{fid}", f"feat/{fid}", "[coder.solve rung=best-of-k gens=4] solved")
 

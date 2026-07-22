@@ -200,6 +200,22 @@ def build_data_router(cfg: dict):
             raise HTTPException(404, f"unknown feature {fid!r}")
         return f
 
+    @router.get("/features/{fid}/progress")
+    async def _progress(fid: str):
+        """Live coder-monitoring snapshot (#84) for the board view's monitor drawer.
+
+        Returns ``{"gens": [{gen, tier, elapsed_s, current_tool, recent_tools,
+        thought_tail, usage, verify}]}`` — the per-gen in-memory ring buffer the loop/
+        coder_seam dispatch taps fill. 404 on an unknown feature; an empty-but-valid
+        ``{"gens": []}`` for a known feature with no live (or recent) run in this
+        process's memory. Read-only + purely in-process — never touches the board."""
+        f = _guard(lambda: store().get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        from . import coder_seam
+
+        return coder_seam.progress_snapshot(fid)
+
     @router.post("/features")
     async def _create_feature(body: dict = Body(...)):
         return _guard(lambda: store().create_feature(**body))
