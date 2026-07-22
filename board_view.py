@@ -95,6 +95,7 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .st-completed{color:var(--pl-color-status-success)}
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}
+  .st-start{color:var(--pl-color-text-muted)}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
 </style>

@@ -915,7 +915,7 @@ class BoardLoop:
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
                         # keeps the prior history rather than blanking on a keep-worktree fix).
-                        result = await coder_seam._dispatch_coder_tapped(
+                        result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
@@ -975,7 +975,7 @@ class BoardLoop:
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
-                        result = await coder_seam._dispatch_coder_tapped(
+                        result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
                     # Goal-verification gate: confirm the diff meets the acceptance
@@ -1682,7 +1682,7 @@ class BoardLoop:
         # shows all N building in parallel; a tap that can't wire degrades per-candidate.
         results = await asyncio.gather(
             *(
-                coder_seam._dispatch_coder_tapped(
+                coder_seam.dispatch_coder_tapped(
                     coder, wt, prompt, fid=fid, gen=i + 1, tier=tier, timeout=self.coder_timeout or None
                 )
                 for i, (wt, _b) in enumerate(cands)

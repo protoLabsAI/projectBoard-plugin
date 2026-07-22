@@ -317,7 +317,7 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
-async def _dispatch_coder_tapped(
+async def dispatch_coder_tapped(
     coder, worktree_path: str, prompt: str, *, fid: str | None, gen: int, tier: str = "", timeout: float | None = None
 ) -> str:
     """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
@@ -697,7 +697,7 @@ class _WorktreeSolveAdapter:
         self._gen_by_wt[wt] = self._n
         # Tapped dispatch (#84) wires the ACP client's callbacks into this gen's live
         # buffer; it degrades to worktree.dispatch_coder when the tap can't wire.
-        reply = await _dispatch_coder_tapped(
+        reply = await dispatch_coder_tapped(
             self.coder,
             wt,
             _augment_prompt(task, feedback),
@@ -741,7 +741,7 @@ class _WorktreeSolveAdapter:
             self.progress_fid, self._n, {"phase": "start", "id": "fusion", "name": "fusion completion", "kind": "edit"}
         )
         # The whole fallible body rides one try/finally so the gen closes on EVERY
-        # exit path — the same totality _dispatch_coder_tapped guarantees (panel round 2).
+        # exit path — the same totality dispatch_coder_tapped guarantees (panel round 2).
         try:
             wt_root = Path(wt).resolve()
             written = 0
