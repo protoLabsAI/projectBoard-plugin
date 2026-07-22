@@ -742,6 +742,7 @@ class _WorktreeSolveAdapter:
         )
         # The whole fallible body rides one try/finally so the gen closes on EVERY
         # exit path — the same totality dispatch_coder_tapped guarantees (panel round 2).
+        _fusion_ok = False
         try:
             wt_root = Path(wt).resolve()
             written = 0
@@ -795,13 +796,22 @@ class _WorktreeSolveAdapter:
                 log.warning(
                     "[project_board] %s fusion reply parsed to 0 writable files — candidate is unchanged base", self.fid
                 )
+            _fusion_ok = True
+            return wt
+        finally:
+            # The tool card must CLOSE on failure too — otherwise the drawer shows a
+            # perpetually-running "fusion completion" on a gen that is already done
+            # (panel round 3). Status derives from whether the body completed.
             progress_tool(
                 self.progress_fid,
                 self._n,
-                {"phase": "end", "id": "fusion", "name": "fusion completion", "status": "completed"},
+                {
+                    "phase": "end",
+                    "id": "fusion",
+                    "name": "fusion completion",
+                    "status": "completed" if _fusion_ok else "failed",
+                },
             )
-            return wt
-        finally:
             progress_end(self.progress_fid, self._n)
 
     async def verify(self, candidate_wt: str):

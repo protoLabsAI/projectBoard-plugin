@@ -148,7 +148,7 @@ def test_infer_tool_kind_from_name():
 # ── the tap: fallback path (host absent) still records the gen ──────────────────
 
 
-async def testdispatch_coder_tapped_falls_back_and_still_records_the_gen(monkeypatch):
+async def test_dispatch_coder_tapped_falls_back_and_still_records_the_gen(monkeypatch):
     """No protoAgent host here (the standalone CI case), so the tap can't wire the
     ACP callbacks — it must fall back to worktree.dispatch_coder and STILL register
     the gen (start/tier) so the drawer shows the run even without a live stream."""
