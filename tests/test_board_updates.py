@@ -44,18 +44,26 @@ class _StatefulBr:
         if args and args[0] == "update":
             i = 2
             while i < len(args):
-                flag = args[i]
-                if flag in self._FIELD_FLAGS and i + 1 < len(args):
-                    self.state[self._FIELD_FLAGS[flag]] = args[i + 1]
-                    i += 2
-                elif flag == "--notes" and i + 1 < len(args):
-                    self.state["files_to_modify"] = [p.strip() for p in args[i + 1].splitlines() if p.strip()]
-                    i += 2
-                elif flag == "--add-label" and i + 1 < len(args):
-                    self.state.setdefault("labels", []).append(args[i + 1])
-                    i += 2
+                tok = args[i]
+                # Fields arrive either as plain `--flag value` (labels) or the leading-dash-
+                # safe `--flag=value` form the value fields now use (#85). Normalize both.
+                if tok.startswith("--") and "=" in tok:
+                    flag, _, val = tok.partition("=")
+                    step = 1
+                elif tok in self._FIELD_FLAGS or tok in ("--notes", "--add-label"):
+                    flag = tok
+                    val = args[i + 1] if i + 1 < len(args) else ""
+                    step = 2
                 else:
                     i += 1
+                    continue
+                if flag in self._FIELD_FLAGS:
+                    self.state[self._FIELD_FLAGS[flag]] = val
+                elif flag == "--notes":
+                    self.state["files_to_modify"] = [p.strip() for p in val.splitlines() if p.strip()]
+                elif flag == "--add-label":
+                    self.state.setdefault("labels", []).append(val)
+                i += step
         return [] if want_json else ""
 
     def cmds(self, name):
@@ -176,7 +184,8 @@ def test_update_feature_writes_only_the_passed_fields(make_board, monkeypatch):
     b.update_feature("bd-1", acceptance_criteria="AC", files_to_modify=["x.py", "y.py"])
 
     (call,) = br.cmds("update")
-    assert call == ("update", "bd-1", "--acceptance-criteria", "AC", "--notes", "x.py\ny.py")
+    # value fields ride in the leading-dash-safe `--flag=value` form (#85)
+    assert call == ("update", "bd-1", "--acceptance-criteria=AC", "--notes=x.py\ny.py")
 
 
 def test_update_feature_replaces_a_stale_difficulty_label(make_board, monkeypatch):
@@ -319,3 +328,83 @@ def test_update_tool_fills_a_missing_field_so_mark_ready_then_passes(make_board,
     out = json.loads(mark_ready.invoke({"feature_id": "bd-1"}))
     assert out["id"] == "bd-1"
     assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+class _WarningStore:
+    """create_feature returns the success-with-warning shape (post-#88 store contract)."""
+
+    def list_features(self, state=None):
+        return []
+
+    def create_feature(self, title, **kw):
+        return {
+            "id": "bd-w1",
+            "title": title,
+            "board_state": "backlog",
+            "enrichment_failed": True,
+            "missing_fields": ["acceptance_criteria", "depends_on(bd-0)"],
+            "warning": "feature bd-w1 was created but enrichment failed — repair with board_update_feature.",
+        }
+
+
+def test_create_tool_surfaces_the_success_with_warning_through_the_boundary(monkeypatch):
+    """QA panel on PR #88 (cross-file): the tool must NOT strip enrichment_failed /
+    missing_fields / warning — a clean-looking success would hide the repair contract
+    from the agent and board_update_feature would never be invoked."""
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _WarningStore())
+    create = _get_tool("board_create_feature")
+
+    out = json.loads(create.invoke({"title": "T", "spec": "s"}))
+
+    assert out["id"] == "bd-w1"
+    assert out["enrichment_failed"] is True
+    assert out["missing_fields"] == ["acceptance_criteria", "depends_on(bd-0)"]
+    assert "board_update_feature" in out["warning"]
+
+
+def test_update_feature_restores_a_dropped_foundation_flag(make_board, monkeypatch):
+    """Round-4 contract completion (#88): a foundation flag lost to a failed create is
+    repairable — update_feature(foundation=True) adds the label; None/False touch nothing."""
+    br = _StatefulBr({"id": "bd-1", "labels": []})
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", foundation=True)
+    update = next(c for c in br.calls if c and c[0] == "update")
+    assert "--add-label" in update and pb.store.LABEL_FOUNDATION in update
+    br.calls.clear()
+    b.update_feature("bd-1", spec="s")  # no foundation arg → label untouched
+    update = next(c for c in br.calls if c and c[0] == "update")
+    assert pb.store.LABEL_FOUNDATION not in update
+
+
+def test_update_tool_splits_newline_separated_deps(monkeypatch):
+    """Round-6 pin: depends_on accepts newline separators (the round-3 normalization
+    the panel requested) — both forms land as individual edges."""
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+    update.invoke({"feature_id": "bd-1", "depends_on": "bd-7\nbd-8, bd-9"})
+    assert fake.updated["depends_on"] == ["bd-7", "bd-8", "bd-9"]
+
+
+def test_update_feature_applies_good_deps_and_names_the_failed_one(make_board, monkeypatch):
+    """Round-7 pin: a bad dep id in a batch must not abort the rest — good edges land,
+    the failure is named in the same success-with-warning contract create uses."""
+    br = _StatefulBr({"id": "bd-1", "labels": []})
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "backlog", "title": "T", "labels": []})
+    real_add = b.add_dependency
+
+    def flaky_add(fid, dep):
+        if dep == "bd-bad":
+            raise BoardError("no such issue")
+        return real_add(fid, dep)
+
+    monkeypatch.setattr(b, "add_dependency", flaky_add)
+    f = b.update_feature("bd-1", depends_on=["bd-7", "bd-bad", "bd-8"])
+    dep_calls = [c for c in br.calls if c and c[0] == "dep"]
+    assert {c[3] for c in dep_calls} == {"bd-7", "bd-8"}  # good edges landed
+    assert f["enrichment_failed"] is True
+    assert any("depends_on(bd-bad)" in m for m in f["missing_fields"])

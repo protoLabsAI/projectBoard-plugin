@@ -570,6 +570,137 @@ def test_ready_queue_relaxed_releases_only_nonfoundation_in_review_blockers(make
     assert b.ready_queue() == []
 
 
+# ── #85: atomic create+enrich, leading-dash hardening, DB retry ─────────────────────
+# board_create_feature was not atomic: `br create` succeeded, then the enrichment
+# `br update` failed whenever a value STARTED WITH '-' (a markdown bullet in
+# acceptance_criteria parsed as a CLI flag), leaving an orphan bead behind an error that
+# hid its id. The fix: pass enrichment VALUES in `--flag=value` form (a leading dash can
+# never parse as an option), and on an enrichment failure AFTER a successful create,
+# return success-with-warning carrying the id + the fields still needing writing.
+
+
+def _enrich_run(created="bd-1", *, fail_update=False, calls=None):
+    """A fake `_run`: `create` returns an id, `show` returns a bare open bead, and
+    `update` either records + succeeds or (fail_update) raises a BoardError — the
+    enrichment-failed-after-create path."""
+
+    def run_impl(*args, want_json=False):
+        if calls is not None:
+            calls.append(args)
+        head = args[0] if args else ""
+        if head == "create":
+            return created
+        if head == "update" and fail_update:
+            raise BoardError(f"`br update {created}` failed: unexpected argument '- do X'")
+        if head == "show":
+            return [{"id": created, "status": "open", "title": "T", "labels": []}]
+        return [] if want_json else ""
+
+    return run_impl
+
+
+def test_create_feature_passes_leading_dash_value_in_end_of_options_form(make_board):
+    """A leading-dash acceptance_criteria ('- …' markdown bullets) must ride in
+    `--flag=value` form so `br` stores it verbatim instead of parsing it as a CLI flag."""
+    calls = []
+    b = make_board(_enrich_run(calls=calls))
+    ac = "- filters results\n- debounces input"
+    b.create_feature("T", spec="s", acceptance_criteria=ac, files_to_modify=["a.py"])
+    update = next(c for c in calls if c and c[0] == "update")
+    # the value is glued to the flag with '=' (dash-safe) …
+    assert f"--acceptance-criteria={ac}" in update
+    # … and NEVER as a bare flag followed by a dash-leading value (the #85 misparse).
+    assert "--acceptance-criteria" not in update
+
+
+def test_create_feature_enrichment_failure_returns_id_and_missing_fields(make_board):
+    """Create succeeds, enrichment `br update` fails → success-with-warning: the bead id
+    plus the fields still needing writing, NEVER a bare error that conceals the id."""
+    b = make_board(_enrich_run("bd-7", fail_update=True))
+    f = b.create_feature("T", spec="s", acceptance_criteria="- do X", design="d", files_to_modify=["a.py"])
+    assert f["id"] == "bd-7"  # the id survives — no orphan hidden behind an error
+    assert f["enrichment_failed"] is True
+    assert set(f["missing_fields"]) == {"acceptance_criteria", "design", "files_to_modify"}
+    assert "board_update_feature" in f["warning"]
+
+
+def test_create_feature_success_carries_no_enrichment_warning(make_board):
+    """The happy path returns a clean projection — no stray enrichment flags."""
+    b = make_board(_enrich_run("bd-3"))
+    f = b.create_feature("T", spec="s", acceptance_criteria="a", files_to_modify=["a.py"])
+    assert "enrichment_failed" not in f and "missing_fields" not in f
+
+
+def test_update_feature_uses_end_of_options_form_for_value_fields(make_board, monkeypatch):
+    """The same #85 hardening in the repair path: a leading-dash value goes out in
+    `--flag=value` form, never as a bare flag + dash-leading value."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", acceptance_criteria="- a leading-dash bullet", spec="-starts with dash")
+    update = next(c for c in br.calls if c and c[0] == "update")
+    assert "--acceptance-criteria=- a leading-dash bullet" in update
+    assert "--description=-starts with dash" in update
+    assert "--acceptance-criteria" not in update and "--description" not in update
+
+
+# ── #85: transient DATABASE_ERROR (SQLite contention) retries with backoff ──────────
+
+
+def _proc(returncode, stderr=""):
+    return types.SimpleNamespace(returncode=returncode, stdout="ok", stderr=stderr)
+
+
+def test_run_retries_a_transient_database_error_then_succeeds(monkeypatch, _have_br):
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        # first attempt: SQLite contention; second: clears.
+        return _proc(1, "DATABASE_ERROR: database is locked") if n["calls"] == 1 else _proc(0)
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    slept = []
+    monkeypatch.setattr(store.time, "sleep", lambda s: slept.append(s))
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True  # skip the br-init pin so only the retry path is exercised
+    assert b._run("list") == "ok"  # the retry cleared the lock
+    assert n["calls"] == 2 and slept  # one failure, one backoff, then success
+
+
+def test_run_does_not_retry_a_non_database_error(monkeypatch, _have_br):
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        return _proc(1, "VALIDATION_ERROR: bad --type")
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.time, "sleep", lambda s: None)
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    with pytest.raises(BoardError, match="failed"):
+        b._run("list")
+    assert n["calls"] == 1  # not contention → no retry
+
+
+def test_run_gives_up_after_exhausting_db_retries(monkeypatch, _have_br):
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        return _proc(1, "DATABASE_ERROR: database is busy")
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.time, "sleep", lambda s: None)
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    with pytest.raises(BoardError):
+        b._run("list")
+    assert n["calls"] == store._DB_RETRY_ATTEMPTS  # persistent lock → bounded retries, then raise
+
+
 # ── workspace pinning (ADR 0055 P0) ─────────────────────────────────────────────
 # The board must be deterministically pinned to ITS workspace (a configured `db` or
 # `repo`), not the host process's cwd — so a per-team-agent board (scale-out) writes
@@ -622,3 +753,41 @@ def test_run_executes_in_the_configured_repo(monkeypatch, _have_br):
 
     store.BeadsBoard()._run("list")
     assert captured["cwd"] == "."  # default repo → process cwd, unchanged behavior
+
+
+def test_create_feature_wires_deps_even_when_enrichment_fails(make_board):
+    """QA panel on PR #88: dependency edges are independent of the enrichment `br update`
+    — an enrichment failure must never silently drop them. Deps go out FIRST."""
+    calls = []
+    b = make_board(_enrich_run("bd-9", fail_update=True, calls=calls))
+    f = b.create_feature(
+        "T", spec="s", acceptance_criteria="- a", files_to_modify=["a.py"], depends_on=["bd-1", "bd-2"]
+    )
+    dep_calls = [c for c in calls if c and c[0] == "dep"]
+    assert [c[2] for c in dep_calls] == ["bd-9", "bd-9"]  # both edges attempted (fid position)
+    assert {c[3] for c in dep_calls} == {"bd-1", "bd-2"}
+    assert f["enrichment_failed"] is True  # the warning still reports the enrichment half
+    assert not any("depends_on" in m for m in f["missing_fields"])  # deps did NOT fail
+
+
+def test_create_feature_reports_failed_dep_edges_in_warning(make_board, monkeypatch):
+    """A dep edge that fails is tracked like a failed field: named in missing_fields and
+    repairable via board_update_feature(depends_on=…) — never silently lost."""
+    b = make_board(_enrich_run("bd-9"))
+    monkeypatch.setattr(b, "add_dependency", lambda fid, dep: (_ for _ in ()).throw(BoardError("no such issue")))
+    f = b.create_feature("T", spec="s", acceptance_criteria="a", files_to_modify=["a.py"], depends_on=["bd-x"])
+    assert f["enrichment_failed"] is True
+    assert any("depends_on(bd-x)" in m for m in f["missing_fields"])
+    assert "board_update_feature" in f["warning"]
+
+
+def test_update_feature_adds_dependency_edges(make_board, monkeypatch):
+    """The repair contract is deliverable: update_feature(depends_on=…) adds the blocking
+    edges a failed create-time wiring dropped (QA panel on PR #88)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", depends_on=["bd-7", "bd-8"])
+    dep_calls = [c for c in br.calls if c and c[0] == "dep"]
+    assert [(c[2], c[3]) for c in dep_calls] == [("bd-1", "bd-7"), ("bd-1", "bd-8")]

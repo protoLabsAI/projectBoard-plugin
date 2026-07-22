@@ -127,6 +127,24 @@ def _strip_wrapping_quotes(s: str) -> str:
     return s
 
 
+def _split_list(raw: str) -> list[str]:
+    """Comma- or newline-separated string → clean list (the shared normalization for
+    files_to_modify and depends_on across create/update — round-4 DRY finding on #88)."""
+    return [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
+
+
+def _feature_reply(f: dict) -> str:
+    """Serialize a store feature for a tool return — carrying the success-with-warning
+    trio through the boundary when set (QA panel on #88: stripping it hides the repair
+    contract from the agent)."""
+    out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
+    if f.get("enrichment_failed"):
+        out["enrichment_failed"] = True
+        out["missing_fields"] = f.get("missing_fields", [])
+        out["warning"] = f.get("warning", "")
+    return json.dumps(out)
+
+
 def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
@@ -199,8 +217,8 @@ def _board_tools(cfg: dict):
                         "the same work; re-check the board before creating again, or pass "
                         "force=true to create a second copy anyway."
                     )
-            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
-            files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
+            deps = _split_list(depends_on)
+            files = _split_list(files_to_modify)
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -213,7 +231,7 @@ def _board_tools(cfg: dict):
                 depends_on=deps,
                 foundation=foundation,
             )
-            return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
+            return _feature_reply(f)
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -225,14 +243,20 @@ def _board_tools(cfg: dict):
         files_to_modify: str = "",
         design: str = "",
         difficulty: str = "",
+        depends_on: str = "",
+        foundation: bool = False,
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
         as-is. Use it to fill a missing `spec`, `acceptance_criteria`, or `files_to_modify`
         (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
         again — no need to cancel and recreate the bead. `difficulty` (small|medium|large)
-        re-seeds the model tier. Inputs are stripped of any literal wrapping double quotes
-        before storage (same hygiene as board_create_feature)."""
+        re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
+        edges, and `foundation=True` restores the foundation flag — the repairs for
+        dependencies/foundation dropped by a create-time failure (False = leave as-is;
+        this tool never removes the flag). Inputs are
+        stripped of any literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
         try:
             store = get_store(**store_kw)
             spec = _strip_wrapping_quotes(spec)
@@ -240,7 +264,9 @@ def _board_tools(cfg: dict):
             files_to_modify = _strip_wrapping_quotes(files_to_modify)
             design = _strip_wrapping_quotes(design)
             difficulty = _strip_wrapping_quotes(difficulty)
-            files = [p.strip() for p in files_to_modify.replace("\n", ",").split(",") if p.strip()]
+            depends_on = _strip_wrapping_quotes(depends_on)
+            files = _split_list(files_to_modify)
+            deps = _split_list(depends_on)
             f = store.update_feature(
                 feature_id,
                 spec=spec or None,
@@ -250,8 +276,10 @@ def _board_tools(cfg: dict):
                 # strip BEFORE the truthiness check so a whitespace-only difficulty is a
                 # no-op (None), never a `"   "` that reaches the store as a "set it" signal.
                 difficulty=difficulty.strip() or None,
+                depends_on=deps or None,
+                foundation=foundation or None,
             )
-            return json.dumps({"id": f["id"], "state": f["board_state"], "title": f["title"]})
+            return _feature_reply(f)
         except BoardError as exc:
             return f"Error: {exc}"
 
