@@ -245,6 +245,7 @@ def _board_tools(cfg: dict):
     @tool
     def board_update_feature(
         feature_id: str,
+        title: str = "",
         spec: str = "",
         acceptance_criteria: str = "",
         files_to_modify: str = "",
@@ -258,7 +259,8 @@ def _board_tools(cfg: dict):
         gate rejects. Only the non-empty arguments are written; every other field is left
         as-is. Use it to fill a missing `spec`, `acceptance_criteria`, or `files_to_modify`
         (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
-        again — no need to cancel and recreate the bead. `difficulty` (small|medium|large)
+        again — no need to cancel and recreate the bead. `title` renames the feature
+        (empty = leave unchanged). `difficulty` (small|medium|large)
         re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
         edges, and `foundation=True` restores the foundation flag — the repairs for
         dependencies/foundation dropped by a create-time failure (False = leave as-is;
@@ -270,6 +272,7 @@ def _board_tools(cfg: dict):
         board_create_feature)."""
         try:
             store = get_store(**store_kw)
+            title = _strip_wrapping_quotes(title)
             spec = _strip_wrapping_quotes(spec)
             acceptance_criteria = _strip_wrapping_quotes(acceptance_criteria)
             files_to_modify = _strip_wrapping_quotes(files_to_modify)
@@ -281,6 +284,9 @@ def _board_tools(cfg: dict):
             deps = _split_list(depends_on)
             f = store.update_feature(
                 feature_id,
+                # strip BEFORE the truthiness check (the difficulty convention below) so a
+                # whitespace-only title is a no-op (None), never a "set the title" signal.
+                title=title.strip() or None,
                 spec=spec or None,
                 acceptance_criteria=acceptance_criteria or None,
                 design=design or None,

@@ -197,6 +197,7 @@ class _RoundTripStore:
         self,
         fid,
         *,
+        title=None,
         spec=None,
         acceptance_criteria=None,
         design=None,
@@ -206,6 +207,8 @@ class _RoundTripStore:
         foundation=None,
         source_issue=None,
     ):
+        if title is not None:
+            self.f["title"] = title
         if spec is not None:
             self.f["spec"] = spec
         if acceptance_criteria is not None:
@@ -231,6 +234,7 @@ def test_get_feature_round_trips_values_written_by_update(monkeypatch):
     update.invoke(
         {
             "feature_id": "bd-1",
+            "title": "Renamed feature",
             "spec": "the new spec",
             "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
             "files_to_modify": "a.py, b.py",
@@ -239,6 +243,7 @@ def test_get_feature_round_trips_values_written_by_update(monkeypatch):
     )
     out = json.loads(get.invoke({"feature_id": "bd-1"}))
 
+    assert out["title"] == "Renamed feature"
     assert out["spec"] == "the new spec"
     assert out["acceptance_criteria"] == "WHEN x THE SYSTEM SHALL y"
     assert out["files_to_modify"] == ["a.py", "b.py"]  # tool split → stored → read back

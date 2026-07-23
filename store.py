@@ -615,6 +615,7 @@ class BeadsBoard:
         self,
         fid: str,
         *,
+        title: str | None = None,
         spec: str | None = None,
         acceptance_criteria: str | None = None,
         design: str | None = None,
@@ -629,17 +630,22 @@ class BeadsBoard:
         left untouched. This is the escape from the 'unrepairable bead' trap: a feature
         the Ready gate rejects for a missing `spec` / `acceptance_criteria` /
         `files_to_modify` can be fixed IN PLACE and re-marked ready, instead of being
-        cancelled and recreated from scratch. ``depends_on`` ADDS blocking edges and
-        ``foundation=True`` adds the foundation label (None/False = untouched) — the
-        repair half of create's success-with-warning contract. ``source_issue`` (a
-        full GitHub issue URL or ``owner/repo#N``) sets/replaces the originating-issue
-        record the PR opener stamps as ``Fixes #N`` (#97)."""
+        cancelled and recreated from scratch. ``title`` renames the feature (`br
+        update --title`); a whitespace-only value collapses to empty → untouched (the
+        difficulty convention — a bead can never carry a blank title). ``depends_on``
+        ADDS blocking edges and ``foundation=True`` adds the foundation label
+        (None/False = untouched) — the repair half of create's success-with-warning
+        contract. ``source_issue`` (a full GitHub issue URL or ``owner/repo#N``)
+        sets/replaces the originating-issue record the PR opener stamps as
+        ``Fixes #N`` (#97)."""
         f = self._require(fid)
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
         # markdown bullet, a leading-dash path) can't be mis-parsed as a CLI option and
         # fail the update (#85) — the same hardening as create_feature's enrichment. Labels
         # never start with '-', so `--add/remove-label` stay in the plain form below.
+        if title is not None and title.strip():
+            args += [f"--title={title.strip()}"]
         if spec is not None:
             args += [f"--description={spec}"]
         if acceptance_criteria is not None:
