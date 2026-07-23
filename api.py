@@ -223,7 +223,7 @@ def build_data_router(cfg: dict):
     @router.post("/features/batch")
     async def _create_from_plan(body: dict = Body(default={})):
         """Batch-create a whole decomposition (#92). Body: ``{"plan": [{title, spec,
-        acceptance_criteria, files, difficulty, depends_on, foundation}, …],
+        acceptance_criteria, files, difficulty, depends_on, foundation, source_issue}, …],
         "mark_ready": false}``. All-or-report: a malformed item fails itself with a
         named reason, the rest proceed; inter-item ``depends_on`` (by 0-based index or
         title) resolves after every create; ``mark_ready`` promotes only clean items."""
