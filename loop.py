@@ -256,7 +256,10 @@ def _source_issue(feature: dict) -> tuple[str, int] | None:
     ``n`` the issue number — or ``None`` when the feature names no source issue.
 
     Precedence: an explicit ``source_issue`` field (a full URL, ``owner/repo#n``, or a
-    bare ``#n``/``n``) wins; otherwise the FIRST GitHub issue URL in the feature text."""
+    bare ``#n``/``n``) wins; otherwise the FIRST GitHub issue URL in the feature text.
+    The explicit field is the store's projection of the bead-notes ``source-issue:``
+    metadata line (#101 — beads' label charset can't carry ``/``/``#``, so the record
+    lives off-label in `notes`); this reader only ever sees the projected value."""
     raw = str(feature.get("source_issue") or "").strip()
     if raw:
         m = _ISSUE_URL_RE.search(raw)

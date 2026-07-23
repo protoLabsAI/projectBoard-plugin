@@ -1052,10 +1052,13 @@ def test_requeue_preserves_the_open_pr_and_clears_the_assignee(make_board, monke
         BeadsBoard._resolve_plan_dep(-5, {0: "bd-1"}, {})
 
 
-# ── source_issue: normalize + store the originating GitHub issue (#97) ───────────
-# The bead carries a single replaced `source:owner/repo#N` label (the gens:/verified:
-# pattern); the projection exposes it as `source_issue`, which the loop's PR opener
-# reads to stamp `Fixes #N` on the feature's PR.
+# ── source_issue: normalize + store the originating GitHub issue (#97/#101) ──────
+# The bead carries a single `source-issue: owner/repo#N` metadata line in its `notes`
+# field, beside the files_to_modify lines — NOT a label: beads' label validator only
+# allows [alphanumeric - _ :], so the original `source:owner/repo#N` label failed
+# VALIDATION_FAILED on every real write (#101). The projection splits notes back into
+# `files_to_modify` + `source_issue`, which the loop's PR opener reads to stamp
+# `Fixes #N` on the feature's PR.
 
 
 @pytest.mark.parametrize(
@@ -1089,12 +1092,14 @@ def test_normalize_source_issue_rejects_invalid_with_a_named_error(bad):
         store.normalize_source_issue(bad)
 
 
-def test_create_feature_stores_the_normalized_source_label(make_board):
+def test_create_feature_stores_the_normalized_source_issue_in_notes(make_board):
     calls = []
     b = make_board(_enrich_run(calls=calls))
     b.create_feature("T", spec="s", source_issue="https://github.com/acme/widgets/issues/97")
     update = next(c for c in calls if c and c[0] == "update")
-    assert "--add-label" in update and "source:acme/widgets#97" in update
+    assert "--notes=source-issue: acme/widgets#97" in update
+    # NEVER a label — beads' label charset rejects `/` and `#` (#101).
+    assert "--add-label" not in update
 
 
 def test_create_feature_passes_a_canonical_slug_through_unchanged(make_board):
@@ -1102,7 +1107,17 @@ def test_create_feature_passes_a_canonical_slug_through_unchanged(make_board):
     b = make_board(_enrich_run(calls=calls))
     b.create_feature("T", spec="s", source_issue="acme/widgets#8")
     update = next(c for c in calls if c and c[0] == "update")
-    assert "source:acme/widgets#8" in update
+    assert "--notes=source-issue: acme/widgets#8" in update
+
+
+def test_create_feature_files_and_source_share_one_notes_write(make_board):
+    """files_to_modify + source_issue land in the SAME `--notes=` payload: paths
+    first (one per line), the metadata line last."""
+    calls = []
+    b = make_board(_enrich_run(calls=calls))
+    b.create_feature("T", spec="s", files_to_modify=["a.py", "b.py"], source_issue="acme/widgets#8")
+    update = next(c for c in calls if c and c[0] == "update")
+    assert "--notes=a.py\nb.py\nsource-issue: acme/widgets#8" in update
 
 
 def test_create_feature_invalid_source_issue_rejects_before_minting_a_bead(make_board):
@@ -1115,22 +1130,45 @@ def test_create_feature_invalid_source_issue_rejects_before_minting_a_bead(make_
     assert not any(c and c[0] == "create" for c in calls)  # no orphan
 
 
-def test_create_feature_without_source_issue_adds_no_source_label(make_board):
+def test_create_feature_without_source_issue_writes_no_source_line(make_board):
     calls = []
     b = make_board(_enrich_run(calls=calls))
     b.create_feature("T", spec="s", acceptance_criteria="a", files_to_modify=["a.py"])
+    update = next(c for c in calls if c and c[0] == "update")
+    assert "--notes=a.py" in update
     for c in calls:
-        assert not any(str(tok).startswith("source:") for tok in c)
+        assert not any("source-issue:" in str(tok) for tok in c)
 
 
-def test_update_feature_replaces_a_stale_source_label(make_board, monkeypatch):
+def test_update_feature_replaces_a_stale_source_line_and_keeps_files(make_board, monkeypatch):
+    """`--notes` replaces the whole field, so the rewrite must carry the current
+    files_to_modify forward while swapping in the new source-issue line."""
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["source:old/repo#1", "ready"]})
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "files_to_modify": ["a.py"], "source_issue": "old/repo#1", "labels": ["ready"]},
+    )
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
     b.update_feature("bd-1", source_issue="https://github.com/acme/widgets/issues/9")
     (call,) = br.cmds("update")
-    assert call == ("update", "bd-1", "--remove-label", "source:old/repo#1", "--add-label", "source:acme/widgets#9")
+    assert call == ("update", "bd-1", "--notes=a.py\nsource-issue: acme/widgets#9")
+
+
+def test_update_feature_files_update_preserves_the_source_line(make_board, monkeypatch):
+    """The mirror image: a files-only update must never drop the stored source."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "files_to_modify": ["a.py"], "source_issue": "acme/widgets#8", "labels": []},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", files_to_modify=["x.py", "y.py"])
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--notes=x.py\ny.py\nsource-issue: acme/widgets#8")
 
 
 def test_update_feature_invalid_source_issue_raises_and_writes_nothing(make_board, monkeypatch):
@@ -1146,16 +1184,18 @@ def test_update_feature_invalid_source_issue_raises_and_writes_nothing(make_boar
 def test_update_feature_whitespace_source_issue_is_a_noop(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["source:old/repo#1"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "source_issue": "old/repo#1", "labels": []})
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
     b.update_feature("bd-1", source_issue="   ")
     assert br.cmds("update") == []  # the difficulty convention: blank = leave untouched
 
 
-def test_project_exposes_source_issue_from_the_label(make_board):
+def test_project_splits_notes_into_files_and_source_issue(make_board):
     b = make_board(Br())
-    bead = {"id": "x", "status": "open", "labels": ["source:acme/widgets#8", "ready"]}
-    assert b._project(bead)["source_issue"] == "acme/widgets#8"
+    bead = {"id": "x", "status": "open", "labels": ["ready"], "notes": "a.py\nsource-issue: acme/widgets#8"}
+    f = b._project(bead)
+    assert f["source_issue"] == "acme/widgets#8"
+    assert f["files_to_modify"] == ["a.py"]  # the metadata line never leaks into the file list
     assert b._project({"id": "y", "status": "open", "labels": []})["source_issue"] == ""
 
 
@@ -1165,7 +1205,7 @@ def test_projected_source_issue_feeds_the_loops_fixes_line(make_board):
     from project_board.loop import _source_issue
 
     b = make_board(Br())
-    f = b._project({"id": "x", "status": "open", "labels": ["source:acme/widgets#8"]})
+    f = b._project({"id": "x", "status": "open", "labels": [], "notes": "source-issue: acme/widgets#8"})
     assert _source_issue(f) == ("acme/widgets", 8)
     # absent → the description-URL fallback still works, unchanged
     f = b._project(
@@ -1180,7 +1220,7 @@ def test_create_from_plan_passes_source_issue_through(make_board, monkeypatch):
         [{"title": "F", "spec": "s", "files": "a.py", "source_issue": "https://github.com/acme/widgets/issues/97"}]
     )
     assert out["summary"]["created"] == 1
-    assert any("--add-label" in u and "source:acme/widgets#97" in u for u in br.cmds("update"))
+    assert any("--notes=a.py\nsource-issue: acme/widgets#97" in u for u in br.cmds("update"))
 
 
 def test_create_from_plan_invalid_source_issue_fails_that_item_not_the_batch(make_board, monkeypatch):
@@ -1195,4 +1235,5 @@ def test_create_from_plan_invalid_source_issue_fails_that_item_not_the_batch(mak
     assert out["created_ids"] == ["bd-1"]  # the invalid item never minted a bead
     bad = next(r for r in out["items"] if not r["created"])
     assert bad["title"] == "Bad" and "invalid source_issue" in bad["error"]
-    assert any("source:acme/widgets#5" in u for u in br.cmds("update"))  # the good item still landed
+    # the good item still landed (its source rides the notes metadata line)
+    assert any("--notes=a.py\nsource-issue: acme/widgets#5" in u for u in br.cmds("update"))
