@@ -103,6 +103,46 @@ def build_router(cfg: dict):
 
         return _guard(_handle)
 
+    @router.post("/features/{fid}/review")
+    async def _review(fid: str, body: dict = Body(...)):
+        """Adverse code-review bounce for the feature's open PR — the review sibling
+        of ``/ci`` fail. Records the ``findings`` as a DISTINCT review-bounce comment
+        on the bead (≠ ci-fail), feeds them into the next dispatch prompt (the same
+        ``_ci_feedback`` lever the in-loop review gate uses), and **requeues onto the
+        SAME open PR** (``pr_url`` preserved via external_ref). Works from
+        ``in_review``.
+
+        Body: ``{findings: str, escalate: bool=false}``. ``escalate=true`` climbs the
+        model ladder (like ``/ci``); the default keeps the same tier. With escalation
+        enabled and the ladder already at the top, an escalated bounce → Blocked
+        (never a silent re-loop)."""
+        findings = str(body.get("findings", ""))
+        escalate = bool(body.get("escalate", False))
+
+        def _handle():
+            s = store()
+            # Distinct review-bounce comment on the bead (enforces in_review), then hand
+            # the findings to the loop so its next dispatch prompt LEADS with them — the
+            # external sibling of the in-loop review gate's _ci_feedback write.
+            s.record_review_bounce(fid, findings)
+            from .loop import queue_review_feedback
+
+            queue_review_feedback(fid, findings)
+            if escalate and escalate_on:
+                nxt = s.escalate(fid, f"review-fail: {findings}" if findings else "review-fail")
+                if nxt is None:
+                    return {
+                        "requeued": False,
+                        "escalated": True,
+                        "exhausted": True,
+                        "feature": s.block_from_review(fid, f"review-fail: {findings}"),
+                    }
+                return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": s.requeue(fid)}
+            # escalate=false (or no ladder configured): requeue at the SAME tier.
+            return {"requeued": True, "escalated": False, "feature": s.requeue(fid)}
+
+        return _guard(_handle)
+
     # ── the ONE Done edge: merge webhook ──────────────────────────────────────
     @router.post("/webhook/pr")
     async def _webhook_pr(request: Request):

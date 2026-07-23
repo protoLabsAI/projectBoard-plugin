@@ -295,6 +295,43 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_get_feature(feature_id: str) -> str:
+        """Read a single feature's FULL detail as JSON — `title`, `spec`,
+        `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `difficulty`,
+        `files_to_modify`, `foundation`, `priority`, `source_issue`, plus two
+        dependency views: `depends_on` (EVERY blocking edge — the historical ledger,
+        including already-merged blockers) and `open_depends_on` (only the edges
+        whose blocker is still OPEN — the live, actionable "what's blocking me now"
+        signal). The READ half of a read-modify-write: fetch the current criteria/
+        spec, revise them, then `board_update_feature` — no operator round-trip. Returns
+        `Error: unknown feature …` for an id that isn't on the board."""
+        try:
+            f = get_store(**store_kw).get_feature(feature_id)
+        except BoardError as exc:
+            return f"Error: {exc}"
+        if f is None:
+            return f"Error: unknown feature {feature_id!r}"
+        return json.dumps(
+            {
+                "id": f["id"],
+                "title": f["title"],
+                "spec": f["spec"],
+                "acceptance_criteria": f["acceptance_criteria"],
+                "design": f["design"],
+                "state": f["board_state"],
+                "labels": f.get("labels", []),
+                "pr_url": f["pr_url"],
+                "difficulty": f["difficulty"],
+                "files_to_modify": f.get("files_to_modify", []),
+                "foundation": f.get("foundation", False),
+                "priority": f.get("priority", 2),
+                "source_issue": f.get("source_issue", ""),
+                "depends_on": f.get("depends_on", []),
+                "open_depends_on": f.get("open_depends_on", []),
+            }
+        )
+
+    @tool
     def board_mark_ready(feature_id: str) -> str:
         """Promote a feature backlog → ready. Fails if it lacks a spec +
         acceptance_criteria (the Ready gate). Only `ready` features are pulled."""
@@ -347,4 +384,12 @@ def _board_tools(cfg: dict):
             indent=2,
         )
 
-    return [board_create_epic, board_create_feature, board_update_feature, board_mark_ready, board_list, board_retro]
+    return [
+        board_create_epic,
+        board_create_feature,
+        board_update_feature,
+        board_get_feature,
+        board_mark_ready,
+        board_list,
+        board_retro,
+    ]

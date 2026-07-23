@@ -790,6 +790,18 @@ class BeadsBoard:
             self._comment(fid, f"CI failed: {reason}")
         return self.get_feature(fid)
 
+    def record_review_bounce(self, fid: str, findings: str = "") -> dict:
+        """Record an adverse code-review bounce as a DISTINCT comment on the bead —
+        the review sibling of ``bounce_ci_fail``'s ``CI failed:`` note, kept separate
+        from the requeue so the review history survives on the bead even though the
+        same open PR is reused. Expects ``in_review`` — the state an adverse review
+        lands from; the caller then ``requeue``s onto the same PR (pr_url preserved)."""
+        f = self._require(fid)
+        if f["board_state"] != "in_review":
+            raise BoardError(f"review bounce expects in_review, got {f['board_state']!r}")
+        self._comment(fid, f"review requested changes: {findings}" if findings else "review requested changes")
+        return f
+
     def requeue(self, fid: str) -> dict:
         """Put a feature back to `ready` for re-dispatch (keeps its open PR via
         external_ref). The puller re-claims it and the loop re-dispatches — at the
@@ -1133,10 +1145,16 @@ class BeadsBoard:
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
         state = self.board_state(bead)
-        dag_blocked = state == "ready" and any(
-            d.get("dependency_type") == "blocks" and d.get("status") != "closed"
-            for d in (bead.get("dependencies") or [])
-        )
+        blocks_edges = [d for d in (bead.get("dependencies") or []) if d.get("dependency_type") == "blocks"]
+        dag_blocked = state == "ready" and any(d.get("status") != "closed" for d in blocks_edges)
+        # The `blocks` dependency ledger vs. its live subset. `br show` carries
+        # dependencies (`br list` omits them, so BOTH are [] in a list projection —
+        # read a single feature via get_feature for the real edges). `depends_on` is
+        # EVERY blocking edge — the historical ledger, including already-merged
+        # (closed) blockers; `open_depends_on` keeps only the edges whose blocker is
+        # still open — the live "what is actually blocking me right now" signal.
+        depends_on = [d["id"] for d in blocks_edges if d.get("id")]
+        open_depends_on = [d["id"] for d in blocks_edges if d.get("id") and d.get("status") != "closed"]
         return {
             "id": bead.get("id"),
             "title": bead.get("title", ""),
@@ -1156,6 +1174,8 @@ class BeadsBoard:
             "cancelled": LABEL_CANCELLED in labels,
             "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
+            "depends_on": depends_on,
+            "open_depends_on": open_depends_on,
             "attempts": attempts,
             "gens_spent": gens_spent,
             "verified_sha": verified_sha,
