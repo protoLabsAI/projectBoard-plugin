@@ -13,7 +13,14 @@ from __future__ import annotations
 import asyncio
 
 from project_board import worktree
-from project_board.loop import BoardLoop, _ci_failure_reason, _pr_body, _resolve_gate_cmd
+from project_board.loop import (
+    BoardLoop,
+    _ci_failure_reason,
+    _inject_source_issue_line,
+    _pr_body,
+    _resolve_gate_cmd,
+    _source_issue,
+)
 
 
 class FakeLoopStore:
@@ -2543,3 +2550,111 @@ def loop_install():
     from project_board.loop import _PNPM_INSTALL
 
     return _PNPM_INSTALL
+
+
+# ── source-issue → PR "Fixes #N" line (#93) ─────────────────────────────────────
+
+
+def test_source_issue_prefers_field_then_scans_description():
+    """An explicit `source_issue` field wins (full URL / owner-repo#n / bare number);
+    otherwise the FIRST GitHub issue URL in the feature text is used."""
+    assert _source_issue({"source_issue": "https://github.com/acme/widgets/issues/8"}) == ("acme/widgets", 8)
+    assert _source_issue({"source_issue": "other/repo#12"}) == ("other/repo", 12)
+    assert _source_issue({"source_issue": "#4"}) == ("", 4)
+    assert _source_issue({"source_issue": "4"}) == ("", 4)
+    # No field → the FIRST issue URL in the text (spec here) wins over the later one.
+    feat = {"spec": "per https://github.com/acme/widgets/issues/1 then https://github.com/acme/widgets/issues/2"}
+    assert _source_issue(feat) == ("acme/widgets", 1)
+    assert _source_issue({"spec": "no issue linked here"}) is None
+
+
+def test_inject_same_repo_appends_fixes_and_is_idempotent():
+    body = "## Summary\n\n- did the thing"
+    out = _inject_source_issue_line(body, "acme/widgets", 7, "acme/widgets")
+    assert out == body + "\n\nFixes #7"
+    # A same-repo closing reference already present suppresses (no duplicate).
+    assert _inject_source_issue_line(out, "acme/widgets", 7, "acme/widgets") == out
+    assert _inject_source_issue_line("Closes #7 already", "acme/widgets", 7, "acme/widgets") == "Closes #7 already"
+
+
+def test_inject_cross_repo_appends_refs_link():
+    body = "## Summary\n\n- did it"
+    out = _inject_source_issue_line(body, "other/repo", 9, "acme/widgets")
+    assert out == body + "\n\nRefs https://github.com/other/repo/issues/9"
+
+
+def test_inject_url_dedup_is_word_bounded():
+    """FIX-NOW item 1: the URL suppression must be \\b-bounded — issues/12 is a substring
+    of issues/123, so a body that only references #123 must NOT suppress a #12 line."""
+    body = "See https://github.com/acme/widgets/issues/123 for context."
+    out = _inject_source_issue_line(body, "acme/widgets", 12, "acme/widgets")
+    assert out.endswith("Fixes #12")  # the 123 URL is not a match for #12
+    # The EXACT-issue URL already present does suppress (a real duplicate reference).
+    exact = "Already linked https://github.com/acme/widgets/issues/12 here."
+    assert _inject_source_issue_line(exact, "acme/widgets", 12, "acme/widgets") == exact
+
+
+def test_inject_cross_repo_shorthand_does_not_suppress():
+    """FIX-NOW item 2: a bare `Fixes #42` can't name another repo's issue, so cross-repo
+    it must NOT suppress the Refs line — only a full-URL match may."""
+    body = "Unrelated: Fixes #42 in this repo."
+    out = _inject_source_issue_line(body, "other/repo", 42, "acme/widgets")
+    assert out.endswith("Refs https://github.com/other/repo/issues/42")
+    # The cross-repo URL already present DOES suppress (no duplicate link).
+    linked = "Refs https://github.com/other/repo/issues/42 already."
+    assert _inject_source_issue_line(linked, "other/repo", 42, "acme/widgets") == linked
+
+
+def test_inject_bare_number_is_same_repo_even_when_target_unknown():
+    # A bare number (slug "") is same-repo by construction — Fixes #n even if the target
+    # repo couldn't be resolved (repo_slug failed open); never a Refs to an empty slug.
+    assert _inject_source_issue_line("body", "", 5, "") == "body\n\nFixes #5"
+
+
+def test_inject_unknown_target_degrades_to_refs_for_a_slugged_issue():
+    # repo_slug failed open (target ""): a slugged issue can't be confirmed same-repo, so
+    # the safe degrade is a Refs link, never a possibly-wrong Fixes that auto-closes here.
+    out = _inject_source_issue_line("body", "acme/widgets", 3, "")
+    assert out == "body\n\nRefs https://github.com/acme/widgets/issues/3"
+
+
+async def test_repo_slug_fails_open_on_gh_error(monkeypatch):
+    """FIX-NOW item 3: worktree.repo_slug must fail OPEN — a raising _gh (WorktreeError /
+    timeout) yields "" rather than propagating; a non-zero rc also yields ""."""
+
+    async def _boom(*args, cwd, timeout=60):
+        raise worktree.WorktreeError("gh repo view timed out after 60s")
+
+    monkeypatch.setattr(worktree, "_gh", _boom)
+    assert await worktree.repo_slug(cwd="/repo") == ""
+
+    async def _rc1(*args, cwd, timeout=60):
+        return (1, "", "not a gh repo")
+
+    monkeypatch.setattr(worktree, "_gh", _rc1)
+    assert await worktree.repo_slug(cwd="/repo") == ""
+
+    async def _ok(*args, cwd, timeout=60):
+        return (0, "acme/widgets\n", "")
+
+    monkeypatch.setattr(worktree, "_gh", _ok)
+    assert await worktree.repo_slug(cwd="/repo") == "acme/widgets"
+
+
+async def test_drive_injects_fixes_line_into_the_pr_body(monkeypatch):
+    """End-to-end: a feature carrying a same-repo source issue gets a `Fixes #n` line
+    appended to the body the loop hands to open_pr (the coder stays out of the loop)."""
+    bodies = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        bodies.append(body)
+        return "https://example/pr/1"
+
+    async def _slug(*, cwd):
+        return "acme/widgets"
+
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    feature = {**FEATURE, "source_issue": "https://github.com/acme/widgets/issues/7"}
+    _loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert bodies and bodies[0].endswith("Fixes #7")
