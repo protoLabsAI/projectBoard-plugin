@@ -224,6 +224,98 @@ async def test_dispatch_records_gens_even_on_a_single_greedy_win(monkeypatch):
     assert gens == [1]
 
 
+async def test_dispatch_records_the_verified_candidate_at_the_verify_boundary(monkeypatch):
+    """#91: once a candidate PASSES its tests and is promoted, dispatch() commits the
+    verified tree (so its content has a real sha — the loop's PR title keeps the
+    shipped commit message unchanged) and hands {branch, sha, worktree} to
+    ``record_verified`` — the crash-salvage record recovery resumes from if the
+    process dies before open_pr."""
+    _stub_worktree(monkeypatch)
+    committed = []
+
+    async def _commit(wt, message):
+        committed.append((wt, message))
+
+    monkeypatch.setattr(worktree, "commit_worktree", _commit)
+
+    async def _git(wt, *args, timeout=60):
+        assert args == ("rev-parse", "HEAD") and wt == "/wt/feat-bd-1"
+        return (0, "abc123\n", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        c0 = await generate(task, feedback=None)
+        return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    recorded = []
+    wt, branch, _result = await dispatch(
+        task="t",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        record_verified=lambda b, s, w: recorded.append((b, s, w)),
+        commit_message="feat: the title",
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert committed == [("/wt/feat-bd-1", "feat: the title")]  # the CANONICAL (promoted) tree
+    assert recorded == [("feat/bd-1", "abc123", "/wt/feat-bd-1")]
+    assert (wt, branch) == ("/wt/feat-bd-1", "feat/bd-1")
+
+
+async def test_dispatch_returns_the_winner_even_if_record_verified_raises(monkeypatch):
+    """The salvage record is fire-and-forget bookkeeping (like record_gens): a `br`
+    hiccup persisting it must never discard a build whose tests already passed."""
+    _stub_worktree(monkeypatch)
+
+    async def _commit(wt, message):
+        pass
+
+    monkeypatch.setattr(worktree, "commit_worktree", _commit)
+
+    async def _git(wt, *args, timeout=60):
+        return (0, "abc123\n", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        c0 = await generate(task, feedback=None)
+        return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    def _boom(b, s, w):
+        raise RuntimeError("br hiccup: lock contention")
+
+    wt, branch, _result = await dispatch(
+        task="t",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        record_verified=_boom,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert (wt, branch) == ("/wt/feat-bd-1", "feat/bd-1")  # dispatch() itself never raised
+
+
 async def test_dispatch_promotes_the_winner_even_if_record_gens_raises(monkeypatch):
     """`store.record_gens_spent` documents itself as fire-and-forget ("a br hiccup
     here must never fail the build the way a missing PR would") — a `BoardError`

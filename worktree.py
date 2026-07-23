@@ -20,6 +20,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -189,6 +190,27 @@ async def promote_worktree(
     if rc != 0:
         raise WorktreeError(f"branch rename failed: {err.strip()[:200]}")
     return os.path.abspath(canon_path), canon_branch
+
+
+# Candidate-worktree id suffixes: `.g<n>` (coder.solve candidates), `.c<n>` (Max-Mode
+# candidates), `.test` (the operator-only test-rung diagnostic — whose own candidates
+# stack as `.test.g<n>`). A real feature id never contains a dot, so stripping these is
+# unambiguous.
+_CANDIDATE_SUFFIX_RE = re.compile(r"\.(?:g\d+|c\d+|test)$")
+
+
+def parent_feature_id(wt_id: str) -> str:
+    """The feature id that OWNS a `feat-<wt_id>` worktree — `wt_id` itself for a
+    canonical worktree, the `.gN`/`.cN`/`.test` suffixes stripped (repeatedly, for the
+    stacked `bd-1.test.g2` shape) for a candidate one. The health sweep resolves board
+    state through this so a leftover candidate worktree is reaped by its PARENT
+    feature's state instead of warning every sweep on a non-feature id (#91)."""
+    out = wt_id
+    while True:
+        stripped = _CANDIDATE_SUFFIX_RE.sub("", out)
+        if stripped == out:
+            return out
+        out = stripped
 
 
 def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:

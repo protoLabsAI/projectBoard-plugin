@@ -873,6 +873,11 @@ class _WorktreeSolveAdapter:
 
 
 RecordGens = Callable[[int], None]
+# The verify-boundary salvage record (#91): called with (branch, sha, worktree) once a
+# candidate has PASSED its acceptance tests and been promoted — the loop persists it on
+# the bead (store.record_verified_candidate) so a crash between here and open_pr can
+# resume the verified build instead of rebuilding fresh.
+RecordVerified = Callable[[str, str, str], None]
 
 
 def _record_gens_best_effort(record_gens: RecordGens, fid: str, n: int) -> None:
@@ -912,6 +917,8 @@ async def dispatch(
     fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
     env_passthrough: Iterable[str] = (),
     tier: str = "",
+    record_verified: RecordVerified | None = None,
+    commit_message: str = "",
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -930,6 +937,12 @@ async def dispatch(
 
     ``record_gens`` (if given) is called with ``result.gens_spent`` exactly once,
     win or lose — the cost accounting (ADR 0064) must survive a failed search too.
+    ``record_verified`` (if given) is called once with the promoted winner's
+    ``(branch, sha, worktree)`` at the verify boundary — the crash-salvage record
+    (#91), persisted by the loop so a crash between here and ``open_pr`` resumes the
+    verified build instead of rebuilding fresh. ``commit_message`` names the commit
+    that gives the verified tree its sha (the loop passes the PR title, so the
+    shipped commit message is unchanged from what ``open_pr`` would have written).
     ``_solve``/``_budget_cls``/``_verdict_cls`` are test-injection seams for
     ``solve()``/``Budget``/``Verdict``; production callers never pass them (the real
     import happens here, deferred so this module carries no hard dependency on the
@@ -1041,6 +1054,22 @@ async def dispatch(
     win_wt = result.solution
     win_branch = next(b for wt, b in adapter.candidates if wt == win_wt)
     canon_wt, canon_branch = await worktree.promote_worktree(repo, win_wt, win_branch, fid, root)
+    # The verify boundary's crash-salvage record (#91): the candidate PASSED its
+    # acceptance tests but open_pr is still ahead (fixups + the pre-PR gate can take
+    # minutes) — a crash in that window used to throw the whole verified build away.
+    # Commit the verified tree so its content has a real sha, then persist
+    # {branch, sha, worktree} via `record_verified` (the loop writes it on the bead)
+    # so recovery can resume at promote→fixups→gate→open_pr instead of re-solving.
+    # Best-effort: a bookkeeping failure must never fail a build that already passed.
+    if record_verified is not None:
+        try:
+            await worktree.commit_worktree(canon_wt, commit_message or f"feat: {fid} (verified candidate)")
+            rc, head, _err = await worktree._git(canon_wt, "rev-parse", "HEAD")
+            sha = (head or "").strip()
+            if rc == 0 and sha:
+                record_verified(canon_branch, sha, canon_wt)
+        except Exception:  # noqa: BLE001 — fire-and-forget salvage bookkeeping
+            log.warning("[project_board] %s could not record the verified candidate (ignored)", fid, exc_info=True)
     for wt, branch in adapter.candidates:
         if wt != win_wt:
             await worktree.remove_worktree(repo, wt, branch)

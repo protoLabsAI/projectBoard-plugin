@@ -90,6 +90,14 @@ ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
 LABEL_GENS_PREFIX = "gens:"
+# Crash-salvage record (#91) — `verified:<sha>`, replaced (never accumulated) each time
+# coder.solve()'s verify boundary promotes a test-PASSING candidate. Written on the bead
+# (not loop memory) so it survives a crash between verify and open_pr; recovery's no-PR
+# path checks it and resumes at promote→fixups→gate→open_pr instead of rebuilding fresh.
+# The branch/worktree are the CANONICAL `feat/<id>` / `feat-<id>` names (the record is
+# written post-promote), so the sha is the only piece that must ride the label; the full
+# {branch, sha, worktree} triple lands in a comment for the audit trail.
+LABEL_VERIFIED_PREFIX = "verified:"
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
@@ -685,6 +693,37 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # ── verified-candidate salvage record (#91) ───────────────────────────────
+    def record_verified_candidate(self, fid: str, *, branch: str, sha: str, worktree: str) -> dict:
+        """Persist the verified candidate's identity — a single, replaced
+        `verified:<sha>` label (the `gens:` pattern) plus a comment carrying the full
+        {branch, sha, worktree} — written at coder_seam's verify boundary so a crash
+        between verify and open_pr can salvage the already-test-passing build instead
+        of rebuilding fresh. Fire-and-forget like record_gens_spent: a `br` hiccup
+        here must never fail a build whose tests already passed."""
+        f = self._require(fid)
+        args = ["update", fid]
+        for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_VERIFIED_PREFIX)]:
+            args += ["--remove-label", stale]
+        args += ["--add-label", f"{LABEL_VERIFIED_PREFIX}{sha}"]
+        self._run(*args)
+        self._comment(fid, f"verified candidate: branch={branch} sha={sha} worktree={worktree}")
+        return self.get_feature(fid)
+
+    def clear_verified_candidate(self, fid: str) -> dict:
+        """Drop the `verified:` salvage record — the crash window it covers has closed
+        (the PR opened) or the record failed its recovery checks (worktree/sha drift),
+        so it must not linger to confuse a later recovery. No-op without the label."""
+        f = self._require(fid)
+        stale = [l for l in f.get("labels") or [] if l.startswith(LABEL_VERIFIED_PREFIX)]
+        if not stale:
+            return f
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
     # ── reads (the projection) ────────────────────────────────────────────────
     def get_feature(self, fid: str) -> dict | None:
         rows = self._run("show", fid, want_json=True)
@@ -835,6 +874,12 @@ class BeadsBoard:
             ),
             0,
         )
+        # The crash-salvage record (#91): the sha of the last test-verified candidate,
+        # from the single replaced `verified:<sha>` label — "" when none was recorded.
+        verified_sha = next(
+            (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
+            "",
+        )
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
@@ -864,6 +909,7 @@ class BeadsBoard:
             "difficulty": diff,
             "attempts": attempts,
             "gens_spent": gens_spent,
+            "verified_sha": verified_sha,
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,

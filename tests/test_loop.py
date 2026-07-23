@@ -36,6 +36,14 @@ class FakeLoopStore:
         self.gens_spent[fid] = self.gens_spent.get(fid, 0) + n
         return {"id": fid}
 
+    def record_verified_candidate(self, fid, *, branch, sha, worktree):
+        self.calls.append(("record_verified", fid, branch, sha, worktree))
+        return {"id": fid}
+
+    def clear_verified_candidate(self, fid):
+        self.calls.append(("clear_verified", fid))
+        return {"id": fid}
+
     def names(self):
         return [c[0] for c in self.calls]
 
@@ -497,13 +505,19 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         fusion_max_file_chars=None,
         env_passthrough=(),
         tier="",
+        record_verified=None,
+        commit_message="",
     ):
         seen["fid"] = fid
         seen["test_cmd"] = test_cmd
         seen["task"] = task
         seen["env_passthrough"] = env_passthrough
         seen["tier"] = tier
+        seen["commit_message"] = commit_message
         record_gens(4)
+        # dispatch() calls this at the verify boundary (#91) — the loop must have
+        # threaded a recorder that lands the record on THIS feature's bead.
+        record_verified(f"feat/{fid}", "abc123", f"/wt/feat-{fid}")
         return (f"/wt/feat-{fid}", f"feat/{fid}", "[coder.solve rung=best-of-k gens=4] solved")
 
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
@@ -517,7 +531,10 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     )
     assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
     assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
+    assert seen["commit_message"] == "feat: Add a thing"  # the verified commit keeps the PR title
     assert store.gens_spent.get("bd-1") == 4
+    # The verify-boundary salvage record (#91) landed on the bead via the store.
+    assert ("record_verified", "bd-1", "feat/bd-1", "abc123", "/wt/feat-bd-1") in store.calls
     assert ("open_review", "bd-1", "https://example/pr/42") in store.calls
     assert store.creates == []  # solve()'s own per-candidate worktrees replaced the single create
 
@@ -1571,6 +1588,9 @@ class _RecoverStore:
     def list_features(self, state=None):
         return self._in_progress if state == "in_progress" else []
 
+    def get_feature(self, fid):
+        return {"id": fid}  # no verified_sha → the salvage check declines cleanly
+
     def open_review(self, fid, *, pr_url):
         self.calls.append(("open_review", fid, pr_url))
 
@@ -1607,6 +1627,169 @@ async def test_recover_is_resilient_to_a_per_feature_error(monkeypatch):
     # bd-1 errored and was skipped; bd-2 still recovered.
     assert ("requeue", "bd-2") in store.calls
     assert all(c[1] != "bd-1" for c in store.calls)
+
+
+# ── crash salvage: resume a verified candidate instead of rebuilding (#91) ──────
+
+
+class _SalvageStore:
+    """A recovery store whose one in_progress feature carries a verified-candidate
+    record (the `verified:<sha>` label projected as ``verified_sha``)."""
+
+    def __init__(self, feature):
+        self.feature = feature
+        self.calls = []
+
+    def list_features(self, state=None):
+        return [{"id": self.feature["id"]}] if state == "in_progress" else []
+
+    def get_feature(self, fid):
+        return self.feature
+
+    def open_review(self, fid, *, pr_url):
+        self.calls.append(("open_review", fid, pr_url))
+
+    def requeue(self, fid):
+        self.calls.append(("requeue", fid))
+
+    def clear_verified_candidate(self, fid):
+        self.calls.append(("clear_verified", fid))
+
+
+def _salvage_git(*, head="abc123", branch="feat/bd-1"):
+    """A ``worktree._git`` fake answering the salvage probes (HEAD sha + branch)."""
+
+    async def _git(wt, *args, timeout=60):
+        if args == ("rev-parse", "HEAD"):
+            return (0, head + "\n", "")
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return (0, branch + "\n", "")
+        return (0, "", "")
+
+    return _git
+
+
+async def _recover_salvage(monkeypatch, tmp_path, *, make_wt=True, head="abc123", gate_out=None):
+    """Run boot recovery over ONE in_progress feature with a recorded verified sha
+    of ``abc123``. Returns (store, promoted, opened, gates) for the assertions."""
+    feature = {
+        "id": "bd-1",
+        "title": "Add a thing",
+        "repo": str(tmp_path),
+        "base_branch": "main",
+        "verified_sha": "abc123",
+    }
+    store = _SalvageStore(feature)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_pr(branch, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    monkeypatch.setattr(worktree, "_git", _salvage_git(head=head))
+    if make_wt:
+        (tmp_path / ".worktrees" / "feat-bd-1").mkdir(parents=True)
+
+    promoted = []
+
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+        promoted.append((src_wt, src_branch, fid))
+        return (src_wt, src_branch)  # already canonical → the real one no-ops too
+
+    monkeypatch.setattr(worktree, "promote_worktree", _promote)
+
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append((wt, branch, base, title))
+        return "https://example/pr/91"
+
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+
+    loop = BoardLoop({"repo": str(tmp_path)})
+    gates = []
+
+    async def _gate(wt):
+        gates.append(wt)
+        return gate_out
+
+    monkeypatch.setattr(loop, "_run_local_gate", _gate)
+    await loop._recover()
+    return store, promoted, opened, gates
+
+
+async def test_recover_salvages_a_verified_candidate(monkeypatch, tmp_path):
+    """A crash between verify and open_pr: the recorded candidate's worktree exists,
+    its branch+sha match, and the gate passes NOW → resume at promote → fixups →
+    gate → open_pr → in_review. No re-solve, no rebuild-fresh requeue."""
+    store, promoted, opened, gates = await _recover_salvage(monkeypatch, tmp_path)
+    assert promoted and promoted[0][1:] == ("feat/bd-1", "bd-1")  # resumed at promote
+    assert gates  # the gate re-ran on the candidate now
+    assert opened and opened[0][1] == "feat/bd-1" and opened[0][3] == "feat: Add a thing"
+    assert ("open_review", "bd-1", "https://example/pr/91") in store.calls
+    assert ("clear_verified", "bd-1") in store.calls  # the record's window closed
+    assert ("requeue", "bd-1") not in store.calls  # never fell through to rebuild
+
+
+async def test_recover_salvage_worktree_gone_rebuilds_fresh(monkeypatch, tmp_path):
+    """The record exists but the worktree dir is gone → doubt → today's rebuild-fresh
+    path (requeue), with no PR opened off a missing tree."""
+    store, promoted, opened, _gates = await _recover_salvage(monkeypatch, tmp_path, make_wt=False)
+    assert ("requeue", "bd-1") in store.calls
+    assert not promoted and not opened
+    assert ("clear_verified", "bd-1") in store.calls  # stale record dropped
+
+
+async def test_recover_salvage_sha_mismatch_rebuilds_fresh(monkeypatch, tmp_path):
+    """The worktree exists but its HEAD is not the recorded sha (someone/something
+    moved it since verify) → doubt → rebuild fresh, never ship the drifted tree."""
+    store, promoted, opened, _gates = await _recover_salvage(monkeypatch, tmp_path, head="0ther5ha")
+    assert ("requeue", "bd-1") in store.calls
+    assert not promoted and not opened
+
+
+async def test_recover_salvage_gate_failing_now_rebuilds_fresh(monkeypatch, tmp_path):
+    """Worktree+branch+sha all check out, but the pre-PR gate FAILS on the candidate
+    now (base moved, env changed) → doubt → rebuild fresh, no PR."""
+    store, _promoted, opened, gates = await _recover_salvage(monkeypatch, tmp_path, gate_out="FAILED tests: boom")
+    assert gates  # the gate did run against the candidate
+    assert not opened  # ...and its failure stopped the salvage before open_pr
+    assert ("requeue", "bd-1") in store.calls
+    assert ("clear_verified", "bd-1") in store.calls
+
+
+async def test_recover_salvage_open_pr_error_falls_back_to_rebuild(monkeypatch, tmp_path):
+    """ANY error inside the salvage (here: open_pr blowing up) must degrade to the
+    rebuild-fresh path, never crash recovery or strand the feature in_progress."""
+    feature = {"id": "bd-1", "title": "T", "repo": str(tmp_path), "base_branch": "main", "verified_sha": "abc123"}
+    store = _SalvageStore(feature)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_pr(branch, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    monkeypatch.setattr(worktree, "_git", _salvage_git())
+    (tmp_path / ".worktrees" / "feat-bd-1").mkdir(parents=True)
+
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+        return (src_wt, src_branch)
+
+    monkeypatch.setattr(worktree, "promote_worktree", _promote)
+
+    async def _boom_pr(wt, branch, *, base, title, body):
+        raise worktree.WorktreeError("gh exploded")
+
+    monkeypatch.setattr(worktree, "open_pr", _boom_pr)
+    loop = BoardLoop({"repo": str(tmp_path)})
+
+    async def _gate(wt):
+        return None
+
+    monkeypatch.setattr(loop, "_run_local_gate", _gate)
+    await loop._recover()  # must not raise
+    assert ("requeue", "bd-1") in store.calls
+    assert all(c[0] != "open_review" for c in store.calls)  # nothing pretended a PR opened
 
 
 # ── periodic health sweep ───────────────────────────────────────────────────────
@@ -1660,6 +1843,38 @@ async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
     await BoardLoop({})._sweep()
     # done + missing feature → reaped; in_review keeps its worktree (CI-fail re-dispatch).
     assert set(reaped) == {"bd-done", "bd-gone"}
+
+
+async def test_sweep_treats_candidate_worktrees_by_parent_feature(monkeypatch):
+    """A leftover `.gN`/`.cN` candidate worktree is NOT a feature id (bd-1cp.g1) — the
+    sweep must resolve its PARENT feature's state (#91): parent done/gone → the
+    candidate is reaped (by its FULL worktree id, so the right dir+branch go); parent
+    with a live drive → left alone. And the store is never asked for the raw candidate
+    id — that lookup was the old warning-spam-every-sweep path."""
+    store = _SweepStore(features={"bd-done": "done", "bd-live": "in_progress"})
+    looked_up = []
+    orig_get = store.get_feature
+
+    def _spy(fid):
+        looked_up.append(fid)
+        return orig_get(fid)
+
+    store.get_feature = _spy
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(
+        worktree, "list_feature_worktrees", lambda repo, root: ["bd-done.g1", "bd-done.c2", "bd-gone.g3", "bd-live.g1"]
+    )
+    reaped = []
+
+    async def _reap(repo, root, fid):
+        reaped.append(fid)
+
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    loop = BoardLoop({})
+    loop._inflight_files = {"bd-live": {"a.py"}}  # bd-live's drive is live → its candidates stay
+    await loop._sweep()
+    assert set(reaped) == {"bd-done.g1", "bd-done.c2", "bd-gone.g3"}  # full worktree ids
+    assert looked_up and all("." not in fid for fid in looked_up)  # never the raw candidate id
 
 
 async def test_maybe_sweep_is_rate_limited(monkeypatch):
