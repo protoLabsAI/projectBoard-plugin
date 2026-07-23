@@ -30,6 +30,7 @@ class _StatefulBr:
     so the emitted ``br`` args can be asserted."""
 
     _FIELD_FLAGS = {
+        "--title": "title",
         "--description": "spec",
         "--acceptance-criteria": "acceptance_criteria",
         "--design": "design",
@@ -209,6 +210,97 @@ def test_update_feature_with_nothing_to_change_makes_no_update_call(make_board, 
     b.update_feature("bd-1")
 
     assert br.cmds("update") == []
+
+
+# ── title: rename in place, same partial-update contract as every other field ───────
+
+
+def test_update_feature_title_round_trips_and_leaves_other_fields_untouched(make_board, monkeypatch):
+    state = {
+        "id": "bd-1",
+        "title": "Old title",
+        "board_state": "backlog",
+        "spec": "do the thing",
+        "acceptance_criteria": "AC",
+        "labels": ["diff:small"],
+    }
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    f = b.update_feature("bd-1", title="New title")
+
+    # value fields ride in the leading-dash-safe `--flag=value` form (#85)
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--title=New title")
+    # round-trip: the rename landed and is readable back off the projection …
+    assert f["title"] == "New title"
+    assert state["title"] == "New title"
+    # … and every other field survived untouched.
+    assert state["spec"] == "do the thing"
+    assert state["acceptance_criteria"] == "AC"
+    assert state["labels"] == ["diff:small"]
+
+
+def test_update_feature_trims_the_title_before_writing(make_board, monkeypatch):
+    state = {"id": "bd-1", "title": "Old", "board_state": "backlog", "labels": []}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.update_feature("bd-1", title="  New title  ")
+
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--title=New title")
+
+
+def test_update_feature_with_whitespace_only_title_is_a_noop(make_board, monkeypatch):
+    state = {"id": "bd-1", "title": "Old title", "board_state": "backlog", "labels": []}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.update_feature("bd-1", title="   ")
+
+    # whitespace collapses to empty → no update call at all; the old title survives.
+    assert br.cmds("update") == []
+    assert state["title"] == "Old title"
+
+
+def test_update_feature_without_a_title_leaves_it_untouched(make_board, monkeypatch):
+    state = {"id": "bd-1", "title": "Old title", "board_state": "backlog", "labels": []}
+    br = _StatefulBr(state)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: state)
+
+    b.update_feature("bd-1", spec="new spec")
+
+    (call,) = br.cmds("update")
+    assert not any(a.startswith("--title") for a in call)
+    assert state["title"] == "Old title"
+
+
+def test_board_update_feature_tool_forwards_a_dequoted_title(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "title": '"New title"'})
+
+    # wrapping quotes are peeled before the store sees the value (create-tool hygiene).
+    assert fake.updated["title"] == "New title"
+
+
+def test_board_update_feature_tool_treats_empty_and_whitespace_title_as_none(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "spec": "s"})
+    assert fake.updated["title"] is None  # omitted → untouched
+
+    update.invoke({"feature_id": "bd-1", "title": "   "})
+    assert fake.updated["title"] is None  # whitespace-only → untouched, never "set it"
 
 
 # ── whitespace-only difficulty must never stamp a malformed `diff:` label (#79/#80) ──
