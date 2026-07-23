@@ -98,12 +98,16 @@ LABEL_GENS_PREFIX = "gens:"
 # written post-promote), so the sha is the only piece that must ride the label; the full
 # {branch, sha, worktree} triple lands in a comment for the audit trail.
 LABEL_VERIFIED_PREFIX = "verified:"
-# The ORIGINATING GitHub issue (#97) — `source:owner/repo#N`, a single replaced label
-# (the `gens:`/`verified:` pattern). Set through create/update's `source_issue`,
-# projected back as the `source_issue` field the loop's PR opener reads to stamp
-# `Fixes #N` (same-repo) / `Refs <url>` (cross-repo) on the PR body; absent, the
-# opener falls back to scanning the feature text for an issue URL.
-LABEL_SOURCE_PREFIX = "source:"
+# The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
+# metadata line in the bead `notes` field, beside the files_to_modify path lines.
+# NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
+# colon, so the original `source:owner/repo#N` label died with VALIDATION_FAILED
+# on every real write (#101) — `/` and `#` can never ride a label. Set through
+# create/update's `source_issue`, projected back as the `source_issue` field the
+# loop's PR opener reads to stamp `Fixes #N` (same-repo) / `Refs <url>`
+# (cross-repo) on the PR body; absent, the opener falls back to scanning the
+# feature text for an issue URL.
+NOTES_SOURCE_PREFIX = "source-issue:"
 # What `source_issue` accepts: a full GitHub issue URL, or the `owner/repo#N`
 # shorthand it normalizes to. Anything else (a bare number, a PR url, free text) is
 # rejected with a named error — the field is explicit provenance, so a value that
@@ -181,6 +185,34 @@ def normalize_source_issue(raw) -> str:
         f"invalid source_issue {raw!r} — expected a GitHub issue URL "
         "(https://github.com/owner/repo/issues/N) or owner/repo#N"
     )
+
+
+def _render_notes(files, source_issue: str = "") -> str:
+    """Serialize the bead `notes` field: one files_to_modify path per line, plus a
+    trailing `source-issue: owner/repo#N` metadata line when set — the single
+    shared home for both (labels can't carry `/`/`#`, see NOTES_SOURCE_PREFIX)."""
+    lines = [str(p).strip() for p in files or () if str(p).strip()]
+    if source_issue:
+        lines.append(f"{NOTES_SOURCE_PREFIX} {source_issue}")
+    return "\n".join(lines)
+
+
+def _split_notes(notes) -> tuple[list[str], str]:
+    """Parse the bead `notes` field back into ``(files_to_modify, source_issue)``
+    — the inverse of ``_render_notes``. Any non-blank line that isn't the
+    `source-issue:` metadata line is a file path; the FIRST metadata line wins
+    (the field is single-valued — the replaced-label convention, kept)."""
+    files: list[str] = []
+    src = ""
+    for line in str(notes or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(NOTES_SOURCE_PREFIX):
+            src = src or s[len(NOTES_SOURCE_PREFIX) :].strip()
+            continue
+        files.append(s)
+    return files, src
 
 
 class BeadsBoard:
@@ -346,11 +378,16 @@ class BeadsBoard:
         if design:
             upd += [f"--design={design}"]
             enriched.append("design")
-        if files_to_modify:
-            # files_to_modify lives in the bead `notes` field, one path per line.
-            notes = "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())
-            upd += [f"--notes={notes}"]
-            enriched.append("files_to_modify")
+        files = [str(p).strip() for p in files_to_modify or () if str(p).strip()]
+        if files or src:
+            # files_to_modify + the source-issue record SHARE the bead `notes` field
+            # (one path per line, the metadata line last — see _render_notes): the
+            # source can't be a label (its `/`/`#` fail beads' label validator, #101).
+            upd += [f"--notes={_render_notes(files, src)}"]
+            if files:
+                enriched.append("files_to_modify")
+            if src:
+                enriched.append("source_issue")
         diff = difficulty.strip().lower()
         if diff:
             # normalize first, then guard: a whitespace-only difficulty must NOT stamp a
@@ -360,9 +397,6 @@ class BeadsBoard:
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")
-        if src:
-            upd += ["--add-label", f"{LABEL_SOURCE_PREFIX}{src}"]
-            enriched.append("source_issue")
         # Dependency edges are independent of the enrichment `br update` — wire them
         # FIRST so an enrichment failure can never silently drop them (QA panel on
         # #88: the early success-with-warning return below used to skip the dep loop,
@@ -612,10 +646,23 @@ class BeadsBoard:
             args += [f"--acceptance-criteria={acceptance_criteria}"]
         if design is not None:
             args += [f"--design={design}"]
-        if files_to_modify is not None:
-            # files_to_modify lives in the bead `notes` field, one path per line.
-            notes = "\n".join(str(p).strip() for p in files_to_modify if str(p).strip())
-            args += [f"--notes={notes}"]
+        set_source = source_issue is not None and str(source_issue).strip()
+        if files_to_modify is not None or set_source:
+            # files_to_modify + source_issue SHARE the bead `notes` field (labels
+            # can't carry the source's `/`/`#`, #101), and `br update --notes`
+            # replaces the whole field — so rewrite it with the untouched half
+            # carried forward from the current projection: a files-only update
+            # must never drop the source-issue line, nor the reverse. An invalid
+            # source_issue raises the named error BEFORE `br update` runs, so it
+            # never half-applies a mixed update; whitespace-only = no-op (the
+            # difficulty convention).
+            files = (
+                [str(p).strip() for p in files_to_modify if str(p).strip()]
+                if files_to_modify is not None
+                else f.get("files_to_modify") or []
+            )
+            src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
+            args += [f"--notes={_render_notes(files, src)}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
@@ -632,14 +679,6 @@ class BeadsBoard:
             # create can be restored here (QA panel on #88, round 4 — same undeliverable-
             # promise class as depends_on). None/False = leave the label untouched.
             args += ["--add-label", LABEL_FOUNDATION]
-        if source_issue is not None and str(source_issue).strip():
-            # An invalid value raises the named error BEFORE `br update` runs, so a bad
-            # source_issue never half-applies a mixed update. Whitespace-only = no-op
-            # (the difficulty convention). Single replaced label — the `diff:` pattern.
-            src = normalize_source_issue(source_issue)
-            for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_SOURCE_PREFIX)]:
-                args += ["--remove-label", stale]
-            args += ["--add-label", f"{LABEL_SOURCE_PREFIX}{src}"]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
         # Same partial-failure contract as create_feature (panel round 7): one bad id
@@ -1141,6 +1180,12 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
+        # The bead `notes` field carries files_to_modify (one path per line) AND the
+        # originating-issue record (#97) as a `source-issue: owner/repo#N` metadata
+        # line — split them apart so the source line never leaks into the file list.
+        # source_issue is "" when unset (the loop's PR opener then falls back to
+        # scanning the feature text for an issue URL).
+        files_to_modify, source_issue = _split_notes(bead.get("notes"))
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
@@ -1164,7 +1209,7 @@ class BeadsBoard:
             "spec": bead.get("description", ""),
             "acceptance_criteria": bead.get("acceptance_criteria", ""),
             "design": bead.get("design", ""),
-            "files_to_modify": [l.strip() for l in (bead.get("notes") or "").splitlines() if l.strip()],
+            "files_to_modify": files_to_modify,
             "priority": bead.get("priority", 2),
             "issue_type": bead.get("issue_type", ""),
             "parent": bead.get("parent", ""),
@@ -1179,13 +1224,7 @@ class BeadsBoard:
             "attempts": attempts,
             "gens_spent": gens_spent,
             "verified_sha": verified_sha,
-            # The originating issue (#97): normalized `owner/repo#N` from the single
-            # replaced `source:` label — "" when unset (the loop's PR opener then falls
-            # back to scanning the feature text for an issue URL).
-            "source_issue": next(
-                (l[len(LABEL_SOURCE_PREFIX) :] for l in labels if l.startswith(LABEL_SOURCE_PREFIX)),
-                "",
-            ),
+            "source_issue": source_issue,
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,

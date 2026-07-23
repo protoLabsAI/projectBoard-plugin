@@ -184,8 +184,9 @@ def _board_tools(cfg: dict):
         comma-separated list of blocking feature ids; set `foundation=True` for a
         feature others build on (dependents gate on its merge, never its review).
         `source_issue` names the ORIGINATING GitHub issue — a full issue URL or
-        `owner/repo#N`, stored normalized as `owner/repo#N` — so the feature's PR
-        gets a `Fixes #N` line and the issue auto-closes on merge.
+        `owner/repo#N`, stored normalized as `owner/repo#N` (off-label, in the bead's
+        notes metadata — a label can't carry `/`/`#`) — so the feature's PR gets a
+        `Fixes #N` line and the issue auto-closes on merge.
 
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
@@ -262,8 +263,9 @@ def _board_tools(cfg: dict):
         edges, and `foundation=True` restores the foundation flag — the repairs for
         dependencies/foundation dropped by a create-time failure (False = leave as-is;
         this tool never removes the flag). `source_issue` (a full GitHub issue URL or
-        `owner/repo#N`, stored normalized) sets/replaces the originating issue the
-        feature's PR will reference as `Fixes #N`. Inputs are
+        `owner/repo#N`, stored normalized off-label in the bead's notes metadata)
+        sets/replaces the originating issue the feature's PR will reference as
+        `Fixes #N`. Inputs are
         stripped of any literal wrapping double quotes before storage (same hygiene as
         board_create_feature)."""
         try:

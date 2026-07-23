@@ -80,7 +80,7 @@ def test_create_tool_defaults_source_issue_to_empty(monkeypatch):
 
     create.invoke({"title": "T", "spec": "s"})
 
-    assert fake.created["source_issue"] == ""  # unset — the store adds no source label
+    assert fake.created["source_issue"] == ""  # unset — the store writes no source-issue line
 
 
 # ── board_update_feature forwards source_issue to the store ─────────────────────────
@@ -150,9 +150,11 @@ def test_update_tool_surfaces_the_named_invalid_source_issue_error(make_board, m
     assert not any(c and c[0] == "update" for c in calls)  # nothing written
 
 
-def test_create_tool_lands_the_normalized_source_label_end_to_end(make_board, monkeypatch):
-    """Tool → store → bead: a full issue URL goes in, the single `source:owner/repo#N`
-    label comes out on the `br update` — the value _source_issue() reads back."""
+def test_create_tool_lands_the_normalized_source_note_end_to_end(make_board, monkeypatch):
+    """Tool → store → bead: a full issue URL goes in, the single `source-issue:
+    owner/repo#N` notes line comes out on the `br update` — the value
+    _source_issue() reads back. Never a label: beads' label validator rejects the
+    `/` and `#` the slug needs (#101)."""
     _b, calls = _stateful_board(make_board, monkeypatch)
     create = _get_tool("board_create_feature")
 
@@ -160,7 +162,8 @@ def test_create_tool_lands_the_normalized_source_label_end_to_end(make_board, mo
 
     assert out["id"] == "bd-1"
     update = next(c for c in calls if c and c[0] == "update")
-    assert "--add-label" in update and "source:o/r#12" in update
+    assert "--notes=source-issue: o/r#12" in update
+    assert "--add-label" not in update
 
 
 # ── board_get_feature: the read half of a read-modify-write (bd-171) ─────────────
