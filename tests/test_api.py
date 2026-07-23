@@ -57,6 +57,15 @@ class FakeStore:
         self.calls.append(("create_feature", (), k))
         return {"id": "bd-new", "board_state": "backlog", "title": k.get("title", "")}
 
+    def create_from_plan(self, plan, mark_ready=False):
+        self.calls.append(("create_from_plan", (), {"plan": plan, "mark_ready": mark_ready}))
+        ids = [f"bd-{i}" for i in range(len(plan))]
+        return {
+            "items": [{"index": i, "created": True, "id": fid} for i, fid in enumerate(ids)],
+            "created_ids": ids,
+            "summary": {"requested": len(plan), "created": len(plan), "failed": 0, "ready": 0, "warnings": 0},
+        }
+
     def add_dependency(self, fid, dep):
         return self._rec("add_dependency", fid, dep)
 
@@ -171,6 +180,44 @@ def test_create_feature_splats_the_body(monkeypatch):
 def test_unknown_feature_is_404(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     assert c.get("/api/plugins/project_board/features/missing").status_code == 404
+
+
+# ── batch create from a structured decomposition (#92): POST /features/batch ────
+
+
+def test_batch_route_forwards_plan_and_mark_ready(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    plan = [{"title": "A", "spec": "sa"}, {"title": "B", "spec": "sb"}]
+    r = c.post("/api/plugins/project_board/features/batch", json={"plan": plan, "mark_ready": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["created_ids"] == ["bd-0", "bd-1"]
+    assert body["summary"]["requested"] == 2
+    call = next(c for c in store.calls if c[0] == "create_from_plan")
+    assert call[2] == {"plan": plan, "mark_ready": True}
+
+
+def test_batch_route_defaults_empty_plan_and_is_operator_gated(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    # no body → empty plan, mark_ready False (a valid request, not a 422)
+    r = c.post("/api/plugins/project_board/features/batch")
+    assert r.status_code == 200
+    call = next(c for c in store.calls if c[0] == "create_from_plan")
+    assert call[2] == {"plan": [], "mark_ready": False}
+    # NOT served on the public prefix (that would skip the operator bearer gate)
+    assert c.post("/plugins/project_board/features/batch", json={"plan": []}).status_code == 404
+
+
+def test_batch_route_surfaces_a_boarderror_as_400(monkeypatch):
+    class BrokenStore(FakeStore):
+        def create_from_plan(self, plan, mark_ready=False):
+            raise BoardError("plan must be a list of feature sections")
+
+    c = _client(monkeypatch, BrokenStore())
+    r = c.post("/api/plugins/project_board/features/batch", json={"plan": "not a list"})
+    assert r.status_code == 400 and "plan must be a list" in r.json()["detail"]
 
 
 # ── live coder-monitoring snapshot (#84): GET /features/{fid}/progress ───────────

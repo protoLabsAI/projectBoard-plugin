@@ -827,3 +827,162 @@ def test_update_feature_adds_dependency_edges(make_board, monkeypatch):
     b.update_feature("bd-1", depends_on=["bd-7", "bd-8"])
     dep_calls = [c for c in br.calls if c and c[0] == "dep"]
     assert [(c[2], c[3]) for c in dep_calls] == [("bd-1", "bd-7"), ("bd-1", "bd-8")]
+
+
+# ── create_from_plan: batch-create a decomposition, all-or-report (#92) ──────────
+
+
+def _plan_board(make_board, monkeypatch):
+    """A board wired for ``create_from_plan``: ``_create`` mints ``bd-<n>`` and registers
+    a ready-eligible bead (spec + acceptance_criteria + files, so ``mark_ready`` can
+    promote a clean item), ``get_feature`` returns it, and enrichment / ``dep add`` /
+    ready ``br update`` calls flow through the recording ``Br`` for assertion."""
+    br = Br()
+    b = make_board(br)
+    beads: dict[str, dict] = {}
+    counter = {"n": 0}
+
+    def _create(title, *, itype="feature", parent="", priority=2, description="", external_ref=""):
+        counter["n"] += 1
+        fid = f"bd-{counter['n']}"
+        beads[fid] = {
+            "id": fid,
+            "title": title,
+            "board_state": "backlog",
+            "spec": description or "spec",
+            "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+            "files_to_modify": ["a.py"],
+        }
+        return fid
+
+    monkeypatch.setattr(b, "_create", _create)
+    monkeypatch.setattr(b, "get_feature", lambda fid: beads.get(fid))
+    return b, beads, br
+
+
+def test_create_from_plan_creates_every_well_formed_item(make_board, monkeypatch):
+    b, _beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "Feature A", "spec": "sa", "files": "a.py"},
+            {"title": "Feature B", "spec": "sb", "files": ["b.py"]},
+        ]
+    )
+    assert out["created_ids"] == ["bd-1", "bd-2"]
+    assert out["summary"] == {"requested": 2, "created": 2, "failed": 0, "ready": 0, "warnings": 0}
+    assert [r["title"] for r in out["items"]] == ["Feature A", "Feature B"]
+    assert all(r["created"] for r in out["items"])
+
+
+def test_create_from_plan_malformed_item_fails_itself_and_the_rest_proceed(make_board, monkeypatch):
+    b, _beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "Good one", "spec": "s", "files": "a.py"},
+            {"spec": "no title here"},  # malformed — no title
+            "not even an object",  # malformed — not a dict
+            {"title": "Also good", "spec": "s", "files": "b.py"},
+        ]
+    )
+    assert out["summary"]["requested"] == 4
+    assert out["summary"]["created"] == 2
+    assert out["summary"]["failed"] == 2
+    assert out["created_ids"] == ["bd-1", "bd-2"]  # only the well-formed items minted ids
+    bad = [r for r in out["items"] if not r["created"]]
+    assert len(bad) == 2
+    assert any("no title" in r["error"] for r in bad)
+    assert any("not an object" in r["error"] for r in bad)
+    # a failed item still preserves its plan index so the caller can map the reason back
+    assert {r["index"] for r in bad} == {1, 2}
+
+
+def test_create_from_plan_resolves_inter_item_deps_by_index_and_title(make_board, monkeypatch):
+    b, _beads, br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "Foundation", "spec": "s", "files": "f.py", "foundation": True},
+            {"title": "Builds via index", "spec": "s", "files": "b.py", "depends_on": [0]},
+            {"title": "Builds via title", "spec": "s", "files": "c.py", "depends_on": ["Foundation"]},
+        ]
+    )
+    assert out["summary"]["created"] == 3
+    assert all(not r.get("enrichment_failed") for r in out["items"])
+    # both dependents wired to the foundation's minted id (bd-1) — resolved AFTER all creates
+    edges = {(a[2], a[3]) for a in br.cmds("dep")}
+    assert edges == {("bd-2", "bd-1"), ("bd-3", "bd-1")}
+
+
+def test_create_from_plan_double_dash_dep_fails_that_item_not_the_whole_batch(make_board, monkeypatch):
+    """#92 AC8: a dep like '--5' passes the old ``lstrip('-').isdigit()`` guard but crashes
+    ``int()`` — it must fail ITS item with a named reason (success-with-warning) while the
+    rest of the batch proceeds, never take the batch down with an uncaught ValueError."""
+    b, _beads, br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "Fine", "spec": "s", "files": "a.py"},
+            {"title": "Bad dep", "spec": "s", "files": "b.py", "depends_on": ["--5"]},
+        ]
+    )
+    # the batch survived: both beads were created, no ValueError escaped
+    assert out["summary"]["created"] == 2
+    assert out["created_ids"] == ["bd-1", "bd-2"]
+    # the '--5' item fails itself, named + repairable; the other stays clean
+    warned = next(r for r in out["items"] if r["title"] == "Bad dep")
+    assert warned["created"] is True and warned["enrichment_failed"] is True
+    assert any("--5" in m for m in warned["missing_fields"])
+    assert "--5" in warned["warning"] and "board_update_feature" in warned["warning"]
+    assert next(r for r in out["items"] if r["title"] == "Fine").get("enrichment_failed") is None
+    # a malformed ref never reaches `br dep add`
+    assert br.cmds("dep") == []
+
+
+def test_create_from_plan_mark_ready_promotes_only_clean_items(make_board, monkeypatch):
+    b, _beads, br = _plan_board(make_board, monkeypatch)
+    real_add = b.add_dependency
+
+    def flaky_add(fid, dep):
+        if dep == "ghost":
+            raise BoardError("no such issue 'ghost'")
+        return real_add(fid, dep)
+
+    monkeypatch.setattr(b, "add_dependency", flaky_add)
+    out = b.create_from_plan(
+        [
+            {"title": "Clean", "spec": "s", "files": "a.py"},
+            {"title": "Warned", "spec": "s", "files": "b.py", "depends_on": ["ghost"]},
+        ],
+        mark_ready=True,
+    )
+    clean = next(r for r in out["items"] if r["title"] == "Clean")
+    warned = next(r for r in out["items"] if r["title"] == "Warned")
+    assert clean["ready"] is True and clean["board_state"] == "ready"
+    assert warned.get("ready") is not True  # a warned item is NOT auto-promoted
+    assert warned["enrichment_failed"] is True
+    assert out["summary"]["ready"] == 1
+    # exactly one `ready`-label update fired, for the clean item only
+    ready_updates = [a for a in br.cmds("update") if "--add-label" in a and "ready" in a]
+    assert len(ready_updates) == 1 and ready_updates[0][1] == "bd-1"
+
+
+def test_resolve_plan_dep_index_title_and_passthrough_id():
+    index_to_id = {0: "bd-1", 1: "bd-2"}
+    title_to_id = {"foundation feature": "bd-1"}
+    assert BeadsBoard._resolve_plan_dep(0, index_to_id, title_to_id) == "bd-1"  # int index
+    assert BeadsBoard._resolve_plan_dep("1", index_to_id, title_to_id) == "bd-2"  # numeric-string index
+    assert BeadsBoard._resolve_plan_dep("Foundation  Feature", index_to_id, title_to_id) == "bd-1"  # by title
+    assert BeadsBoard._resolve_plan_dep("bd-9", index_to_id, title_to_id) == "bd-9"  # literal id passthrough
+
+
+@pytest.mark.parametrize("bad", ["--5", "---7", "--10"])
+def test_resolve_plan_dep_multi_dash_index_is_named_not_a_crash(bad):
+    """#92 AC8 (unit): multi-dash junk the loose guard accepted raises a NAMED BoardError,
+    not an uncaught ValueError from ``int()``."""
+    with pytest.raises(BoardError, match="malformed"):
+        BeadsBoard._resolve_plan_dep(bad, {}, {})
+
+
+def test_resolve_plan_dep_out_of_range_index_raises_named():
+    with pytest.raises(BoardError, match="out of range"):
+        BeadsBoard._resolve_plan_dep("7", {0: "bd-1"}, {})
+    with pytest.raises(BoardError, match="out of range"):
+        BeadsBoard._resolve_plan_dep(-5, {0: "bd-1"}, {})
