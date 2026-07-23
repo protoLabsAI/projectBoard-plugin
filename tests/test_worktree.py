@@ -230,6 +230,24 @@ def test_list_feature_worktrees_absent_dir(tmp_path):
     assert worktree.list_feature_worktrees(str(tmp_path), "does-not-exist") == []
 
 
+# ── parent_feature_id: candidate worktrees resolve to their owning feature (#91) ──
+
+
+def test_parent_feature_id_strips_candidate_suffixes():
+    assert worktree.parent_feature_id("bd-1cp.g1") == "bd-1cp"  # coder.solve candidate
+    assert worktree.parent_feature_id("bd-1.c2") == "bd-1"  # Max-Mode candidate
+    assert worktree.parent_feature_id("bd-1.test") == "bd-1"  # test-rung diagnostic
+    assert worktree.parent_feature_id("bd-1.test.g2") == "bd-1"  # stacked: test-rung's own candidate
+    assert worktree.parent_feature_id("bd-1cp.g12") == "bd-1cp"  # multi-digit gen
+
+
+def test_parent_feature_id_leaves_canonical_ids_alone():
+    assert worktree.parent_feature_id("bd-13w") == "bd-13w"
+    assert worktree.parent_feature_id("bd-1cp") == "bd-1cp"
+    # A dot that is NOT a candidate suffix is not a candidate marker — untouched.
+    assert worktree.parent_feature_id("bd-1.gx") == "bd-1.gx"
+
+
 # ── reap_feature_worktree: the shared id → worktree/branch reap ──────────────────
 
 

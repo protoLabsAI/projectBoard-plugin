@@ -170,6 +170,42 @@ def test_record_gens_spent_accumulates_and_replaces_the_old_label(make_board, mo
     assert ("update", "bd-1", "--remove-label", "gens:5", "--add-label", "gens:9") in br.calls
 
 
+# ── verified-candidate salvage record (#91) ─────────────────────────────────────
+
+
+def test_record_verified_candidate_replaces_the_label_and_comments(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["verified:old5ha", "ready"]})
+    b.record_verified_candidate("bd-1", branch="feat/bd-1", sha="abc123", worktree="/wt/feat-bd-1")
+    # single replaced label (the gens: pattern) — never two verified: labels at once
+    assert ("update", "bd-1", "--remove-label", "verified:old5ha", "--add-label", "verified:abc123") in br.calls
+    # the full triple rides a comment for the audit trail
+    comment = next(a for a in br.calls if a[0] == "comments")
+    assert "branch=feat/bd-1" in comment[3] and "sha=abc123" in comment[3] and "worktree=/wt/feat-bd-1" in comment[3]
+
+
+def test_clear_verified_candidate_drops_the_label_and_noops_without_one(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["verified:abc123", "ready"]})
+    b.clear_verified_candidate("bd-1")
+    assert ("update", "bd-1", "--remove-label", "verified:abc123") in br.calls
+    br2 = Br()
+    b2 = make_board(br2)
+    monkeypatch.setattr(b2, "_require", lambda fid: {"id": fid, "labels": ["ready"]})
+    b2.clear_verified_candidate("bd-1")
+    assert not br2.cmds("update")  # nothing to drop → no br write
+
+
+def test_project_exposes_verified_sha(make_board):
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "in_progress", "labels": ["verified:abc123"]})["verified_sha"] == "abc123"
+    assert b._project({"id": "y", "status": "open", "labels": []})["verified_sha"] == ""
+
+
 # ── _project: the bead → feature view mapping ───────────────────────────────────
 
 

@@ -518,17 +518,93 @@ class BoardLoop:
     # ── crash recovery (runs once, before the puller claims new work) ──────────
     async def _reconcile_orphan(self, fid: str):
         """A claimed feature with no live drive: if its PR actually got opened (a crash
-        between ``open_pr`` and ``open_review``) adopt it → ``in_review``; otherwise
-        reset it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
+        between ``open_pr`` and ``open_review``) adopt it → ``in_review``; else, if a
+        VERIFIED candidate was recorded at coder_seam's verify boundary and still checks
+        out on disk (a crash between verify and ``open_pr``), salvage it — resume at
+        promote → fixups → gate → open_pr instead of re-solving (#91); otherwise reset
+        it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
         pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=self._store_kw["repo"])
         if pr_url:
             store.open_review(fid, pr_url=pr_url)
             log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
+        elif await self._salvage_verified_candidate(store, fid):
+            pass  # resumed + PR opened → in_review (logged inside)
         else:
             store.requeue(fid)
             log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
+
+    @staticmethod
+    def _clear_verified(store, fid: str) -> None:
+        """Best-effort drop of the salvage record — bookkeeping only, never raises."""
+        try:
+            store.clear_verified_candidate(fid)
+        except Exception:  # noqa: BLE001 — a failed clear must not fail recovery
+            log.warning("[project_board] %s clear_verified_candidate failed (ignored)", fid, exc_info=True)
+
+    async def _salvage_verified_candidate(self, store, fid: str) -> bool:
+        """Crash salvage (#91): resume a build whose candidate already PASSED its
+        acceptance tests but crashed before ``open_pr``.
+
+        ``coder_seam.dispatch`` records the verified candidate at its verify boundary
+        (a ``verified:<sha>`` label + a bead comment with {branch, sha, worktree}). If
+        that record still checks out EXACTLY — the canonical worktree dir exists, it
+        has the recorded branch checked out at the recorded sha, and the pre-PR gate
+        passes on it NOW — resume the tail of the drive (promote → fixups → gate →
+        open_pr → in_review) instead of throwing a verified build away to re-solve.
+        ANY doubt (no record, worktree gone, branch/sha drift, gate red now, any error
+        anywhere) → False, and the caller falls through to today's rebuild-fresh
+        unchanged — a wrong salvage ships unverified code; a skipped one only costs a
+        rebuild."""
+        try:
+            f = store.get_feature(fid) or {}
+            sha = str(f.get("verified_sha") or "").strip()
+            if not sha:
+                return False
+            repo = f.get("repo") or self._store_kw["repo"]
+            base = f.get("base_branch") or self._store_kw.get("base_branch") or "main"
+            branch = f"feat/{fid}"
+            wt = os.path.join(repo, self.root, f"feat-{fid}")
+            if not os.path.isdir(wt):
+                log.info("[project_board] %s salvage: verified worktree gone — rebuild fresh", fid)
+                self._clear_verified(store, fid)
+                return False
+            rc, head, _err = await worktree._git(wt, "rev-parse", "HEAD")
+            if rc != 0 or head.strip() != sha:
+                log.info(
+                    "[project_board] %s salvage: sha drift (%s ≠ recorded %s) — rebuild fresh",
+                    fid,
+                    head.strip()[:12],
+                    sha[:12],
+                )
+                self._clear_verified(store, fid)
+                return False
+            rc, cur, _err = await worktree._git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+            if rc != 0 or cur.strip() != branch:
+                log.info("[project_board] %s salvage: branch drift (%s ≠ %s) — rebuild fresh", fid, cur.strip(), branch)
+                self._clear_verified(store, fid)
+                return False
+            # Resume the drive's tail in its normal order: promote (a no-op — the
+            # record is written post-promote, so the candidate already holds the
+            # canonical name) → fixups → gate → open_pr. The gate re-runs NOW: a
+            # candidate that verified before the crash but fails today (base moved,
+            # env changed) is a doubt, not a ship.
+            wt, branch = await worktree.promote_worktree(repo, wt, branch, fid, self.root)
+            await self._run_fixups(wt)
+            if await self._run_local_gate(wt) is not None:
+                log.info("[project_board] %s salvage: gate fails on the candidate now — rebuild fresh", fid)
+                self._clear_verified(store, fid)
+                return False
+            title = f"feat: {f.get('title') or fid}"
+            pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=_pr_body("", f))
+            store.open_review(fid, pr_url=pr_url)
+            self._clear_verified(store, fid)
+            log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
+            return True
+        except Exception:  # noqa: BLE001 — ANY doubt/error → today's rebuild-fresh path
+            log.warning("[project_board] %s salvage attempt failed — rebuild fresh", fid, exc_info=True)
+            return False
 
     async def _recover(self):
         """On boot, reconcile every ``in_progress`` feature the previous run left
@@ -567,16 +643,22 @@ class BoardLoop:
                 await self._reconcile_orphan(fid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reconcile for %s failed", fid, exc_info=True)
-        for fid in worktree.list_feature_worktrees(repo, self.root):
+        for wtid in worktree.list_feature_worktrees(repo, self.root):
+            # A `.gN`/`.cN` candidate worktree is not a feature id (bd-1cp.g1) — its
+            # board state lives on the PARENT feature, so resolve through that (#91):
+            # skip while the parent's drive is live, reap when the parent is gone or
+            # done. The old raw-id `get_feature` lookup failed every sweep and just
+            # warned forever without ever reaping the candidate.
+            fid = worktree.parent_feature_id(wtid)
             if fid in self._inflight_files:
-                continue  # a live drive owns this worktree
+                continue  # a live drive owns this worktree (or its candidates)
             try:
                 f = store.get_feature(fid)
                 if f is None or f["board_state"] == "done":
-                    await worktree.reap_feature_worktree(repo, self.root, fid)
-                    log.info("[project_board] sweep: reaped orphaned worktree feat-%s", fid)
+                    await worktree.reap_feature_worktree(repo, self.root, wtid)
+                    log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
             except Exception:  # noqa: BLE001
-                log.warning("[project_board] sweep reap for %s failed", fid, exc_info=True)
+                log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
@@ -963,6 +1045,12 @@ class BoardLoop:
                             # get — keep the whitelist consistent across every subprocess.
                             env_passthrough=self.env_passthrough,
                             tier=tier,  # #84: label each solve gen with the current tier
+                            # #91: persist the verified candidate on the bead at the
+                            # verify boundary, so a crash before open_pr is salvageable.
+                            record_verified=lambda br_name, sha, wt_path: store.record_verified_candidate(
+                                fid, branch=br_name, sha=sha, worktree=wt_path
+                            ),
+                            commit_message=title,
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
