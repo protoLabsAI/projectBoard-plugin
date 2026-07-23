@@ -161,3 +161,159 @@ def test_create_tool_lands_the_normalized_source_label_end_to_end(make_board, mo
     assert out["id"] == "bd-1"
     update = next(c for c in calls if c and c[0] == "update")
     assert "--add-label" in update and "source:o/r#12" in update
+
+
+# ── board_get_feature: the read half of a read-modify-write (bd-171) ─────────────
+
+
+class _RoundTripStore:
+    """``update_feature`` writes fields onto an in-memory feature; ``get_feature``
+    reads them back — so a board_update_feature → board_get_feature round-trip proves
+    the read tool surfaces exactly what the write tool stored."""
+
+    def __init__(self):
+        self.f = {
+            "id": "bd-1",
+            "title": "T",
+            "spec": "",
+            "acceptance_criteria": "",
+            "design": "",
+            "board_state": "backlog",
+            "labels": [],
+            "pr_url": "",
+            "difficulty": "",
+            "files_to_modify": [],
+            "foundation": False,
+            "priority": 2,
+            "source_issue": "",
+            "depends_on": [],
+            "open_depends_on": [],
+        }
+
+    def update_feature(
+        self,
+        fid,
+        *,
+        spec=None,
+        acceptance_criteria=None,
+        design=None,
+        files_to_modify=None,
+        difficulty=None,
+        depends_on=None,
+        foundation=None,
+        source_issue=None,
+    ):
+        if spec is not None:
+            self.f["spec"] = spec
+        if acceptance_criteria is not None:
+            self.f["acceptance_criteria"] = acceptance_criteria
+        if design is not None:
+            self.f["design"] = design
+        if files_to_modify is not None:
+            self.f["files_to_modify"] = files_to_modify
+        if difficulty is not None:
+            self.f["difficulty"] = difficulty
+        return {"id": fid, "title": self.f["title"], "board_state": self.f["board_state"]}
+
+    def get_feature(self, fid):
+        return dict(self.f) if fid == self.f["id"] else None
+
+
+def test_get_feature_round_trips_values_written_by_update(monkeypatch):
+    fake = _RoundTripStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+    get = _get_tool("board_get_feature")
+
+    update.invoke(
+        {
+            "feature_id": "bd-1",
+            "spec": "the new spec",
+            "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+            "files_to_modify": "a.py, b.py",
+            "difficulty": "medium",
+        }
+    )
+    out = json.loads(get.invoke({"feature_id": "bd-1"}))
+
+    assert out["spec"] == "the new spec"
+    assert out["acceptance_criteria"] == "WHEN x THE SYSTEM SHALL y"
+    assert out["files_to_modify"] == ["a.py", "b.py"]  # tool split → stored → read back
+    assert out["difficulty"] == "medium"
+    assert out["state"] == "backlog"  # board_state surfaced as `state`
+
+
+def test_get_feature_surfaces_both_dependency_views(monkeypatch):
+    """AC (bd-171 review-fix): a feature with one closed + one open blocker returns
+    BOTH in `depends_on` (the ledger) but only the open one in `open_depends_on`."""
+
+    class _S:
+        def get_feature(self, fid):
+            if fid != "bd-1":
+                return None
+            return {
+                "id": "bd-1",
+                "title": "T",
+                "spec": "s",
+                "acceptance_criteria": "ac",
+                "design": "",
+                "board_state": "ready",
+                "labels": ["ready"],
+                "pr_url": "",
+                "difficulty": "",
+                "files_to_modify": [],
+                "foundation": False,
+                "priority": 2,
+                "source_issue": "",
+                "depends_on": ["bd-a", "bd-b"],  # every blocking edge (the ledger)
+                "open_depends_on": ["bd-b"],  # only the still-open blocker
+            }
+
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
+    out = json.loads(_get_tool("board_get_feature").invoke({"feature_id": "bd-1"}))
+    assert out["depends_on"] == ["bd-a", "bd-b"]
+    assert out["open_depends_on"] == ["bd-b"]
+
+
+def test_get_feature_end_to_end_through_the_projection(make_board, monkeypatch):
+    """board_get_feature → store.get_feature → _project: the closed/open blocker split
+    is computed by the REAL projection off a `br show` bead, not hand-fed by a fake."""
+    bead = {
+        "id": "bd-1",
+        "title": "T",
+        "status": "open",
+        "labels": ["ready", "diff:medium"],
+        "description": "the spec",
+        "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
+        "external_ref": "https://example/pr/1",
+        "dependencies": [
+            {"id": "bd-a", "dependency_type": "blocks", "status": "closed"},
+            {"id": "bd-b", "dependency_type": "blocks", "status": "open"},
+        ],
+    }
+
+    def run_impl(*args, want_json=False):
+        if args and args[0] == "show":
+            return [bead]
+        return [] if want_json else ""
+
+    b = make_board(run_impl)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: b)
+    out = json.loads(_get_tool("board_get_feature").invoke({"feature_id": "bd-1"}))
+
+    assert out["spec"] == "the spec"
+    assert out["state"] == "ready"
+    assert out["pr_url"] == "https://example/pr/1"
+    assert out["difficulty"] == "medium"
+    assert out["depends_on"] == ["bd-a", "bd-b"]  # ledger
+    assert out["open_depends_on"] == ["bd-b"]  # live subset
+
+
+def test_get_feature_unknown_id_surfaces_a_named_error(monkeypatch):
+    class _S:
+        def get_feature(self, fid):
+            return None
+
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
+    out = _get_tool("board_get_feature").invoke({"feature_id": "nope"})
+    assert out.startswith("Error:") and "unknown feature" in out

@@ -984,6 +984,70 @@ def test_resolve_plan_dep_multi_dash_index_is_named_not_a_crash(bad):
 def test_resolve_plan_dep_out_of_range_index_raises_named():
     with pytest.raises(BoardError, match="out of range"):
         BeadsBoard._resolve_plan_dep("7", {0: "bd-1"}, {})
+
+
+# ── _project: depends_on ledger vs. the live open subset (bd-171) ────────────────
+
+
+def test_project_exposes_depends_on_ledger_and_open_subset(make_board):
+    """`_project` surfaces BOTH dependency views: `depends_on` is every `blocks`
+    edge (the historical ledger, incl. already-merged/closed blockers) while
+    `open_depends_on` keeps only the edges whose blocker is still open — the live,
+    actionable signal. Non-`blocks` edges are ignored by both."""
+    b = make_board(Br())
+    bead = {
+        "id": "bd-5",
+        "status": "open",
+        "labels": [],
+        "dependencies": [
+            {"id": "bd-a", "dependency_type": "blocks", "status": "closed"},  # blocker merged
+            {"id": "bd-b", "dependency_type": "blocks", "status": "open"},  # still blocking
+            {"id": "bd-c", "dependency_type": "related", "status": "open"},  # not a blocks edge
+        ],
+    }
+    f = b._project(bead)
+    assert f["depends_on"] == ["bd-a", "bd-b"]  # the full ledger
+    assert f["open_depends_on"] == ["bd-b"]  # only the still-open blocker
+    # a feature with no deps (`br list` omits them too) → both empty, never missing
+    empty = b._project({"id": "x", "status": "open", "labels": []})
+    assert empty["depends_on"] == [] and empty["open_depends_on"] == []
+
+
+# ── the adverse-review bounce (bd-171): a distinct comment + requeue-on-same-PR ──
+
+
+def test_record_review_bounce_comments_from_in_review_distinct_from_ci(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    comments = []
+    monkeypatch.setattr(b, "_comment", lambda fid, text: comments.append((fid, text)))
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_review_bounce("bd-9", "auth check missing a null guard")
+    assert comments == [("bd-9", "review requested changes: auth check missing a null guard")]
+    assert "CI failed" not in comments[0][1]  # distinct from the ci-fail note
+
+
+def test_record_review_bounce_rejects_a_non_in_review_state(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_progress"})
+    with pytest.raises(BoardError, match="expects in_review"):
+        b.record_review_bounce("bd-9", "x")
+
+
+def test_requeue_preserves_the_open_pr_and_clears_the_assignee(make_board, monkeypatch):
+    """A requeue (the /ci + /review re-dispatch path) keeps the open PR — it never
+    touches external_ref — and clears the assignee so the re-pull can `--claim`."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "get_feature", lambda fid: {"id": fid, "board_state": "ready", "pr_url": "https://example/pr/1"}
+    )
+    f = b.requeue("bd-1")
+    call = next(c for c in br.calls if c and c[0] == "update")
+    assert "--external-ref" not in call  # the open PR is left intact
+    assert "--assignee" in call  # cleared (paired with "") so `--claim` won't reject
+    assert "--add-label" in call and "ready" in call and "in-review" in call  # ready↑, in-review↓
+    assert f["pr_url"] == "https://example/pr/1"  # preserved onto the requeued feature
     with pytest.raises(BoardError, match="out of range"):
         BeadsBoard._resolve_plan_dep(-5, {0: "bd-1"}, {})
 

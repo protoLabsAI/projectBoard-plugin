@@ -89,6 +89,9 @@ class FakeStore:
     def bounce_ci_fail(self, fid, reason):
         return self._rec("bounce_ci_fail", fid, reason)
 
+    def record_review_bounce(self, fid, findings=""):
+        return self._rec("record_review_bounce", fid, findings)
+
     def escalate(self, fid, reason):
         self.calls.append(("escalate", (fid, reason), {}))
         return self._escalate_to
@@ -388,6 +391,89 @@ def test_ci_fail_with_a_single_coder_bounces_to_in_progress(monkeypatch):
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is False
     assert any(call[0] == "bounce_ci_fail" for call in store.calls)
+
+
+# ── /features/{fid}/review — the adverse-review bounce (bd-171) ─────────────────
+# The review sibling of /ci fail: record a distinct review-bounce comment, feed the
+# findings into the loop's re-dispatch prompt (the _ci_feedback bridge), and requeue
+# onto the SAME open PR. escalate=false keeps the tier; escalate=true climbs.
+
+
+def test_review_bounce_requeues_and_records_a_distinct_comment(monkeypatch):
+    from project_board import loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={})  # no ladder → default keeps the same tier
+    r = c.post(
+        "/plugins/project_board/features/bd-1/review",
+        json={"findings": "auth check missing a null guard"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["requeued"] is True and body["escalated"] is False
+    names = [call[0] for call in store.calls]
+    assert "record_review_bounce" in names  # a distinct review-bounce comment on the bead
+    assert "requeue" in names  # same open PR reused (store.requeue keeps external_ref)
+    assert "escalate" not in names  # default keeps the same tier
+
+
+def test_review_findings_reach_the_loop_feedback_bridge(monkeypatch):
+    """AC: the findings text crosses into the loop's re-dispatch path (the same
+    _ci_feedback lever the in-loop review gate writes), via queue_review_feedback."""
+    from project_board import loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    c = _client(monkeypatch, FakeStore())
+    c.post("/plugins/project_board/features/bd-1/review", json={"findings": "missing a null guard"})
+    assert "missing a null guard" in loop_mod._PENDING_FEEDBACK.get("bd-1", "")
+
+
+def test_review_escalate_true_climbs_the_ladder(monkeypatch):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
+    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": True})
+    body = r.json()
+    assert body["escalated"] is True and body["next_tier"] == "smart" and body["requeued"] is True
+    assert any(call[0] == "escalate" for call in store.calls)
+    assert any(call[0] == "requeue" for call in store.calls)
+
+
+def test_review_escalate_false_keeps_the_same_tier(monkeypatch):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)  # a ladder exists…
+    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": False})
+    body = r.json()
+    assert body["escalated"] is False and body["requeued"] is True
+    assert not any(call[0] == "escalate" for call in store.calls)  # …but the default doesn't climb it
+    assert any(call[0] == "requeue" for call in store.calls)
+
+
+def test_review_escalate_exhausted_blocks(monkeypatch):
+    store = FakeStore(escalate_to=None)  # ladder already at the top
+    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
+    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": True})
+    body = r.json()
+    assert body["exhausted"] is True and body["requeued"] is False
+    assert any(call[0] == "block_from_review" for call in store.calls)
+
+
+def test_review_is_public_not_operator_gated(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    # served on the public prefix (a review-infra edge, like /ci + /webhook)…
+    assert c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 200
+    # …and NOT on the gated /api prefix.
+    assert c.post("/api/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 404
+
+
+def test_review_from_a_non_in_review_state_surfaces_as_400(monkeypatch):
+    class WrongState(FakeStore):
+        def record_review_bounce(self, fid, findings=""):
+            raise BoardError("review bounce expects in_review, got 'in_progress'")
+
+    c = _client(monkeypatch, WrongState())
+    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"})
+    assert r.status_code == 400 and "in_review" in r.json()["detail"]
 
 
 # ── /features/{fid}/test-rung — operator-only diagnostic (ADR 0064) ─────────────

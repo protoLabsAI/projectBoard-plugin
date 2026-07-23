@@ -55,6 +55,31 @@ from .store import (
 log = logging.getLogger("protoagent.plugins.project_board")
 
 
+# ── external re-dispatch feedback bridge (the /review route → the loop) ──────────
+# An adverse-review bounce POSTed to /features/{fid}/review is handled in the API
+# router — a DIFFERENT object from the running loop (register() mounts both, so they
+# share a process but not an instance). This module-level dict is the seam between
+# them: the router stashes the findings here and the loop drains them into its
+# per-run ``_ci_feedback`` the next time it builds a dispatch prompt — the same
+# lever the in-loop review gate writes directly. Keyed by feature id; last write wins.
+_PENDING_FEEDBACK: dict[str, str] = {}
+
+
+def queue_review_feedback(fid: str, findings: str) -> None:
+    """Stash an adverse-review bounce's ``findings`` so the loop leads ``fid``'s next
+    dispatch prompt with them — the cross-instance sibling of the in-loop review
+    gate's ``_ci_feedback`` write (``POST /features/{fid}/review`` calls this). Blank
+    findings are a no-op (nothing to carry back)."""
+    text = str(findings or "").strip()
+    if not text:
+        return
+    _PENDING_FEEDBACK[fid] = (
+        "An adverse code review REQUESTED CHANGES on your PR. Fix every finding "
+        "below in the existing branch (the PR updates on push) — do not rewrite "
+        "unrelated code.\n\n" + text
+    )
+
+
 # ── auto gate resolution ────────────────────────────────────────────────────────
 # The pre-PR gate is repo-specific, and hard-coding one repo's check steps into the
 # orchestrator (or the operator's dispatch) rots two ways: the repo's CI changes and
@@ -1927,6 +1952,12 @@ class BoardLoop:
         # checks itself — edit-only). Also widen scope: the fix may touch tests/files
         # the original `files_to_modify` didn't list (the #1053 lesson).
         fid = feature.get("id", "")
+        # Drain any externally-queued review-bounce feedback (the /review route stashed
+        # it via queue_review_feedback) into THIS run's _ci_feedback, so an operator/CI
+        # review bounce rides the exact same prompt path as an in-loop CI/review bounce.
+        pending = _PENDING_FEEDBACK.pop(fid, None)
+        if pending:
+            self._ci_feedback[fid] = pending
         ci = self._ci_feedback.get(fid)
         prior = self._ci_prior_diff.get(fid)
         prior_block = (

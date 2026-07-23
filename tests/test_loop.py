@@ -126,6 +126,30 @@ def test_build_prompt_asks_for_a_clean_pr_summary_not_raw_reasoning():
     assert "do not narrate your process" in prompt.lower()
 
 
+def test_queue_review_feedback_reaches_the_next_prompt():
+    """AC (bd-171): a /review bounce stashed via queue_review_feedback rides the SAME
+    prompt path as an in-loop CI/review bounce — _build_prompt drains it into
+    _ci_feedback, leads the prompt with it, and clears the one-shot pending entry."""
+    from project_board.loop import _PENDING_FEEDBACK, queue_review_feedback
+
+    _PENDING_FEEDBACK.clear()
+    loop = BoardLoop({})
+    queue_review_feedback("bd-1", "the auth check is missing a null guard")  # FEATURE id is bd-1
+    prompt = loop._build_prompt(FEATURE)
+    assert "REJECTED" in prompt  # the previous-attempt-rejected block fires
+    assert "null guard" in prompt  # the findings text reached the dispatch prompt
+    assert "bd-1" not in _PENDING_FEEDBACK  # drained one-shot
+    assert loop._ci_feedback.get("bd-1")  # promoted into the per-run feedback lever
+
+
+def test_queue_review_feedback_ignores_blank_findings():
+    from project_board.loop import _PENDING_FEEDBACK, queue_review_feedback
+
+    _PENDING_FEEDBACK.clear()
+    queue_review_feedback("bd-9", "   ")
+    assert "bd-9" not in _PENDING_FEEDBACK  # nothing to carry back
+
+
 def test_is_test_path_classification():
     """The deterministic gate's path classifier — what counts as a test vs code."""
     from project_board.loop import _is_code_path, _is_test_path
