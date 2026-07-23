@@ -174,6 +174,7 @@ def _board_tools(cfg: dict):
         depends_on: str = "",
         foundation: bool = False,
         force: bool = False,
+        source_issue: str = "",
     ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
@@ -182,6 +183,9 @@ def _board_tools(cfg: dict):
         `difficulty` (small|medium|large) seeds the model tier; `depends_on` is a
         comma-separated list of blocking feature ids; set `foundation=True` for a
         feature others build on (dependents gate on its merge, never its review).
+        `source_issue` names the ORIGINATING GitHub issue — a full issue URL or
+        `owner/repo#N`, stored normalized as `owner/repo#N` — so the feature's PR
+        gets a `Fixes #N` line and the issue auto-closes on merge.
 
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
@@ -204,6 +208,7 @@ def _board_tools(cfg: dict):
             parent = _strip_wrapping_quotes(parent)
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
+            source_issue = _strip_wrapping_quotes(source_issue)
             if not force:
                 try:
                     existing = store.list_features()
@@ -230,6 +235,7 @@ def _board_tools(cfg: dict):
                 difficulty=difficulty,
                 depends_on=deps,
                 foundation=foundation,
+                source_issue=source_issue,
             )
             return _feature_reply(f)
         except BoardError as exc:
@@ -245,6 +251,7 @@ def _board_tools(cfg: dict):
         difficulty: str = "",
         depends_on: str = "",
         foundation: bool = False,
+        source_issue: str = "",
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
@@ -254,7 +261,9 @@ def _board_tools(cfg: dict):
         re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
         edges, and `foundation=True` restores the foundation flag — the repairs for
         dependencies/foundation dropped by a create-time failure (False = leave as-is;
-        this tool never removes the flag). Inputs are
+        this tool never removes the flag). `source_issue` (a full GitHub issue URL or
+        `owner/repo#N`, stored normalized) sets/replaces the originating issue the
+        feature's PR will reference as `Fixes #N`. Inputs are
         stripped of any literal wrapping double quotes before storage (same hygiene as
         board_create_feature)."""
         try:
@@ -265,6 +274,7 @@ def _board_tools(cfg: dict):
             design = _strip_wrapping_quotes(design)
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
+            source_issue = _strip_wrapping_quotes(source_issue)
             files = _split_list(files_to_modify)
             deps = _split_list(depends_on)
             f = store.update_feature(
@@ -278,6 +288,7 @@ def _board_tools(cfg: dict):
                 difficulty=difficulty.strip() or None,
                 depends_on=deps or None,
                 foundation=foundation or None,
+                source_issue=source_issue.strip() or None,
             )
             return _feature_reply(f)
         except BoardError as exc:

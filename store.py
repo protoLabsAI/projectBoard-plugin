@@ -98,6 +98,19 @@ LABEL_GENS_PREFIX = "gens:"
 # written post-promote), so the sha is the only piece that must ride the label; the full
 # {branch, sha, worktree} triple lands in a comment for the audit trail.
 LABEL_VERIFIED_PREFIX = "verified:"
+# The ORIGINATING GitHub issue (#97) — `source:owner/repo#N`, a single replaced label
+# (the `gens:`/`verified:` pattern). Set through create/update's `source_issue`,
+# projected back as the `source_issue` field the loop's PR opener reads to stamp
+# `Fixes #N` (same-repo) / `Refs <url>` (cross-repo) on the PR body; absent, the
+# opener falls back to scanning the feature text for an issue URL.
+LABEL_SOURCE_PREFIX = "source:"
+# What `source_issue` accepts: a full GitHub issue URL, or the `owner/repo#N`
+# shorthand it normalizes to. Anything else (a bare number, a PR url, free text) is
+# rejected with a named error — the field is explicit provenance, so a value that
+# can't name ONE exact issue must fail loudly, not store junk the PR opener would
+# silently drop.
+_SOURCE_ISSUE_URL_RE = re.compile(r"https://github\.com/([^/\s#]+)/([^/\s#]+)/issues/(\d+)/?")
+_SOURCE_ISSUE_SLUG_RE = re.compile(r"[^/\s#]+/[^/\s#]+#\d+")
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
@@ -149,6 +162,25 @@ def _plan_deps(val) -> list:
 
 class BoardError(Exception):
     """A rejected op (bad gate, unknown feature, `br` failure). Caller → 4xx / tool error."""
+
+
+def normalize_source_issue(raw) -> str:
+    """Normalize a source-issue reference to the canonical ``owner/repo#N``.
+
+    Accepts a full GitHub issue URL (``https://github.com/owner/repo/issues/123``)
+    or the ``owner/repo#N`` shorthand (returned unchanged). Anything else raises a
+    named BoardError so the caller rejects just this field/item — never storing a
+    value the PR opener can't resolve to one exact issue."""
+    s = str(raw or "").strip()
+    m = _SOURCE_ISSUE_URL_RE.fullmatch(s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}#{m.group(3)}"
+    if _SOURCE_ISSUE_SLUG_RE.fullmatch(s):
+        return s
+    raise BoardError(
+        f"invalid source_issue {raw!r} — expected a GitHub issue URL "
+        "(https://github.com/owner/repo/issues/N) or owner/repo#N"
+    )
 
 
 class BeadsBoard:
@@ -286,12 +318,18 @@ class BeadsBoard:
         difficulty: str = "",
         depends_on=(),
         foundation: bool = False,
+        source_issue: str = "",
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
         pass the Ready gate (ProtoMaker's spec-quality discipline — vague tasks make
         a coder produce nothing). Mark `foundation=True` for a feature others build on
-        (dependents gate on its merge, never its review)."""
+        (dependents gate on its merge, never its review). `source_issue` names the
+        ORIGINATING GitHub issue (a full issue URL or `owner/repo#N`, stored
+        normalized) so the PR opener can stamp `Fixes #N` on the feature's PR (#97)."""
+        # Normalize BEFORE minting the bead: an invalid source_issue must reject the
+        # whole create with a named error, never leave an orphan bead behind it.
+        src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
         fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
         # with a follow-up `br update`. Free-text VALUES ride in `--flag=value` form so a
@@ -322,6 +360,9 @@ class BeadsBoard:
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")
+        if src:
+            upd += ["--add-label", f"{LABEL_SOURCE_PREFIX}{src}"]
+            enriched.append("source_issue")
         # Dependency edges are independent of the enrichment `br update` — wire them
         # FIRST so an enrichment failure can never silently drop them (QA panel on
         # #88: the early success-with-warning return below used to skip the dep loop,
@@ -437,7 +478,7 @@ class BeadsBoard:
     def create_from_plan(self, plan, mark_ready: bool = False) -> dict:
         """Batch-create a whole decomposition in ONE call — ``plan`` is a list of
         feature sections (each: title / spec / acceptance_criteria / files /
-        difficulty / depends_on / foundation). Reuses ``create_feature``'s validation,
+        difficulty / depends_on / foundation / source_issue). Reuses ``create_feature``'s validation,
         enrichment, and success-with-warning contract PER ITEM (#85): a malformed item
         fails ITSELF with a named reason and the rest proceed (all-or-report, never
         all-or-nothing). The single-create tool is unchanged.
@@ -475,6 +516,7 @@ class BeadsBoard:
                     difficulty=str(item.get("difficulty") or ""),
                     depends_on=(),  # wired in phase 2, once every plan-item id is known
                     foundation=bool(item.get("foundation", False)),
+                    source_issue=str(item.get("source_issue") or ""),
                 )
             except BoardError as exc:
                 results.append({"index": i, "created": False, "title": title, "error": str(exc)})
@@ -546,6 +588,7 @@ class BeadsBoard:
         difficulty: str | None = None,
         depends_on: list[str] | None = None,
         foundation: bool | None = None,
+        source_issue: str | None = None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -554,7 +597,9 @@ class BeadsBoard:
         `files_to_modify` can be fixed IN PLACE and re-marked ready, instead of being
         cancelled and recreated from scratch. ``depends_on`` ADDS blocking edges and
         ``foundation=True`` adds the foundation label (None/False = untouched) — the
-        repair half of create's success-with-warning contract."""
+        repair half of create's success-with-warning contract. ``source_issue`` (a
+        full GitHub issue URL or ``owner/repo#N``) sets/replaces the originating-issue
+        record the PR opener stamps as ``Fixes #N`` (#97)."""
         f = self._require(fid)
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
@@ -587,6 +632,14 @@ class BeadsBoard:
             # create can be restored here (QA panel on #88, round 4 — same undeliverable-
             # promise class as depends_on). None/False = leave the label untouched.
             args += ["--add-label", LABEL_FOUNDATION]
+        if source_issue is not None and str(source_issue).strip():
+            # An invalid value raises the named error BEFORE `br update` runs, so a bad
+            # source_issue never half-applies a mixed update. Whitespace-only = no-op
+            # (the difficulty convention). Single replaced label — the `diff:` pattern.
+            src = normalize_source_issue(source_issue)
+            for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_SOURCE_PREFIX)]:
+                args += ["--remove-label", stale]
+            args += ["--add-label", f"{LABEL_SOURCE_PREFIX}{src}"]
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
         # Same partial-failure contract as create_feature (panel round 7): one bad id
@@ -1106,6 +1159,13 @@ class BeadsBoard:
             "attempts": attempts,
             "gens_spent": gens_spent,
             "verified_sha": verified_sha,
+            # The originating issue (#97): normalized `owner/repo#N` from the single
+            # replaced `source:` label — "" when unset (the loop's PR opener then falls
+            # back to scanning the feature text for an issue URL).
+            "source_issue": next(
+                (l[len(LABEL_SOURCE_PREFIX) :] for l in labels if l.startswith(LABEL_SOURCE_PREFIX)),
+                "",
+            ),
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,
