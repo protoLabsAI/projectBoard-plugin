@@ -103,6 +103,49 @@ LABEL_VERIFIED_PREFIX = "verified:"
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
 TIER_LADDER = ["smart", "reasoning", "opus"]
 
+# A plan-item `depends_on` entry that is a plain integer is a 0-based INDEX into the
+# plan. STRICT — a single optional leading '-' only. The old `lstrip('-').isdigit()`
+# guard also accepted multi-dash junk like '--5' (lstrip strips BOTH dashes → '5')
+# and then crashed `int('--5')` with an uncaught ValueError, taking the whole batch
+# down (#92). Gating int() on this pattern keeps a malformed ref from ever reaching
+# int(); a still-numeric-looking miss is named as malformed for that item alone.
+_PLAN_INDEX_RE = re.compile(r"-?\d+")
+
+
+def _norm_plan_title(t) -> str:
+    """Normalize a title for plan-internal dep matching (trim, lowercase, collapse
+    internal whitespace) — the same normalization the tool-boundary dedup uses."""
+    return " ".join(str(t or "").strip().lower().split())
+
+
+def _plan_item_title(item) -> str:
+    """The raw title of a plan item, or '' — safe on a non-dict item (used only to
+    label a malformed item in the failure report)."""
+    return str(item.get("title") or "") if isinstance(item, dict) else ""
+
+
+def _plan_files(val) -> list[str]:
+    """Normalize a plan item's `files` (a list of paths, or a comma/newline string)
+    to a clean list — a bare string must NOT reach create_feature, which iterates it
+    (char-by-char for a str)."""
+    if isinstance(val, str):
+        return [x.strip() for x in val.replace("\n", ",").split(",") if x.strip()]
+    return [str(p).strip() for p in (val or ()) if str(p).strip()]
+
+
+def _plan_deps(val) -> list:
+    """Normalize a plan item's `depends_on` (a list, or a comma/newline string) to a
+    clean list — integer entries (plan indices) are preserved as ints; strings are
+    trimmed. (bool is dropped: it's an int subclass but never a valid index/id.)"""
+    if isinstance(val, str):
+        return [x.strip() for x in val.replace("\n", ",").split(",") if x.strip()]
+    out: list = []
+    for v in val or ():
+        if isinstance(v, bool):
+            continue
+        out.append(v if isinstance(v, int) else str(v).strip())
+    return [d for d in out if d != ""]
+
 
 class BoardError(Exception):
     """A rejected op (bad gate, unknown feature, `br` failure). Caller → 4xx / tool error."""
@@ -337,6 +380,159 @@ class BeadsBoard:
         also how a *foundation* gate is expressed: dependents carry a blocks-edge on
         the foundation feature, so they only become `ready` once it merges → done."""
         self._run("dep", "add", fid, depends_on, "--type", "blocks")
+
+    # ── batch create from a structured decomposition (#92) ─────────────────────
+    @staticmethod
+    def _validate_plan_item(item, index: int) -> str:
+        """A plan item must be an object carrying a non-empty title. Anything else is
+        malformed and fails ITSELF (all-or-report) — raise a named reason the caller
+        records against this item while the rest of the batch proceeds."""
+        if not isinstance(item, dict):
+            raise BoardError(f"plan item {index} is not an object (got {type(item).__name__})")
+        title = str(item.get("title") or "").strip()
+        if not title:
+            raise BoardError(f"plan item {index} has no title")
+        return title
+
+    @staticmethod
+    def _resolve_plan_dep(dep, index_to_id: dict, title_to_id: dict) -> str:
+        """Resolve one plan-item `depends_on` entry to a real feature id. A dep may be
+        a 0-based plan-item INDEX (an int, or a plain numeric string), the TITLE of
+        another plan item, or an existing board feature id (passed through untouched —
+        add_dependency validates it). Raises BoardError with a named reason on anything
+        unresolvable, so the CALLER fails just that item's edge in place (#92) instead
+        of letting an uncaught error kill the whole batch."""
+        # bool is an int subclass — reject before the int branch swallows True/False.
+        if isinstance(dep, bool):
+            raise BoardError(f"dependency {dep!r} is not a valid feature reference")
+        if isinstance(dep, int):
+            if dep in index_to_id:
+                return index_to_id[dep]
+            raise BoardError(f"plan-item index {dep} is out of range (or its item failed to create)")
+        s = str(dep).strip()
+        if not s:
+            raise BoardError("empty dependency reference")
+        # A plain integer STRING is a plan-item index. Gate int() on the STRICT
+        # _PLAN_INDEX_RE (single optional leading '-') so multi-dash junk like '--5'
+        # never reaches int() and blows up (#92 AC8).
+        if _PLAN_INDEX_RE.fullmatch(s):
+            idx = int(s)
+            if idx in index_to_id:
+                return index_to_id[idx]
+            raise BoardError(f"plan-item index {idx} is out of range (or its item failed to create)")
+        # '--5' passes the OLD loose `lstrip('-').isdigit()` guard but not the strict
+        # one — name it as a malformed index for THIS item rather than passing it
+        # downstream (where it would be mis-read as a `br` flag).
+        if s.lstrip("-").isdigit():
+            raise BoardError(
+                f"dependency {dep!r} looks like a plan-item index but is malformed "
+                "(only a single optional leading '-' is allowed)"
+            )
+        # otherwise: the title of another plan item, else an existing board feature id.
+        key = _norm_plan_title(s)
+        if key in title_to_id:
+            return title_to_id[key]
+        return s  # assume an existing board feature id; add_dependency validates it
+
+    def create_from_plan(self, plan, mark_ready: bool = False) -> dict:
+        """Batch-create a whole decomposition in ONE call — ``plan`` is a list of
+        feature sections (each: title / spec / acceptance_criteria / files /
+        difficulty / depends_on / foundation). Reuses ``create_feature``'s validation,
+        enrichment, and success-with-warning contract PER ITEM (#85): a malformed item
+        fails ITSELF with a named reason and the rest proceed (all-or-report, never
+        all-or-nothing). The single-create tool is unchanged.
+
+        Dependency edges BETWEEN plan items are resolved AFTER every create — the ids
+        aren't known up front, so a ``depends_on`` entry may reference another plan
+        item by 0-based index (int or numeric string) or by title, or name an existing
+        board feature id; an unresolvable/malformed ref fails that item's edge with a
+        named reason (success-with-warning), never the batch. With ``mark_ready=True``
+        only items that created CLEANLY (no enrichment/dep warning) are promoted."""
+        if not isinstance(plan, (list, tuple)):
+            raise BoardError("plan must be a list of feature sections")
+
+        created: list[tuple[int, dict, dict]] = []  # (plan index, source item, feature)
+        index_to_id: dict[int, str] = {}
+        title_to_id: dict[str, str] = {}
+        results: list[dict] = []
+
+        # ── phase 1: validate + create each item (deps deferred to phase 2) ──────
+        for i, item in enumerate(plan):
+            try:
+                title = self._validate_plan_item(item, i)
+            except BoardError as exc:
+                results.append({"index": i, "created": False, "title": _plan_item_title(item), "error": str(exc)})
+                continue
+            try:
+                f = self.create_feature(
+                    title,
+                    spec=str(item.get("spec") or ""),
+                    acceptance_criteria=str(item.get("acceptance_criteria") or ""),
+                    design=str(item.get("design") or ""),
+                    files_to_modify=_plan_files(item.get("files", item.get("files_to_modify"))),
+                    parent=str(item.get("parent") or ""),
+                    priority=int(item.get("priority", 2) or 2),
+                    difficulty=str(item.get("difficulty") or ""),
+                    depends_on=(),  # wired in phase 2, once every plan-item id is known
+                    foundation=bool(item.get("foundation", False)),
+                )
+            except BoardError as exc:
+                results.append({"index": i, "created": False, "title": title, "error": str(exc)})
+                continue
+            index_to_id[i] = f["id"]
+            title_to_id[_norm_plan_title(title)] = f["id"]
+            created.append((i, item, f))
+            r = dict(f)
+            r["index"] = i
+            r["created"] = True
+            results.append(r)
+
+        # ── phase 2: wire inter-item dep edges now every id is resolvable ─────────
+        result_by_id = {r["id"]: r for r in results if r.get("created")}
+        for _i, item, f in created:
+            failed: list[str] = []
+            for dep in _plan_deps(item.get("depends_on")):
+                try:
+                    self.add_dependency(f["id"], self._resolve_plan_dep(dep, index_to_id, title_to_id))
+                except BoardError as exc:
+                    failed.append(f"{dep} ({exc})")
+            if failed:
+                r = result_by_id[f["id"]]
+                r["enrichment_failed"] = True
+                r["missing_fields"] = list(r.get("missing_fields") or []) + [f"depends_on({d})" for d in failed]
+                prior = f"{r['warning']} " if r.get("warning") else ""
+                r["warning"] = (
+                    f"{prior}feature {f['id']} was created but these dependency edges failed: "
+                    f"{'; '.join(failed)} — repair with "
+                    f"board_update_feature(feature_id={f['id']!r}, depends_on=...)."
+                )
+
+        # ── phase 3: promote ONLY the cleanly-created items ──────────────────────
+        if mark_ready:
+            for _i, _item, f in created:
+                r = result_by_id[f["id"]]
+                if r.get("enrichment_failed"):
+                    continue  # a warned item isn't clean → don't auto-promote it
+                try:
+                    self.mark_ready(f["id"])
+                    r["board_state"] = "ready"
+                    r["ready"] = True
+                except BoardError as exc:
+                    r["ready"] = False
+                    r["ready_error"] = str(exc)
+
+        n_created = len(created)
+        return {
+            "items": results,
+            "created_ids": [f["id"] for _i, _item, f in created],
+            "summary": {
+                "requested": len(plan),
+                "created": n_created,
+                "failed": len(plan) - n_created,
+                "ready": sum(1 for r in results if r.get("ready")),
+                "warnings": sum(1 for r in results if r.get("enrichment_failed")),
+            },
+        }
 
     # ── partial update (the repair path) ──────────────────────────────────────
     def update_feature(

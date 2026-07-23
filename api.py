@@ -220,6 +220,19 @@ def build_data_router(cfg: dict):
     async def _create_feature(body: dict = Body(...)):
         return _guard(lambda: store().create_feature(**body))
 
+    @router.post("/features/batch")
+    async def _create_from_plan(body: dict = Body(default={})):
+        """Batch-create a whole decomposition (#92). Body: ``{"plan": [{title, spec,
+        acceptance_criteria, files, difficulty, depends_on, foundation}, …],
+        "mark_ready": false}``. All-or-report: a malformed item fails itself with a
+        named reason, the rest proceed; inter-item ``depends_on`` (by 0-based index or
+        title) resolves after every create; ``mark_ready`` promotes only clean items."""
+        return _guard(
+            lambda: store().create_from_plan(
+                (body or {}).get("plan") or [], mark_ready=bool((body or {}).get("mark_ready", False))
+            )
+        )
+
     @router.post("/features/{fid}/dep")
     async def _dep(fid: str, body: dict = Body(...)):
         """Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done.
