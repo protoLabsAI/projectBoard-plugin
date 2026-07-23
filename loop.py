@@ -213,6 +213,70 @@ def _pr_body(result: str, feature: dict) -> str:
     return body[:4000]
 
 
+# ── source-issue → PR "Fixes #N" line (pure metadata; the coder never touches it) ─
+# At PR-open the loop stamps the ORIGINATING issue onto the generated body itself.
+# The source issue is either an explicit ``source_issue`` field or the FIRST GitHub
+# issue URL in the feature's text. When that issue lives in the PR's OWN target repo,
+# ``Fixes #N`` (GitHub's repo-scoped closing keyword) auto-closes it on merge; a
+# cross-repo issue can't be closed by a bare ``#N`` there, so it gets a plain
+# ``Refs <full-url>`` link instead. One line of pure metadata — no coder round-trip.
+_ISSUE_URL_RE = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/issues/(\d+)")
+# GitHub's issue-closing keywords (close/fix/resolve + their conjugations).
+_CLOSING_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+
+
+def _source_issue(feature: dict) -> tuple[str, int] | None:
+    """The issue this feature's PR should reference: ``(slug, n)`` — ``slug`` is the
+    issue's ``owner/repo`` (``""`` when the source is a bare number ⇒ same repo) and
+    ``n`` the issue number — or ``None`` when the feature names no source issue.
+
+    Precedence: an explicit ``source_issue`` field (a full URL, ``owner/repo#n``, or a
+    bare ``#n``/``n``) wins; otherwise the FIRST GitHub issue URL in the feature text."""
+    raw = str(feature.get("source_issue") or "").strip()
+    if raw:
+        m = _ISSUE_URL_RE.search(raw)
+        if m:
+            return (m.group(1), int(m.group(2)))
+        m = re.fullmatch(r"([^/\s]+/[^/\s]+)#(\d+)", raw)
+        if m:
+            return (m.group(1), int(m.group(2)))
+        m = re.fullmatch(r"#?(\d+)", raw)
+        if m:
+            return ("", int(m.group(1)))
+        return None
+    text = "\n".join(
+        str(feature.get(k) or "") for k in ("description", "spec", "design", "acceptance_criteria", "title")
+    )
+    m = _ISSUE_URL_RE.search(text)
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: str) -> str:
+    """Append the source-issue reference to ``body`` (idempotently).
+
+    Same-repo (the issue's ``owner/repo`` equals the PR's ``target_repo``, or the
+    source was a bare number) ⇒ ``Fixes #n`` (auto-closes on merge); cross-repo ⇒
+    ``Refs <full-url>`` — a bare ``#n`` can't refer to another repo's issue, and an
+    unresolvable ``target_repo`` (``repo_slug`` failed open) degrades to the safe
+    ``Refs`` link rather than a possibly-wrong ``Fixes``.
+
+    Suppression is scope-aware: a full-URL reference to THIS issue (``\\b``-bounded, so
+    ``issues/12`` never matches ``issues/123``) suppresses in either case; the
+    ``Fixes/Closes #n`` shorthand only suppresses SAME-repo — cross-repo it cannot
+    name this issue, so it must NOT block the ``Refs`` line."""
+    url = f"https://github.com/{issue_slug}/issues/{n}" if issue_slug else ""
+    same_repo = (not issue_slug) or (bool(target_repo) and issue_slug.lower() == target_repo.lower())
+    url_present = bool(url) and re.search(rf"https://github\.com/{re.escape(issue_slug)}/issues/{n}\b", body)
+    if same_repo:
+        shorthand = re.search(rf"{_CLOSING_KW}\s+#{n}\b", body, re.I)
+        if shorthand or url_present:
+            return body
+        return f"{body.rstrip()}\n\nFixes #{n}"
+    if url_present:
+        return body
+    return f"{body.rstrip()}\n\nRefs {url}"
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -597,7 +661,8 @@ class BoardLoop:
                 self._clear_verified(store, fid)
                 return False
             title = f"feat: {f.get('title') or fid}"
-            pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=_pr_body("", f))
+            body = await self._with_source_issue_ref(f, wt, _pr_body("", f))
+            pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
             store.open_review(fid, pr_url=pr_url)
             self._clear_verified(store, fid)
             log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
@@ -1133,7 +1198,8 @@ class BoardLoop:
                             fid,
                             n,
                         )
-                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=_pr_body(result, feature))
+                    body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
+                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     policy = classify(str(exc))
                     # A capability failure = the coder didn't deliver (no diff / dispatch
@@ -1206,6 +1272,19 @@ class BoardLoop:
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
             self._inflight.pop(fid, None)
+
+    async def _with_source_issue_ref(self, feature: dict, wt: str, body: str) -> str:
+        """Stamp the feature's source issue onto the PR body — ``Fixes #n`` when the
+        issue is in the PR's own target repo, ``Refs <url>`` cross-repo. No source
+        issue ⇒ body unchanged (and no ``gh`` round-trip). ``worktree.repo_slug`` fails
+        open, so an unresolvable target repo degrades to a ``Refs`` link — never a
+        wrong ``Fixes`` and never a blocked PR."""
+        parsed = _source_issue(feature)
+        if not parsed:
+            return body
+        issue_slug, n = parsed
+        target_repo = await worktree.repo_slug(cwd=wt)
+        return _inject_source_issue_line(body, issue_slug, n, target_repo)
 
     async def _request_review(self, fid: str, pr_url: str):
         """Hand the PR to the reviewer (an a2a delegate, e.g. quinn). Best-effort:

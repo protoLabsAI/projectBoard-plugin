@@ -492,3 +492,18 @@ async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
     adopting → in_review) from one that needs a fresh rebuild."""
     rc, out, _err = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=cwd)
     return out.strip() if rc == 0 else ""
+
+
+async def repo_slug(*, cwd: str = ".") -> str:
+    """The ``owner/name`` slug of the checkout's default GitHub repo — the repo a PR
+    opened from here TARGETS — or ``""`` when it can't be resolved.
+
+    Fails OPEN: a ``gh`` non-zero exit OR a ``WorktreeError`` (the timeout ``_gh``
+    raises) returns ``""`` instead of propagating, so a caller (e.g. the PR-body
+    source-issue stamp) that can't learn the target repo simply degrades rather than
+    blocking the PR. This never raises into the loop."""
+    try:
+        rc, out, _err = await _gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner", cwd=cwd)
+    except WorktreeError:
+        return ""
+    return out.strip() if rc == 0 else ""
