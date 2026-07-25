@@ -27,8 +27,29 @@ jobs:
         # files (main carried this mismatch). Pin both sides to keep them in step.
         run: pip install -r requirements-dev.txt ruff==0.15.10
 
+      - name: Install beads (br) — pinned prebuilt release binary
+        # The real-br integration tier (tests/test_integration.py, #136) shells the
+        # ACTUAL `br`. Pinned to v0.1.23 — the version we run locally: `br` upgrades
+        # change behavior the plugin consumes (#138: 0.2.16 changed the --json payload
+        # shape from [] to {"issues":[…]}), so an upgrade lands deliberately by moving
+        # this pin (URL + sha256) alongside the code, never via "latest". A prebuilt
+        # release asset — download + untar, no Rust toolchain in CI.
+        run: |
+          curl -fsSL -o /tmp/br.tar.gz \
+            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.1.23/br-v0.1.23-linux_amd64.tar.gz
+          echo "2f0d70865eba171e845a4f616151893def534ad83e0b0bc8e216a827f1f9f6dc  /tmp/br.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/br.tar.gz -C "$HOME/.local/bin" br
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/br" --version
+
       - name: Lint
         run: ruff check . && ruff format --check .
 
       - name: Test
+        # PB_REQUIRE_BR turns an absent `br` into a FAILURE (the guard test in
+        # tests/test_integration.py) instead of a silent skip of the integration
+        # tier — a silent skip is a fake with extra ceremony (#136).
+        env:
+          PB_REQUIRE_BR: "1"
         run: pytest -q
