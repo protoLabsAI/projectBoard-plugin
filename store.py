@@ -53,9 +53,42 @@ BR = os.environ.get("BR_BIN", "br")
 # transient contention that clears on a short retry. Retry ONLY that class (a bad-arg
 # failure is not going to fix itself) with a small exponential backoff so a create/
 # update isn't lost to a lock it merely lost the race for.
-_DB_RETRY_ATTEMPTS = 4
-_DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4)
+#
+# The window is sized for REAL WAL contention, not a token retry (#116): the loop polls
+# the same DB on a 30s tick while boarding writes, so a create-plus-enrich races the
+# poller by construction and a budget shorter than a WAL checkpoint keeps losing. 6
+# attempts backing off 0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2s give a ~6.3s total window —
+# enough to outlast typical write contention without holding a turn for minutes. The old
+# 4-attempt, 0.7s budget lost the `bd-ud1` enrichment write, dropping its `source_issue`.
+_DB_RETRY_ATTEMPTS = 6
+_DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2, ~6.3s total)
 _DB_CONTENTION_RE = re.compile(r"DATABASE_ERROR|database is (?:locked|busy)", re.IGNORECASE)
+
+
+def _contention_in_json(out) -> str:
+    """Detect DB contention that `br` wrote as structured JSON on stdout with a ZERO
+    exit code (#116) — a failure shape a bare `returncode == 0` check sails right past,
+    so the retry loop never fires and the write is silently lost. Parse stdout and, if
+    it's an error-shaped object (an ``error`` / ``message`` / ``code`` / ``status`` /
+    ``detail`` field whose text names contention), return that text so ``_run`` retries
+    it exactly like a stderr DATABASE_ERROR. Returns '' for a normal payload (a list of
+    beads, a bead object, empty) — only error-shaped keys are sniffed, so a legit
+    `status: "open"` can never be mistaken for a lock."""
+    s = str(out or "").strip()
+    if not s.startswith("{"):  # normal br JSON payloads are lists ('[') or empty
+        return ""
+    try:
+        obj = json.loads(s)
+    except ValueError:
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("error", "message", "code", "status", "detail"):
+        val = obj.get(key)
+        if isinstance(val, str) and _DB_CONTENTION_RE.search(val):
+            return val
+    return ""
+
 
 # Labels that encode board state / escalation (everything else is free-form).
 LABEL_READY = "ready"
@@ -403,26 +436,44 @@ class BeadsBoard:
         # per-team-agent `repo` (or an explicit `db`), the board is deterministically
         # pinned to its repo instead of polluting whatever dir the host launched from.
         # A transient DATABASE_ERROR (SQLite contention) is retried with a short backoff;
-        # any other non-zero exit raises immediately.
+        # any other non-zero exit raises immediately. Contention surfaces TWO ways: a
+        # non-zero exit with DATABASE_ERROR on stderr, OR (br 0.1.x) a ZERO exit that
+        # wrote the error as structured JSON on stdout — the latter slips past a bare
+        # returncode check, so it's sniffed post-parse too (#116). The retry count is
+        # logged on final success so the operator can see contention was resolved.
         delay = _DB_RETRY_DELAY
+        retries = 0
         for attempt in range(_DB_RETRY_ATTEMPTS):
             proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
-            if proc.returncode == 0:
-                break
             err = proc.stderr.strip()
-            if attempt < _DB_RETRY_ATTEMPTS - 1 and _DB_CONTENTION_RE.search(err):
+            contention = (
+                (err if _DB_CONTENTION_RE.search(err) else "")
+                if proc.returncode != 0
+                else _contention_in_json(proc.stdout)
+            )
+            if proc.returncode == 0 and not contention:
+                if retries:
+                    log.info(
+                        "[project_board] `br %s` cleared DB contention after %d retr%s",
+                        args[0] if args else "",
+                        retries,
+                        "y" if retries == 1 else "ies",
+                    )
+                break
+            if contention and attempt < _DB_RETRY_ATTEMPTS - 1:
+                retries += 1
                 log.warning(
                     "[project_board] `br %s` hit DB contention (attempt %d/%d) — backing off %.2fs: %s",
                     args[0] if args else "",
                     attempt + 1,
                     _DB_RETRY_ATTEMPTS,
                     delay,
-                    err[:120],
+                    contention[:120],
                 )
                 time.sleep(delay)
                 delay *= 2
                 continue
-            raise BoardError(f"`br {' '.join(args)}` failed: {err[:300]}")
+            raise BoardError(f"`br {' '.join(args)}` failed: {(err or contention)[:300]}")
         if not want_json:
             return proc.stdout.strip()
         # `br` prefixes some JSON with INFO log lines on stderr; stdout is clean JSON.
