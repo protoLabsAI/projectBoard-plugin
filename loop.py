@@ -48,6 +48,8 @@ from .store import (
     LABEL_CHANGES_REQUESTED,
     LABEL_REVIEW_PENDING,
     BoardError,
+    _all_items_disposed,
+    apply_requirement_dispositions,
     escalation_enabled,
     get_store,
 )
@@ -221,6 +223,43 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str]:
 # Match the heading at line start; keep from the LAST occurrence so an early mention
 # of the phrase mid-narration doesn't truncate the real section (#56).
 _SUMMARY_HEADING_RE = re.compile(r"^##\s*Summary\b", re.MULTILINE)
+
+# The requirement-ledger disposition section (#113) — the `## Summary` pattern's
+# sibling: the coder reports one line per item id (`- r2: done`, `- r3: declined —
+# <reason>`). Same last-occurrence discipline as the summary; the section ends at
+# the next `## ` heading. Only the CLOSED statuses parse — silence (or an explicit
+# `open`) is not a disposition, so an unreported item stays open on the ledger.
+_REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
+_REQ_LINE_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
+    r"(?P<status>done|declined)\b\s*(?:[:\-—–]\s*)?(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_requirements_reply(text: str) -> list[dict]:
+    """Parse the coder reply's ``## Requirements`` section into disposition dicts
+    (`{id, status, decline_reason?}`) for ``apply_requirement_dispositions``. Keeps
+    the LAST such heading (a mid-narration mention must not shadow the real section,
+    the #56 lesson), reads until the next heading, and skips any line that isn't a
+    well-formed `<id>: done|declined [— reason]` row — a malformed row is silence,
+    and silence is not disposition. No section → no dispositions."""
+    headings = list(_REQ_HEADING_RE.finditer(text or ""))
+    if not headings:
+        return []
+    out: list[dict] = []
+    for line in text[headings[-1].end() :].splitlines():
+        if line.strip().startswith("##"):
+            break  # the next section — the ledger block ended
+        m = _REQ_LINE_RE.match(line)
+        if not m:
+            continue
+        d = {"id": m.group("id"), "status": m.group("status").lower()}
+        reason = m.group("reason").strip()
+        if d["status"] == "declined" and reason:
+            d["decline_reason"] = reason
+        out.append(d)
+    return out
 
 
 def _pr_body(result: str, feature: dict) -> str:
@@ -540,6 +579,11 @@ class BoardLoop:
         self._goal_fix_attempts: dict[str, int] = {}
         # Pre-PR local-gate failure re-dispatches so far (fid → count), same-tier.
         self._gate_fix_attempts: dict[str, int] = {}
+        # Pre-PR requirement-ledger bounces so far (fid → count, #113) — open items
+        # at the open_pr seam re-dispatch same-tier/keep-worktree with the open list,
+        # sharing the goal-fix budget knob (goal_fix_max: the same "the coder didn't
+        # deliver everything it was told; tell it what's missing" class).
+        self._req_fix_attempts: dict[str, int] = {}
         # Rebase-conflict re-dispatches so far (fid → count) when a sibling merge
         # leaves a PR with a real (non-clean) conflict against base.
         self._rebase_attempts: dict[str, int] = {}
@@ -1159,6 +1203,27 @@ class BoardLoop:
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
+                    # Requirement-ledger write-back (#113): merge the reply's
+                    # `## Requirements` dispositions into the ledger and persist it on
+                    # the bead — the LOOP writes dispositions, never the coder, and the
+                    # completion gate below reads the ledger, never the reply text.
+                    # Silence leaves an item open. The bead write is best-effort (the
+                    # gate still checks the in-hand merged ledger), but a re-dispatch
+                    # after requeue re-projects from the bead, so a lost write only
+                    # costs a repeat disposition, never a false "disposed".
+                    ledger = list(feature.get("requirements") or [])
+                    if ledger:
+                        ledger = apply_requirement_dispositions(ledger, _parse_requirements_reply(result or ""))
+                        feature["requirements"] = ledger
+                        try:
+                            store.set_requirements(fid, ledger)
+                        except Exception:  # noqa: BLE001 — bookkeeping must not fail the build
+                            log.warning(
+                                "[project_board] %s requirement write-back failed (gate still checks "
+                                "the merged ledger)",
+                                fid,
+                                exc_info=True,
+                            )
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -1226,6 +1291,44 @@ class BoardLoop:
                             fid,
                             n,
                         )
+                    # Completion gate (#113, the planSpec mechanism): a feature may NOT
+                    # reach in_review with OPEN requirement items — the ledger decides,
+                    # not the coder's say-so. Same seam as the local gate (after the
+                    # coder's fix rounds, before the PR opens). Open items bounce back
+                    # same-tier/keep-worktree with the list, bounded by the goal-fix
+                    # budget; exhaustion is a capability failure (escalate/block via
+                    # the handler below), NEVER a PR with unaddressed requirements —
+                    # unlike the local gate, this one does not fail open: a `declined`
+                    # with a reason is always available, so "can't" has a valid exit.
+                    if ledger and not _all_items_disposed(ledger):
+                        open_items = [i for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")]
+                        listing = "\n".join(f"- {i.get('id')}: {i.get('text')}" for i in open_items)
+                        n = self._req_fix_attempts.get(fid, 0)
+                        if n < self.goal_fix_max:
+                            self._req_fix_attempts[fid] = n + 1
+                            self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
+                            self._ci_feedback[fid] = (
+                                "Your implementation is ALREADY in this worktree's files, but these "
+                                "requirement items are still OPEN on the ledger — no disposition was "
+                                "recorded for them. Address each one, then END your reply with a "
+                                "`## Requirements` section marking EVERY item `done` or `declined — "
+                                "<concrete reason>` (silence is not a disposition):\n\n" + listing
+                            )
+                            log.info(
+                                "[project_board] %s requirement gate: %d open item(s) — re-dispatch %d/%d "
+                                "(tier=%s, keep worktree)",
+                                fid,
+                                len(open_items),
+                                n + 1,
+                                self.goal_fix_max,
+                                tier or "default",
+                            )
+                            keep_wt = True
+                            continue
+                        raise worktree.WorktreeError(
+                            f"requirements unresolved: {len(open_items)} item(s) still open after "
+                            f"{n} fix round(s): " + ", ".join(str(i.get("id")) for i in open_items)
+                        )
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
@@ -1238,6 +1341,7 @@ class BoardLoop:
                         isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
                         or str(exc).startswith("coder dispatch failed")
                         or str(exc).startswith("goal verification failed")
+                        or str(exc).startswith("requirements unresolved")
                     )
                     # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
                     #    off the latest base also clears a merge conflict).
@@ -1266,6 +1370,7 @@ class BoardLoop:
                             # spent budget, so it blocks on its first gap without a real shot.
                             self._goal_fix_attempts.pop(fid, None)
                             self._gate_fix_attempts.pop(fid, None)  # fresh local-gate budget too
+                            self._req_fix_attempts.pop(fid, None)  # and a fresh ledger budget (#113)
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
@@ -1280,6 +1385,7 @@ class BoardLoop:
                 store.open_review(fid, pr_url=pr_url)
                 self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
                 self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
+                self._req_fix_attempts.pop(fid, None)  # and the requirement-ledger budget (#113)
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.
@@ -1984,6 +2090,30 @@ class BoardLoop:
             if lessons.strip()
             else ""
         )
+        # Requirement ledger (#113): the tracked items decomposed from the acceptance
+        # criteria at mark_ready, WITH their current statuses — so a re-dispatch
+        # re-injects the still-open items and the coder must dispose of every one
+        # (done, or declined with a reason). Silence is not disposition: an
+        # unreported item stays open and the completion gate refuses the PR.
+        reqs = feature.get("requirements") or []
+        req_lines = "\n".join(
+            f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
+            + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
+            for r in reqs
+        )
+        req_block = (
+            "\n## Requirements ledger (dispose of EVERY item)\n"
+            f"{req_lines}\n\n"
+            "Each item above is tracked on the board. Address every `open` item this "
+            "round, and report a per-item disposition: include a `## Requirements` "
+            "section in your final message (before the `## Summary`) with ONE line "
+            "per item — `- <id>: done` or `- <id>: declined — <concrete reason>`. "
+            "Declining with a real reason (e.g. not reachable/not applicable) is a "
+            "valid closed state; SILENCE IS NOT — an unreported item stays open, and "
+            "the PR cannot open while any item is open.\n"
+            if reqs
+            else ""
+        )
         return (
             f"You are implementing ONE feature in this repository. Your working "
             f"directory is an isolated git worktree — **make all the edits here, now**. "
@@ -1995,7 +2125,8 @@ class BoardLoop:
             f"## Task\n{feature.get('spec', '')}\n\n"
             f"## Files to create / modify\n{files_block}\n"
             f"{design_block}\n"
-            f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n\n"
+            f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
+            f"{req_block}\n"
             f"## Rules\n"
             f"- Make the edits directly in the working tree NOW — actually write the files.\n"
             f"- Touch only the files this task needs; mirror the surrounding code's style.\n"

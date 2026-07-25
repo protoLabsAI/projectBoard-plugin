@@ -51,6 +51,10 @@ class FakeLoopStore:
         self.calls.append(("clear_verified", fid))
         return {"id": fid}
 
+    def set_requirements(self, fid, items):
+        self.calls.append(("set_requirements", fid, items))
+        return {"id": fid, "requirements": items}
+
     def names(self):
         return [c[0] for c in self.calls]
 
@@ -2682,3 +2686,132 @@ async def test_drive_injects_fixes_line_into_the_pr_body(monkeypatch):
     _loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
     assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
     assert bodies and bodies[0].endswith("Fixes #7")
+
+
+# ── #113: the requirement ledger — parse dispositions, carry in prompt, gate the PR ──
+
+
+def test_parse_requirements_reply_reads_done_and_declined_lines():
+    from project_board.loop import _parse_requirements_reply
+
+    reply = (
+        "I did the work.\n"
+        "## Requirements\n"
+        "- r1: done\n"
+        "- r2: declined — dicts not reachable through SqliteSaver+pickle\n"
+        "r3 - done\n"
+        "not a disposition line\n"
+        "## Summary\n\n- r4: done (this is PAST the section — must not parse)\n"
+    )
+    assert _parse_requirements_reply(reply) == [
+        {"id": "r1", "status": "done"},
+        {"id": "r2", "status": "declined", "decline_reason": "dicts not reachable through SqliteSaver+pickle"},
+        {"id": "r3", "status": "done"},
+    ]
+
+
+def test_parse_requirements_reply_keeps_the_last_heading_and_tolerates_no_section():
+    from project_board.loop import _parse_requirements_reply
+
+    reply = "## Requirements\n- r1: done\nnarration…\n## Requirements\n- r2: declined: not applicable\n"
+    assert _parse_requirements_reply(reply) == [{"id": "r2", "status": "declined", "decline_reason": "not applicable"}]
+    assert _parse_requirements_reply("no section here") == []
+    assert _parse_requirements_reply("") == []
+
+
+def test_parse_requirements_reply_ignores_open_and_junk_statuses():
+    from project_board.loop import _parse_requirements_reply
+
+    reply = "## Requirements\n- r1: open\n- r2: wontfix\n- r3: done\n"
+    assert _parse_requirements_reply(reply) == [{"id": "r3", "status": "done"}]
+
+
+def test_build_prompt_carries_the_requirement_ledger_with_statuses():
+    feature = {
+        **FEATURE,
+        "requirements": [
+            {"id": "r1", "text": "restore dict tolerance", "status": "open"},
+            {"id": "r2", "text": "update CHANGELOG.md", "status": "done"},
+        ],
+    }
+    prompt = BoardLoop({})._build_prompt(feature)
+    assert "Requirements ledger" in prompt
+    assert "`r1` [open] restore dict tolerance" in prompt
+    assert "`r2` [done] update CHANGELOG.md" in prompt  # statuses ride along on re-dispatch
+    assert "## Requirements" in prompt  # the reporting contract is named
+    assert "SILENCE IS NOT" in prompt  # silence is not disposition
+    # no ledger → no block (the prose-AC prompt is unchanged)
+    assert "Requirements ledger" not in BoardLoop({})._build_prompt(FEATURE)
+
+
+async def test_drive_requirement_gate_bounces_open_items_then_opens(monkeypatch):
+    """An undisposed item bounces the build back (same tier, keep-worktree) with the
+    open list injected; once every item is done/declined the PR opens. The loop —
+    not the coder — writes the dispositions back to the bead each round."""
+    prompts = []
+    replies = iter(
+        [
+            "did some of it\n## Requirements\n- r1: done\n",  # r2 silent → stays open → bounce
+            "## Requirements\n- r2: declined — repo has no CHANGELOG\n## Summary\n\n- done\n",
+        ]
+    )
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        prompts.append(prompt)
+        return next(replies)
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/3"
+
+    feature = {
+        **FEATURE,
+        "requirements": [
+            {"id": "r1", "text": "restore dict tolerance", "status": "open"},
+            {"id": "r2", "text": "update CHANGELOG.md", "status": "open"},
+        ],
+    }
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch, feature=feature)
+    assert len(prompts) == 2  # initial + 1 ledger bounce
+    assert store.creates == ["bd-1"]  # keep-worktree: the impl is not thrown away
+    assert "r2" in prompts[1] and "update CHANGELOG.md" in prompts[1]  # the open list re-injected
+    # the loop wrote dispositions back each round; the final ledger is fully closed
+    writes = [c for c in store.calls if c[0] == "set_requirements"]
+    assert len(writes) == 2
+    final = writes[-1][2]
+    assert {i["id"]: i["status"] for i in final} == {"r1": "done", "r2": "declined"}
+    assert final[1]["decline_reason"] == "repo has no CHANGELOG"  # a decline with a reason is a valid close
+    assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
+    assert loop._req_fix_attempts.get("bd-1", 0) == 0  # budget reset once the PR opened
+
+
+async def test_drive_requirement_gate_exhausted_blocks_never_opens(monkeypatch):
+    """The hard invariant: a feature cannot reach in_review with open items — an
+    exhausted bounce budget is a capability failure (block with a single coder),
+    NEVER a PR with unaddressed requirements (unlike the local gate's fail-open)."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        return "no requirements section at all"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise AssertionError("no PR may open while ledger items are open")
+
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "restore dict tolerance", "status": "open"}]}
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_dispatch,
+        feature=feature,
+        cfg={"coder": "proto", "goal_fix_max": 0},
+    )
+    assert "open_review" not in store.names()
+    blocked = next(c for c in store.calls if c[0] == "flag_blocked")
+    assert "requirements unresolved" in blocked[2] and "r1" in blocked[2]
+
+
+async def test_drive_without_a_ledger_never_touches_set_requirements(monkeypatch):
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/4"
+
+    _loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no ledger
+    assert "set_requirements" not in store.names()
+    assert ("open_review", "bd-1", "https://example/pr/4") in store.calls

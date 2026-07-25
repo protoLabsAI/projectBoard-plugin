@@ -1350,3 +1350,158 @@ def test_raw_features_with_comments_listing_is_unbounded(make_board):
     b.raw_features_with_comments()
     assert br.cmds("list")  # a list query actually ran
     assert all(_passes_unlimited(c) for c in br.cmds("list"))
+
+
+# ── #113: the requirement ledger — decompose, dispose, and the notes round-trip ───
+# Acceptance criteria become tracked items ({id, text, status}) so partial completion
+# is distinguishable from completion: prose stays the authoring interface, mark_ready
+# decomposes it, the coder disposes per item, and the completion gate (loop) reads the
+# ledger back. Stored as `req: {…json…}` lines in the shared bead `notes` field.
+
+
+def test_decompose_ac_unbulleted_prose_is_a_single_item():
+    items = store._decompose_ac("The system SHALL frob the widget\nwhenever asked.")
+    assert items == [{"id": "r1", "text": "The system SHALL frob the widget whenever asked.", "status": "open"}]
+
+
+def test_decompose_ac_bulleted_list_yields_one_item_per_bullet():
+    ac = "- restore dict tolerance\n* cut em dashes to under 12\n+ update CHANGELOG.md\n2. gate green"
+    items = store._decompose_ac(ac)
+    assert [i["id"] for i in items] == ["r1", "r2", "r3", "r4"]
+    assert [i["text"] for i in items] == [
+        "restore dict tolerance",
+        "cut em dashes to under 12",
+        "update CHANGELOG.md",
+        "gate green",
+    ]
+    assert all(i["status"] == "open" for i in items)
+
+
+def test_decompose_ac_continuation_lines_join_their_bullet():
+    items = store._decompose_ac("- a requirement\n  spanning two lines\n- another")
+    assert [i["text"] for i in items] == ["a requirement spanning two lines", "another"]
+
+
+def test_decompose_ac_blank_prose_yields_no_ledger():
+    assert store._decompose_ac("") == []
+    assert store._decompose_ac("   \n  ") == []
+
+
+def test_all_items_disposed_true_only_when_every_item_is_closed():
+    done = {"id": "r1", "text": "a", "status": "done"}
+    declined = {"id": "r2", "text": "b", "status": "declined", "decline_reason": "not reachable"}
+    assert store._all_items_disposed([done, declined]) is True
+    assert store._all_items_disposed([done, declined, {"id": "r3", "text": "c", "status": "open"}]) is False
+    assert store._all_items_disposed([]) is True  # no ledger → nothing gates
+
+
+def test_apply_requirement_dispositions_merges_closed_statuses_only():
+    items = [
+        {"id": "r1", "text": "a", "status": "open"},
+        {"id": "r2", "text": "b", "status": "open"},
+        {"id": "r3", "text": "c", "status": "open"},
+    ]
+    out = store.apply_requirement_dispositions(
+        items,
+        [
+            {"id": "r1", "status": "done"},
+            {"id": "r2", "status": "declined", "decline_reason": "dicts not reachable through SqliteSaver"},
+            {"id": "r9", "status": "done"},  # unknown id — a reply can't invent ledger rows
+            {"id": "r3", "status": "open"},  # `open` is not a disposition — ignored
+        ],
+    )
+    assert out[0]["status"] == "done"
+    assert out[1]["status"] == "declined" and out[1]["decline_reason"] == "dicts not reachable through SqliteSaver"
+    assert out[2]["status"] == "open"  # silence (and non-closed statuses) leave the item open
+    assert items[0]["status"] == "open"  # inputs never mutated
+
+
+def test_apply_requirement_dispositions_done_clears_a_stale_decline_reason():
+    items = [{"id": "r1", "text": "a", "status": "declined", "decline_reason": "old"}]
+    out = store.apply_requirement_dispositions(items, [{"id": "r1", "status": "done"}])
+    assert out[0]["status"] == "done" and "decline_reason" not in out[0]
+
+
+def test_render_and_split_notes_round_trip_the_ledger_beside_files_and_source():
+    items = [
+        {"id": "r1", "text": "restore dict tolerance", "status": "done"},
+        {"id": "r2", "text": "update CHANGELOG.md", "status": "declined", "decline_reason": "no changelog"},
+    ]
+    notes = store._render_notes(["a.py", "b.py"], "acme/widgets#8", items)
+    files, src, reqs = store._split_notes(notes)
+    assert files == ["a.py", "b.py"]  # req/source lines never leak into the file list
+    assert src == "acme/widgets#8"
+    assert reqs == items
+
+
+def test_split_notes_drops_a_malformed_req_line_never_a_file():
+    files, _src, reqs = store._split_notes('a.py\nreq: {not json}\nreq: {"id": "r1", "status": "open", "text": "t"}')
+    assert files == ["a.py"]  # the malformed line must not poison files_to_modify (#110 path check)
+    assert reqs == [{"id": "r1", "status": "open", "text": "t"}]
+
+
+def test_mark_ready_decomposes_the_ac_into_ledger_items_in_notes(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    feature = {
+        "id": "bd-1",
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "- alpha\n- beta",
+        "files_to_modify": ["a.py (new)"],
+        "requirements": [],
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+    b.mark_ready("bd-1")
+    notes_call = next(c for c in br.cmds("update") if any(str(t).startswith("--notes=") for t in c))
+    notes = next(t for t in notes_call if str(t).startswith("--notes="))[len("--notes=") :]
+    files, _src, reqs = store._split_notes(notes)
+    assert files == ["a.py (new)"]  # the files half rides along untouched
+    assert [(i["id"], i["text"], i["status"]) for i in reqs] == [("r1", "alpha", "open"), ("r2", "beta", "open")]
+    # the ready label still lands (its own update, the pinned shape)
+    assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_mark_ready_preserves_an_existing_ledger(make_board, monkeypatch):
+    """A re-mark (requeue → ready) must never wipe recorded dispositions back to open."""
+    br = Br()
+    b = make_board(br)
+    feature = {
+        "id": "bd-1",
+        "board_state": "ready",
+        "spec": "s",
+        "acceptance_criteria": "- alpha\n- beta",
+        "files_to_modify": ["a.py (new)"],
+        "requirements": [{"id": "r1", "text": "alpha", "status": "done"}],
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+    b.mark_ready("bd-1")
+    assert not any(any(str(t).startswith("--notes=") for t in c) for c in br.calls)  # no re-decompose
+    assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_set_requirements_writes_the_ledger_and_keeps_the_other_notes_halves(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "files_to_modify": ["a.py"], "source_issue": "acme/widgets#8", "labels": []},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    items = [{"id": "r1", "text": "alpha", "status": "declined", "decline_reason": "not reachable"}]
+    b.set_requirements("bd-1", items)
+    (call,) = br.cmds("update")
+    notes = next(t for t in call if str(t).startswith("--notes="))[len("--notes=") :]
+    files, src, reqs = store._split_notes(notes)
+    assert files == ["a.py"] and src == "acme/widgets#8"  # both halves carried forward
+    assert reqs == items
+
+
+def test_project_exposes_the_requirement_ledger(make_board):
+    b = make_board(Br())
+    notes = store._render_notes(["a.py"], "", [{"id": "r1", "text": "alpha", "status": "open"}])
+    f = b._project({"id": "x", "status": "open", "labels": [], "notes": notes})
+    assert f["requirements"] == [{"id": "r1", "text": "alpha", "status": "open"}]
+    assert f["files_to_modify"] == ["a.py"]
+    assert b._project({"id": "y", "status": "open", "labels": []})["requirements"] == []
