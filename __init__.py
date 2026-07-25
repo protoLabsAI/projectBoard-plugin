@@ -355,6 +355,90 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_cancel_feature(feature_id: str, reason: str = "") -> str:
+        """Cancel a feature created in error (bad decomposition, duplicate, scope cut) —
+        the verb that RETIRES a bad card. Tags the bead `cancelled` and closes it with an
+        auditable `reason` (`br close -r`), a second terminal edge that keeps the card (and
+        its history) visible in a distinct `cancelled` state — NOT `done`, so the merge/CI
+        reconcilers and loop-retro never mistake it for shipped work. The bead survives (a
+        cancel, not a hard delete). `reason` is stripped of any literal wrapping double
+        quotes before storage (same hygiene as board_create_feature)."""
+        try:
+            reason = _strip_wrapping_quotes(reason)
+            f = get_store(**store_kw).cancel_feature(feature_id, reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_requeue_feature(feature_id: str, findings: str = "") -> str:
+        """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
+        the fix-round doctrine needs to carry review findings to the SAME branch.
+
+        WITH `findings` (an adverse review's requested changes): mirrors
+        `POST /features/{fid}/review` — records a DISTINCT review-bounce comment on the
+        bead (`record_review_bounce`), queues the findings so the loop's NEXT dispatch
+        prompt LEADS with them (`queue_review_feedback`), THEN requeues onto the same
+        open PR (`requeue`). This is the fix round: the coder re-dispatches knowing
+        exactly what to fix, instead of blindly re-running the original prompt. Requires
+        `in_review` (record_review_bounce enforces the state an adverse review lands
+        from).
+
+        WITHOUT `findings` (empty): a BARE re-dispatch — just `requeue`. Back to `ready`,
+        open PR preserved, assignee cleared, NO new feedback; the coder re-runs against
+        the ORIGINAL prompt (a plain retry, e.g. after a transient failure). The puller
+        re-claims it and the loop re-dispatches (at the higher tier if it was just
+        escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
+        literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
+        try:
+            store = get_store(**store_kw)
+            findings = _strip_wrapping_quotes(findings)
+            if findings.strip():
+                # Mirror the non-escalating POST /features/{fid}/review path: record the
+                # distinct review-bounce comment, hand the findings to the loop so its
+                # next dispatch prompt LEADS with them, THEN requeue onto the same PR.
+                # Without this the findings would silently not travel and the coder would
+                # burn a run re-producing the rejected output. Import queue_review_feedback
+                # lazily (as the API route does) — the loop imports from here, so a
+                # top-level import would be circular.
+                store.record_review_bounce(feature_id, findings)
+                from .loop import queue_review_feedback
+
+                queue_review_feedback(feature_id, findings)
+            f = store.requeue(feature_id)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_block_feature(feature_id: str, reason: str) -> str:
+        """Flag a feature `blocked` with a `reason` — it stays ON the board (blocked is a
+        flag, not a lane) with the reason visible, and is skipped by the puller until
+        cleared. Complements the board_update_feature repair path: block when the feature
+        is stuck on something external (a missing dep, an unanswered question) and you want
+        the card parked-and-visible; update when the spec itself needs fixing. `reason` is
+        stripped of any literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
+        try:
+            reason = _strip_wrapping_quotes(reason)
+            f = get_store(**store_kw).flag_blocked(feature_id, reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_unblock_feature(feature_id: str) -> str:
+        """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
+        board_block_feature. Removes the blocked label; the puller can claim it again once
+        it's otherwise `ready`."""
+        try:
+            f = get_store(**store_kw).clear_blocked(feature_id)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_list(state: str = "") -> str:
         """List board features, optionally filtered by board `state` (backlog/ready/
         in_progress/in_review/done/blocked). Priority order."""
@@ -403,6 +487,10 @@ def _board_tools(cfg: dict):
         board_update_feature,
         board_get_feature,
         board_mark_ready,
+        board_cancel_feature,
+        board_requeue_feature,
+        board_block_feature,
+        board_unblock_feature,
         board_list,
         board_retro,
     ]
