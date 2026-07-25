@@ -395,7 +395,7 @@ def test_update_tool_fills_a_missing_field_so_mark_ready_then_passes(make_board,
         "board_state": "backlog",
         "spec": "do the thing",
         "acceptance_criteria": "",
-        "files_to_modify": ["a.py"],
+        "files_to_modify": ["a.py (new)"],  # (new) bypasses the path-existence gate (#110)
         "labels": [],
     }
     br = _StatefulBr(state)

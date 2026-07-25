@@ -261,7 +261,7 @@ def test_mark_ready_adds_the_label_when_fully_specced(make_board, monkeypatch):
         "board_state": "backlog",
         "spec": "do the thing",
         "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
-        "files_to_modify": ["a.py"],
+        "files_to_modify": ["a.py (new)"],  # (new) bypasses the path-existence gate (#110)
     }
     monkeypatch.setattr(b, "get_feature", lambda fid: ready_feature)
     b.mark_ready("bd-1")
@@ -294,6 +294,41 @@ def test_mark_ready_rejects_an_underspecced_feature(make_board, monkeypatch, mis
     assert br.cmds("update") == []  # nothing mutated on a rejected gate
 
 
+def test_mark_ready_gate_validates_files_to_modify_exist_in_the_repo(make_board, monkeypatch, tmp_path):
+    """#110: a files_to_modify path must resolve in the bound checkout (or be a `(new)`
+    stub) — a phantom path is invisible until a coder burns a run chasing it."""
+    br = Br()
+    b = make_board(br, repo=str(tmp_path))
+    real = tmp_path / "real.py"
+    real.write_text("x = 1\n")
+    feature = {
+        "id": "bd-1",
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        "files_to_modify": ["real.py"],
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+
+    b.mark_ready("bd-1")  # the path exists → gate passes
+    assert br.cmds("update")
+
+    br.calls.clear()
+    real.unlink()  # same path, now missing → gate refuses and names it
+    with pytest.raises(BoardError, match=r"do not exist in the repo: real\.py"):
+        b.mark_ready("bd-1")
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+    # a `(new)` marker (case-insensitive, anywhere in the entry) bypasses the check
+    br.calls.clear()
+    feature["files_to_modify"] = ["real.py", "docs/new-guide.md (NEW)"]
+    with pytest.raises(BoardError, match=r"do not exist in the repo: real\.py"):
+        b.mark_ready("bd-1")  # real.py still phantom, but the (NEW) entry is exempt
+    feature["files_to_modify"] = ["real.py (new)", "docs/new-guide.md (NEW)"]
+    b.mark_ready("bd-1")  # every remaining entry is a (new) stub → gate passes
+    assert br.cmds("update")
+
+
 # ── the DESIGN gate (plan M6): large/architectural needs design + ADR ref ───────
 
 
@@ -303,7 +338,7 @@ def _design_feature(**over):
         "board_state": "backlog",
         "spec": "s",
         "acceptance_criteria": "a",
-        "files_to_modify": ["a.py"],
+        "files_to_modify": ["a.py (new)"],  # (new) bypasses the path-existence gate (#110)
         "difficulty": "large",
         "design": "",
     }
@@ -851,7 +886,7 @@ def _plan_board(make_board, monkeypatch):
             "board_state": "backlog",
             "spec": description or "spec",
             "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
-            "files_to_modify": ["a.py"],
+            "files_to_modify": ["a.py (new)"],  # (new) bypasses the path-existence gate (#110)
         }
         return fid
 

@@ -723,6 +723,20 @@ class BeadsBoard:
                 f"Fill the missing field(s) in place with board_update_feature(feature_id={fid!r}, "
                 "…) and mark it ready again — no need to cancel and recreate the bead."
             )
+        # #110: every files_to_modify path must resolve in the bound checkout — a phantom
+        # path (a plausible-but-wrong file the card author guessed) is invisible until a
+        # coder burns a run chasing it. A `(new)` marker (case-insensitive, anywhere in the
+        # entry) declares the file doesn't exist yet and bypasses the existence check.
+        phantom = [
+            p
+            for p in f["files_to_modify"]
+            if "(new)" not in p.lower() and not os.path.exists(os.path.join(self.repo, p))
+        ]
+        if phantom:
+            raise BoardError(
+                f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
+                f"in the repo: {', '.join(phantom)} — either create a (new) stub or correct the path."
+            )
         # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
         # a task — it may not go ready until its `design` field exists AND references
         # the ADR that records the decision (run /due-diligence, write the ADR, cite
