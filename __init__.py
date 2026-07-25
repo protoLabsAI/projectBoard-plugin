@@ -366,14 +366,42 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_requeue_feature(feature_id: str) -> str:
+    def board_requeue_feature(feature_id: str, findings: str = "") -> str:
         """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
-        the fix-round doctrine needs to carry review findings to the SAME branch. The
-        puller re-claims it and the loop re-dispatches (at the higher tier if it was just
-        escalated; the open PR is pushed to, not reopened). Use it to route review-round
-        work back onto an in_review feature rather than opening a fresh card."""
+        the fix-round doctrine needs to carry review findings to the SAME branch.
+
+        WITH `findings` (an adverse review's requested changes): mirrors
+        `POST /features/{fid}/review` — records a DISTINCT review-bounce comment on the
+        bead (`record_review_bounce`), queues the findings so the loop's NEXT dispatch
+        prompt LEADS with them (`queue_review_feedback`), THEN requeues onto the same
+        open PR (`requeue`). This is the fix round: the coder re-dispatches knowing
+        exactly what to fix, instead of blindly re-running the original prompt. Requires
+        `in_review` (record_review_bounce enforces the state an adverse review lands
+        from).
+
+        WITHOUT `findings` (empty): a BARE re-dispatch — just `requeue`. Back to `ready`,
+        open PR preserved, assignee cleared, NO new feedback; the coder re-runs against
+        the ORIGINAL prompt (a plain retry, e.g. after a transient failure). The puller
+        re-claims it and the loop re-dispatches (at the higher tier if it was just
+        escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
+        literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
         try:
-            f = get_store(**store_kw).requeue(feature_id)
+            store = get_store(**store_kw)
+            findings = _strip_wrapping_quotes(findings)
+            if findings.strip():
+                # Mirror the non-escalating POST /features/{fid}/review path: record the
+                # distinct review-bounce comment, hand the findings to the loop so its
+                # next dispatch prompt LEADS with them, THEN requeue onto the same PR.
+                # Without this the findings would silently not travel and the coder would
+                # burn a run re-producing the rejected output. Import queue_review_feedback
+                # lazily (as the API route does) — the loop imports from here, so a
+                # top-level import would be circular.
+                store.record_review_bounce(feature_id, findings)
+                from .loop import queue_review_feedback
+
+                queue_review_feedback(feature_id, findings)
+            f = store.requeue(feature_id)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"

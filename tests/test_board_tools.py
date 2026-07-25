@@ -126,6 +126,99 @@ def test_board_requeue_feature_returns_to_ready_and_drops_in_review(make_board, 
     )
 
 
+def test_board_requeue_feature_bare_path_carries_no_findings(make_board, monkeypatch):
+    """The empty-findings path stays a PLAIN re-dispatch: no review-bounce comment, and
+    nothing queued for the loop's next dispatch prompt — only the requeue update fires
+    (the coder re-runs against the ORIGINAL prompt). Asserts the EFFECT, not just the
+    return: the feedback bridge must be untouched so a bare retry can't masquerade as a
+    fix round."""
+    import project_board.loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()  # isolate the cross-instance bridge (test_api convention)
+    _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "ready"})
+
+    out = json.loads(_get_tool("board_requeue_feature").invoke({"feature_id": "bd-1"}))
+
+    assert out == {"id": "bd-1", "state": "ready"}
+    assert loop_mod._PENDING_FEEDBACK == {}  # nothing queued on the bare path
+    assert br.cmds("comments") == []  # no review-bounce comment recorded
+    (update,) = br.cmds("update")  # only the requeue write fired
+    assert update[:2] == ("update", "bd-1")
+
+
+def test_board_requeue_feature_with_findings_carries_them_to_next_dispatch(make_board, monkeypatch):
+    """WITH findings the tool runs the fix round — mirrors POST /features/{fid}/review:
+    record_review_bounce → queue_review_feedback → requeue. Asserts the EFFECT that the
+    review flagged as missing before: the findings are queued on the loop's feedback
+    bridge so the NEXT dispatch prompt LEADS with them (not silently dropped)."""
+    import project_board.loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    # record_review_bounce enforces in_review — the state an adverse review lands from.
+    _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_review"})
+
+    _get_tool("board_requeue_feature").invoke(
+        {"feature_id": "bd-1", "findings": "the retry loop never terminates on a 500"}
+    )
+
+    # EFFECT 1: queue_review_feedback populated the bridge for this fid (the whole point
+    # of #112 — without it the coder re-runs blind and reproduces the rejected output).
+    assert "bd-1" in loop_mod._PENDING_FEEDBACK
+    assert "the retry loop never terminates on a 500" in loop_mod._PENDING_FEEDBACK["bd-1"]
+    # EFFECT 2: a DISTINCT review-bounce comment is recorded on the bead.
+    (comment,) = br.cmds("comments")
+    assert comment == (
+        "comments",
+        "add",
+        "bd-1",
+        "review requested changes: the retry loop never terminates on a 500",
+    )
+    # EFFECT 3: the feature is requeued onto the same open PR (ready + in-review dropped).
+    (update,) = br.cmds("update")
+    assert update == (
+        "update",
+        "bd-1",
+        "--status",
+        "open",
+        "--assignee",
+        "",
+        "--add-label",
+        "ready",
+        "--remove-label",
+        "in-review",
+    )
+
+
+def test_board_requeue_feature_strips_wrapping_quotes_from_findings(make_board, monkeypatch):
+    import project_board.loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_review"})
+
+    _get_tool("board_requeue_feature").invoke({"feature_id": "bd-1", "findings": '"missing a null guard"'})
+
+    # the wrapping quotes are peeled before the findings reach the bead comment + bridge.
+    (comment,) = br.cmds("comments")
+    assert comment == ("comments", "add", "bd-1", "review requested changes: missing a null guard")
+    assert "missing a null guard" in loop_mod._PENDING_FEEDBACK["bd-1"]
+
+
+def test_board_requeue_feature_with_findings_from_non_in_review_is_an_error(make_board, monkeypatch):
+    """record_review_bounce enforces in_review; the tool must surface that as an Error
+    string (not blow up the turn) and queue NOTHING — a fix round can't start from a
+    state an adverse review never lands in."""
+    import project_board.loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_progress"})
+
+    out = _get_tool("board_requeue_feature").invoke({"feature_id": "bd-1", "findings": "x"})
+
+    assert out.startswith("Error: ")
+    assert loop_mod._PENDING_FEEDBACK == {}  # bounce rejected before anything was queued
+    assert br.cmds("update") == []  # and nothing was requeued
+
+
 # ── board_block_feature → store.flag_blocked ────────────────────────────────────────
 
 
