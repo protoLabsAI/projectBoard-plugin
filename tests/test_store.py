@@ -1176,6 +1176,73 @@ def test_create_from_plan_mark_ready_promotes_only_clean_items(make_board, monke
     assert len(ready_updates) == 1 and ready_updates[0][1] == "bd-1"
 
 
+def _ids_before_flags(update_args):
+    """The positional issue ids of a `br update <id…> --flag…` call (everything after
+    the `update` subcommand, up to the first `--flag`)."""
+    ids = []
+    for a in update_args[1:]:
+        if a.startswith("--"):
+            break
+        ids.append(a)
+    return ids
+
+
+def test_create_from_plan_promotes_the_whole_batch_atomically(make_board, monkeypatch):
+    """#111: a batch promoted with ``mark_ready=True`` must reach a state where EVERY
+    item carries the ``ready`` label before the puller can claim ANY of them. Priority
+    only ranks what is *already* ready, so if items flipped to ``ready`` one at a time an
+    idle loop could claim the first promoted item before the rest landed. We model the
+    ``ready`` set a concurrent puller (``br ready``) would observe and snapshot it at
+    every point a claim could interleave (every ``br`` call is such a boundary): the
+    promotion must be all-or-nothing — never a partial batch where some clean items are
+    ready and others are not yet."""
+    b, beads, br = _plan_board(make_board, monkeypatch)
+
+    ready: set[str] = set()  # the ids a puller would currently see as claimable
+    observed: list[frozenset[str]] = []  # ready-set snapshot at each br-call boundary
+    real_run = b._run
+
+    def instrumented(*args, want_json=False):
+        # A `br update … --add-label ready` is the write that makes a bead claimable;
+        # apply it to its target ids so the model tracks exactly what the puller can see.
+        if args and args[0] == "update" and "--add-label" in args and store.LABEL_READY in args:
+            ready.update(_ids_before_flags(args))
+        # Every br call is a boundary a concurrent puller could interleave a claim at.
+        observed.append(frozenset(ready))
+        return real_run(*args, want_json=want_json)
+
+    monkeypatch.setattr(b, "_run", instrumented)
+
+    out = b.create_from_plan(
+        [
+            {"title": "One", "spec": "s", "files": "a.py"},
+            {"title": "Two", "spec": "s", "files": "b.py"},
+            {"title": "Three", "spec": "s", "files": "c.py"},
+        ],
+        mark_ready=True,
+    )
+
+    clean = {r["id"] for r in out["items"] if r.get("created")}
+    assert clean == {"bd-1", "bd-2", "bd-3"}
+    assert out["summary"]["ready"] == 3
+
+    # THE INVARIANT: at no observable boundary is the batch partially promoted — the
+    # ready set a puller could see is always either NONE of the clean items or ALL of
+    # them, never a strict, claimable subset. A per-item promotion loop would expose
+    # {bd-1} (then {bd-1, bd-2}) here and fail this assertion.
+    for snap in observed:
+        seen = snap & clean
+        assert seen == set() or seen == clean, f"partial promotion visible to the puller: {seen}"
+    # and the batch genuinely crossed into ready (0 → all in a single boundary).
+    assert any((snap & clean) == clean for snap in observed)
+
+    # structural proof of the atomic flip: ONE `br update` carries the ready label and it
+    # lists every clean id — a single write the puller cannot interleave a claim into.
+    ready_updates = [a for a in br.cmds("update") if "--add-label" in a and "ready" in a]
+    assert len(ready_updates) == 1
+    assert set(_ids_before_flags(ready_updates[0])) == clean
+
+
 def test_resolve_plan_dep_index_title_and_passthrough_id():
     index_to_id = {0: "bd-1", 1: "bd-2"}
     title_to_id = {"foundation feature": "bd-1"}
