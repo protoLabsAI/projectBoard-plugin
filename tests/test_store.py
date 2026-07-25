@@ -720,8 +720,8 @@ def test_update_feature_uses_end_of_options_form_for_value_fields(make_board, mo
 # ── #85: transient DATABASE_ERROR (SQLite contention) retries with backoff ──────────
 
 
-def _proc(returncode, stderr=""):
-    return types.SimpleNamespace(returncode=returncode, stdout="ok", stderr=stderr)
+def _proc(returncode, stderr="", stdout="ok"):
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 def test_run_retries_a_transient_database_error_then_succeeds(monkeypatch, _have_br):
@@ -771,6 +771,123 @@ def test_run_gives_up_after_exhausting_db_retries(monkeypatch, _have_br):
     with pytest.raises(BoardError):
         b._run("list")
     assert n["calls"] == store._DB_RETRY_ATTEMPTS  # persistent lock → bounded retries, then raise
+
+
+# ── #116: retry window sized for real WAL contention (6 attempts, ~6.3s) ─────────────
+# The old 4-attempt / 0.7s budget lost the `bd-ud1` enrichment write to a WAL checkpoint
+# (dropping its source_issue → a PR with no `Fixes #N`). The window is now 6 attempts
+# backing off 0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2s, contention is also caught when `br`
+# writes it as JSON on a ZERO exit, and the resolved retry count is logged on success.
+
+
+def test_db_retry_window_is_six_attempts_with_a_doubling_backoff(monkeypatch, _have_br):
+    """#116 r1: 6 attempts, the delay doubling each retry — a ~6.3s window that
+    outlasts a WAL checkpoint instead of the old 0.7s that lost the race."""
+    assert store._DB_RETRY_ATTEMPTS == 6
+    assert store._DB_RETRY_DELAY == 0.1
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        return _proc(1, "DATABASE_ERROR: database is busy")
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    slept = []
+    monkeypatch.setattr(store.time, "sleep", lambda s: slept.append(s))
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    with pytest.raises(BoardError):
+        b._run("list")
+    assert n["calls"] == 6  # six attempts, then give up
+    # five backoffs between the six attempts, each double the last (0.1 → 1.6)
+    assert slept == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6])
+
+
+def test_run_retries_db_contention_written_as_json_on_a_zero_exit(monkeypatch, _have_br):
+    """#116 r2: `br` can exit 0 yet write the failure as structured JSON on stdout — a
+    shape a bare returncode check sails past. It's caught post-parse and retried."""
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        # exit 0 the whole time; the first body is an error-shaped JSON, then it clears.
+        if n["calls"] == 1:
+            return _proc(0, stdout='{"error": "DATABASE_ERROR: database is busy"}')
+        return _proc(0, stdout='{"id": "bd-1"}')
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    slept = []
+    monkeypatch.setattr(store.time, "sleep", lambda s: slept.append(s))
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    assert b._run("create", want_json=True) == {"id": "bd-1"}  # cleared, parsed through
+    assert n["calls"] == 2 and slept  # the zero-exit error was retried, not returned
+
+
+def test_run_does_not_mistake_a_normal_json_payload_for_contention(monkeypatch, _have_br):
+    """A legit zero-exit JSON payload (a bead carrying `status: "open"`) must NOT trip
+    the error-shaped-JSON sniff — only DB-error text in an error field triggers a retry."""
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        return _proc(0, stdout='[{"id": "bd-1", "status": "open"}]')
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.time, "sleep", lambda s: None)
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    assert b._run("list", want_json=True) == [{"id": "bd-1", "status": "open"}]
+    assert n["calls"] == 1  # a normal payload isn't contention → no retry
+
+
+def test_run_logs_the_retry_count_on_final_success(monkeypatch, _have_br, caplog):
+    """#116 r3: on final success after contention, the resolved retry count is logged
+    (info) so the operator can see the race was won, not silently swallowed."""
+    n = {"calls": 0}
+
+    def fake_run(cmd, **kw):
+        n["calls"] += 1
+        return _proc(1, "DATABASE_ERROR: database is busy") if n["calls"] <= 2 else _proc(0)
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.time, "sleep", lambda s: None)
+    b = store.BeadsBoard(repo="/repo")
+    b._workspace_ready = True
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        assert b._run("list") == "ok"
+    assert n["calls"] == 3  # two contention failures, then success on the third
+    assert any("cleared DB contention after 2" in m for m in caplog.messages)
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        '{"error": "DATABASE_ERROR: database is busy"}',
+        '{"message": "database is locked"}',
+        '{"code": "DATABASE_ERROR"}',
+        '{"detail": "SQLite: database is busy"}',
+    ],
+)
+def test_contention_in_json_flags_error_shaped_db_errors(out):
+    """The post-parse sniff catches DB contention in any error-shaped field."""
+    assert store._contention_in_json(out)
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        "",
+        "ok",
+        '[{"id": "bd-1", "status": "open"}]',  # a normal list payload
+        '{"id": "bd-1", "status": "open"}',  # a normal bead object — status isn't a lock
+        '{"error": "VALIDATION_ERROR: bad --type"}',  # a real error, but not contention
+        "{oops",  # not valid JSON
+    ],
+)
+def test_contention_in_json_ignores_normal_and_non_contention_payloads(out):
+    """Normal payloads and non-contention errors are passed through untouched."""
+    assert store._contention_in_json(out) == ""
 
 
 # ── workspace pinning (ADR 0055 P0) ─────────────────────────────────────────────
