@@ -226,12 +226,15 @@ def build_data_router(cfg: dict):
 
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
-    async def _features(state: str | None = None):
+    async def _features(state: str | None = None, include_archived: bool = False):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
         # actionable BoardError message — an escaped BoardError is a text/plain 500
         # the view can only render as a JSON-parse error.
-        return _guard(lambda: {"features": store().list_features(state=state)})
+        # Default = the LIVE board: `archived` features (terminal + past the archive
+        # window, #115) are excluded unless ?include_archived=true — same contract
+        # as the board_list tool; nothing is deleted, everything stays queryable.
+        return _guard(lambda: {"features": store().list_features(state=state, include_archived=include_archived)})
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):

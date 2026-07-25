@@ -439,10 +439,14 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_list(state: str = "") -> str:
+    def board_list(state: str = "", include_archived: bool = False) -> str:
         """List board features, optionally filtered by board `state` (backlog/ready/
-        in_progress/in_review/done/blocked). Priority order."""
-        feats = get_store(**store_kw).list_features(state=state or None)
+        in_progress/in_review/done/blocked). Priority order. Terminal features
+        (done/cancelled) past the archive window carry an `archived` label and are
+        EXCLUDED from this default response (#115) — the live board, not all of
+        history. Pass `include_archived=true` for the exhaustive view; nothing is
+        ever deleted, so archived features stay fully queryable."""
+        feats = get_store(**store_kw).list_features(state=state or None, include_archived=include_archived)
         return json.dumps(
             [
                 {
@@ -465,7 +469,9 @@ def _board_tools(cfg: dict):
         features into recurring failure CLASSES + flow stats (escalation / block /
         multi-attempt rates + the blocked features and why). The loop-retro skill
         reads this to distill durable grounding (PROTO.md gotchas) so the next runs
-        stop repeating known failures. Read-only."""
+        stop repeating known failures. Read-only. Spans ALL history: the store's
+        retro read explicitly opts into `archived` features (#115), so a
+        retrospective never silently shrinks to the archive window."""
         from . import retro
 
         d = retro.summarize(get_store(**store_kw).raw_features_with_comments())
