@@ -117,6 +117,19 @@ def _client(monkeypatch, store, *, cfg=None):
     return TestClient(app)
 
 
+def _stub_reap(monkeypatch):
+    """No-op the terminal-edge worktree reap (it shells out to git) and return the list
+    it records ``(repo, root, fid)`` into, so a test can assert it fired with the router's
+    configured repo/worktrees_root and the feature id."""
+    reaped = []
+
+    async def _reap(repo, root, fid):
+        reaped.append((repo, root, fid))
+
+    monkeypatch.setattr("project_board.worktree.reap_feature_worktree", _reap)
+    return reaped
+
+
 # ── the route split + the view-path mount (the regression guard) ────────────────
 
 
@@ -282,6 +295,7 @@ def test_ready_gate_rejection_surfaces_as_400(monkeypatch):
 def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
     """POST /features/{fid}/cancel — the second terminal edge (#47). Carries the
     optional reason through; works with no body too."""
+    _stub_reap(monkeypatch)  # the terminal edge now reaps; keep it hermetic (no git)
     store = FakeStore()
     c = _client(monkeypatch, store)
     r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "duplicate"})
@@ -296,6 +310,7 @@ def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
 def test_delete_route_calls_delete_feature(monkeypatch):
     """DELETE /features/{fid} — the hard-delete sibling of cancel (#47). Carries an
     optional reason; works with no body too."""
+    _stub_reap(monkeypatch)  # the terminal edge now reaps; keep it hermetic (no git)
     store = FakeStore()
     c = _client(monkeypatch, store)
     r = c.request("DELETE", "/api/plugins/project_board/features/bd-7", json={"reason": "mistake"})
@@ -304,6 +319,51 @@ def test_delete_route_calls_delete_feature(monkeypatch):
     r2 = c.delete("/api/plugins/project_board/features/bd-8")
     assert r2.status_code == 200
     assert ("delete_feature", ("bd-8", ""), {}) in store.calls
+
+
+def test_cancel_route_reaps_the_worktree_at_the_terminal_edge(monkeypatch):
+    """#109: cancel is terminal (nothing left to build), so it reaps the feature's
+    worktree right after cancel_feature() succeeds — same pattern as the merge webhook
+    — instead of leaking it until the health sweep. The reap gets the router's configured
+    repo + worktrees_root and the feature id."""
+    reaped = _stub_reap(monkeypatch)
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={"repo": "/repo", "worktrees_root": ".wt"})
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "dup"})
+    assert r.status_code == 200
+    assert ("cancel_feature", ("bd-7", "dup"), {}) in store.calls  # cancel runs first…
+    assert reaped == [("/repo", ".wt", "bd-7")]  # …then the reap fires
+
+
+def test_delete_route_reaps_the_worktree_at_the_terminal_edge(monkeypatch):
+    """#109: delete is the same terminal class as cancel/merge — a deleted feature leaves
+    nothing to build — so its worktree is reaped on the way out too."""
+    reaped = _stub_reap(monkeypatch)
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={"repo": "/repo", "worktrees_root": ".wt"})
+    r = c.request("DELETE", "/api/plugins/project_board/features/bd-7", json={"reason": "oops"})
+    assert r.status_code == 200
+    assert ("delete_feature", ("bd-7", "oops"), {}) in store.calls
+    assert reaped == [("/repo", ".wt", "bd-7")]
+
+
+def test_terminal_edge_reap_failure_does_not_fail_the_response(monkeypatch):
+    """The reap is best-effort — the bead is already cancelled/deleted, so a git or
+    worktree blow-up must not turn a successful terminal transition into a 500 (#109).
+    The health sweep is the backstop for whatever the edge reap missed."""
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("git worktree remove exploded")
+
+    monkeypatch.setattr("project_board.worktree.reap_feature_worktree", _boom)
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "dup"})
+    assert r.status_code == 200
+    assert ("cancel_feature", ("bd-7", "dup"), {}) in store.calls
+    r2 = c.request("DELETE", "/api/plugins/project_board/features/bd-8", json={"reason": "oops"})
+    assert r2.status_code == 200
+    assert ("delete_feature", ("bd-8", "oops"), {}) in store.calls
 
 
 # ── the single Done edge: the merge webhook ─────────────────────────────────────

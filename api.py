@@ -201,6 +201,7 @@ def build_data_router(cfg: dict):
         repo=(cfg or {}).get("repo", "."),
         base_branch=(cfg or {}).get("base_branch", "main"),
     )
+    worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
     def store():
         return get_store(**store_kw)
@@ -210,6 +211,18 @@ def build_data_router(cfg: dict):
             return fn()
         except BoardError as e:
             raise HTTPException(400, str(e))
+
+    async def _reap_worktree(fid: str) -> None:
+        """Reap the feature's worktree at a terminal edge (cancel/delete) — the same
+        best-effort pattern as the merge webhook's Done-edge reap (``build_router``).
+        The bead is already closed, so a reap failure must never raise into the
+        response; the health sweep stays the crash backstop for anything missed."""
+        try:
+            from . import worktree
+
+            await worktree.reap_feature_worktree(store_kw["repo"], worktrees_root, fid)
+        except Exception:  # noqa: BLE001 — reaping is best-effort; the edge is already closed
+            log.warning("[project_board] worktree reap for %s failed", fid, exc_info=True)
 
     # ── hierarchy (epic → milestone → feature) ────────────────────────────────
     @router.post("/epics")
@@ -303,16 +316,24 @@ def build_data_router(cfg: dict):
         """Cancel a feature created in error — the second terminal edge (#47). Closes
         the bead with an audit reason and tags it `cancelled` (a distinct state, not
         `done`), so a bad decomposition/duplicate leaves the board cleanly instead of
-        being deleted out-of-band (which desyncs the board ↔ JSONL)."""
-        return _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
+        being deleted out-of-band (which desyncs the board ↔ JSONL). Reaps the
+        feature's worktree once cancel succeeds — a terminal edge leaves nothing left to
+        build — the same reap the merge webhook does at `done` (#109)."""
+        f = _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
+        await _reap_worktree(fid)
+        return f
 
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):
         """Hard-delete a feature created in error — a `br` tombstone (the harder sibling
         of POST …/cancel). Goes through the board so board ↔ JSONL stay consistent;
         refuses (400) if the feature has dependents (deleting would orphan them). Prefer
-        cancel to keep a visible, reopenable audit lane; use delete to leave no trace."""
-        return _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
+        cancel to keep a visible, reopenable audit lane; use delete to leave no trace.
+        Reaps the feature's worktree too — same terminal-edge class as cancel/merge, a
+        deleted feature leaves nothing to build (#109)."""
+        f = _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
+        await _reap_worktree(fid)
+        return f
 
     # ── coder.solve() rung diagnostic (ADR 0064) — OPERATOR ONLY, deliberately no
     #    @tool wrapper: same boundary this router already draws around cancel/
