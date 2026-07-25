@@ -281,3 +281,111 @@ def test_lifecycle_tools_return_error_string_for_unknown_feature(make_board, mon
 
     assert out.startswith("Error: unknown feature")
     assert br.cmds("update") == []  # nothing was written for a non-existent feature
+
+
+# ── depends_on-aware dedup: a card built on an in-flight (in_review + open PR) feature ──
+#
+# Title matching can't see this ("work based on work that hasn't landed"): the new card
+# has a legitimately different title, so it slips past the title guard and stacks a second
+# card subordinate to an in-flight PR. _open_duplicate now also inspects the new card's
+# depends_on and steers the author to board_requeue_feature (the fix-round verb, #112).
+
+
+def test_open_duplicate_flags_depends_on_in_review_with_open_pr():
+    features = [{"id": "bd-1", "title": "Base", "board_state": "in_review", "pr_url": "https://github.com/o/r/pull/9"}]
+    dup = pb._open_duplicate(features, "A brand new title", ["bd-1"])
+    assert dup is not None
+    assert dup["id"] == "bd-1"
+    assert dup["_dup_reason"] == "depends_on_in_review"  # tagged so the caller picks the requeue message
+
+
+def test_open_duplicate_ignores_depends_on_in_review_without_a_pr():
+    # in_review but no open PR → not the "based on in-flight work" pattern; let it through.
+    features = [{"id": "bd-1", "title": "Base", "board_state": "in_review", "pr_url": ""}]
+    assert pb._open_duplicate(features, "A brand new title", ["bd-1"]) is None
+
+
+def test_open_duplicate_ignores_depends_on_not_in_review():
+    # an open blocker in any other state (here in_progress) is a normal dependency, not a dup.
+    features = [{"id": "bd-1", "title": "Base", "board_state": "in_progress", "pr_url": "https://gh/pr/9"}]
+    assert pb._open_duplicate(features, "A brand new title", ["bd-1"]) is None
+
+
+def test_open_duplicate_title_match_still_wins_and_is_untagged():
+    # backward-compat: a plain same-title dup returns the raw feature with no _dup_reason,
+    # even when depends_on is also supplied.
+    features = [{"id": "bd-1", "title": "Same title", "board_state": "backlog"}]
+    dup = pb._open_duplicate(features, "same   title", ["bd-2"])
+    assert dup["id"] == "bd-1"
+    assert "_dup_reason" not in dup
+
+
+class _BoardWithDeps:
+    """A store whose ``list_features`` returns a fixed board projection and whose
+    ``create_feature`` records what it stacked — enough to exercise
+    board_create_feature's depends_on dedup decision without a real br CLI."""
+
+    def __init__(self, board):
+        self._board = board
+        self.created: list[dict] = []
+
+    def list_features(self, state=None):
+        return list(self._board)
+
+    def create_feature(self, title, **kw):
+        f = {"id": f"bd-new{len(self.created) + 1}", "title": title, "board_state": "backlog", **kw}
+        self.created.append(f)
+        return f
+
+
+def test_board_create_feature_depends_on_in_review_pr_steers_to_requeue(monkeypatch):
+    board = [{"id": "bd-1", "title": "Foundation", "board_state": "in_review", "pr_url": "https://gh/acme/pull/7"}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = _get_tool("board_create_feature").invoke(
+        {"title": "Fix a bug in the foundation", "spec": "s", "depends_on": "bd-1"}
+    )
+
+    assert "Skipped" in out
+    assert "bd-1" in out  # names the in-flight blocker
+    assert "board_requeue_feature" in out and "findings=" in out  # the correct verb
+    assert fake.created == []  # the subordinate card was NOT stacked
+
+
+def test_board_create_feature_depends_on_in_review_force_stacks_anyway(monkeypatch):
+    board = [{"id": "bd-1", "title": "Foundation", "board_state": "in_review", "pr_url": "https://gh/acme/pull/7"}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = _get_tool("board_create_feature").invoke(
+        {"title": "Fix a bug in the foundation", "depends_on": "bd-1", "force": True}
+    )
+
+    assert json.loads(out)["id"] == "bd-new1"  # force bypasses the guard
+    assert len(fake.created) == 1
+
+
+def test_board_create_feature_depends_on_in_review_without_pr_is_allowed(monkeypatch):
+    # in_review but no open PR yet → the guard doesn't fire; the card is created normally.
+    board = [{"id": "bd-1", "title": "Foundation", "board_state": "in_review", "pr_url": ""}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = _get_tool("board_create_feature").invoke({"title": "New downstream work", "depends_on": "bd-1"})
+
+    assert json.loads(out)["id"] == "bd-new1"
+    assert len(fake.created) == 1
+
+
+def test_board_create_feature_depends_on_open_but_not_in_review_is_allowed(monkeypatch):
+    # a normal open dependency (backlog) is legitimate — depends_on dedup only fires on
+    # the in_review-with-open-PR pattern.
+    board = [{"id": "bd-1", "title": "Foundation", "board_state": "backlog", "pr_url": ""}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = _get_tool("board_create_feature").invoke({"title": "New downstream work", "depends_on": "bd-1"})
+
+    assert json.loads(out)["id"] == "bd-new1"
+    assert len(fake.created) == 1
