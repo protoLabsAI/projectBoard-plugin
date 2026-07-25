@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .beads/
 .beads-demo/
 .worktrees/
