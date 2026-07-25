@@ -772,8 +772,9 @@ class BoardLoop:
     async def _sweep(self):
         """Self-heal: (a) reset ``in_progress`` features that no live drive owns (a
         drive died without finishing) — same reconcile as boot recovery; (b) reap
-        ``feat-<id>`` worktrees whose feature is gone or already ``done`` (a missed
-        reap); (c) label terminal features past the archive window ``archived``
+        ``feat-<id>`` worktrees whose feature is gone or already terminal —
+        ``done``/``cancelled`` (a missed reap); (c) label terminal features past the
+        archive window ``archived``
         (#115) — the board's growth valve; archival only, nothing is ever deleted.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
@@ -791,14 +792,15 @@ class BoardLoop:
             # A `.gN`/`.cN` candidate worktree is not a feature id (bd-1cp.g1) — its
             # board state lives on the PARENT feature, so resolve through that (#91):
             # skip while the parent's drive is live, reap when the parent is gone or
-            # done. The old raw-id `get_feature` lookup failed every sweep and just
-            # warned forever without ever reaping the candidate.
+            # terminal (done/cancelled — the terminal-edge reap's crash backstop, #109).
+            # The old raw-id `get_feature` lookup failed every sweep and just warned
+            # forever without ever reaping the candidate.
             fid = worktree.parent_feature_id(wtid)
             if fid in self._inflight_files:
                 continue  # a live drive owns this worktree (or its candidates)
             try:
                 f = store.get_feature(fid)
-                if f is None or f["board_state"] == "done":
+                if f is None or f["board_state"] in ("done", "cancelled"):
                     await worktree.reap_feature_worktree(repo, self.root, wtid)
                     log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
             except Exception:  # noqa: BLE001

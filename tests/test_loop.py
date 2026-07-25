@@ -1871,9 +1871,11 @@ async def test_sweep_reconciles_in_progress_with_no_live_drive(monkeypatch):
 
 
 async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
-    store = _SweepStore(features={"bd-done": "done", "bd-rev": "in_review"})
+    store = _SweepStore(features={"bd-done": "done", "bd-cancelled": "cancelled", "bd-rev": "in_review"})
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: ["bd-done", "bd-rev", "bd-gone"])
+    monkeypatch.setattr(
+        worktree, "list_feature_worktrees", lambda repo, root: ["bd-done", "bd-cancelled", "bd-rev", "bd-gone"]
+    )
     reaped = []
 
     async def _reap(repo, root, fid):
@@ -1881,8 +1883,10 @@ async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
 
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
     await BoardLoop({})._sweep()
-    # done + missing feature → reaped; in_review keeps its worktree (CI-fail re-dispatch).
-    assert set(reaped) == {"bd-done", "bd-gone"}
+    # Terminal (done/cancelled) + missing feature → reaped; in_review keeps its worktree
+    # (a CI-fail re-dispatch still pushes to the same PR). Cancelled is the crash backstop
+    # for the terminal-edge reap in api._cancel (#109).
+    assert set(reaped) == {"bd-done", "bd-cancelled", "bd-gone"}
 
 
 async def test_sweep_treats_candidate_worktrees_by_parent_feature(monkeypatch):
