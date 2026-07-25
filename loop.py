@@ -422,6 +422,11 @@ class BoardLoop:
         # Health sweep: periodic self-heal (reclaim slots from dead drives, reap
         # orphaned worktrees). 0 disables it.
         self.sweep_interval = float(self.cfg.get("health_sweep_interval_s", 300))
+        # Archive window (#115): terminal features (done/cancelled) whose closed_at is
+        # older than this many days get the `archived` label during the health sweep —
+        # out of the default board view, NEVER deleted (query back via
+        # include_archived). Rides the sweep cadence; no scheduler of its own.
+        self.archive_after_days = float(self.cfg.get("archive_after_days", 7))
         # CI-feedback edge (closed-loop verify): poll in_review PRs' check-runs and,
         # on a FAILING rollup, bounce the feature back to the coder with the failure
         # injected as feedback (vs the old open-loop: a red PR sat in_review forever).
@@ -768,7 +773,9 @@ class BoardLoop:
         """Self-heal: (a) reset ``in_progress`` features that no live drive owns (a
         drive died without finishing) — same reconcile as boot recovery; (b) reap
         ``feat-<id>`` worktrees whose feature is gone or already ``done`` (a missed
-        reap). Best-effort; a per-item failure never stops the sweep or the loop."""
+        reap); (c) label terminal features past the archive window ``archived``
+        (#115) — the board's growth valve; archival only, nothing is ever deleted.
+        Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
         repo = self._store_kw["repo"]
         for f in store.list_features(state="in_progress"):
@@ -796,6 +803,16 @@ class BoardLoop:
                     log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
+        # (c) the archive pass (#115): age done/cancelled features out of the live
+        # view so the Done column doesn't bury recent work — a label write only.
+        try:
+            archived = store.archive_stale(self.archive_after_days)
+            if archived:
+                log.info(
+                    "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("[project_board] sweep archive pass failed", exc_info=True)
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):

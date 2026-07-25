@@ -39,8 +39,8 @@ class FakeStore:
         self.calls.append((name, a, k))
         return {"id": a[0] if a else "bd-x", "op": name}
 
-    def list_features(self, state=None):
-        self.calls.append(("list_features", (), {"state": state}))
+    def list_features(self, state=None, include_archived=False):
+        self.calls.append(("list_features", (), {"state": state, "include_archived": include_archived}))
         return [{"id": "bd-1", "title": "T", "board_state": "ready", "priority": 2}]
 
     def get_feature(self, fid):
@@ -155,7 +155,7 @@ def test_unusable_board_reads_surface_as_json_400_not_500(monkeypatch):
     JSON-parse error."""
 
     class BrokenStore(FakeStore):
-        def list_features(self, state=None):
+        def list_features(self, state=None, include_archived=False):
             raise BoardError("repo '.' has no beads workspace — set project_board.repo")
 
         def get_feature(self, fid):
@@ -183,6 +183,17 @@ def test_create_feature_splats_the_body(monkeypatch):
 def test_unknown_feature_is_404(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     assert c.get("/api/plugins/project_board/features/missing").status_code == 404
+
+
+def test_features_route_defaults_to_live_and_forwards_include_archived(monkeypatch):
+    """GET /features is the LIVE board by default (archived excluded in the store,
+    #115); ?include_archived=true opts the caller into the full history."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    assert c.get("/api/plugins/project_board/features").status_code == 200
+    assert ("list_features", (), {"state": None, "include_archived": False}) in store.calls
+    assert c.get("/api/plugins/project_board/features?include_archived=true").status_code == 200
+    assert ("list_features", (), {"state": None, "include_archived": True}) in store.calls
 
 
 # ── batch create from a structured decomposition (#92): POST /features/batch ────

@@ -10,6 +10,7 @@ replaced by the ``make_board`` fixture — no CLI, no DB.
 from __future__ import annotations
 
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -1385,6 +1386,101 @@ def test_decompose_ac_continuation_lines_join_their_bullet():
 def test_decompose_ac_blank_prose_yields_no_ledger():
     assert store._decompose_ac("") == []
     assert store._decompose_ac("   \n  ") == []
+
+
+# ── #115: archival — terminal features leave the live view, never the record ─────
+# The health sweep labels done/cancelled features whose closed_at aged past the
+# window `archived`; the default list_features projection drops them (queryable back
+# via include_archived=True) and board_retro's source EXPLICITLY opts in — a retro
+# that inherited the default exclusion would silently shrink to the archive window.
+
+# A fixed "now" so the window math is deterministic (no clock dependence).
+_NOW = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def test_parse_closed_at_accepts_iso_and_epoch_rejects_junk():
+    assert store._parse_closed_at("2026-07-25T12:00:00Z") == _NOW
+    assert store._parse_closed_at("2026-07-25T12:00:00+00:00") == _NOW
+    assert store._parse_closed_at("2026-07-25T12:00:00") == _NOW  # naive → taken as UTC
+    assert store._parse_closed_at(_NOW) == _NOW  # bare epoch passes through
+    # absent/unparseable → None: the archive pass must never archive on a guess
+    assert store._parse_closed_at(None) is None
+    assert store._parse_closed_at("") is None
+    assert store._parse_closed_at("yesterday-ish") is None
+    assert store._parse_closed_at(True) is None
+
+
+def test_archive_stale_labels_only_terminal_features_past_the_window(make_board):
+    beads = [
+        {"id": "bd-old-done", "status": "closed", "labels": [], "closed_at": "2026-07-10T12:00:00Z"},
+        {"id": "bd-old-cxl", "status": "closed", "labels": ["cancelled"], "closed_at": "2026-07-01T00:00:00Z"},
+        {"id": "bd-fresh", "status": "closed", "labels": [], "closed_at": "2026-07-23T12:00:00Z"},  # 2 days — keep
+        {"id": "bd-open", "status": "open", "labels": [], "closed_at": "2026-01-01T00:00:00Z"},  # not terminal
+        {"id": "bd-no-ts", "status": "closed", "labels": [], "closed_at": None},  # unparseable → left visible
+    ]
+    br = Br({"list": beads})
+    b = make_board(br)
+    assert set(b.archive_stale(archive_after_days=7, now=_NOW)) == {"bd-old-done", "bd-old-cxl"}
+    labeled = {a[1] for a in br.cmds("update") if ("--add-label", "archived") == a[-2:]}
+    assert labeled == {"bd-old-done", "bd-old-cxl"}
+    # ARCHIVAL, NOT DELETION (#115): the pass writes labels only — it never
+    # deletes/closes a bead (the JSONL record is untouched).
+    assert not br.cmds("delete") and not br.cmds("close")
+
+
+def test_archive_stale_skips_already_archived_features(make_board):
+    """An archived bead is out of the default listing, so a second sweep never
+    re-writes its label (no redundant br update per sweep)."""
+    beads = [{"id": "bd-arch", "status": "closed", "labels": ["archived"], "closed_at": "2026-01-01T00:00:00Z"}]
+    br = Br({"list": beads})
+    assert make_board(br).archive_stale(archive_after_days=7, now=_NOW) == []
+    assert not br.cmds("update")
+
+
+def test_list_features_hides_archived_by_default_and_flag_restores(make_board):
+    beads = [
+        {"id": "bd-arch", "status": "closed", "labels": ["archived"]},
+        {"id": "bd-live", "status": "closed", "labels": []},
+    ]
+    br = Br({"list": beads})
+    b = make_board(br)
+    assert [f["id"] for f in b.list_features()] == ["bd-live"]
+    assert [f["id"] for f in b.list_features(include_archived=True)] == ["bd-arch", "bd-live"]
+    # the state filter composes with the archive scope the same way
+    assert [f["id"] for f in b.list_features(state="done")] == ["bd-live"]
+    assert [f["id"] for f in b.list_features(state="done", include_archived=True)] == ["bd-arch", "bd-live"]
+
+
+def test_project_exposes_archived_and_closed_at(make_board):
+    b = make_board(Br())
+    f = b._project({"id": "x", "status": "closed", "labels": ["archived"], "closed_at": "2026-07-01T00:00:00Z"})
+    assert f["archived"] is True and f["closed_at"] == "2026-07-01T00:00:00Z"
+    assert f["board_state"] == "done"  # archived is visibility, not a board state
+    g = b._project({"id": "y", "status": "open", "labels": []})
+    assert g["archived"] is False and g["closed_at"] == ""
+
+
+def test_retro_source_still_sees_a_feature_past_the_archive_window(make_board):
+    """THE TRAP (#115): board_retro must NOT inherit the default archive exclusion.
+    A feature closed far past the window (and already archived) still appears in the
+    retro's source AND in retro.summarize's output — else every retrospective
+    silently becomes 'the last archive_after_days days'."""
+    ancient = {
+        "id": "bd-ancient",
+        "status": "closed",
+        "labels": ["archived"],
+        "closed_at": "2026-01-01T00:00:00Z",
+        "comments": [{"text": "attempt 1 (tier=smart): CI fail: pytest exploded"}],
+    }
+    br = Br({"list": [ancient], "show": lambda args: [ancient]})
+    b = make_board(br)
+    raw = b.raw_features_with_comments()
+    assert [f["id"] for f in raw] == ["bd-ancient"]  # explicit include_archived opt-in
+    from project_board import retro
+
+    d = retro.summarize(raw)  # the exact pipeline board_retro runs
+    assert d["n_features"] == 1
+    assert [f["id"] for f in d["features"]] == ["bd-ancient"]
 
 
 def test_all_items_disposed_true_only_when_every_item_is_closed():

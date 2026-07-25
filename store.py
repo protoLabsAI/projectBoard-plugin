@@ -40,6 +40,9 @@ import re
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
+
+from . import _TERMINAL_STATES
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -63,6 +66,16 @@ LABEL_BLOCKED = "blocked"
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
 # for shipped work. Preserves the one-Done-edge invariant (only record_merge → `done`).
 LABEL_CANCELLED = "cancelled"
+# Archival (#115): a terminal feature (done/cancelled — `_TERMINAL_STATES`, shared
+# with the tool-boundary dedup) whose `closed_at` has aged past the archive window is
+# labeled `archived` by the loop's health sweep. It leaves the DEFAULT list_features
+# projection (and so board_list + the board view) but is NEVER deleted: the bead, its
+# history, and the git-backed JSONL are untouched, and `include_archived=True`
+# restores the exhaustive view. Consumers whose reads must span history (board_retro)
+# opt in explicitly — inheriting the default exclusion would silently turn "all time"
+# into "the last archive_after_days days" (the #114 class, one layer up).
+LABEL_ARCHIVED = "archived"
+ARCHIVE_AFTER_DAYS_DEFAULT = 7.0
 # A feature others build *on*: dependents gate on its MERGE, never its review (vs a
 # non-foundation blocker, which can release dependents at in_review under dep_gate:
 # review). Inert under the default dep_gate: merge (then every blocker gates on merge).
@@ -301,6 +314,29 @@ def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
             continue
         files.append(s)
     return files, src, reqs
+
+
+def _parse_closed_at(raw) -> float | None:
+    """A bead ``closed_at`` → epoch seconds, or None when absent/unparseable. The
+    archive pass treats None as NOT archivable — a terminal feature with a missing or
+    mangled timestamp stays visible rather than vanishing on a guess (fail visible:
+    archival must never be trigger-happy, #115). Accepts the ISO-8601 forms `br`
+    emits (``Z`` or an explicit offset; a naive stamp is taken as UTC) plus a bare
+    epoch number."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 class BeadsBoard:
@@ -1038,6 +1074,35 @@ class BeadsBoard:
         self._run("delete", fid, "--reason", f"deleted: {reason}" if reason else "deleted")
         return f
 
+    # ── archival (#115): age terminal features out of the live view — never delete ─
+    def archive_stale(
+        self, archive_after_days: float = ARCHIVE_AFTER_DAYS_DEFAULT, now: float | None = None
+    ) -> list[str]:
+        """Label every terminal feature (``_TERMINAL_STATES``: done/cancelled) whose
+        ``closed_at`` is older than ``archive_after_days`` with ``archived`` — the
+        board's unbounded-growth valve (#115), run from the loop's periodic health
+        sweep (no scheduler of its own). ARCHIVAL, NOT DELETION: only the label is
+        written — the bead, its history, and the git-backed JSONL are untouched, and
+        ``list_features(include_archived=True)`` still returns everything. A feature
+        with no parseable ``closed_at`` is left alone (fail visible — never archive
+        on a guess). Best-effort per feature; returns the ids archived this pass."""
+        cutoff = (time.time() if now is None else now) - float(archive_after_days) * 86400.0
+        archived: list[str] = []
+        # The default listing already excludes `archived`, so an archived bead never
+        # takes a second (redundant) label write on every sweep.
+        for f in self.list_features():
+            if f["board_state"] not in _TERMINAL_STATES:
+                continue
+            ts = _parse_closed_at(f.get("closed_at"))
+            if ts is None or ts > cutoff:
+                continue
+            try:
+                self._run("update", f["id"], "--add-label", LABEL_ARCHIVED)
+                archived.append(f["id"])
+            except BoardError:
+                log.warning("[project_board] archive pass: labeling %s failed (skipped this sweep)", f["id"])
+        return archived
+
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
     def flag_blocked(self, fid: str, reason: str) -> dict:
         self._require(fid)
@@ -1172,7 +1237,7 @@ class BeadsBoard:
             return None
         return self._project(rows[0] if isinstance(rows, list) else rows)
 
-    def list_features(self, state: str | None = None) -> list[dict]:
+    def list_features(self, state: str | None = None, include_archived: bool = False) -> list[dict]:
         """All feature rows for the board projection (every state, incl. the Done
         column); pass ``state`` to narrow the projection to one board state.
 
@@ -1184,6 +1249,13 @@ class BeadsBoard:
         see only the first 50 rows — and worse, the cap applies IN `br` while the state
         filter runs afterward in Python, so `state="in_review"` would mean 'in_review among
         the first 50 rows br returned', not all of them.
+
+        DOCUMENTED cap (#115): the default projection is the LIVE board — features
+        labeled ``archived`` (terminal + past the archive window, see ``archive_stale``)
+        are excluded unless ``include_archived=True``. The `br` query itself stays
+        unbounded; the narrowing is this one visible, opt-out-able label filter. A
+        consumer whose read must span history (``raw_features_with_comments`` →
+        board_retro) passes the flag explicitly.
         """
         # All statuses — `br list` defaults to open/in_progress, but the board view
         # needs `closed` features too (that's the Done column). `--limit 0` = unlimited
@@ -1209,6 +1281,8 @@ class BeadsBoard:
             or []
         )
         out = [self._project(r) for r in rows]
+        if not include_archived:
+            out = [f for f in out if not f["archived"]]
         # `br list` omits dependencies, so mark dag_blocked by cross-referencing the
         # puller: a `ready` feature the puller WON'T claim is blocked by an open dep.
         claimable = {f["id"] for f in self.ready_queue()}
@@ -1225,8 +1299,13 @@ class BeadsBoard:
         — the loop-retro's data source. ``list_features`` projects comments away and
         ``br list`` omits them, so re-fetch each terminal feature via ``br show`` (which
         carries the full comment history — the attempt/outcome record the retro mines).
-        Defaults to the terminal states (done + blocked = completed + failed work)."""
-        ids = [f["id"] for f in self.list_features() if f.get("board_state") in states]
+        Defaults to the terminal states (done + blocked = completed + failed work).
+
+        THE TRAP (#115): this read EXPLICITLY opts into archived features
+        (``include_archived=True``). The retro mines ALL completed work — inheriting
+        list_features' default archive exclusion would silently turn every
+        retrospective into 'the last archive_after_days days'."""
+        ids = [f["id"] for f in self.list_features(include_archived=True) if f.get("board_state") in states]
         raw: list[dict] = []
         for fid in ids:
             rows = self._run("show", fid, want_json=True)
@@ -1370,6 +1449,9 @@ class BeadsBoard:
             "board_state": state,
             "dag_blocked": dag_blocked,
             "bead_status": bead.get("status"),
+            # when the bead closed (`br` exposes it) — the archive pass selects on it,
+            # and the board view sorts the Done column most-recent-first by it (#115).
+            "closed_at": bead.get("closed_at", ""),
             "spec": bead.get("description", ""),
             "acceptance_criteria": bead.get("acceptance_criteria", ""),
             "design": bead.get("design", ""),
@@ -1381,6 +1463,9 @@ class BeadsBoard:
             "assignee": bead.get("assignee", ""),
             "blocked": LABEL_BLOCKED in labels,
             "cancelled": LABEL_CANCELLED in labels,
+            # archived is VISIBILITY, not a state: the feature stays done/cancelled;
+            # the label only drops it from the default list_features projection (#115).
+            "archived": LABEL_ARCHIVED in labels,
             "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
             "depends_on": depends_on,

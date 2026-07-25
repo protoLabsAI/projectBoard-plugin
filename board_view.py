@@ -58,6 +58,11 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   #list tr.grp:hover>td{color:var(--pl-color-fg)}
   #list tr.grp .tw{display:inline-block;width:1.1em;text-align:center}
   #list tr.grp .gl{margin-right:var(--pl-space-2)}
+  /* Done cap (#115): the "show all" affordance under the truncated Done column/group. */
+  .showall{display:block;width:100%;margin-top:2px;padding:6px;background:none;cursor:pointer;
+    border:var(--pl-border-width) dashed var(--pl-color-border);border-radius:var(--pl-radius);
+    color:var(--pl-color-fg-muted);font-size:11px}
+  .showall:hover{color:var(--pl-color-fg);border-color:var(--pl-color-accent)}
   /* in_progress cards/rows open the live monitor drawer (#84) — cue it's clickable. */
   .card--live{cursor:pointer}
   .card--live:hover{border-color:var(--pl-color-accent)}
@@ -187,10 +192,30 @@ const LIST_SECTIONS = [...COLS, "blocked", "cancelled"];
 const COLLAPSED = new Set();
 function toggleGroup(state){ COLLAPSED.has(state) ? COLLAPSED.delete(state) : COLLAPSED.add(state); render(); }
 
+// Done cap (#115): the Done column/group shows only the most recent DONE_CAP
+// features (closed_at desc) with a "show all" affordance — recent merges stay on
+// top instead of drowning in history. (The server already keeps archived features
+// out of the default /features response; this cap covers the still-live window.)
+// DONE_ALL is module-scoped so the 10s auto-reload doesn't re-truncate an expanded view.
+const DONE_CAP = 20;
+let DONE_ALL = false;
+function showAllDone(){ DONE_ALL = true; render(); }
+// → {items, total}: most recent first, capped until "show all"; total drives the
+// header count badge + the affordance label so the cap is never mistaken for the count.
+function doneSlice(items){
+  const sorted = items.slice().sort((a,b) => (b.closed_at||"").localeCompare(a.closed_at||""));
+  return {items: (DONE_ALL || sorted.length <= DONE_CAP) ? sorted : sorted.slice(0, DONE_CAP),
+          total: sorted.length};
+}
+function showAllBtn(total){
+  return '<button class="showall" onclick="showAllDone()">show all ('+total+')</button>';
+}
+
 function render(){
   if (VIEW === "kanban"){
     $("kanban").innerHTML = COLS.map(state => {
-      const items = FEATURES.filter(f => f.state === state);
+      let items = FEATURES.filter(f => f.state === state), total = items.length;
+      if (state === "done"){ const d = doneSlice(items); items = d.items; total = d.total; }  // cap Done (#115)
       const cards = items.map(f => {
         const color = f.blocked ? "var(--pl-color-status-error)" : (f.dag_blocked ? "var(--pl-color-status-warning)" : (STATE_COLOR[state]||"var(--pl-color-accent)"));
         // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
@@ -201,9 +226,10 @@ function render(){
           + '<div class="m"><span class="id">'+esc(f.id)+'</span><span>P'+f.priority+'</span>'
           + flags(f)+' '+pr(f)+'</div></div>';
       }).join("") || '<div class="pl-empty">—</div>';
+      const more = total > items.length ? showAllBtn(total) : "";
       return '<div class="col"><div class="pl-panel-header pl-panel-header--compact">'
         + '<span class="pl-panel-header__title">'+state.replace("_"," ")+'</span>'
-        + '<span class="pl-badge">'+items.length+'</span></div>'+cards+'</div>';
+        + '<span class="pl-badge">'+total+'</span></div>'+cards+more+'</div>';
     }).join("");
   } else {
     // List: group rows under a collapsible per-state header (COLS order + blocked +
@@ -221,14 +247,18 @@ function render(){
     Object.keys(byState).forEach(s => { if (!order.includes(s)) order.push(s); });
     let html = "";
     order.forEach(state => {
-      const items = byState[state] || [];
+      let items = byState[state] || [], total = items.length;
       if (!items.length) return;  // omit empty sections
+      if (state === "done"){ const d = doneSlice(items); items = d.items; total = d.total; }  // cap Done (#115)
       const collapsed = COLLAPSED.has(state);
       html += '<tr class="grp" data-state="'+esc(state)+'" onclick="toggleGroup(this.dataset.state)">'
         + '<td colspan="6"><span class="tw">'+(collapsed?"▸":"▾")+'</span>'
         + '<span class="gl">'+esc(state.replace("_"," "))+'</span>'
-        + '<span class="pl-badge">'+items.length+'</span></td></tr>';
-      if (!collapsed) html += items.map(row).join("");  // collapsed → header only (rows omitted)
+        + '<span class="pl-badge">'+total+'</span></td></tr>';
+      if (!collapsed){  // collapsed → header only (rows omitted)
+        html += items.map(row).join("");
+        if (total > items.length) html += '<tr><td colspan="6">'+showAllBtn(total)+'</td></tr>';
+      }
     });
     $("rows").innerHTML = html || '<tr><td colspan="6"><div class="pl-empty">No features yet — create some via the board tools or API.</div></td></tr>';
   }
@@ -315,9 +345,10 @@ $("drawer-close").addEventListener("click", closeMonitor);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMonitor(); });  // Esc closes
 
 // Module scripts are scoped — expose the inline onclick handlers (view toggle +
-// the list's per-state collapse).
+// the list's per-state collapse + the Done cap's "show all").
 window.setView = setView;
 window.toggleGroup = toggleGroup;
+window.showAllDone = showAllDone;
 setView(VIEW);   // sync the toggle + visibility to the initial view (list on mobile)
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated /features pull authenticates) or a short timer

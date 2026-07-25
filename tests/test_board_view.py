@@ -33,6 +33,24 @@ def test_kanban_columns_are_unchanged():
     assert 'const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];' in BOARD_PAGE
 
 
+# ── Done cap (#115): most recent 20 + the "show all" affordance ─────────────────
+
+
+def test_done_column_caps_at_20_most_recent_with_a_show_all_affordance():
+    """The Done column/group shows only the most recent DONE_CAP features (closed_at
+    desc) so recent merges aren't buried; "show all" expands, and the expansion is
+    module-scoped so the 10s auto-reload doesn't re-truncate it."""
+    assert "const DONE_CAP = 20;" in BOARD_PAGE
+    assert "let DONE_ALL = false;" in BOARD_PAGE
+    assert "function showAllDone()" in BOARD_PAGE
+    assert "window.showAllDone = showAllDone;" in BOARD_PAGE  # exposed for the inline onclick
+    assert "show all (" in BOARD_PAGE  # the affordance carries the true total
+    # most recent first — sorted on closed_at desc before the cap is applied
+    assert '(b.closed_at||"").localeCompare(a.closed_at||"")' in BOARD_PAGE
+    # both projections cap their done section through the shared slice
+    assert BOARD_PAGE.count("{ const d = doneSlice(items); items = d.items; total = d.total; }") == 2
+
+
 # ── live coder monitor drawer (#84) ─────────────────────────────────────────────
 
 
