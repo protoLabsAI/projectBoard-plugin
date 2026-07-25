@@ -350,6 +350,62 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_cancel_feature(feature_id: str, reason: str = "") -> str:
+        """Cancel a feature created in error (bad decomposition, duplicate, scope cut) —
+        the verb that RETIRES a bad card. Tags the bead `cancelled` and closes it with an
+        auditable `reason` (`br close -r`), a second terminal edge that keeps the card (and
+        its history) visible in a distinct `cancelled` state — NOT `done`, so the merge/CI
+        reconcilers and loop-retro never mistake it for shipped work. The bead survives (a
+        cancel, not a hard delete). `reason` is stripped of any literal wrapping double
+        quotes before storage (same hygiene as board_create_feature)."""
+        try:
+            reason = _strip_wrapping_quotes(reason)
+            f = get_store(**store_kw).cancel_feature(feature_id, reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_requeue_feature(feature_id: str) -> str:
+        """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
+        the fix-round doctrine needs to carry review findings to the SAME branch. The
+        puller re-claims it and the loop re-dispatches (at the higher tier if it was just
+        escalated; the open PR is pushed to, not reopened). Use it to route review-round
+        work back onto an in_review feature rather than opening a fresh card."""
+        try:
+            f = get_store(**store_kw).requeue(feature_id)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_block_feature(feature_id: str, reason: str) -> str:
+        """Flag a feature `blocked` with a `reason` — it stays ON the board (blocked is a
+        flag, not a lane) with the reason visible, and is skipped by the puller until
+        cleared. Complements the board_update_feature repair path: block when the feature
+        is stuck on something external (a missing dep, an unanswered question) and you want
+        the card parked-and-visible; update when the spec itself needs fixing. `reason` is
+        stripped of any literal wrapping double quotes before storage (same hygiene as
+        board_create_feature)."""
+        try:
+            reason = _strip_wrapping_quotes(reason)
+            f = get_store(**store_kw).flag_blocked(feature_id, reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_unblock_feature(feature_id: str) -> str:
+        """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
+        board_block_feature. Removes the blocked label; the puller can claim it again once
+        it's otherwise `ready`."""
+        try:
+            f = get_store(**store_kw).clear_blocked(feature_id)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_list(state: str = "") -> str:
         """List board features, optionally filtered by board `state` (backlog/ready/
         in_progress/in_review/done/blocked). Priority order."""
@@ -398,6 +454,10 @@ def _board_tools(cfg: dict):
         board_update_feature,
         board_get_feature,
         board_mark_ready,
+        board_cancel_feature,
+        board_requeue_feature,
+        board_block_feature,
+        board_unblock_feature,
         board_list,
         board_retro,
     ]
