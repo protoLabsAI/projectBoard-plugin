@@ -9,11 +9,14 @@ replaced by the ``make_board`` fixture — no CLI, no DB.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import types
 from datetime import datetime, timezone
 
 import pytest
 
+import project_board as pb
 from project_board import store
 from project_board.store import BeadsBoard, BoardError, escalation_enabled
 
@@ -1844,3 +1847,182 @@ def test_project_exposes_the_requirement_ledger(make_board):
     assert f["requirements"] == [{"id": "r1", "text": "alpha", "status": "open"}]
     assert f["files_to_modify"] == ["a.py"]
     assert b._project({"id": "y", "status": "open", "labels": []})["requirements"] == []
+
+
+# ── #107 slice 1: the CI join — annotate_ci_status + board_list's opt-in flags ────
+# board_list projected pr_url but no CI signal, so the PM had to open every PR to
+# find the red ones. The join is OPT-IN (one `gh` call per PR-bearing feature — see
+# annotate_ci_status's cost rationale): the default listing must cost zero gh calls,
+# probes skip no-PR and terminal rows, and `failing_only` is the PM's "which
+# in_review PRs are red" query.
+
+
+def _fake_ci(monkeypatch, statuses):
+    """Patch worktree.pr_ci_status with a canned {pr_url: (status, summary)} map;
+    returns the recorded (pr_url, cwd) calls so tests can assert what was probed."""
+    calls = []
+
+    async def _probe(pr_url, *, cwd=".", log_chars=3000):
+        calls.append((pr_url, cwd))
+        return statuses.get(pr_url, ("none", ""))
+
+    monkeypatch.setattr("project_board.worktree.pr_ci_status", _probe)
+    return calls
+
+
+def test_annotate_ci_status_probes_only_live_pr_bearing_features(make_board, monkeypatch):
+    calls = _fake_ci(
+        monkeypatch,
+        {
+            "https://pr/red": ("failing", "Failing checks:\n- gate: FAILURE"),
+            "https://pr/green": ("passing", ""),
+        },
+    )
+    b = make_board(Br(), repo="/repo")
+    feats = [
+        {"id": "bd-1", "board_state": "in_review", "pr_url": "https://pr/red"},
+        {"id": "bd-2", "board_state": "in_progress", "pr_url": "https://pr/green"},
+        {"id": "bd-3", "board_state": "backlog", "pr_url": ""},
+        {"id": "bd-4", "board_state": "done", "pr_url": "https://pr/merged"},
+        {"id": "bd-5", "board_state": "cancelled", "pr_url": "https://pr/dead"},
+    ]
+    out = b.annotate_ci_status(feats)
+    assert out is feats  # annotates in place
+    assert feats[0]["ci_status"] == "failing" and feats[0]["ci_summary"] == "Failing checks:\n- gate: FAILURE"
+    assert feats[1]["ci_status"] == "passing" and feats[1]["ci_summary"] == ""
+    # no-PR and terminal rows read "" (distinct from pr_ci_status's "none" = probed,
+    # no checks) and — the cost guard — were never probed at all.
+    assert all(feats[i]["ci_status"] == "" for i in (2, 3, 4))
+    assert sorted(u for u, _ in calls) == ["https://pr/green", "https://pr/red"]
+    assert all(cwd == "/repo" for _, cwd in calls)  # gh runs in the board's repo
+
+
+def test_annotate_ci_status_drops_the_log_block_from_the_summary(make_board, monkeypatch):
+    """The listing keeps the failing check NAMES; the truncated-log block pr_ci_status
+    appends after a blank line stays out of the board projection."""
+    summary = "Failing checks:\n- gate: FAILURE\n\nFailing log (truncated):\nE  assert 1 == 2"
+    _fake_ci(monkeypatch, {"https://pr/1": ("failing", summary)})
+    b = make_board(Br())
+    (f,) = b.annotate_ci_status([{"id": "bd-1", "board_state": "in_review", "pr_url": "https://pr/1"}])
+    assert f["ci_summary"] == "Failing checks:\n- gate: FAILURE"
+
+
+def test_annotate_ci_status_without_probeable_rows_never_touches_worktree(make_board, monkeypatch):
+    calls = _fake_ci(monkeypatch, {})
+    b = make_board(Br())
+    feats = [{"id": "bd-1", "board_state": "backlog", "pr_url": ""}]
+    assert b.annotate_ci_status(feats) == [
+        {"id": "bd-1", "board_state": "backlog", "pr_url": "", "ci_status": "", "ci_summary": ""}
+    ]
+    assert calls == []
+
+
+def test_annotate_ci_status_survives_a_running_event_loop(make_board, monkeypatch):
+    """The sync store bridges to the async probe with asyncio.run — which raises if
+    the calling thread already runs a loop. The bridge must hop to a private thread
+    instead, so a caller inside an event loop still gets the join."""
+    _fake_ci(monkeypatch, {"https://pr/1": ("passing", "")})
+    b = make_board(Br())
+
+    async def _call_from_async():
+        return b.annotate_ci_status([{"id": "bd-1", "board_state": "in_review", "pr_url": "https://pr/1"}])
+
+    (f,) = asyncio.run(_call_from_async())
+    assert f["ci_status"] == "passing"
+
+
+# ── board_list's with_ci / failing_only flags (the tool boundary) ─────────────────
+
+
+class _CiStore:
+    """A fake store for board_list's CI flags: canned projections, the recorded
+    list_features call, and an annotate that stamps statuses by pr_url."""
+
+    def __init__(self, feats, statuses=None):
+        self.feats = feats
+        self.statuses = statuses or {}
+        self.listed = None
+        self.annotated = False
+
+    def list_features(self, state=None, include_archived=False):
+        self.listed = (state, include_archived)
+        return [dict(f) for f in self.feats if state is None or f["board_state"] == state]
+
+    def annotate_ci_status(self, feats):
+        self.annotated = True
+        for f in feats:
+            f["ci_status"], f["ci_summary"] = self.statuses.get(f["pr_url"], ("", ""))
+        return feats
+
+
+def _feat(fid, state, pr=""):
+    return {
+        "id": fid,
+        "title": fid,
+        "board_state": state,
+        "blocked": False,
+        "pr_url": pr,
+        "priority": 2,
+        "difficulty": "",
+    }
+
+
+def _list_tool():
+    return {t.name: t for t in pb._board_tools({})}["board_list"]
+
+
+def test_board_list_default_omits_ci_and_never_probes(monkeypatch):
+    """The cost contract: a plain board_list makes ZERO gh calls and its rows carry
+    no ci keys — the join only runs when the caller opts in."""
+    fake = _CiStore([_feat("bd-1", "in_review", "https://pr/1")])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    (row,) = json.loads(_list_tool().invoke({}))
+    assert fake.annotated is False
+    assert "ci_status" not in row and "ci_summary" not in row
+
+
+def test_board_list_with_ci_joins_status_and_failing_summary(monkeypatch):
+    fake = _CiStore(
+        [_feat("bd-1", "in_review", "https://pr/red"), _feat("bd-2", "backlog")],
+        {"https://pr/red": ("failing", "Failing checks:\n- gate: FAILURE")},
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    by_id = {r["id"]: r for r in json.loads(_list_tool().invoke({"with_ci": True}))}
+    assert by_id["bd-1"]["ci_status"] == "failing"
+    assert by_id["bd-1"]["ci_summary"] == "Failing checks:\n- gate: FAILURE"
+    # a row with nothing to report carries the (stable) status key but no empty summary
+    assert by_id["bd-2"]["ci_status"] == "" and "ci_summary" not in by_id["bd-2"]
+
+
+def test_board_list_failing_only_defaults_to_in_review_and_keeps_only_red(monkeypatch):
+    fake = _CiStore(
+        [
+            _feat("bd-red", "in_review", "https://pr/red"),
+            _feat("bd-green", "in_review", "https://pr/green"),
+            _feat("bd-wip", "in_progress", "https://pr/wip-red"),
+        ],
+        {
+            "https://pr/red": ("failing", "Failing checks:\n- gate: FAILURE"),
+            "https://pr/green": ("passing", ""),
+            "https://pr/wip-red": ("failing", "Failing checks:\n- gate: FAILURE"),
+        },
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    out = json.loads(_list_tool().invoke({"failing_only": True}))
+    assert fake.listed == ("in_review", False)  # no explicit state → the PM's in_review query
+    assert [r["id"] for r in out] == ["bd-red"]  # green dropped; in_progress never listed
+    assert out[0]["ci_status"] == "failing"
+
+
+def test_board_list_failing_only_honors_an_explicit_state(monkeypatch):
+    fake = _CiStore(
+        [_feat("bd-red", "in_review", "https://pr/red"), _feat("bd-wip", "in_progress", "https://pr/wip-red")],
+        {
+            "https://pr/red": ("failing", "Failing checks:\n- x: FAILURE"),
+            "https://pr/wip-red": ("failing", "Failing checks:\n- x: FAILURE"),
+        },
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    out = json.loads(_list_tool().invoke({"failing_only": True, "state": "in_progress"}))
+    assert fake.listed == ("in_progress", False)
+    assert [r["id"] for r in out] == ["bd-wip"]
