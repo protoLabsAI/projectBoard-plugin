@@ -82,6 +82,25 @@ def queue_review_feedback(fid: str, findings: str) -> None:
     )
 
 
+def _parse_gate_files(raw: object) -> list[str]:
+    """Read ``project_board.gate_files`` — the repo standing gate files (#108) that
+    ride every coder prompt regardless of a card's ``files_to_modify``.
+
+    Accepts a list/tuple of paths, or a single comma-/whitespace-separated string
+    (so both ``["CHANGELOG.md", "docs/api.json"]`` and ``"CHANGELOG.md docs/api.json"``
+    work — mirrors ``config.parse_env_passthrough``). Returns a de-duplicated list,
+    order preserved. Missing/blank ⇒ empty (the documented default)."""
+    if not raw:
+        return []
+    parts = raw.replace(",", " ").split() if isinstance(raw, str) else raw
+    seen: dict[str, None] = {}
+    for name in parts:
+        name = str(name).strip()
+        if name:
+            seen.setdefault(name, None)
+    return list(seen)
+
+
 # ── auto gate resolution ────────────────────────────────────────────────────────
 # The pre-PR gate is repo-specific, and hard-coding one repo's check steps into the
 # orchestrator (or the operator's dispatch) rots two ways: the repo's CI changes and
@@ -551,6 +570,14 @@ class BoardLoop:
         self.kg_lessons = bool(self.cfg.get("kg_lessons", True))
         self.kg_lessons_k = max(1, int(self.cfg.get("kg_lessons_k", 3)))
         self.kg_lessons_domain = str(self.cfg.get("kg_lessons_domain", "loop-lessons")).strip()
+        # Repo standing gate files (#108): files EVERY change in this repo must keep
+        # green (a CHANGELOG, a coverage manifest, an API golden…). A tight card-level
+        # `files_to_modify` would otherwise suppress them, since a card author can't
+        # enumerate per-repo obligations. These ride the coder prompt as a separate
+        # block — a prompt addition, NOT ledger items (#113) and NOT `files_to_modify`
+        # entries. Per-repo, default empty. Accepts a list, or a comma/space-separated
+        # string (mirrors env_passthrough), de-duplicated with order preserved.
+        self.gate_files = _parse_gate_files(self.cfg.get("gate_files"))
         # Env hygiene (#78): the host identifies/authenticates THIS agent via env vars
         # (AGENT_NAME, PROTOAGENT_*, A2A_* — see config.py). None of them belong to the
         # gate preflight, the pre-PR local_gate_cmd, or the coder we spawn, so they're
@@ -2107,6 +2134,21 @@ class BoardLoop:
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
         )
+        # Repo standing gate files (#108): repo-wide obligations that a card's tight
+        # `files_to_modify` would otherwise suppress — a card author can't enumerate
+        # per-repo gates, so the loop carries them from config. Emitted as a SEPARATE
+        # prompt block (not merged into `files_to_modify`, not a ledger item #113): a
+        # standing reminder that these must stay green even if the change doesn't
+        # centre on them. Empty by default → no block.
+        gate_files_block = (
+            "\n## Repo standing gate files (keep these green — repo-wide, not per-card)\n"
+            + "\n".join(f"- {g}" for g in self.gate_files)
+            + "\nThese are standing obligations for EVERY change in this repo (beyond the "
+            "files listed above). If your change affects them, update them so the gate "
+            "stays green.\n"
+            if self.gate_files
+            else ""
+        )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
@@ -2177,6 +2219,7 @@ class BoardLoop:
             f"{lessons_block}"
             f"## Task\n{feature.get('spec', '')}\n\n"
             f"## Files to create / modify\n{files_block}\n"
+            f"{gate_files_block}"
             f"{design_block}\n"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
