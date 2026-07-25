@@ -306,13 +306,17 @@ def _board_tools(cfg: dict):
     def board_get_feature(feature_id: str) -> str:
         """Read a single feature's FULL detail as JSON — `title`, `spec`,
         `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `difficulty`,
-        `files_to_modify`, `foundation`, `priority`, `source_issue`, plus two
-        dependency views: `depends_on` (EVERY blocking edge — the historical ledger,
-        including already-merged blockers) and `open_depends_on` (only the edges
-        whose blocker is still OPEN — the live, actionable "what's blocking me now"
-        signal). The READ half of a read-modify-write: fetch the current criteria/
-        spec, revise them, then `board_update_feature` — no operator round-trip. Returns
-        `Error: unknown feature …` for an id that isn't on the board."""
+        `files_to_modify`, `foundation`, `priority`, `source_issue`, `requirements`
+        (the tracked requirement ledger decomposed from the acceptance criteria at
+        mark_ready — each item `{id, text, status, decline_reason?}`, status one of
+        open/done/declined; the completion gate refuses a PR while any item is
+        open), plus two dependency views: `depends_on` (EVERY blocking edge — the
+        historical ledger, including already-merged blockers) and `open_depends_on`
+        (only the edges whose blocker is still OPEN — the live, actionable "what's
+        blocking me now" signal). The READ half of a read-modify-write: fetch the
+        current criteria/spec, revise them, then `board_update_feature` — no
+        operator round-trip. Returns `Error: unknown feature …` for an id that
+        isn't on the board."""
         try:
             f = get_store(**store_kw).get_feature(feature_id)
         except BoardError as exc:
@@ -334,6 +338,7 @@ def _board_tools(cfg: dict):
                 "foundation": f.get("foundation", False),
                 "priority": f.get("priority", 2),
                 "source_issue": f.get("source_issue", ""),
+                "requirements": f.get("requirements", []),
                 "depends_on": f.get("depends_on", []),
                 "open_depends_on": f.get("open_depends_on", []),
             }

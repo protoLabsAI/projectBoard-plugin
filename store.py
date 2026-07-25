@@ -115,6 +115,79 @@ NOTES_SOURCE_PREFIX = "source-issue:"
 # silently drop.
 _SOURCE_ISSUE_URL_RE = re.compile(r"https://github\.com/([^/\s#]+)/([^/\s#]+)/issues/(\d+)/?")
 _SOURCE_ISSUE_SLUG_RE = re.compile(r"[^/\s#]+/[^/\s#]+#\d+")
+# The requirement LEDGER (#113): acceptance criteria decomposed into tracked items —
+# `{id, text, status, decline_reason?}`, status ∈ open|done|declined — one JSON line
+# per item in the bead `notes` (`req: {...}`), beside the files_to_modify paths and
+# the `source-issue:` metadata line. Prose AC stays the authoring interface; the
+# board decomposes it at `mark_ready` (the same seam as the DESIGN gate), and the
+# loop's completion gate reads the ledger back — so partial completion is
+# distinguishable from completion (a coder satisfying two of five requirements no
+# longer produces the same board state as one satisfying five).
+NOTES_REQ_PREFIX = "req:"
+REQ_CLOSED_STATUSES = ("done", "declined")
+# A markdown bullet (-/*/+ or `1.`/`1)`) opens a new requirement item; anything else
+# is a continuation of the current one (or, with no bullets at all, plain prose = ONE item).
+_AC_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+
+
+def _decompose_ac(text) -> list[dict]:
+    """Split acceptance-criteria prose into requirement items (#113): each markdown
+    bullet becomes one `{id, text, status: "open"}` item (a non-bullet line continues
+    the item above it); prose with no bullets at all is a SINGLE item. Ids are stable
+    positional `r1..rN` — the coder reports dispositions against them and the
+    completion gate reads them back. Empty/blank prose → no items (no ledger)."""
+    s = str(text or "").strip()
+    if not s:
+        return []
+    texts: list[str] = []
+    for line in s.splitlines():
+        m = _AC_BULLET_RE.match(line)
+        if m:
+            if m.group(1).strip():
+                texts.append(m.group(1).strip())
+        elif texts and line.strip():
+            texts[-1] += " " + line.strip()
+    if not texts:
+        texts = [" ".join(s.split())]
+    return [{"id": f"r{i + 1}", "text": t, "status": "open"} for i, t in enumerate(texts)]
+
+
+def _all_items_disposed(items) -> bool:
+    """True only when EVERY requirement item is closed (`done` or `declined`) — the
+    completion-gate predicate (#113): silence/`open` is not disposition, so one open
+    item means the feature may not reach in_review. Vacuously True with no items
+    (no ledger → nothing gates)."""
+    return all(str(i.get("status", "")).strip().lower() in REQ_CLOSED_STATUSES for i in items or ())
+
+
+def apply_requirement_dispositions(items, dispositions) -> list[dict]:
+    """Merge one coder round's per-item dispositions into the requirement ledger.
+
+    ``dispositions`` is what the loop parsed from the coder's ``## Requirements``
+    section: dicts of `{id, status, decline_reason?}`. Only the CLOSED statuses are
+    applied (`done`/`declined` — a coder can't re-open an item, and silence leaves an
+    item untouched: silence is NOT disposition, #113). Unknown ids are ignored — the
+    ledger's item set is fixed at decomposition, a reply can't invent rows. A decline
+    keeps its reason (the first-class "won't do, and here's why" record); a `done`
+    clears any stale one. Returns a NEW list; the inputs are never mutated."""
+    out = [dict(i) for i in items or ()]
+    by_id = {str(i.get("id", "")): i for i in out}
+    for d in dispositions or ():
+        item = by_id.get(str(d.get("id", "")).strip())
+        if item is None:
+            continue
+        status = str(d.get("status", "")).strip().lower()
+        if status not in REQ_CLOSED_STATUSES:
+            continue
+        item["status"] = status
+        reason = str(d.get("decline_reason") or "").strip()
+        if status == "declined":
+            if reason:
+                item["decline_reason"] = reason
+        else:
+            item.pop("decline_reason", None)
+    return out
+
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
@@ -187,23 +260,30 @@ def normalize_source_issue(raw) -> str:
     )
 
 
-def _render_notes(files, source_issue: str = "") -> str:
-    """Serialize the bead `notes` field: one files_to_modify path per line, plus a
-    trailing `source-issue: owner/repo#N` metadata line when set — the single
-    shared home for both (labels can't carry `/`/`#`, see NOTES_SOURCE_PREFIX)."""
+def _render_notes(files, source_issue: str = "", requirements=()) -> str:
+    """Serialize the bead `notes` field: one files_to_modify path per line, one
+    `req: {…json…}` requirement-item line per ledger entry (#113), plus a trailing
+    `source-issue: owner/repo#N` metadata line when set — the single shared home
+    for all three (labels can't carry `/`/`#`, see NOTES_SOURCE_PREFIX; the ledger
+    rides the same structured-lines path to avoid a schema migration)."""
     lines = [str(p).strip() for p in files or () if str(p).strip()]
+    for item in requirements or ():
+        lines.append(f"{NOTES_REQ_PREFIX} {json.dumps(item, ensure_ascii=False, sort_keys=True)}")
     if source_issue:
         lines.append(f"{NOTES_SOURCE_PREFIX} {source_issue}")
     return "\n".join(lines)
 
 
-def _split_notes(notes) -> tuple[list[str], str]:
-    """Parse the bead `notes` field back into ``(files_to_modify, source_issue)``
-    — the inverse of ``_render_notes``. Any non-blank line that isn't the
-    `source-issue:` metadata line is a file path; the FIRST metadata line wins
-    (the field is single-valued — the replaced-label convention, kept)."""
+def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
+    """Parse the bead `notes` field back into ``(files_to_modify, source_issue,
+    requirements)`` — the inverse of ``_render_notes``. Any non-blank line that isn't
+    a `req:` item line or the `source-issue:` metadata line is a file path; the FIRST
+    metadata line wins (the field is single-valued — the replaced-label convention,
+    kept). A malformed `req:` line is dropped, never mistaken for a file path (it
+    would otherwise poison files_to_modify and the ready gate's path check, #110)."""
     files: list[str] = []
     src = ""
+    reqs: list[dict] = []
     for line in str(notes or "").splitlines():
         s = line.strip()
         if not s:
@@ -211,8 +291,16 @@ def _split_notes(notes) -> tuple[list[str], str]:
         if s.startswith(NOTES_SOURCE_PREFIX):
             src = src or s[len(NOTES_SOURCE_PREFIX) :].strip()
             continue
+        if s.startswith(NOTES_REQ_PREFIX):
+            try:
+                item = json.loads(s[len(NOTES_REQ_PREFIX) :].strip())
+            except ValueError:
+                continue
+            if isinstance(item, dict) and str(item.get("id", "")).strip():
+                reqs.append(item)
+            continue
         files.append(s)
-    return files, src
+    return files, src, reqs
 
 
 class BeadsBoard:
@@ -654,21 +742,22 @@ class BeadsBoard:
             args += [f"--design={design}"]
         set_source = source_issue is not None and str(source_issue).strip()
         if files_to_modify is not None or set_source:
-            # files_to_modify + source_issue SHARE the bead `notes` field (labels
-            # can't carry the source's `/`/`#`, #101), and `br update --notes`
-            # replaces the whole field — so rewrite it with the untouched half
+            # files_to_modify + source_issue + the requirement ledger SHARE the bead
+            # `notes` field (labels can't carry the source's `/`/`#`, #101; the
+            # ledger rides the same structured lines, #113), and `br update --notes`
+            # replaces the whole field — so rewrite it with every untouched part
             # carried forward from the current projection: a files-only update
-            # must never drop the source-issue line, nor the reverse. An invalid
-            # source_issue raises the named error BEFORE `br update` runs, so it
-            # never half-applies a mixed update; whitespace-only = no-op (the
-            # difficulty convention).
+            # must never drop the source-issue line or the ledger, nor any other
+            # combination. An invalid source_issue raises the named error BEFORE
+            # `br update` runs, so it never half-applies a mixed update;
+            # whitespace-only = no-op (the difficulty convention).
             files = (
                 [str(p).strip() for p in files_to_modify if str(p).strip()]
                 if files_to_modify is not None
                 else f.get("files_to_modify") or []
             )
             src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
-            args += [f"--notes={_render_notes(files, src)}"]
+            args += [f"--notes={_render_notes(files, src, f.get('requirements') or [])}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
@@ -755,6 +844,19 @@ class BeadsBoard:
                     f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} and has a "
                     "design, but the design references no ADR — record the decision as an ADR and "
                     "cite it (e.g. 'ADR 0077') so the rationale outlives this feature."
+                )
+        # Requirement ledger (#113): decompose the acceptance-criteria prose into
+        # tracked items HERE — the same seam as the gates above (the PM authors prose;
+        # the coder sees items). Only when the bead carries no ledger yet: a re-mark
+        # (requeue → ready → mark_ready) must never wipe recorded dispositions back
+        # to `open`. Stored in `notes` beside files_to_modify/source-issue.
+        if not f.get("requirements"):
+            items = _decompose_ac(f.get("acceptance_criteria", ""))
+            if items:
+                self._run(
+                    "update",
+                    fid,
+                    f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
                 )
         self._run("update", fid, "--add-label", LABEL_READY, "--remove-label", LABEL_DESIGNING)
         return self.get_feature(fid)
@@ -1047,6 +1149,22 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # ── requirement ledger write-back (#113) ──────────────────────────────────
+    def set_requirements(self, fid: str, items) -> dict:
+        """Write the requirement ledger back to the bead — the loop calls this after
+        each coder round with the dispositions merged in (see
+        ``apply_requirement_dispositions``), so the LEDGER on the bead — not the
+        coder's reply text — is what the completion gate reads. `br update --notes`
+        replaces the whole field, so the files/source halves are carried forward
+        from the current projection (the update_feature contract)."""
+        f = self._require(fid)
+        self._run(
+            "update",
+            fid,
+            f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
+        )
+        return self.get_feature(fid)
+
     # ── reads (the projection) ────────────────────────────────────────────────
     def get_feature(self, fid: str) -> dict | None:
         rows = self._run("show", fid, want_json=True)
@@ -1225,12 +1343,13 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
-        # The bead `notes` field carries files_to_modify (one path per line) AND the
+        # The bead `notes` field carries files_to_modify (one path per line), the
+        # requirement ledger (#113, one `req: {…}` line per item), AND the
         # originating-issue record (#97) as a `source-issue: owner/repo#N` metadata
-        # line — split them apart so the source line never leaks into the file list.
-        # source_issue is "" when unset (the loop's PR opener then falls back to
-        # scanning the feature text for an issue URL).
-        files_to_modify, source_issue = _split_notes(bead.get("notes"))
+        # line — split them apart so neither structured line ever leaks into the
+        # file list. source_issue is "" when unset (the loop's PR opener then falls
+        # back to scanning the feature text for an issue URL).
+        files_to_modify, source_issue, requirements = _split_notes(bead.get("notes"))
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
@@ -1270,6 +1389,7 @@ class BeadsBoard:
             "gens_spent": gens_spent,
             "verified_sha": verified_sha,
             "source_issue": source_issue,
+            "requirements": requirements,
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,
