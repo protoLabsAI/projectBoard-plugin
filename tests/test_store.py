@@ -1237,3 +1237,81 @@ def test_create_from_plan_invalid_source_issue_fails_that_item_not_the_batch(mak
     assert bad["title"] == "Bad" and "invalid source_issue" in bad["error"]
     # the good item still landed (its source rides the notes metadata line)
     assert any("--notes=a.py\nsource-issue: acme/widgets#5" in u for u in br.cmds("update"))
+
+
+# ── #114: exhaustive board queries must pass `--limit 0` (br list defaults 50) ────
+# `br list` caps at 50 rows by default and `br ready` at 20 — and the plugin filters by
+# board_state / issue_type in Python AFTER `br` returns, so a capped result silently
+# truncates every consumer (PR reconcile, sweep/recover, the pending-review count, dedup,
+# the ready scan, /features, board_list). A query that reads as exhaustive must pass
+# `--limit 0` (the documented unlimited sentinel) so the cap can't hide rows behind the
+# Python filter. Asserting the argv proves the flag is passed without a brittle 51-row
+# fixture.
+
+
+def _passes_unlimited(argv) -> bool:
+    """True iff this `br` argv carries `--limit 0` (the flag immediately followed by 0)."""
+    for i, tok in enumerate(argv):
+        if tok == "--limit":
+            return i + 1 < len(argv) and argv[i + 1] == "0"
+    return False
+
+
+def test_list_features_query_is_unbounded(make_board):
+    """list_features passes `--limit 0` so the projection isn't capped at br's default 50
+    (then narrowed further by the Python state filter)."""
+    br = Br({"list": [], "ready": []})
+    b = make_board(br)
+    b.list_features()
+    (list_call,) = br.cmds("list")
+    assert "--limit" in list_call and "0" in list_call
+    assert _passes_unlimited(list_call)  # flag + value adjacent, not just both present
+
+
+def test_list_features_state_filter_still_queries_unbounded(make_board):
+    """The state filter runs in Python AFTER br returns, so the underlying `br list` must
+    still be unbounded — a `state=` argument must never narrow the query itself."""
+    br = Br({"list": [], "ready": []})
+    b = make_board(br)
+    b.list_features(state="in_review")
+    (list_call,) = br.cmds("list")
+    assert _passes_unlimited(list_call)
+
+
+def test_find_by_external_ref_scan_is_unbounded(make_board):
+    """record_merge's PR lookup scans `br list` unfiltered — it too must be unbounded,
+    else a merge webhook for a feature past row 50 would silently never close it."""
+    br = Br({"list": []})
+    b = make_board(br)
+    b._find_by_external_ref("https://example/pr/1")
+    (list_call,) = br.cmds("list")
+    assert _passes_unlimited(list_call)
+
+
+def test_claim_next_ready_query_is_unbounded(make_board):
+    """`br ready` defaults `--limit 20`; the puller filters `feature`/blocked in Python
+    AFTER, so a capped queue could hide the only claimable feature past row 20."""
+    br = Br({"ready": []})
+    b = make_board(br)
+    b.claim_next_ready()
+    (ready_call,) = br.cmds("ready")
+    assert _passes_unlimited(ready_call)
+
+
+def test_ready_queue_query_is_unbounded(make_board):
+    """The puller's queue must see EVERY ready feature — `br ready` is unbounded here too."""
+    br = Br({"ready": [], "list": []})
+    b = make_board(br)
+    b.ready_queue()
+    (ready_call,) = br.cmds("ready")
+    assert _passes_unlimited(ready_call)
+
+
+def test_raw_features_with_comments_listing_is_unbounded(make_board):
+    """board_retro's source delegates its listing to list_features, so its exhaustive
+    scan of terminal features inherits `--limit 0` — never capped at 50."""
+    br = Br({"list": [], "ready": []})
+    b = make_board(br)
+    b.raw_features_with_comments()
+    assert br.cmds("list")  # a list query actually ran
+    assert all(_passes_unlimited(c) for c in br.cmds("list"))

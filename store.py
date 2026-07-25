@@ -762,7 +762,10 @@ class BeadsBoard:
         """Atomically pull the top-priority unblocked, board-`ready` **feature** →
         `in_progress`. Returns None if nothing is ready. (`br ready` is priority-
         ordered; we filter `feature` in Python to dodge the --type+--label quirk.)"""
-        ready = self._run("ready", "--label", LABEL_READY, want_json=True) or []
+        # `--limit 0` = unlimited: `br ready` defaults `--limit 20`, and we filter to
+        # `feature` (+ non-blocked) in Python AFTER, so a capped queue could hide the only
+        # claimable feature behind 20 epics/blocked rows (the exhaustiveness invariant).
+        ready = self._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True) or []
         feats = [b for b in ready if b.get("issue_type") == "feature" and LABEL_BLOCKED not in (b.get("labels") or [])]
         if not feats:
             return None
@@ -1038,8 +1041,22 @@ class BeadsBoard:
         return self._project(rows[0] if isinstance(rows, list) else rows)
 
     def list_features(self, state: str | None = None) -> list[dict]:
+        """All feature rows for the board projection (every state, incl. the Done
+        column); pass ``state`` to narrow the projection to one board state.
+
+        INVARIANT: **a board query that reads as exhaustive must be exhaustive, or must
+        document its cap.** `br list` defaults `--limit 50` (and `br ready` defaults 20),
+        so this passes `--limit 0` (the documented unlimited sentinel) to make the query
+        genuinely unbounded. Without it every consumer (PR reconcile, sweep/recover, the
+        pending-review count, dedup, the ready scan, /features, board_list) would silently
+        see only the first 50 rows — and worse, the cap applies IN `br` while the state
+        filter runs afterward in Python, so `state="in_review"` would mean 'in_review among
+        the first 50 rows br returned', not all of them.
+        """
         # All statuses — `br list` defaults to open/in_progress, but the board view
-        # needs `closed` features too (that's the Done column).
+        # needs `closed` features too (that's the Done column). `--limit 0` = unlimited
+        # (see the exhaustiveness invariant above): the 50-row default would truncate the
+        # projection before the Python state filter ever ran.
         rows = (
             self._run(
                 "list",
@@ -1053,6 +1070,8 @@ class BeadsBoard:
                 "closed",
                 "--status",
                 "deferred",
+                "--limit",
+                "0",
                 want_json=True,
             )
             or []
@@ -1091,7 +1110,10 @@ class BeadsBoard:
         every still-open blocker is a NON-foundation feature already at ``in_review``
         — build on code that's in review, not merged. Foundation blockers always gate
         on merge."""
-        ready = self._run("ready", "--label", LABEL_READY, want_json=True) or []
+        # `--limit 0` = unlimited: `br ready` defaults `--limit 20`, but the puller's queue
+        # must see EVERY ready feature (the exhaustiveness invariant) — a cap here would
+        # drop ready work past row 20 from the scan and the relaxed-gate cross-reference.
+        ready = self._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True) or []
         # `br ready --json` omits the labels field (beads-rust ≤0.1.23), so projecting
         # its rows directly makes board_state() see no `ready` label → "backlog", and
         # the puller's `board_state != "ready"` guard self-rejects every candidate (the
@@ -1142,7 +1164,10 @@ class BeadsBoard:
         return f
 
     def _find_by_external_ref(self, ref: str) -> dict | None:
-        rows = self._run("list", want_json=True) or []
+        # `--limit 0` = unlimited: this scans EVERY feature for the merged PR's url, so a
+        # 50-row cap would let record_merge silently miss (never close) a feature past
+        # row 50 — the same exhaustiveness invariant as list_features.
+        rows = self._run("list", "--limit", "0", want_json=True) or []
         match = next((r for r in rows if r.get("external_ref") == ref), None)
         return self._project(match) if match else None
 
