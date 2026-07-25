@@ -846,7 +846,16 @@ class BoardLoop:
         (``max_pending_reviews``), and skip a candidate whose ``files_to_modify``
         overlap an in-flight build (the hot-file guard — two parallel coders editing
         the same file are a guaranteed merge conflict). Returns True if it started at
-        least one drive (so the runner stays hot)."""
+        least one drive (so the runner stays hot).
+
+        Every tick that reaches the claim scan emits ONE parseable ``claim_decision``
+        ``log.info`` (#124): the fid(s) selected this tick and, for each higher-priority
+        ``ready_queue`` candidate passed over, the structured reason it was skipped
+        (hot-file overlap with which in-flight fid, ``claim()`` returned None, not
+        ready/blocked). That is the evidence to tell a lost claim race from the hot-file
+        guard from a ``ready_queue`` mis-ordering when a lower-priority card claims ahead
+        of a higher one — the payload is JSON, so a future observer parses it without
+        grepping log levels."""
         if len(self._drives) >= self.max_concurrent:
             return False
         # Fail-closed gate preflight: if the gate can't run on clean base, HOLD all work
@@ -859,24 +868,49 @@ class BoardLoop:
         if self.max_pending_reviews and len(store.list_features(state="in_review")) >= self.max_pending_reviews:
             return False
         spawned = False
-        busy = set().union(*self._inflight_files.values()) if self._inflight_files else set()
+        # file → the in-flight (or claimed-this-tick) fid that owns it, so a hot-file
+        # skip can NAME the build it collides with, not just report "some overlap".
+        file_owner: dict[str, str] = {}
+        for owner_fid, owner_files in self._inflight_files.items():
+            for path in owner_files:
+                file_owner.setdefault(path, owner_fid)
+        busy = set(file_owner)
+        selected: list[str] = []
+        skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
         for candidate in store.ready_queue(relaxed=self.relaxed_gate):  # priority order, dep-unblocked
             if len(self._drives) >= self.max_concurrent:
-                break
+                break  # remaining candidates are lower priority than what we already selected
+            cid = candidate["id"]
             if candidate.get("board_state") != "ready" or candidate.get("blocked"):
-                continue  # a blocked-flagged feature can carry the `ready` label too
+                # a blocked-flagged feature can carry the `ready` label too
+                reason = "blocked" if candidate.get("blocked") else f"state={candidate.get('board_state')}"
+                skipped.append({"fid": cid, "reason": reason})
+                continue
             files = set(candidate.get("files_to_modify") or [])
-            if files & busy:
-                continue  # would edit a file an in-flight build owns → defer a tick
-            claimed = store.claim(candidate["id"], assignee=self.coder_name)
+            overlap = files & busy
+            if overlap:
+                # would edit a file an in-flight build owns → defer a tick
+                owners = sorted({file_owner[p] for p in overlap})
+                skipped.append({"fid": cid, "reason": "hot-file", "overlaps": owners, "files": sorted(overlap)})
+                continue
+            claimed = store.claim(cid, assignee=self.coder_name)
             if claimed is None:
-                continue  # raced / no longer ready
+                skipped.append({"fid": cid, "reason": "claim-race"})  # raced / no longer ready
+                continue
             self._inflight_files[claimed["id"]] = files
+            for path in files:
+                file_owner.setdefault(path, claimed["id"])
             task = asyncio.create_task(self._drive(claimed), name=f"pb-drive-{claimed['id']}")
             self._drives.add(task)
             task.add_done_callback(self._make_drive_done_cb(claimed["id"]))
             busy |= files
+            selected.append(claimed["id"])
             spawned = True
+        if selected or skipped:
+            log.info(
+                "[project_board] claim_decision %s",
+                json.dumps({"selected": selected, "skipped": skipped}, separators=(",", ":"), sort_keys=True),
+            )
         return spawned
 
     def _make_drive_done_cb(self, fid: str):

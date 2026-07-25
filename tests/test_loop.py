@@ -11,6 +11,7 @@ an unconfigured coder → ``flag_blocked`` before any worktree is created.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from project_board import worktree
 from project_board.loop import (
@@ -1096,6 +1097,61 @@ async def test_drive_done_releases_its_files(monkeypatch):
     await asyncio.sleep(0)  # let the done-callbacks run
     assert loop._inflight_files == {}  # files released when the drive finished
     assert loop._drives == set()
+
+
+async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch, caplog):
+    """#124: when a lower-priority card claims ahead of a higher one, the single
+    per-tick claim_decision line must name the selected fid AND why the higher card
+    was passed over — the evidence to tell the hot-file guard from a lost claim race.
+    Mirrors the caplog pattern in test_store.test_run_logs_the_retry_count_on_final_success."""
+    # bd-hi is FIRST in the ready queue (higher priority) but collides on shared.py with
+    # an in-flight build; bd-lo is disjoint and gets claimed ahead of it.
+    store = _ClaimStore([_ready("bd-hi", ["shared.py"]), _ready("bd-lo", ["other.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})
+    loop._inflight_files = {"bd-live": {"shared.py"}}  # an in-flight build already owns shared.py
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+            loop._spawn_ready()
+    finally:
+        await finish()
+    assert store.claimed == ["bd-lo"]  # the lower-priority card claimed ahead of bd-hi
+    lines = [m for m in caplog.messages if "claim_decision" in m]
+    assert len(lines) == 1  # exactly one structured line per tick
+    payload = json.loads(lines[0].split("claim_decision", 1)[1])  # parseable without log grepping
+    assert payload["selected"] == ["bd-lo"]  # the selected fid is recorded
+    skip = {s["fid"]: s for s in payload["skipped"]}
+    assert skip["bd-hi"]["reason"] == "hot-file"  # the passed-over card's reason…
+    assert skip["bd-hi"]["overlaps"] == ["bd-live"]  # …names the in-flight build it collides with
+    assert skip["bd-hi"]["files"] == ["shared.py"]
+
+
+async def test_spawn_ready_logs_a_claim_race_skip(monkeypatch, caplog):
+    """#124: a candidate whose claim() returns None (lost the atomic-claim race) is
+    recorded with a distinct, parseable reason — not conflated with the hot-file guard."""
+
+    class _RacingStore(_ClaimStore):
+        def claim(self, fid, assignee=""):
+            if fid == "bd-hi":
+                return None  # someone else won the claim race for the higher card
+            return super().claim(fid, assignee=assignee)
+
+    store = _RacingStore([_ready("bd-hi", ["a.py"]), _ready("bd-lo", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+            loop._spawn_ready()
+    finally:
+        await finish()
+    lines = [m for m in caplog.messages if "claim_decision" in m]
+    assert len(lines) == 1
+    payload = json.loads(lines[0].split("claim_decision", 1)[1])
+    assert payload["selected"] == ["bd-lo"]
+    skip = {s["fid"]: s for s in payload["skipped"]}
+    assert skip["bd-hi"]["reason"] == "claim-race"
 
 
 # ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────
