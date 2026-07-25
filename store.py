@@ -758,19 +758,41 @@ class BeadsBoard:
                     f"board_update_feature(feature_id={f['id']!r}, depends_on=...)."
                 )
 
-        # ── phase 3: promote ONLY the cleanly-created items ──────────────────────
+        # ── phase 3: promote the cleanly-created items ATOMICALLY (#111) ──────────
+        # A per-item `mark_ready` loop flips the `ready` label one bead at a time, so an
+        # idle loop could claim the first promoted item before the rest land — priority
+        # only ranks what is ALREADY ready. Instead: validate + prep every clean item
+        # first (none of that adds the `ready` label), then flip the whole batch's label
+        # in a SINGLE `br update`. The puller (a separate `br ready` process) sees either
+        # the pre-state or the fully-promoted batch — never a partial one, so no item can
+        # be claimed before every item in the batch is ready.
         if mark_ready:
+            promote: list[dict] = []
             for _i, _item, f in created:
                 r = result_by_id[f["id"]]
                 if r.get("enrichment_failed"):
                     continue  # a warned item isn't clean → don't auto-promote it
                 try:
-                    self.mark_ready(f["id"])
-                    r["board_state"] = "ready"
-                    r["ready"] = True
+                    self._prepare_ready(f["id"])  # gate + ledger, but NOT the `ready` label
                 except BoardError as exc:
                     r["ready"] = False
                     r["ready_error"] = str(exc)
+                    continue
+                promote.append(r)
+            if promote:
+                # One `br update <id1> <id2> …` — every clean item crosses into `ready`
+                # in a single write the puller can't interleave a claim into.
+                self._run(
+                    "update",
+                    *[r["id"] for r in promote],
+                    "--add-label",
+                    LABEL_READY,
+                    "--remove-label",
+                    LABEL_DESIGNING,
+                )
+                for r in promote:
+                    r["board_state"] = "ready"
+                    r["ready"] = True
 
         n_created = len(created)
         return {
@@ -884,7 +906,13 @@ class BeadsBoard:
         return f
 
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────
-    def mark_ready(self, fid: str) -> dict:
+    def _prepare_ready(self, fid: str) -> None:
+        """Enforce the Ready gate and materialize the requirement ledger for ``fid``
+        WITHOUT flipping the ``ready`` label — the prep half of ``mark_ready``, split
+        out so a batch promotion can validate + prep every item first and then flip the
+        whole batch's ``ready`` label in ONE ``br update`` (#111): the puller must never
+        observe a partially-promoted batch (some items ready, some not). Raises
+        BoardError if the gate rejects the feature."""
         f = self._require(fid)
         if f["board_state"] not in ("backlog", "ready"):
             raise BoardError(f"can't mark ready from {f['board_state']!r}")
@@ -945,6 +973,11 @@ class BeadsBoard:
                     fid,
                     f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
                 )
+
+    def mark_ready(self, fid: str) -> dict:
+        """Promote a single feature to `ready` (backlog → ready): enforce the gate,
+        materialize the requirement ledger, then flip the `ready` label."""
+        self._prepare_ready(fid)
         self._run("update", fid, "--add-label", LABEL_READY, "--remove-label", LABEL_DESIGNING)
         return self.get_feature(fid)
 
