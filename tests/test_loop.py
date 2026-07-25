@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 
+import pytest
+
+from project_board import store as store_mod
 from project_board import worktree
 from project_board.loop import (
+    _MERGED_VERIFIED_SHA_LEN,
     BoardLoop,
     _ci_failure_reason,
     _inject_source_issue_line,
@@ -22,6 +27,7 @@ from project_board.loop import (
     _resolve_gate_cmd,
     _source_issue,
 )
+from project_board.store import BeadsBoard, BoardError
 
 
 class FakeLoopStore:
@@ -1853,6 +1859,97 @@ async def test_verify_merged_state_conflict_and_error_are_noops(monkeypatch):
     # budget untouched → the third call actually verifies and stamps.
     assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
     assert store.verified == [("bd-1", "abc")]
+
+
+async def test_verify_merged_state_stamps_the_short_sha(monkeypatch):
+    """The stamp is the SHORT sha (12 chars): `merged-verified:` + 40 = 56 blew beads'
+    50-char label cap, so #132's write always died VALIDATION_FAILED — 12 chars (28
+    total) fits (#135)."""
+    full_sha = "0123456789abcdef0123456789abcdef01234567"  # a real 40-char sha
+    assert len(full_sha) == 40
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret(full_sha))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt")))
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop()
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green
+    assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    assert store.verified == [("bd-1", full_sha[:_MERGED_VERIFIED_SHA_LEN])]
+    # the stamp read back the next poll matches the same-width truncation → current,
+    # so nothing rebuilds (the read-back comparison and the write use the SAME width).
+    feature = {"id": "bd-1", "labels": [f"merged-verified:{full_sha[:_MERGED_VERIFIED_SHA_LEN]}"]}
+    built = []
+    monkeypatch.setattr(worktree, "merged_state_worktree", lambda *a, **k: built.append(1))
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert not built  # current → no rebuild
+
+
+async def test_verify_merged_state_stamp_write_failure_never_aborts_or_burns_budget(monkeypatch):
+    """A BoardError stamping the verified sha is optional bookkeeping (#135): it must
+    NOT propagate — the caller's CI/merge reconciliation still has to run — and must NOT
+    spend the re-verify budget on a write that never landed; next poll re-verifies."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("def456abc789"))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt")))
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+
+    class _BoomStore(_VerifyStore):
+        def record_merged_verified(self, fid, sha):
+            raise BoardError("`br update` failed: VALIDATION_FAILED")
+
+    store = _BoomStore({"id": "bd-1"})
+    loop = _vloop(rebase_fix_max=3)
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green
+    # does not raise, does not block…
+    assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    assert store.blocked == []
+    # …and the budget is untouched — a write that can't land isn't a re-verify attempt.
+    assert loop._merged_verify_attempts.get("bd-1", 0) == 0
+
+
+async def test_verify_merged_state_absent_stamp_is_never_reported_stale(monkeypatch, caplog):
+    """With the budget spent and NO stamp ever written (rebase_fix_max=0), the exhaustion
+    log must not claim a 'stale stamp' that doesn't exist — that false report is the very
+    class of bug #132 was built to prevent (#135)."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("abc123def456"))
+    built = []
+    monkeypatch.setattr(worktree, "merged_state_worktree", lambda *a, **k: built.append(1))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(rebase_fix_max=0)
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    joined = "\n".join(caplog.messages)
+    assert "no merged-verified stamp was ever written" in joined
+    assert "leaving the stale merged-verified stamp" not in joined
+    assert not built  # budget 0 → never even builds the merged worktree
+    assert store.verified == [] and store.blocked == []
+
+
+@pytest.mark.skipif(
+    shutil.which(store_mod.BR) is None,
+    reason="real `br` (beads) CLI not on PATH — integration label round-trip needs it",
+)
+async def test_verify_merged_state_stamp_lands_through_real_br(monkeypatch, tmp_path):
+    """Integration (#135): the merged-verified stamp must LAND through the ACTUAL `br`
+    label path with a real 40-char sha. `merged-verified:` + 40 = 56 > beads' 50-char
+    cap, so the pre-#135 write died VALIDATION_FAILED and #132's promised stamp never
+    existed — a gap the fake-`record_merged_verified` unit tests could never catch. A
+    REAL BeadsBoard writes the (short) stamp here; we assert the label is on the bead."""
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    f = board.create_feature("Verify stamp", spec="s", acceptance_criteria="WHEN x THE SYSTEM SHALL y")
+    fid = f["id"]
+    full_sha = "0123456789abcdef0123456789abcdef01234567"  # a real 40-char sha
+    assert len(full_sha) == 40
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret(full_sha))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", str(tmp_path / "wt"))))
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    loop = _vloop()
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green
+    # base moved (no stamp yet) + green gate → stamp the short sha through real `br`.
+    assert await loop._verify_merged_state(board, board.get_feature(fid), "pr", str(tmp_path)) is False
+    labels = board.get_feature(fid).get("labels") or []
+    stamps = [l for l in labels if l.startswith("merged-verified:")]
+    assert stamps == [f"merged-verified:{full_sha[:_MERGED_VERIFIED_SHA_LEN]}"]  # it LANDED
+    assert all(len(l) <= 50 for l in labels)  # and every label fits beads' cap
 
 
 async def test_reconcile_prs_verify_block_skips_ci(monkeypatch):
