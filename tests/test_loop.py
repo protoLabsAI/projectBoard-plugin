@@ -155,6 +155,64 @@ def test_queue_review_feedback_ignores_blank_findings():
     assert "bd-9" not in _PENDING_FEEDBACK  # nothing to carry back
 
 
+# ── repo standing gate files (#108) ──────────────────────────────────────────────
+
+
+def test_gate_files_config_defaults_empty():
+    """`project_board.gate_files` is per-repo, default empty (this repo has no
+    CHANGELOG, so it declares none). Accepts a list or a comma/space string,
+    de-duplicated with order preserved (mirrors env_passthrough)."""
+    assert BoardLoop({}).gate_files == []
+    assert BoardLoop({"gate_files": []}).gate_files == []
+    assert BoardLoop({"gate_files": ["CHANGELOG.md", "docs/api.json"]}).gate_files == [
+        "CHANGELOG.md",
+        "docs/api.json",
+    ]
+    # string form: comma- or whitespace-separated, same result
+    assert BoardLoop({"gate_files": "CHANGELOG.md, docs/api.json"}).gate_files == ["CHANGELOG.md", "docs/api.json"]
+    assert BoardLoop({"gate_files": "CHANGELOG.md docs/api.json"}).gate_files == ["CHANGELOG.md", "docs/api.json"]
+    # dedup, order preserved; blanks dropped
+    assert BoardLoop({"gate_files": ["a.py", "a.py", "  ", "b.py"]}).gate_files == ["a.py", "b.py"]
+
+
+def test_build_prompt_appends_repo_gate_files():
+    """AC (#108): the prompt-assembly seam appends `project_board.gate_files` as a
+    SEPARATE block — repo-wide obligations a tight `files_to_modify` would suppress,
+    which a card author can't enumerate per repo."""
+    loop = BoardLoop({"gate_files": ["CHANGELOG.md", "docs/openapi.json"]})
+    prompt = loop._build_prompt(FEATURE)
+    assert "Repo standing gate files" in prompt
+    assert "- CHANGELOG.md" in prompt and "- docs/openapi.json" in prompt
+    # the card's own files still appear — gate files are additive, not a replacement
+    assert "- a.py" in prompt and "- b.py" in prompt
+
+
+def test_build_prompt_omits_gate_files_block_when_none_configured():
+    """Default (empty) → no block at all, so a repo that declares none (e.g. this one,
+    no CHANGELOG) gets the unchanged prompt."""
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    assert "Repo standing gate files" not in prompt
+
+
+def test_gate_files_are_not_ledger_items_nor_files_to_modify():
+    """Composes with #113: gate files are a prompt-assembly ADDITION, not ledger items
+    and not merged into the feature's `files_to_modify` — the block is distinct from
+    the `## Files to create / modify` list and the `## Requirements ledger`."""
+    loop = BoardLoop({"gate_files": ["CHANGELOG.md"]})
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    prompt = loop._build_prompt(feature)
+    # gate file lands under its own heading, NOT under Files to create / modify
+    # ([0] is the file list itself — everything up to the next `##` heading)
+    files_section = prompt.split("## Files to create / modify")[1].split("##")[0]
+    assert "CHANGELOG.md" not in files_section
+    assert "- a.py" in files_section  # sanity: this IS the file-list section
+    # the standing block does not leak into / become a ledger requirement line
+    ledger_section = prompt.split("## Requirements ledger")[1]
+    assert "CHANGELOG.md" not in ledger_section
+    # …and the feature's own files_to_modify was never mutated by prompt assembly
+    assert feature["files_to_modify"] == ["a.py", "b.py"]
+
+
 def test_is_test_path_classification():
     """The deterministic gate's path classifier — what counts as a test vs code."""
     from project_board.loop import _is_code_path, _is_test_path
