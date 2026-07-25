@@ -424,6 +424,65 @@ def test_cancel_feature_tags_cancelled_and_closes_with_reason(make_board, monkey
     assert f["board_state"] == "cancelled" and f["cancelled"] is True
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "source issue 2267: retired and replaced by 2282",  # a colon
+        "scope cut — folded into bd-42",  # an em dash
+    ],
+)
+def test_cancel_feature_passes_a_punctuated_reason_through_intact(make_board, monkeypatch, reason):
+    """The counterexample (#106): a colon/em-dash reason is handed to `br close -r`
+    verbatim and — when close succeeds — the route stays a clean single cancel (no undo)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "cancelled", "cancelled": True})
+    b.cancel_feature("bd-9", reason)
+    close = next(c for c in br.calls if c[0] == "close")
+    assert close == ("close", "bd-9", "-r", f"cancelled: {reason}")
+    # a successful close leaves NO compensating write — the `cancelled` tag stands.
+    assert not any(c[0] == "update" and "--remove-label" in c for c in br.calls)
+
+
+def _raise_on_close(args):
+    # Mimic `br close -r` rejecting the reason (#106): a punctuated reason `br` couldn't
+    # parse surfaced as a non-zero exit → BoardError, mid-way through the two-write route.
+    raise BoardError("`br close bd-9 -r ...` failed: unparseable reason")
+
+
+def test_cancel_feature_rolls_back_when_close_fails_leaving_no_zombie(make_board, monkeypatch):
+    """Atomic-or-clean (#106): if `br close` fails after the `cancelled` tag + unassign
+    landed, the route undoes BOTH — remove the label, restore the prior assignee — and
+    re-raises, so the feature is never stranded OPEN + `ready` + `cancelled` (a claimable
+    zombie), but back in its exact pre-cancel state."""
+    br = Br(returns={"close": _raise_on_close})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "assignee": "alice", "labels": ["ready"]})
+    with pytest.raises(BoardError, match="failed"):
+        b.cancel_feature("bd-9", "source issue 2267: retired and replaced by 2282")
+    # the tag/unassign write went out first…
+    assert ("update", "bd-9", "--add-label", "cancelled", "--assignee", "") in br.calls
+    # …then close blew up, so the compensating write undoes the tag AND restores the assignee.
+    assert ("update", "bd-9", "--remove-label", "cancelled", "--assignee", "alice") in br.calls
+    # the `ready` label is never touched by cancel, so the rollback needn't re-add it —
+    # the pre-cancel state is preserved without a spurious ready write.
+    assert not any(c[0] == "update" and "--add-label" in c and "ready" in c for c in br.calls)
+
+
+def test_cancel_feature_rollback_skips_assignee_restore_when_unassigned(make_board, monkeypatch):
+    """When the feature had no assignee, the rollback drops just the `cancelled` label —
+    no redundant `--assignee ""` write to re-clear an already-empty assignee."""
+    br = Br(returns={"close": _raise_on_close})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "assignee": "", "labels": ["ready"]})
+    with pytest.raises(BoardError):
+        b.cancel_feature("bd-9", "scope cut — folded into bd-42")
+    assert ("update", "bd-9", "--remove-label", "cancelled") in br.calls
+    # no assignee token in any undo write (there was nothing to restore).
+    undo = next(c for c in br.calls if c[0] == "update" and "--remove-label" in c)
+    assert "--assignee" not in undo
+
+
 def test_cancel_feature_unknown_id_raises(make_board, monkeypatch):
     b = make_board(Br())
     monkeypatch.setattr(b, "get_feature", lambda fid: None)
