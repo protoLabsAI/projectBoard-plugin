@@ -57,6 +57,16 @@ from .store import (
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
+# The merged-state verdict stamp (#131) rides a ``merged-verified:<sha>`` LABEL, and
+# beads caps labels at 50 chars. The 16-char prefix + a full 40-char sha = 56 chars, so
+# EVERY real write died VALIDATION_FAILED (#135) — the stamp #132 promised was silently
+# never written (the fake-``_run`` unit tests accepted any label and hid it). A 12-char
+# short sha (28 chars total) fits with room to spare and still uniquely identifies an
+# origin/<base> commit (git's own default abbreviation). The read-back comparison in
+# ``_verify_merged_state`` truncates the live origin/<base> to the SAME width so the
+# ``stamped == current`` currency check stays exact.
+_MERGED_VERIFIED_SHA_LEN = 12
+
 
 # ── external re-dispatch feedback bridge (the /review route → the loop) ──────────
 # An adverse-review bounce POSTed to /features/{fid}/review is handled in the API
@@ -1107,10 +1117,14 @@ class BoardLoop:
         hand). So when current ``origin/<base>`` ≠ the ``merged-verified:<sha>`` stamp
         on the bead (a missing stamp counts as moved — the first poll verifies and
         stamps), build the merged state (branch tip + that base commit) in a throwaway
-        worktree, run ``local_gate_cmd`` there, and stamp the base sha the verdict was
-        verified against — the ONE field an adjudicator checks for verdict currency.
-        Same principle as the completion gate (#113): verify the property, don't trust
-        the report.
+        worktree, run ``local_gate_cmd`` there, and stamp the SHORT base sha the verdict
+        was verified against — the ONE field an adjudicator checks for verdict currency
+        (short because ``merged-verified:`` + a full 40-char sha = 56 chars blew beads'
+        50-char label cap, so #132's stamp never actually landed until #135). The stamp
+        is best-effort bookkeeping: a ``BoardError`` writing it is caught and logged so
+        the required CI/merge reconciliation is never skipped, and a write that didn't
+        land never spends the re-verify budget. Same principle as the completion gate
+        (#113): verify the property, don't trust the report.
 
         NON-BLOCKING by default: a moved base is unverified, not broken. A green gate
         (or one that can't run — the ``_run_local_gate`` fail-open contract; CI is
@@ -1137,19 +1151,33 @@ class BoardLoop:
             ),
             "",
         )
-        if stamped == base_sha:
+        if stamped == base_sha[:_MERGED_VERIFIED_SHA_LEN]:
             return False  # the verdict is current — base hasn't moved since it was stamped
         n = self._merged_verify_attempts.get(fid, 0)
         if n >= self.rebase_fix_max:
             if n == self.rebase_fix_max:  # log the exhaustion once, then stay quiet
                 self._merged_verify_attempts[fid] = n + 1
-                log.info(
-                    "[project_board] %s base moved again but the merged-verify budget (%d) is spent — "
-                    "leaving the stale merged-verified stamp for the adjudicator: %s",
-                    fid,
-                    self.rebase_fix_max,
-                    pr_url,
-                )
+                # Only claim a "stale stamp" when one actually exists. With the budget
+                # exhausted and NO stamp ever written (e.g. rebase_fix_max=0, or the
+                # pre-#135 world where every write failed), the adjudicator sees an
+                # UNVERIFIED merged state — reporting a stale verdict that isn't there
+                # is the same lie #132 was built to prevent.
+                if stamped:
+                    log.info(
+                        "[project_board] %s base moved again but the merged-verify budget (%d) is spent — "
+                        "leaving the stale merged-verified stamp for the adjudicator: %s",
+                        fid,
+                        self.rebase_fix_max,
+                        pr_url,
+                    )
+                else:
+                    log.info(
+                        "[project_board] %s base moved but the merged-verify budget (%d) is spent and no "
+                        "merged-verified stamp was ever written — the merged state stays unverified: %s",
+                        fid,
+                        self.rebase_fix_max,
+                        pr_url,
+                    )
             return False
         outcome, detail = await worktree.merged_state_worktree(repo, f"feat/{fid}", base_sha, root=self.root)
         if outcome == "error":
@@ -1162,27 +1190,44 @@ class BoardLoop:
                 "[project_board] %s merged-state verify: merge conflicts (%s) — leaving to the rebase edge", fid, detail
             )
             return False
-        self._merged_verify_attempts[fid] = n + 1
         try:
             failure = await self._run_local_gate(detail)
         finally:
             await worktree.remove_worktree(repo, detail)
+        short = base_sha[:_MERGED_VERIFIED_SHA_LEN]
         if failure is None:
-            store.record_merged_verified(fid, base_sha)
+            # Green: the verdict still holds on the merged state. Stamp the SHORT sha,
+            # then — and only then — spend a budget unit. The stamp is optional
+            # bookkeeping: a BoardError writing it must NOT abort the reconcile pass
+            # (the merge/CI edges below still have to run) nor burn the re-verify budget
+            # on a write that didn't land — the next poll simply re-verifies (#135).
+            try:
+                store.record_merged_verified(fid, short)
+            except BoardError:
+                log.warning(
+                    "[project_board] %s merged-state gate green but stamping the verified sha failed — "
+                    "reconcile continues, next poll re-verifies: %s",
+                    fid,
+                    pr_url,
+                    exc_info=True,
+                )
+                return False
+            self._merged_verify_attempts[fid] = n + 1
             log.info(
                 "[project_board] %s merged-state gate green — verdict re-verified against %s@%s",
                 fid,
                 base,
-                base_sha[:12],
+                short,
             )
             return False
+        self._merged_verify_attempts[fid] = n + 1
         store.flag_blocked(
             fid,
-            f"gate FAILED on the merged state (branch + {base}@{base_sha[:12]}) — the PR merges clean "
+            f"gate FAILED on the merged state (branch + {base}@{short}) — the PR merges clean "
             f"but the RESULT is broken; needs triage: {pr_url}\n{failure}",
         )
         await worktree.reap_feature_worktree(repo, self.root, fid)
-        log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, base_sha[:12])
+        log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, short)
         return True
 
     async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
