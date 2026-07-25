@@ -33,6 +33,7 @@ Notes on `br` quirks pinned down empirically (br 0.1.x):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -379,6 +380,24 @@ def _parse_closed_at(raw) -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def _complete(coro):
+    """Run an async worktree coroutine to completion from this synchronous module.
+
+    The store is sync (it shells ``br``); the CI probe (``worktree.pr_ci_status``)
+    is async. The tools and API handlers reach the store from plain threads, where
+    ``asyncio.run`` is correct — but if a caller ever invokes us from INSIDE a
+    running event loop's thread (where ``asyncio.run`` raises RuntimeError), hop to
+    a private thread with its own loop instead of failing or deadlocking."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 class BeadsBoard:
@@ -1419,6 +1438,51 @@ class BeadsBoard:
             out = [f for f in out if f["board_state"] == state]
         out.sort(key=lambda f: (f["priority"], f["id"]))
         return out
+
+    def annotate_ci_status(self, feats: list[dict]) -> list[dict]:
+        """Join projected features with their PR's LIVE CI rollup, in place (#107).
+
+        Every row gains ``ci_status`` — ``worktree.pr_ci_status``'s token
+        (``passing|failing|pending|none``; only BLOCKING checks decide it, a red
+        advisory bot never reads as failing) or ``""`` for a row that wasn't probed
+        — and ``ci_summary``: the failing check NAMES. The log excerpt
+        ``pr_ci_status`` appends after a blank line is dropped — a listing row is a
+        triage signal, not a 3000-char build log (board_get_feature / the CI bounce
+        carry the full detail).
+
+        COST — the design decision: this is one ``gh`` network round-trip per
+        probed feature, so the join is **opt-in** (board_list's ``with_ci`` /
+        ``failing_only`` flags), not always-on and not TTL-cached.
+          - Always-on would tax EVERY board_list — the PM's hottest read, mostly
+            serving states where CI is irrelevant — with N network calls and
+            GitHub rate-limit burn.
+          - A TTL cache answers "is it red NOW" with stale data — the exact
+            question the flag exists to answer (a fresh push flips red → pending →
+            green well inside any useful TTL) — and adds mutable cross-call state
+            to a store that is otherwise a pure projection over beads.
+        Within an opted-in call the cost is still bounded: only NON-terminal
+        features carrying a ``pr_url`` are probed (a done/cancelled PR is already
+        merged or dead — its rollup is noise, and done rows are the unbounded
+        class), and the probes run CONCURRENTLY in one event-loop hop, so
+        wall-clock is the slowest single ``gh`` call, not the sum. Best-effort
+        like ``pr_ci_status`` itself: a ``gh`` failure reads ``none``, never
+        raises into the listing."""
+        from . import worktree  # lazy, matching the other cross-module reaches
+
+        for f in feats:
+            f.setdefault("ci_status", "")
+            f.setdefault("ci_summary", "")
+        live = [f for f in feats if f.get("pr_url") and f.get("board_state") not in _TERMINAL_STATES]
+        if not live:
+            return feats
+
+        async def _probe_all():
+            return await asyncio.gather(*(worktree.pr_ci_status(f["pr_url"], cwd=self.repo or ".") for f in live))
+
+        for f, (status, summary) in zip(live, _complete(_probe_all())):
+            f["ci_status"] = status
+            f["ci_summary"] = summary.split("\n\n", 1)[0]
+        return feats
 
     def raw_features_with_comments(self, states: tuple[str, ...] = ("done", "blocked")) -> list[dict]:
         """Raw ``br`` dicts (WITH ``comments``) for features in the given board states

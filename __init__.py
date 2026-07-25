@@ -447,29 +447,51 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_list(state: str = "", include_archived: bool = False) -> str:
+    def board_list(
+        state: str = "", include_archived: bool = False, with_ci: bool = False, failing_only: bool = False
+    ) -> str:
         """List board features, optionally filtered by board `state` (backlog/ready/
         in_progress/in_review/done/blocked). Priority order. Terminal features
         (done/cancelled) past the archive window carry an `archived` label and are
         EXCLUDED from this default response (#115) — the live board, not all of
         history. Pass `include_archived=true` for the exhaustive view; nothing is
-        ever deleted, so archived features stay fully queryable."""
-        feats = get_store(**store_kw).list_features(state=state or None, include_archived=include_archived)
-        return json.dumps(
-            [
-                {
-                    "id": f["id"],
-                    "title": f["title"],
-                    "state": f["board_state"],
-                    "blocked": f["blocked"],
-                    "dag_blocked": f.get("dag_blocked", False),
-                    "pr_url": f["pr_url"],
-                    "priority": f["priority"],
-                    "difficulty": f["difficulty"],
-                }
-                for f in feats
-            ]
-        )
+        ever deleted, so archived features stay fully queryable.
+
+        `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
+        (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
+        the failing check names in `ci_summary`. OPT-IN, never default — each
+        PR-bearing feature costs a `gh` network call (see
+        store.annotate_ci_status for the full cost rationale). `failing_only=true`
+        (implies `with_ci`) narrows the listing to rows whose CI is red; with no
+        explicit `state` it defaults to `in_review` — the PM's "which PRs are red
+        and waiting" query — but honors a `state` you pass alongside it."""
+        if failing_only:
+            with_ci = True
+            state = state or "in_review"
+        store = get_store(**store_kw)
+        feats = store.list_features(state=state or None, include_archived=include_archived)
+        if with_ci:
+            feats = store.annotate_ci_status(feats)
+            if failing_only:
+                feats = [f for f in feats if f.get("ci_status") == "failing"]
+        rows = []
+        for f in feats:
+            row = {
+                "id": f["id"],
+                "title": f["title"],
+                "state": f["board_state"],
+                "blocked": f["blocked"],
+                "dag_blocked": f.get("dag_blocked", False),
+                "pr_url": f["pr_url"],
+                "priority": f["priority"],
+                "difficulty": f["difficulty"],
+            }
+            if with_ci:
+                row["ci_status"] = f.get("ci_status", "")
+                if f.get("ci_summary"):
+                    row["ci_summary"] = f["ci_summary"]
+            rows.append(row)
+        return json.dumps(rows)
 
     @tool
     def board_retro() -> str:
