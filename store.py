@@ -1106,10 +1106,27 @@ class BeadsBoard:
         mistake a cancel for shipped or regressed work. Audit-preserving (the bead + its
         history survive), vs a hard `br delete` tombstone. Clears the assignee so a
         revived id could be re-claimed. Idempotent-ish: re-cancelling a cancelled feature
-        just re-closes it."""
-        self._require(fid)
+        just re-closes it.
+
+        ATOMIC-OR-CLEAN (#106): the tag/unassign write lands BEFORE `br close`, so a failing
+        close (a reason `br` can't parse, contention outlasting the retries, …) would strand
+        the feature as a claimable zombie — still OPEN, still `ready`-labelled, now also
+        `cancelled` and unassigned. On any close failure we undo the tag + restore the prior
+        assignee, then re-raise: the feature lands back in its exact pre-cancel state and the
+        caller sees the error, never a silent half-cancel."""
+        f = self._require(fid)
+        prior_assignee = f.get("assignee", "")
         self._run("update", fid, "--add-label", LABEL_CANCELLED, "--assignee", "")
-        self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
+        try:
+            self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
+        except BoardError:
+            undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
+            # Only rewrite the assignee if there was one — a bead that was already
+            # unassigned needs no restore (and `--assignee ""` would be a redundant write).
+            if prior_assignee:
+                undo += ["--assignee", prior_assignee]
+            self._run(*undo)
+            raise
         return self.get_feature(fid)
 
     def delete_feature(self, fid: str, reason: str = "") -> dict:
