@@ -104,20 +104,41 @@ def _norm_title(t: str) -> str:
     return " ".join(str(t or "").strip().lower().split())
 
 
-def _open_duplicate(features: list, title: str) -> dict | None:
-    """The first OPEN board feature whose title matches ``title`` (normalized), or
-    None. A board's own agent (onboarding, or its own reasoning about a dispatched
-    task) can call board_create_feature more than once for the same piece of work
-    within a single turn — this catches it at the tool boundary, same as
-    portfolio_dispatch's dedup guards the PM's re-dispatch one tier up."""
+def _open_duplicate(features: list, title: str, depends_on: list | None = None) -> dict | None:
+    """The first board feature this new card would DUPLICATE, or None. Two patterns,
+    checked in order:
+
+    1. TITLE — the first OPEN feature whose title matches ``title`` (normalized). A
+       board's own agent (onboarding, or its own reasoning about a dispatched task) can
+       call board_create_feature more than once for the same piece of work within a
+       single turn; this catches it at the tool boundary, same as portfolio_dispatch's
+       dedup guards the PM's re-dispatch one tier up.
+
+    2. DEPENDS_ON — a card whose ``depends_on`` names a feature that is ``in_review``
+       with an open ``pr_url``: the "work based on work that hasn't landed" pattern.
+       Title matching can't see it (the new card has a legitimately different title), so
+       it slips past pattern 1 and stacks a second card subordinate to in-flight work.
+       The matched blocker is returned tagged ``_dup_reason="depends_on_in_review"`` so
+       the caller can steer the author to board_requeue_feature (a fix round belongs on
+       the in-flight feature's OWN PR, not a new card).
+
+    ``features`` is the live board projection; ``depends_on`` is the new card's declared
+    blocker ids."""
+    features = features or []
     want = _norm_title(title)
-    if not want:
-        return None
-    for f in features or []:
-        if str(f.get("board_state", "")).lower() in _TERMINAL_STATES:
+    if want:
+        for f in features:
+            if str(f.get("board_state", "")).lower() in _TERMINAL_STATES:
+                continue
+            if _norm_title(f.get("title", "")) == want:
+                return f
+    by_id = {str(f.get("id", "")): f for f in features}
+    for dep in depends_on or []:
+        blocker = by_id.get(str(dep).strip())
+        if blocker is None:
             continue
-        if _norm_title(f.get("title", "")) == want:
-            return f
+        if str(blocker.get("board_state", "")).lower() == "in_review" and str(blocker.get("pr_url", "")).strip():
+            return {**blocker, "_dup_reason": "depends_on_in_review"}
     return None
 
 
@@ -199,8 +220,11 @@ def _board_tools(cfg: dict):
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
         twice for the same task (e.g. reconsidering mid-turn) stacks a duplicate the
-        loop then churns on. Pass `force=true` to create a second copy anyway. A
-        store read failure never blocks creation (better a possible dup than a
+        loop then churns on. It ALSO refuses when `depends_on` names a feature that is
+        already `in_review` with an open PR: work built on in-flight work is a fix
+        round and belongs on that feature's OWN PR — the warning points you at
+        `board_requeue_feature(fid, findings=...)` instead. Pass `force=true` to create
+        anyway. A store read failure never blocks creation (better a possible dup than a
         stuck board)."""
         try:
             store = get_store(**store_kw)
@@ -218,21 +242,33 @@ def _board_tools(cfg: dict):
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
             source_issue = _strip_wrapping_quotes(source_issue)
+            deps = _split_list(depends_on)
+            files = _split_list(files_to_modify)
             if not force:
                 try:
                     existing = store.list_features()
                 except BoardError:
                     existing = []  # can't check → don't block creation on a read failure
-                dup = _open_duplicate(existing, title)
+                dup = _open_duplicate(existing, title, deps)
                 if dup is not None:
+                    if dup.get("_dup_reason") == "depends_on_in_review":
+                        # The new card builds on an in-flight feature (in_review, open PR).
+                        # That's a fix round, and a fix round belongs on the in-flight
+                        # feature's OWN PR — point the author at the requeue verb (#112),
+                        # not a second card the loop would churn on.
+                        return (
+                            f"Skipped — this card's depends_on names {dup.get('id', '?')}, which is "
+                            f"already in_review with an open PR ({dup.get('pr_url', '')}). Work built "
+                            "on an in-flight feature belongs on THAT feature's PR, not a fresh card: "
+                            f"call board_requeue_feature({dup.get('id', '?')!r}, findings=...) to carry "
+                            "your changes onto the same branch. Pass force=true to stack a new card anyway."
+                        )
                     return (
                         f"Skipped — a feature titled {title!r} is already open on this board "
                         f"({dup.get('id', '?')}, {dup.get('board_state', 'open')}). It's likely "
                         "the same work; re-check the board before creating again, or pass "
                         "force=true to create a second copy anyway."
                     )
-            deps = _split_list(depends_on)
-            files = _split_list(files_to_modify)
             f = store.create_feature(
                 title,
                 spec=spec,
