@@ -395,6 +395,66 @@ async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".w
         await _git(repo, "worktree", "remove", "--force", rel)
 
 
+async def origin_head_sha(repo: str, ref: str) -> str:
+    """Fetch ``origin/<ref>`` and return its sha — ``""`` on any git failure (the
+    caller's next poll retries; never raises into the loop on a plain non-zero
+    exit). The merged-state verify (#131) reads this to decide whether base moved
+    under an ``in_review`` PR since its verdict was last stamped."""
+    rc, _o, _err = await _git(repo, "fetch", "origin", ref, timeout=120)
+    if rc != 0:
+        return ""
+    rc, out, _err = await _git(repo, "rev-parse", f"origin/{ref}")
+    return out.strip() if rc == 0 else ""
+
+
+async def merged_state_worktree(repo: str, branch: str, base_sha: str, *, root: str = ".worktrees") -> tuple[str, str]:
+    """Build the MERGED state — ``origin/<branch>`` tip + ``base_sha`` (the base
+    commit the verdict will be stamped against, which the caller just fetched via
+    ``origin_head_sha`` so it is locally reachable) — in a throwaway DETACHED
+    worktree, with NO push: the branch, the PR, and its CI stay untouched (vs
+    ``rebase_onto_base``, which force-pushes). Returns:
+
+    - ``("merged", path)``    — the worktree holds the merged tree; the CALLER runs
+      the gate there and must ``remove_worktree(repo, path)`` when done
+    - ``("conflict", files)`` — the merge hit conflicts (worktree removed; a real
+      conflict is the DIRTY/rebase edge's job, not a verdict)
+    - ``("error", msg)``      — an infra failure (fetch / worktree add / merge tooling)
+
+    DETACHED for the same reason as the rebase worktree: ``feat-<id>`` already has
+    the branch checked out, and a branch can't be checked out twice. The merge
+    commit is local scratch, so the committer identity is pinned inline (no reliance
+    on the target repo's git config). ``node_modules`` is linked in like
+    ``create_worktree`` so an npm/pnpm gate resolves deps instead of false-failing."""
+    rel = os.path.join(root, f".verify-{branch.replace('/', '-')}")
+    path = os.path.join(repo, rel)
+    await _git(repo, "worktree", "remove", "--force", rel)  # clear a stale leftover
+    rc, _o, err = await _git(repo, "fetch", "origin", branch, timeout=120)
+    if rc != 0:
+        return ("error", f"fetch failed: {err.strip()[:200]}")
+    rc, _o, err = await _git(repo, "worktree", "add", "--detach", "--force", rel, f"origin/{branch}", timeout=60)
+    if rc != 0:
+        return ("error", f"worktree add failed: {err.strip()[:200]}")
+    abspath = os.path.abspath(path)
+    await asyncio.to_thread(link_node_modules, repo, abspath)
+    rc, out, err = await _git(
+        abspath,
+        "-c",
+        "user.name=project-board",
+        "-c",
+        "user.email=project-board@localhost",
+        "merge",
+        "--no-edit",
+        base_sha,
+        timeout=180,
+    )
+    if rc != 0:
+        _rc, files, _e = await _git(abspath, "diff", "--name-only", "--diff-filter=U")
+        await _git(abspath, "merge", "--abort")
+        await _git(repo, "worktree", "remove", "--force", rel)
+        return ("conflict", files.strip() or (out or err).strip()[:300])
+    return ("merged", abspath)
+
+
 async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
     """The PR's unified diff, truncated — the prior attempt's actual work, carried
     into the next (escalated) re-dispatch's prompt so a stronger coder FIXES the

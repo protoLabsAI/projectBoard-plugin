@@ -144,6 +144,15 @@ LABEL_GENS_PREFIX = "gens:"
 # written post-promote), so the sha is the only piece that must ride the label; the full
 # {branch, sha, worktree} triple lands in a comment for the audit trail.
 LABEL_VERIFIED_PREFIX = "verified:"
+# In-review VERDICT currency (#131) — `merged-verified:<sha>`, replaced (never
+# accumulated) each time the merge-poll reconciler re-runs the gate against the
+# MERGED state (branch tip + current origin/<base>) after base moved under an
+# `in_review` PR. The sha is the origin/<base> commit the verdict was verified
+# against — the ONE field an adjudicator checks: label sha == current
+# origin/<base> ⇒ the gate ran on the state that will actually land; anything
+# else ⇒ the verdict is stale (unverified, not broken — staleness alone never
+# blocks; only a gate FAILURE on the merged state does).
+LABEL_MERGED_VERIFIED_PREFIX = "merged-verified:"
 # The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
 # metadata line in the bead `notes` field, beside the files_to_modify path lines.
 # NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
@@ -1312,6 +1321,22 @@ class BeadsBoard:
         args = ["update", fid]
         for label in stale:
             args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    # ── merged-state verify stamp (#131) ──────────────────────────────────────
+    def record_merged_verified(self, fid: str, sha: str) -> dict:
+        """Stamp the origin/<base> sha the in_review verdict was verified against
+        (#131) — a single, replaced `merged-verified:<sha>` label (the `gens:`
+        pattern), written by the merge-poll reconciler after the gate passed on
+        the MERGED state (branch tip + that base commit). Fire-and-forget like
+        record_gens_spent: a `br` hiccup here must never fail the reconcile (the
+        next poll just re-verifies)."""
+        f = self._require(fid)
+        args = ["update", fid]
+        for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_MERGED_VERIFIED_PREFIX)]:
+            args += ["--remove-label", stale]
+        args += ["--add-label", f"{LABEL_MERGED_VERIFIED_PREFIX}{sha}"]
         self._run(*args)
         return self.get_feature(fid)
 

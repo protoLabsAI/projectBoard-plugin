@@ -1700,6 +1700,223 @@ async def test_reconcile_prs_no_rebase_runs_ci(monkeypatch):
     assert ci == [1]  # nothing to rebase → CI reconcile runs
 
 
+# ── merged-state verify: re-verify the verdict when base moves (#131) ────────────
+
+
+class _VerifyStore(_CiStore):
+    def __init__(self, feature):
+        super().__init__(feature)
+        self.verified = []
+
+    def record_merged_verified(self, fid, sha):
+        self.verified.append((fid, sha))
+        return {"id": fid}
+
+
+def _vloop(**cfg):
+    base = {"coder": "proto", "local_gate_cmd": "pytest -q"}
+    base.update(cfg)
+    return BoardLoop(base)
+
+
+async def test_verify_merged_state_noop_without_a_gate(monkeypatch):
+    """No local_gate_cmd → nothing to verify the merged state WITH; never touches git."""
+    calls = []
+    monkeypatch.setattr(worktree, "origin_head_sha", lambda *a, **k: calls.append(1))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = BoardLoop({"coder": "proto"})  # no gate configured
+    assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    assert not calls and store.verified == [] and store.blocked == []
+
+
+async def test_verify_merged_state_current_stamp_is_noop(monkeypatch):
+    """Stamp == current origin/<base> → the verdict is current; no worktree, no gate run."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("abc123"))
+    built = []
+    monkeypatch.setattr(worktree, "merged_state_worktree", lambda *a, **k: built.append(1))
+    store = _VerifyStore({"id": "bd-1"})
+    feature = {"id": "bd-1", "labels": ["merged-verified:abc123"]}
+    assert await _vloop()._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert not built and store.verified == [] and store.blocked == []
+
+
+async def test_verify_merged_state_sha_read_failure_is_noop(monkeypatch):
+    """A git hiccup reading origin/<base> degrades to no-op — next poll retries."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret(""))
+    built = []
+    monkeypatch.setattr(worktree, "merged_state_worktree", lambda *a, **k: built.append(1))
+    store = _VerifyStore({"id": "bd-1"})
+    assert await _vloop()._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    assert not built and store.blocked == []
+
+
+async def test_verify_merged_state_base_moved_green_gate_stamps_and_stays(monkeypatch):
+    """Base moved + green gate on the merged state → stamp the sha, card STAYS in
+    review (non-blocking default), throwaway worktree removed."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("def456"))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/repo/.worktrees/.verify-feat-bd-1")))
+    removed = []
+
+    async def _remove(repo, wt, branch=""):
+        removed.append(wt)
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop()
+    gates = []
+
+    async def _gate(wt):
+        gates.append(wt)
+        return None  # green
+
+    monkeypatch.setattr(loop, "_run_local_gate", _gate)
+    feature = {"id": "bd-1", "labels": ["merged-verified:oldsha"]}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert gates == ["/repo/.worktrees/.verify-feat-bd-1"]
+    assert removed == gates  # throwaway removed even on success
+    assert store.verified == [("bd-1", "def456")]
+    assert store.requeued == [] and store.blocked == []
+
+
+async def test_verify_merged_state_red_gate_blocks(monkeypatch):
+    """A CLEAN gate FAILURE on the merged state is the ONLY blocking outcome — the
+    PR merges clean but the result is broken; the reason carries the gate output."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("def456"))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt")))
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    reaped = []
+
+    async def _reap(repo, root, fid):
+        reaped.append(fid)
+
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop()
+    monkeypatch.setattr(loop, "_run_local_gate", _aret("1 failed: test_x"))
+    assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is True
+    assert [b[0] for b in store.blocked] == ["bd-1"]
+    assert "merged state" in store.blocked[0][1] and "1 failed: test_x" in store.blocked[0][1]
+    assert store.verified == []  # a red verdict is never stamped current
+    assert reaped == ["bd-1"]
+
+
+async def test_verify_merged_state_budget_bounds_reverification(monkeypatch):
+    """rebase_fix_max bounds re-verification: a base that moves repeatedly stops
+    burning gate runs — the stale stamp stays visible, the card stays in review."""
+    shas = iter(["aaa", "bbb", "ccc"])
+
+    async def _sha(repo, ref):
+        return next(shas)
+
+    monkeypatch.setattr(worktree, "origin_head_sha", _sha)
+    built = []
+
+    async def _build(repo, branch, sha, root=".worktrees"):
+        built.append(sha)
+        return ("merged", "/wt")
+
+    monkeypatch.setattr(worktree, "merged_state_worktree", _build)
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(rebase_fix_max=1)
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))
+    # 1st move (no stamp yet) → verify + stamp against aaa.
+    assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
+    assert store.verified == [("bd-1", "aaa")]
+    # base moves again (bbb, then ccc) but the budget (1) is spent → no more gate
+    # runs, no block — the stale stamp is the adjudicator's signal.
+    feature = {"id": "bd-1", "labels": ["merged-verified:aaa"]}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert built == ["aaa"]
+    assert store.verified == [("bd-1", "aaa")] and store.blocked == []
+
+
+async def test_verify_merged_state_conflict_and_error_are_noops(monkeypatch):
+    """An infra error retries next poll; a merge conflict is the DIRTY/rebase edge's
+    job — neither blocks, stamps, nor burns the verify budget."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("abc"))
+    outcomes = iter([("error", "fetch failed"), ("conflict", "x.py"), ("merged", "/wt")])
+
+    async def _build(repo, branch, sha, root=".worktrees"):
+        return next(outcomes)
+
+    monkeypatch.setattr(worktree, "merged_state_worktree", _build)
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(rebase_fix_max=1)
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))
+    feature = {"id": "bd-1", "labels": []}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # error
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # conflict
+    assert store.verified == [] and store.blocked == []
+    # budget untouched → the third call actually verifies and stamps.
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert store.verified == [("bd-1", "abc")]
+
+
+async def test_reconcile_prs_verify_block_skips_ci(monkeypatch):
+    """The merged-state verify rides the OPEN branch after the rebase; when it
+    blocks (red gate on the merged state) the CI reconcile is skipped."""
+    store = _VerifyStore({"id": "bd-1", "pr_url": "https://e/pr/1", "labels": []})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = _vloop()
+    monkeypatch.setattr(loop, "_maybe_rebase", _aret(False))
+    monkeypatch.setattr(loop, "_verify_merged_state", _aret(True))
+    ci = []
+
+    async def _ci_spy(*a, **k):
+        ci.append(1)
+
+    monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+    await loop._reconcile_prs()
+    assert ci == []  # blocked on the merged state → CI reconcile skipped
+
+
+async def test_reconcile_prs_verify_green_still_runs_ci(monkeypatch):
+    """A verify that did NOT block (green gate, or nothing to do) leaves the rest
+    of the pass — the CI reconcile — untouched."""
+    store = _VerifyStore({"id": "bd-1", "pr_url": "https://e/pr/1", "labels": []})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = _vloop()
+    monkeypatch.setattr(loop, "_maybe_rebase", _aret(False))
+    monkeypatch.setattr(loop, "_verify_merged_state", _aret(False))
+    ci = []
+
+    async def _ci_spy(*a, **k):
+        ci.append(1)
+
+    monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+    await loop._reconcile_prs()
+    assert ci == [1]
+
+
+async def test_reconcile_prs_auto_rebase_off_skips_verify(monkeypatch):
+    """The verify extends the auto_rebase mechanism — the same flag gates it."""
+    store = _VerifyStore({"id": "bd-1", "pr_url": "https://e/pr/1", "labels": []})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = _vloop(auto_rebase=False, ci_poll=False)
+    called = []
+    monkeypatch.setattr(loop, "_verify_merged_state", lambda *a, **k: called.append(1))
+    await loop._reconcile_prs()
+    assert called == []
+
+
+async def test_reconcile_merged_clears_merged_verify_attempts(monkeypatch):
+    """The merged terminal edge drops the per-run verify counter with the rest."""
+    store = _ReconcileStore([{"id": "bd-m", "pr_url": "https://e/pr/1"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "pr_state", _aret("MERGED"))
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+    loop = BoardLoop({})
+    loop._merged_verify_attempts["bd-m"] = 2
+    await loop._reconcile_prs()
+    assert "bd-m" not in loop._merged_verify_attempts
+
+
 async def test_maybe_reconcile_is_rate_limited(monkeypatch):
     loop = BoardLoop({"merge_poll": True, "merge_poll_interval_s": 60})
     calls = []
