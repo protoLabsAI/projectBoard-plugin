@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: project-board
-Version: 0.37.0
-Summary: Board-driven coding-orchestration plugin for protoAgent (beads board + ACP spawn loop + planning layer + console view).
-Requires-Python: >=3.11
