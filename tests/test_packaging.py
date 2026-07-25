@@ -43,6 +43,17 @@ def test_manifest_and_pyproject_versions_agree():
     )
 
 
+def test_lockfile_version_agrees_with_manifest():
+    # uv.lock is the third version-bearing file — its project-board entry must move
+    # in lockstep with the manifest/pyproject on every bump, or the lock ships stale.
+    m = _manifest()
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+    board = next(p for p in lock["package"] if p["name"] == "project-board")
+    assert board["version"] == m["version"], (
+        "uv.lock project-board version drifted from the manifest — re-lock on every bump"
+    )
+
+
 def test_manifest_view_path_is_public_and_base_safe():
     view = _manifest()["views"][0]
     assert view["id"] == "board"
