@@ -25,7 +25,15 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 
 def register(registry) -> None:
-    cfg = registry.config or {}
+    # Resolve `project:` against the host's ADR 0095 registry BEFORE anything reads
+    # cfg — every consumer below (router, loop, tools) takes cfg from here, so this
+    # is the single place the two layers meet. Deliberately OUTSIDE the try/except
+    # blocks below: an unresolvable project name must abort registration rather than
+    # let the board start building in cwd (see projects.py). The host records the
+    # message on the plugin entry and skips us; boot is unaffected.
+    from .projects import resolve_project_cfg
+
+    cfg = resolve_project_cfg(registry.config or {})
 
     # Board HTTP API + console view, mounted as ONE router under the UNGATED prefix
     # /plugins/project_board (matching the sibling agent-browser/doom plugins, whose

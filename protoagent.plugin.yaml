@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.35.0
+version: 0.36.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -108,6 +108,17 @@ config:
                             # and the losers reaped (#21). Costs N× tokens — gate it to hard work;
                             # only a FROM-SCRATCH build fans out (a CI/goal-fix re-dispatch fixes
                             # the existing diff with one coder). Bound N × max_concurrent to the host.
+  project: ""               # OPTIONAL — a `name` from the host's managed-projects
+                            # registry (ADR 0095, protoAgent 0.115.0+). Set it and the
+                            # board takes that project's `path` as `repo` and its
+                            # `default_branch` as `base_branch`, so a project is
+                            # declared once instead of repeated here. `repo` /
+                            # `base_branch` set to anything OTHER than the defaults
+                            # below still win. A name the registry doesn't have is
+                            # FATAL (the plugin refuses to load, with the reason on its
+                            # entry) — the board creates worktrees, branches and PRs,
+                            # so it must never silently fall back to repo "." and build
+                            # in the server's cwd.
   repo: "."                 # repo the coders work in (worktrees branch off it)
   base_branch: main         # base branch worktrees/PRs target
   worktrees_root: .worktrees
