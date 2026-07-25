@@ -46,6 +46,7 @@ from . import coder_seam, config, worktree
 from .failures import classify
 from .store import (
     LABEL_CHANGES_REQUESTED,
+    LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_PENDING,
     BoardError,
     _all_items_disposed,
@@ -459,7 +460,10 @@ class BoardLoop:
         # same files). On BEHIND (stale, no conflict) a clean rebase + force-push fixes
         # it with NO coder; on DIRTY (a real conflict) the rebase aborts and the coder
         # is re-dispatched to re-resolve, bounded by rebase_fix_max. Rides the
-        # merge-poll cadence; defaults to merge_poll's value.
+        # merge-poll cadence; defaults to merge_poll's value. The same flag also
+        # gates the merged-state VERIFY (#131): a CLEAN PR whose base moved gets the
+        # gate re-run against the merged state (no push) and the sha stamped as
+        # `merged-verified:<sha>` — bounded by the same rebase_fix_max budget.
         self.auto_rebase = bool(self.cfg.get("auto_rebase", self.merge_poll))
         self.rebase_fix_max = max(0, int(self.cfg.get("rebase_fix_max", 1)))
         # Pre-PR goal-verify gap: a rejected diff (e.g. missing tests) is fixable by
@@ -619,6 +623,10 @@ class BoardLoop:
         # Rebase-conflict re-dispatches so far (fid → count) when a sibling merge
         # leaves a PR with a real (non-clean) conflict against base.
         self._rebase_attempts: dict[str, int] = {}
+        # Merged-state verifications run so far (fid → count, #131) — the verdict
+        # half of the rebase edge, bounded by the same rebase_fix_max budget so a
+        # base that moves repeatedly doesn't burn a gate run every poll forever.
+        self._merged_verify_attempts: dict[str, int] = {}
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
@@ -986,6 +994,7 @@ class BoardLoop:
                         self._ci_feedback.pop(fid, None)
                         self._ci_fix_attempts.pop(fid, None)
                         self._rebase_attempts.pop(fid, None)
+                        self._merged_verify_attempts.pop(fid, None)
                         self._review_fix_attempts.pop(fid, None)
                         self._review_run_failures.pop(fid, None)
                         self._review_prior.pop(fid, None)
@@ -1005,6 +1014,7 @@ class BoardLoop:
                     self._ci_feedback.pop(fid, None)
                     self._ci_fix_attempts.pop(fid, None)
                     self._rebase_attempts.pop(fid, None)
+                    self._merged_verify_attempts.pop(fid, None)
                     self._review_fix_attempts.pop(fid, None)
                     self._review_run_failures.pop(fid, None)
                     self._review_prior.pop(fid, None)
@@ -1016,6 +1026,13 @@ class BoardLoop:
                     # would just be thrown away.
                     if self.auto_rebase and await self._maybe_rebase(store, f, pr_url, repo):
                         continue
+                    # The VERDICT half of the rebase edge (#131): a sibling merge
+                    # moved base under this still-CLEAN PR (no conflict, so the
+                    # rebase above left it alone) — the state that will actually
+                    # LAND was never gated. Re-run the gate on the merged state
+                    # (no push) and stamp the sha; only a red gate blocks.
+                    if self.auto_rebase and await self._verify_merged_state(store, f, pr_url, repo):
+                        continue  # blocked on a red merged-state gate → nothing further this pass
                     if self.ci_poll:
                         await self._reconcile_ci(store, fid, pr_url, repo)
                     # The merge-edge half of the review gate (M5): an in_review PR still
@@ -1079,6 +1096,93 @@ class BoardLoop:
             mss,
             detail,
         )
+        return True
+
+    async def _verify_merged_state(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """Re-verify an ``in_review`` PR's VERDICT after its base moved (#131).
+
+        The rebase above only acts on BEHIND/DIRTY — but without strict base-freshness
+        a PR whose base advanced still reads CLEAN, merges clean, and nobody ever ran
+        the gate on the state that will actually land (five straight PRs, verified by
+        hand). So when current ``origin/<base>`` ≠ the ``merged-verified:<sha>`` stamp
+        on the bead (a missing stamp counts as moved — the first poll verifies and
+        stamps), build the merged state (branch tip + that base commit) in a throwaway
+        worktree, run ``local_gate_cmd`` there, and stamp the base sha the verdict was
+        verified against — the ONE field an adjudicator checks for verdict currency.
+        Same principle as the completion gate (#113): verify the property, don't trust
+        the report.
+
+        NON-BLOCKING by default: a moved base is unverified, not broken. A green gate
+        (or one that can't run — the ``_run_local_gate`` fail-open contract; CI is
+        still the real gate) just refreshes the stamp and the card stays in review;
+        only a CLEAN gate FAILURE on the merged state blocks. Bounded by
+        ``rebase_fix_max`` (the rebase edge's budget): once spent, re-verification
+        stops and the stale stamp stays visible to the adjudicator rather than the
+        loop burning a gate run every poll forever. A merge conflict is the
+        DIRTY/rebase edge's job and an infra error retries next poll — neither burns
+        budget nor stamps. Returns True only when it BLOCKED the card (the caller
+        skips the rest of this pass)."""
+        fid = feature["id"]
+        if not self.local_gate_cmd:
+            return False  # no gate → nothing to verify the merged state WITH
+        base = feature.get("base_branch") or self._store_kw.get("base_branch") or "main"
+        base_sha = await worktree.origin_head_sha(repo, base)
+        if not base_sha:
+            return False  # transient git/infra hiccup — next poll retries
+        stamped = next(
+            (
+                l[len(LABEL_MERGED_VERIFIED_PREFIX) :]
+                for l in feature.get("labels") or []
+                if l.startswith(LABEL_MERGED_VERIFIED_PREFIX)
+            ),
+            "",
+        )
+        if stamped == base_sha:
+            return False  # the verdict is current — base hasn't moved since it was stamped
+        n = self._merged_verify_attempts.get(fid, 0)
+        if n >= self.rebase_fix_max:
+            if n == self.rebase_fix_max:  # log the exhaustion once, then stay quiet
+                self._merged_verify_attempts[fid] = n + 1
+                log.info(
+                    "[project_board] %s base moved again but the merged-verify budget (%d) is spent — "
+                    "leaving the stale merged-verified stamp for the adjudicator: %s",
+                    fid,
+                    self.rebase_fix_max,
+                    pr_url,
+                )
+            return False
+        outcome, detail = await worktree.merged_state_worktree(repo, f"feat/{fid}", base_sha, root=self.root)
+        if outcome == "error":
+            log.warning("[project_board] %s merged-state verify hit infra trouble — next poll retries: %s", fid, detail)
+            return False
+        if outcome == "conflict":
+            # A real conflict is the DIRTY/rebase edge's job (pr_merge_state reads
+            # DIRTY once GitHub recomputes) — not a verdict, not a reason to block.
+            log.info(
+                "[project_board] %s merged-state verify: merge conflicts (%s) — leaving to the rebase edge", fid, detail
+            )
+            return False
+        self._merged_verify_attempts[fid] = n + 1
+        try:
+            failure = await self._run_local_gate(detail)
+        finally:
+            await worktree.remove_worktree(repo, detail)
+        if failure is None:
+            store.record_merged_verified(fid, base_sha)
+            log.info(
+                "[project_board] %s merged-state gate green — verdict re-verified against %s@%s",
+                fid,
+                base,
+                base_sha[:12],
+            )
+            return False
+        store.flag_blocked(
+            fid,
+            f"gate FAILED on the merged state (branch + {base}@{base_sha[:12]}) — the PR merges clean "
+            f"but the RESULT is broken; needs triage: {pr_url}\n{failure}",
+        )
+        await worktree.reap_feature_worktree(repo, self.root, fid)
+        log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, base_sha[:12])
         return True
 
     async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
