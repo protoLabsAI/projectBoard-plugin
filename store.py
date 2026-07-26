@@ -91,6 +91,28 @@ def _contention_in_json(out) -> str:
     return ""
 
 
+def _issues_envelope(parsed):
+    """Normalize `br --json` across the two envelope shapes beads has shipped (#138).
+
+    beads 0.1.x returns a BARE list for `br list`/`br ready` (``[]`` / ``[{…}, …]``) and a
+    single-element list for `br show`. beads 0.2.x (≥0.2.16) wraps list payloads in an
+    envelope — ``{"issues": [...], "total": N, "has_more": bool, …}``. Every call site here
+    consumes the *list* (or a bare `br show` bead dict), so unwrap the envelope to its
+    ``issues`` list and pass everything else through untouched::
+
+        [ … ]                → [ … ]        (0.1.x list, unchanged)
+        {"issues": [ … ], …} → [ … ]        (0.2.x envelope, unwrapped)
+        {"id": "bd-1", …}    → {"id": …}    (bare `br show` bead, unchanged — no "issues" key)
+        None                 → None
+
+    Non-breaking in BOTH directions: neither a br upgrade nor a downgrade needs a code
+    change, so the move stays reversible (the whole point — #138 was rolled back live in
+    ~30s when the raw envelope reached iterators that expected a list)."""
+    if isinstance(parsed, dict) and "issues" in parsed:
+        return parsed["issues"]
+    return parsed
+
+
 # Labels that encode board state / escalation (everything else is free-form).
 LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
@@ -415,6 +437,10 @@ class BeadsBoard:
         self.repo = repo
         self.base_branch = base_branch
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
+        # has_more off the last want_json `_run` (#138): the 0.2.x envelope carries it,
+        # 0.1.x doesn't → None means "shape absent, trust --limit 0". Read right after the
+        # `_run` that set it, before any other want_json call overwrites it.
+        self._last_json_has_more = None
 
     # ── workspace pin (ADR 0055 P0, #48) ──────────────────────────────────────
     def _ensure_workspace(self) -> None:
@@ -507,9 +533,15 @@ class BeadsBoard:
         # `br` prefixes some JSON with INFO log lines on stderr; stdout is clean JSON.
         out = proc.stdout.strip()
         try:
-            return json.loads(out) if out else None
+            parsed = json.loads(out) if out else None
         except json.JSONDecodeError as exc:
             raise BoardError(f"`br {args[0]}` returned non-JSON: {exc} :: {out[:200]}")
+        # #138: br 0.2.x wraps list payloads in an envelope ({"issues":[…],"has_more":…})
+        # where 0.1.x returned a bare list. Stash has_more off the envelope (None when the
+        # shape is absent, so a truncation check guards on SHAPE, never a version sniff),
+        # then normalize the payload to the list/dict every call site already consumes.
+        self._last_json_has_more = parsed["has_more"] if isinstance(parsed, dict) and "has_more" in parsed else None
+        return _issues_envelope(parsed)
 
     def _create(
         self,
@@ -1425,6 +1457,18 @@ class BeadsBoard:
             )
             or []
         )
+        # #138/#114: on br 0.2.x the envelope reports has_more — turn `--limit 0` = unbounded
+        # from an ASSUMPTION into an assertion. A `--limit 0` page that still reports more rows
+        # means the exhaustiveness invariant is broken and this projection would be silently
+        # truncated (every consumer reads it as the whole board); fail loud instead of guessing.
+        # Guarded on has_more SHAPE presence — None on 0.1.x, where `--limit 0` stays trusted —
+        # not a version sniff. Checked BEFORE ready_queue() below, whose own _run overwrites it.
+        if self._last_json_has_more:
+            raise BoardError(
+                "`br list --limit 0` reported has_more=true — the unbounded feature query was "
+                "truncated, so the board projection would be incomplete (#114/#138). Check the "
+                "installed beads version's `--limit 0` semantics before trusting the board."
+            )
         out = [self._project(r) for r in rows]
         if not include_archived:
             out = [f for f in out if not f["archived"]]
