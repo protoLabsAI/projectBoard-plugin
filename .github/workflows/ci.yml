@@ -13,6 +13,31 @@ on:
 jobs:
   test:
     runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    name: test (br ${{ matrix.br_version }})
+    # #138: `br` 0.2.16 changed the --json payload shape ([] → {"issues":[…]}). The seam
+    # normalizes both, so the shape contract must hold on BOTH versions — run the real-br
+    # integration tier across a version matrix instead of a single pinned binary.
+    #   0.1.23 (the version we run locally + pin to): the FULL suite gates here, including
+    #          the tests that pin 0.1.x-SPECIFIC quirks (br ready omitting labels, the
+    #          50-char label cap, contention-as-JSON-on-zero-exit).
+    #   0.2.16: only `-m br_shape` — the version-agnostic --json SHAPE contract. The
+    #          0.1.x-quirk pins would rightly disagree with 0.2.16; running them here would
+    #          test beads, not the plugin's shape handling (see tests/test_integration.py).
+    # An upgrade lands deliberately by moving a pin (URL + sha256) alongside the code,
+    # never via "latest". Each sha256 is from the release's published checksums.sha256.
+    # fail-fast off so a red on one version still reports the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - br_version: "0.1.23"
+            br_asset: "br-v0.1.23-linux_amd64.tar.gz" # 0.1.x assets carry the `v` prefix
+            br_sha256: "2f0d70865eba171e845a4f616151893def534ad83e0b0bc8e216a827f1f9f6dc"
+            pytest_args: "" # full suite
+          - br_version: "0.2.16"
+            br_asset: "br-0.2.16-linux_amd64.tar.gz" # 0.2.x assets dropped the `v` prefix
+            br_sha256: "9ee22d340b56dacfb20460d8e4b2a0065fb66f161910472285d55f51e04512b0"
+            pytest_args: "-m br_shape" # only the version-agnostic --json shape contract
     steps:
       - uses: actions/checkout@v4
 
@@ -27,17 +52,15 @@ jobs:
         # files (main carried this mismatch). Pin both sides to keep them in step.
         run: pip install -r requirements-dev.txt ruff==0.15.10
 
-      - name: Install beads (br) — pinned prebuilt release binary
-        # The real-br integration tier (tests/test_integration.py, #136) shells the
-        # ACTUAL `br`. Pinned to v0.1.23 — the version we run locally: `br` upgrades
-        # change behavior the plugin consumes (#138: 0.2.16 changed the --json payload
-        # shape from [] to {"issues":[…]}), so an upgrade lands deliberately by moving
-        # this pin (URL + sha256) alongside the code, never via "latest". A prebuilt
-        # release asset — download + untar, no Rust toolchain in CI.
+      - name: Install beads (br ${{ matrix.br_version }}) — pinned prebuilt release binary
+        # The real-br integration tier (tests/test_integration.py, #136) shells the ACTUAL
+        # `br`. A prebuilt release asset — download + untar, no Rust toolchain in CI. The
+        # asset name differs by version (0.1.x has a `v` prefix, 0.2.x doesn't), so it rides
+        # the matrix; the sha256 pins the exact bytes (from the release's checksums.sha256).
         run: |
           curl -fsSL -o /tmp/br.tar.gz \
-            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.1.23/br-v0.1.23-linux_amd64.tar.gz
-          echo "2f0d70865eba171e845a4f616151893def534ad83e0b0bc8e216a827f1f9f6dc  /tmp/br.tar.gz" | sha256sum -c -
+            "https://github.com/Dicklesworthstone/beads_rust/releases/download/v${{ matrix.br_version }}/${{ matrix.br_asset }}"
+          echo "${{ matrix.br_sha256 }}  /tmp/br.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/br.tar.gz -C "$HOME/.local/bin" br
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -48,8 +71,9 @@ jobs:
 
       - name: Test
         # PB_REQUIRE_BR turns an absent `br` into a FAILURE (the guard test in
-        # tests/test_integration.py) instead of a silent skip of the integration
-        # tier — a silent skip is a fake with extra ceremony (#136).
+        # tests/test_integration.py, itself @br_shape so it runs on BOTH legs) instead of a
+        # silent skip of the integration tier — a silent skip is a fake with extra ceremony
+        # (#136). `pytest_args` is empty on 0.1.23 (full suite) and `-m br_shape` on 0.2.16.
         env:
           PB_REQUIRE_BR: "1"
-        run: pytest -q
+        run: pytest -q ${{ matrix.pytest_args }}

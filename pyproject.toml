@@ -12,6 +12,12 @@ requires-python = ">=3.11"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    # #138: the `br --json` SHAPE contract — tests that must hold on BOTH br 0.1.x
+    # (bare list) and 0.2.x (envelope). The CI matrix runs `-m br_shape` on the 0.2.16
+    # leg; the 0.1.23 leg runs the whole suite (these plus the 0.1.x-quirk pins).
+    "br_shape: real-br test that asserts the version-agnostic --json shape contract (#138)",
+]
 
 [tool.ruff]
 line-length = 120

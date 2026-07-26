@@ -2026,3 +2026,83 @@ def test_board_list_failing_only_honors_an_explicit_state(monkeypatch):
     out = json.loads(_list_tool().invoke({"failing_only": True, "state": "in_progress"}))
     assert fake.listed == ("in_progress", False)
     assert [r["id"] for r in out] == ["bd-wip"]
+
+
+# ── #138: `br --json` envelope normalization at the `_run` choke point ────────────
+#
+# These fake `subprocess.run` (not `_run`) so the REAL seam parses + normalizes — the
+# exact code path both br versions hit. A `db=` board makes `_ensure_workspace` a noop
+# (test_ensure_workspace_noop_with_explicit_db), so no `br init` shells.
+
+
+def _json_board(monkeypatch, stdout):
+    """A board whose `br` calls all return `stdout` (canned JSON) on a zero exit."""
+    b = _board(monkeypatch, db="/x/.beads/beads.db")
+    monkeypatch.setattr(
+        store.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    )
+    return b
+
+
+# The 0.1.x bare list, the 0.2.x envelope, a bare `br show` bead (no "issues" key), empty.
+# RED-IS-REACHABLE (r5): collapse `_issues_envelope` to `return parsed["issues"]` and the
+# bare-list/bare-dict/None cases below throw or mismatch; collapse it to `return parsed`
+# and the two envelope cases keep the dict instead of the list. Handling ONE shape fails
+# the OTHER — the same signal the br_shape CI matrix surfaces across the two real binaries.
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ("[]", []),  # 0.1.x: bare empty list
+        ('[{"id": "bd-1"}, {"id": "bd-2"}]', [{"id": "bd-1"}, {"id": "bd-2"}]),  # 0.1.x: bare list
+        ('{"issues": [], "total": 0, "limit": 0, "offset": 0, "has_more": false}', []),  # 0.2.x: empty envelope
+        ('{"issues": [{"id": "bd-1"}], "total": 1, "has_more": false}', [{"id": "bd-1"}]),  # 0.2.x: envelope
+        ('{"id": "bd-1", "status": "open", "labels": []}', {"id": "bd-1", "status": "open", "labels": []}),  # br show
+        ("", None),  # no output
+    ],
+)
+def test_run_normalizes_both_json_envelope_shapes(monkeypatch, payload, expected):
+    assert _json_board(monkeypatch, payload)._run("list", want_json=True) == expected
+
+
+def test_issues_envelope_helper_is_non_breaking_in_both_directions():
+    """The pure normalizer, direct: a bare list survives untouched (downgrade path), an
+    envelope unwraps to its issues (upgrade path), and a bare `br show` bead dict — which
+    has no `issues` key — passes through so the `rows[0] if isinstance(rows, list) else rows`
+    call sites still take their `else` branch."""
+    assert store._issues_envelope([]) == []
+    assert store._issues_envelope([{"id": "bd-1"}]) == [{"id": "bd-1"}]
+    assert store._issues_envelope({"issues": [{"id": "bd-1"}], "has_more": False}) == [{"id": "bd-1"}]
+    assert store._issues_envelope({"id": "bd-1", "status": "open"}) == {"id": "bd-1", "status": "open"}
+    assert store._issues_envelope(None) is None
+
+
+def test_run_stashes_has_more_only_when_the_envelope_carries_it(monkeypatch):
+    """`_last_json_has_more` is the truncation signal, guarded on SHAPE presence: a bool
+    off the 0.2.x envelope, None whenever the `has_more` key is absent (0.1.x bare list,
+    or a bare `br show` bead) — so a check on it can never be a version sniff."""
+    b = _json_board(monkeypatch, '{"issues": [], "total": 99, "has_more": true}')
+    b._run("list", want_json=True)
+    assert b._last_json_has_more is True
+    monkeypatch.setattr(  # a later 0.1.x-shaped call clears it back to None
+        store.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    )
+    b._run("list", want_json=True)
+    assert b._last_json_has_more is None
+
+
+def test_list_features_raises_when_unbounded_query_reports_truncation(monkeypatch):
+    """#114/#138: a `--limit 0` page that STILL reports has_more=true means the query was
+    truncated and the projection would be silently incomplete — list_features fails loud.
+    The raise fires on the first `_run` (the list query), before ready_queue()."""
+    envelope = '{"issues": [{"id": "bd-1", "issue_type": "feature", "status": "open", "labels": []}], "has_more": true}'
+    b = _json_board(monkeypatch, envelope)
+    with pytest.raises(BoardError, match="has_more=true"):
+        b.list_features()
+
+
+def test_list_features_trusts_limit_zero_when_no_has_more_shape(monkeypatch):
+    """The 0.1.x fallback: no envelope → `_last_json_has_more` stays None → the truncation
+    guard never fires and `--limit 0` is trusted exactly as before (non-breaking downgrade)."""
+    b = _json_board(monkeypatch, "[]")  # every br call returns a bare empty list
+    assert b.list_features() == []
+    assert b._last_json_has_more is None

@@ -13,9 +13,16 @@ tier (623 tests, every ``_run`` a mock) is structurally blind to:
 
 The pattern is #137's ``test_verify_merged_state_stamp_lands_through_real_br``: a
 real ``BeadsBoard`` over ``tmp_path`` (``_ensure_workspace`` runs the real ``br
-init``), ``skipif`` when the binary is absent. CI installs the PINNED v0.1.23
-release binary and sets ``PB_REQUIRE_BR=1``, which turns an absent `br` into a
-FAILURE via the guard test below — a silent skip is a fake with extra ceremony.
+init``), ``skipif`` when the binary is absent. CI installs a PINNED release binary
+and sets ``PB_REQUIRE_BR=1``, which turns an absent `br` into a FAILURE via the
+guard test below — a silent skip is a fake with extra ceremony.
+
+#138 MATRIX (see .github/workflows/ci.yml): the tests that assert the version-agnostic
+``--json`` SHAPE contract carry ``@pytest.mark.br_shape`` and run against BOTH br 0.1.23
+(bare list) and 0.2.16 (envelope). The 0.2.16 leg runs ONLY ``-m br_shape`` — the rest of
+this tier pins 0.1.x-SPECIFIC quirks (``br ready --json`` omitting ``labels``, the 50-char
+label cap, contention reported as JSON on a zero exit) whose whole value is that they're
+version-specific; running them on 0.2.16 would test beads, not the plugin's shape handling.
 """
 
 from __future__ import annotations
@@ -49,6 +56,8 @@ requires_br = pytest.mark.skipif(
 )
 
 
+@pytest.mark.br_shape  # runs on BOTH matrix legs — the 0.2.16 leg is `-m br_shape`, so
+# without this the whole leg could silently skip a broken `br` install (#136's failure mode)
 def test_integration_tier_cannot_silently_skip_in_ci():
     """The skip guard (#136) — deliberately NOT under ``requires_br``: when CI says
     `br` must be present (PB_REQUIRE_BR=1, set right after the pinned install step),
@@ -157,19 +166,24 @@ def test_escalation_cost_and_difficulty_labels_land_at_realistic_values(board):
 
 
 @requires_br
+@pytest.mark.br_shape
 def test_json_shape_show_for_get_feature(board):
-    """`br show --json` (get_feature) returns a LIST wrapping the bead dict on
-    0.1.23 — the shape `rows[0] if isinstance(rows, list) else rows` consumes.
-    #138's 0.2.16 wrapped payloads in {"issues":[…]}, which this asserts against."""
+    """`br show --json` (get_feature) → the bead dict the `rows[0] if isinstance(rows,
+    list) else rows` sites consume: a single-element LIST on 0.1.23, and — through the
+    #138 seam — either an unwrapped ``{"issues":[…]}`` list or a bare object on 0.2.16.
+    The consume-pattern collapses all three to the bead, which get_feature projects. The
+    assertion is on that PROJECTABLE bead (version-agnostic), not the raw list-ness of a
+    single-object `show`, which 0.2.16 may legitimately return unwrapped."""
     f = board.create_feature("Show me", spec="the spec")
     rows = board._run("show", f["id"], want_json=True)
-    assert isinstance(rows, list) and rows, f"br show --json shape changed: {type(rows).__name__}"
-    assert isinstance(rows[0], dict) and rows[0]["id"] == f["id"]
+    bead = rows[0] if isinstance(rows, list) else rows  # exactly what the three call sites do
+    assert isinstance(bead, dict) and bead["id"] == f["id"], f"br show --json shape changed: {type(rows).__name__}"
     got = board.get_feature(f["id"])  # and the projection consumes it end-to-end
     assert got["id"] == f["id"] and got["spec"] == "the spec" and got["board_state"] == "backlog"
 
 
 @requires_br
+@pytest.mark.br_shape
 def test_json_shape_list_for_list_features(board):
     """`br list --type feature --status … --limit 0 --json` (list_features) must be
     a bare LIST — the call site does `or []` then iterates rows outright."""
@@ -183,6 +197,7 @@ def test_json_shape_list_for_list_features(board):
 
 
 @requires_br
+@pytest.mark.br_shape
 def test_json_shape_ready_for_claim_next_ready(board, tmp_path):
     """`br ready --label ready --limit 0 --json` (claim_next_ready) must be a bare
     LIST of dicts carrying `id` + `issue_type` — the site iterates and filters on
@@ -198,11 +213,13 @@ def test_json_shape_ready_for_claim_next_ready(board, tmp_path):
     assert [i["id"] for i in claimed["requirements"]] == ["r1"]
 
 
-@requires_br
+@requires_br  # NOT @br_shape: asserts the 0.1.x `comments`-field STRUCTURE, so 0.1.23-pinned
 def test_json_shape_show_for_raw_features_with_comments(board):
     """`br show --json` re-fetch in raw_features_with_comments: the RAW bead must
     carry the `comments` list (`br list` omits it — the whole reason the re-fetch
-    exists), each with the `text` the retro mines."""
+    exists), each with the `text` the retro mines. This pins a beads-INTERNAL field
+    layout (not the top-level envelope #138 fixed), so it stays on the 0.1.23 leg
+    rather than asserting 0.2.16's unverified comments schema."""
     f = board.create_feature("Blocked one", spec="s")
     board.flag_blocked(f["id"], "waiting on upstream: see #99 — contention")
     raw = board.raw_features_with_comments(states=("blocked",))
@@ -212,13 +229,15 @@ def test_json_shape_show_for_raw_features_with_comments(board):
     assert any("waiting on upstream: see #99 — contention" in c.get("text", "") for c in comments)
 
 
-@requires_br
+@requires_br  # deliberately NOT @br_shape: a 0.1.x quirk, so it runs only on the 0.1.23 leg
 def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path):
     """`br ready --json` (ready_queue) on 0.1.23 OMITS the `labels` field — the
     documented quirk the per-row `get_feature` re-fetch works around (without it
     every candidate projects as `backlog` and the puller silently never claims).
     If an upgrade starts carrying labels here, this failing is the signal the
-    workaround is droppable — exactly the class #138 needed surfaced."""
+    workaround is droppable — exactly the class #138 needed surfaced. This asserts a
+    version-SPECIFIC absence, so it is intentionally excluded from the br_shape
+    matrix (the 0.2.16 leg would rightly disagree); it stays on the 0.1.23 pin."""
     f = _ready_feature(board, tmp_path)
     rows = board._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True)
     assert isinstance(rows, list) and rows
@@ -228,11 +247,13 @@ def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path):
     assert queue[0]["board_state"] == "ready"  # the re-fetch restored the labels
 
 
-@requires_br
+@requires_br  # NOT @br_shape: asserts the 0.1.x `dependencies`-field STRUCTURE, so 0.1.23-pinned
 def test_json_shape_show_for_open_blockers(board):
     """`br show --json` (_open_blockers) — the `dependencies` entries must carry
     `id`/`status`/`dependency_type`, the three keys the filter reads. A closed
-    blocker stops gating (the merge-gate semantics ride exactly this shape)."""
+    blocker stops gating (the merge-gate semantics ride exactly this shape). Like the
+    comments test above, this pins a beads-INTERNAL field layout rather than the #138
+    envelope, so it stays on the 0.1.23 leg (0.2.16's dep schema is unverified here)."""
     blocker = board.create_feature("Foundation", spec="s")
     dependent = board.create_feature("Dependent", spec="s")
     board.add_dependency(dependent["id"], blocker["id"])
@@ -249,6 +270,7 @@ def test_json_shape_show_for_open_blockers(board):
 
 
 @requires_br
+@pytest.mark.br_shape
 def test_json_shape_list_for_find_by_external_ref_and_record_merge(board, tmp_path):
     """`br list --limit 0 --json` (_find_by_external_ref) must be a bare LIST whose
     rows carry `external_ref` — the field the merge webhook scans for the PR url.
@@ -312,19 +334,44 @@ def test_cancel_rollback_restores_pre_cancel_state_through_real_br(board, tmp_pa
 
 
 @requires_br
+@pytest.mark.br_shape
 def test_limit_zero_is_unbounded_and_a_cap_truncates(board):
     """`--limit 0` is beads' documented unlimited sentinel and a positive limit
     REALLY truncates — the pair of facts the exhaustiveness invariant rests on
     (list_features / ready_queue / _find_by_external_ref all pass `--limit 0`;
     the state filter runs in Python AFTER, so a silent cap would corrupt every
-    consumer). On 0.1.23 truncation is silent (no `has_more` marker — that's a
-    0.2.x addition, out of scope for this pin)."""
+    consumer). Both hold on 0.1.23 AND 0.2.16 (the seam normalizes the envelope to
+    a list either way), so this is a br_shape test. Truncation *detection* rides
+    `has_more` — see the dedicated test below; here `--limit 0` must never trip it."""
     fids = {board.create_feature(f"feat {i}", spec="s")["id"] for i in range(3)}
     capped = board._run("list", "--limit", "1", want_json=True)
     assert isinstance(capped, list) and len(capped) == 1  # a cap really truncates
     unbounded = board._run("list", "--limit", "0", want_json=True)
     assert {r["id"] for r in unbounded} >= fids  # limit 0 returns everything
     assert {feat["id"] for feat in board.list_features()} == fids
+
+
+@requires_br
+@pytest.mark.br_shape
+def test_has_more_rides_the_0_2_envelope_and_unbounded_never_truncates(board):
+    """`has_more` (#138): the 0.2.x envelope carries it, 0.1.x has no envelope at all,
+    so `_run` stashes it as a bool on 0.2.16 and as None on 0.1.23 — the SHAPE-presence
+    signal `list_features` guards truncation on (never a version sniff). A real cap with
+    rows to spare reports more on 0.2.16 (True) / nothing on 0.1.23 (None); the unbounded
+    `--limit 0` the projection actually issues must report has_more=false on 0.2.16 (never
+    None-vs-True ambiguity → no BoardError) and None on 0.1.23. Either way list_features
+    returns the whole board without raising — the assertion the exhaustiveness invariant
+    now IS, rather than merely assumes."""
+    fids = {board.create_feature(f"feat {i}", spec="s")["id"] for i in range(3)}
+    board._run("list", "--limit", "1", want_json=True)  # a real cap, 2 rows to spare
+    assert board._last_json_has_more in (True, None), (
+        "a capped query with rows to spare must report has_more=true on the 0.2.x "
+        f"envelope (None on 0.1.x, no envelope) — got {board._last_json_has_more!r}"
+    )
+    board._run("list", "--limit", "0", want_json=True)  # the unbounded query the projection uses
+    assert board._last_json_has_more in (False, None)  # never True → the truncation guard stays quiet
+    feats = board.list_features()  # so the projection completes without a BoardError…
+    assert {f["id"] for f in feats} == fids  # …and really is the whole board
 
 
 # ── create-plus-enrich as a unit (#85/#116): the two-write seam, incl. partial write ──
