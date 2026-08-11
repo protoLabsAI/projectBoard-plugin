@@ -606,6 +606,7 @@ class BoardLoop:
         )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._shutting_down: bool = False
         # The running drive tasks, and the worktrees they hold (fid → (repo, wt,
         # branch)) so shutdown can reap any a cancel mid-drive would orphan; the coder
         # subprocess itself is reaped by dispatch_coder's finally.
@@ -678,6 +679,7 @@ class BoardLoop:
         return self._task
 
     async def stop(self):
+        self._shutting_down = True
         self._stop.set()
         if self._task:
             self._task.cancel()
@@ -868,7 +870,7 @@ class BoardLoop:
         except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
             log.exception("[project_board] crash recovery failed")
         log.info("[project_board] recovery done — entering tick loop")
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._shutting_down:
             spawned = False
             try:
                 await self._maybe_reconcile()
@@ -1561,6 +1563,10 @@ class BoardLoop:
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
+                    if self._shutting_down:
+                        log.info("[project_board] %s dispatch aborted by shutdown — no escalation", fid)
+                        self._inflight.pop(fid, None)
+                        return
                     policy = classify(str(exc))
                     # A capability failure = the coder didn't deliver (no diff / dispatch
                     # error / timed out). Those are NOT transient-retried (re-running the
@@ -2005,6 +2011,11 @@ class BoardLoop:
                 "HOLDING all work until the environment is fixed:\n%s",
                 self._preflight_state,
             )
+        except asyncio.CancelledError:
+            if self._shutting_down:
+                log.info("[project_board] preflight cancelled by shutdown — no verdict")
+                return
+            raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
             self._preflight_state = f"gate command could not run: {exc}"
             log.error("[project_board] PREFLIGHT FAILED — %s; HOLDING all work until fixed.", self._preflight_state)

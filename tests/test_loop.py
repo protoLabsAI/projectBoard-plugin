@@ -3376,3 +3376,76 @@ async def test_drive_without_a_ledger_never_touches_set_requirements(monkeypatch
     _loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no ledger
     assert "set_requirements" not in store.names()
     assert ("open_review", "bd-1", "https://example/pr/4") in store.calls
+
+
+# ── shutdown-aware dispatch guards (#149) ──────────────────────────────────────
+
+
+async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
+    """A dispatch killed during host shutdown must NOT escalate and must NOT write a
+    tier label or block the feature (r1/r3/r4/r5). The feature stays in_progress so
+    boot recovery (_recover → _reconcile_orphan) handles it on the next start."""
+
+    class _EscStore(FakeLoopStore):
+        def __init__(self):
+            super().__init__()
+            self.escalated = []
+
+        def escalate(self, fid, reason):
+            self.escalated.append((fid, reason))
+            return "smart"  # would climb a tier without the shutdown guard
+
+    store = _EscStore()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        raise worktree.CoderTimeout("coder killed during shutdown")
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise AssertionError("open_pr must not be reached when shutting down")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    # Escalation is ON (two distinct coders) so without the guard this would escalate.
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    assert loop.escalation_on
+    loop._shutting_down = True  # simulate shutdown in progress
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    await loop._drive(FEATURE)
+
+    assert store.escalated == []  # no tier escalation (no tier label written)
+    assert "flag_blocked" not in store.names()  # feature stays in_progress
+    assert loop._inflight == {}  # cleanup still runs
+
+
+async def test_preflight_cancelled_by_shutdown_does_not_produce_failure(monkeypatch):
+    """A preflight cancelled during host shutdown must NOT set _preflight_state to a
+    failure string (r2/r6): no PREFLIGHT FAILED log, no HOLDING verdict. The state
+    stays at its pre-call value (None = unchecked) so the next boot re-runs cleanly."""
+    loop = BoardLoop({"local_gate_cmd": "ruff check .", "preflight": True})
+    loop._shutting_down = True  # simulate shutdown in progress
+
+    async def _cancelled(*a, **k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _cancelled)
+
+    await loop._preflight()
+
+    # State must remain None (unchecked) — never a failure string that would hold work.
+    assert not isinstance(loop._preflight_state, str)
