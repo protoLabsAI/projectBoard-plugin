@@ -999,7 +999,8 @@ class BeadsBoard:
         if phantom:
             raise BoardError(
                 f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
-                f"in the repo: {', '.join(phantom)} — either create a (new) stub or correct the path."
+                f"in the repo (bound root: {os.path.abspath(self.repo)!r}, set via project_board.repo): "
+                f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
             )
         # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
         # a task — it may not go ready until its `design` field exists AND references
