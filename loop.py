@@ -597,6 +597,14 @@ class BoardLoop:
         # entries. Per-repo, default empty. Accepts a list, or a comma/space-separated
         # string (mirrors env_passthrough), de-duplicated with order preserved.
         self.gate_files = _parse_gate_files(self.cfg.get("gate_files"))
+        # Repo conventions (#108): free-text markdown the host repo populates with the
+        # standing rules a coder must follow that no card author will enumerate per-card
+        # — "CI runs ruff", "every PR needs a changelog fragment", "this file is
+        # GENERATED, don't hand-edit it", "if a convention here doesn't exist, STOP".
+        # Where `gate_files` names the PATHS that must stay green, this carries the
+        # RULES + formats around them. Injected verbatim as a `## Repo conventions`
+        # block in the coder prompt (no per-card opt-out). Empty by default → no block.
+        self.repo_conventions = str(self.cfg.get("repo_conventions", "") or "")
         # Env hygiene (#78): the host identifies/authenticates THIS agent via env vars
         # (AGENT_NAME, PROTOAGENT_*, A2A_* — see config.py). None of them belong to the
         # gate preflight, the pre-PR local_gate_cmd, or the coder we spawn, so they're
@@ -2390,6 +2398,16 @@ class BoardLoop:
             if self.gate_files
             else ""
         )
+        # Repo conventions (#108): the RULES around the repo-wide gates — what CI runs,
+        # what format a required fragment takes, which files are GENERATED and must not
+        # be hand-edited, and the standing "if a convention named here doesn't exist,
+        # STOP and say so" guard. `gate_files` lists the paths; this carries the prose a
+        # card author can't restate per-card. Emitted as a SEPARATE block right after
+        # the gate files (its natural neighbour — both are repo-wide, not per-card),
+        # verbatim from config. Injected unconditionally when set; empty → no block.
+        repo_conventions_block = (
+            "\n## Repo conventions\n" + self.repo_conventions.strip() + "\n" if self.repo_conventions.strip() else ""
+        )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
@@ -2461,6 +2479,7 @@ class BoardLoop:
             f"## Task\n{feature.get('spec', '')}\n\n"
             f"## Files to create / modify\n{files_block}\n"
             f"{gate_files_block}"
+            f"{repo_conventions_block}"
             f"{design_block}\n"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"

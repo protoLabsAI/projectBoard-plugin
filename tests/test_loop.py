@@ -220,6 +220,48 @@ def test_gate_files_are_not_ledger_items_nor_files_to_modify():
     assert feature["files_to_modify"] == ["a.py", "b.py"]
 
 
+# ── repo conventions (#108) ──────────────────────────────────────────────────────
+
+_CONVENTIONS = (
+    "- CI runs `ruff check . && ruff format --check .` — lint and format must pass.\n"
+    "- Every PR must include a `changelog.d/<issue>.<kind>.md` fragment.\n"
+    "- `plugins/docs/nav.json` is GENERATED — never edit it directly.\n"
+    "- If a convention named here does not exist in the repo, STOP and say so."
+)
+
+
+def test_repo_conventions_config_defaults_empty():
+    """`project_board.repo_conventions` is per-repo free-text markdown, default empty
+    (backwards-compatible). Read verbatim — no parsing, unlike `gate_files`."""
+    assert BoardLoop({}).repo_conventions == ""
+    assert BoardLoop({"repo_conventions": ""}).repo_conventions == ""
+    assert BoardLoop({"repo_conventions": _CONVENTIONS}).repo_conventions == _CONVENTIONS
+    # a None in config coerces to "" rather than exploding on .strip() downstream
+    assert BoardLoop({"repo_conventions": None}).repo_conventions == ""
+
+
+def test_build_prompt_injects_repo_conventions():
+    """AC (#108): when set, the conventions ride the dispatch prompt verbatim as a
+    distinct `## Repo conventions` block — the standing RULES a card author can't
+    restate per-card (what CI runs, required fragment formats, generated files)."""
+    loop = BoardLoop({"repo_conventions": _CONVENTIONS, "gate_files": ["CHANGELOG.md"]})
+    prompt = loop._build_prompt(FEATURE)
+    assert "## Repo conventions" in prompt
+    assert _CONVENTIONS in prompt  # injected verbatim, not reformatted
+    # sits AFTER the gate-files block (its natural neighbour — both repo-wide, not per-card)
+    assert prompt.index("## Repo conventions") > prompt.index("Repo standing gate files")
+    # the card's own task/files are untouched — the block is additive
+    assert "- a.py" in prompt and "do the thing" in prompt
+
+
+def test_build_prompt_omits_repo_conventions_when_empty():
+    """Default (empty/absent) → no block at all, so a repo that declares no conventions
+    gets the unchanged prompt (backwards-compatible)."""
+    assert "## Repo conventions" not in BoardLoop({})._build_prompt(FEATURE)
+    # whitespace-only is treated as empty too
+    assert "## Repo conventions" not in BoardLoop({"repo_conventions": "   \n  "})._build_prompt(FEATURE)
+
+
 def test_is_test_path_classification():
     """The deterministic gate's path classifier — what counts as a test vs code."""
     from project_board.loop import _is_code_path, _is_test_path
