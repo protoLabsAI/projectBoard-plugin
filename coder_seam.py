@@ -683,6 +683,15 @@ class _WorktreeSolveAdapter:
         # Also what `_verify_goal`'s NO_TEST_NEEDED escape hatch reads. Fusion has no
         # such reply (a plain completion, not a summary) — absent for fusion wins.
         self._replies: dict[str, str] = {}
+        # #146: a FAILING sibling candidate's verify output, accumulated across this
+        # tier's best-of-k so a later candidate's generate() can learn from what
+        # already failed. solve() only threads `feedback` into a rung's SEQUENTIAL
+        # retries; PARALLEL best-of-k candidates (dispatched via asyncio.gather) each
+        # arrive with feedback=None, so without this every candidate re-attacks the
+        # task blind to the exact assertion its siblings already tripped. Each entry
+        # is one prior candidate's labeled verify tail; generate() folds the whole
+        # accumulated list BELOW the ladder's own feedback via `_augment_prompt`.
+        self._completed_failures: list[str] = []
 
     async def _new_candidate_worktree(self) -> tuple[str, str]:
         self._n += 1
@@ -692,6 +701,23 @@ class _WorktreeSolveAdapter:
         self.candidates.append((wt, branch))
         return wt, branch
 
+    def _compose_feedback(self, feedback: str | None) -> str | None:
+        """Fold this tier's accumulated sibling failures (#146) below the ladder's
+        own retry ``feedback``. Kept as ONE feedback string so ``_augment_prompt``
+        stays the single place that shapes the failure section of the prompt. The
+        two blocks are clearly separated so the coder can tell the ladder's own
+        prior-attempt failure apart from other candidates' failures at this tier."""
+        if not self._completed_failures:
+            return feedback
+        prior = (
+            "## Prior candidate failures at this tier (sibling best-of-k attempts)\n"
+            "Earlier candidates solving THIS SAME task already failed verify with the "
+            "errors below — a different attempt from yours, not your own prior try. "
+            "Do not repeat their mistakes:\n\n" + "\n\n".join(self._completed_failures)
+        )
+        own = (feedback or "").strip()
+        return f"{own}\n\n{prior}" if own else prior
+
     async def generate(self, task: str, *, feedback: str | None = None) -> str:
         wt, _branch = await self._new_candidate_worktree()
         self._gen_by_wt[wt] = self._n
@@ -700,7 +726,7 @@ class _WorktreeSolveAdapter:
         reply = await dispatch_coder_tapped(
             self.coder,
             wt,
-            _augment_prompt(task, feedback),
+            _augment_prompt(task, self._compose_feedback(feedback)),
             fid=self.progress_fid,
             gen=self._n,
             tier=self.progress_tier,
@@ -828,6 +854,14 @@ class _WorktreeSolveAdapter:
                 output=getattr(verdict, "output", "") or "",
                 passed=bool(getattr(verdict, "passed", False)),
             )
+        # #146: a candidate that FAILED verify feeds its output forward to the sibling
+        # best-of-k candidates still to run at this tier (see `_completed_failures`).
+        # Independent of progress_fid — this is the solve feedback path, not the live
+        # monitor. Tail-capped at 1500 chars, matching progress_verify's own cap.
+        if not bool(getattr(verdict, "passed", False)):
+            tail = (getattr(verdict, "output", "") or "")[-1500:]
+            label = f"candidate {gen}" if gen is not None else "a prior candidate"
+            self._completed_failures.append(f"### {label} failed `{self.test_cmd}`:\n{tail}".rstrip())
         return verdict
 
     async def _run_acceptance_tests(self, candidate_wt: str):
