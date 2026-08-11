@@ -319,14 +319,20 @@ def test_mark_ready_gate_validates_files_to_modify_exist_in_the_repo(make_board,
 
     br.calls.clear()
     real.unlink()  # same path, now missing → gate refuses and names it
-    with pytest.raises(BoardError, match=r"do not exist in the repo: real\.py"):
+    with pytest.raises(BoardError) as exc_info:
         b.mark_ready("bd-1")
+    err = str(exc_info.value)
+    assert "do not exist in the repo" in err
+    assert "real.py" in err
+    assert str(tmp_path) in err  # bound repo root is named (#141)
+    assert "project_board.repo" in err  # config key is named (#141)
+    assert "fix the repo binding" in err  # hint is present (#141)
     assert br.cmds("update") == []  # nothing mutated on a rejected gate
 
     # a `(new)` marker (case-insensitive, anywhere in the entry) bypasses the check
     br.calls.clear()
     feature["files_to_modify"] = ["real.py", "docs/new-guide.md (NEW)"]
-    with pytest.raises(BoardError, match=r"do not exist in the repo: real\.py"):
+    with pytest.raises(BoardError, match=r"do not exist in the repo.*real\.py"):
         b.mark_ready("bd-1")  # real.py still phantom, but the (NEW) entry is exempt
     feature["files_to_modify"] = ["real.py (new)", "docs/new-guide.md (NEW)"]
     b.mark_ready("bd-1")  # every remaining entry is a (new) stub → gate passes
