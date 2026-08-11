@@ -612,6 +612,35 @@ def _augment_prompt(task: str, feedback: str | None) -> str:
     )
 
 
+# #146 circuit breaker — a failure SIGNATURE for cross-candidate dedup. The intent
+# is to tell "K DIFFERENT failures" (real search, keep going) apart from "K copies of
+# the SAME failure" (a spec smell — the assertion is unsatisfiable, not the model's
+# fault), so the signature is the pair the spec names: the failing pytest node id
+# (``FAILED tests/…::test_name``) plus the ``AssertionError:`` line. The FAILED node
+# id is anchored to a line start (pytest's short-summary form); the AssertionError
+# line is matched anywhere so BOTH the inline short-summary form (``FAILED … -
+# AssertionError: …``) and the ``E   AssertionError: …`` traceback form are caught.
+_FAILED_TEST_RE = re.compile(r"^FAILED\s+(\S+::\S+)", re.MULTILINE)
+_ASSERTION_LINE_RE = re.compile(r"AssertionError:[^\n]*")
+
+
+def _failure_signature(output: str) -> str | None:
+    """Extract a stable failure signature from a candidate's verify output — the
+    failing test's node id and the ``AssertionError:`` line — so identical failures
+    across candidates collapse to the same key. Returns ``None`` when NEITHER pattern
+    is present (nothing to dedup on — a non-assertion error, an empty output), which
+    can never trip the circuit breaker; only a recognizable, repeatable assertion
+    signature counts."""
+    text = output or ""
+    test_m = _FAILED_TEST_RE.search(text)
+    assert_m = _ASSERTION_LINE_RE.search(text)
+    if test_m is None and assert_m is None:
+        return None
+    test = test_m.group(1) if test_m else ""
+    assertion = assert_m.group(0).strip() if assert_m else ""
+    return f"{test} :: {assertion}".strip()
+
+
 class _WorktreeSolveAdapter:
     """Adapts `coder.solve()`'s ``generate``/``verify`` contract onto board
     worktrees. `solve()` treats a candidate as an opaque string; here that string is
@@ -621,6 +650,14 @@ class _WorktreeSolveAdapter:
     then runs the acceptance-test command in that same worktree and reports real
     pass/fail. Tracks every candidate worktree it creates so the caller can promote
     the winner and reap the losers."""
+
+    # #146: when this many candidates fail on the IDENTICAL assertion signature, the
+    # problem is the spec (an unsatisfiable assertion), not model capability — keep
+    # searching and we just burn the rest of the budget re-failing the same way. At
+    # the threshold, `verify()` raises SolveExhausted early, naming the repeated
+    # assertion, and the loop's existing SolveExhausted handler blocks the feature
+    # with that quoted — the correct outcome for a spec smell.
+    CIRCUIT_BREAKER_THRESHOLD = 3
 
     def __init__(
         self,
@@ -692,6 +729,11 @@ class _WorktreeSolveAdapter:
         # is one prior candidate's labeled verify tail; generate() folds the whole
         # accumulated list BELOW the ladder's own feedback via `_augment_prompt`.
         self._completed_failures: list[str] = []
+        # #146 circuit breaker: signature (failing test node id + AssertionError line)
+        # → how many candidates have failed on exactly it. When any single count hits
+        # CIRCUIT_BREAKER_THRESHOLD, `verify()` short-circuits the whole ladder with
+        # SolveExhausted rather than spend the rest of the budget re-failing identically.
+        self._failure_signatures: dict[str, int] = {}
 
     async def _new_candidate_worktree(self) -> tuple[str, str]:
         self._n += 1
@@ -859,9 +901,26 @@ class _WorktreeSolveAdapter:
         # Independent of progress_fid — this is the solve feedback path, not the live
         # monitor. Tail-capped at 1500 chars, matching progress_verify's own cap.
         if not bool(getattr(verdict, "passed", False)):
-            tail = (getattr(verdict, "output", "") or "")[-1500:]
+            output = getattr(verdict, "output", "") or ""
+            tail = output[-1500:]
             label = f"candidate {gen}" if gen is not None else "a prior candidate"
             self._completed_failures.append(f"### {label} failed `{self.test_cmd}`:\n{tail}".rstrip())
+            # #146 circuit breaker: when K candidates fail on the IDENTICAL assertion
+            # signature, the spec is unsatisfiable — not a model-capability failure — so
+            # continuing to search only re-fails the same way and burns the budget. At
+            # the threshold, raise SolveExhausted early, naming the repeated assertion:
+            # solve() has no try/except around verify(), so this propagates straight out
+            # to dispatch()'s handler (which reaps every candidate and re-raises), and
+            # the loop treats SolveExhausted as a capability failure and blocks the
+            # feature with the message quoted — the right call for a spec smell.
+            sig = _failure_signature(output)
+            if sig is not None:
+                count = self._failure_signatures[sig] = self._failure_signatures.get(sig, 0) + 1
+                if count >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    raise SolveExhausted(
+                        f"circuit breaker tripped: {count} candidates failed on the IDENTICAL "
+                        f"assertion — a spec problem, not model capability. Repeated failure: {sig}"
+                    )
         return verdict
 
     async def _run_acceptance_tests(self, candidate_wt: str):

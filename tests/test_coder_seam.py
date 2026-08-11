@@ -832,6 +832,166 @@ async def test_adapter_feeds_prior_candidate_verify_failures_to_the_next_candida
     assert p3.index("ladder says: fix the import") < p3.index("Prior candidate failures")
 
 
+# ── #146 circuit breaker: K candidates failing on the IDENTICAL assertion ────────
+
+
+def test_failure_signature_pairs_test_node_and_assertion():
+    """#146 r2: the signature is the pytest FAILED node id + the AssertionError line,
+    matched whether the assertion is inline (short-summary form) or on its own
+    ``E   AssertionError:`` traceback line — both forms collapse to the SAME key."""
+    inline = "FAILED tests/test_x.py::test_y - AssertionError: expected 5 got 3\n1 failed"
+    sig = coder_seam._failure_signature(inline)
+    assert sig is not None
+    assert "tests/test_x.py::test_y" in sig
+    assert "AssertionError: expected 5 got 3" in sig
+
+    traceback = (
+        "    assert result == 5\n"
+        "E   AssertionError: expected 5 got 3\n"
+        "=== short test summary ===\n"
+        "FAILED tests/test_x.py::test_y - AssertionError: expected 5 got 3"
+    )
+    assert coder_seam._failure_signature(traceback) == sig  # same failure → same key
+
+
+def test_failure_signature_none_without_a_failed_line_or_assertion():
+    """No recognizable FAILED node id and no AssertionError line ⇒ None, so a
+    non-assertion error (import error, collection error, empty output) can never
+    accumulate a signature or trip the breaker."""
+    assert coder_seam._failure_signature("collected 0 items\nno tests ran in 0.01s") is None
+    assert coder_seam._failure_signature("E   ImportError: no module named foo") is None
+    assert coder_seam._failure_signature("") is None
+
+
+def _breaker_adapter():
+    return _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-146",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+    )
+
+
+def _failing_proc_returning(outputs):
+    """A fake ``asyncio.create_subprocess_shell`` yielding the next canned output on
+    each call (a list is cycled by an iterator; a single bytes value repeats)."""
+    it = iter(outputs) if isinstance(outputs, (list, tuple)) else None
+
+    async def _spawn(*a, **k):
+        out = next(it) if it is not None else outputs
+
+        class _Proc:
+            returncode = 1
+
+            async def communicate(self):
+                return (out, None)
+
+        return _Proc()
+
+    return _spawn
+
+
+async def test_circuit_breaker_trips_when_k_candidates_fail_on_the_same_assertion(monkeypatch):
+    """#146 r1/r4: when K (=3) candidates fail on the IDENTICAL assertion signature,
+    verify() raises SolveExhausted EARLY (on the 3rd failure, not after the whole
+    budget) with the repeated assertion quoted in the message."""
+    _stub_worktree(monkeypatch)
+    same = b"FAILED tests/test_x.py::test_y - AssertionError: expected 5 got 3\n1 failed in 0.01s"
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _failing_proc_returning(same))
+
+    adapter = _breaker_adapter()
+    # The first two identical failures accumulate the signature but do NOT trip it —
+    # two of a kind isn't yet a spec smell, and each verify still returns a verdict.
+    assert (await adapter.verify("/wt/a")).passed is False
+    assert (await adapter.verify("/wt/b")).passed is False
+    assert adapter._failure_signatures  # the signature is being tracked
+
+    # The THIRD identical failure trips the breaker — raised early, naming the
+    # repeated assertion (both the failing test node and the assertion text).
+    try:
+        await adapter.verify("/wt/c")
+        raised = False
+    except SolveExhausted as exc:
+        raised = True
+        assert "AssertionError: expected 5 got 3" in str(exc)
+        assert "tests/test_x.py::test_y" in str(exc)
+    assert raised
+
+
+async def test_circuit_breaker_does_not_trip_on_different_assertions(monkeypatch):
+    """#146 r3/r5: three candidates failing on DIFFERENT assertions are real search,
+    not a spec smell — no single signature reaches the threshold, so none trips."""
+    _stub_worktree(monkeypatch)
+    outputs = [
+        b"FAILED tests/test_x.py::test_a - AssertionError: expected 5 got 3\n1 failed",
+        b"FAILED tests/test_x.py::test_b - AssertionError: expected 1 got 2\n1 failed",
+        b"FAILED tests/test_y.py::test_c - AssertionError: lists differ [1] != [2]\n1 failed",
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _failing_proc_returning(outputs))
+
+    adapter = _breaker_adapter()
+    # Three DISTINCT signatures — each counts exactly once; none reaches K, so no raise.
+    assert (await adapter.verify("/wt/a")).passed is False
+    assert (await adapter.verify("/wt/b")).passed is False
+    assert (await adapter.verify("/wt/c")).passed is False  # must NOT raise
+    assert set(adapter._failure_signatures.values()) == {1}  # three keys, each seen once
+
+
+async def test_dispatch_circuit_breaker_stops_early_and_reaps_every_candidate(monkeypatch):
+    """#146 r1 end-to-end: through dispatch(), the breaker cuts the ladder short well
+    before the budget is spent. SolveExhausted propagates out of solve() (which has no
+    try/except around verify()), dispatch() reaps every candidate it created and
+    re-raises, and nothing is promoted — a spec smell never opens a PR."""
+    created, removed, promoted = _stub_worktree(monkeypatch)
+    same = b"FAILED tests/test_x.py::test_y - AssertionError: expected 5 got 3\n1 failed"
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _failing_proc_returning(same))
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        # A ladder that would try the FULL budget of candidates if never interrupted —
+        # the breaker must stop it at the 3rd identical failure, not the 20th gen.
+        for _ in range(budget.total):
+            c = await generate(task, feedback=None)
+            await verify(c)  # raises SolveExhausted on the 3rd identical failure
+        raise AssertionError("circuit breaker never tripped")
+
+    gens = []
+    try:
+        await dispatch(
+            task="t",
+            coder=object(),
+            repo="/repo",
+            base="main",
+            root=".worktrees",
+            fid="bd-cb",
+            dispatch_timeout=None,
+            test_cmd="pytest -q",
+            test_timeout=30,
+            budget=20,
+            k=3,
+            tree_depth=2,
+            record_gens=gens.append,
+            _solve=_fake_solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+        raised = False
+    except SolveExhausted as exc:
+        raised = True
+        assert "AssertionError: expected 5 got 3" in str(exc)
+    assert raised
+    # EARLY: exactly 3 candidates generated (not the budget of 20), every one reaped,
+    # nothing promoted, and the attempted cost still surfaced.
+    assert created == ["bd-cb.g1", "bd-cb.g2", "bd-cb.g3"]
+    assert set(removed) == {"/wt/feat-bd-cb.g1", "/wt/feat-bd-cb.g2", "/wt/feat-bd-cb.g3"}
+    assert promoted == []
+    assert gens == [3]
+
+
 # ── rung 4: fusion (ADR 0064 P3) — a plain completion, not an ACP session ────────
 
 
