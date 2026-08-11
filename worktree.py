@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -142,22 +143,42 @@ def link_node_modules(repo: str, worktree: str) -> int:
     return linked
 
 
-async def remove_worktree(repo: str, worktree: str, branch: str = "") -> None:
+async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     """Tear down the worktree (and its branch, once merged the branch is junk).
-    Best-effort — teardown must not raise into the loop's success path."""
+
+    Returns True if the worktree directory is gone after the call, False otherwise.
+    Best-effort — teardown must not raise into the loop's success path.
+
+    When ``git worktree remove`` fails because the git metadata is already gone
+    (stderr contains "is not a working tree"), the directory may still be on disk.
+    In that case: prune stale admin entries, then remove the directory via
+    ``shutil.rmtree``, and return True only if the directory is now absent.
+    Any other failure reason (dirty tree, locked, permissions) returns False
+    without touching the directory."""
     rc, _out, err = await _git(repo, "worktree", "remove", "--force", worktree)
-    if rc != 0:
-        log.warning("[project_board] worktree remove %s failed: %s", worktree, err.strip()[:200])
+    removed = rc == 0
+    if not removed:
+        if "is not a working tree" in err:
+            await _git(repo, "worktree", "prune")
+            try:
+                shutil.rmtree(worktree)
+            except OSError:
+                pass
+            removed = not os.path.exists(worktree)
+        else:
+            log.warning("[project_board] worktree remove %s failed: %s", worktree, err.strip()[:200])
     if branch:
         await _git(repo, "branch", "-D", branch)
+    return removed
 
 
-async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> None:
+async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> bool:
     """Remove the worktree + branch a feature owns, by its id — the one place that
     knows the ``feat-<id>`` / ``feat/<id>`` naming. Shared by the merge webhook and
-    the merge poll (both reap once a feature reaches ``done``)."""
+    the merge poll (both reap once a feature reaches ``done``). Returns True if the
+    directory is gone after the call."""
     wt = os.path.join(repo, worktrees_root, f"feat-{fid}")
-    await remove_worktree(repo, wt, f"feat/{fid}")
+    return await remove_worktree(repo, wt, f"feat/{fid}")
 
 
 async def promote_worktree(
