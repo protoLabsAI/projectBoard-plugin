@@ -759,6 +759,79 @@ async def test_adapter_verify_times_out_as_failed_not_silently_passed(monkeypatc
     assert "timed out" in v.output
 
 
+async def test_adapter_feeds_prior_candidate_verify_failures_to_the_next_candidate(monkeypatch):
+    """#146: within a tier's best-of-k, a candidate that FAILS verify must feed its
+    failure output into the sibling candidates still to run — otherwise every
+    parallel candidate (dispatched with feedback=None) re-attacks the task blind to
+    the exact assertion its sibling already tripped."""
+    _stub_worktree(monkeypatch)
+    prompts = []
+
+    async def _dispatch(coder, wt, prompt, *, timeout=None):
+        prompts.append(prompt)
+        return f"reply from {wt}"
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+
+    # Each verify run yields a DISTINCT failure so we can prove both are carried
+    # forward and each is labeled with its own candidate number.
+    outputs = iter(
+        [
+            b"E   AssertionError: expected 5 got 3\n1 failed in 0.01s",
+            b"E   TypeError: 'NoneType' has no len()\n1 failed in 0.01s",
+        ]
+    )
+
+    async def _failing(*a, **k):
+        out = next(outputs)
+
+        class _Proc:
+            returncode = 1
+
+            async def communicate(self):
+                return (out, None)
+
+        return _Proc()
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _failing)
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-146",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+    )
+
+    # Candidate 1 runs first — it can't have any sibling failure to learn from.
+    c1 = await adapter.generate("do the thing", feedback=None)
+    assert (await adapter.verify(c1)).passed is False
+    assert "AssertionError: expected 5 got 3" not in prompts[0]
+
+    # r1: candidate 2's prompt carries candidate 1's verify failure, clearly labeled
+    # as a PRIOR CANDIDATE failure (not the ladder's own retry feedback).
+    await adapter.generate("do the thing", feedback=None)
+    assert "AssertionError: expected 5 got 3" in prompts[1]
+    assert "candidate 1" in prompts[1]
+    assert "Prior candidate failures" in prompts[1]
+
+    # r2 + r3: with candidate 2 also failed, candidate 3 gets BOTH prior failures
+    # (each labeled with its number) AND the ladder's own retry feedback, kept in
+    # separate, distinctly-labeled sections — own feedback first, siblings below.
+    assert (await adapter.verify("/wt/feat-bd-146.g2")).passed is False
+    await adapter.generate("do the thing", feedback="ladder says: fix the import")
+    p3 = prompts[2]
+    assert "candidate 1" in p3 and "AssertionError: expected 5 got 3" in p3
+    assert "candidate 2" in p3 and "TypeError: 'NoneType' has no len()" in p3
+    assert "ladder says: fix the import" in p3
+    # The ladder's own feedback is distinct from the sibling-failure block, and sits
+    # above it (the sibling failures are appended below the ladder's own feedback).
+    assert p3.index("ladder says: fix the import") < p3.index("Prior candidate failures")
+
+
 # ── rung 4: fusion (ADR 0064 P3) — a plain completion, not an ACP session ────────
 
 
