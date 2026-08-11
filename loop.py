@@ -1592,6 +1592,15 @@ class BoardLoop:
                         nxt = store.escalate(fid, str(exc)[:200])
                         if nxt:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
+                            # A timeout carries NO diff and NO CI output, so the stronger
+                            # tier would otherwise get a BYTE-IDENTICAL prompt — blind to
+                            # the fact a prior attempt ran out of time and what it was doing
+                            # when killed (#146). Seed the same feedback lever a CI/review
+                            # bounce uses with the ring buffer's timeout context, so the
+                            # escalated dispatch leads with it via the normal prompt path.
+                            if isinstance(exc, worktree.CoderTimeout):
+                                self._ci_feedback[fid] = self._timeout_escalation_context(fid)
+                                self._ci_prior_diff.pop(fid, None)  # a timeout produced no diff to echo back
                             tier = nxt
                             retries = 0
                             # Fresh goal-fix budget at the new tier — otherwise a tier that
@@ -2269,6 +2278,49 @@ class BoardLoop:
             text = (h.get("preview") or h.get("content") or "").strip()
             if text:
                 lines.append(f"- {text}")
+        return "\n".join(lines)
+
+    def _timeout_escalation_context(self, fid: str) -> str:
+        """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).
+
+        A ``CoderTimeout`` climbs the tier ladder (``_drive``), but on its own the
+        stronger model would get a BYTE-IDENTICAL prompt: zero signal that a prior
+        attempt ran out of time, how long it ran, or what it was doing when killed.
+        Mine the progress ring buffer (``coder_seam.progress_snapshot``) for the
+        timed-out gen's elapsed time, the last tool in flight, and the thought tail,
+        and lead the re-dispatch with them. Returned for injection into
+        ``_ci_feedback`` so it rides the exact same prompt path a CI/review bounce
+        uses — no new plumbing. Best-effort: a missing/empty snapshot still yields a
+        usable "prior attempt timed out, produced no diff" note — a monitor read must
+        never break escalation."""
+        try:
+            gens = coder_seam.progress_snapshot(fid).get("gens") or []
+        except Exception:  # noqa: BLE001 — a monitor read must never break escalation
+            gens = []
+        gen = gens[-1] if gens else {}
+        elapsed = gen.get("elapsed_s")
+        ran_for = f"ran ~{elapsed}s and " if elapsed is not None else ""
+        lines = [
+            "A PREVIOUS attempt at this feature TIMED OUT and was killed — it "
+            f"{ran_for}produced NO diff (nothing was committed). You are a stronger "
+            "model taking over: be decisive, avoid open-ended exploration, and make "
+            "the edits early rather than reading indefinitely.",
+        ]
+        cur = gen.get("current_tool") or {}
+        if cur.get("name"):
+            locs = ", ".join(cur.get("locations") or [])
+            where = f" on {locs}" if locs else ""
+            lines.append(
+                f"- Last tool in flight when it was killed: {cur['name']} ({cur.get('status', 'running')}){where}."
+            )
+        else:
+            recent = gen.get("recent_tools") or []
+            if recent:
+                last = recent[-1]
+                lines.append(f"- Last observed tool: {last.get('name', 'tool')} ({last.get('status', '')}).")
+        tail = (gen.get("thought_tail") or "").strip()
+        if tail:
+            lines.append(f"- Its last reasoning before the timeout (it never converged):\n{tail}")
         return "\n".join(lines)
 
     def _build_prompt(self, feature: dict, lessons: str = "") -> str:
