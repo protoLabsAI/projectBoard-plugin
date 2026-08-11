@@ -16,6 +16,7 @@ import shutil
 
 import pytest
 
+from project_board import coder_seam
 from project_board import store as store_mod
 from project_board import worktree
 from project_board.loop import (
@@ -1053,6 +1054,94 @@ async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch
     assert calls["n"] == 1
     assert "flag_blocked" in store.names()
     assert loop._inflight == {}
+
+
+class _EscalatingStore(FakeLoopStore):
+    """A store that hands out one climb (fast→smart) then None (ladder top), so a
+    _drive test can exercise the timeout-escalation path end to end."""
+
+    def __init__(self, tiers):
+        super().__init__()
+        self._tiers = list(tiers)
+        self.escalated = []
+
+    def escalate(self, fid, reason):
+        self.escalated.append((fid, reason))
+        return self._tiers.pop(0) if self._tiers else None
+
+
+async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypatch):
+    """A CoderTimeout that climbs the tier ladder must NOT hand the stronger model a
+    byte-identical prompt (#146): the escalated dispatch leads with the ring buffer's
+    timeout context — elapsed time, that no diff was produced, and the last tool/thought
+    tail — injected via `_ci_feedback` so it rides the normal prompt-building path."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    # Deterministic gen clock: the timed-out gen runs 0.0s→1800.0s (elapsed 1800.0),
+    # every later _monotonic() reads freeze at the tail value.
+    ticks = iter([0.0, 1800.0])
+    monkeypatch.setattr(coder_seam, "_monotonic", lambda: next(ticks, 1800.0))
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        return "https://example/pr/1"
+
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            # Simulate live activity the tap would have recorded, then time out. The
+            # gen buffer already exists (dispatch_coder_tapped called progress_begin
+            # before falling back to worktree.dispatch_coder in a host-free test env).
+            coder_seam.progress_thought("bd-1", 1, "still mapping the dispatch flow in loop.py")
+            coder_seam.progress_tool(
+                "bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {"path": "loop.py"}}
+            )
+            raise worktree.CoderTimeout("coder timed out after 1800s")
+        return "the escalated coder's reply"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    # It escalated once (fast→smart), redispatched, and shipped a clean PR.
+    assert [e[0] for e in store.escalated] == ["bd-1"]
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert len(prompts) == 2
+
+    original, escalated = prompts
+    # r1: the escalated prompt is NOT byte-identical to the one that timed out.
+    assert escalated != original
+    # The original carried no timeout context (nothing had failed yet).
+    assert "TIMED OUT" not in original
+    # r2: the escalated prompt names the elapsed time, the no-diff outcome, and the
+    # last tool + thought tail mined from the progress ring buffer.
+    assert "TIMED OUT" in escalated
+    assert "1800.0s" in escalated
+    assert "produced NO diff" in escalated
+    assert "Read" in escalated and "loop.py" in escalated
+    assert "still mapping the dispatch flow" in escalated
+    # r3: it arrived via `_ci_feedback`, so it rides the standard rejected-attempt block.
+    assert "previous attempt was REJECTED" in escalated
+    assert "still mapping the dispatch flow" in loop._ci_feedback.get("bd-1", "")
 
 
 # ── concurrency: _spawn_ready claims up to max_concurrent ────────────────────────
