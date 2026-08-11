@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import sys
 import types
 
@@ -548,3 +549,53 @@ def test_link_node_modules_does_not_descend_into_node_modules(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
     assert worktree.link_node_modules(str(repo), str(wt)) == 1  # only the top-level one
+
+
+# ── remove_worktree / reap_feature_worktree: orphan fallback via shutil.rmtree ──────
+
+
+async def test_reap_feature_worktree_rmtree_fallback_when_git_metadata_gone(monkeypatch, tmp_path):
+    """When git worktree remove fails with 'is not a working tree' (git metadata is gone
+    but the directory is still on disk), reap_feature_worktree must fully remove the
+    directory via shutil.rmtree and return True. (r1, r4)"""
+    wt_root = tmp_path / ".worktrees"
+    wt_dir = wt_root / "feat-bd-147"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "some_code.py").write_text("# leftover")
+
+    calls = []
+
+    async def _fake_git(repo, *args, timeout=60):
+        calls.append(args)
+        if args[:2] == ("worktree", "remove"):
+            return (1, "", "fatal: '/some/path' is not a working tree")
+        return (0, "", "")  # prune, branch -D, etc. all succeed
+
+    monkeypatch.setattr(worktree, "_git", _fake_git)
+    result = await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-147")
+
+    assert result is True, "reap_feature_worktree must return True when directory is gone"
+    assert not wt_dir.exists(), "the orphaned directory must be fully removed"
+    assert any(a[:2] == ("worktree", "prune") for a in calls), "git worktree prune must be called"
+
+
+async def test_remove_worktree_does_not_rmtree_on_other_git_failure(monkeypatch, tmp_path, caplog):
+    """When git worktree remove fails for a reason OTHER than 'is not a working tree'
+    (e.g. dirty tree, locked), the directory must NOT be touched and a WARNING must be
+    logged. (r5)"""
+    wt_dir = tmp_path / "feat-bd-999"
+    wt_dir.mkdir()
+    (wt_dir / "dirty_file.py").write_text("# uncommitted change")
+
+    async def _fake_git(repo, *args, timeout=60):
+        if args[:2] == ("worktree", "remove"):
+            return (1, "", "fatal: 'path' contains modified or untracked files, use --force to delete it")
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _fake_git)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        result = await worktree.remove_worktree(str(tmp_path), str(wt_dir))
+
+    assert result is False, "must return False when removal was not possible"
+    assert wt_dir.exists(), "directory must NOT be touched when git fails for another reason"
+    assert "failed" in caplog.text, "a WARNING about the failure must be logged"

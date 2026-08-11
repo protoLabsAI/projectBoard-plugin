@@ -67,6 +67,11 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # ``stamped == current`` currency check stays exact.
 _MERGED_VERIFIED_SHA_LEN = 12
 
+# After this many consecutive failed reap attempts for the same worktree path, stop
+# logging at WARNING and downgrade to DEBUG to avoid log spam (e.g. 464 lines for
+# one stuck path — the bug this constant defends against).
+_REAP_WARN_CAP = 5
+
 
 # ── external re-dispatch feedback bridge (the /review route → the loop) ──────────
 # An adverse-review bounce POSTed to /features/{fid}/review is handled in the API
@@ -649,6 +654,10 @@ class BoardLoop:
         # prior_findings input so a bounce re-review is a DELTA review
         # (GitHub-native review memory, ADR 0078 D5).
         self._review_prior: dict[str, str] = {}
+        # Consecutive failed reap attempts per worktree id (not path, so it survives
+        # repo-path changes). After _REAP_WARN_CAP failures the noise is downgraded
+        # from WARNING to DEBUG; a successful reap resets the counter.
+        self._reap_failures: dict[str, int] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -696,8 +705,11 @@ class BoardLoop:
         inflight, self._inflight = dict(self._inflight), {}
         for fid, (repo, wt, branch) in inflight.items():
             try:
-                await worktree.remove_worktree(repo, wt, branch or "")
-                log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
+                ok = await worktree.remove_worktree(repo, wt, branch or "")
+                if ok:
+                    log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
+                else:
+                    log.warning("[project_board] worktree reap on shutdown failed (directory remains): %s", wt)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
 
@@ -846,8 +858,25 @@ class BoardLoop:
             try:
                 f = store.get_feature(fid)
                 if f is None or f["board_state"] in ("done", "cancelled"):
-                    await worktree.reap_feature_worktree(repo, self.root, wtid)
-                    log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
+                    reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
+                    if reaped:
+                        self._reap_failures.pop(wtid, None)
+                        log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
+                    else:
+                        n = self._reap_failures.get(wtid, 0) + 1
+                        self._reap_failures[wtid] = n
+                        if n <= _REAP_WARN_CAP:
+                            log.warning(
+                                "[project_board] sweep: could not reap orphaned worktree feat-%s (attempt %d)",
+                                wtid,
+                                n,
+                            )
+                        else:
+                            log.debug(
+                                "[project_board] sweep: could not reap orphaned worktree feat-%s (attempt %d)",
+                                wtid,
+                                n,
+                            )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
         # (c) the archive pass (#115): age done/cancelled features out of the live
