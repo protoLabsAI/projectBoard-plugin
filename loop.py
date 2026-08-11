@@ -616,6 +616,7 @@ class BoardLoop:
             db=self.cfg.get("db_path") or None,
             repo=self.cfg.get("repo", "."),
             base_branch=self.cfg.get("base_branch", "main"),
+            max_files_by_difficulty=self.cfg.get("max_files_by_difficulty"),
         )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()

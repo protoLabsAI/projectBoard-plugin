@@ -401,6 +401,167 @@ def test_design_gate_ignores_small_and_medium_features(make_board, monkeypatch):
     assert br.cmds("update")
 
 
+# ── the BREADTH cap: small/medium cards may not exceed the files_to_modify cap (#143) ──
+
+
+def _breadth_feature(**over):
+    base = {
+        "id": "bd-8",
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        # 8 paths, all `(new)` so the phantom-path gate is bypassed — the breadth cap is
+        # what's under test, not path existence.
+        "files_to_modify": [f"f{i}.py (new)" for i in range(8)],
+        "difficulty": "medium",
+        "design": "",
+        "depends_on": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_breadth_gate_refuses_an_oversized_medium_card(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _breadth_feature())
+    with pytest.raises(BoardError) as exc_info:
+        b.mark_ready("bd-8")
+    err = str(exc_info.value)
+    assert "Breadth gate" in err
+    assert "8" in err  # the count
+    assert "cap of 4" in err  # the cap
+    assert "SPLIT" in err  # remedy 1: split into smaller cards
+    assert "`large`" in err  # remedy 2: re-declare large
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+def test_breadth_gate_exempts_a_large_card_with_a_design(make_board, monkeypatch):
+    """The SAME 8-path card, re-declared `large` with a design citing an ADR, passes:
+    large/architectural carry no breadth cap — they answer to the DESIGN gate instead."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "get_feature", lambda fid: _breadth_feature(difficulty="large", design="Per ADR 0143, this is one unit.")
+    )
+    b.mark_ready("bd-8")
+    assert ("update", "bd-8", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_breadth_exempt_large_card_still_answers_to_the_design_gate(make_board, monkeypatch):
+    """large is exempt from the breadth cap but NOT from the design gate — an 8-path large
+    card with no design is still refused (by the design gate, not the breadth gate)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _breadth_feature(difficulty="large", design=""))
+    with pytest.raises(BoardError, match="Design gate"):
+        b.mark_ready("bd-8")
+    assert br.cmds("update") == []
+
+
+def test_breadth_cap_is_configurable_via_max_files_by_difficulty(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    b.max_files_by_difficulty = {"small": 2, "medium": 2}  # tighter than the built-in default of 4
+    three_small = _breadth_feature(difficulty="small", files_to_modify=["a.py (new)", "b.py (new)", "c.py (new)"])
+    monkeypatch.setattr(b, "get_feature", lambda fid: three_small)
+    with pytest.raises(BoardError, match="cap of 2"):
+        b.mark_ready("bd-8")
+    # the built-in default (4) would have admitted the same 3-file card
+    b.max_files_by_difficulty = dict(store.MAX_FILES_BY_DIFFICULTY)
+    b.mark_ready("bd-8")
+    assert br.cmds("update")
+
+
+def test_max_files_by_difficulty_kwarg_threads_the_config_key(monkeypatch):
+    """The `max_files_by_difficulty` config key reaches the board as a constructor kwarg
+    (via store_kw); a None override (key absent) falls back to the built-in default,
+    copied so a caller's dict can't mutate the policy under us."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    tuned = store.BeadsBoard(db=None, repo="/repo", max_files_by_difficulty={"small": 1, "medium": 9})
+    assert tuned.max_files_by_difficulty == {"small": 1, "medium": 9}
+    default = store.BeadsBoard(db=None, repo="/repo", max_files_by_difficulty=None)
+    assert default.max_files_by_difficulty == store.MAX_FILES_BY_DIFFICULTY
+    assert default.max_files_by_difficulty is not store.MAX_FILES_BY_DIFFICULTY  # copied, not aliased
+
+
+# ── the SHARED-FILE overlap gate: two non-terminal cards + same file need depends_on (#143) ──
+
+
+def _shared_feature(fid, files, **over):
+    base = {
+        "id": fid,
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        "files_to_modify": files,
+        "difficulty": "medium",
+        "design": "",
+        "depends_on": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_shared_file_gate_refuses_a_second_card_naming_the_same_file(make_board, monkeypatch):
+    """bd-i0w and bd-tw5 both name loop.py with no dependency edge — the second is refused
+    at ready, naming the overlapping file and the other card id (#143)."""
+    br = Br()
+    b = make_board(br)
+    first = _shared_feature("bd-i0w", ["loop.py (new)"], board_state="in_progress")
+    second = _shared_feature("bd-tw5", ["loop.py (new)"])
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
+    with pytest.raises(BoardError) as exc_info:
+        b.mark_ready("bd-tw5")
+    err = str(exc_info.value)
+    assert "Shared-file gate" in err
+    assert "loop.py (new)" in err  # the overlapping path is named
+    assert "bd-i0w" in err  # the other card id is named
+    assert "depends_on" in err  # the remedy is suggested
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+def test_shared_file_gate_passes_with_a_depends_on_edge(make_board, monkeypatch):
+    """Adding a depends_on edge (second → first) orders the two cards, so the overlap is
+    intentional and the gate does not fire."""
+    br = Br()
+    b = make_board(br)
+    first = _shared_feature("bd-i0w", ["loop.py (new)"], board_state="in_progress")
+    second = _shared_feature("bd-tw5", ["loop.py (new)"], depends_on=["bd-i0w"])
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
+    b.mark_ready("bd-tw5")
+    assert ("update", "bd-tw5", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_shared_file_gate_passes_with_a_reverse_depends_on_edge(make_board, monkeypatch):
+    """The edge counts in EITHER direction: here the first card depends on the second, and
+    the gate still treats the pair as ordered."""
+    br = Br()
+    b = make_board(br)
+    first = _shared_feature("bd-i0w", ["loop.py (new)"], board_state="in_progress", depends_on=["bd-tw5"])
+    second = _shared_feature("bd-tw5", ["loop.py (new)"])
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
+    b.mark_ready("bd-tw5")
+    assert br.cmds("update")
+
+
+def test_shared_file_gate_ignores_terminal_cards(make_board, monkeypatch):
+    """A merged (done) or cancelled card no longer contends for the file, so its overlap
+    with the card going ready is not a conflict."""
+    br = Br()
+    b = make_board(br)
+    done = _shared_feature("bd-old", ["loop.py (new)"], board_state="done")
+    cancelled = _shared_feature("bd-cxl", ["loop.py (new)"], board_state="cancelled")
+    second = _shared_feature("bd-tw5", ["loop.py (new)"])
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [done, cancelled, second])
+    b.mark_ready("bd-tw5")
+    assert br.cmds("update")
+
+
 def test_mark_designing_parks_and_mark_ready_unparks(make_board, monkeypatch):
     br = Br()
     b = make_board(br)

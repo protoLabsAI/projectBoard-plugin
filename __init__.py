@@ -178,7 +178,10 @@ def _board_tools(cfg: dict):
     from .store import BoardError, get_store
 
     store_kw = dict(
-        db=cfg.get("db_path") or None, repo=cfg.get("repo", "."), base_branch=cfg.get("base_branch", "main")
+        db=cfg.get("db_path") or None,
+        repo=cfg.get("repo", "."),
+        base_branch=cfg.get("base_branch", "main"),
+        max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
     )
 
     @tool

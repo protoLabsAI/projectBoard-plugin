@@ -155,6 +155,15 @@ DESIGN_GATED_DIFFICULTIES = ("large", "architectural")
 # What counts as "references an ADR": `ADR 0076` / `ADR-76` / `adr/0076` /
 # a `docs/adr/0076-…` path — case-insensitive, number required.
 ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
+# Breadth cap (#143): the most files_to_modify a card of a given difficulty may name
+# before the Ready gate refuses it. A card wider than this times out before it lands —
+# and a timeout teaches nothing (the single worst failure mode: it burns the tiers with
+# zero diff). So the gate forces the author to SPLIT the work or re-declare the card
+# `large` (which then owes the design + ADR the DESIGN gate enforces). `large`/
+# `architectural` carry NO cap (absent from this dict) — they answer to the design gate,
+# not the breadth cap. Configurable via the `max_files_by_difficulty` config key (threaded
+# to BeadsBoard through store_kw, beside repo/base_branch); a None override keeps this default.
+MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4}
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
@@ -426,7 +435,14 @@ class BeadsBoard:
     """Wraps the `br` CLI. One process-wide instance (the loop, API, and tools share
     it). `br` auto-discovers `.beads/*.db`; pass ``db`` to pin a workspace."""
 
-    def __init__(self, db: str | None = None, actor: str = "agent", repo: str = ".", base_branch: str = "main"):
+    def __init__(
+        self,
+        db: str | None = None,
+        actor: str = "agent",
+        repo: str = ".",
+        base_branch: str = "main",
+        max_files_by_difficulty: dict | None = None,
+    ):
         if not shutil.which(BR):
             raise BoardError(
                 f"beads CLI {BR!r} not on PATH — install beads-rust (`cargo install beads_rust`), "
@@ -436,6 +452,11 @@ class BeadsBoard:
         self.actor = actor
         self.repo = repo
         self.base_branch = base_branch
+        # Breadth-cap policy (#143): difficulty → max files_to_modify before the Ready gate
+        # refuses. Threaded from the `max_files_by_difficulty` config key (store_kw); a None/
+        # empty override falls back to the built-in default. Copied so a caller's dict can't
+        # mutate the policy under us.
+        self.max_files_by_difficulty = dict(max_files_by_difficulty or MAX_FILES_BY_DIFFICULTY)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
         # has_more off the last want_json `_run` (#138): the 0.2.x envelope carries it,
         # 0.1.x doesn't → None means "shape absent, trust --limit 0". Read right after the
@@ -1002,6 +1023,56 @@ class BeadsBoard:
                 f"in the repo (bound root: {os.path.abspath(self.repo)!r}, set via project_board.repo): "
                 f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
             )
+        # BREADTH cap (#143): a small/medium card that names more files than its difficulty
+        # allows times out before it lands — and a timeout teaches nothing (it burns the top
+        # tiers with zero diff, the single worst failure mode). Refuse it here so the author
+        # must SPLIT the work or re-declare the card `large` (which then owes the design + ADR
+        # the DESIGN gate below enforces). `large`/`architectural` carry no cap (absent from
+        # the dict) → exempt from breadth, still subject to that design gate. Configurable via
+        # the `max_files_by_difficulty` config key.
+        diff = str(f.get("difficulty", "")).strip().lower()
+        cap = self.max_files_by_difficulty.get(diff)
+        if cap is not None and len(f["files_to_modify"]) > cap:
+            n = len(f["files_to_modify"])
+            raise BoardError(
+                f"Breadth gate: feature {fid!r} is difficulty={diff!r} and names {n} "
+                f"files_to_modify, over the cap of {cap} for a {diff} card — a card this wide "
+                "times out before it lands, and a timeout teaches nothing. Either SPLIT it into "
+                "cards each at or under the cap, or re-declare it difficulty=`large` (which then "
+                "owes a design + ADR reference before it can go ready). Tune the limit with the "
+                "max_files_by_difficulty config key if this cap is wrong."
+            )
+        # SHARED-FILE overlap (#143): two non-terminal cards naming the same file with no
+        # depends_on edge between them build off a stale base and collide — the loop can claim
+        # one while the other sits unmerged, so the second builds on a base that's about to
+        # move under it. Refuse unless a dependency edge (in EITHER direction) already orders
+        # them. (The in-flight hot-file guard only stops PARALLEL edits, and never fires at
+        # max_concurrent=1 — this is the serialization that guard can't provide, enforced at
+        # the gate.) `list_features` is the exhaustive non-archived projection; terminal
+        # (done/cancelled) cards no longer contend for the file, so they're skipped.
+        my_files = {p for p in f["files_to_modify"] if str(p).strip()}
+        if my_files:
+            my_deps = set(f.get("depends_on") or [])
+            conflicts: list[tuple[str, list[str]]] = []
+            for other in self.list_features():
+                if other["id"] == fid or other["board_state"] in _TERMINAL_STATES:
+                    continue
+                shared = sorted(my_files & {p for p in (other.get("files_to_modify") or []) if str(p).strip()})
+                if not shared:
+                    continue
+                linked = other["id"] in my_deps or fid in set(other.get("depends_on") or [])
+                if not linked:
+                    conflicts.append((other["id"], shared))
+            if conflicts:
+                detail = "; ".join(f"{oid} (shares {', '.join(files)})" for oid, files in conflicts)
+                raise BoardError(
+                    f"Shared-file gate: feature {fid!r} names files_to_modify already claimed by "
+                    f"non-terminal card(s) with no depends_on edge between them: {detail}. Two cards "
+                    "editing the same file without a dependency edge build off a stale base and "
+                    f"collide — add a depends_on edge (board_update_feature(feature_id={fid!r}, "
+                    "depends_on=[…])) so one waits for the other to merge, or split the file work "
+                    "so they don't overlap."
+                )
         # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
         # a task — it may not go ready until its `design` field exists AND references
         # the ADR that records the decision (run /due-diligence, write the ADR, cite

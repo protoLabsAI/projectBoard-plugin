@@ -49,6 +49,7 @@ def build_router(cfg: dict):
         db=(cfg or {}).get("db_path") or None,
         repo=(cfg or {}).get("repo", "."),
         base_branch=(cfg or {}).get("base_branch", "main"),
+        max_files_by_difficulty=(cfg or {}).get("max_files_by_difficulty"),
     )
     escalate_on = escalation_enabled(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
@@ -200,6 +201,7 @@ def build_data_router(cfg: dict):
         db=(cfg or {}).get("db_path") or None,
         repo=(cfg or {}).get("repo", "."),
         base_branch=(cfg or {}).get("base_branch", "main"),
+        max_files_by_difficulty=(cfg or {}).get("max_files_by_difficulty"),
     )
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
