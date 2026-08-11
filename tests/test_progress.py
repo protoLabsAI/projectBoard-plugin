@@ -155,7 +155,7 @@ async def test_dispatch_coder_tapped_falls_back_and_still_records_the_gen(monkey
     coder_seam._progress.clear()
     seen = {}
 
-    async def _fake(coder, wt, prompt, *, timeout=None):
+    async def _fake(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         seen["args"] = (wt, prompt, timeout)
         return "the reply"
 
@@ -207,7 +207,7 @@ async def test_dispatch_records_per_gen_progress_including_the_verify_outcome(mo
     async def _create(repo, base, cid, root):
         return (f"/wt/feat-{cid}", f"feat/{cid}")
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         return f"reply {wt}"
 
     async def _remove(repo, wt, branch=""):

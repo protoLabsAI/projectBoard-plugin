@@ -318,7 +318,15 @@ def progress_snapshot(fid: str) -> dict:
 
 
 async def dispatch_coder_tapped(
-    coder, worktree_path: str, prompt: str, *, fid: str | None, gen: int, tier: str = "", timeout: float | None = None
+    coder,
+    worktree_path: str,
+    prompt: str,
+    *,
+    fid: str | None,
+    gen: int,
+    tier: str = "",
+    timeout: float | None = None,
+    env_passthrough: Iterable[str] = (),
 ) -> str:
     """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
     — same fresh-both session discipline, same guaranteed subprocess teardown — but
@@ -344,11 +352,15 @@ async def dispatch_coder_tapped(
         overrides: dict = {"workdir": worktree_path}
         if any(f.name == "manage_git" for f in _dc.fields(coder)):
             overrides["manage_git"] = False  # the BOARD owns git for scoped dispatches
+        if any(f.name == "env" for f in _dc.fields(coder)):
+            overrides["env"] = config.sanitized_env(env_passthrough)
         scoped = _dc.replace(coder, **overrides)
         spec = adapter._spec(scoped)
     except Exception:  # noqa: BLE001 — host internals absent/changed → untapped fallback
         try:
-            return await worktree.dispatch_coder(coder, worktree_path, prompt, timeout=timeout)
+            return await worktree.dispatch_coder(
+                coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
+            )
         finally:
             progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
 
@@ -773,6 +785,7 @@ class _WorktreeSolveAdapter:
             gen=self._n,
             tier=self.progress_tier,
             timeout=self.dispatch_timeout,
+            env_passthrough=self.env_passthrough,
         )
         if (reply or "").strip():
             self._replies[wt] = reply

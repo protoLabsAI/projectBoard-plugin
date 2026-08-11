@@ -353,7 +353,7 @@ async def _drive_with(
         store.creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
-    async def _default_dispatch(c, wt, prompt, *, timeout=None):
+    async def _default_dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         return "the coder's reply"
 
     async def _remove(repo, wt, branch=""):
@@ -403,7 +403,7 @@ async def test_drive_pr_body_is_the_summary_not_the_raw_stream(monkeypatch):
         bodies.append(body)
         return "https://example/pr/9"
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         return "I first looked at loop.py.\nLet me wire it up.\n## Summary\n\n- Wired the helper\n"
 
     await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch)
@@ -425,7 +425,7 @@ async def test_drive_max_mode_fans_out_and_ships_the_winner(monkeypatch):
 
     dispatched = []
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         dispatched.append(wt)
         return f"reply from {wt}"
 
@@ -500,7 +500,7 @@ async def test_drive_local_gate_failure_redispatches_then_opens(monkeypatch):
     REUSING the worktree (one create), then opens the PR once the gate passes."""
     prompts = []
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         return "reply"
 
@@ -531,7 +531,7 @@ async def test_drive_local_gate_exhausted_opens_pr_anyway(monkeypatch):
     blocks (CI + the ci-fix budget are the backstop)."""
     prompts = []
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         return "reply"
 
@@ -902,7 +902,7 @@ async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
     monkeypatch.setattr(BoardLoop, "_verify_goal", _verify)
     dispatched = []
 
-    async def _disp(c, wt, prompt, *, timeout=None):
+    async def _disp(c, wt, prompt, *, timeout=None, env_passthrough=()):
         dispatched.append(prompt)
         return "reply"
 
@@ -939,7 +939,7 @@ async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
 
     dispatched = []
 
-    async def _disp(c, wt, prompt, *, timeout=None):
+    async def _disp(c, wt, prompt, *, timeout=None, env_passthrough=()):
         dispatched.append(prompt)
         return "reply"
 
@@ -1082,7 +1082,7 @@ async def test_drive_blocks_immediately_on_a_terminal_failure(monkeypatch):
 async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch):
     calls = {"n": 0}
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         calls["n"] += 1
         raise worktree.CoderTimeout("coder timed out after 1800s")
 
@@ -1140,7 +1140,7 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
 
     prompts = []
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         if len(prompts) == 1:
             # Simulate live activity the tap would have recorded, then time out. The
@@ -3359,7 +3359,7 @@ async def test_drive_requirement_gate_bounces_open_items_then_opens(monkeypatch)
         ]
     )
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         return next(replies)
 
@@ -3392,7 +3392,7 @@ async def test_drive_requirement_gate_exhausted_blocks_never_opens(monkeypatch):
     exhausted bounce budget is a capability failure (block with a single coder),
     NEVER a PR with unaddressed requirements (unlike the local gate's fail-open)."""
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         return "no requirements section at all"
 
     async def _open_pr(wt, branch, *, base, title, body):
@@ -3450,7 +3450,7 @@ async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
     async def _reap(repo, root, fid):
         return None
 
-    async def _dispatch(c, wt, prompt, *, timeout=None):
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         raise worktree.CoderTimeout("coder killed during shutdown")
 
     async def _open_pr(wt, branch, *, base, title, body):

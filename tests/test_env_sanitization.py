@@ -347,3 +347,138 @@ async def test_dispatch_threads_env_passthrough_to_verify(monkeypatch):
     env = captured["env"]
     assert env["A2A_AUTH_TOKEN"] == "secret"  # whitelisted → present in verify()
     assert "AGENT_NAME" not in env  # not whitelisted → stripped
+
+
+# ── worktree.dispatch_coder / coder_seam.dispatch_coder_tapped: Delegate env overlay (#142) ──────
+
+
+def _inject_fake_acp_adapter(monkeypatch, captured: dict):
+    """Inject a fake ``plugins.delegates.adapters`` module so ``dispatch_coder``'s
+    local import resolves without the host plugins installed. The fake adapter
+    records the scoped Delegate on ``forget_session``."""
+    import sys
+    import types
+
+    class _FakeAdapter:
+        async def forget_session(self, scoped):
+            captured["scoped"] = scoped
+
+        async def dispatch(self, scoped, prompt, timeout=None):
+            return "done"
+
+        async def teardown(self, scoped):
+            pass
+
+    fake_mod = types.ModuleType("plugins.delegates.adapters")
+    fake_mod.ADAPTERS = {"acp": _FakeAdapter()}
+    fake_mod.DelegateError = Exception
+
+    for _ns in ("plugins", "plugins.delegates"):
+        if _ns not in sys.modules:
+            monkeypatch.setitem(sys.modules, _ns, types.ModuleType(_ns))
+    monkeypatch.setitem(sys.modules, "plugins.delegates.adapters", fake_mod)
+
+
+async def test_dispatch_coder_scoped_env_excludes_host_vars(monkeypatch):
+    """dispatch_coder populates the scoped Delegate's env overlay via sanitized_env —
+    host identity vars are absent from the overlay (#142)."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _FakeDelegate:
+        workdir: str = ""
+        env: dict = _dc.field(default_factory=dict)
+        manage_git: bool = False
+
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("PROTOAGENT_ID", "abc")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    captured = {}
+    _inject_fake_acp_adapter(monkeypatch, captured)
+
+    from project_board import worktree as wt_mod
+
+    await wt_mod.dispatch_coder(_FakeDelegate(), "/wt", "do it", env_passthrough=())
+
+    scoped = captured["scoped"]
+    assert "AGENT_NAME" not in scoped.env
+    assert "PROTOAGENT_ID" not in scoped.env
+    assert scoped.env["PATH"] == "/usr/bin"
+
+
+async def test_dispatch_coder_scoped_env_honors_passthrough(monkeypatch):
+    """env_passthrough whitelist reaches the scoped Delegate's env overlay (#142)."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _FakeDelegate:
+        workdir: str = ""
+        env: dict = _dc.field(default_factory=dict)
+        manage_git: bool = False
+
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("A2A_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    captured = {}
+    _inject_fake_acp_adapter(monkeypatch, captured)
+
+    from project_board import worktree as wt_mod
+
+    await wt_mod.dispatch_coder(_FakeDelegate(), "/wt", "do it", env_passthrough=["A2A_TOKEN"])
+
+    scoped = captured["scoped"]
+    assert scoped.env["A2A_TOKEN"] == "secret"  # whitelisted → present
+    assert "AGENT_NAME" not in scoped.env
+
+
+async def test_dispatch_coder_no_env_field_unchanged(monkeypatch):
+    """When the Delegate has no env field, dispatch_coder does not add one (#142, r2)."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _FakeDelegate:
+        workdir: str = ""
+        manage_git: bool = False
+
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+
+    captured = {}
+    _inject_fake_acp_adapter(monkeypatch, captured)
+
+    from project_board import worktree as wt_mod
+
+    await wt_mod.dispatch_coder(_FakeDelegate(), "/wt", "do it", env_passthrough=())
+
+    scoped = captured["scoped"]
+    assert not hasattr(scoped, "env")  # no env field on the no-env delegate
+
+
+async def test_dispatch_coder_tapped_threads_env_passthrough_to_fallback(monkeypatch):
+    """dispatch_coder_tapped's fallback path threads env_passthrough to dispatch_coder,
+    which strips host identity vars from the scoped Delegate's env overlay (#142)."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _FakeDelegate:
+        workdir: str = ""
+        env: dict = _dc.field(default_factory=dict)
+        manage_git: bool = False
+
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("A2A_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    captured = {}
+    _inject_fake_acp_adapter(monkeypatch, captured)
+
+    from project_board import coder_seam as cs
+
+    # dispatch_coder_tapped's tap path fails (plugins.coding_agent absent) → fallback to
+    # worktree.dispatch_coder, which builds the scoped Delegate with the sanitized env.
+    await cs.dispatch_coder_tapped(_FakeDelegate(), "/wt", "do it", fid="bd-1", gen=1, env_passthrough=["A2A_TOKEN"])
+
+    scoped = captured["scoped"]
+    assert scoped.env["A2A_TOKEN"] == "secret"  # whitelisted → present
+    assert "AGENT_NAME" not in scoped.env

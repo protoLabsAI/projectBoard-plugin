@@ -91,7 +91,7 @@ def _stub_worktree(monkeypatch, *, created=None, removed=None, promoted=None):
         created.append(cid)
         return (f"/wt/feat-{cid}", f"feat/{cid}")
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         return f"reply from {wt}"
 
     async def _remove(repo, wt, branch=""):
@@ -494,7 +494,7 @@ async def test_dispatch_reaps_candidates_when_solve_raises_and_reraises_original
 
     calls = {"n": 0}
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         calls["n"] += 1
         if calls["n"] == 2:
             raise _Boom("candidate coder timed out")
@@ -547,7 +547,7 @@ async def test_dispatch_reraises_the_original_mid_ladder_exception_even_if_recor
 
     calls = {"n": 0}
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         calls["n"] += 1
         if calls["n"] == 2:
             raise _Boom("candidate coder timed out")
@@ -638,7 +638,7 @@ async def test_adapter_generate_creates_a_fresh_worktree_per_call(monkeypatch):
     created, _removed, _promoted = _stub_worktree(monkeypatch)
     prompts = []
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         return "ok"
 
@@ -767,7 +767,7 @@ async def test_adapter_feeds_prior_candidate_verify_failures_to_the_next_candida
     _stub_worktree(monkeypatch)
     prompts = []
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         prompts.append(prompt)
         return f"reply from {wt}"
 
@@ -1402,7 +1402,7 @@ async def test_test_rung_always_reaps_even_on_a_pass(monkeypatch, tmp_path):
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         return "reply"
 
     async def _remove(repo, wt, branch=""):
@@ -1453,7 +1453,7 @@ async def test_test_rung_reaps_on_a_fail_too(monkeypatch, tmp_path):
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         return "reply"
 
     async def _remove(repo, wt, branch=""):
@@ -1506,7 +1506,7 @@ async def test_test_rung_reaps_even_if_solve_raises(monkeypatch, tmp_path):
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
 
-    async def _dispatch(coder, wt, prompt, *, timeout=None):
+    async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
         return "reply"
 
     async def _remove(repo, wt, branch=""):
