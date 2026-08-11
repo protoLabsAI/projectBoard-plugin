@@ -22,6 +22,9 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Iterable
+
+from . import config
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -246,7 +249,9 @@ def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:
     return [n[len("feat-") :] for n in names if n.startswith("feat-") and os.path.isdir(os.path.join(base, n))]
 
 
-async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | None = None) -> str:
+async def dispatch_coder(
+    coder, worktree: str, prompt: str, *, timeout: float | None = None, env_passthrough: Iterable[str] = ()
+) -> str:
     """Dispatch the coder (an ``acp`` Delegate) scoped to ``worktree``.
 
     Builds a per-feature copy with the worktree as workdir (registry untouched),
@@ -274,6 +279,8 @@ async def dispatch_coder(coder, worktree: str, prompt: str, *, timeout: float | 
     overrides: dict = {"workdir": worktree}
     if any(f.name == "manage_git" for f in dataclasses.fields(coder)):
         overrides["manage_git"] = False
+    if any(f.name == "env" for f in dataclasses.fields(coder)):
+        overrides["env"] = config.sanitized_env(env_passthrough)
     scoped = dataclasses.replace(coder, **overrides)
     try:
         await adapter.forget_session(scoped)
