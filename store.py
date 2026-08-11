@@ -1469,11 +1469,26 @@ class BeadsBoard:
                 "truncated, so the board projection would be incomplete (#114/#138). Check the "
                 "installed beads version's `--limit 0` semantics before trusting the board."
             )
+        # `br list` omits the `dependencies` array; `br show` carries it. Batch all IDs
+        # into ONE call so `_project` sees real edges — avoids N+1 subprocess spawns on
+        # this continuously-polled endpoint (#144). Guard the empty-rows case: `br show`
+        # with no arguments is an error.
+        if rows:
+            ids = [r["id"] for r in rows if r.get("id")]
+            if ids:
+                batch = self._run("show", *ids, want_json=True) or []
+                if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
+                    batch = [batch]
+                show_by_id = {r["id"]: r for r in batch if isinstance(r, dict) and r.get("id")}
+                for r in rows:
+                    rid = r.get("id")
+                    if rid and rid in show_by_id and "dependencies" not in r:
+                        r["dependencies"] = show_by_id[rid].get("dependencies")
         out = [self._project(r) for r in rows]
         if not include_archived:
             out = [f for f in out if not f["archived"]]
-        # `br list` omits dependencies, so mark dag_blocked by cross-referencing the
-        # puller: a `ready` feature the puller WON'T claim is blocked by an open dep.
+        # Cross-reference the puller's ready queue: a `ready` feature the puller won't
+        # claim is dep-blocked even if the show batch missed its edges.
         claimable = {f["id"] for f in self.ready_queue()}
         for f in out:
             if f["board_state"] == "ready" and f["id"] not in claimable:

@@ -1560,6 +1560,51 @@ def test_list_features_state_filter_still_queries_unbounded(make_board):
     assert _passes_unlimited(list_call)
 
 
+def test_list_features_batch_show_populates_depends_on(make_board):
+    """list_features injects `dependencies` from a single batch `br show *ids` call so
+    `_project` can populate `depends_on` / `open_depends_on` correctly (#144).
+    Without the batch fetch, `br list` omits the `dependencies` array and every card
+    reports `depends_on: []` even when real edges exist."""
+    beads = [
+        {"id": "bd-1", "status": "open", "labels": []},
+        {"id": "bd-2", "status": "open", "labels": []},
+    ]
+    show_beads = [
+        {"id": "bd-1", "status": "open", "labels": [], "dependencies": []},
+        {
+            "id": "bd-2",
+            "status": "open",
+            "labels": [],
+            "dependencies": [{"id": "bd-1", "dependency_type": "blocks", "status": "open"}],
+        },
+    ]
+    br = Br({"list": beads, "ready": [], "show": show_beads})
+    b = make_board(br)
+    features = b.list_features()
+
+    # ONE batch show call — not one per card
+    show_calls = br.cmds("show")
+    assert len(show_calls) == 1
+    assert "bd-1" in show_calls[0] and "bd-2" in show_calls[0]
+
+    bd2 = next(f for f in features if f["id"] == "bd-2")
+    assert bd2["depends_on"] == ["bd-1"]
+    assert bd2["open_depends_on"] == ["bd-1"]
+
+    bd1 = next(f for f in features if f["id"] == "bd-1")
+    assert bd1["depends_on"] == []
+    assert bd1["open_depends_on"] == []
+
+
+def test_list_features_empty_board_skips_show(make_board):
+    """`br show` with no arguments is an error; list_features must not call it when
+    the board has zero cards."""
+    br = Br({"list": [], "ready": []})
+    b = make_board(br)
+    b.list_features()
+    assert not br.cmds("show")  # no show call issued
+
+
 def test_find_by_external_ref_scan_is_unbounded(make_board):
     """record_merge's PR lookup scans `br list` unfiltered — it too must be unbounded,
     else a merge webhook for a feature past row 50 would silently never close it."""
