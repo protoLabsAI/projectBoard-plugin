@@ -721,6 +721,21 @@ def test_remove_dependency_clears_dag_blocked(make_board):
     assert projected["depends_on"] == []
 
 
+def test_cancelled_blocker_does_not_block_dependent_forever(make_board):
+    """When a blocker is cancelled, `br close` sets its status to `closed`.
+    A dependent that sees a dep with status=closed must NOT be dag_blocked (#145)."""
+    b = make_board(Br())
+    # After `br close` the blocker's status reads "closed" in the dep record, regardless
+    # of whether it was merged (done) or cancelled — _project must treat both as resolved.
+    bead = {
+        "id": "bd-child",
+        "status": "open",
+        "labels": ["ready"],
+        "dependencies": [{"id": "bd-blocker", "dependency_type": "blocks", "status": "closed"}],
+    }
+    assert b._project(bead)["dag_blocked"] is False
+
+
 def test_delete_feature_tombstones_with_reason(make_board, monkeypatch):
     """The harder sibling of cancel: `br delete` (tombstone) with an audit reason, run
     THROUGH the board so board↔JSONL stay in step. Returns the pre-delete snapshot."""
