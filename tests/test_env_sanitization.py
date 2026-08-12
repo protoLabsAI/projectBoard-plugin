@@ -188,7 +188,14 @@ async def test_preflight_spawns_with_sanitized_env(monkeypatch):
         return _FakeProc(0)
 
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._store_kw = {"repo": "/repo"}
+
+    # #90: preflight is now per-project and only smokes projects with ready work — give
+    # it one ready feature (default project) so the gate actually spawns.
+    class _Store:
+        def list_features(self, state=None):
+            return [{"id": "bd-1"}] if state == "ready" else []
+
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _Store())
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()
 

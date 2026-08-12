@@ -509,7 +509,7 @@ async def test_drive_local_gate_failure_redispatches_then_opens(monkeypatch):
 
     gate_seq = iter(["FAILED tests/test_config.py::golden - boom", None])
 
-    async def _gate(wt):
+    async def _gate(wt, feature=None):
         return next(gate_seq)
 
     loop, store = await _drive_with(
@@ -538,7 +538,7 @@ async def test_drive_local_gate_exhausted_opens_pr_anyway(monkeypatch):
     async def _open_pr(wt, branch, *, base, title, body):
         return "https://example/pr/2"
 
-    async def _gate(wt):
+    async def _gate(wt, feature=None):
         return "still red"
 
     loop, store = await _drive_with(
@@ -611,7 +611,7 @@ def test_use_coder_solve_false_without_a_test_command(monkeypatch):
     assert loop._use_coder_solve({"acceptance_criteria": "WHEN x THE SYSTEM SHALL y"}) is False
 
 
-async def _pass_gate(wt):
+async def _pass_gate(wt, feature=None):
     """A stand-in for `_run_local_gate` — pass immediately. These tests set
     `local_gate_cmd` (needed as the coder_solve_test_cmd fallback) but the drive's
     fake worktree paths don't exist on disk, so the REAL gate would just shell out
@@ -1902,7 +1902,7 @@ async def test_verify_merged_state_base_moved_green_gate_stamps_and_stays(monkey
     loop = _vloop()
     gates = []
 
-    async def _gate(wt):
+    async def _gate(wt, feature=None):
         gates.append(wt)
         return None  # green
 
@@ -2303,7 +2303,7 @@ async def _recover_salvage(monkeypatch, tmp_path, *, make_wt=True, head="abc123"
     loop = BoardLoop({"repo": str(tmp_path)})
     gates = []
 
-    async def _gate(wt):
+    async def _gate(wt, feature=None):
         gates.append(wt)
         return gate_out
 
@@ -2377,7 +2377,7 @@ async def test_recover_salvage_open_pr_error_falls_back_to_rebuild(monkeypatch, 
     monkeypatch.setattr(worktree, "open_pr", _boom_pr)
     loop = BoardLoop({"repo": str(tmp_path)})
 
-    async def _gate(wt):
+    async def _gate(wt, feature=None):
         return None
 
     monkeypatch.setattr(loop, "_run_local_gate", _gate)
@@ -2649,7 +2649,7 @@ async def test_select_candidate_prefers_passing_gate(monkeypatch):
     wts = ["/c0", "/c1", "/c2"]
     monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))  # all have a diff
 
-    async def gate(wt):
+    async def gate(wt, feature=None):
         return None if wt == "/c2" else "boom"  # only c2 passes
 
     async def judge(*a, **k):
@@ -2666,7 +2666,7 @@ async def test_select_candidate_judges_only_among_passing(monkeypatch):
     wts = ["/c0", "/c1", "/c2"]
     monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
 
-    async def gate(wt):
+    async def gate(wt, feature=None):
         return None if wt in ("/c0", "/c2") else "boom"  # c0 + c2 pass, c1 fails
 
     async def judge(feature, base, sub):
@@ -2683,7 +2683,7 @@ async def test_select_candidate_falls_back_to_judge_when_none_pass(monkeypatch):
     wts = ["/c0", "/c1"]
     monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
 
-    async def gate(wt):
+    async def gate(wt, feature=None):
         return "boom"  # none pass
 
     async def judge(feature, base, sub):
@@ -2700,7 +2700,7 @@ async def test_select_candidate_no_gate_uses_judge_and_never_runs_gate(monkeypat
     wts = ["/c0", "/c1"]
     monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set(wts)))
 
-    async def gate(wt):
+    async def gate(wt, feature=None):
         raise AssertionError("the gate must not run when local_gate_cmd is unset")
 
     async def judge(*a, **k):
@@ -2715,7 +2715,7 @@ async def test_select_candidate_none_when_no_diff(monkeypatch):
     loop = BoardLoop({"local_gate_cmd": "pytest", "max_mode_n": 2})
     monkeypatch.setattr(worktree, "_git", _git_nonempty_for(set()))  # all empty
 
-    async def gate(wt):
+    async def gate(wt, feature=None):
         raise AssertionError("no diffs → nothing to gate")
 
     monkeypatch.setattr(loop, "_run_local_gate", gate)
@@ -2979,18 +2979,157 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     assert "drops data" in seen_inputs[1]["prior_findings"]
 
 
+# ── per-feature project resolution (#90 slice 2) ─────────────────────────────────
+
+# A board serving several repos: the flat top-level keys are the INSTANCE defaults;
+# the `projects:` map carries each repo's own execution surface. The tests below prove
+# a feature resolves repo/gate/coders/solve-knobs from ITS project, not the instance.
+_MULTI_CFG = {
+    "repo": "/instance/repo",
+    "base_branch": "main",
+    "local_gate_cmd": "instance-gate",
+    "coders": {"fast": "instance-coder"},
+    "default_project": "board-plugin",
+    "projects": {
+        "board-plugin": {
+            "repo": "/repos/board-plugin",
+            "base_branch": "develop",
+            "local_gate_cmd": "ruff check .",
+            "coders": {"fast": "bp-fast", "smart": "bp-smart"},
+            "gate_files": ["CHANGELOG.md"],
+            "repo_conventions": "CI runs ruff",
+            "coder_solve_budget": 9,
+        },
+        "other": {"repo": "/repos/other", "local_gate_cmd": "make test"},
+    },
+}
+
+
+def test_feature_resolves_repo_gate_and_coders_from_its_project():
+    # r1/r7: a labeled feature resolves its repo, base, gate and coders from the project
+    # config — overriding the instance default the store stamped on `feature["repo"]`.
+    lp = BoardLoop(_MULTI_CFG)
+    feat = {"id": "bd-9", "project": "board-plugin", "repo": "/instance/repo", "base_branch": "main"}
+    assert lp._repo_for(feat) == "/repos/board-plugin"  # project repo, NOT the stamped instance one
+    assert lp._base_branch_for(feat) == "develop"
+    assert lp._local_gate_cmd_for(feat) == "ruff check ."
+    assert lp._coders_for(feat) == {"fast": "bp-fast", "smart": "bp-smart"}
+    # …and the instance defaults are genuinely DIFFERENT — proving we didn't read them.
+    assert lp.local_gate_cmd == "instance-gate"
+    assert lp.coders == {"fast": "instance-coder"}
+    assert lp._store_kw["repo"] == "/instance/repo"
+
+
+def test_unlabeled_feature_resolves_to_the_default_project():
+    # r8 back-compat: a feature with no project label falls back to the default project.
+    lp = BoardLoop(_MULTI_CFG)  # default_project = board-plugin
+    feat = {"id": "bd-x"}  # no `project`
+    assert lp._project_cfg(feat)["name"] == "board-plugin"
+    assert lp._repo_for(feat) == "/repos/board-plugin"
+    assert lp._coders_for(feat) == {"fast": "bp-fast", "smart": "bp-smart"}
+
+
+def test_back_compat_no_projects_map_is_a_single_implicit_project():
+    # r8: absent a `projects:` map, one implicit "default" project is synthesized from
+    # the flat keys — every feature resolves to the instance repo/gate/coders as before.
+    lp = BoardLoop({"repo": "/solo", "local_gate_cmd": "make gate", "coders": {"fast": "solo"}})
+    assert lp._default_project == "default"
+    feat = {"id": "bd-1"}  # unlabeled
+    assert lp._repo_for(feat) == "/solo"
+    assert lp._local_gate_cmd_for(feat) == "make gate"
+    assert lp._coders_for(feat) == {"fast": "solo"}
+
+
+def test_build_prompt_uses_the_features_project_gate_files_and_conventions():
+    # r4: the dispatch prompt carries the FEATURE's project gate_files + repo_conventions.
+    lp = BoardLoop(_MULTI_CFG)
+    prompt = lp._build_prompt({**FEATURE, "project": "board-plugin"})
+    assert "CHANGELOG.md" in prompt  # board-plugin's gate_files
+    assert "CI runs ruff" in prompt  # board-plugin's repo_conventions
+    # a project that declares NEITHER (and no instance-level default) gets no blocks.
+    p2 = lp._build_prompt({**FEATURE, "project": "other"})
+    assert "Repo standing gate files" not in p2
+    assert "## Repo conventions" not in p2
+
+
+def test_coder_solve_settings_resolve_per_project():
+    # r5: the solve() search knobs + verifier command resolve from the feature's project.
+    lp = BoardLoop(_MULTI_CFG)
+    s = lp._coder_solve_settings({"id": "bd-9", "project": "board-plugin"})
+    assert s["budget"] == 9  # board-plugin's coder_solve_budget
+    assert s["test_cmd"] == "ruff check ."  # its gate doubles as the solve verifier
+    # a project with no coder_solve_budget override falls back to the instance default.
+    other = lp._coder_solve_settings({"id": "bd-o", "project": "other"})
+    assert other["budget"] == lp.coder_solve_budget
+
+
+async def test_drive_builds_in_the_features_project_repo(monkeypatch):
+    # r1 end-to-end: the drive creates the worktree + opens the PR in the project's repo.
+    captured = {}
+    store = FakeLoopStore()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root):
+        captured["repo"], captured["base"] = repo, base
+        return (f"/wt/feat-{fid}", f"feat/{fid}")
+
+    async def _dispatch(*a, **k):
+        return "the coder reply"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        captured["pr_base"] = base
+        return "https://example/pr/1"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+    loop = BoardLoop(
+        {
+            "coder": "proto",
+            "coder_solve": False,  # force the single-shot path (no solve ladder)
+            "repo": "/instance/repo",
+            "projects": {"board-plugin": {"repo": "/repos/board-plugin", "base_branch": "develop"}},
+        }
+    )
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive({**FEATURE, "project": "board-plugin"})
+    assert captured["repo"] == "/repos/board-plugin"  # NOT /instance/repo
+    assert captured["base"] == "develop" and captured["pr_base"] == "develop"
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+
+
 # ── gate preflight (fail-closed: never start work a broken gate can't accept) ─────
 
 
 class _PreflightStore(FakeLoopStore):
-    """FakeLoopStore + the ready-list and clear_blocked the preflight hold/release use."""
+    """FakeLoopStore + the ready list, ready_queue, claim, and clear_blocked the
+    per-project preflight hold/release + _spawn_ready use. ``ready`` is a list of fids
+    (default project) or ``(fid, project)`` tuples so a test can spread ready work
+    across projects (#90)."""
 
     def __init__(self, ready):
         super().__init__()
-        self._ready = [{"id": f, "blocked": False} for f in ready]
+        self._ready = []
+        for r in ready:
+            fid, project = r if isinstance(r, tuple) else (r, "")
+            f = {"id": fid, "board_state": "ready", "blocked": False, "files_to_modify": []}
+            if project:
+                f["project"] = project
+            self._ready.append(f)
 
     def list_features(self, state=None):
-        return list(self._ready) if state == "ready" else []
+        return [dict(f) for f in self._ready] if state == "ready" else []
+
+    def ready_queue(self, relaxed=False):
+        return [dict(f) for f in self._ready]
+
+    def claim(self, fid, assignee=""):
+        for f in self._ready:
+            if f["id"] == fid:
+                self.calls.append(("claim", fid))
+                return dict(f)
+        return None
 
     def clear_blocked(self, fid):
         self.calls.append(("clear_blocked", fid))
@@ -3011,65 +3150,66 @@ class _FakeProc:
 
 def test_preflight_config_defaults():
     assert BoardLoop({}).preflight is True  # on by default
-    assert BoardLoop({})._preflight_state is None
+    assert BoardLoop({})._preflight_state == {}  # per-project dict, empty = nothing checked
     assert BoardLoop({"preflight": False}).preflight is False
 
 
-async def test_preflight_noop_when_no_gate():
-    # No local_gate_cmd → nothing to smoke → treated as runnable, never shells out.
+async def test_preflight_noop_when_no_gate(monkeypatch):
+    # No local_gate_cmd → nothing to smoke → the project is treated as runnable.
     lp = BoardLoop({"preflight": True})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
     await lp._maybe_preflight()
-    assert lp._preflight_state is True
+    assert lp._preflight_state["default"] is True
 
 
 async def test_preflight_passes_when_gate_exits_zero(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._store_kw = {"repo": "/repo"}
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
 
     async def _shell(*a, **k):
         return _FakeProc(0)
 
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()
-    assert lp._preflight_state is True
+    assert lp._preflight_state["default"] is True
 
 
 async def test_preflight_fails_closed_on_nonzero(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._store_kw = {"repo": "/repo"}
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
 
     async def _shell(*a, **k):
         return _FakeProc(1, b"apps/x build: sh: 1: tsc: not found")
 
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()
-    assert isinstance(lp._preflight_state, str)
-    assert "tsc: not found" in lp._preflight_state
+    assert isinstance(lp._preflight_state["default"], str)
+    assert "tsc: not found" in lp._preflight_state["default"]
 
 
 async def test_preflight_fails_closed_when_gate_cannot_launch(monkeypatch):
     # The exact case this exists for: the gate binary isn't installed.
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._store_kw = {"repo": "/repo"}
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
 
     async def _shell(*a, **k):
         raise FileNotFoundError("pnpm")
 
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()
-    assert isinstance(lp._preflight_state, str)
-    assert "could not run" in lp._preflight_state
+    assert isinstance(lp._preflight_state["default"], str)
+    assert "could not run" in lp._preflight_state["default"]
 
 
 def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._preflight_state = "gate exited 1: tsc: not found"  # simulate a failed preflight
+    lp._preflight_state = {"default": "gate exited 1: tsc: not found"}  # simulate a failed preflight
     store = _PreflightStore(ready=["bd-1", "bd-2"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     spawned = lp._spawn_ready()
 
-    assert spawned is False  # dispatched nothing
+    assert spawned is False  # dispatched nothing — every ready card is in the held project
     blocked = {c[1]: c[2] for c in store.calls if c[0] == "flag_blocked"}
     assert set(blocked) == {"bd-1", "bd-2"}  # both held, visibly
     assert all("preflight" in reason.lower() for reason in blocked.values())
@@ -3077,13 +3217,14 @@ def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
 
 async def test_preflight_recovery_releases_holds(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
-    lp._store_kw = {"repo": "/repo"}
-    lp._preflight_state = "gate exited 1"  # previously failed
-    lp._preflight_held = {"bd-1", "bd-2"}  # and it held these
+    lp._preflight_state = {"default": "gate exited 1"}  # previously failed
+    lp._preflight_held = {"default": {"bd-1", "bd-2"}}  # and it held these
     # A recheck of a KNOWN-failed preflight is throttled by (monotonic() - _last_preflight);
     # put the last check far enough back that the recheck fires regardless of the absolute
     # monotonic value (a fresh CI container's clock can be < the 60s throttle window).
-    lp._last_preflight = -10_000.0
+    lp._last_preflight = {"default": -10_000.0}
+    # No ready work left (the held cards dropped out of `ready`) — recovery must STILL
+    # fire for a project still marked failed, else the holds never release.
     store = _PreflightStore(ready=[])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
@@ -3093,9 +3234,56 @@ async def test_preflight_recovery_releases_holds(monkeypatch):
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()
 
-    assert lp._preflight_state is True
-    assert lp._preflight_held == set()
+    assert lp._preflight_state["default"] is True
+    assert lp._preflight_held == {}  # the project's hold set was cleared and dropped
     assert {c[1] for c in store.calls if c[0] == "clear_blocked"} == {"bd-1", "bd-2"}
+
+
+async def test_spawn_ready_holds_only_the_failed_project(monkeypatch):
+    """Per-project isolation (#90, r2/r6): preflight failed for project A, but a ready
+    feature in project B is still claimed + driven this tick."""
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build", "max_concurrent": 2})
+    lp._preflight_state = {"proj-a": "gate exited 1: tsc missing", "proj-b": True}
+    # bd-a builds in the broken project A; bd-b in the healthy project B.
+    store = _PreflightStore(ready=[("bd-a", "proj-a"), ("bd-b", "proj-b")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    finish = await _hold_drives(lp, monkeypatch)
+    try:
+        spawned = lp._spawn_ready()
+        assert spawned is True  # project B's feature was dispatched despite A's broken gate
+        assert len(lp._drives) == 1  # ONLY B — A is held
+        claims = [c[1] for c in store.calls if c[0] == "claim"]
+        assert claims == ["bd-b"]  # A never claimed; B claimed
+        blocked = {c[1] for c in store.calls if c[0] == "flag_blocked"}
+        assert blocked == {"bd-a"}  # only the failed project's card is held
+    finally:
+        await finish()
+
+
+async def test_preflight_isolation_a_fails_b_passes(monkeypatch):
+    """_maybe_preflight smokes each project's gate independently (#90): project A's gate
+    fails-closed while project B's passes — the two states never cross-contaminate."""
+    lp = BoardLoop(
+        {
+            "preflight": True,
+            "projects": {
+                "proj-a": {"repo": "/repos/a", "local_gate_cmd": "gate-a"},
+                "proj-b": {"repo": "/repos/b", "local_gate_cmd": "gate-b"},
+            },
+        }
+    )
+    store = _PreflightStore(ready=[("bd-a", "proj-a"), ("bd-b", "proj-b")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _shell(cmd, **k):
+        return _FakeProc(1, b"gate-a: boom") if cmd == "gate-a" else _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+
+    assert isinstance(lp._preflight_state["proj-a"], str)  # A held closed
+    assert "boom" in lp._preflight_state["proj-a"]
+    assert lp._preflight_state["proj-b"] is True  # B runnable — unaffected by A
 
 
 # ── auto gate resolution (_resolve_gate_cmd) ────────────────────────────────────
@@ -3487,7 +3675,9 @@ async def test_preflight_cancelled_by_shutdown_does_not_produce_failure(monkeypa
 
     monkeypatch.setattr("asyncio.create_subprocess_shell", _cancelled)
 
-    await loop._preflight()
+    await loop._preflight("default", "ruff check .", "/repo")
 
-    # State must remain None (unchecked) — never a failure string that would hold work.
-    assert not isinstance(loop._preflight_state, str)
+    # The project's state must remain unset (unchecked) — never a failure string that
+    # would hold work.
+    assert loop._preflight_state.get("default") is None
+    assert not isinstance(loop._preflight_state.get("default"), str)

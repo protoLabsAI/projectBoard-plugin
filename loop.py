@@ -44,6 +44,8 @@ import time
 
 from . import coder_seam, config, worktree
 from .failures import classify
+from .projects import default_project as resolve_default_project
+from .projects import resolve_projects
 from .store import (
     LABEL_CHANGES_REQUESTED,
     LABEL_MERGED_VERIFIED_PREFIX,
@@ -389,6 +391,17 @@ _MAX_MODE_JUDGE_SYS = (
 class BoardLoop:
     def __init__(self, cfg: dict):
         self.cfg = cfg or {}
+        # Per-feature project resolution (#90 slice 2): the board's `projects:` map
+        # (name → execution settings, resolved by projects.resolve_projects) so a single
+        # loop can serve several repos. Absent a map, resolve_projects synthesizes a
+        # SINGLE implicit project from the flat top-level keys, so a pre-#90 config
+        # behaves exactly as before — every feature resolves to `self._default_project`.
+        # `_project_cfg(feature)` reads the `project:<name>` label stamped in slice 1 and
+        # returns THAT project's settings; every repo/gate/coder/preflight decision below
+        # resolves through it, falling back to the instance-level knobs the flat config
+        # parsed. `_default_project` is the fallback for a feature carrying no label.
+        self._projects = resolve_projects(self.cfg)
+        self._default_project = resolve_default_project(self.cfg)
         self.coder_name = self.cfg.get("coder", "proto")
         self.reviewer_name = self.cfg.get("reviewer", "quinn")
         # Review dispatch is OPT-IN (default off). The fleet's PR-review pipeline
@@ -523,9 +536,14 @@ class BoardLoop:
         # gate). Opt out with ``preflight: false``.
         self.preflight = bool(self.cfg.get("preflight", True))
         self.preflight_timeout = float(self.cfg.get("preflight_timeout_s", self.local_gate_timeout))
-        self._preflight_state: bool | str | None = None  # None=unchecked, True=runnable, str=reason
-        self._last_preflight = 0.0
-        self._preflight_held: set[str] = set()
+        # Per-PROJECT preflight isolation (#90 slice 2): keyed by project name, not a
+        # single scalar — a broken gate in project A holds only A's ready work while B
+        # keeps dispatching. Each value is None=unchecked, True=runnable, str=failure
+        # reason; `_preflight_held[name]` is the set of fids THIS loop blocked for that
+        # project's failed preflight; `_last_preflight[name]` throttles its re-checks.
+        self._preflight_state: dict[str, bool | str | None] = {}
+        self._last_preflight: dict[str, float] = {}
+        self._preflight_held: dict[str, set[str]] = {}
         # ── coder.solve() board seam (ADR 0064 P2, opt-in) ─────────────────────────
         # Route a FRESH build (not a keep-worktree/CI-bounce re-dispatch) through the
         # `coder` plugin's execution-grounded solve() ladder (greedy → best-of-k →
@@ -617,6 +635,10 @@ class BoardLoop:
             repo=self.cfg.get("repo", "."),
             base_branch=self.cfg.get("base_branch", "main"),
             max_files_by_difficulty=self.cfg.get("max_files_by_difficulty"),
+            # #90: hand the store the same resolved map, so its own per-feature reads
+            # (the Ready gate's `_repo_for`) resolve to the same project the loop does.
+            projects=self._projects,
+            default_project=self._default_project,
         )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -678,6 +700,166 @@ class BoardLoop:
         identity/credential block, honoring ``env_passthrough`` (#78)."""
         return config.sanitized_env(self.env_passthrough)
 
+    # ── per-feature project resolution (#90 slice 2) ──────────────────────────────
+    def _project_name(self, feature: dict) -> str:
+        """The project a feature builds in: its `project:<name>` label (stamped in
+        slice 1), or the board's default project when the feature carries none — a
+        pre-#90 feature, or a board with no `projects:` map."""
+        return str(feature.get("project") or "").strip() or self._default_project
+
+    def _project_cfg(self, feature: dict) -> dict:
+        """The resolved execution settings for THIS feature's project — repo,
+        base_branch, local_gate_cmd, coders, gate_files, repo_conventions, every
+        `coder_solve_*` knob, … (see projects.py). Falls back to the default project's
+        settings when the feature's label names no known project (or names none), so a
+        single-repo board and every pre-#90 feature resolve exactly as before."""
+        entry = self._projects.get(self._project_name(feature))
+        if entry is None:
+            entry = self._projects.get(self._default_project)
+        return entry or {}
+
+    def _repo_for(self, feature: dict) -> str:
+        """The repo root this feature builds in (#90). A feature carrying an explicit
+        `project:<name>` label resolves STRICTLY to that project's `repo` — overriding
+        the instance default the store stamped on it (this is the whole point of the
+        slice: a labeled feature builds in ITS repo, not the board's). An unlabeled
+        feature — pre-#90, or a board with no `projects:` map — keeps the store-stamped
+        repo, then the default project's, then the instance default (back-compat)."""
+        name = str(feature.get("project") or "").strip()
+        if name:
+            repo = str((self._projects.get(name) or {}).get("repo") or "").strip()
+            if repo:
+                return repo
+        return (
+            str(feature.get("repo") or "").strip()
+            or str(self._project_cfg(feature).get("repo") or "").strip()
+            or self._store_kw["repo"]
+        )
+
+    def _base_branch_for(self, feature: dict) -> str:
+        """The base branch this feature's PR targets (#90). A labeled feature whose
+        project declares a `base_branch` uses it; otherwise the store-stamped value, the
+        default project's, then the instance default."""
+        name = str(feature.get("project") or "").strip()
+        if name:
+            base = str((self._projects.get(name) or {}).get("base_branch") or "").strip()
+            if base:
+                return base
+        return (
+            str(feature.get("base_branch") or "").strip()
+            or str(self._project_cfg(feature).get("base_branch") or "").strip()
+            or self._store_kw.get("base_branch")
+            or "main"
+        )
+
+    def _local_gate_cmd_for(self, feature: dict) -> str:
+        """The pre-PR / preflight gate command for this feature's project (#90). When
+        the project entry declares `local_gate_cmd` it is resolved against THAT project's
+        repo (so ``auto`` discovers the right checkout); otherwise the instance-level
+        gate the flat config already resolved at init."""
+        pc = self._project_cfg(feature)
+        if "local_gate_cmd" in pc:
+            return _resolve_gate_cmd(str(pc.get("local_gate_cmd") or ""), self._repo_for(feature))
+        return self.local_gate_cmd
+
+    def _format_cmd_for(self, feature: dict) -> str:
+        """The pre-PR auto-fix command (``format_cmd``) for this feature's project
+        (#90), else the instance default."""
+        pc = self._project_cfg(feature)
+        if "format_cmd" in pc:
+            return str(pc.get("format_cmd") or "").strip()
+        return self.format_cmd
+
+    def _gate_files_for(self, feature: dict) -> list[str]:
+        """The repo standing gate files (#108) for this feature's project (#90), else
+        the instance default."""
+        pc = self._project_cfg(feature)
+        if "gate_files" in pc:
+            return _parse_gate_files(pc.get("gate_files"))
+        return self.gate_files
+
+    def _repo_conventions_for(self, feature: dict) -> str:
+        """The repo conventions prose (#108) for this feature's project (#90), else the
+        instance default."""
+        pc = self._project_cfg(feature)
+        if "repo_conventions" in pc:
+            return str(pc.get("repo_conventions") or "")
+        return self.repo_conventions
+
+    def _coders_for(self, feature: dict) -> dict[str, str]:
+        """The tier→delegate `coders` map for this feature's project (#90), else the
+        instance default — so escalation on a multi-repo board climbs the ladder the
+        FEATURE's project declares, not the board's."""
+        raw = self._project_cfg(feature).get("coders")
+        if isinstance(raw, dict) and raw:
+            return {str(k): str(v) for k, v in raw.items()}
+        return self.coders
+
+    def _coder_solve_test_cmd_for(self, feature: dict) -> str:
+        """The coder.solve() verifier command for this feature's project (#90): the
+        project's `coder_solve_test_cmd`, else its resolved gate command (many repos
+        configure that as the real test command), else the instance default."""
+        pc = self._project_cfg(feature)
+        v = str(pc.get("coder_solve_test_cmd", "")).strip()
+        if v:
+            return v
+        gate = self._local_gate_cmd_for(feature)
+        return gate or self.coder_solve_test_cmd
+
+    def _coder_solve_settings(self, feature: dict) -> dict:
+        """Resolve the coder.solve() search knobs for this feature's project (#90). Each
+        `coder_solve_*` knob prefers the project entry, falling back to the instance-level
+        value the flat config parsed — so a board with no `projects:` map is unchanged."""
+        pc = self._project_cfg(feature)
+
+        def _int(key: str, default: int, floor: int) -> int:
+            if key in pc:
+                try:
+                    return max(floor, int(pc[key]))
+                except (TypeError, ValueError):
+                    return default
+            return default
+
+        def _float(key: str, default: float) -> float:
+            if key in pc:
+                try:
+                    return float(pc[key])
+                except (TypeError, ValueError):
+                    return default
+            return default
+
+        fusion = self.coder_solve_fusion_delegate
+        if "coder_solve_fusion_delegate" in pc:
+            fusion = str(pc.get("coder_solve_fusion_delegate") or "").strip()
+        return {
+            "test_cmd": self._coder_solve_test_cmd_for(feature),
+            "test_timeout": _float("coder_solve_test_timeout_s", self.coder_solve_test_timeout),
+            "budget": _int("coder_solve_budget", self.coder_solve_budget, 1),
+            "k": _int("coder_solve_k", self.coder_solve_k, 1),
+            "tree_depth": _int("coder_solve_tree_depth", self.coder_solve_tree_depth, 0),
+            "fusion_delegate": fusion,
+            "fusion_k": _int("coder_solve_fusion_k", self.coder_solve_fusion_k, 1),
+            "fusion_max_file_chars": _int(
+                "coder_solve_fusion_max_file_chars", self.coder_solve_fusion_max_file_chars, 1
+            ),
+            "fusion_max_total_chars": _int(
+                "coder_solve_fusion_max_total_chars", self.coder_solve_fusion_max_total_chars, 1
+            ),
+        }
+
+    def _all_repos(self) -> list[str]:
+        """Every distinct repo root the board builds in — one per project (#90). A
+        filesystem sweep that isn't scoped to a single feature (the orphaned-worktree
+        reap) must cover every project's checkout, not just the instance default."""
+        seen: dict[str, None] = {}
+        for entry in self._projects.values():
+            repo = str((entry or {}).get("repo") or "").strip()
+            if repo:
+                seen.setdefault(repo, None)
+        if not seen:
+            seen.setdefault(self._store_kw["repo"], None)
+        return list(seen)
+
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
         if not self.enabled:
@@ -734,7 +916,8 @@ class BoardLoop:
         it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
-        pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=self._store_kw["repo"])
+        feature = store.get_feature(fid) or {}
+        pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=self._repo_for(feature))
         if pr_url:
             store.open_review(fid, pr_url=pr_url)
             log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
@@ -771,8 +954,8 @@ class BoardLoop:
             sha = str(f.get("verified_sha") or "").strip()
             if not sha:
                 return False
-            repo = f.get("repo") or self._store_kw["repo"]
-            base = f.get("base_branch") or self._store_kw.get("base_branch") or "main"
+            repo = self._repo_for(f)
+            base = self._base_branch_for(f)
             branch = f"feat/{fid}"
             wt = os.path.join(repo, self.root, f"feat-{fid}")
             if not os.path.isdir(wt):
@@ -800,8 +983,8 @@ class BoardLoop:
             # candidate that verified before the crash but fails today (base moved,
             # env changed) is a doubt, not a ship.
             wt, branch = await worktree.promote_worktree(repo, wt, branch, fid, self.root)
-            await self._run_fixups(wt)
-            if await self._run_local_gate(wt) is not None:
+            await self._run_fixups(wt, f)
+            if await self._run_local_gate(wt, f) is not None:
                 log.info("[project_board] %s salvage: gate fails on the candidate now — rebuild fresh", fid)
                 self._clear_verified(store, fid)
                 return False
@@ -846,7 +1029,6 @@ class BoardLoop:
         (#115) — the board's growth valve; archival only, nothing is ever deleted.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
-        repo = self._store_kw["repo"]
         for f in store.list_features(state="in_progress"):
             fid = f["id"]
             if fid in self._inflight_files:
@@ -856,6 +1038,28 @@ class BoardLoop:
                 await self._reconcile_orphan(fid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reconcile for %s failed", fid, exc_info=True)
+        # #90: reap orphaned worktrees across EVERY project's checkout, not just the
+        # instance default — a multi-repo board holds feat-<id> worktrees under each
+        # project's repo, and a worktree resolved in repo A must be reaped in repo A.
+        for repo in self._all_repos():
+            await self._sweep_worktrees(store, repo)
+        # (c) the archive pass (#115): age done/cancelled features out of the live
+        # view so the Done column doesn't bury recent work — a label write only. Runs
+        # ONCE per sweep (project-independent — the board db is shared), after the
+        # per-repo worktree reap above.
+        try:
+            archived = store.archive_stale(self.archive_after_days)
+            if archived:
+                log.info(
+                    "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("[project_board] sweep archive pass failed", exc_info=True)
+
+    async def _sweep_worktrees(self, store, repo: str) -> None:
+        """Reap orphaned ``feat-<id>`` worktrees under one project's checkout (#90) —
+        the per-repo half of the health sweep, factored out so it runs once per project
+        repo. Best-effort; a per-item failure never stops the sweep."""
         for wtid in worktree.list_feature_worktrees(repo, self.root):
             # A `.gN`/`.cN` candidate worktree is not a feature id (bd-1cp.g1) — its
             # board state lives on the PARENT feature, so resolve through that (#91):
@@ -890,16 +1094,6 @@ class BoardLoop:
                             )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
-        # (c) the archive pass (#115): age done/cancelled features out of the live
-        # view so the Done column doesn't bury recent work — a label write only.
-        try:
-            archived = store.archive_stale(self.archive_after_days)
-            if archived:
-                log.info(
-                    "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
-                )
-        except Exception:  # noqa: BLE001
-            log.warning("[project_board] sweep archive pass failed", exc_info=True)
 
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
@@ -945,11 +1139,13 @@ class BoardLoop:
         grepping log levels."""
         if len(self._drives) >= self.max_concurrent:
             return False
-        # Fail-closed gate preflight: if the gate can't run on clean base, HOLD all work
-        # (surfaced on the board) rather than dispatch coders that can never pass it.
-        if isinstance(self._preflight_state, str):
+        # Fail-closed gate preflight, per-project (#90): a project whose gate can't run on
+        # clean base HOLDS its own ready work (surfaced on the board) rather than dispatch
+        # coders that can never pass it — but a broken gate in project A must NOT hold
+        # project B, so this holds only the failed projects and the claim loop below skips
+        # their candidates while continuing to dispatch every runnable project.
+        if any(isinstance(v, str) for v in self._preflight_state.values()):
             self._hold_ready_for_preflight()
-            return False
         store = self._store()
         # Review-queue WIP limit — don't claim new work while the review queue is full.
         if self.max_pending_reviews and len(store.list_features(state="in_review")) >= self.max_pending_reviews:
@@ -972,6 +1168,13 @@ class BoardLoop:
                 # a blocked-flagged feature can carry the `ready` label too
                 reason = "blocked" if candidate.get("blocked") else f"state={candidate.get('board_state')}"
                 skipped.append({"fid": cid, "reason": reason})
+                continue
+            # Per-project preflight hold (#90): this candidate's project can't run its
+            # gate on clean base — skip it (it was flag_blocked above), but keep scanning
+            # so a sibling in a HEALTHY project still gets claimed this tick.
+            pname = self._project_name(candidate)
+            if isinstance(self._preflight_state.get(pname), str):
+                skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
                 continue
             files = set(candidate.get("files_to_modify") or [])
             overlap = files & busy
@@ -1030,12 +1233,13 @@ class BoardLoop:
         Blocked for triage (+reap; the work was rejected, don't silently re-dispatch);
         ``OPEN`` → leave it in review."""
         store = self._store()
-        repo = self._store_kw["repo"]
         for f in store.list_features(state="in_review"):
             fid = f["id"]
             pr_url = f.get("pr_url")
             if not pr_url:
                 continue
+            # #90: reconcile each PR against ITS project's checkout, not the board default.
+            repo = self._repo_for(f)
             try:
                 state = await worktree.pr_state(pr_url, cwd=repo)
                 if state == "MERGED":
@@ -1111,7 +1315,7 @@ class BoardLoop:
         mss = await worktree.pr_merge_state(pr_url, cwd=repo)
         if mss not in ("BEHIND", "DIRTY"):
             return False  # CLEAN / BLOCKED(checks) / UNKNOWN(computing) / DRAFT → not ours
-        base = feature.get("base_branch") or self._store_kw.get("base_branch") or "main"
+        base = self._base_branch_for(feature)
         outcome, detail = await worktree.rebase_onto_base(repo, f"feat/{fid}", base, root=self.root)
         if outcome == "clean":
             log.info("[project_board] %s auto-rebased onto %s (was %s) — force-pushed", fid, base, mss)
@@ -1177,9 +1381,9 @@ class BoardLoop:
         budget nor stamps. Returns True only when it BLOCKED the card (the caller
         skips the rest of this pass)."""
         fid = feature["id"]
-        if not self.local_gate_cmd:
+        if not self._local_gate_cmd_for(feature):
             return False  # no gate → nothing to verify the merged state WITH
-        base = feature.get("base_branch") or self._store_kw.get("base_branch") or "main"
+        base = self._base_branch_for(feature)
         base_sha = await worktree.origin_head_sha(repo, base)
         if not base_sha:
             return False  # transient git/infra hiccup — next poll retries
@@ -1231,7 +1435,7 @@ class BoardLoop:
             )
             return False
         try:
-            failure = await self._run_local_gate(detail)
+            failure = await self._run_local_gate(detail, feature)
         finally:
             await worktree.remove_worktree(repo, detail)
         short = base_sha[:_MERGED_VERIFIED_SHA_LEN]
@@ -1359,8 +1563,12 @@ class BoardLoop:
         it blocks at once — no redundant tier dance."""
         store = self._store()
         fid = feature["id"]
-        repo = feature.get("repo") or "."
-        base = feature.get("base_branch") or "main"
+        # #90: resolve repo/base/coders from THIS feature's project, not the instance
+        # default — so a multi-repo board builds each feature in its own checkout and
+        # escalates through the ladder its project declares.
+        repo = self._repo_for(feature)
+        base = self._base_branch_for(feature)
+        coders = self._coders_for(feature)
         title = f"feat: {feature['title']}"
         tier = store.current_tier(fid) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
@@ -1374,7 +1582,7 @@ class BoardLoop:
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons)
-                coder_name = self.coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
+                coder_name = coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
                     store.flag_blocked(fid, f"coder delegate {coder_name!r} not configured/enabled")
@@ -1408,9 +1616,11 @@ class BoardLoop:
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
                         files_to_modify = feature.get("files_to_modify") or []
+                        # #90: every solve() knob resolves from THIS feature's project.
+                        solve = self._coder_solve_settings(feature)
                         fusion = (
-                            self._resolve_delegate(self.coder_solve_fusion_delegate, "openai")
-                            if self.coder_solve_fusion_delegate
+                            self._resolve_delegate(solve["fusion_delegate"], "openai")
+                            if solve["fusion_delegate"]
                             else None
                         )
                         if fusion is not None:
@@ -1422,8 +1632,8 @@ class BoardLoop:
                             viable, reason = coder_seam.fusion_viable_for_files(
                                 repo,
                                 files_to_modify,
-                                max_file_chars=self.coder_solve_fusion_max_file_chars,
-                                max_total_chars=self.coder_solve_fusion_max_total_chars,
+                                max_file_chars=solve["fusion_max_file_chars"],
+                                max_total_chars=solve["fusion_max_total_chars"],
                             )
                             if not viable:
                                 log.info("[project_board] %s fusion rung skipped for this dispatch: %s", fid, reason)
@@ -1437,16 +1647,16 @@ class BoardLoop:
                             root=self.root,
                             fid=fid,
                             dispatch_timeout=self.coder_timeout or None,
-                            test_cmd=self.coder_solve_test_cmd,
-                            test_timeout=self.coder_solve_test_timeout,
-                            budget=self.coder_solve_budget,
-                            k=self.coder_solve_k,
-                            tree_depth=self.coder_solve_tree_depth,
+                            test_cmd=solve["test_cmd"],
+                            test_timeout=solve["test_timeout"],
+                            budget=solve["budget"],
+                            k=solve["k"],
+                            tree_depth=solve["tree_depth"],
                             record_gens=lambda n: store.record_gens_spent(fid, n),
                             fusion_delegate=fusion,
-                            fusion_k=self.coder_solve_fusion_k,
+                            fusion_k=solve["fusion_k"],
                             files_to_modify=files_to_modify,
-                            fusion_max_file_chars=self.coder_solve_fusion_max_file_chars,
+                            fusion_max_file_chars=solve["fusion_max_file_chars"],
                             # #86: same host-env strip the gate/preflight/format spawns
                             # get — keep the whitelist consistent across every subprocess.
                             env_passthrough=self.env_passthrough,
@@ -1530,12 +1740,12 @@ class BoardLoop:
                             raise worktree.WorktreeError(f"goal verification failed: {gap}")
                     # Auto-fix lint/format before the PR — the coder can't run the repo's
                     # formatter (edit-only), so this clears trivial nits that would fail CI.
-                    await self._run_fixups(wt)
+                    await self._run_fixups(wt, feature)
                     # Pre-PR local gate: run the repo's real checks in the worktree and, on
                     # failure, hand the coder the actual output to fix IN-WORKTREE before a PR
                     # (and a CI round-trip) ever opens. Same-tier, keep-worktree, bounded by
                     # local_gate_max; on exhaustion open the PR anyway (CI is the backstop).
-                    gate_out = await self._run_local_gate(wt)
+                    gate_out = await self._run_local_gate(wt, feature)
                     if gate_out is not None:
                         n = self._gate_fix_attempts.get(fid, 0)
                         if n < self.local_gate_max:
@@ -1919,7 +2129,7 @@ class BoardLoop:
             return False
         if self.max_mode_n > 1:
             return False
-        return coder_seam.should_use_solve(feature, test_cmd=self.coder_solve_test_cmd)
+        return coder_seam.should_use_solve(feature, test_cmd=self._coder_solve_test_cmd_for(feature))
 
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the
@@ -1928,17 +2138,19 @@ class BoardLoop:
         ``coder_seam.resolve_delegate``."""
         return coder_seam.resolve_delegate(name, expect_type)
 
-    async def _run_fixups(self, wt: str) -> None:
+    async def _run_fixups(self, wt: str, feature: dict | None = None) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.
         ``ruff check --fix . && ruff format .``) in the worktree before opening the PR.
         The coder is edit-only — it can't run the linter/formatter, so trivial lint/format
         nits would otherwise fail CI and burn a bounce/escalation. Best-effort: no command
-        configured, or any error/timeout, just proceeds (CI is still the real lint gate)."""
-        if not self.format_cmd:
+        configured, or any error/timeout, just proceeds (CI is still the real lint gate).
+        Resolves ``format_cmd`` from the feature's project when given (#90)."""
+        cmd = self._format_cmd_for(feature) if feature is not None else self.format_cmd
+        if not cmd:
             return
         try:
             proc = await asyncio.create_subprocess_shell(
-                self.format_cmd,
+                cmd,
                 cwd=wt,
                 env=self._child_env(),
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1948,7 +2160,7 @@ class BoardLoop:
         except Exception as exc:  # noqa: BLE001 — best-effort; CI still gates lint
             log.info("[project_board] fixups command failed (proceeding — CI still gates): %s", exc)
 
-    async def _run_local_gate(self, wt: str) -> str | None:
+    async def _run_local_gate(self, wt: str, feature: dict | None = None) -> str | None:
         """Run the pre-PR local gate (``local_gate_cmd``) in the worktree.
 
         Returns ``None`` when the gate passes (exit 0), when no gate is configured,
@@ -1956,8 +2168,9 @@ class BoardLoop:
         broken or flaky gate must never block otherwise-good work, so those degrade
         to "pass" (CI is still the real gate). Returns the captured output (tail,
         truncated to ``local_gate_output_chars``) on a CLEAN non-zero exit, so the
-        caller can hand it to the coder to fix."""
-        cmd = self.local_gate_cmd
+        caller can hand it to the coder to fix. Resolves the gate command from the
+        feature's project when given (#90)."""
+        cmd = self._local_gate_cmd_for(feature) if feature is not None else self.local_gate_cmd
         if not cmd:
             return None
         try:
@@ -1987,35 +2200,64 @@ class BoardLoop:
             log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
             return None
 
-    # ── gate preflight (fail-closed: never start work a broken gate can't accept) ──
-    async def _maybe_preflight(self) -> None:
-        """Re-run the gate preflight while it hasn't passed, throttled. Once it passes it
-        stays passed for the run (a healthy env doesn't spontaneously lose its toolchain;
-        a per-PR gate failure is handled in the drive, not here)."""
-        if not self.preflight or not self.local_gate_cmd:
-            self._preflight_state = True
-            return
-        if self._preflight_state is True:
-            return
-        now = time.monotonic()
-        # First check runs immediately (state is None); re-checks of a KNOWN-failed
-        # preflight are throttled so a slow gate isn't hammered every tick.
-        if self._preflight_state is not None and (now - self._last_preflight) < max(self.interval, 60.0):
-            return
-        self._last_preflight = now
-        await self._preflight()
+    # ── gate preflight (fail-closed, PER PROJECT: never start work a broken gate can't accept) ──
+    def _ready_projects(self, store) -> list[str]:
+        """The distinct projects with ready work right now — the set _maybe_preflight
+        smokes each tick (order-preserving, deduped)."""
+        names: list[str] = []
+        seen: set[str] = set()
+        for f in store.list_features(state="ready"):
+            name = self._project_name(f)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
 
-    async def _preflight(self) -> None:
-        """Smoke-run ``local_gate_cmd`` on the CLEAN base checkout (the main repo — coders
-        only ever touch worktrees, so it stays at base). Sets ``self._preflight_state``:
+    async def _maybe_preflight(self) -> None:
+        """Re-run each project's gate preflight while it hasn't passed, throttled per
+        project (#90). Once a project passes it stays passed for the run (a healthy env
+        doesn't spontaneously lose its toolchain; a per-PR gate failure is handled in the
+        drive, not here). Runs for every project with ready work AND every project still
+        marked failed — the latter so a project whose ready work got HELD (and so dropped
+        out of `ready`) still re-checks and can recover."""
+        if not self.preflight:
+            return
+        store = self._store()
+        names = list(self._ready_projects(store))
+        seen = set(names)
+        # A failed project may have no ready work left (its cards got held) — keep
+        # re-checking it so it can recover and release those holds.
+        for name, st in self._preflight_state.items():
+            if isinstance(st, str) and name not in seen:
+                seen.add(name)
+                names.append(name)
+        now = time.monotonic()
+        for name in names:
+            cmd = self._local_gate_cmd_for({"project": name})
+            if not cmd:
+                self._preflight_state[name] = True  # nothing to smoke → runnable
+                continue
+            state = self._preflight_state.get(name)
+            if state is True:
+                continue  # already passed this run
+            # First check runs immediately (state is None); re-checks of a KNOWN-failed
+            # preflight are throttled so a slow gate isn't hammered every tick.
+            if state is not None and (now - self._last_preflight.get(name, 0.0)) < max(self.interval, 60.0):
+                continue
+            self._last_preflight[name] = now
+            await self._preflight(name, cmd, self._repo_for({"project": name}))
+
+    async def _preflight(self, name: str, cmd: str, repo: str) -> None:
+        """Smoke-run project ``name``'s gate on its CLEAN base checkout (coders only ever
+        touch worktrees, so it stays at base). Sets ``self._preflight_state[name]``:
         ``True`` when the gate exits 0 (runnable), a reason string on a CLEAN non-zero exit
-        or a launch failure (broken environment → hold work). A TIMEOUT is indeterminate →
-        allow (a slow gate must not wedge the board). Releases any holds on recovery."""
-        repo = self._store_kw["repo"]
-        log.info("[project_board] preflight: smoking the gate on clean base — %s", self.local_gate_cmd)
+        or a launch failure (broken environment → hold THIS project's work). A TIMEOUT is
+        indeterminate → allow (a slow gate must not wedge the board). Releases this
+        project's holds on recovery."""
+        log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
         try:
             proc = await asyncio.create_subprocess_shell(
-                self.local_gate_cmd,
+                cmd,
                 cwd=repo,
                 env=self._child_env(),
                 stdout=asyncio.subprocess.PIPE,
@@ -2029,67 +2271,80 @@ class BoardLoop:
                 except ProcessLookupError:
                     pass
                 log.warning(
-                    "[project_board] preflight timed out (%ss) — indeterminate, allowing dispatch",
+                    "[project_board] preflight[%s] timed out (%ss) — indeterminate, allowing dispatch",
+                    name,
                     self.preflight_timeout,
                 )
-                self._preflight_state = True
+                self._preflight_state[name] = True
                 return
             if proc.returncode == 0:
-                if isinstance(self._preflight_state, str):
-                    log.info("[project_board] preflight RECOVERED — gate runnable again, releasing held work")
-                self._preflight_state = True
-                self._release_preflight_holds()
+                if isinstance(self._preflight_state.get(name), str):
+                    log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
+                self._preflight_state[name] = True
+                self._release_preflight_holds(name)
                 return
             text = (out or b"").decode("utf-8", "replace").strip()
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
-            self._preflight_state = text or f"gate exited {proc.returncode} with no output"
+            self._preflight_state[name] = text or f"gate exited {proc.returncode} with no output"
             log.error(
-                "[project_board] PREFLIGHT FAILED — the gate does not pass on clean base; "
-                "HOLDING all work until the environment is fixed:\n%s",
-                self._preflight_state,
+                "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
+                "HOLDING that project's work until the environment is fixed:\n%s",
+                name,
+                self._preflight_state[name],
             )
         except asyncio.CancelledError:
             if self._shutting_down:
-                log.info("[project_board] preflight cancelled by shutdown — no verdict")
+                log.info("[project_board] preflight[%s] cancelled by shutdown — no verdict", name)
                 return
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
-            self._preflight_state = f"gate command could not run: {exc}"
-            log.error("[project_board] PREFLIGHT FAILED — %s; HOLDING all work until fixed.", self._preflight_state)
+            self._preflight_state[name] = f"gate command could not run: {exc}"
+            log.error(
+                "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
+                name,
+                self._preflight_state[name],
+            )
 
     def _hold_ready_for_preflight(self) -> None:
-        """Flag every ready, not-already-held feature blocked with the preflight reason, so
-        the hold shows on the board instead of being a silent stall."""
-        reason = self._preflight_state if isinstance(self._preflight_state, str) else "gate preflight failed"
-        short = "gate preflight failed — the coder environment can't run the gate: " + reason.splitlines()[-1][:200]
+        """Flag every ready feature whose PROJECT's preflight failed blocked with that
+        project's reason (#90), so the hold shows on the board instead of a silent stall.
+        Features in projects whose gate CAN run are left alone — a broken gate in project
+        A never holds project B."""
         store = self._store()
         for f in store.list_features(state="ready"):
             fid = f["id"]
-            if fid in self._preflight_held or f.get("blocked"):
+            name = self._project_name(f)
+            reason = self._preflight_state.get(name)
+            if not isinstance(reason, str):
+                continue  # this feature's project can run its gate (or hasn't been checked)
+            held = self._preflight_held.setdefault(name, set())
+            if fid in held or f.get("blocked"):
                 continue
+            short = "gate preflight failed — the coder environment can't run the gate: " + reason.splitlines()[-1][:200]
             try:
                 store.flag_blocked(fid, short)
-                self._preflight_held.add(fid)
-                log.info("[project_board] preflight hold: flagged %s blocked (gate not runnable)", fid)
+                held.add(fid)
+                log.info("[project_board] preflight hold: flagged %s blocked (project %s gate not runnable)", fid, name)
             except Exception:  # noqa: BLE001 — a hold that can't be recorded must not kill the tick
                 log.warning("[project_board] preflight hold: flag_blocked failed for %s", fid, exc_info=True)
 
-    def _release_preflight_holds(self) -> None:
-        """Clear the blocks this loop placed for a failed preflight (only those — never
-        clobber a feature blocked for another reason)."""
-        if not self._preflight_held:
+    def _release_preflight_holds(self, name: str) -> None:
+        """Clear the blocks this loop placed for project ``name``'s failed preflight (only
+        those — never clobber a feature blocked for another reason)."""
+        held = self._preflight_held.get(name)
+        if not held:
             return  # nothing to release — don't build the store (it may need a CLI/DB
             # that isn't present) just to iterate an empty set. A clean preflight (the
             # common path) must never touch the store: the resulting error would be
             # caught by _preflight's outer except and masquerade as a gate failure.
         store = self._store()
-        for fid in list(self._preflight_held):
+        for fid in list(held):
             try:
                 store.clear_blocked(fid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] preflight release: clear_blocked failed for %s", fid, exc_info=True)
-        self._preflight_held.clear()
+        self._preflight_held.pop(name, None)
 
     async def _verify_goal(self, feature: dict, wt: str, base: str, coder_reply: str = "") -> str | None:
         """Pre-PR gate — DETERMINISTIC: no LLM, no diff dump. The one thing it adds over
@@ -2213,7 +2468,7 @@ class BoardLoop:
         Returns the winning index, or ``None`` when no candidate produced a diff."""
         # No oracle → judge exactly as before (it does its own emptiness handling and
         # returns None when every candidate is empty). Avoids a redundant diff pass.
-        if not self.local_gate_cmd:
+        if not self._local_gate_cmd_for(feature):
             return await self._judge_candidates(feature, base, worktrees)
 
         nonempty = await self._candidate_diff_indices(base, worktrees)
@@ -2223,7 +2478,7 @@ class BoardLoop:
             return nonempty[0]
 
         fid = feature.get("id")
-        gates = await asyncio.gather(*(self._run_local_gate(worktrees[i]) for i in nonempty))
+        gates = await asyncio.gather(*(self._run_local_gate(worktrees[i], feature) for i in nonempty))
         passing = [i for i, gap in zip(nonempty, gates) if gap is None]
         if not passing:
             log.info(
@@ -2390,13 +2645,16 @@ class BoardLoop:
         # prompt block (not merged into `files_to_modify`, not a ledger item #113): a
         # standing reminder that these must stay green even if the change doesn't
         # centre on them. Empty by default → no block.
+        # #90: gate files + conventions resolve from THIS feature's project, so a coder
+        # on a multi-repo board gets the standing obligations of the repo it builds in.
+        gate_files = self._gate_files_for(feature)
         gate_files_block = (
             "\n## Repo standing gate files (keep these green — repo-wide, not per-card)\n"
-            + "\n".join(f"- {g}" for g in self.gate_files)
+            + "\n".join(f"- {g}" for g in gate_files)
             + "\nThese are standing obligations for EVERY change in this repo (beyond the "
             "files listed above). If your change affects them, update them so the gate "
             "stays green.\n"
-            if self.gate_files
+            if gate_files
             else ""
         )
         # Repo conventions (#108): the RULES around the repo-wide gates — what CI runs,
@@ -2406,8 +2664,9 @@ class BoardLoop:
         # card author can't restate per-card. Emitted as a SEPARATE block right after
         # the gate files (its natural neighbour — both are repo-wide, not per-card),
         # verbatim from config. Injected unconditionally when set; empty → no block.
+        repo_conventions = self._repo_conventions_for(feature)
         repo_conventions_block = (
-            "\n## Repo conventions\n" + self.repo_conventions.strip() + "\n" if self.repo_conventions.strip() else ""
+            "\n## Repo conventions\n" + repo_conventions.strip() + "\n" if repo_conventions.strip() else ""
         )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
