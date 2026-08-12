@@ -16,7 +16,12 @@ import types
 
 import pytest
 
-from project_board.projects import registry_projects, resolve_project_cfg
+from project_board.projects import (
+    default_project,
+    registry_projects,
+    resolve_project_cfg,
+    resolve_projects,
+)
 
 
 @pytest.fixture
@@ -123,3 +128,127 @@ def test_a_raising_host_config_is_fatal_when_project_is_set(fake_host):
     fake_host([], raises=True)
     with pytest.raises(ValueError):
         resolve_project_cfg({"project": "pa", "repo": "."})
+
+
+# ── the board's own `projects:` map (#90) — distinct from the host registry above ──
+
+
+def test_resolve_projects_parses_the_map_with_full_execution_settings():
+    cfg = {
+        "default_project": "protoagent",
+        "projects": {
+            "protoagent": {
+                "repo": "/dev/protoAgent-team",
+                "base_branch": "main",
+                "local_gate_cmd": "make gate",
+                "coders": {"smart": "sonnet", "reasoning": "opus"},
+                "coder_solve_k": 3,
+                "gate_files": ["CHANGELOG.md"],
+                "repo_conventions": "keep it terse",
+                "worktrees_root": ".worktrees",
+                "format_cmd": "ruff format .",
+                "env_passthrough": ["HOME"],
+            },
+            "board-plugin": {
+                "repo": "/dev/projectBoard-plugin",
+                "local_gate_cmd": "ruff check .",
+                "coder_solve_k": 5,
+            },
+        },
+    }
+    out = resolve_projects(cfg)
+    assert set(out) == {"protoagent", "board-plugin"}
+    pa = out["protoagent"]
+    # every declared execution setting rides through untouched…
+    assert pa["repo"] == "/dev/protoAgent-team"
+    assert pa["base_branch"] == "main"
+    assert pa["local_gate_cmd"] == "make gate"
+    assert pa["coders"] == {"smart": "sonnet", "reasoning": "opus"}
+    assert pa["coder_solve_k"] == 3  # coder_solve_* carried by prefix, not a fixed key
+    assert pa["gate_files"] == ["CHANGELOG.md"]
+    assert pa["repo_conventions"] == "keep it terse"
+    assert pa["worktrees_root"] == ".worktrees"
+    assert pa["format_cmd"] == "ruff format ."
+    assert pa["env_passthrough"] == ["HOME"]
+    assert pa["name"] == "protoagent"  # each entry carries its own name
+    # …and a sparse entry only carries what it declared
+    bp = out["board-plugin"]
+    assert bp["repo"] == "/dev/projectBoard-plugin"
+    assert bp["coder_solve_k"] == 5
+    assert "base_branch" not in bp
+
+
+def test_resolve_projects_requires_repo_in_each_entry():
+    """r4: a project entry with no `repo` has nowhere to build → ValueError naming it,
+    never a silent bind to the server's cwd."""
+    with pytest.raises(ValueError, match="board-plugin.*has no `repo`"):
+        resolve_projects({"projects": {"board-plugin": {"local_gate_cmd": "ruff check ."}}})
+
+
+def test_resolve_projects_expands_tilde_paths(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/kj")
+    out = resolve_projects({"projects": {"pa": {"repo": "~/dev/pa", "worktrees_root": "~/wt"}}})
+    assert out["pa"]["repo"] == "/home/kj/dev/pa"
+    assert out["pa"]["worktrees_root"] == "/home/kj/wt"
+
+
+def test_resolve_projects_does_not_mutate_the_input():
+    cfg = {"projects": {"pa": {"repo": "/r"}}}
+    resolve_projects(cfg)
+    assert cfg == {"projects": {"pa": {"repo": "/r"}}}  # the entry is copied, never annotated in place
+
+
+# ── back-compat: no `projects:` map ⇒ a single implicit project from the flat keys ──
+
+
+def test_resolve_projects_synthesizes_an_implicit_project_from_flat_keys():
+    """r2/r10: absent `projects:`, one implicit project is synthesized from today's flat
+    top-level keys — so a config that predates the map keeps working, no migration."""
+    cfg = {
+        "repo": "/dev/thing",
+        "base_branch": "trunk",
+        "local_gate_cmd": "pytest -q",
+        "coders": {"smart": "sonnet"},
+        "coder_solve_k": 4,
+        "gate_files": ["README.md"],
+    }
+    out = resolve_projects(cfg)
+    assert list(out) == ["default"]  # the implicit name
+    entry = out["default"]
+    assert entry["repo"] == "/dev/thing"
+    assert entry["base_branch"] == "trunk"
+    assert entry["local_gate_cmd"] == "pytest -q"
+    assert entry["coders"] == {"smart": "sonnet"}
+    assert entry["coder_solve_k"] == 4
+    assert entry["gate_files"] == ["README.md"]
+    assert entry["name"] == "default"
+
+
+def test_resolve_projects_implicit_project_defaults_repo_to_dot():
+    """Back-compat: a flat config with no `repo` still yields a project (repo='.'), NOT a
+    ValueError — the pre-#90 single-repo default. (The ValueError is only for explicit
+    `projects:` entries.)"""
+    assert resolve_projects({"base_branch": "main"})["default"]["repo"] == "."
+
+
+def test_resolve_projects_implicit_project_takes_the_default_project_name():
+    out = resolve_projects({"default_project": "solo", "repo": "/r"})
+    assert list(out) == ["solo"]
+    assert out["solo"]["repo"] == "/r"
+
+
+# ── default_project: which project a feature falls back to at create time ──
+
+
+def test_default_project_prefers_the_configured_name():
+    cfg = {"default_project": "pa", "projects": {"pa": {"repo": "/r"}, "x": {"repo": "/y"}}}
+    assert default_project(cfg) == "pa"
+
+
+def test_default_project_falls_back_to_the_sole_project():
+    assert default_project({"projects": {"only": {"repo": "/r"}}}) == "only"
+    assert default_project({"repo": "/r"}) == "default"  # the implicit single project
+
+
+def test_default_project_is_empty_for_a_multi_project_map_with_no_default():
+    assert default_project({"projects": {"a": {"repo": "/a"}, "b": {"repo": "/b"}}}) == ""
