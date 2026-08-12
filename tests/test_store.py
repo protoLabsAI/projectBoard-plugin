@@ -947,6 +947,115 @@ def test_ready_queue_relaxed_releases_only_nonfoundation_in_review_blockers(make
     assert b.ready_queue() == []
 
 
+# ── #90: per-feature project field + per-project store resolution ───────────────────
+
+
+def test_project_exposes_the_project_label(make_board):
+    """_project reads the `project:<name>` label back into the projection; a feature
+    with no such label (pre-#90, or a board with no default) projects project=''."""
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "open", "labels": ["project:board-plugin"]})["project"] == "board-plugin"
+    assert b._project({"id": "y", "status": "open", "labels": []})["project"] == ""
+
+
+def test_create_feature_stamps_the_project_label_per_project(make_board):
+    """Two features created into two different projects each carry their OWN
+    `project:<name>` label (#90) — and neither is cross-stamped with the other's."""
+
+    def board_for(name):
+        br = Br({"create": "bd-x", "show": [{"id": "bd-x", "status": "open", "labels": [f"project:{name}"]}]})
+        return br, make_board(br)
+
+    br_a, b_a = board_for("protoagent")
+    f_a = b_a.create_feature("A", spec="s", acceptance_criteria="a", files_to_modify=["x.py"], project="protoagent")
+    br_b, b_b = board_for("board-plugin")
+    f_b = b_b.create_feature("B", spec="s", acceptance_criteria="a", files_to_modify=["y.py"], project="board-plugin")
+
+    assert f_a["project"] == "protoagent"
+    assert any(c[0] == "update" and "--add-label" in c and "project:protoagent" in c for c in br_a.calls)
+    assert f_b["project"] == "board-plugin"
+    assert any(c[0] == "update" and "--add-label" in c and "project:board-plugin" in c for c in br_b.calls)
+    # never cross-stamped: the protoagent board never writes the board-plugin label
+    assert not any("project:board-plugin" in c for c in br_a.calls)
+
+
+def test_create_feature_defaults_the_project_to_the_board_default(monkeypatch):
+    """With no explicit `project`, the feature is stamped with the board's
+    `default_project` — the single-config-serves-a-default path."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    br = Br({"create": "bd-1", "show": [{"id": "bd-1", "status": "open", "labels": ["project:protoagent"]}]})
+    b = store.BeadsBoard(db=None, repo="/repo", default_project="protoagent")
+    monkeypatch.setattr(b, "_run", br)
+    f = b.create_feature("t", spec="s", acceptance_criteria="a", files_to_modify=["x.py"])
+    assert f["project"] == "protoagent"
+    assert any(c[0] == "update" and "--add-label" in c and "project:protoagent" in c for c in br.calls)
+
+
+def test_create_feature_without_a_default_stamps_no_project_label(make_board):
+    """Back-compat: a board with no projects map / no default (make_board) stamps no
+    `project:` label — the single-repo behavior is unchanged."""
+    br = Br({"create": "bd-1", "show": [{"id": "bd-1", "status": "open", "labels": []}]})
+    b = make_board(br)
+    f = b.create_feature("t", spec="s", acceptance_criteria="a", files_to_modify=["x.py"])
+    assert f["project"] == ""
+    assert not any("--add-label" in c and any(str(a).startswith("project:") for a in c) for c in br.calls)
+
+
+def test_create_feature_rejects_an_invalid_project_name(make_board):
+    """An illegal project name (a `/` or `#`, unsafe for a beads label) rejects the
+    whole create BEFORE the bead is minted — never an orphan behind VALIDATION_FAILED."""
+    br = Br()
+    b = make_board(br)
+    with pytest.raises(BoardError, match="invalid project"):
+        b.create_feature("t", spec="s", acceptance_criteria="a", files_to_modify=["x.py"], project="bad/name#1")
+    assert not br.cmds("create")  # rejected before minting
+
+
+def test_ready_gate_validates_files_against_the_features_project_repo(monkeypatch, tmp_path):
+    """#90: the Ready gate resolves files_to_modify against the FEATURE's own project's
+    repo (from its `project` label + the board's projects map), not the instance default —
+    so a multi-repo board checks each card against the right checkout."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    server = tmp_path / "server"
+    server.mkdir()  # the instance default repo — deliberately EMPTY
+    proto = tmp_path / "proto"
+    proto.mkdir()  # protoagent project repo — also empty
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    (plugin / "store.py").write_text("x = 1\n")  # exists ONLY in the board-plugin repo
+    projects = {"protoagent": {"repo": str(proto)}, "board-plugin": {"repo": str(plugin)}}
+    br = Br()
+    b = store.BeadsBoard(db=None, repo=str(server), projects=projects, default_project="protoagent")
+    monkeypatch.setattr(b, "_run", br)
+
+    feature = {
+        "id": "bd-1",
+        "board_state": "backlog",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        "files_to_modify": ["store.py"],
+        "project": "board-plugin",
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+    # store.py exists in the board-plugin repo → the gate passes (it did NOT check the
+    # empty instance/server repo, which would have failed).
+    b.mark_ready("bd-1")
+    assert ("update", "bd-1", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+    # the SAME paths, now attributed to the protoagent project (store.py absent there) →
+    # refused, and the error names the protoagent repo, not the instance default.
+    br.calls.clear()
+    feature["project"] = "protoagent"
+    with pytest.raises(BoardError) as exc_info:
+        b.mark_ready("bd-1")
+    err = str(exc_info.value)
+    assert "do not exist in the repo" in err
+    assert "store.py" in err
+    assert str(proto) in err  # the feature's project repo is named…
+    assert str(server) not in err  # …NOT the instance default
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
 # ── #85: atomic create+enrich, leading-dash hardening, DB retry ─────────────────────
 # board_create_feature was not atomic: `br create` succeeded, then the enrichment
 # `br update` failed whenever a value STARTED WITH '-' (a markdown bullet in

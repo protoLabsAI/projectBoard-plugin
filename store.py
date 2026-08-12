@@ -148,6 +148,19 @@ LABEL_CHANGES_REQUESTED = "changes-requested"
 # the projection/console — the HARD gate is in `mark_ready` (a design referencing an
 # ADR is required at that size before the feature can go ready).
 LABEL_DESIGNING = "designing"
+# Which PROJECT a feature belongs to (#90): a `project:<name>` label naming the entry
+# in the board's `projects:` map (projects.py) that owns this feature — so one board
+# instance can serve multiple repos, the Ready gate validating each feature's paths
+# against ITS project's repo, not the instance default. Stamped at create time from
+# the `project` param (default = the board's `default_project`). A label, not a notes
+# line: project names are alphanumeric/hyphen, safe for beads' label validator (vs the
+# `/`/`#` in a source-issue, which had to move off-label, see NOTES_SOURCE_PREFIX).
+LABEL_PROJECT_PREFIX = "project:"
+# A project name must round-trip cleanly through a beads label — alphanumeric plus
+# hyphen/underscore (colon is the label separator, so it's excluded). A name with any
+# other character is rejected at create time with a named error rather than stamping a
+# label beads' validator would reject (VALIDATION_FAILED) after the bead already exists.
+_PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 # Difficulties whose blast radius demands a written design + an ADR reference before
 # the feature may go ready (the M6 DESIGN gate in `mark_ready`).
@@ -347,6 +360,25 @@ def normalize_source_issue(raw) -> str:
     )
 
 
+def normalize_project(raw) -> str:
+    """Normalize + validate a project name for the `project:<name>` label (#90).
+
+    Trims and requires alphanumeric/hyphen/underscore (see ``_PROJECT_NAME_RE``) so the
+    name round-trips cleanly through beads' label validator. Empty input returns ""
+    (no project stamped — the caller falls back to the board's default); a non-empty
+    value with an illegal character raises a named BoardError BEFORE the bead is minted,
+    so an invalid project can never leave an orphan bead behind a VALIDATION_FAILED."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if not _PROJECT_NAME_RE.fullmatch(s):
+        raise BoardError(
+            f"invalid project {raw!r} — a project name must be alphanumeric with hyphens/"
+            "underscores (safe for a beads label); rename the project in project_board.projects."
+        )
+    return s
+
+
 def _render_notes(files, source_issue: str = "", requirements=()) -> str:
     """Serialize the bead `notes` field: one files_to_modify path per line, one
     `req: {…json…}` requirement-item line per ledger entry (#113), plus a trailing
@@ -442,6 +474,8 @@ class BeadsBoard:
         repo: str = ".",
         base_branch: str = "main",
         max_files_by_difficulty: dict | None = None,
+        projects: dict | None = None,
+        default_project: str = "",
     ):
         if not shutil.which(BR):
             raise BoardError(
@@ -452,6 +486,19 @@ class BeadsBoard:
         self.actor = actor
         self.repo = repo
         self.base_branch = base_branch
+        # Per-project resolution (#90): the board's `projects:` map (name → settings,
+        # resolved by projects.resolve_projects) so a single instance can serve several
+        # repos. Copied so a caller's dict can't mutate it under us. `default_project` is
+        # the project a feature is stamped with when create_feature names none; absent a
+        # wired map (the host-free default, and every pre-#90 caller) it's "", so the
+        # store keeps its single-repo behavior — every feature resolves to `self.repo`.
+        self.projects = dict(projects or {})
+        # A wired map with a single entry has an obvious default even if none was named;
+        # a multi-project map with no default leaves it "" (create_feature then requires
+        # an explicit project, or stamps nothing).
+        self.default_project = str(default_project or "").strip() or (
+            next(iter(self.projects)) if len(self.projects) == 1 else ""
+        )
         # Breadth-cap policy (#143): difficulty → max files_to_modify before the Ready gate
         # refuses. Threaded from the `max_files_by_difficulty` config key (store_kw); a None/
         # empty override falls back to the built-in default. Copied so a caller's dict can't
@@ -607,6 +654,7 @@ class BeadsBoard:
         depends_on=(),
         foundation: bool = False,
         source_issue: str = "",
+        project: str = "",
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -614,10 +662,14 @@ class BeadsBoard:
         a coder produce nothing). Mark `foundation=True` for a feature others build on
         (dependents gate on its merge, never its review). `source_issue` names the
         ORIGINATING GitHub issue (a full issue URL or `owner/repo#N`, stored
-        normalized) so the PR opener can stamp `Fixes #N` on the feature's PR (#97)."""
-        # Normalize BEFORE minting the bead: an invalid source_issue must reject the
-        # whole create with a named error, never leave an orphan bead behind it.
+        normalized) so the PR opener can stamp `Fixes #N` on the feature's PR (#97).
+        `project` names the entry in the board's `projects:` map this feature builds in
+        (default = the board's `default_project`); it's stamped as a `project:<name>`
+        label so the Ready gate validates the feature's paths against ITS repo (#90)."""
+        # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
+        # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
+        proj = normalize_project(project or self.default_project)
         fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
         # with a follow-up `br update`. Free-text VALUES ride in `--flag=value` form so a
@@ -653,6 +705,11 @@ class BeadsBoard:
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")
+        if proj:
+            # `project:<name>` (#90) — stamped only when a name resolves (the param, or
+            # the board's default). Validated above, so it can't fail the label validator.
+            upd += ["--add-label", f"{LABEL_PROJECT_PREFIX}{proj}"]
+            enriched.append("project")
         # Dependency edges are independent of the enrichment `br update` — wire them
         # FIRST so an enrichment failure can never silently drop them (QA panel on
         # #88: the early success-with-warning return below used to skip the dep loop,
@@ -992,6 +1049,16 @@ class BeadsBoard:
         return f
 
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────
+    def _repo_for(self, f: dict) -> str:
+        """The repo root a feature's files_to_modify are validated against (#90). When
+        the feature carries a `project` known to this board's `projects:` map, that
+        project's repo; otherwise the instance repo — so a board with no map (or a
+        feature with no project) keeps its single-repo behavior. Guards the two ways an
+        entry can lack a usable repo (absent, or set to a blank) by falling back."""
+        name = str(f.get("project") or "").strip()
+        entry = self.projects.get(name) if name else None
+        return str((entry or {}).get("repo") or "").strip() or self.repo
+
     def _prepare_ready(self, fid: str) -> None:
         """Enforce the Ready gate and materialize the requirement ledger for ``fid``
         WITHOUT flipping the ``ready`` label — the prep half of ``mark_ready``, split
@@ -1017,15 +1084,17 @@ class BeadsBoard:
         # path (a plausible-but-wrong file the card author guessed) is invisible until a
         # coder burns a run chasing it. A `(new)` marker (case-insensitive, anywhere in the
         # entry) declares the file doesn't exist yet and bypasses the existence check.
+        # #90: the bound checkout is THIS FEATURE's project repo (via its `project` label),
+        # not the instance default — so a multi-repo board checks each card against its own
+        # repo; a card with no project falls back to the instance repo (single-repo path).
+        repo = self._repo_for(f)
         phantom = [
-            p
-            for p in f["files_to_modify"]
-            if "(new)" not in p.lower() and not os.path.exists(os.path.join(self.repo, p))
+            p for p in f["files_to_modify"] if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))
         ]
         if phantom:
             raise BoardError(
                 f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
-                f"in the repo (bound root: {os.path.abspath(self.repo)!r}, set via project_board.repo): "
+                f"in the repo (bound root: {os.path.abspath(repo)!r}, set via project_board.repo): "
                 f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
             )
         # BREADTH cap (#143): a small/medium card that names more files than its difficulty
@@ -1747,6 +1816,10 @@ class BeadsBoard:
         """A `br` bead → the board's feature view (stable shape for the loop/API)."""
         labels = bead.get("labels") or []
         diff = next((l.split(":", 1)[1] for l in labels if l.startswith("diff:")), "")
+        # Which project (#90) this feature builds in, from the single `project:<name>`
+        # label — "" when unstamped (a pre-#90 feature, or a board with no default),
+        # in which case the Ready gate falls back to the instance repo.
+        project = next((l[len(LABEL_PROJECT_PREFIX) :] for l in labels if l.startswith(LABEL_PROJECT_PREFIX)), "")
         attempts = sorted(
             int(l.split(":", 1)[1]) for l in labels if l.startswith("attempt:") and l.split(":", 1)[1].isdigit()
         )
@@ -1819,6 +1892,7 @@ class BeadsBoard:
             "verified_sha": verified_sha,
             "source_issue": source_issue,
             "requirements": requirements,
+            "project": project,
             "labels": labels,
             "repo": self.repo,
             "base_branch": self.base_branch,
