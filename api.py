@@ -296,7 +296,16 @@ def build_data_router(cfg: dict):
             )
 
         _PATCH_FIELDS = frozenset(
-            {"title", "spec", "acceptance_criteria", "design", "files_to_modify", "difficulty", "source_issue"}
+            {
+                "title",
+                "spec",
+                "acceptance_criteria",
+                "design",
+                "files_to_modify",
+                "difficulty",
+                "priority",
+                "source_issue",
+            }
         )
         kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
         changed = sorted(kwargs)

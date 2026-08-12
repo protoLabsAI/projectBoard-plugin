@@ -815,3 +815,26 @@ def test_patch_feature_is_operator_gated(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     assert c.patch("/api/plugins/project_board/features/bd-5", json={"spec": "x"}).status_code == 200
     assert c.patch("/plugins/project_board/features/bd-5", json={"spec": "x"}).status_code == 404
+
+
+def test_patch_feature_accepts_all_r1_fields(monkeypatch):
+    """All fields named in r1 — including priority — are forwarded to update_feature."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    payload = {
+        "title": "new title",
+        "spec": "new spec",
+        "acceptance_criteria": "new ac",
+        "design": "new design",
+        "files_to_modify": ["a.py", "b.py"],
+        "difficulty": "hard",
+        "priority": 1,
+        "source_issue": "https://github.com/org/repo/issues/99",
+    }
+    r = c.patch("/api/plugins/project_board/features/bd-5", json=payload)
+    assert r.status_code == 200
+    call = next(x for x in store.calls if x[0] == "update_feature")
+    assert call[1] == ("bd-5",)
+    for field in payload:
+        assert field in call[2], f"field {field!r} missing from update_feature kwargs"
+    assert call[2]["priority"] == 1
