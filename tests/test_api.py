@@ -20,6 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import project_board as pb
 from project_board import api, coder_seam
 from project_board.store import BoardError
 
@@ -55,7 +56,14 @@ class FakeStore:
 
     def create_feature(self, **k):
         self.calls.append(("create_feature", (), k))
-        return {"id": "bd-new", "board_state": "backlog", "title": k.get("title", "")}
+        # Echo `project` back as the real store's projection does (#90) — "" when the
+        # body named none (the store then stamps its own default_project).
+        return {
+            "id": "bd-new",
+            "board_state": "backlog",
+            "title": k.get("title", ""),
+            "project": k.get("project", ""),
+        }
 
     def create_from_plan(self, plan, mark_ready=False):
         self.calls.append(("create_from_plan", (), {"plan": plan, "mark_ready": mark_ready}))
@@ -838,3 +846,220 @@ def test_patch_feature_accepts_all_r1_fields(monkeypatch):
     for field in payload:
         assert field in call[2], f"field {field!r} missing from update_feature kwargs"
     assert call[2]["priority"] == 1
+
+
+# ── #90 slice 3: the `project` param through the data router ─────────────────────
+
+
+class _ProjectStore(FakeStore):
+    """A board holding features across two projects — exercises the ?project filter and
+    the detail-includes-project echo without a real ``br``."""
+
+    _FEATS = [
+        {"id": "bd-a", "title": "A", "board_state": "ready", "priority": 2, "project": "board-plugin"},
+        {"id": "bd-b", "title": "B", "board_state": "ready", "priority": 2, "project": "protoagent"},
+        {"id": "bd-c", "title": "C", "board_state": "backlog", "priority": 2, "project": "board-plugin"},
+    ]
+
+    def list_features(self, state=None, include_archived=False):
+        self.calls.append(("list_features", (), {"state": state, "include_archived": include_archived}))
+        return [dict(f) for f in self._FEATS]
+
+    def get_feature(self, fid):
+        self.calls.append(("get_feature", (fid,), {}))
+        return next((dict(f) for f in self._FEATS if f["id"] == fid), None)
+
+
+def test_create_feature_accepts_project_in_the_body(monkeypatch):
+    """r4: POST /features carries ``project`` through to store.create_feature, and the
+    created feature echoes it back in the response."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features", json={"title": "X", "spec": "s", "project": "board-plugin"})
+    assert r.status_code == 200 and r.json()["project"] == "board-plugin"
+    call = next(c for c in store.calls if c[0] == "create_feature")
+    assert call[2] == {"title": "X", "spec": "s", "project": "board-plugin"}
+
+
+def test_create_feature_without_project_lets_the_store_default_it(monkeypatch):
+    """r8 (API): a create with no ``project`` in the body forwards no project key, so the
+    store stamps its own ``default_project`` (the store-side default is pinned in
+    test_store.py) rather than the route forcing a value."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features", json={"title": "X", "spec": "s"})
+    assert r.status_code == 200
+    call = next(c for c in store.calls if c[0] == "create_feature")
+    assert "project" not in call[2]  # not forced → create_feature applies its default_project
+
+
+def test_features_route_filters_by_project(monkeypatch):
+    """r5: GET /features?project=<name> returns only the features stamped for that
+    project; absent, every project is listed; an unknown name is an empty listing."""
+    c = _client(monkeypatch, _ProjectStore())
+    filtered = c.get("/api/plugins/project_board/features?project=board-plugin")
+    assert filtered.status_code == 200
+    assert [f["id"] for f in filtered.json()["features"]] == ["bd-a", "bd-c"]
+    every = c.get("/api/plugins/project_board/features")
+    assert {f["id"] for f in every.json()["features"]} == {"bd-a", "bd-b", "bd-c"}
+    nope = c.get("/api/plugins/project_board/features?project=nope")
+    assert nope.status_code == 200 and nope.json()["features"] == []
+
+
+def test_feature_detail_includes_project(monkeypatch):
+    """r3 (API): GET /features/{fid} carries the feature's ``project`` field."""
+    c = _client(monkeypatch, _ProjectStore())
+    r = c.get("/api/plugins/project_board/features/bd-b")
+    assert r.status_code == 200 and r.json()["project"] == "protoagent"
+
+
+# ── #90 slice 3: the tool layer ─────────────────────────────────────────────────
+
+
+class _ProjectToolStore:
+    """A minimal store for the tool-level project flow: ``create_feature`` records the
+    ``project`` it's handed and remembers the feature; ``list_features`` returns them (so
+    the create-time dedup read and board_list both see the growing board)."""
+
+    def __init__(self):
+        self.feats = []
+
+    def list_features(self, state=None, include_archived=False):
+        return [dict(f) for f in self.feats]
+
+    def create_feature(self, title, **kw):
+        f = {
+            "id": f"bd-{len(self.feats) + 1}",
+            "title": title,
+            "board_state": "backlog",
+            "blocked": False,
+            "pr_url": "",
+            "priority": 2,
+            "difficulty": "",
+            "project": kw.get("project", ""),
+        }
+        self.feats.append(f)
+        return f
+
+
+def test_tools_create_in_two_projects_then_list_filters(monkeypatch):
+    """r1/r2/r7: two features created via board_create_feature into two projects; the
+    ``project`` rides create → list, and board_list(project=…) keeps only that project's
+    rows while an unfiltered list shows the whole board."""
+    fake = _ProjectToolStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    cfg = {
+        "projects": {"board-plugin": {"repo": "/plugin"}, "protoagent": {"repo": "/proto"}},
+        "default_project": "board-plugin",
+    }
+    tools = {t.name: t for t in pb._board_tools(cfg)}
+    create, lst = tools["board_create_feature"], tools["board_list"]
+
+    create.invoke(
+        {"title": "A", "spec": "s", "acceptance_criteria": "a", "files_to_modify": "a.py", "project": "board-plugin"}
+    )
+    create.invoke(
+        {"title": "B", "spec": "s", "acceptance_criteria": "a", "files_to_modify": "b.py", "project": "protoagent"}
+    )
+
+    only_plugin = json.loads(lst.invoke({"project": "board-plugin"}))
+    assert [(r["title"], r["project"]) for r in only_plugin] == [("A", "board-plugin")]
+    only_proto = json.loads(lst.invoke({"project": "protoagent"}))
+    assert [(r["title"], r["project"]) for r in only_proto] == [("B", "protoagent")]
+    everything = json.loads(lst.invoke({}))
+    assert {r["title"] for r in everything} == {"A", "B"}
+
+
+def test_tools_resolve_store_kw_to_the_named_project_repo(monkeypatch):
+    """r6: a project-scoped tool op resolves get_store to THAT project's repo/base_branch
+    (from the board's projects map), not the instance default — while the shared projects
+    map + default_project ride along so the store keeps its own per-feature resolution."""
+    seen = []
+    fake = _ProjectToolStore()
+
+    def _get_store(**kw):
+        seen.append(kw)
+        return fake
+
+    monkeypatch.setattr("project_board.store.get_store", _get_store)
+    cfg = {
+        "repo": "/server",
+        "projects": {
+            "board-plugin": {"repo": "/plugin", "base_branch": "main"},
+            "protoagent": {"repo": "/proto", "base_branch": "develop"},
+        },
+        "default_project": "board-plugin",
+    }
+    tools = {t.name: t for t in pb._board_tools(cfg)}
+
+    tools["board_create_feature"].invoke(
+        {"title": "A", "spec": "s", "acceptance_criteria": "a", "files_to_modify": "a.py", "project": "protoagent"}
+    )
+    assert seen[-1]["repo"] == "/proto" and seen[-1]["base_branch"] == "develop"
+    assert seen[-1]["default_project"] == "board-plugin"
+    assert set(seen[-1]["projects"]) == {"board-plugin", "protoagent"}
+
+    seen.clear()
+    tools["board_list"].invoke({"project": "protoagent"})
+    assert seen[-1]["repo"] == "/proto" and seen[-1]["base_branch"] == "develop"
+
+
+def test_tool_absent_project_stamps_the_board_default_end_to_end(monkeypatch):
+    """r8: board_create_feature with no ``project`` stamps the board's ``default_project``
+    — the store fills in the default the tool forwards as empty, proven on the real ``br``
+    label the create emits."""
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    calls = []
+
+    def run_impl(*args, want_json=False):
+        calls.append(args)
+        if args and args[0] == "create":
+            return "bd-1"
+        if args and args[0] == "show":
+            return [{"id": "bd-1", "status": "open", "labels": ["project:board-plugin"]}]
+        return [] if want_json else ""
+
+    board = store_mod.BeadsBoard(
+        db=None, repo="/repo", projects={"board-plugin": {"repo": "/repo"}}, default_project="board-plugin"
+    )
+    monkeypatch.setattr(board, "_run", run_impl)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    cfg = {"projects": {"board-plugin": {"repo": "/repo"}}, "default_project": "board-plugin"}
+    create = {t.name: t for t in pb._board_tools(cfg)}["board_create_feature"]
+    out = json.loads(create.invoke({"title": "T", "spec": "s", "acceptance_criteria": "a", "files_to_modify": "x.py"}))
+
+    assert out["id"] == "bd-1"
+    # the create stamped the board default project though the tool call named none
+    assert any(c and c[0] == "update" and "--add-label" in c and "project:board-plugin" in c for c in calls)
+
+
+def test_tool_get_feature_includes_project(monkeypatch):
+    """r3 (tool): board_get_feature surfaces the feature's ``project`` in its JSON."""
+
+    class _S:
+        def get_feature(self, fid):
+            return {
+                "id": fid,
+                "title": "T",
+                "spec": "s",
+                "acceptance_criteria": "a",
+                "design": "",
+                "board_state": "ready",
+                "labels": ["project:board-plugin"],
+                "pr_url": "",
+                "difficulty": "",
+                "files_to_modify": [],
+                "foundation": False,
+                "priority": 2,
+                "source_issue": "",
+                "depends_on": [],
+                "open_depends_on": [],
+                "project": "board-plugin",
+            }
+
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
+    out = json.loads({t.name: t for t in pb._board_tools({})}["board_get_feature"].invoke({"feature_id": "bd-1"}))
+    assert out["project"] == "board-plugin"

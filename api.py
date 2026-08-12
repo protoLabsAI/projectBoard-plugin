@@ -24,9 +24,28 @@ import os
 
 from fastapi import Request  # module-level so the webhook's stringized annotation resolves
 
+from .projects import default_project as resolve_default_project
+from .projects import resolve_projects
 from .store import BoardError, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+def _store_kw(cfg: dict) -> dict:
+    """The store constructor kwargs shared by both routers. Carries the board's
+    `projects:` map + `default_project` (#90) so the API's store resolves feature
+    defaults and per-feature repos (the Ready gate's `_repo_for`) exactly as the loop
+    does — a create with no `project` stamps the board default, and a labeled feature's
+    gate validates against its own repo."""
+    cfg = cfg or {}
+    return dict(
+        db=cfg.get("db_path") or None,
+        repo=cfg.get("repo", "."),
+        base_branch=cfg.get("base_branch", "main"),
+        max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+        projects=resolve_projects(cfg),
+        default_project=resolve_default_project(cfg),
+    )
 
 
 def build_router(cfg: dict):
@@ -45,12 +64,7 @@ def build_router(cfg: dict):
     async def _board():
         return HTMLResponse(BOARD_PAGE)
 
-    store_kw = dict(
-        db=(cfg or {}).get("db_path") or None,
-        repo=(cfg or {}).get("repo", "."),
-        base_branch=(cfg or {}).get("base_branch", "main"),
-        max_files_by_difficulty=(cfg or {}).get("max_files_by_difficulty"),
-    )
+    store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
     # GitHub webhook secret (HMAC-SHA256). From config or env; blank ⇒ verification
@@ -197,12 +211,7 @@ def build_data_router(cfg: dict):
     from fastapi import APIRouter, Body, HTTPException
 
     router = APIRouter()
-    store_kw = dict(
-        db=(cfg or {}).get("db_path") or None,
-        repo=(cfg or {}).get("repo", "."),
-        base_branch=(cfg or {}).get("base_branch", "main"),
-        max_files_by_difficulty=(cfg or {}).get("max_files_by_difficulty"),
-    )
+    store_kw = _store_kw(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
     def store():
@@ -241,7 +250,7 @@ def build_data_router(cfg: dict):
 
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
-    async def _features(state: str | None = None, include_archived: bool = False):
+    async def _features(state: str | None = None, include_archived: bool = False, project: str | None = None):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
         # actionable BoardError message — an escaped BoardError is a text/plain 500
@@ -249,7 +258,17 @@ def build_data_router(cfg: dict):
         # Default = the LIVE board: `archived` features (terminal + past the archive
         # window, #115) are excluded unless ?include_archived=true — same contract
         # as the board_list tool; nothing is deleted, everything stays queryable.
-        return _guard(lambda: {"features": store().list_features(state=state, include_archived=include_archived)})
+        # ?project=<name> (#90) narrows the listing to the features stamped for that
+        # project — the multi-repo board's per-repo view; absent, every project is listed.
+        want = str(project or "").strip()
+
+        def _list():
+            feats = store().list_features(state=state, include_archived=include_archived)
+            if want:
+                feats = [f for f in feats if str(f.get("project") or "") == want]
+            return {"features": feats}
+
+        return _guard(_list)
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):
@@ -318,6 +337,10 @@ def build_data_router(cfg: dict):
 
     @router.post("/features")
     async def _create_feature(body: dict = Body(...)):
+        """Create a feature — the body is splatted into ``store.create_feature``, so it
+        accepts every create field, including ``project`` (#90): the entry in the board's
+        `projects:` map the feature builds in, stamped as an immutable ``project:<name>``
+        label. Absent, it falls back to the board's ``default_project``."""
         return _guard(lambda: store().create_feature(**body))
 
     @router.post("/features/batch")
