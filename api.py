@@ -274,6 +274,48 @@ def build_data_router(cfg: dict):
 
         return coder_seam.progress_snapshot(fid)
 
+    @router.patch("/features/{fid}")
+    async def _patch_feature(fid: str, body: dict = Body(default={})):
+        """In-place spec edit — the REST complement of ``board_update_feature``.
+        Accepts ``title``, ``spec``, ``acceptance_criteria``, ``design``,
+        ``files_to_modify``, ``difficulty``, ``source_issue``; only non-null
+        fields are written. Refuses edits to an ``in_progress`` feature unless
+        ``force=true`` is passed (a live drive owns it)."""
+        body = body or {}
+        force = bool(body.get("force", False))
+
+        s = store()
+        f = _guard(lambda: s.get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+
+        if f.get("board_state") == "in_progress" and not force:
+            raise HTTPException(
+                400,
+                f"feature {fid!r} is in_progress — a live drive owns it; pass force=true to edit anyway",
+            )
+
+        _PATCH_FIELDS = frozenset(
+            {
+                "title",
+                "spec",
+                "acceptance_criteria",
+                "design",
+                "files_to_modify",
+                "difficulty",
+                "priority",
+                "source_issue",
+            }
+        )
+        kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
+        changed = sorted(kwargs)
+
+        updated = _guard(lambda: s.update_feature(fid, **kwargs))
+        if changed:
+            s._comment(fid, f"spec updated: {', '.join(changed)}")
+
+        return updated
+
     @router.post("/features")
     async def _create_feature(body: dict = Body(...)):
         return _guard(lambda: store().create_feature(**body))
