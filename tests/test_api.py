@@ -102,6 +102,13 @@ class FakeStore:
     def block_from_review(self, fid, reason):
         return self._rec("block_from_review", fid, reason)
 
+    def update_feature(self, fid, **kwargs):
+        self.calls.append(("update_feature", (fid,), kwargs))
+        return {"id": fid, "board_state": "backlog", **kwargs}
+
+    def _comment(self, fid, text):
+        self.calls.append(("_comment", (fid, text), {}))
+
     def record_merge(self, *, pr_url):
         self.calls.append(("record_merge", (), {"pr_url": pr_url}))
         return self._merged
@@ -723,3 +730,88 @@ def test_test_rung_surfaces_a_solve_failure_as_400_not_500(monkeypatch):
     r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
     assert r.status_code == 400
     assert "test-rung failed" in r.json()["detail"]
+
+
+# ── PATCH /features/{fid} — in-place spec edit (#148) ──────────────────────────
+
+
+class InProgressStore(FakeStore):
+    """FakeStore variant whose get_feature always returns in_progress state."""
+
+    def get_feature(self, fid):
+        self.calls.append(("get_feature", (fid,), {}))
+        return None if fid == "missing" else {"id": fid, "board_state": "in_progress"}
+
+
+def test_patch_feature_updates_spec_and_returns_updated_feature(monkeypatch):
+    """PATCH /features/{fid} delegates to update_feature with only non-null fields
+    and returns the updated feature dict."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.patch("/api/plugins/project_board/features/bd-5", json={"spec": "new spec text"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == "bd-5"
+    assert body["spec"] == "new spec text"
+    call = next(x for x in store.calls if x[0] == "update_feature")
+    assert call[1] == ("bd-5",) and call[2] == {"spec": "new spec text"}
+
+
+def test_patch_feature_records_audit_comment_naming_changed_fields(monkeypatch):
+    """The route appends a comment on the bead naming every field that changed."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    c.patch(
+        "/api/plugins/project_board/features/bd-5",
+        json={"spec": "s", "acceptance_criteria": "ac"},
+    )
+    comment_calls = [x for x in store.calls if x[0] == "_comment"]
+    assert len(comment_calls) == 1
+    text = comment_calls[0][1][1]
+    assert "spec updated:" in text
+    assert "acceptance_criteria" in text and "spec" in text
+
+
+def test_patch_feature_in_progress_without_force_is_400(monkeypatch):
+    """Editing an in_progress feature without force=true is refused with 400."""
+    store = InProgressStore()
+    c = _client(monkeypatch, store)
+    r = c.patch("/api/plugins/project_board/features/bd-5", json={"spec": "new"})
+    assert r.status_code == 400
+    assert "in_progress" in r.json()["detail"]
+    assert not any(x[0] == "update_feature" for x in store.calls)
+
+
+def test_patch_feature_in_progress_with_force_succeeds(monkeypatch):
+    """force=true bypasses the in_progress guard and applies the update."""
+    store = InProgressStore()
+    c = _client(monkeypatch, store)
+    r = c.patch("/api/plugins/project_board/features/bd-5", json={"spec": "new", "force": True})
+    assert r.status_code == 200
+    assert any(x[0] == "update_feature" for x in store.calls)
+
+
+def test_patch_feature_only_writes_non_null_fields(monkeypatch):
+    """Null fields in the body are not forwarded to update_feature."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.patch(
+        "/api/plugins/project_board/features/bd-5",
+        json={"spec": "s", "acceptance_criteria": None, "title": None},
+    )
+    assert r.status_code == 200
+    call = next(x for x in store.calls if x[0] == "update_feature")
+    assert call[2] == {"spec": "s"}
+
+
+def test_patch_feature_404_on_unknown_feature(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    r = c.patch("/api/plugins/project_board/features/missing", json={"spec": "x"})
+    assert r.status_code == 404
+
+
+def test_patch_feature_is_operator_gated(monkeypatch):
+    """PATCH is under /api (operator-bearer gated) — not on the public prefix."""
+    c = _client(monkeypatch, FakeStore())
+    assert c.patch("/api/plugins/project_board/features/bd-5", json={"spec": "x"}).status_code == 200
+    assert c.patch("/plugins/project_board/features/bd-5", json={"spec": "x"}).status_code == 404
