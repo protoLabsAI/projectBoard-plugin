@@ -175,14 +175,44 @@ def _feature_reply(f: dict) -> str:
 
 
 def _board_tools(cfg: dict):
+    from .projects import default_project as resolve_default_project
+    from .projects import resolve_projects
     from .store import BoardError, get_store
+
+    # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
+    # execution settings) + the default project a create falls back to. Threaded into
+    # store_kw so the resolved store carries the SAME map the loop does — its own
+    # per-feature reads (the Ready gate's `_repo_for`) then resolve to the same repo.
+    projects = resolve_projects(cfg)
+    default_proj = resolve_default_project(cfg)
 
     store_kw = dict(
         db=cfg.get("db_path") or None,
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),
         max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+        projects=projects,
+        default_project=default_proj,
     )
+
+    def _store_kw_for(project: str = "") -> dict:
+        """store_kw whose `repo`/`base_branch` resolve to ``project``'s entry in the
+        board's `projects:` map (#90) — so a project-scoped tool op (create/list) targets
+        that project's checkout, not the instance default. An empty or unknown name falls
+        back to the base (default-project) repo; the shared `projects`/`default_project`
+        ride along unchanged so the resolved store keeps the same per-feature resolution
+        the loop uses. With a shared `db_path` every project store talks to the ONE board
+        DB while carrying its own repo for the Ready gate's path validation."""
+        name = str(project or "").strip() or default_proj
+        entry = projects.get(name) or {}
+        kw = dict(store_kw)
+        repo = str(entry.get("repo") or "").strip()
+        if repo:
+            kw["repo"] = repo
+        base = str(entry.get("base_branch") or "").strip()
+        if base:
+            kw["base_branch"] = base
+        return kw
 
     @tool
     def board_create_epic(title: str, description: str = "") -> str:
@@ -207,6 +237,7 @@ def _board_tools(cfg: dict):
         foundation: bool = False,
         force: bool = False,
         source_issue: str = "",
+        project: str = "",
     ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
@@ -218,7 +249,12 @@ def _board_tools(cfg: dict):
         `source_issue` names the ORIGINATING GitHub issue — a full issue URL or
         `owner/repo#N`, stored normalized as `owner/repo#N` (off-label, in the bead's
         notes metadata — a label can't carry `/`/`#`) — so the feature's PR gets a
-        `Fixes #N` line and the issue auto-closes on merge.
+        `Fixes #N` line and the issue auto-closes on merge. `project` names the entry
+        in the board's `projects:` map this feature builds in (#90) — it determines
+        which repo the feature's worktree/PR target and which repo the Ready gate
+        validates its files against; it's stamped as an immutable `project:<name>`
+        label. Defaults to the board's `default_project` when omitted; a single-repo
+        board can ignore it.
 
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
@@ -230,7 +266,13 @@ def _board_tools(cfg: dict):
         anyway. A store read failure never blocks creation (better a possible dup than a
         stuck board)."""
         try:
-            store = get_store(**store_kw)
+            # Resolve the store against THIS feature's project (#90): its repo/base_branch
+            # for the get_store call, so the dedup read + the create land against the right
+            # checkout (with a shared db_path, the same board DB but the project's repo for
+            # the Ready gate). Strip the project's wrapping quotes FIRST so the resolution
+            # (and the store's own validation) sees the bare name.
+            project = _strip_wrapping_quotes(project)
+            store = get_store(**_store_kw_for(project))
             # Input hygiene: an agent (or a shell one layer up) sometimes hands us a
             # value already wrapped in a literal pair of double quotes, which — stored
             # verbatim — renders quoted in every downstream view and even defeats the
@@ -284,6 +326,7 @@ def _board_tools(cfg: dict):
                 depends_on=deps,
                 foundation=foundation,
                 source_issue=source_issue,
+                project=project,
             )
             return _feature_reply(f)
         except BoardError as exc:
@@ -314,7 +357,10 @@ def _board_tools(cfg: dict):
         this tool never removes the flag). `source_issue` (a full GitHub issue URL or
         `owner/repo#N`, stored normalized off-label in the bead's notes metadata)
         sets/replaces the originating issue the feature's PR will reference as
-        `Fixes #N`. Inputs are
+        `Fixes #N`. There is deliberately NO `project` argument: a feature's project
+        (#90) is immutable once stamped — it determines which repo the feature's
+        worktree/PR target, and re-homing an in-flight card mid-stream would strand its
+        branch; cancel and recreate to move a feature to another project. Inputs are
         stripped of any literal wrapping double quotes before storage (same hygiene as
         board_create_feature)."""
         try:
@@ -353,7 +399,9 @@ def _board_tools(cfg: dict):
     def board_get_feature(feature_id: str) -> str:
         """Read a single feature's FULL detail as JSON — `title`, `spec`,
         `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `difficulty`,
-        `files_to_modify`, `foundation`, `priority`, `source_issue`, `requirements`
+        `files_to_modify`, `foundation`, `priority`, `source_issue`, `project`
+        (the entry in the board's `projects:` map this feature builds in, #90),
+        `requirements`
         (the tracked requirement ledger decomposed from the acceptance criteria at
         mark_ready — each item `{id, text, status, decline_reason?}`, status one of
         open/done/declined; the completion gate refuses a PR while any item is
@@ -388,6 +436,9 @@ def _board_tools(cfg: dict):
                 "requirements": f.get("requirements", []),
                 "depends_on": f.get("depends_on", []),
                 "open_depends_on": f.get("open_depends_on", []),
+                # Which project (#90) this feature builds in — "" for a pre-#90 feature
+                # or a single-repo board with no `projects:` map.
+                "project": f.get("project", ""),
             }
         )
 
@@ -487,7 +538,11 @@ def _board_tools(cfg: dict):
 
     @tool
     def board_list(
-        state: str = "", include_archived: bool = False, with_ci: bool = False, failing_only: bool = False
+        state: str = "",
+        include_archived: bool = False,
+        with_ci: bool = False,
+        failing_only: bool = False,
+        project: str = "",
     ) -> str:
         """List board features, optionally filtered by board `state` (backlog/ready/
         in_progress/in_review/done/blocked). Priority order. Terminal features
@@ -495,6 +550,11 @@ def _board_tools(cfg: dict):
         EXCLUDED from this default response (#115) — the live board, not all of
         history. Pass `include_archived=true` for the exhaustive view; nothing is
         ever deleted, so archived features stay fully queryable.
+
+        `project` (a name in the board's `projects:` map, #90) narrows the listing to
+        the features that build in that project — the multi-repo board's "just this
+        repo's cards" view. Omitted (the default) lists every project; each row carries
+        its `project` field so an unfiltered listing stays legible on a mixed board.
 
         `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
         (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
@@ -507,8 +567,14 @@ def _board_tools(cfg: dict):
         if failing_only:
             with_ci = True
             state = state or "in_review"
-        store = get_store(**store_kw)
+        project = _strip_wrapping_quotes(project).strip()
+        store = get_store(**_store_kw_for(project))
         feats = store.list_features(state=state or None, include_archived=include_archived)
+        # Project filter (#90): keep only the features stamped for `project`. Applied
+        # BEFORE the CI join so a filtered listing never spends a `gh` call on a row it
+        # would drop.
+        if project:
+            feats = [f for f in feats if str(f.get("project") or "") == project]
         if with_ci:
             feats = store.annotate_ci_status(feats)
             if failing_only:
@@ -524,6 +590,7 @@ def _board_tools(cfg: dict):
                 "pr_url": f["pr_url"],
                 "priority": f["priority"],
                 "difficulty": f["difficulty"],
+                "project": f.get("project", ""),
             }
             if with_ci:
                 row["ci_status"] = f.get("ci_status", "")
