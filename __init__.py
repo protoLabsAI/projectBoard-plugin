@@ -623,7 +623,7 @@ def _board_tools(cfg: dict):
             indent=2,
         )
 
-    return [
+    tools = [
         board_create_epic,
         board_create_feature,
         board_update_feature,
@@ -636,3 +636,13 @@ def _board_tools(cfg: dict):
         board_list,
         board_retro,
     ]
+
+    # Runtime project registration (#167). Appended rather than folded in above because
+    # it writes CONFIG, not board rows — it is the only tool here that doesn't touch a
+    # store, and it refuses on its own (the operator's onboarding space) rather than on
+    # the board's state. `None` when langchain isn't importable in a host-free run.
+    from .project_registry import build_register_tool
+
+    if (register_tool := build_register_tool(cfg)) is not None:
+        tools.append(register_tool)
+    return tools
