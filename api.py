@@ -299,6 +299,16 @@ def build_data_router(cfg: dict):
             lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))), store().get_feature(fid))[1]
         )
 
+    @router.delete("/features/{fid}/dep")
+    async def _dep_delete(fid: str, body: dict = Body(default={})):
+        """Remove a `blocks` edge — inverse of POST …/dep. Body: ``{"depends_on": "<id>"}``."""
+        return _guard(
+            lambda: (
+                store().remove_dependency(fid, str((body or {}).get("depends_on", ""))),
+                store().get_feature(fid),
+            )[1]
+        )
+
     # ── transitions ───────────────────────────────────────────────────────────
     @router.post("/features/{fid}/ready")
     async def _ready(fid: str):

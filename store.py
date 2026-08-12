@@ -712,6 +712,11 @@ class BeadsBoard:
         the foundation feature, so they only become `ready` once it merges → done."""
         self._run("dep", "add", fid, depends_on, "--type", "blocks")
 
+    def remove_dependency(self, fid: str, depends_on: str) -> None:
+        """Remove a `blocks` edge — the inverse of ``add_dependency``. After this call
+        `fid` is no longer gated on `depends_on`."""
+        self._run("dep", "remove", fid, depends_on, "--type", "blocks")
+
     # ── batch create from a structured decomposition (#92) ─────────────────────
     @staticmethod
     def _validate_plan_item(item, index: int) -> str:
@@ -1282,6 +1287,21 @@ class BeadsBoard:
         f = self._require(fid)
         prior_assignee = f.get("assignee", "")
         self._run("update", fid, "--add-label", LABEL_CANCELLED, "--assignee", "")
+        # Drop open incoming `blocks` edges before closing (#145): `br close` refuses
+        # when blockers are unresolved, but a cancel is a scope-cut — prerequisites
+        # being unfinished is irrelevant. Log each dropped edge for the audit trail.
+        dropped: list[str] = []
+        for blocker_id in self._open_blockers(fid):
+            try:
+                self.remove_dependency(fid, blocker_id)
+                dropped.append(blocker_id)
+                log.info("[project_board] cancel %s: dropped blocks edge from %s", fid, blocker_id)
+            except BoardError:
+                log.warning(
+                    "[project_board] cancel %s: could not drop edge from %s (close may still fail)",
+                    fid,
+                    blocker_id,
+                )
         try:
             self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
         except BoardError:
@@ -1292,7 +1312,10 @@ class BeadsBoard:
                 undo += ["--assignee", prior_assignee]
             self._run(*undo)
             raise
-        return self.get_feature(fid)
+        result = self.get_feature(fid) or {}
+        if dropped:
+            result["dropped_deps"] = dropped
+        return result
 
     def delete_feature(self, fid: str, reason: str = "") -> dict:
         """Hard-delete a feature (a `br` tombstone) — the harder sibling of

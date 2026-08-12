@@ -660,6 +660,82 @@ def test_cancel_feature_unknown_id_raises(make_board, monkeypatch):
         b.cancel_feature("nope")
 
 
+def test_cancel_feature_with_open_deps_drops_edges_and_reports_them(make_board, monkeypatch):
+    """Cancel drops open incoming `blocks` edges before calling `br close` (#145), so a
+    scope-cut succeeds even when the feature's prerequisites are still unfinished.
+    The response carries `dropped_deps` listing the edges that were removed."""
+    # _open_blockers calls `br show`; two open blockers gate this feature.
+    bead_with_deps = {
+        "id": "bd-9",
+        "dependencies": [
+            {"id": "bd-1", "dependency_type": "blocks", "status": "open"},
+            {"id": "bd-2", "dependency_type": "blocks", "status": "in_progress"},
+        ],
+    }
+    dep_calls = []
+
+    def run_impl(*args, want_json=False):
+        dep_calls.append(args)
+        if args[0] == "show":
+            return [bead_with_deps]
+        return [] if want_json else ""
+
+    br = run_impl  # use the callable directly (make_board accepts any callable)
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "cancelled", "cancelled": True})
+    f = b.cancel_feature("bd-9", "scope cut")
+    # both `dep remove` calls were issued — one per blocker
+    # tuple layout: ("dep", "remove", fid, blocker_id, "--type", "blocks")
+    dep_removes = [c for c in dep_calls if c[0] == "dep" and c[1] == "remove"]
+    removed_ids = {c[3] for c in dep_removes}
+    assert removed_ids == {"bd-1", "bd-2"}
+    # the feature was closed after the edges were dropped
+    assert any(c[0] == "close" and "bd-9" in c for c in dep_calls)
+    # the response reports which edges were dropped
+    assert set(f.get("dropped_deps", [])) == {"bd-1", "bd-2"}
+
+
+def test_remove_dependency_issues_dep_remove_command(make_board):
+    """remove_dependency is the inverse of add_dependency: it calls `br dep remove
+    <fid> <depends_on> --type blocks` to tear down the gate."""
+    br = Br()
+    b = make_board(br)
+    b.remove_dependency("bd-child", "bd-parent")
+    assert ("dep", "remove", "bd-child", "bd-parent", "--type", "blocks") in br.calls
+
+
+def test_remove_dependency_clears_dag_blocked(make_board):
+    """After removing a blocks edge the dependent is no longer dag_blocked.
+    _project reads `dependencies` directly from the bead, so a bead with no
+    remaining blocks edges produces dag_blocked=False."""
+    b = make_board(Br())
+    # Simulate the post-removal state: the bead has no open blocks edges left.
+    bead_after_removal = {
+        "id": "bd-child",
+        "status": "open",
+        "labels": ["ready"],
+        "dependencies": [],  # edge was removed
+    }
+    projected = b._project(bead_after_removal)
+    assert projected["dag_blocked"] is False
+    assert projected["depends_on"] == []
+
+
+def test_cancelled_blocker_does_not_block_dependent_forever(make_board):
+    """When a blocker is cancelled, `br close` sets its status to `closed`.
+    A dependent that sees a dep with status=closed must NOT be dag_blocked (#145)."""
+    b = make_board(Br())
+    # After `br close` the blocker's status reads "closed" in the dep record, regardless
+    # of whether it was merged (done) or cancelled — _project must treat both as resolved.
+    bead = {
+        "id": "bd-child",
+        "status": "open",
+        "labels": ["ready"],
+        "dependencies": [{"id": "bd-blocker", "dependency_type": "blocks", "status": "closed"}],
+    }
+    assert b._project(bead)["dag_blocked"] is False
+
+
 def test_delete_feature_tombstones_with_reason(make_board, monkeypatch):
     """The harder sibling of cancel: `br delete` (tombstone) with an audit reason, run
     THROUGH the board so board↔JSONL stay in step. Returns the pre-delete snapshot."""
