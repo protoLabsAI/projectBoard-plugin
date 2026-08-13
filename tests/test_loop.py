@@ -19,6 +19,7 @@ import pytest
 from project_board import coder_seam
 from project_board import store as store_mod
 from project_board import worktree
+import project_board.loop as loop_mod
 from project_board.loop import (
     _MERGED_VERIFIED_SHA_LEN,
     BoardLoop,
@@ -27,6 +28,7 @@ from project_board.loop import (
     _pr_body,
     _resolve_gate_cmd,
     _source_issue,
+    _source_issue_still_open,
 )
 from project_board.store import BeadsBoard, BoardError
 
@@ -57,6 +59,10 @@ class FakeLoopStore:
 
     def clear_verified_candidate(self, fid):
         self.calls.append(("clear_verified", fid))
+        return {"id": fid}
+
+    def cancel_feature(self, fid, reason=""):
+        self.calls.append(("cancel_feature", fid, reason))
         return {"id": fid}
 
     def set_requirements(self, fid, items):
@@ -562,6 +568,153 @@ async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
     assert "flag_blocked" in store.names()
     assert "open_review" not in store.names()
     assert loop._inflight == {}
+
+
+# ── source-issue closed guard (#166) ────────────────────────────────────────────
+
+
+async def test_source_issue_still_open_no_raw():
+    """Empty source_issue → True (no gh call, proceed)."""
+    assert await _source_issue_still_open("", "/wt") is True
+
+
+async def test_source_issue_still_open_open_state(monkeypatch):
+    """gh reports 'open' → True (proceed)."""
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        return 0, "open\n", ""
+
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("owner/repo#42", "/wt")
+    assert result is True
+
+
+async def test_source_issue_still_open_closed_state(monkeypatch):
+    """gh reports 'closed' → False (skip PR)."""
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        return 0, "closed\n", ""
+
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("owner/repo#42", "/wt")
+    assert result is False
+
+
+async def test_source_issue_still_open_gh_nonzero_fail_open(monkeypatch):
+    """gh exits non-zero (e.g. 404) → True (fail-open)."""
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        return 1, "", "not found"
+
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("owner/repo#42", "/wt")
+    assert result is True
+
+
+async def test_source_issue_still_open_gh_raises_fail_open(monkeypatch):
+    """gh raises (e.g. WorktreeError timeout) → True (fail-open)."""
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        raise worktree.WorktreeError("timed out")
+
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("owner/repo#42", "/wt")
+    assert result is True
+
+
+async def test_source_issue_still_open_full_url(monkeypatch):
+    """Full GitHub issue URL is parsed correctly."""
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        assert "repos/acme/lib/issues/7" in args
+        return 0, "closed", ""
+
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("https://github.com/acme/lib/issues/7", "/wt")
+    assert result is False
+
+
+async def test_source_issue_still_open_bare_number_resolves_slug(monkeypatch):
+    """A bare issue number resolves the slug from the worktree remote."""
+    called_with_slug = []
+
+    async def _fake_slug(*, cwd):
+        return "myorg/myrepo"
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        called_with_slug.append(args)
+        assert "repos/myorg/myrepo/issues/5" in args
+        return 0, "open", ""
+
+    monkeypatch.setattr(worktree, "repo_slug", _fake_slug)
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("#5", "/wt")
+    assert result is True
+    assert called_with_slug  # gh was called
+
+
+async def test_source_issue_still_open_bare_number_unresolvable_fail_open(monkeypatch):
+    """Bare number with unresolvable slug → True (fail-open, no gh call)."""
+    gh_called = []
+
+    async def _fake_slug(*, cwd):
+        return ""  # couldn't resolve
+
+    async def _fake_gh(*args, cwd, timeout=60):
+        gh_called.append(args)
+        return 0, "closed", ""
+
+    monkeypatch.setattr(worktree, "repo_slug", _fake_slug)
+    monkeypatch.setattr(worktree, "_gh", _fake_gh)
+    result = await _source_issue_still_open("#99", "/wt")
+    assert result is True
+    assert gh_called == []  # never called gh when slug unresolvable
+
+
+async def test_drive_skips_pr_when_source_issue_closed(monkeypatch):
+    """When source_issue is closed at PR-open time, no PR is created and the
+    card is cancelled (cancel_feature is called with the supersede reason)."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append((wt, branch))
+        return "https://example/pr/99"
+
+    async def _closed(si_raw, cwd):
+        return False
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    feature = dict(FEATURE, source_issue="owner/repo#42")
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert opened == []  # no PR opened
+    assert "cancel_feature" in store.names()
+    assert "open_review" not in store.names()
+    cancel_calls = [c for c in store.calls if c[0] == "cancel_feature"]
+    assert any("superseded" in c[2] for c in cancel_calls)
+    assert loop._inflight == {}
+
+
+async def test_drive_opens_pr_when_source_issue_still_open(monkeypatch):
+    """When source_issue is still open, the PR opens normally."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append("https://example/pr/1")
+        return opened[-1]
+
+    async def _still_open(si_raw, cwd):
+        return True
+
+    async def _slug(*, cwd):
+        return "owner/repo"
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _still_open)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    feature = dict(FEATURE, source_issue="owner/repo#42")
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert len(opened) == 1
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert "cancel_feature" not in store.names()
 
 
 # ── coder.solve() board seam (ADR 0064 P2) ───────────────────────────────────────
