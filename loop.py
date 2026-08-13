@@ -381,6 +381,37 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     return f"{body.rstrip()}\n\nRefs {url}"
 
 
+async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
+    """Re-check the source issue's state before opening a PR (#166).
+
+    Returns True (proceed) when the issue is open, when the gh call fails for
+    any reason (fail-open — a failed read must not block a legitimate PR), or
+    when the slug can't be resolved. Returns False only when gh exits 0 and
+    reports a state other than 'open'."""
+    if not source_issue_raw:
+        return True
+    parsed = _source_issue({"source_issue": source_issue_raw})
+    if parsed is None:
+        return True  # unparseable reference → fail-open
+    slug, n = parsed
+    if not slug:
+        # Bare issue number — resolve owner/repo from the worktree's remote.
+        try:
+            slug = await worktree.repo_slug(cwd=cwd)
+        except Exception:  # noqa: BLE001
+            return True  # fail-open
+    if not slug:
+        return True  # couldn't resolve → fail-open
+    try:
+        rc, out, _err = await worktree._gh("api", f"repos/{slug}/issues/{n}", "--jq", ".state", cwd=cwd, timeout=15)
+    except Exception:  # noqa: BLE001 — timeout / infra error → fail-open
+        return True
+    if rc != 0:
+        return True  # gh error → fail-open
+    state = out.strip().strip('"').lower()
+    return state == "open"
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -1808,6 +1839,26 @@ class BoardLoop:
                             f"requirements unresolved: {len(open_items)} item(s) still open after "
                             f"{n} fix round(s): " + ", ".join(str(i.get("id")) for i in open_items)
                         )
+                    # Source-issue closed guard (#166): re-check the issue before
+                    # opening a PR. A closed source issue means another PR already
+                    # resolved the ticket — opening a duplicate wastes reviewer/CI
+                    # cycles. Fail-open: any gh error lets the PR proceed normally.
+                    si_raw = str(feature.get("source_issue") or "").strip()
+                    if si_raw and not await _source_issue_still_open(si_raw, wt):
+                        reason = f"source issue {si_raw} already closed — work superseded"
+                        log.info("[project_board] %s skipping PR — %s", fid, reason)
+                        try:
+                            store.cancel_feature(fid, reason)
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "[project_board] %s cancel_feature failed — flagging blocked instead",
+                                fid,
+                                exc_info=True,
+                            )
+                            store.flag_blocked(fid, reason)
+                        await worktree.remove_worktree(repo, wt, branch or "")
+                        self._inflight.pop(fid, None)
+                        return
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
