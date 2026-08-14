@@ -330,6 +330,33 @@ def test_cancel_rollback_restores_pre_cancel_state_through_real_br(board, tmp_pa
     assert got["assignee"] == "test"  # restored, so it stays claimable/requeue-able
 
 
+@requires_br
+@pytest.mark.br_shape  # the whole point is proving remove_dependency's --type fallback
+# (store.py) works against WHICHEVER real br is on this leg — 0.1.23 or 0.2.16.
+def test_cancel_with_an_open_blocker_drops_the_edge_through_real_br(board):
+    """The actual gap that let a live cancel silently keep failing (found live,
+    2026-08-14): every existing real-`br` test either cancels a feature with NO
+    open blockers, or cancels the BLOCKER itself (test_json_shape_show_for_open_
+    blockers, above) — never a feature that HAS an open blocker at cancel time,
+    which is the one scenario that calls `remove_dependency` for real. On a real
+    `br 0.2.16` install, `remove_dependency`'s `br dep remove … --type blocks`
+    hard-errored ("unexpected argument '--type' found"); `cancel_feature`'s
+    per-edge `except BoardError` swallowed it (logged a warning), so the blocker
+    was never dropped and `br close` kept refusing — every mocked unit test for
+    this path stayed green throughout, because none of them shell out to a real
+    `br`. This is the regression test for that gap, not just the store.py fix."""
+    blocker = board.create_feature("Foundation", spec="s")
+    dependent = board.create_feature("Dependent", spec="s")
+    board.add_dependency(dependent["id"], blocker["id"])
+    assert board._open_blockers(dependent["id"]) == [blocker["id"]]
+
+    got = board.cancel_feature(dependent["id"], "scope cut — no longer needed")
+
+    assert got["board_state"] == "cancelled" and got["cancelled"] is True
+    assert got["dropped_deps"] == [blocker["id"]]
+    assert board._open_blockers(dependent["id"]) == []
+
+
 # ── `--limit 0` = unbounded; a real cap really truncates (the exhaustiveness invariant) ──
 
 
