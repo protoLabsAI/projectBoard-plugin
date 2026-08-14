@@ -689,6 +689,7 @@ class _WorktreeSolveAdapter:
         env_passthrough: Iterable[str] = (),
         progress_fid: str | None = None,
         progress_tier: str = "",
+        max_concurrent_sessions: int = 0,
         _fusion_dispatch=None,
     ):
         self.repo = repo
@@ -715,6 +716,16 @@ class _WorktreeSolveAdapter:
         self.fusion_delegate = fusion_delegate  # a resolved `openai`-type Delegate, or None
         self.files_to_modify = files_to_modify or []
         self.fusion_max_file_chars = fusion_max_file_chars
+        # Concurrency cap: `max_concurrent_sessions` limits how many ACP dispatches this
+        # solve run holds open simultaneously. 0 (default) = unlimited within the k budget.
+        # The best-of-k rung dispatches `k` candidates concurrently via asyncio.gather;
+        # peak sessions per drive = coder_solve_k (or fusion_k for the fusion rung).
+        # Across multiple concurrent drives (max_concurrent > 1), peak is max_concurrent ×
+        # coder_solve_k. Set max_concurrent_sessions=1 to serialize candidates within a
+        # drive — useful when the host can support only one ACP process at a time.
+        self._session_sem: asyncio.Semaphore | None = (
+            asyncio.Semaphore(max(1, max_concurrent_sessions)) if max_concurrent_sessions > 0 else None
+        )
         # Test-injection seam (mirrors `_solve`/`_budget_cls`/`_verdict_cls` on
         # `dispatch()`): production never passes this — the real lazy
         # `ADAPTERS["openai"].dispatch` import happens in `generate_fusion` below.
@@ -777,16 +788,32 @@ class _WorktreeSolveAdapter:
         self._gen_by_wt[wt] = self._n
         # Tapped dispatch (#84) wires the ACP client's callbacks into this gen's live
         # buffer; it degrades to worktree.dispatch_coder when the tap can't wire.
-        reply = await dispatch_coder_tapped(
-            self.coder,
-            wt,
-            _augment_prompt(task, self._compose_feedback(feedback)),
-            fid=self.progress_fid,
-            gen=self._n,
-            tier=self.progress_tier,
-            timeout=self.dispatch_timeout,
-            env_passthrough=self.env_passthrough,
-        )
+        # The semaphore (when set) serializes concurrent best-of-k ACP dispatches to
+        # honour max_concurrent_sessions; worktree creation above is already complete
+        # and unaffected (serialized independently by _wt_lock).
+        if self._session_sem is not None:
+            async with self._session_sem:
+                reply = await dispatch_coder_tapped(
+                    self.coder,
+                    wt,
+                    _augment_prompt(task, self._compose_feedback(feedback)),
+                    fid=self.progress_fid,
+                    gen=self._n,
+                    tier=self.progress_tier,
+                    timeout=self.dispatch_timeout,
+                    env_passthrough=self.env_passthrough,
+                )
+        else:
+            reply = await dispatch_coder_tapped(
+                self.coder,
+                wt,
+                _augment_prompt(task, self._compose_feedback(feedback)),
+                fid=self.progress_fid,
+                gen=self._n,
+                tier=self.progress_tier,
+                timeout=self.dispatch_timeout,
+                env_passthrough=self.env_passthrough,
+            )
         if (reply or "").strip():
             self._replies[wt] = reply
         return wt
@@ -1025,6 +1052,7 @@ async def dispatch(
     tier: str = "",
     record_verified: RecordVerified | None = None,
     commit_message: str = "",
+    max_concurrent_sessions: int = 0,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -1068,6 +1096,14 @@ async def dispatch(
     preflight already strip — with no ``env=`` the verify child would inherit the host's
     whole environment and could pass/fail on the HOST's identity, not the candidate's.
 
+    **Concurrency note.** ``max_concurrent`` is feature-level: up to that many drives run
+    simultaneously, each invoking ``dispatch()`` once. Within a single drive the
+    best-of-k rung of ``solve()`` dispatches ``k`` ACP sessions concurrently
+    (``asyncio.gather``), so peak ACP processes = ``max_concurrent × coder_solve_k``.
+    ``max_concurrent_sessions`` (default 0 = unlimited within the k budget) caps the
+    concurrent ACP dispatches within THIS call — set to 1 to run k candidates
+    serially when the host cannot sustain that many parallel processes.
+
     **``solve()`` itself can raise.** The ladder (`coder`'s own ``solve.py``) has no
     try/except around ``generate``/``verify`` — it assumes a candidate attempt never
     errors, only that it might fail its tests. A REAL dispatch can still raise
@@ -1103,6 +1139,7 @@ async def dispatch(
         env_passthrough=env_passthrough,
         progress_fid=fid,
         progress_tier=tier,
+        max_concurrent_sessions=max_concurrent_sessions,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:

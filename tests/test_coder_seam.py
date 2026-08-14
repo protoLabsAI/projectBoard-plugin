@@ -1590,6 +1590,126 @@ async def test_test_rung_forwards_fusion_and_files_to_modify(monkeypatch, tmp_pa
     assert seen["fusion_k"] == 5
 
 
+# ── max_concurrent_sessions: semaphore-based within-drive concurrency cap ─────────
+
+
+async def test_adapter_max_concurrent_sessions_zero_leaves_behaviour_unchanged(monkeypatch):
+    """max_concurrent_sessions=0 (default) must not add a semaphore — behaviour is
+    identical to the pre-cap baseline."""
+    created, *_ = _stub_worktree(monkeypatch)
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-cs0",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        max_concurrent_sessions=0,
+    )
+    assert adapter._session_sem is None  # no semaphore created
+    await adapter.generate("task", feedback=None)
+    assert created == ["bd-cs0.g1"]
+
+
+async def test_adapter_max_concurrent_sessions_one_serialises_concurrent_dispatches(monkeypatch):
+    """max_concurrent_sessions=1 limits the adapter to one in-flight ACP dispatch at
+    a time — even when solve() calls generate() via asyncio.gather with k>1."""
+    import asyncio as _asyncio
+
+    _stub_worktree(monkeypatch)
+
+    order: list[str] = []
+    gate = _asyncio.Event()
+
+    async def _slow_dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
+        order.append(f"start:{wt}")
+        await gate.wait()
+        order.append(f"end:{wt}")
+        return f"reply from {wt}"
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _slow_dispatch)
+
+    adapter = _WorktreeSolveAdapter(
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-cs1",
+        coder=object(),
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        verdict_cls=_FakeVerdict,
+        max_concurrent_sessions=1,
+    )
+    assert adapter._session_sem is not None
+
+    # Launch two concurrent generate() calls. With sem=1 only one can enter
+    # dispatch_coder at a time. The gate lets us inspect the intermediate state.
+    t1 = _asyncio.create_task(adapter.generate("task"))
+    t2 = _asyncio.create_task(adapter.generate("task"))
+
+    # Let the event loop run until at least one dispatch has started.
+    await _asyncio.sleep(0)
+    await _asyncio.sleep(0)
+
+    # Only one dispatch should be in-flight (started but not ended) before the gate opens.
+    started_before_gate = [e for e in order if e.startswith("start:")]
+    assert len(started_before_gate) == 1, f"expected 1 in-flight dispatch, got: {order}"
+
+    gate.set()
+    await _asyncio.gather(t1, t2)
+
+    # After both complete, the full sequence must show strict serialisation:
+    # start g1 → end g1 → start g2 → end g2 (or the reverse g2/g1 ordering —
+    # whichever task was scheduled first is irrelevant; what matters is no overlap).
+    assert len(order) == 4
+    for i in range(0, 4, 2):
+        assert order[i].startswith("start:") and order[i + 1].startswith("end:")
+        assert order[i].split(":")[1] == order[i + 1].split(":")[1]
+
+
+async def test_dispatch_threads_max_concurrent_sessions_to_adapter(monkeypatch):
+    """dispatch() must pass max_concurrent_sessions to the adapter so the
+    semaphore is active when the caller sets it."""
+    _stub_worktree(monkeypatch)
+    seen_sem = {}
+
+    original_init = _WorktreeSolveAdapter.__init__
+
+    def _patched_init(self, **kwargs):
+        seen_sem["value"] = kwargs.get("max_concurrent_sessions", -1)
+        original_init(self, **kwargs)
+
+    monkeypatch.setattr(_WorktreeSolveAdapter, "__init__", _patched_init)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        c0 = await generate(task, feedback=None)
+        return _FakeResult(solution=c0, passed=True, rung="greedy", gens_spent=1, candidates_tried=1)
+
+    await dispatch(
+        task="t",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-mcs",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=30,
+        budget=6,
+        k=3,
+        tree_depth=2,
+        max_concurrent_sessions=2,
+        _solve=_fake_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert seen_sem["value"] == 2
+
+
 # ── resolve_delegate: shared by loop.py and api.py's test-rung route ─────────────
 
 
