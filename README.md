@@ -117,7 +117,12 @@ project_board:
   repo: ~/dev/my-repo
   base_branch: main
   loop_enabled: false        # flip true to start the background puller
-  max_concurrent: 1          # >1 builds features in parallel (each its own worktree)
+  max_concurrent: 1          # >1 builds features in parallel (each its own worktree).
+                             # FEATURE-level: one drive per slot. Within each drive the
+                             # best-of-k rung dispatches coder_solve_k ACP sessions
+                             # concurrently, so peak ACP processes =
+                             # max_concurrent × coder_solve_k (default: 1 × 3 = 3).
+                             # Use max_concurrent_sessions to cap the within-drive parallelism.
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
@@ -151,6 +156,12 @@ project_board:
                              # delegate name (e.g. protolabs/fusion) for the hardest
                              # features. Blank (default) = ladder stops at tree-search.
   coder_solve_fusion_k: 2    # candidates fusion generates when reached
+  max_concurrent_sessions: 0 # cap concurrent ACP processes within a single drive's solve.
+                             # 0 (default) = unlimited within the k budget (best-of-k
+                             # candidates run in parallel). Set to 1 to run k candidates
+                             # sequentially — useful when the host supports only one ACP
+                             # process at a time. Peak without this cap:
+                             # max_concurrent × coder_solve_k.
   # webhook_secret: "..."    # set before exposing /webhook/pr publicly
 ```
 

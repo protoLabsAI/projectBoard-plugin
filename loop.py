@@ -610,6 +610,11 @@ class BoardLoop:
         self.coder_solve_budget = max(1, int(self.cfg.get("coder_solve_budget", 6)))
         self.coder_solve_k = max(1, int(self.cfg.get("coder_solve_k", 3)))
         self.coder_solve_tree_depth = max(0, int(self.cfg.get("coder_solve_tree_depth", 2)))
+        # max_concurrent is FEATURE-level (one drive per slot). Within each drive the
+        # best-of-k rung dispatches `coder_solve_k` ACP sessions concurrently, so peak
+        # ACP processes = max_concurrent × coder_solve_k. Set max_concurrent_sessions to
+        # cap that (0 = unlimited within the k budget; 1 = serialise k candidates).
+        self.max_concurrent_sessions = max(0, int(self.cfg.get("max_concurrent_sessions", 0)))
         # Rung 4 (ADR 0064 P3): a richer generator for the HARDEST features — reached
         # only after greedy AND best-of-k AND tree-search all fail their tests. Fusion
         # can't tool-call (it's a plain completion, not an ACP session), so it's an
@@ -876,6 +881,7 @@ class BoardLoop:
             "fusion_max_total_chars": _int(
                 "coder_solve_fusion_max_total_chars", self.coder_solve_fusion_max_total_chars, 1
             ),
+            "max_concurrent_sessions": _int("max_concurrent_sessions", self.max_concurrent_sessions, 0),
         }
 
     def _all_repos(self) -> list[str]:
@@ -907,6 +913,19 @@ class BoardLoop:
             self.merge_poll,
             self.coder_timeout,
         )
+        if self.coder_solve and self.coder_solve_k > 1:
+            peak = self.max_concurrent * self.coder_solve_k
+            cap_note = f", capped at {self.max_concurrent_sessions}" if self.max_concurrent_sessions > 0 else ""
+            log.info(
+                "[project_board] coder_solve_k=%d: peak concurrent ACP sessions = "
+                "max_concurrent × coder_solve_k = %d × %d = %d%s "
+                "(set max_concurrent_sessions to cap this)",
+                self.coder_solve_k,
+                self.max_concurrent,
+                self.coder_solve_k,
+                peak,
+                cap_note,
+            )
         return self._task
 
     async def stop(self):
@@ -1698,6 +1717,7 @@ class BoardLoop:
                                 fid, branch=br_name, sha=sha, worktree=wt_path
                             ),
                             commit_message=title,
+                            max_concurrent_sessions=solve["max_concurrent_sessions"],
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):

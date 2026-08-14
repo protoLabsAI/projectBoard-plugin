@@ -85,6 +85,10 @@ FEATURE = {
 }
 
 
+async def _noop_coro():
+    """Async no-op — used to patch BoardLoop._run in startup-log tests."""
+
+
 # ── config parsing ──────────────────────────────────────────────────────────────
 
 
@@ -728,6 +732,63 @@ def test_coder_solve_config_defaults():
     assert loop.coder_solve_k == 3
     assert loop.coder_solve_tree_depth == 2
     assert loop.coder_solve_test_timeout == 300
+    assert loop.max_concurrent_sessions == 0  # default: unlimited within the k budget
+
+
+def test_max_concurrent_sessions_config():
+    assert BoardLoop({"max_concurrent_sessions": 1}).max_concurrent_sessions == 1
+    assert BoardLoop({"max_concurrent_sessions": 4}).max_concurrent_sessions == 4
+    assert BoardLoop({"max_concurrent_sessions": -1}).max_concurrent_sessions == 0  # floors at 0
+
+
+async def test_coder_solve_startup_log_notes_peak_sessions_when_k_gt_1(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setattr("project_board.loop.BoardLoop._run", lambda self: _noop_coro())
+
+    with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
+        loop = BoardLoop({"coder_solve": True, "coder_solve_k": 3, "max_concurrent": 2, "loop_enabled": True})
+        loop.start()
+
+    if loop._task:
+        loop._task.cancel()
+
+    peak_lines = [r.message for r in caplog.records if "peak concurrent ACP sessions" in r.message]
+    assert peak_lines, "expected a startup INFO line noting peak concurrent ACP sessions"
+    assert "2" in peak_lines[0] and "3" in peak_lines[0] and "6" in peak_lines[0]
+
+
+async def test_coder_solve_startup_log_silent_when_k_is_one(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setattr("project_board.loop.BoardLoop._run", lambda self: _noop_coro())
+
+    with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
+        loop = BoardLoop({"coder_solve": True, "coder_solve_k": 1, "loop_enabled": True})
+        loop.start()
+
+    if loop._task:
+        loop._task.cancel()
+
+    peak_lines = [r.message for r in caplog.records if "peak concurrent ACP sessions" in r.message]
+    assert not peak_lines, "no peak-sessions log expected when coder_solve_k=1"
+
+
+async def test_coder_solve_startup_log_notes_cap_when_max_concurrent_sessions_set(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setattr("project_board.loop.BoardLoop._run", lambda self: _noop_coro())
+
+    with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
+        loop = BoardLoop({"coder_solve": True, "coder_solve_k": 3, "max_concurrent_sessions": 1, "loop_enabled": True})
+        loop.start()
+
+    if loop._task:
+        loop._task.cancel()
+
+    peak_lines = [r.message for r in caplog.records if "peak concurrent ACP sessions" in r.message]
+    assert peak_lines
+    assert "capped at 1" in peak_lines[0]
 
 
 def test_coder_solve_test_cmd_falls_back_to_local_gate_cmd():
@@ -803,6 +864,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         tier="",
         record_verified=None,
         commit_message="",
+        max_concurrent_sessions=0,
     ):
         seen["fid"] = fid
         seen["test_cmd"] = test_cmd
