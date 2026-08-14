@@ -771,8 +771,24 @@ class BeadsBoard:
 
     def remove_dependency(self, fid: str, depends_on: str) -> None:
         """Remove a `blocks` edge — the inverse of ``add_dependency``. After this call
-        `fid` is no longer gated on `depends_on`."""
-        self._run("dep", "remove", fid, depends_on, "--type", "blocks")
+        `fid` is no longer gated on `depends_on`.
+
+        `add_dependency` needs `--type` to pick what kind of edge to CREATE
+        (`blocks`/`parent-child`/`related`); `br dep remove` never needed one to
+        identify which edge to tear down, and some `br` builds now refuse the flag
+        outright (`error: unexpected argument '--type' found` — confirmed against a
+        real `br 0.2.16` install; `dep remove`'s usage is bare `<ISSUE> <DEPENDS_ON>`).
+        Try with `--type` first (older builds may still expect it) and retry once
+        without it on that specific CLI-parse failure — this is a version-skew
+        adaptation, not error-swallowing, so any other failure (e.g. the edge
+        doesn't exist) still raises."""
+        try:
+            self._run("dep", "remove", fid, depends_on, "--type", "blocks")
+        except BoardError as exc:
+            if "--type" in str(exc) and "unexpected argument" in str(exc):
+                self._run("dep", "remove", fid, depends_on)
+            else:
+                raise
 
     # ── batch create from a structured decomposition (#92) ─────────────────────
     @staticmethod

@@ -704,6 +704,47 @@ def test_remove_dependency_issues_dep_remove_command(make_board):
     assert ("dep", "remove", "bd-child", "bd-parent", "--type", "blocks") in br.calls
 
 
+def test_remove_dependency_retries_without_type_when_br_rejects_the_flag(make_board):
+    """br dep remove dropped --type in newer builds — bare `<ISSUE> <DEPENDS_ON>`,
+    no type disambiguator (unlike `add`, which still needs one to pick what kind of
+    edge to CREATE). Confirmed empirically: a real `br dep remove --type blocks` on
+    a locally-installed br 0.2.16 hard-errors ("unexpected argument '--type' found").
+    remove_dependency retries once without the flag on that specific failure rather
+    than assuming every br build accepts it the way `add` still does — this was the
+    actual root cause of cancel_feature's (#145/#160) drop-open-blockers step
+    silently no-op'ing: `_open_blockers` found the right edges, but every
+    `remove_dependency` call died on `--type` and got swallowed by cancel_feature's
+    own per-edge `except BoardError` (log a warning, keep going) — so `br close`
+    still hit the un-dropped blocker and cancel still failed, looking exactly like
+    a stale-code symptom when it was a br CLI-version mismatch."""
+    calls = []
+
+    def run_impl(*args, want_json=False):
+        calls.append(args)
+        if args == ("dep", "remove", "bd-child", "bd-parent", "--type", "blocks"):
+            raise BoardError(
+                "`br dep remove bd-child bd-parent --type blocks` failed: error: unexpected argument '--type' found"
+            )
+        return ""
+
+    b = make_board(run_impl)
+    b.remove_dependency("bd-child", "bd-parent")
+    assert ("dep", "remove", "bd-child", "bd-parent", "--type", "blocks") in calls
+    assert ("dep", "remove", "bd-child", "bd-parent") in calls
+
+
+def test_remove_dependency_reraises_a_real_failure_unretried(make_board):
+    """A genuine remove failure (e.g. the edge doesn't exist) must not be masked by
+    the --type-compat retry — only that one specific CLI-parse signature falls back."""
+
+    def run_impl(*args, want_json=False):
+        raise BoardError("`br dep remove bd-child bd-parent --type blocks` failed: dependency not found")
+
+    b = make_board(run_impl)
+    with pytest.raises(BoardError, match="dependency not found"):
+        b.remove_dependency("bd-child", "bd-parent")
+
+
 def test_remove_dependency_clears_dag_blocked(make_board):
     """After removing a blocks edge the dependent is no longer dag_blocked.
     _project reads `dependencies` directly from the bead, so a bead with no
