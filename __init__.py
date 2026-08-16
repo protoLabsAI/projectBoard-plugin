@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import subprocess
 
 from langchain_core.tools import tool
 
@@ -142,6 +144,74 @@ def _open_duplicate(features: list, title: str, depends_on: list | None = None) 
     return None
 
 
+def _pr_references_issue(pr: dict, n: int, slug: str) -> bool:
+    """True when the PR's title/body mechanically references issue ``n`` — either the
+    ``#N`` shorthand (word-bounded, so ``#12`` never matches inside ``#123``) or the
+    full issue URL for ``slug`` (``owner/repo``). ANY mention counts, not just closing
+    keywords: a PR that says ``see #12`` is still in-flight work on that issue and a
+    new card would duplicate it."""
+    text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
+    if re.search(rf"#{n}\b", text):
+        return True
+    return bool(re.search(rf"github\.com/{re.escape(slug)}/issues/{n}\b", text, re.IGNORECASE))
+
+
+def _find_open_pr_for_issue(source_issue: str) -> dict | None:
+    """The first OPEN PR in the source issue's repo whose title/body references the
+    issue number, or None — the PR-side dedup for board_create_feature (#174): a card
+    created for an issue that already has an open PR dispatches a coder against work
+    that's already in flight.
+
+    BEST-EFFORT, fail-open (same posture as the title dedup's store-read failure): a
+    gh failure of any kind — missing binary, network, non-zero exit, bad JSON — logs
+    a warning and returns None rather than blocking creation. An unnormalizable
+    ``source_issue`` (e.g. a bare ``#N`` with no repo to search) also returns None;
+    create_feature rejects it with its own named error right after."""
+    from .store import BoardError, normalize_source_issue
+
+    try:
+        try:
+            src = normalize_source_issue(source_issue)
+        except BoardError:
+            return None  # no owner/repo to search; create_feature raises the named error
+        slug, _, n_str = src.rpartition("#")
+        n = int(n_str)
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                slug,
+                "--state",
+                "open",
+                "--json",
+                "number,title,body,url",
+                "--limit",
+                "100",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            log.warning(
+                "[project_board] PR-dedup check for %s failed (gh exit %s: %s) — proceeding without it",
+                src,
+                proc.returncode,
+                (proc.stderr or "").strip(),
+            )
+            return None
+        for pr in json.loads(proc.stdout or "[]"):
+            if _pr_references_issue(pr, n, slug):
+                return pr
+    except Exception:  # noqa: BLE001 — best-effort: never block creation on a gh/parse failure
+        log.warning(
+            "[project_board] PR-dedup check for %r errored — proceeding without it", source_issue, exc_info=True
+        )
+    return None
+
+
 def _strip_wrapping_quotes(s: str) -> str:
     """Peel ONE symmetric layer of literal wrapping double quotes off a string arg.
 
@@ -262,8 +332,12 @@ def _board_tools(cfg: dict):
         loop then churns on. It ALSO refuses when `depends_on` names a feature that is
         already `in_review` with an open PR: work built on in-flight work is a fix
         round and belongs on that feature's OWN PR — the warning points you at
-        `board_requeue_feature(fid, findings=...)` instead. Pass `force=true` to create
-        anyway. A store read failure never blocks creation (better a possible dup than a
+        `board_requeue_feature(fid, findings=...)` instead. When `source_issue` is
+        set it ALSO refuses when an open PR in that issue's repo already references
+        the issue number (title/body) — the issue is already being worked; review or
+        contribute to that PR instead of dispatching a second coder at it. Pass
+        `force=true` to create anyway (bypasses all three checks). A store read or
+        GitHub API failure never blocks creation (better a possible dup than a
         stuck board)."""
         try:
             # Resolve the store against THIS feature's project (#90): its repo/base_branch
@@ -314,6 +388,20 @@ def _board_tools(cfg: dict):
                         "the same work; re-check the board before creating again, or pass "
                         "force=true to create a second copy anyway."
                     )
+                # PR-side dedup (#174): an open PR that already references the source
+                # issue means the work is IN FLIGHT — a new card would dispatch a second
+                # coder at it (the real incident: a card created for an issue that
+                # already had an open, CI-passing PR). Mechanical, best-effort: a gh
+                # failure logs a warning inside the helper and never blocks creation.
+                if str(source_issue or "").strip():
+                    pr = _find_open_pr_for_issue(source_issue)
+                    if pr is not None:
+                        return (
+                            f"Skipped — open PR #{pr.get('number', '?')} ({pr.get('url', '')}) already "
+                            f"references issue {source_issue}: that work is in flight. Review or "
+                            "contribute to the existing PR instead of creating a duplicate card. "
+                            "Pass force=true to create anyway."
+                        )
             f = store.create_feature(
                 title,
                 spec=spec,
