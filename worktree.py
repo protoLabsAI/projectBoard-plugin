@@ -176,12 +176,42 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
 
 
 async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> bool:
-    """Remove the worktree + branch a feature owns, by its id — the one place that
-    knows the ``feat-<id>`` / ``feat/<id>`` naming. Shared by the merge webhook and
-    the merge poll (both reap once a feature reaches ``done``). Returns True if the
+    """Remove the worktree(s) + branch(es) a feature owns, by its id — the one place
+    that knows the ``feat-<id>`` / ``feat/<id>`` naming. Shared by the merge webhook,
+    the merge poll (both reap once a feature reaches ``done``), and the cancel path.
+
+    Reaps the canonical ``feat-<id>`` tree first, then sweeps any leftover CANDIDATE
+    trees (``feat-<id>.g<n>`` / ``.c<n>`` / ``.test``…, the ``_CANDIDATE_SUFFIX_RE``
+    shapes): a feature cancelled mid-first-generation has no canonical worktree yet —
+    only candidates — and a canonical-only reap would silently no-op, stranding the
+    tree + branch on disk (#175). Each candidate's branch follows the same
+    ``feat/<id>.<suffix>`` naming it was created with. Best-effort throughout (an
+    already-gone candidate is simply skipped). Returns True if the canonical
     directory is gone after the call."""
-    wt = os.path.join(repo, worktrees_root, f"feat-{fid}")
-    return await remove_worktree(repo, wt, f"feat/{fid}")
+    base = os.path.join(repo, worktrees_root)
+    canonical = os.path.join(base, f"feat-{fid}")
+    had_canonical = os.path.isdir(canonical)
+    removed = await remove_worktree(repo, canonical, f"feat/{fid}")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        names = []
+    reaped: list[str] = []
+    for name in names:
+        wt_id = name[len("feat-") :]
+        # Only THIS feature's candidates: `feat-<fid>.<suffix>` whose suffixes strip
+        # back to fid (handles the stacked `.test.g2` shape; skips `feat-<fid>x`
+        # prefix-collisions and non-candidate dots like `.gx`).
+        if not name.startswith(f"feat-{fid}.") or parent_feature_id(wt_id) != fid:
+            continue
+        if not os.path.isdir(os.path.join(base, name)):
+            continue
+        if await remove_worktree(repo, os.path.join(base, name), f"feat/{wt_id}"):
+            reaped.append(name)
+    if (removed and had_canonical) or reaped:
+        cleaned = ([f"feat-{fid}"] if removed and had_canonical else []) + reaped
+        log.info("[project_board] reaped worktrees for %s: %s", fid, ", ".join(cleaned))
+    return removed
 
 
 async def promote_worktree(

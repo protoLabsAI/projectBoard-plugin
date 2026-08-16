@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import sys
 import types
 
@@ -599,3 +600,103 @@ async def test_remove_worktree_does_not_rmtree_on_other_git_failure(monkeypatch,
     assert result is False, "must return False when removal was not possible"
     assert wt_dir.exists(), "directory must NOT be touched when git fails for another reason"
     assert "failed" in caplog.text, "a WARNING about the failure must be logged"
+
+
+# ── reap_feature_worktree: candidate sweep on cancel (#175) ─────────────────────
+
+
+async def test_reap_sweeps_candidate_when_canonical_absent(monkeypatch, tmp_path):
+    """Mid-first-generation cancel: only `feat-<id>.g1` exists (nothing promoted
+    yet). The reap must remove the candidate worktree + its `feat/<id>.g1` branch —
+    the old canonical-only reap silently no-opped here."""
+    (tmp_path / ".worktrees" / "feat-bd-9.g1").mkdir(parents=True)
+    calls = []
+
+    async def _remove(repo, wt, branch=""):
+        calls.append((wt, branch))
+        return True
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
+    assert calls == [
+        (str(tmp_path / ".worktrees" / "feat-bd-9"), "feat/bd-9"),
+        (str(tmp_path / ".worktrees" / "feat-bd-9.g1"), "feat/bd-9.g1"),
+    ]
+
+
+async def test_reap_sweeps_all_candidates_and_skips_other_features(monkeypatch, tmp_path):
+    """Multiple candidates (`.g1`, `.c1`, `.c2`) are all cleaned in one reap call; a
+    sibling feature's candidate (`feat-bd-90.g1`) and a non-candidate dot dir
+    (`feat-bd-9.gx`) are left alone."""
+    root = tmp_path / ".worktrees"
+    for name in ("feat-bd-9.g1", "feat-bd-9.c1", "feat-bd-9.c2", "feat-bd-90.g1", "feat-bd-9.gx"):
+        (root / name).mkdir(parents=True)
+    calls = []
+
+    async def _remove(repo, wt, branch=""):
+        calls.append((os.path.basename(wt), branch))
+        return True
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
+    assert calls[0] == ("feat-bd-9", "feat/bd-9")  # canonical attempt first, unchanged
+    assert calls[1:] == [
+        ("feat-bd-9.c1", "feat/bd-9.c1"),
+        ("feat-bd-9.c2", "feat/bd-9.c2"),
+        ("feat-bd-9.g1", "feat/bd-9.g1"),
+    ]
+
+
+async def test_reap_removes_candidate_dirs_from_disk_and_logs(monkeypatch, tmp_path, caplog):
+    """End-to-end over the rmtree fallback: the canonical AND candidate dirs both
+    vanish from disk, and the reap logs what it cleaned at INFO."""
+    root = tmp_path / ".worktrees"
+    canon = root / "feat-bd-9"
+    cand = root / "feat-bd-9.g1"
+    for d in (canon, cand):
+        d.mkdir(parents=True)
+        (d / "leftover.py").write_text("# stale")
+
+    async def _fake_git(repo, *args, timeout=60):
+        if args[:2] == ("worktree", "remove"):
+            return (1, "", "fatal: 'x' is not a working tree")  # metadata gone → rmtree fallback
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _fake_git)
+    with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
+        result = await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
+
+    assert result is True
+    assert not canon.exists() and not cand.exists()
+    assert "feat-bd-9" in caplog.text and "feat-bd-9.g1" in caplog.text
+
+
+async def test_reap_is_best_effort_when_nothing_exists(monkeypatch, tmp_path):
+    """No worktrees root, no candidates — the reap must not raise (same best-effort
+    posture as the existing canonical no-op)."""
+
+    async def _fake_git(repo, *args, timeout=60):
+        if args[:2] == ("worktree", "remove"):
+            return (1, "", "fatal: 'x' is not a working tree")
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _fake_git)
+    result = await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
+    assert result is True  # nothing on disk → the canonical dir is (vacuously) gone
+
+
+async def test_reap_tolerates_a_candidate_that_fails_to_remove(monkeypatch, tmp_path):
+    """A candidate whose git removal fails for a real reason (locked/dirty) is left
+    in place — never an exception into the loop."""
+    cand = tmp_path / ".worktrees" / "feat-bd-9.g1"
+    cand.mkdir(parents=True)
+
+    async def _fake_git(repo, *args, timeout=60):
+        if args[:2] == ("worktree", "remove"):
+            return (1, "", "fatal: 'x' is locked")
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_git", _fake_git)
+    result = await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
+    assert result is False  # canonical never existed AND its remove reported failure
+    assert cand.exists()  # the locked candidate was not force-deleted behind git's back
