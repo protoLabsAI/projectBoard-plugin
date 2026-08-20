@@ -81,7 +81,9 @@ import importlib
 import json
 import logging
 import re
+import sys
 import time
+import types
 from collections import OrderedDict, deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -230,8 +232,92 @@ class _GenBuffer:
         }
 
 
+# ── Reload-stable buffer slot (#178) ────────────────────────────────────────────
+# `_progress` used to be a plain module global — so a plugin hot-reload (graph
+# reload, `reload_plugins`) imported a FRESH module instance whose empty dict the
+# newly-mounted API routes read, while the still-running dispatch loop (holding the
+# OLD instance via its own import-time `from . import coder_seam`) kept streaming
+# gens into the previous dict: the drawer answered "No live coder run" for a gen
+# that was actively streaming. The buffer now lives on a process-stable holder — a
+# synthetic (non-importable) entry in ``sys.modules``, which a plugin reload never
+# replaces (it only re-imports the plugin's own package) — so every module instance
+# in the process reads and writes the SAME dict. Adoption by SHARING, not copying:
+# a copy would orphan the old loop's future writes all over again.
+#
+# Keyed by the loaded package name (the host mounts each plugin under its own
+# synthetic package) so two boards in one host never share a buffer, while a reload
+# of THIS plugin (same package name, fresh module object) finds its own slot. The
+# prefix keeps the slot name from starting with the plugin package's own name, so a
+# host that purges ``sys.modules`` by package prefix on reload can't purge it.
+#
+# Deliberately NOT filtered by board state on adoption (no "transfer only
+# in_progress features"): this module has no store access, and the buffer is
+# already bounded (_MAX_FEATURES LRU) and reset per fresh build (progress_new_run),
+# so carried-over stale entries age out exactly as they always did.
+_PROGRESS_SLOT_PREFIX = "project_board.coder_progress::"
+
+
+def _progress_slot_name() -> str:
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+    return _PROGRESS_SLOT_PREFIX + pkg
+
+
+def _attach_progress() -> "tuple[OrderedDict[str, OrderedDict[int, _GenBuffer]], int, int]":
+    """Attach to (or create) the process-stable live-monitor buffer. Returns
+    ``(buffer, carried, live)``: the shared dict, how many features a PREVIOUS
+    module instance left in it (0 on a fresh boot), and how many of those still
+    have a running (not-done) gen. The carried gens hold the previous instance's
+    ``_GenBuffer`` class — duck-typed everywhere they're read, never isinstance'd."""
+    name = _progress_slot_name()
+    holder = sys.modules.get(name)
+    prev = getattr(holder, "progress", None)
+    if isinstance(prev, OrderedDict):
+        live = sum(1 for gens in prev.values() if any(not b.done for b in gens.values()))
+        return prev, len(prev), live
+    holder = types.ModuleType(name)
+    holder.__doc__ = (
+        "Process-stable holder for project_board's live coder-monitor buffer (#178) — "
+        "a data slot that survives plugin reloads, not importable code."
+    )
+    holder.progress = OrderedDict()
+    sys.modules[name] = holder
+    return holder.progress, 0, 0
+
+
 # fid -> {gen -> _GenBuffer}. An OrderedDict so whole features LRU-evict cheaply.
-_progress: "OrderedDict[str, OrderedDict[int, _GenBuffer]]" = OrderedDict()
+# Attached to the process-stable slot above so it survives a plugin reload (#178).
+_progress: "OrderedDict[str, OrderedDict[int, _GenBuffer]]"
+_progress, _adopted_features, _adopted_live = _attach_progress()
+if _adopted_features:
+    # The splunk line for #178: a reload adopted the previous instance's buffer.
+    log.warning(
+        "[project_board] plugin reload: adopted the previous instance's coder-monitor "
+        "buffer — %d feature(s) carried over (%d with a live gen)",
+        _adopted_features,
+        _adopted_live,
+    )
+
+
+def ensure_progress_attached() -> int:
+    """``register()``'s mount-time hook (#178): make sure THIS module instance's
+    ``_progress`` IS the process-stable shared buffer, and return how many features
+    it currently carries. Import-time attachment normally already did this (the
+    call is then a no-op); going through it at register() pins adoption to the
+    plugin lifecycle — not the first progress poll after a reload — and repairs the
+    one divergence left, the slot replaced from outside after this module was
+    imported (adopt it: the slot is the single source of truth every instance must
+    read AND write; keeping two live dicts is exactly the split this fix removes)."""
+    global _progress
+    buf, carried, live = _attach_progress()
+    if buf is not _progress:
+        log.warning(
+            "[project_board] coder-monitor buffer slot changed after import — re-adopting "
+            "(%d feature(s) carried over, %d with a live gen)",
+            carried,
+            live,
+        )
+        _progress = buf
+    return len(buf)
 
 
 def _gens_for(fid: str | None, *, create: bool = False):
