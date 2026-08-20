@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.37.0
+version: 0.38.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -18,7 +18,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.27.0"   # console views (ADR 0026) + the delegate teardown (#715/#727)
+min_protoagent_version: "0.31.0"   # register_surface(reload=) — the live concurrency knobs (#509/#511)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
@@ -101,6 +101,10 @@ config:
   coder_solve_k: 3          # best-of-k width (rung 2): candidates generated (each in
                             # its own throwaway worktree) before execution-select.
   coder_solve_tree_depth: 2 # refine-on-failing-tests depth (rung 3).
+  max_concurrent_sessions: 0  # cap on the best-of-k fan-out INSIDE one build (0 = unlimited
+                            # within the k budget; 1 = one candidate at a time). Host-wide peak
+                            # ACP processes = max_concurrent × min(coder_solve_k, this). LIVE:
+                            # a config reload applies it to the next dispatch (console field).
   max_mode_n: 1             # best-of-N "Max-Mode" (borrowed from MiMo-Code). 1 = off. >1 builds a
                             # feature N ways in parallel (N candidate worktrees, all dispatched at
                             # once), a low-temp judge picks the diff that best satisfies
@@ -132,10 +136,17 @@ config:
                             # >1 drives that many features in parallel, each in its
                             # own worktree; 1 = serial (the safe default). Parallel
                             # builds whose files_to_modify overlap are serialized (the
-                            # hot-file guard) to avoid sure merge conflicts.
+                            # hot-file guard) to avoid sure merge conflicts. On a
+                            # multi-project board size it to the project count — one
+                            # slot per repo — or a deep queue in one project starves
+                            # the rest. LIVE: a config reload (console Settings save)
+                            # applies it to the running loop's next claim scan; lowering
+                            # it never kills an in-flight build.
   max_pending_reviews: 5    # back-pressure: pause claiming new work while this many
                             # PRs already await review (don't pile up faster than they
-                            # merge). 0 = unlimited.
+                            # merge). 0 = unlimited. LIVE (see max_concurrent) — raise
+                            # it with max_concurrent or the extra slots idle behind
+                            # the review queue.
   dep_gate: merge           # how a blocks-dependency gates its dependents: "merge"
                             # (default, safe) — wait for the blocker to merge (done);
                             # "review" — a NON-foundation blocker releases dependents at
@@ -173,6 +184,19 @@ config:
   webhook_secret: ""        # GitHub webhook HMAC secret for /webhook/pr (the Done
                             # edge). Blank → signature NOT verified (dev only); set
                             # it (or PROJECT_BOARD_WEBHOOK_SECRET) before exposing.
+
+# Console Settings fields (ADR 0019) — rendered under Settings → Plugins → "Project Board".
+# ONLY the knobs the running loop re-applies on a config reload belong here (loop.py
+# LIVE_KNOBS, via register_surface(reload=)): a field the operator can edit but that
+# silently needs a restart is worse than no field. Saving writes `project_board.<key>`
+# to the agent layer; the reload hook applies it on the loop's next tick.
+settings:
+  - { key: max_concurrent, label: "Parallel builds", type: number, group: "Project Board",
+      description: "How many features the loop drives at once, each in its own worktree (1 = serial). Size it to the board's projects — one slot per repo keeps a deep queue in one project from starving the others. Applies live on save; lowering it never kills a running build, the loop just stops claiming until it is under the cap. Peak coder processes = this × coder_solve_k." }
+  - { key: max_concurrent_sessions, label: "Coder sessions per build", type: number, group: "Project Board",
+      description: "Caps the best-of-k fan-out INSIDE one build (0 = unlimited within the k budget; 1 = generate candidates one at a time). Applies to the next dispatch. Host-wide peak ACP processes = Parallel builds × this." }
+  - { key: max_pending_reviews, label: "Review-queue limit", type: number, group: "Project Board",
+      description: "Back-pressure: stop claiming new work while this many PRs already sit in review (0 = unlimited). Applies live on save. Raise it alongside Parallel builds or the extra slots idle behind the review queue." }
 
 # Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
 # The list/Kanban view is a projection over the /features API (no separate store).

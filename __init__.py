@@ -63,7 +63,11 @@ def register(registry) -> None:
         from .loop import BoardLoop
 
         loop = BoardLoop(cfg)
-        registry.register_surface(loop.start, stop=loop.stop, name="project-board-loop")
+        # `reload=` (ADR 0018): the host fires it on every config reload with the new
+        # config, so the concurrency knobs (LIVE_KNOBS — max_concurrent et al.) edited
+        # in the console Settings land on the RUNNING loop. Without it the surface
+        # wires once and a cap change needed a restart.
+        registry.register_surface(loop.start, stop=loop.stop, reload=loop.reload, name="project-board-loop")
     except Exception:  # noqa: BLE001 — loop is best-effort; the API still serves
         log.exception("[project_board] registering loop surface failed")
 

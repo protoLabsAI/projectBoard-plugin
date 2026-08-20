@@ -112,6 +112,58 @@ def test_max_concurrent_floors_at_one():
     assert BoardLoop({"max_concurrent": 4}).max_concurrent == 4
 
 
+# ── reload(): the live concurrency knobs land on the RUNNING loop ────────────────
+
+
+class _HostConfig:
+    """Shape of what the host hands a surface's reload hook: a LangGraphConfig whose
+    `.plugin_config[section]` is the resolved (manifest defaults ⊕ YAML) section."""
+
+    def __init__(self, section):
+        self.plugin_config = {"project_board": section}
+
+
+def test_reload_applies_every_live_knob_and_returns_the_diff():
+    loop = BoardLoop({"max_concurrent": 1, "max_pending_reviews": 5, "max_concurrent_sessions": 0})
+    changed = loop.reload(_HostConfig({"max_concurrent": 6, "max_pending_reviews": 12, "max_concurrent_sessions": 2}))
+    assert changed == {"max_concurrent": (1, 6), "max_pending_reviews": (5, 12), "max_concurrent_sessions": (0, 2)}
+    assert (loop.max_concurrent, loop.max_pending_reviews, loop.max_concurrent_sessions) == (6, 12, 2)
+    # Idempotent: the same payload again is a no-op diff.
+    assert (
+        loop.reload(_HostConfig({"max_concurrent": 6, "max_pending_reviews": 12, "max_concurrent_sessions": 2})) == {}
+    )
+
+
+def test_reload_accepts_a_bare_section_dict_or_a_wrapped_one():
+    loop = BoardLoop({})
+    assert loop.reload({"max_concurrent": 3}) == {"max_concurrent": (1, 3)}
+    assert loop.reload({"project_board": {"max_concurrent": 4}}) == {"max_concurrent": (3, 4)}
+    assert loop.reload(None) == {} and loop.reload("nonsense") == {}
+
+
+def test_reload_floors_like_the_constructor_and_keeps_bad_values(caplog):
+    """A Settings typo must not stall the loop: a non-integer keeps the current knob
+    (with a warning); a below-floor value floors exactly as construction does; a
+    payload missing the key leaves that knob alone."""
+    loop = BoardLoop({"max_concurrent": 2, "max_pending_reviews": 5})
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        assert loop.reload({"max_concurrent": "lots"}) == {}
+    assert loop.max_concurrent == 2
+    assert "not an integer" in caplog.text
+    assert loop.reload({"max_concurrent": 0, "max_pending_reviews": -3}) == {
+        "max_concurrent": (2, 1),
+        "max_pending_reviews": (5, 0),
+    }
+    assert loop.reload({"max_pending_reviews": 7}) == {"max_pending_reviews": (0, 7)}
+    assert loop.max_concurrent == 1  # untouched by a payload without the key
+
+
+def test_reload_only_touches_live_knobs():
+    loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30})
+    assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coder": "other"}) == {}
+    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coder_name == "proto"
+
+
 def test_max_mode_n_parsing():
     assert BoardLoop({}).max_mode_n == 1  # off by default
     assert BoardLoop({"max_mode_n": 5}).max_mode_n == 5
@@ -1458,6 +1510,41 @@ async def test_spawn_ready_claims_up_to_max_concurrent(monkeypatch):
         assert loop._spawn_ready() is True
         assert len(loop._drives) == 2  # capped at max_concurrent
         assert store.claimed == ["bd-1", "bd-2"]  # stopped claiming once full
+    finally:
+        await finish()
+
+
+async def test_reload_raises_the_cap_for_the_next_claim_scan_without_a_restart(monkeypatch):
+    """The bug this fixes: six projects' worth of ready cards behind a one-slot loop,
+    and a max_concurrent edit that only landed after a restart. After reload() the
+    very next _spawn_ready claims up to the NEW cap on the SAME running loop."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"]), _ready("bd-3", ["c.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        loop._spawn_ready()
+        assert store.claimed == ["bd-1"]  # serial: one slot
+        assert loop.reload(_HostConfig({"max_concurrent": 3})) == {"max_concurrent": (1, 3)}
+        loop._spawn_ready()
+        assert store.claimed == ["bd-1", "bd-2", "bd-3"]  # both extra slots filled this tick
+        assert len(loop._drives) == 3
+    finally:
+        await finish()
+
+
+async def test_reload_lowering_the_cap_never_kills_a_drive(monkeypatch):
+    store = _ClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"]), _ready("bd-3", ["c.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        loop._spawn_ready()
+        assert len(loop._drives) == 2
+        loop.reload({"max_concurrent": 1})
+        assert len(loop._drives) == 2  # in-flight builds keep running…
+        assert loop._spawn_ready() is False  # …the loop just stops claiming until under the cap
+        assert store.claimed == ["bd-1", "bd-2"]
     finally:
         await finish()
 
