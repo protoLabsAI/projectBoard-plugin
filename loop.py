@@ -1023,6 +1023,7 @@ class BoardLoop:
             self.coder_timeout,
             ", ".join(LIVE_KNOBS),
         )
+        self._warn_if_review_gate_unrunnable()
         if self.coder_solve and self.coder_solve_k > 1:
             peak = self.max_concurrent * self.coder_solve_k
             cap_note = f", capped at {self.max_concurrent_sessions}" if self.max_concurrent_sessions > 0 else ""
@@ -1037,6 +1038,30 @@ class BoardLoop:
                 cap_note,
             )
         return self._task
+
+    def _warn_if_review_gate_unrunnable(self) -> None:
+        """Boot-time preflight for the review gate (#180): review_gate=True with
+        neither a workflow runner (``STATE.workflow_run`` — absent when the
+        workflows plugin is disabled) nor a resolvable reviewer means EVERY
+        review will fail closed. Say so once, loudly, at loop start — instead of
+        letting the operator correlate per-feature gate warnings with a plugin
+        toggle by reading the server log. Advisory only: the per-run gate still
+        fails closed on its own; a runner appearing later just works."""
+        if not self.review_gate:
+            return
+        runner = None
+        try:
+            from runtime.state import STATE
+
+            runner = getattr(STATE, "workflow_run", None)
+        except Exception:  # noqa: BLE001 — non-protoAgent host (tests)
+            runner = None
+        if runner is not None or self._resolve_delegate(self.reviewer_name, "a2a") is not None:
+            return
+        log.warning(
+            "[project_board] review_gate is on but no review runner available "
+            "(workflows plugin disabled? reviewer_name not set?) — every review will fail closed"
+        )
 
     def reload(self, new_config) -> dict:
         """Apply the concurrency knobs from a reloaded config to the RUNNING loop.
@@ -2315,14 +2340,15 @@ class BoardLoop:
         the gate after test-passing candidate selection is a one-line move.
         """
         store.set_review_substate(fid, LABEL_REVIEW_PENDING)
-        output = await self._run_review_workflow(fid, pr_url)
+        output, why = await self._run_review_workflow(fid, pr_url)
         if output is None:
-            # Could not review (no runner + no reviewer, a dead run, or a PARTIAL
-            # panel — a failed finder step is not a review; judging from it is how
-            # an unreviewed PR gets promoted, ADR 0078 D3). Leave review-pending so
-            # the PR reconcile retries next poll — but bounded: a persistently
-            # unrunnable gate escalates to the operator instead of re-burning the
-            # workflow every poll forever.
+            # Could not review — ``why`` names the actual cause (#180: no runner +
+            # no reviewer, failed panel steps, a dead call — a failed finder step is
+            # not a review; judging from it is how an unreviewed PR gets promoted,
+            # ADR 0078 D3). Leave review-pending so the PR reconcile retries next
+            # poll — but bounded: a persistently unrunnable gate escalates to the
+            # operator instead of re-burning the workflow every poll forever.
+            reason = why or "review produced no output"
             n = self._review_run_failures.get(fid, 0) + 1
             self._review_run_failures[fid] = n
             if n >= self.review_run_max:
@@ -2334,17 +2360,18 @@ class BoardLoop:
                 # review, so its PR could merge un-reviewed.
                 store.flag_blocked(
                     fid,
-                    f"review gate could not complete after {n} attempt(s) (runner missing, "
-                    f"workflow dying, or panel steps failing) — needs operator attention: {pr_url}",
+                    f"review gate could not complete after {n} attempt(s) — {reason} — "
+                    f"needs operator attention: {pr_url}",
                 )
                 self._review_run_failures.pop(fid, None)
-                log.warning("[project_board] %s blocked (review gate unrunnable %d times)", fid, n)
+                log.warning("[project_board] %s blocked (review gate unrunnable %d times: %s)", fid, n, reason)
                 return
             log.warning(
-                "[project_board] %s review gate could not run (%d/%d) — will retry on the next poll",
+                "[project_board] %s review gate could not run (%d/%d): %s — will retry on the next poll",
                 fid,
                 n,
                 self.review_run_max,
+                reason,
             )
             return
         self._review_run_failures.pop(fid, None)
@@ -2405,11 +2432,18 @@ class BoardLoop:
             len(blocking),
         )
 
-    async def _run_review_workflow(self, fid: str, pr_url: str) -> str | None:
+    async def _run_review_workflow(self, fid: str, pr_url: str) -> tuple[str | None, str | None]:
         """Produce the raw review output for a PR: the host's workflow runner
         (``runtime.state.STATE.workflow_run`` — published by the workflows plugin,
         no plugin import needed) running ``review_workflow``, else the configured
-        a2a reviewer told to emit the findings convention. None = could not review."""
+        a2a reviewer told to emit the findings convention.
+
+        Returns ``(output, None)`` on success, ``(None, reason)`` when the review
+        could not happen. The reason names the ACTUAL cause — runner missing,
+        failed panel steps, a dead call — so the gate's retry warning and eventual
+        block reason tell the operator what to fix instead of making them
+        correlate a generic three-hypothesis message with the server log (#180:
+        the live incident was simply the workflows plugin being disabled)."""
         number, repo_slug = _parse_pr_url(pr_url)
         runner = None
         try:
@@ -2418,6 +2452,9 @@ class BoardLoop:
             runner = getattr(STATE, "workflow_run", None)
         except Exception:  # noqa: BLE001 — non-protoAgent host (tests) → try the reviewer
             runner = None
+        # Why the workflow path yielded nothing (None = there was no runner at all) —
+        # composed into the reason when the reviewer fallback can't save the run.
+        no_run_reason: str | None = None
         if runner is not None and number:
             try:
                 inputs: dict = {"pr": number, "repo": repo_slug}
@@ -2436,14 +2473,25 @@ class BoardLoop:
                         self.review_workflow,
                         failed,
                     )
-                    return None
-                return str((result or {}).get("output") or "") or None
+                    return None, (
+                        f"workflow {self.review_workflow!r} ran but had failed step(s): "
+                        f"{', '.join(str(s) for s in failed)}"
+                    )
+                output = str((result or {}).get("output") or "")
+                if output:
+                    return output, None
+                return None, f"workflow {self.review_workflow!r} ran but produced no output"
             except Exception as exc:  # noqa: BLE001 — a dead workflow ≠ a dead loop
                 log.warning("[project_board] %s review workflow %r failed: %s", fid, self.review_workflow, exc)
+                no_run_reason = f"workflow {self.review_workflow!r} call failed: {exc}"
                 # fall through to the reviewer alternative
+        elif runner is not None:
+            no_run_reason = f"workflow runner present but no PR number parses from {pr_url!r}"
         reviewer = self._resolve_delegate(self.reviewer_name, "a2a")
         if reviewer is None:
-            return None
+            if no_run_reason is not None:
+                return None, f"{no_run_reason}; no reviewer fallback configured"
+            return None, "no workflow runner available and no reviewer configured"
         from plugins.delegates.adapters import ADAPTERS
 
         try:
@@ -2455,10 +2503,13 @@ class BoardLoop:
                 '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '
                 "No findings → an empty array []."
             )
-            return await ADAPTERS["a2a"].dispatch(reviewer, msg)
+            output = await ADAPTERS["a2a"].dispatch(reviewer, msg)
+            if output is None:
+                return None, f"reviewer {self.reviewer_name!r} returned no output"
+            return output, None
         except Exception as exc:  # noqa: BLE001
             log.warning("[project_board] %s reviewer fallback failed: %s", fid, exc)
-            return None
+            return None, f"reviewer {self.reviewer_name!r} call failed: {exc}"
 
     @staticmethod
     def _parse_findings(output: str):
