@@ -3169,11 +3169,14 @@ def _inject_fake_findings(monkeypatch):
 
 def _gate_loop(monkeypatch, output, cfg=None):
     """A review_gate loop whose review-workflow run returns ``output`` (None = the
-    run could not happen) and whose PR-diff fetch is stubbed."""
+    run could not happen, with the no-runner-no-reviewer reason) and whose PR-diff
+    fetch is stubbed."""
     loop = BoardLoop({"review_gate": True, **(cfg or {})})
 
     async def _run(fid, pr_url):
-        return output
+        if output is None:
+            return None, "no workflow runner available and no reviewer configured"
+        return output, None
 
     async def _diff(pr_url, cwd="."):
         return "diff --git a/x b/x"
@@ -3309,6 +3312,8 @@ async def test_review_gate_unrunnable_escalates_after_run_max(monkeypatch):
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
     assert blocked and "operator attention" in blocked[0][2]
+    # #180: the block reason carries the ACTUAL cause, not the generic three-hypothesis text
+    assert "no workflow runner available and no reviewer configured" in blocked[0][2]
     assert "bd-1" not in loop._review_run_failures
     # #181: review-pending is PRESERVED through the block (never cleared) so an
     # operator unblock re-arms the gate on the next reconcile poll — cleared, the
@@ -3364,7 +3369,7 @@ async def test_review_gate_unrunnable_block_then_unblock_rearms_the_gate(monkeyp
 
     async def _run(fid, pr_url):
         runs.append(pr_url)
-        return None  # unrunnable — no runner, dead run, or partial panel
+        return None, "stub: unrunnable"  # no runner, dead run, or partial panel
 
     async def _pr_state(url, *, cwd="."):
         return "OPEN"
@@ -3419,6 +3424,177 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert "prior_findings" in seen_inputs[1]
     assert "drops data" in seen_inputs[1]["prior_findings"]
+
+
+# ── surfaced unrunnable-gate causes (#180) ───────────────────────────────────────
+
+
+def _inject_runtime_runner(monkeypatch, runner):
+    """Stand in for the HOST's runtime.state.STATE (the workflows plugin's published
+    runner) — ``runner=None`` models the plugin being disabled."""
+    import sys as _sys
+    import types as _types
+
+    rt = _types.ModuleType("runtime")
+    rt_state = _types.ModuleType("runtime.state")
+    rt_state.STATE = _types.SimpleNamespace(workflow_run=runner)
+    rt.state = rt_state
+    monkeypatch.setitem(_sys.modules, "runtime", rt)
+    monkeypatch.setitem(_sys.modules, "runtime.state", rt_state)
+
+
+def _inject_fake_adapters(monkeypatch, dispatch):
+    """Stand in for the HOST's plugins.delegates.adapters (absent in this suite) so
+    the reviewer-fallback path can be exercised."""
+    import sys as _sys
+    import types as _types
+
+    adapters = _types.ModuleType("plugins.delegates.adapters")
+    adapters.ADAPTERS = {"a2a": _types.SimpleNamespace(dispatch=dispatch)}
+    plugins = _types.ModuleType("plugins")
+    delegates = _types.ModuleType("plugins.delegates")
+    plugins.delegates = delegates
+    delegates.adapters = adapters
+    monkeypatch.setitem(_sys.modules, "plugins", plugins)
+    monkeypatch.setitem(_sys.modules, "plugins.delegates", delegates)
+    monkeypatch.setitem(_sys.modules, "plugins.delegates.adapters", adapters)
+
+
+async def test_run_review_workflow_reason_no_runner_no_reviewer(monkeypatch):
+    """#180 (a) — the live incident: workflows plugin disabled (no STATE.workflow_run)
+    and no reviewer resolves. The reason names BOTH missing dependencies."""
+    _inject_runtime_runner(monkeypatch, None)
+    loop = BoardLoop({"review_gate": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+    output, why = await loop._run_review_workflow("bd-1", "https://github.com/o/r/pull/9")
+    assert output is None
+    assert why == "no workflow runner available and no reviewer configured"
+
+
+async def test_run_review_workflow_reason_names_failed_steps(monkeypatch):
+    """#180 (b): a partial panel fails closed with the failed step NAMES in the reason."""
+
+    async def _runner(name, inputs):
+        return {"output": "clean.\n```json\n[]\n```", "steps": {}, "failed": ["find_crossfile", "judge"]}
+
+    _inject_runtime_runner(monkeypatch, _runner)
+    loop = BoardLoop({"review_gate": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+    output, why = await loop._run_review_workflow("bd-1", "https://github.com/o/r/pull/9")
+    assert output is None
+    assert "failed step(s)" in why and "find_crossfile" in why and "judge" in why
+
+
+async def test_run_review_workflow_reason_includes_workflow_exception(monkeypatch):
+    """#180 (c): a dying workflow with no reviewer fallback — the reason carries the
+    exception message and says the fallback was missing."""
+
+    async def _runner(name, inputs):
+        raise RuntimeError("panel exploded")
+
+    _inject_runtime_runner(monkeypatch, _runner)
+    loop = BoardLoop({"review_gate": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+    output, why = await loop._run_review_workflow("bd-1", "https://github.com/o/r/pull/9")
+    assert output is None
+    assert "call failed" in why and "panel exploded" in why
+    assert "no reviewer fallback configured" in why
+
+
+async def test_run_review_workflow_reason_includes_reviewer_exception(monkeypatch):
+    """#180 (c), reviewer flavor: no runner, the a2a dispatch raises — the reason
+    names the reviewer and carries the exception message."""
+    _inject_runtime_runner(monkeypatch, None)
+
+    async def _dispatch(reviewer, msg):
+        raise RuntimeError("a2a unreachable")
+
+    _inject_fake_adapters(monkeypatch, _dispatch)
+    loop = BoardLoop({"review_gate": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: object())
+    output, why = await loop._run_review_workflow("bd-1", "https://github.com/o/r/pull/9")
+    assert output is None
+    assert "reviewer" in why and "call failed" in why and "a2a unreachable" in why
+
+
+async def test_review_gate_retry_and_block_name_the_actual_cause(monkeypatch, caplog):
+    """End-to-end through the REAL _run_review_workflow: the retry warning AND the
+    eventual block reason say exactly what is missing — the operator no longer
+    correlates plugin toggles with generic gate warnings in the server log (#180)."""
+    _inject_fake_findings(monkeypatch)
+    _inject_runtime_runner(monkeypatch, None)
+    store = _GateStore()
+    loop = BoardLoop({"review_gate": True, "review_run_max": 2})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert "no workflow runner available and no reviewer configured" in caplog.text  # the retry warning
+    assert not any(c[0] == "flag_blocked" for c in store.calls)
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")  # exhausts run_max
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "no workflow runner available and no reviewer configured" in blocked[0][2]
+    assert "runner missing" not in blocked[0][2]  # the generic three-hypothesis text is gone
+
+
+async def test_review_gate_block_reason_names_failed_steps(monkeypatch):
+    """A gate exhausted by partial panels blocks with the failed step named (#180 (b))."""
+    _inject_fake_findings(monkeypatch)
+
+    async def _runner(name, inputs):
+        return {"output": "clean", "steps": {}, "failed": ["find_crossfile"]}
+
+    _inject_runtime_runner(monkeypatch, _runner)
+    store = _GateStore()
+    loop = BoardLoop({"review_gate": True, "review_run_max": 1})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "find_crossfile" in blocked[0][2]
+
+
+async def test_boot_warns_when_review_gate_has_no_runner(monkeypatch, caplog):
+    """#180: review_gate=True with neither a workflow runner nor a reviewer → ONE
+    loud actionable WARNING at loop start naming the missing dependencies."""
+    import logging
+
+    monkeypatch.setattr("project_board.loop.BoardLoop._run", lambda self: _noop_coro())
+    _inject_runtime_runner(monkeypatch, None)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        loop = BoardLoop({"review_gate": True, "loop_enabled": True})
+        monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+        loop.start()
+    if loop._task:
+        loop._task.cancel()
+    warn = [r.message for r in caplog.records if "review_gate is on but no review runner available" in r.message]
+    assert warn, "expected a boot WARNING when the review gate cannot run"
+    assert "workflows plugin disabled" in warn[0] and "fail closed" in warn[0]
+
+
+async def test_boot_warning_silent_when_a_runner_or_reviewer_resolves(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr("project_board.loop.BoardLoop._run", lambda self: _noop_coro())
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        # a live workflow runner → no warning
+        _inject_runtime_runner(monkeypatch, lambda name, inputs: None)
+        loop = BoardLoop({"review_gate": True, "loop_enabled": True})
+        monkeypatch.setattr(loop, "_resolve_delegate", lambda n, t: None)
+        loop.start()
+        if loop._task:
+            loop._task.cancel()
+        # no runner but a reviewer resolves → no warning either
+        _inject_runtime_runner(monkeypatch, None)
+        loop2 = BoardLoop({"review_gate": True, "loop_enabled": True})
+        monkeypatch.setattr(loop2, "_resolve_delegate", lambda n, t: object())
+        loop2.start()
+        if loop2._task:
+            loop2._task.cancel()
+        # review_gate off → the preflight is skipped entirely
+        loop3 = BoardLoop({"loop_enabled": True})
+        loop3.start()
+        if loop3._task:
+            loop3._task.cancel()
+    assert "review_gate is on but no review runner available" not in caplog.text
 
 
 # ── per-feature project resolution (#90 slice 2) ─────────────────────────────────
