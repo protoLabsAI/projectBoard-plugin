@@ -2326,7 +2326,12 @@ class BoardLoop:
             n = self._review_run_failures.get(fid, 0) + 1
             self._review_run_failures[fid] = n
             if n >= self.review_run_max:
-                store.set_review_substate(fid, None)
+                # Deliberately KEEP review-pending through the block (#181): blocked
+                # features aren't reconciled, so the label is inert while blocked —
+                # but the moment the operator unblocks, the feature is back in_review
+                # with review-pending set and the next poll re-arms the gate. Clearing
+                # it here left an unblocked feature indistinguishable from a clean
+                # review, so its PR could merge un-reviewed.
                 store.flag_blocked(
                     fid,
                     f"review gate could not complete after {n} attempt(s) (runner missing, "

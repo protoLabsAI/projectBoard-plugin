@@ -3310,6 +3310,83 @@ async def test_review_gate_unrunnable_escalates_after_run_max(monkeypatch):
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
     assert blocked and "operator attention" in blocked[0][2]
     assert "bd-1" not in loop._review_run_failures
+    # #181: review-pending is PRESERVED through the block (never cleared) so an
+    # operator unblock re-arms the gate on the next reconcile poll — cleared, the
+    # feature would sit in_review indistinguishable from a clean review.
+    assert store.review_states == [("review-pending", "")]
+    assert ("set_review_substate", "bd-1", None) not in store.calls
+
+
+class _RoundTripStore(_GateStore):
+    """_GateStore + the reconcile surface — one feature whose labels/state mirror
+    what set_review_substate / flag_blocked / an operator unblock would do."""
+
+    _SUBSTATES = ("review-pending", "changes-requested", "review-clean")
+
+    def __init__(self):
+        super().__init__()
+        self.labels = []
+        self.pr_url = "https://github.com/o/r/pull/9"
+
+    def set_review_substate(self, fid, label, note=""):
+        self.labels = [l for l in self.labels if l not in self._SUBSTATES]
+        if label:
+            self.labels.append(label)
+        return super().set_review_substate(fid, label, note)
+
+    def flag_blocked(self, fid, reason):
+        self.state = "blocked"
+        return super().flag_blocked(fid, reason)
+
+    def unblock(self, fid):
+        self.state = "in_review"
+
+    def list_features(self, state=None):
+        if state == "in_review" and self.state == "in_review":
+            return [{"id": "bd-1", "pr_url": self.pr_url, "labels": list(self.labels), "repo": "/repo"}]
+        return []
+
+    def get_feature(self, fid):
+        return {"id": fid, "board_state": self.state, "labels": list(self.labels)}
+
+
+async def test_review_gate_unrunnable_block_then_unblock_rearms_the_gate(monkeypatch):
+    """The full #181 round trip: gate exhausts review_run_max → blocked WITH
+    review-pending kept → the label is inert while blocked (no reconcile) →
+    operator unblocks → the next reconcile poll sees review-pending and re-runs
+    the gate."""
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    # merge_poll off → ci_poll/auto_rebase default off, so the reconcile exercises
+    # ONLY the review-gate resume edge.
+    loop = BoardLoop({"review_gate": True, "review_run_max": 1, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return None  # unrunnable — no runner, dead run, or partial panel
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    # Round 1: the only allowed attempt fails → blocked, review-pending intact.
+    await loop._review_gate(store, "bd-1", store.pr_url, "/repo")
+    assert store.state == "blocked"
+    assert "review-pending" in store.labels
+
+    # Blocked features aren't reconciled — the label is inert, the gate stays quiet.
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url]
+
+    # Operator fixes the environment and unblocks → back in_review with the label
+    # still set — the next poll re-arms the gate.
+    store.unblock("bd-1")
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url, store.pr_url]
 
 
 async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
