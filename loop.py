@@ -2343,6 +2343,20 @@ class BoardLoop:
                 return None
             if proc.returncode == 0:
                 return None
+            if proc.returncode is not None and proc.returncode < 0:
+                # Killed by a signal — the member shutting down (SIGTERM reaches the
+                # child), an operator `kill`, the OOM killer — NOT the repo failing its
+                # own gate. Same posture as the timeout above: the gate couldn't run to
+                # a verdict, so it must not produce one. Seen 2026-08-20: a restart
+                # landed mid merged-state gate, pytest died at 13% with rc=-15, and the
+                # feature was flag_blocked "gate FAILED on the merged state" against a
+                # PR whose CI was fully green.
+                log.warning(
+                    "[project_board] pre-PR gate killed by signal %d (shutdown / external kill) — "
+                    "no verdict, treating as pass (CI still gates)",
+                    -proc.returncode,
+                )
+                return None
             text = (out or b"").decode("utf-8", "replace").strip()
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
