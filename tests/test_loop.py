@@ -149,13 +149,22 @@ def test_reload_floors_like_the_constructor_and_keeps_bad_values(caplog):
     with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
         assert loop.reload({"max_concurrent": "lots"}) == {}
     assert loop.max_concurrent == 2
-    assert "not an integer" in caplog.text
+    assert "is malformed" in caplog.text
     assert loop.reload({"max_concurrent": 0, "max_pending_reviews": -3}) == {
         "max_concurrent": (2, 1),
         "max_pending_reviews": (5, 0),
     }
     assert loop.reload({"max_pending_reviews": 7}) == {"max_pending_reviews": (0, 7)}
     assert loop.max_concurrent == 1  # untouched by a payload without the key
+
+
+def test_reload_flips_auto_merge_and_rejects_garbage():
+    loop = BoardLoop({})
+    assert loop.auto_merge is False
+    assert loop.reload({"auto_merge": True}) == {"auto_merge": (False, True)}
+    assert loop.reload({"auto_merge": "false"}) == {"auto_merge": (True, False)}  # YAML string spelling
+    assert loop.reload({"auto_merge": "maybe"}) == {}  # malformed → keep
+    assert loop.auto_merge is False
 
 
 def test_reload_only_touches_live_knobs():
@@ -3176,7 +3185,7 @@ async def test_review_gate_clean_and_nonblocking_findings_pass(monkeypatch):
         await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
         assert ("requeue", "bd-1") not in store.calls
         assert not any(c[0] == "flag_blocked" for c in store.calls)
-        assert store.review_states[-1][0] is None  # sub-state cleared
+        assert store.review_states[-1][0] == "review-clean"  # the POSITIVE verdict the merge edge keys off
         assert "bd-1" not in loop._ci_feedback
 
 
@@ -3997,3 +4006,137 @@ async def test_preflight_cancelled_by_shutdown_does_not_produce_failure(monkeypa
     # would hold work.
     assert loop._preflight_state.get("default") is None
     assert not isinstance(loop._preflight_state.get("default"), str)
+
+
+# ── the auto-merge edge: green + current + reviewed + not held → gh pr merge ──────
+
+
+class _MergeStore:
+    def __init__(self, feature):
+        self.feature = dict(feature)
+        self.comments = []
+
+    def get_feature(self, fid):
+        return dict(self.feature)
+
+    def _comment(self, fid, text):
+        self.comments.append((fid, text))
+
+
+def _reviewed(**over):
+    f = {
+        "id": "bd-1",
+        "board_state": "in_review",
+        "blocked": False,
+        "labels": ["in-review", "review-clean", "merged-verified:abcdef123456"],
+        "pr_url": "https://github.com/o/r/pull/1",
+    }
+    f.update(over)
+    return f
+
+
+def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True):
+    calls = {"merge": []}
+
+    async def _head(repo, ref):
+        return head
+
+    async def _mss(pr_url, *, cwd="."):
+        return mss
+
+    async def _merge(pr_url, *, method="squash", cwd="."):
+        calls["merge"].append((pr_url, method, cwd))
+        return (merge_ok, "" if merge_ok else "Pull request is not mergeable: required status check pending")
+
+    monkeypatch.setattr(worktree, "origin_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_merge_state", _mss)
+    monkeypatch.setattr(worktree, "merge_pr", _merge)
+    return calls
+
+
+async def test_auto_merge_merges_when_every_gate_is_green_and_current(monkeypatch):
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert calls["merge"] == [("https://github.com/o/r/pull/1", "squash", "/repo")]
+
+
+async def test_auto_merge_is_off_by_default_and_never_called(monkeypatch):
+    loop = BoardLoop({})
+    assert loop.auto_merge is False  # opt-in: a pre-upgrade board keeps parking PRs for its adjudicator
+
+
+@pytest.mark.parametrize(
+    "over, reason",
+    [
+        ({"labels": ["in-review", "review-clean", "merged-verified:abcdef123456", "merge-hold"]}, "merge-hold"),
+        ({"labels": ["in-review", "review-pending", "merged-verified:abcdef123456"]}, "review in progress"),
+        ({"labels": ["in-review", "changes-requested", "merged-verified:abcdef123456"]}, "changes requested"),
+        ({"labels": ["in-review", "merged-verified:abcdef123456"]}, "no review-clean verdict"),
+        ({"labels": ["in-review", "review-clean", "merged-verified:000000000000"]}, "merged-verified stamp"),
+        ({"labels": ["in-review", "review-clean"]}, "merged-verified stamp (none)"),
+        ({"blocked": True}, "blocked"),
+        ({"board_state": "in_progress"}, "state=in_progress"),
+    ],
+)
+async def test_auto_merge_holds_on_each_board_side_blocker(monkeypatch, over, reason):
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed(**over))
+    why = await loop._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
+    assert any(reason in w for w in why), why
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert calls["merge"] == []
+
+
+@pytest.mark.parametrize("mss", ["BLOCKED", "UNSTABLE", "BEHIND", "DIRTY", "UNKNOWN", "DRAFT", ""])
+async def test_auto_merge_requires_github_clean(monkeypatch, mss):
+    """Only GitHub's CLEAN — required checks + branch protection satisfied, not draft,
+    mergeable. UNSTABLE (a non-required check red) is deliberately NOT a merge."""
+    calls = _merge_env(monkeypatch, mss=mss)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert calls["merge"] == []
+
+
+async def test_auto_merge_without_review_gate_needs_no_review_label(monkeypatch):
+    """review_gate off ⇒ there is no review verdict to wait for (the fleet pipeline
+    reviews on its own); CI + verdict currency still gate."""
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": False})
+    store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
+
+
+async def test_auto_merge_without_auto_rebase_skips_the_currency_check(monkeypatch):
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True, "auto_rebase": False})
+    store = _MergeStore(_reviewed(labels=["in-review", "review-clean"]))  # no stamp — auto_rebase never writes one
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
+
+
+async def test_auto_merge_refusal_retries_then_gives_up_on_the_bead_never_blocks(monkeypatch, caplog):
+    calls = _merge_env(monkeypatch, merge_ok=False)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True, "auto_merge_max": 2})
+    store = _MergeStore(_reviewed())
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+        assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+        # exhausted: no third gh call, one give-up comment, and the feature is NOT blocked
+        assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert len(calls["merge"]) == 2
+    assert len(store.comments) == 1 and "auto-merge gave up after 2 attempt(s)" in store.comments[0][1]
+    assert "gave up" in caplog.text
+    assert store.feature["blocked"] is False
+
+
+async def test_auto_merge_honours_merge_method(monkeypatch):
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": False, "merge_method": "rebase"})
+    store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
+    await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo")
+    assert calls["merge"][0][1] == "rebase"

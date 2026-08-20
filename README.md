@@ -131,6 +131,14 @@ project_board:
                              # multi-project board size max_concurrent to the project
                              # count (one slot per repo) or one deep queue starves the rest.
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
+  auto_merge: false          # OPT-IN, LIVE (console field). The MERGE edge: once an in_review
+                             # PR is green by every gate the loop runs — GitHub CLEAN (required
+                             # checks + branch protection), merged-state verdict stamped against
+                             # the CURRENT base, review gate `review-clean` — merge it; the board
+                             # flips to done via the normal Done edge. Off = park green PRs for a
+                             # human/agent adjudicator (which is only as durable as whatever
+                             # schedules it). Label a card `merge-hold` to exempt it.
+  merge_method: squash       # squash | merge | rebase
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
   local_gate_cmd: "auto"     # pre-PR gate (the FAST slice of CI — lint/typecheck/unit,
