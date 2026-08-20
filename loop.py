@@ -76,6 +76,30 @@ _MERGED_VERIFIED_SHA_LEN = 12
 # one stuck path — the bug this constant defends against).
 _REAP_WARN_CAP = 5
 
+# The block-reason prefix a preflight hold stamps on a card (#90) — the marker boot
+# recovery scans for (#186). The holds live in the loop's in-memory `_preflight_held`,
+# which dies with the process: without this marker a restart could never tell its own
+# holds from an operator's blocks, and the cards would stay held forever (blocked cards
+# are invisible to both `_ready_projects` and a fresh `_preflight_state`).
+PREFLIGHT_BLOCK_PREFIX = "gate preflight failed"
+
+# `flag_blocked` records its reason as a `blocked: <reason>` bead comment (the same
+# format retro.py mines); the LAST such comment is the card's CURRENT block reason.
+_BLOCKED_COMMENT_RE = re.compile(r"^\s*blocked:\s*(.*)", re.I | re.S)
+
+
+def _last_block_reason(feat: dict) -> str:
+    """The most recent ``blocked: <reason>`` comment on a raw ``br`` dict — a card
+    requeued and re-blocked carries older reasons too, and only the last one says why
+    it is blocked NOW. Returns "" when no reason was ever recorded."""
+    reason = ""
+    for c in feat.get("comments") or []:
+        text = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
+        m = _BLOCKED_COMMENT_RE.match(text.strip())
+        if m:
+            reason = m.group(1).strip()
+    return reason
+
 
 # ── external re-dispatch feedback bridge (the /review route → the loop) ──────────
 # An adverse-review bounce POSTed to /features/{fid}/review is handled in the API
@@ -1177,12 +1201,44 @@ class BoardLoop:
     async def _recover(self):
         """On boot, reconcile every ``in_progress`` feature the previous run left
         mid-drive (a drive doesn't survive a restart). ``in_review`` features are NOT
-        touched — they have a PR and the webhook/poll resolves them."""
-        for f in self._store().list_features(state="in_progress"):
+        touched — they have a PR and the webhook/poll resolves them. Also releases the
+        previous run's orphaned preflight holds (#186) — see
+        ``_recover_preflight_holds``."""
+        store = self._store()
+        for f in store.list_features(state="in_progress"):
             try:
                 await self._reconcile_orphan(f["id"])
             except Exception:  # noqa: BLE001 — recovery is best-effort, per feature
                 log.warning("[project_board] recovery for %s failed", f["id"], exc_info=True)
+        self._recover_preflight_holds(store)
+
+    def _recover_preflight_holds(self, store) -> None:
+        """Release the PREVIOUS run's preflight holds on boot (#186). `_preflight_held`
+        is in-memory and dies with the process, so a restart orphans every card the old
+        loop flag_blocked'd for a failed preflight: the cards are blocked (not ready),
+        which makes them invisible to `_ready_projects`, and the fresh `_preflight_state`
+        is empty — nothing would ever re-smoke their project or clear them. A restart is
+        also the moment the environment most plausibly changed, so simply unblock them:
+        a still-broken gate re-holds them one tick later (`_maybe_preflight` +
+        `_hold_ready_for_preflight` — fail-closed is preserved), a fixed one lets them
+        build. Cards blocked for any OTHER reason are never touched."""
+        try:
+            blocked = store.raw_features_with_comments(states=("blocked",))
+        except Exception:  # noqa: BLE001 — a failed scan must not stop the loop from booting
+            log.warning("[project_board] boot preflight release: blocked-card scan failed", exc_info=True)
+            return
+        for feat in blocked:
+            fid = feat.get("id")
+            if not fid or not _last_block_reason(feat).startswith(PREFLIGHT_BLOCK_PREFIX):
+                continue
+            try:
+                store.clear_blocked(fid)
+                log.info(
+                    "[project_board] boot: released orphaned preflight hold on %s (re-checked on the first tick)",
+                    fid,
+                )
+            except Exception:  # noqa: BLE001 — best-effort, per feature
+                log.warning("[project_board] boot preflight release: clear_blocked failed for %s", fid, exc_info=True)
 
     # ── periodic health sweep (self-heal during the run) ───────────────────────
     async def _maybe_sweep(self):
@@ -2643,7 +2699,8 @@ class BoardLoop:
             held = self._preflight_held.setdefault(name, set())
             if fid in held or f.get("blocked"):
                 continue
-            short = "gate preflight failed — the coder environment can't run the gate: " + reason.splitlines()[-1][:200]
+            tail = reason.splitlines()[-1][:200]
+            short = f"{PREFLIGHT_BLOCK_PREFIX} — the coder environment can't run the gate: {tail}"
             try:
                 store.flag_blocked(fid, short)
                 held.add(fid)

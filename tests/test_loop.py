@@ -2541,6 +2541,9 @@ class _RecoverStore:
     def list_features(self, state=None):
         return self._in_progress if state == "in_progress" else []
 
+    def raw_features_with_comments(self, states=("done", "blocked")):
+        return []  # no blocked cards → the boot preflight release is a no-op
+
     def get_feature(self, fid):
         return {"id": fid}  # no verified_sha → the salvage check declines cleanly
 
@@ -2595,6 +2598,9 @@ class _SalvageStore:
 
     def list_features(self, state=None):
         return [{"id": self.feature["id"]}] if state == "in_progress" else []
+
+    def raw_features_with_comments(self, states=("done", "blocked")):
+        return []  # no blocked cards → the boot preflight release is a no-op
 
     def get_feature(self, fid):
         return self.feature
@@ -3643,6 +3649,89 @@ async def test_preflight_isolation_a_fails_b_passes(monkeypatch):
     assert isinstance(lp._preflight_state["proj-a"], str)  # A held closed
     assert "boom" in lp._preflight_state["proj-a"]
     assert lp._preflight_state["proj-b"] is True  # B runnable — unaffected by A
+
+
+# ── boot recovery of orphaned preflight holds (#186) ────────────────────────────
+
+
+_PREFLIGHT_HOLD_COMMENT = "blocked: gate preflight failed — the coder environment can't run the gate: tsc: not found"
+
+
+class _BootPreflightStore(_PreflightStore):
+    """_PreflightStore + the boot-recovery reads (#186): `_recover`'s in_progress scan
+    (inherited — [] for any non-ready state) and the blocked-card scan WITH comment
+    history (``raw_features_with_comments``)."""
+
+    def __init__(self, ready=(), blocked=()):
+        super().__init__(list(ready))
+        self._blocked = list(blocked)  # raw `br` dicts: {"id", "comments"}
+
+    def raw_features_with_comments(self, states=("done", "blocked")):
+        return [dict(f) for f in self._blocked] if "blocked" in states else []
+
+
+async def test_recover_unblocks_orphaned_preflight_holds(monkeypatch):
+    """#186 (r1): `_preflight_held` dies with the process, so a restart orphans the
+    previous loop's holds — the cards are blocked (not ready), invisible to both
+    `_ready_projects` and a fresh `_preflight_state`, and would stay held forever.
+    Boot recovery clear_blocked's every card whose CURRENT block reason carries the
+    preflight marker — and ONLY those."""
+    store = _BootPreflightStore(
+        blocked=[
+            {"id": "bd-1", "comments": [_PREFLIGHT_HOLD_COMMENT]},
+            # `br` comments can be dict-shaped — the text field must parse too
+            {"id": "bd-2", "comments": [{"text": _PREFLIGHT_HOLD_COMMENT}]},
+            # blocked for an unrelated reason (operator/CI block) → never touched
+            {"id": "bd-3", "comments": ["blocked: CI failed: pytest exploded"]},
+            # once preflight-held but later re-blocked for another reason: the LAST
+            # `blocked:` comment is the current reason → not a preflight orphan
+            {"id": "bd-4", "comments": [_PREFLIGHT_HOLD_COMMENT, "blocked: coder timeout"]},
+            # the reverse — an old unrelated block, currently preflight-held → released
+            {"id": "bd-5", "comments": ["blocked: coder timeout", _PREFLIGHT_HOLD_COMMENT]},
+        ]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await BoardLoop({})._recover()
+    cleared = {c[1] for c in store.calls if c[0] == "clear_blocked"}
+    assert cleared == {"bd-1", "bd-2", "bd-5"}
+
+
+async def test_recover_cleared_card_reheld_when_gate_still_broken(monkeypatch):
+    """#186 (r2): boot releases the orphaned hold, and the first tick re-checks — a
+    STILL-broken gate re-holds the card one tick later (fail-closed survives the
+    restart; nothing is ever dispatched against the broken gate)."""
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    store = _BootPreflightStore(
+        ready=["bd-1"],  # clear_blocked put the card back in ready
+        blocked=[{"id": "bd-1", "comments": [_PREFLIGHT_HOLD_COMMENT]}],
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await lp._recover()
+    assert ("clear_blocked", "bd-1") in store.calls  # boot released the orphan
+
+    async def _shell(*a, **k):
+        return _FakeProc(1, b"apps/x build: sh: 1: tsc: not found")  # STILL broken
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()  # the first tick smokes the gate again…
+    assert isinstance(lp._preflight_state["default"], str)
+    spawned = lp._spawn_ready()  # …and the claim scan re-holds instead of dispatching
+    assert spawned is False
+    blocked = {c[1]: c[2] for c in store.calls if c[0] == "flag_blocked"}
+    assert set(blocked) == {"bd-1"}  # re-held, visibly, one tick after boot
+    assert blocked["bd-1"].startswith(loop_mod.PREFLIGHT_BLOCK_PREFIX)
+
+
+def test_hold_reason_carries_the_recovery_marker(monkeypatch):
+    """#186 (r3): the hold path stamps the SAME module constant the boot scan matches
+    on — a drifted prefix would orphan every future hold across restarts."""
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    lp._preflight_state = {"default": "gate exited 1: tsc: not found"}
+    store = _PreflightStore(ready=["bd-1"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    lp._hold_ready_for_preflight()
+    reasons = [c[2] for c in store.calls if c[0] == "flag_blocked"]
+    assert reasons and all(r.startswith(loop_mod.PREFLIGHT_BLOCK_PREFIX) for r in reasons)
 
 
 # ── auto gate resolution (_resolve_gate_cmd) ────────────────────────────────────
