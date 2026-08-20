@@ -383,6 +383,20 @@ async def test_run_local_gate_passes_and_captures_failure(tmp_path):
     assert out is not None and "boom" in out
 
 
+async def test_run_local_gate_signal_kill_is_no_verdict_not_a_failure(tmp_path, caplog):
+    """A gate process killed by a signal (member shutdown delivering SIGTERM, an operator
+    kill, the OOM killer) has no verdict — it must degrade to pass like a timeout does,
+    not surface as "gate FAILED" with a half-finished pytest transcript. Before this a
+    restart that landed mid merged-state gate flag_blocked a feature whose PR CI was
+    fully green (2026-08-20, bd-k2j)."""
+    # The shell kills ITSELF with SIGTERM after emitting partial output → returncode -15.
+    cmd = "echo 'tests/x.py ....... [ 13%]'; kill -TERM $$"
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        out = await BoardLoop({"local_gate_cmd": cmd})._run_local_gate(str(tmp_path))
+    assert out is None
+    assert "killed by signal 15" in caplog.text
+
+
 async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
     """A gate that can't even spawn must not block — it degrades to pass (CI gates)."""
 
