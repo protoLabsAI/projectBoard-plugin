@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.39.0
+version: 0.39.1
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -187,6 +187,11 @@ config:
   merge_method: squash      # squash | merge | rebase
   auto_merge_max: 3         # merge refusals (branch protection, a race) before the loop stops
                             # retrying and leaves a comment on the bead for a human. Never blocks.
+  merged_verify_max: 5      # re-verify budget for the merged-state gate: how many sibling merges
+                            # a held in_review card can survive, each costing one gate run
+                            # against the new base (only when base actually moved). 0 = unlimited.
+                            # With auto_merge on, exhaustion is a hard hold on the merge edge
+                            # (logged as a WARNING) — raise it or label the card merge-hold.
   rebase_fix_max: 1         # cap on coder re-dispatches to resolve a real rebase CONFLICT
                             # before the feature is Blocked for a manual rebase. 0 = block on
                             # the first conflict (clean BEHIND rebases still run — they need no coder).

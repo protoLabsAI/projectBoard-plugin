@@ -584,6 +584,15 @@ class BoardLoop:
         # `merged-verified:<sha>` — bounded by the same rebase_fix_max budget.
         self.auto_rebase = bool(self.cfg.get("auto_rebase", self.merge_poll))
         self.rebase_fix_max = max(0, int(self.cfg.get("rebase_fix_max", 1)))
+        # Re-verify budget for the merged-state gate (#131): how many times a single
+        # in_review card's verdict is re-run after a sibling merge moves base under it.
+        # Used to ride rebase_fix_max (=1) — fine when a human adjudicates a stale
+        # stamp, fatal when the loop is the adjudicator: with auto_merge on, a card
+        # held for review across ONE sibling merge went stale and parked forever
+        # (2026-08-20, bd-c3k/bd-ohx). Each re-verify costs one gate run and only
+        # happens when base actually moved, so the bound is "how many sibling merges
+        # can a held card survive". 0 = unlimited.
+        self.merged_verify_max = max(0, int(self.cfg.get("merged_verify_max", 5)))
         # The MERGE edge (opt-in, LIVE): when an in_review PR is green by every gate the
         # loop itself runs — GitHub says CLEAN (required checks + branch protection),
         # the merged-state verdict is stamped against the CURRENT base, the review gate
@@ -1535,11 +1544,20 @@ class BoardLoop:
             log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
             return False
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo)
+        if not ok:
+            # gh's exit code is not the verdict — the merge may have landed and a
+            # later step failed, or a concurrent merge (webhook, human) beat us. The
+            # PR's real state is.
+            ok = (await worktree.pr_state(pr_url, cwd=repo)) == "MERGED"
         if ok:
             self._auto_merge_failures.pop(fid, None)
             log.info(
                 "[project_board] %s auto-merged (%s, all gates green + current): %s", fid, self.merge_method, pr_url
             )
+            # Remote-branch cleanup, best-effort; the worktree (which still holds the
+            # local branch) is reaped when the reconcile reads MERGED.
+            if not await worktree.delete_remote_branch(repo, f"feat/{fid}"):
+                log.info("[project_board] %s remote branch feat/%s not deleted (already gone or protected)", fid, fid)
             return True
         n = self._auto_merge_failures.get(fid, 0) + 1
         self._auto_merge_failures[fid] = n
@@ -1631,9 +1649,10 @@ class BoardLoop:
         (or one that can't run — the ``_run_local_gate`` fail-open contract; CI is
         still the real gate) just refreshes the stamp and the card stays in review;
         only a CLEAN gate FAILURE on the merged state blocks. Bounded by
-        ``rebase_fix_max`` (the rebase edge's budget): once spent, re-verification
-        stops and the stale stamp stays visible to the adjudicator rather than the
-        loop burning a gate run every poll forever. A merge conflict is the
+        ``merged_verify_max`` (0 = unlimited): once spent, re-verification stops and
+        the stale stamp stays visible to the adjudicator rather than the loop burning
+        a gate run every poll forever — with ``auto_merge`` on that hold is the merge
+        edge's, so exhaustion logs a WARNING naming the remedy. A merge conflict is the
         DIRTY/rebase edge's job and an infra error retries next poll — neither burns
         budget nor stamps. Returns True only when it BLOCKED the card (the caller
         skips the rest of this pass)."""
@@ -1655,9 +1674,20 @@ class BoardLoop:
         if stamped == base_sha[:_MERGED_VERIFIED_SHA_LEN]:
             return False  # the verdict is current — base hasn't moved since it was stamped
         n = self._merged_verify_attempts.get(fid, 0)
-        if n >= self.rebase_fix_max:
-            if n == self.rebase_fix_max:  # log the exhaustion once, then stay quiet
+        if self.merged_verify_max and n >= self.merged_verify_max:
+            if n == self.merged_verify_max:  # log the exhaustion once, then stay quiet
                 self._merged_verify_attempts[fid] = n + 1
+                if self.auto_merge:
+                    # The loop IS the adjudicator here, and a stale stamp is a hard hold
+                    # on the merge edge — say so, and say what unsticks it.
+                    log.warning(
+                        "[project_board] %s merged-verify budget (%d) spent with auto_merge on — the card "
+                        "will NOT auto-merge until base stops moving or merged_verify_max is raised "
+                        "(0 = unlimited); label it merge-hold to hand it to a human: %s",
+                        fid,
+                        self.merged_verify_max,
+                        pr_url,
+                    )
                 # Only claim a "stale stamp" when one actually exists. With the budget
                 # exhausted and NO stamp ever written (e.g. rebase_fix_max=0, or the
                 # pre-#135 world where every write failed), the adjudicator sees an
@@ -1668,7 +1698,7 @@ class BoardLoop:
                         "[project_board] %s base moved again but the merged-verify budget (%d) is spent — "
                         "leaving the stale merged-verified stamp for the adjudicator: %s",
                         fid,
-                        self.rebase_fix_max,
+                        self.merged_verify_max,
                         pr_url,
                     )
                 else:
@@ -1676,7 +1706,7 @@ class BoardLoop:
                         "[project_board] %s base moved but the merged-verify budget (%d) is spent and no "
                         "merged-verified stamp was ever written — the merged state stays unverified: %s",
                         fid,
-                        self.rebase_fix_max,
+                        self.merged_verify_max,
                         pr_url,
                     )
             return False
