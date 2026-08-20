@@ -2263,7 +2263,7 @@ async def test_verify_merged_state_red_gate_blocks(monkeypatch):
 
 
 async def test_verify_merged_state_budget_bounds_reverification(monkeypatch):
-    """rebase_fix_max bounds re-verification: a base that moves repeatedly stops
+    """merged_verify_max bounds re-verification: a base that moves repeatedly stops
     burning gate runs — the stale stamp stays visible, the card stays in review."""
     shas = iter(["aaa", "bbb", "ccc"])
 
@@ -2280,7 +2280,7 @@ async def test_verify_merged_state_budget_bounds_reverification(monkeypatch):
     monkeypatch.setattr(worktree, "merged_state_worktree", _build)
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     store = _VerifyStore({"id": "bd-1"})
-    loop = _vloop(rebase_fix_max=1)
+    loop = _vloop(merged_verify_max=1)
     monkeypatch.setattr(loop, "_run_local_gate", _aret(None))
     # 1st move (no stamp yet) → verify + stamp against aaa.
     assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
@@ -2306,7 +2306,7 @@ async def test_verify_merged_state_conflict_and_error_are_noops(monkeypatch):
     monkeypatch.setattr(worktree, "merged_state_worktree", _build)
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     store = _VerifyStore({"id": "bd-1"})
-    loop = _vloop(rebase_fix_max=1)
+    loop = _vloop(merged_verify_max=1)
     monkeypatch.setattr(loop, "_run_local_gate", _aret(None))
     feature = {"id": "bd-1", "labels": []}
     assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # error
@@ -2362,21 +2362,55 @@ async def test_verify_merged_state_stamp_write_failure_never_aborts_or_burns_bud
     assert loop._merged_verify_attempts.get("bd-1", 0) == 0
 
 
+async def test_verify_merged_state_budget_zero_is_unlimited(monkeypatch):
+    """merged_verify_max=0 ⇒ every base move re-verifies (the auto_merge posture for a
+    busy base: a held card must never park on a stale stamp)."""
+    loop = _vloop(merged_verify_max=0)
+    assert loop.merged_verify_max == 0
+    # Exhaustion branch unreachable: attempts far past any budget still verify.
+    loop._merged_verify_attempts["bd-1"] = 50
+    ran = []
+
+    async def _head(repo, ref):
+        return "f" * 40
+
+    async def _mst(repo, branch, base_sha, root="."):
+        ran.append(base_sha)
+        return ("ok", "/wt")
+
+    async def _gate(wt, feature=None):
+        return None
+
+    async def _rm(*a, **k):
+        return None
+
+    monkeypatch.setattr(worktree, "origin_head_sha", _head)
+    monkeypatch.setattr(worktree, "merged_state_worktree", _mst)
+    monkeypatch.setattr(worktree, "remove_worktree", _rm)
+    monkeypatch.setattr(loop, "_run_local_gate", _gate)
+    store = _VerifyStore({"id": "bd-1"})
+    feature = {"id": "bd-1", "labels": ["merged-verified:000000000000"]}
+    await loop._verify_merged_state(store, feature, "https://x/pull/1", "/repo")
+    assert ran == ["f" * 40]
+    assert store.verified == [("bd-1", "f" * 12)]
+
+
 async def test_verify_merged_state_absent_stamp_is_never_reported_stale(monkeypatch, caplog):
-    """With the budget spent and NO stamp ever written (rebase_fix_max=0), the exhaustion
+    """With the budget spent and NO stamp ever written (every write failed), the exhaustion
     log must not claim a 'stale stamp' that doesn't exist — that false report is the very
     class of bug #132 was built to prevent (#135)."""
     monkeypatch.setattr(worktree, "origin_head_sha", _aret("abc123def456"))
     built = []
     monkeypatch.setattr(worktree, "merged_state_worktree", lambda *a, **k: built.append(1))
     store = _VerifyStore({"id": "bd-1"})
-    loop = _vloop(rebase_fix_max=0)
+    loop = _vloop(merged_verify_max=1)
+    loop._merged_verify_attempts["bd-1"] = 1  # budget already spent, stamp write never landed
     with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
         assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
     joined = "\n".join(caplog.messages)
     assert "no merged-verified stamp was ever written" in joined
     assert "leaving the stale merged-verified stamp" not in joined
-    assert not built  # budget 0 → never even builds the merged worktree
+    assert not built  # budget spent → never even builds the merged worktree
     assert store.verified == [] and store.blocked == []
 
 
@@ -4048,9 +4082,18 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
         calls["merge"].append((pr_url, method, cwd))
         return (merge_ok, "" if merge_ok else "Pull request is not mergeable: required status check pending")
 
+    async def _state(pr_url, *, cwd="."):
+        return "MERGED" if (merge_ok or calls.get("landed_anyway")) else "OPEN"
+
+    async def _delete(repo, branch):
+        calls.setdefault("deleted", []).append(branch)
+        return True
+
     monkeypatch.setattr(worktree, "origin_head_sha", _head)
     monkeypatch.setattr(worktree, "pr_merge_state", _mss)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
+    monkeypatch.setattr(worktree, "pr_state", _state)
+    monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
     return calls
 
 
@@ -4132,6 +4175,27 @@ async def test_auto_merge_refusal_retries_then_gives_up_on_the_bead_never_blocks
     assert len(store.comments) == 1 and "auto-merge gave up after 2 attempt(s)" in store.comments[0][1]
     assert "gave up" in caplog.text
     assert store.feature["blocked"] is False
+
+
+async def test_auto_merge_trusts_pr_state_over_gh_exit_code(monkeypatch):
+    """gh can exit non-zero AFTER the merge landed (the --delete-branch local-branch
+    trap, 2026-08-20) or lose a race to a concurrent merge — the PR's state is the
+    verdict, and a landed merge must not spend the retry budget."""
+    calls = _merge_env(monkeypatch, merge_ok=False)
+    calls["landed_anyway"] = True
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert "bd-1" not in loop._auto_merge_failures
+    assert calls["deleted"] == ["feat/bd-1"]  # remote cleanup rides the success path
+
+
+async def test_auto_merge_deletes_the_remote_branch_after_a_clean_merge(monkeypatch):
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": False})
+    store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert calls["deleted"] == ["feat/bd-1"]
 
 
 async def test_auto_merge_honours_merge_method(monkeypatch):

@@ -421,15 +421,30 @@ async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
 
 async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tuple[bool, str]:
     """Merge an open PR via ``gh pr merge`` (the auto-merge edge). ``method`` is
-    ``squash`` / ``merge`` / ``rebase``; the remote branch is deleted (the feature's
-    worktree is reaped separately when the board reads MERGED). Returns
-    ``(ok, detail)`` — never raises into the loop; a refusal (branch protection, a
-    required review, a race with a concurrent merge) is the caller's to log and retry
-    or give up on."""
+    ``squash`` / ``merge`` / ``rebase``. Returns ``(ok, detail)`` — never raises into
+    the loop; a refusal (branch protection, a required review, a race with a
+    concurrent merge) is the caller's to log and retry or give up on.
+
+    Deliberately NOT ``--delete-branch``: gh deletes the LOCAL branch too, and
+    ``feat/<fid>`` is checked out in the feature's worktree, so the merge landed and
+    then gh exited non-zero on the local delete — a successful merge read as a refusal
+    (2026-08-20, bd-p9q/bd-wrl). The remote branch goes via ``delete_remote_branch``
+    once the board has read MERGED; the worktree is reaped there too."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(str(method).lower(), "--squash")
-    rc, out, err = await _gh("pr", "merge", pr_url, flag, "--delete-branch", cwd=cwd, timeout=120)
+    rc, out, err = await _gh("pr", "merge", pr_url, flag, cwd=cwd, timeout=120)
     detail = (err or out or "").strip()
     return rc == 0, detail
+
+
+async def delete_remote_branch(repo: str, branch: str) -> bool:
+    """Best-effort ``git push origin --delete <branch>`` — the remote half of the
+    merged feature's cleanup. False on any failure (already gone, protected, offline);
+    never raises. Touches no local ref, so a worktree holding the branch is fine."""
+    try:
+        rc, _o, _e = await _git(repo, "push", "origin", "--delete", branch, timeout=60)
+    except Exception:  # noqa: BLE001
+        return False
+    return rc == 0
 
 
 async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".worktrees") -> tuple[str, str]:

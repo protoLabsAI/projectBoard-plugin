@@ -139,6 +139,9 @@ project_board:
                              # human/agent adjudicator (which is only as durable as whatever
                              # schedules it). Label a card `merge-hold` to exempt it.
   merge_method: squash       # squash | merge | rebase
+  merged_verify_max: 5       # sibling merges a held in_review card can survive (one gate run each,
+                             # only when base moved) before its merged-state verdict stops being
+                             # refreshed. 0 = unlimited. Exhaustion holds the auto-merge edge.
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
   local_gate_cmd: "auto"     # pre-PR gate (the FAST slice of CI — lint/typecheck/unit,
