@@ -143,6 +143,17 @@ LABEL_FOUNDATION = "foundation"
 # feature went back). Both are inert when the review gate is off.
 LABEL_REVIEW_PENDING = "review-pending"
 LABEL_CHANGES_REQUESTED = "changes-requested"
+# `review-clean` is the POSITIVE record that the gate ran and found nothing blocking
+# — the auto-merge edge requires it when the gate is on. Its absence is NOT proof of
+# a review (an inert/unrunnable gate also clears review-pending, lapsing to advisory,
+# projectBoard#181), which is exactly why the merge edge can't key off "no
+# review-pending". Swapped with the other two by set_review_substate; any requeue
+# re-enters via review-pending, which drops it.
+LABEL_REVIEW_CLEAN = "review-clean"
+# `merge-hold`: the operator's per-card veto on the auto-merge edge — a green,
+# verified, reviewed PR the operator still wants to QA by hand (a console layout
+# change, a risky migration). The loop never sets or clears it.
+LABEL_MERGE_HOLD = "merge-hold"
 # Pre-ready DESIGN state (plan M6, optional): a large/architectural feature parked
 # while its design/due-diligence is worked out (`mark_designing`). Informational for
 # the projection/console — the HARD gate is in `mark_ready` (a design referencing an
@@ -1270,12 +1281,12 @@ class BeadsBoard:
 
     def set_review_substate(self, fid: str, label: str | None, note: str = "") -> dict:
         """Swap the review-gate sub-state labels (``review-pending`` /
-        ``changes-requested``) — exactly one (or none) at a time. ``note`` (the
+        ``changes-requested`` / ``review-clean``) — exactly one (or none) at a time. ``note`` (the
         findings block, a clean-review line) is recorded as a comment so the
         review history lives on the bead."""
         self._require(fid)
         args = ["update", fid]
-        for known in (LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED):
+        for known in (LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED, LABEL_REVIEW_CLEAN):
             if known != label:
                 args += ["--remove-label", known]
         if label:

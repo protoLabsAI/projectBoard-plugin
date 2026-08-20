@@ -419,6 +419,19 @@ async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tuple[bool, str]:
+    """Merge an open PR via ``gh pr merge`` (the auto-merge edge). ``method`` is
+    ``squash`` / ``merge`` / ``rebase``; the remote branch is deleted (the feature's
+    worktree is reaped separately when the board reads MERGED). Returns
+    ``(ok, detail)`` — never raises into the loop; a refusal (branch protection, a
+    required review, a race with a concurrent merge) is the caller's to log and retry
+    or give up on."""
+    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(str(method).lower(), "--squash")
+    rc, out, err = await _gh("pr", "merge", pr_url, flag, "--delete-branch", cwd=cwd, timeout=120)
+    detail = (err or out or "").strip()
+    return rc == 0, detail
+
+
 async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".worktrees") -> tuple[str, str]:
     """Rebase ``origin/<branch>`` onto ``origin/<base>`` in a throwaway DETACHED
     worktree, then force-push the result. Returns:

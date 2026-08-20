@@ -158,13 +158,13 @@ def test_manifest_settings_are_exactly_the_live_knobs():
     is worse than no field, and a live knob with no field can't be reached from the
     console. Each must also carry a manifest default (the reload payload is manifest
     defaults ⊕ YAML, so the hook always sees every knob)."""
-    from project_board.loop import LIVE_KNOBS
+    from project_board.loop import LIVE_BOOL_KNOBS, LIVE_KNOBS
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
     assert set(fields) == set(LIVE_KNOBS)
     for key, spec in fields.items():
-        assert spec["type"] == "number", key
+        assert spec["type"] == ("bool" if key in LIVE_BOOL_KNOBS else "number"), key
         assert spec["label"] and spec["description"], key
         assert key in m["config"], f"{key} has no manifest default"
 

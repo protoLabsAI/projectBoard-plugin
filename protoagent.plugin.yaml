@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.38.0
+version: 0.39.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -174,6 +174,19 @@ config:
                             # coder; DIRTY (a real conflict) → re-dispatch the coder to resolve
                             # off the fresh base. Rides the merge-poll cadence; defaults to
                             # merge_poll's value; set false to disable.
+  auto_merge: false         # OPT-IN, LIVE. The MERGE edge: once an in_review PR is green by
+                            # every gate the loop itself runs — GitHub mergeStateStatus CLEAN
+                            # (required checks + branch protection), the merged-state verdict
+                            # stamped against the CURRENT base (auto_rebase), and the review
+                            # gate's `review-clean` verdict (review_gate) — merge it
+                            # (`gh pr merge --<merge_method> --delete-branch`); the board
+                            # flips to done on the next reconcile via the one Done edge.
+                            # Off = park green PRs for the adjudicator (the pre-0.39 posture).
+                            # A card labelled `merge-hold` is never auto-merged — the
+                            # operator's per-card veto for work they want to QA by hand.
+  merge_method: squash      # squash | merge | rebase
+  auto_merge_max: 3         # merge refusals (branch protection, a race) before the loop stops
+                            # retrying and leaves a comment on the bead for a human. Never blocks.
   rebase_fix_max: 1         # cap on coder re-dispatches to resolve a real rebase CONFLICT
                             # before the feature is Blocked for a manual rebase. 0 = block on
                             # the first conflict (clean BEHIND rebases still run — they need no coder).
@@ -195,6 +208,8 @@ settings:
       description: "How many features the loop drives at once, each in its own worktree (1 = serial). Size it to the board's projects — one slot per repo keeps a deep queue in one project from starving the others. Applies live on save; lowering it never kills a running build, the loop just stops claiming until it is under the cap. Peak coder processes = this × coder_solve_k." }
   - { key: max_concurrent_sessions, label: "Coder sessions per build", type: number, group: "Project Board",
       description: "Caps the best-of-k fan-out INSIDE one build (0 = unlimited within the k budget; 1 = generate candidates one at a time). Applies to the next dispatch. Host-wide peak ACP processes = Parallel builds × this." }
+  - { key: auto_merge, label: "Auto-merge green PRs", type: bool, group: "Project Board",
+      description: "Merge an in-review PR once every gate the loop runs is green and current: GitHub CLEAN (required checks + branch protection), the merged-state verdict stamped against the current base, and a clean review-gate verdict. Off = park green PRs for you to merge. Label a card merge-hold to exempt it. Applies live on save." }
   - { key: max_pending_reviews, label: "Review-queue limit", type: number, group: "Project Board",
       description: "Back-pressure: stop claiming new work while this many PRs already sit in review (0 = unlimited). Applies live on save. Raise it alongside Parallel builds or the extra slots idle behind the review queue." }
 

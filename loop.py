@@ -48,7 +48,9 @@ from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import (
     LABEL_CHANGES_REQUESTED,
+    LABEL_MERGE_HOLD,
     LABEL_MERGED_VERIFIED_PREFIX,
+    LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
     BoardError,
     _all_items_disposed,
@@ -418,8 +420,11 @@ async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
 # at construction and needs a restart — the startup log says so. Keep this list in
 # step with the manifest's ``settings:`` block (those are the console fields) and
 # the README's "Concurrency" section.
-LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions")
+LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge")
 LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0}
+# Knobs that are booleans (coerced by _knob_bool); everything else in LIVE_KNOBS is
+# an int with a floor in LIVE_KNOB_FLOORS.
+LIVE_BOOL_KNOBS = ("auto_merge",)
 _CONFIG_SECTION = "project_board"
 
 
@@ -427,6 +432,20 @@ def _knob_int(cfg: dict, key: str, default: int, *, floor: int) -> int:
     """``int(cfg[key])`` floored — the one coercion every live knob shares, so the
     constructor and ``reload()`` can't drift on what "1" or "-1" means."""
     return max(floor, int(cfg.get(key, default)))
+
+
+def _knob_bool(cfg: dict, key: str, default: bool) -> bool:
+    """A bool knob that also accepts the YAML/Settings string spellings — the
+    console posts real booleans, but a hand-edited ``"false"`` must not read as on."""
+    raw = cfg.get(key, default)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off", ""):
+            return False
+        raise ValueError(f"{key}={raw!r} is not a boolean")
+    return bool(raw)
 
 
 def _plugin_section(new_config) -> dict:
@@ -565,6 +584,19 @@ class BoardLoop:
         # `merged-verified:<sha>` — bounded by the same rebase_fix_max budget.
         self.auto_rebase = bool(self.cfg.get("auto_rebase", self.merge_poll))
         self.rebase_fix_max = max(0, int(self.cfg.get("rebase_fix_max", 1)))
+        # The MERGE edge (opt-in, LIVE): when an in_review PR is green by every gate the
+        # loop itself runs — GitHub says CLEAN (required checks + branch protection),
+        # the merged-state verdict is stamped against the CURRENT base, the review gate
+        # recorded review-clean — merge it. Before this the loop built, verified, and
+        # reviewed PRs and then parked them "for the adjudicator": a chat-driven sweep
+        # that is only as durable as the session scheduling it (2026-08-20: 7 green PRs
+        # sat overnight after a restart dropped that session's one-shot). A card
+        # labelled `merge-hold` is never auto-merged — the operator's per-card veto.
+        self.auto_merge = _knob_bool(self.cfg, "auto_merge", False)
+        self.merge_method = str(self.cfg.get("merge_method", "squash")).strip().lower() or "squash"
+        # Failed merge attempts (a refusal, a race) before the loop stops trying and
+        # leaves the PR for a human — logged once on the bead, never a block.
+        self.auto_merge_max = max(1, int(self.cfg.get("auto_merge_max", 3)))
         # Pre-PR goal-verify gap: a rejected diff (e.g. missing tests) is fixable by
         # the SAME coder told what's missing — NOT a model-capability failure. So
         # carry the gap as feedback + re-dispatch the same tier, bounded by
@@ -752,6 +784,7 @@ class BoardLoop:
         # half of the rebase edge, bounded by the same rebase_fix_max budget so a
         # base that moves repeatedly doesn't burn a gate run every poll forever.
         self._merged_verify_attempts: dict[str, int] = {}
+        self._auto_merge_failures: dict[str, int] = {}
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
@@ -987,15 +1020,18 @@ class BoardLoop:
         warning and keeps the current knob — a typo in Settings must not stall the
         loop mid-drive."""
         section = _plugin_section(new_config)
-        changed: dict[str, tuple[int, int]] = {}
+        changed: dict[str, tuple] = {}
         for key in LIVE_KNOBS:
             if key not in section:
                 continue
             cur = getattr(self, key)
             try:
-                new = _knob_int(section, key, cur, floor=LIVE_KNOB_FLOORS[key])
+                if key in LIVE_BOOL_KNOBS:
+                    new = _knob_bool(section, key, cur)
+                else:
+                    new = _knob_int(section, key, cur, floor=LIVE_KNOB_FLOORS[key])
             except (TypeError, ValueError):
-                log.warning("[project_board] reload: %s=%r is not an integer — keeping %d", key, section.get(key), cur)
+                log.warning("[project_board] reload: %s=%r is malformed — keeping %r", key, section.get(key), cur)
                 continue
             if new != cur:
                 setattr(self, key, new)
@@ -1429,8 +1465,99 @@ class BoardLoop:
                         and store.get_feature(fid).get("board_state") == "in_review"
                     ):
                         await self._review_gate(store, fid, pr_url, repo)
+                    # The MERGE edge — last, so it sees this pass's rebase / verify /
+                    # CI / review outcomes, and re-reads the feature rather than
+                    # trusting the snapshot those gates may have changed.
+                    if self.auto_merge:
+                        await self._maybe_auto_merge(store, fid, pr_url, repo)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
+
+    async def _auto_merge_blockers(self, store, feature: dict, pr_url: str, repo: str) -> list[str]:
+        """Why this in_review PR must NOT be auto-merged right now — empty means every
+        gate the loop owns is green AND current. Each reason is a short, greppable
+        phrase; the caller logs them at debug so a parked PR is explainable, not
+        mysterious. Order: the cheap board reads first, GitHub last."""
+        fid = feature["id"]
+        labels = set(feature.get("labels") or [])
+        why: list[str] = []
+        if feature.get("board_state") != "in_review":
+            why.append(f"state={feature.get('board_state')}")
+        if feature.get("blocked"):
+            why.append("blocked")
+        if LABEL_MERGE_HOLD in labels:
+            why.append("merge-hold")
+        if LABEL_REVIEW_PENDING in labels or LABEL_CHANGES_REQUESTED in labels:
+            why.append("review in progress / changes requested")
+        elif self.review_gate and LABEL_REVIEW_CLEAN not in labels:
+            # The gate is on but never recorded a clean verdict for THIS head (an
+            # inert gate, a pre-upgrade card, an operator unblock) — not reviewed.
+            why.append("no review-clean verdict")
+        if self._auto_merge_failures.get(fid, 0) >= self.auto_merge_max:
+            why.append("merge attempts exhausted")
+        if why:
+            return why
+        if self.auto_rebase:
+            # Verdict currency (#131): the merged-state gate must have run against the
+            # base that will actually land. Stale = unverified, so hold (never block).
+            base = self._base_branch_for(feature)
+            head = await worktree.origin_head_sha(repo, base)
+            if not head:
+                return ["base sha unavailable"]
+            stamped = next(
+                (
+                    lb[len(LABEL_MERGED_VERIFIED_PREFIX) :]
+                    for lb in labels
+                    if lb.startswith(LABEL_MERGED_VERIFIED_PREFIX)
+                ),
+                "",
+            )
+            if not stamped or not head.startswith(stamped):
+                return [f"merged-verified stamp {stamped or '(none)'} ≠ {base}@{head[:_MERGED_VERIFIED_SHA_LEN]}"]
+        mss = await worktree.pr_merge_state(pr_url, cwd=repo)
+        if mss != "CLEAN":
+            # BLOCKED = required checks not satisfied; UNSTABLE = a non-required check
+            # failing; BEHIND/DIRTY = the rebase edge's job; UNKNOWN = GitHub still
+            # computing; "" = gh failed. None of them is a merge.
+            return [f"github mergeStateStatus={mss or 'unavailable'}"]
+        return []
+
+    async def _maybe_auto_merge(self, store, fid: str, pr_url: str, repo: str) -> bool:
+        """Merge an in_review PR once every gate the loop owns is green and current
+        (see ``_auto_merge_blockers``). Returns True if it merged. The board flips to
+        done on the next reconcile pass (the existing MERGED edge — one Done path,
+        idempotent, webhook-compatible). A refusal is retried next pass up to
+        ``auto_merge_max`` times, then recorded on the bead and left for a human —
+        never a block: the work is good, only the merge didn't land."""
+        feature = store.get_feature(fid)
+        why = await self._auto_merge_blockers(store, feature, pr_url, repo)
+        if why:
+            log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
+            return False
+        ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo)
+        if ok:
+            self._auto_merge_failures.pop(fid, None)
+            log.info(
+                "[project_board] %s auto-merged (%s, all gates green + current): %s", fid, self.merge_method, pr_url
+            )
+            return True
+        n = self._auto_merge_failures.get(fid, 0) + 1
+        self._auto_merge_failures[fid] = n
+        if n >= self.auto_merge_max:
+            try:
+                store._comment(
+                    fid,
+                    f"auto-merge gave up after {n} attempt(s) — every gate is green but GitHub refused the "
+                    f"merge; needs a human: {pr_url}\n{detail}",
+                )
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+                log.warning("[project_board] %s auto-merge give-up comment failed", fid, exc_info=True)
+            log.warning("[project_board] %s auto-merge gave up after %d attempt(s): %s", fid, n, detail)
+        else:
+            log.warning(
+                "[project_board] %s auto-merge refused (attempt %d/%d): %s", fid, n, self.auto_merge_max, detail
+            )
+        return False
 
     async def _maybe_rebase(self, store, feature: dict, pr_url: str, repo: str) -> bool:
         """If a sibling merge left this in_review PR BEHIND/DIRTY vs base, refresh it.
@@ -2148,7 +2275,7 @@ class BoardLoop:
         if not blocking:
             store.set_review_substate(
                 fid,
-                None,
+                LABEL_REVIEW_CLEAN,
                 note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
             )
             self._review_fix_attempts.pop(fid, None)
