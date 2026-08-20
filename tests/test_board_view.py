@@ -70,6 +70,44 @@ def test_in_progress_cards_and_rows_are_the_click_targets():
     assert 'e.target.closest("[data-mon]")' in BOARD_PAGE
 
 
+# ── display-name map (#182): "ready" renders as "on deck" ───────────────────────
+
+
+def test_state_label_map_covers_every_board_state():
+    """STATE_LABEL is the operator-facing vocabulary — "ready" means "spec complete,
+    queued for a coder", so the view says "on deck" (and in_progress → "building")."""
+    assert "const STATE_LABEL = {" in BOARD_PAGE
+    assert 'backlog: "backlog",' in BOARD_PAGE
+    assert 'ready: "on deck",' in BOARD_PAGE
+    assert 'in_progress: "building",' in BOARD_PAGE
+    assert 'in_review: "in review",' in BOARD_PAGE
+    assert 'done: "done",' in BOARD_PAGE
+    assert 'blocked: "blocked",' in BOARD_PAGE
+    assert 'cancelled: "cancelled",' in BOARD_PAGE
+
+
+def test_state_labels_are_used_at_every_render_site_with_a_fallback():
+    """All three user-facing state renders go through STATE_LABEL, falling back to
+    state.replace("_"," ") for an unknown state (no crash, no `undefined` label)."""
+    # Kanban column header + list group header share the same lookup-with-fallback.
+    assert BOARD_PAGE.count('STATE_LABEL[state] || state.replace("_"," ")') == 2
+    # List view status dot label falls back to the raw state.
+    assert "esc(STATE_LABEL[f.state] || f.state)" in BOARD_PAGE
+    # No render site bypasses the map: the old raw-label patterns are gone.
+    assert '\'+state.replace("_"," ")+\'' not in BOARD_PAGE
+    assert "esc(state.replace" not in BOARD_PAGE
+    assert "esc(f.state)" not in BOARD_PAGE
+
+
+def test_internal_state_names_stay_internal():
+    """#182 is a view-layer label swap only — grouping, filtering, and the collapse
+    toggle still key on the raw state names, so the API/store contract is untouched."""
+    assert "FEATURES.filter(f => f.state === state)" in BOARD_PAGE
+    assert 'data-state="' in BOARD_PAGE
+    assert "'+esc(state)+'" in BOARD_PAGE  # toggleGroup's data-state carries the raw state, not the label
+    assert BOARD_PAGE.count('"on deck"') == 1  # the label lives only in the map — renders go through the lookup
+
+
 def test_monitor_polls_the_progress_endpoint_and_closes_on_esc_or_click_away():
     assert "function openMonitor(fid)" in BOARD_PAGE
     assert "function closeMonitor()" in BOARD_PAGE

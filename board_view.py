@@ -147,6 +147,19 @@ try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
 catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
 
 const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
+// State → operator-facing label (#182): a view-layer relabel only — internal
+// state names (store/API/tools) are unchanged. `ready` means spec complete and
+// queued for a coder, which read as finished under the raw name. Unknown
+// states fall back to state.replace("_"," ").
+const STATE_LABEL = {
+  backlog: "backlog",
+  ready: "on deck",
+  in_progress: "building",
+  in_review: "in review",
+  done: "done",
+  blocked: "blocked",
+  cancelled: "cancelled",
+};
 // State → DS status token. (blocked → error, dag/deps → warning handled in flags.)
 const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-status-success)",
   in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
@@ -228,7 +241,7 @@ function render(){
       }).join("") || '<div class="pl-empty">—</div>';
       const more = total > items.length ? showAllBtn(total) : "";
       return '<div class="col"><div class="pl-panel-header pl-panel-header--compact">'
-        + '<span class="pl-panel-header__title">'+state.replace("_"," ")+'</span>'
+        + '<span class="pl-panel-header__title">'+(STATE_LABEL[state] || state.replace("_"," "))+'</span>'
         + '<span class="pl-badge">'+total+'</span></div>'+cards+more+'</div>';
     }).join("");
   } else {
@@ -238,7 +251,7 @@ function render(){
       '<tr'+(f.state==="in_progress"?' data-mon="'+esc(f.id)+'"':"")+'>'  // in_progress → opens the monitor (#84)
       + '<td class="id">'+esc(f.id)+'</td><td>'+esc(f.title)+'</td>'
       + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
-      + '<span class="pl-dot-row__label">'+esc(f.state)+'</span></span></td>'
+      + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
       + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+pr(f)+'</td></tr>';
     const byState = {};
     FEATURES.forEach(f => (byState[f.state] = byState[f.state] || []).push(f));
@@ -253,7 +266,7 @@ function render(){
       const collapsed = COLLAPSED.has(state);
       html += '<tr class="grp" data-state="'+esc(state)+'" onclick="toggleGroup(this.dataset.state)">'
         + '<td colspan="6"><span class="tw">'+(collapsed?"▸":"▾")+'</span>'
-        + '<span class="gl">'+esc(state.replace("_"," "))+'</span>'
+        + '<span class="gl">'+esc(STATE_LABEL[state] || state.replace("_"," "))+'</span>'
         + '<span class="pl-badge">'+total+'</span></td></tr>';
       if (!collapsed){  // collapsed → header only (rows omitted)
         html += items.map(row).join("");
