@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import json
+import logging
+import sys
+import types
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -299,6 +304,127 @@ def test_progress_returns_the_per_gen_snapshot_contract(monkeypatch):
     assert g["current_tool"]["name"] == "edit_file" and g["current_tool"]["locations"] == ["a.py"]
     assert g["thought_tail"] == "planning the change"
     assert g["usage"] == {"used": 12, "size": 100}
+
+
+# ── reload-stability (#178): the monitor buffer survives a plugin/graph reload ──
+
+
+def _reimport_coder_seam():
+    """Import a FRESH coder_seam module instance — exactly what reload_plugins/a
+    graph reload produce: a new module object whose body re-runs, while the old
+    instance (and anything still holding it, like the live dispatch loop's own
+    import-time ``from . import coder_seam``) keeps its reference. Callers must
+    restore via ``_restore_coder_seam`` so the rest of the suite keeps the
+    original instance."""
+    sys.modules.pop("project_board.coder_seam", None)
+    return importlib.import_module("project_board.coder_seam")
+
+
+def _restore_coder_seam():
+    sys.modules["project_board.coder_seam"] = coder_seam
+    pb.coder_seam = coder_seam
+
+
+def test_progress_survives_a_plugin_reload(monkeypatch, caplog):
+    """#178 r1: the gen that was streaming before a reload is still served by the
+    freshly-mounted route — never ``{"gens": []}`` for a live run — and the OLD
+    instance's still-running loop keeps feeding the SAME buffer the new instance
+    reads (adoption shares the dict, it doesn't copy a snapshot)."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-1", 1, "smart")  # the pre-reload live gen
+    coder_seam.progress_thought("bd-1", 1, "mid-stream")
+    try:
+        with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+            fresh = _reimport_coder_seam()
+        # The re-mounted route resolves the FRESH module (`from . import coder_seam`)…
+        c = _client(monkeypatch, FakeStore())
+        r = c.get("/api/plugins/project_board/features/bd-1/progress")
+        assert r.status_code == 200
+        gens = r.json()["gens"]
+        assert [g["gen"] for g in gens] == [1]  # NOT {"gens": []} — the reload bug
+        assert gens[0]["tier"] == "smart"
+        assert gens[0]["thought_tail"] == "mid-stream"
+        # …while the OLD instance (the still-running dispatch loop) writes into the
+        # SAME dict the new instance serves — a later delta stays visible:
+        coder_seam.progress_thought("bd-1", 1, " and still going")
+        assert fresh.progress_snapshot("bd-1")["gens"][0]["thought_tail"].endswith("and still going")
+        # #178 r3: the adoption logged how much was carried over, for the splunk pass.
+        assert "1 feature(s) carried over (1 with a live gen)" in caplog.text
+    finally:
+        _restore_coder_seam()
+        coder_seam._progress.clear()
+
+
+def test_progress_buffer_is_fresh_on_a_clean_boot(caplog):
+    """#178 r2: no previous instance (the stable slot is empty — a real fresh boot)
+    → an empty buffer and no adoption warning, exactly as before the fix."""
+    slot = coder_seam._progress_slot_name()
+    saved_holder = sys.modules.pop(slot, None)
+    try:
+        with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+            fresh = _reimport_coder_seam()
+        assert not fresh._progress  # empty…
+        assert fresh._progress is not coder_seam._progress  # …and genuinely new
+        assert fresh.progress_snapshot("bd-1") == {"gens": []}
+        assert "carried over" not in caplog.text
+    finally:
+        _restore_coder_seam()
+        if saved_holder is not None:
+            sys.modules[slot] = saved_holder
+        else:
+            sys.modules.pop(slot, None)
+
+
+def test_ensure_progress_attached_reports_and_repairs(monkeypatch):
+    """#178 r4: the register()-time hook — idempotent on the common path (already
+    attached at import; same shared object, reports the carried count) and, if the
+    slot was somehow replaced after import, re-adopts it rather than keeping two
+    live dicts (the very split this fix removes)."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-1", 1, "fast")
+    before = coder_seam._progress
+    assert coder_seam.ensure_progress_attached() == 1
+    assert coder_seam._progress is before
+    slot = coder_seam._progress_slot_name()
+    saved_holder = sys.modules[slot]
+    replacement = types.ModuleType(slot)
+    replacement.progress = OrderedDict()
+    sys.modules[slot] = replacement
+    try:
+        coder_seam.ensure_progress_attached()
+        assert coder_seam._progress is replacement.progress
+    finally:
+        sys.modules[slot] = saved_holder
+        coder_seam.ensure_progress_attached()  # re-adopt the original for the rest of the suite
+        coder_seam._progress.clear()
+
+
+def test_register_runs_the_reload_adoption_hook(monkeypatch):
+    """register() (every plugin (re)mount) goes through the adoption hook, so a
+    reload adopts at mount time — not lazily at the first progress poll after it."""
+    called = []
+    monkeypatch.setattr(coder_seam, "ensure_progress_attached", lambda: called.append(True) or 0)
+
+    class _Registry:
+        config = {"coder": "proto"}
+
+        def register_tool(self, t):
+            pass
+
+        def register_router(self, router, prefix):
+            pass
+
+        def register_surface(self, start, stop=None, name=None):
+            pass
+
+        def register_subagent(self, config):
+            pass
+
+        def register_skill_dir(self, path):
+            pass
+
+    pb.register(_Registry())
+    assert called
 
 
 def test_ready_gate_rejection_surfaces_as_400(monkeypatch):

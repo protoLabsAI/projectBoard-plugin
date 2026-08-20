@@ -71,6 +71,20 @@ def register(registry) -> None:
     for t in _board_tools(cfg):
         registry.register_tool(t)
 
+    # Reload-stability (#178): a hot-reload (`reload_plugins`, graph reload) imports
+    # a FRESH coder_seam whose live-monitor buffer would otherwise start empty while
+    # the previous instance's still-running dispatch loop keeps streaming into its
+    # own — the drawer then answers "No live coder run" for a gen that is actively
+    # streaming. coder_seam attaches to a process-stable shared buffer at import;
+    # going through the hook HERE pins the adoption (and its carried-over warning)
+    # to plugin mount time instead of the first progress poll after the reload.
+    try:
+        from . import coder_seam
+
+        coder_seam.ensure_progress_attached()
+    except Exception:  # noqa: BLE001 — monitoring must never break registration
+        log.exception("[project_board] attaching the coder-monitor buffer failed")
+
     # Planning layer (D9): the decompose/antagonist subagents + the orchestration
     # skill that turns an idea into the docs tree + the board (per-epic human gate).
     try:
