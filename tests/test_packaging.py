@@ -102,6 +102,7 @@ class _Registry:
         self.config = {"coder": "proto"}
         self.tools, self.routers, self.surfaces = [], [], []
         self.subagents, self.skill_dirs = [], []
+        self.surface_reloads = {}
 
     def register_tool(self, t):
         self.tools.append(t)
@@ -109,8 +110,9 @@ class _Registry:
     def register_router(self, router, prefix):
         self.routers.append(prefix)
 
-    def register_surface(self, start, stop=None, name=None):
+    def register_surface(self, start, stop=None, name=None, reload=None):
         self.surfaces.append(name)
+        self.surface_reloads[name] = reload
 
     def register_subagent(self, config):
         self.subagents.append(config)
@@ -132,3 +134,44 @@ def test_register_wires_routers_surface_and_tools():
     # The four headless board tools the agent (or A2A) can drive.
     names = {getattr(t, "name", "") for t in reg.tools}
     assert {"board_create_epic", "board_create_feature", "board_mark_ready", "board_list"} <= names
+
+
+def test_register_wires_the_loop_reload_hook():
+    """The surface registers `reload=` (ADR 0018) so a config reload re-applies the
+    live concurrency knobs to the RUNNING loop. Without it the host can't tell the
+    loop anything after boot and a `max_concurrent` edit silently waits for a restart
+    — the exact gap: a one-slot loop serializing a six-project board."""
+    import project_board
+    from project_board.loop import BoardLoop
+
+    reg = _Registry()
+    project_board.register(reg)
+    reload_cb = reg.surface_reloads["project-board-loop"]
+    assert callable(reload_cb)
+    assert getattr(reload_cb, "__func__", None) is BoardLoop.reload
+
+
+def test_manifest_settings_are_exactly_the_live_knobs():
+    """Settings → Plugins renders the manifest's `settings:`; every field there MUST be
+    one the running loop re-applies on reload (LIVE_KNOBS), and every live knob must
+    be editable there — a field the operator can edit that silently needs a restart
+    is worse than no field, and a live knob with no field can't be reached from the
+    console. Each must also carry a manifest default (the reload payload is manifest
+    defaults ⊕ YAML, so the hook always sees every knob)."""
+    from project_board.loop import LIVE_KNOBS
+
+    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
+    fields = {s["key"]: s for s in m["settings"]}
+    assert set(fields) == set(LIVE_KNOBS)
+    for key, spec in fields.items():
+        assert spec["type"] == "number", key
+        assert spec["label"] and spec["description"], key
+        assert key in m["config"], f"{key} has no manifest default"
+
+
+def test_manifest_min_host_version_covers_the_reload_hook():
+    """register_surface(reload=) landed in protoAgent v0.31.0 (#509/#511); an older
+    host raises TypeError on the kwarg and the loop never registers."""
+    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
+    major, minor, *_ = (int(x) for x in str(m["min_protoagent_version"]).split("."))
+    assert (major, minor) >= (0, 31)

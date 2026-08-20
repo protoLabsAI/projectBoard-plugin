@@ -412,6 +412,42 @@ async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
     return state == "open"
 
 
+# ── live concurrency knobs ─────────────────────────────────────────────────────
+# The cfg keys a config reload re-applies to the RUNNING loop (BoardLoop.reload, wired
+# through ADR 0018 ``register_surface(reload=)``). Everything else in cfg is read once
+# at construction and needs a restart — the startup log says so. Keep this list in
+# step with the manifest's ``settings:`` block (those are the console fields) and
+# the README's "Concurrency" section.
+LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions")
+LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0}
+_CONFIG_SECTION = "project_board"
+
+
+def _knob_int(cfg: dict, key: str, default: int, *, floor: int) -> int:
+    """``int(cfg[key])`` floored — the one coercion every live knob shares, so the
+    constructor and ``reload()`` can't drift on what "1" or "-1" means."""
+    return max(floor, int(cfg.get(key, default)))
+
+
+def _plugin_section(new_config) -> dict:
+    """The ``project_board`` section out of whatever the host handed ``reload()``:
+    the ``LangGraphConfig`` (``.plugin_config[section]``, the documented ADR 0018
+    payload), or a plain dict — either the section itself or a ``{section: {...}}``
+    wrapper. Anything else ⇒ ``{}`` (reload becomes a no-op, never a crash)."""
+    if new_config is None:
+        return {}
+    pconf = getattr(new_config, "plugin_config", None)
+    if isinstance(pconf, dict):
+        sec = pconf.get(_CONFIG_SECTION)
+        return sec if isinstance(sec, dict) else {}
+    if isinstance(new_config, dict):
+        inner = new_config.get(_CONFIG_SECTION)
+        if isinstance(inner, dict):
+            return inner
+        return new_config
+    return {}
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -478,12 +514,16 @@ class BoardLoop:
         self.escalation_on = escalation_enabled(self.cfg)
         # Concurrency: drive up to `max_concurrent` features at once, each in its own
         # worktree. 1 (the default) = serial — the safe default for token + merge-
-        # integration cost; raise it on a repo that parallelizes cleanly.
-        self.max_concurrent = max(1, int(self.cfg.get("max_concurrent", 1)))
+        # integration cost; raise it on a repo that parallelizes cleanly. LIVE: a
+        # config reload re-applies it to the running loop via `reload()` (ADR 0018
+        # register_surface reload=), so the console Settings field takes effect on
+        # the next tick — no restart. Lowering it never kills a drive: in-flight
+        # builds finish and the loop just stops claiming until it's under the cap.
+        self.max_concurrent = _knob_int(self.cfg, "max_concurrent", 1, floor=1)
         # Review-queue WIP limit: pause new claims when this many PRs already await
         # review, so the loop can't pile up PRs faster than they merge (flooding CI /
-        # reviewers). 0 = unlimited.
-        self.max_pending_reviews = int(self.cfg.get("max_pending_reviews", 5))
+        # reviewers). 0 = unlimited. LIVE (see max_concurrent).
+        self.max_pending_reviews = _knob_int(self.cfg, "max_pending_reviews", 5, floor=0)
         # Dependency gate: "merge" (default) — a dependent waits for every blocker to
         # merge (done); "review" — a NON-foundation blocker releases its dependents at
         # in_review (more parallelism, at the risk of building on un-merged code).
@@ -614,7 +654,9 @@ class BoardLoop:
         # best-of-k rung dispatches `coder_solve_k` ACP sessions concurrently, so peak
         # ACP processes = max_concurrent × coder_solve_k. Set max_concurrent_sessions to
         # cap that (0 = unlimited within the k budget; 1 = serialise k candidates).
-        self.max_concurrent_sessions = max(0, int(self.cfg.get("max_concurrent_sessions", 0)))
+        # LIVE (see max_concurrent) — applies to the NEXT dispatch; a running
+        # best-of-k fan-out keeps the semaphore it was built with.
+        self.max_concurrent_sessions = _knob_int(self.cfg, "max_concurrent_sessions", 0, floor=0)
         # Rung 4 (ADR 0064 P3): a richer generator for the HARDEST features — reached
         # only after greedy AND best-of-k AND tree-search all fail their tests. Fusion
         # can't tool-call (it's a plain completion, not an ACP session), so it's an
@@ -905,13 +947,15 @@ class BoardLoop:
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
         log.info(
             "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
-            "merge_poll=%s, coder_timeout=%ss)",
+            "merge_poll=%s, coder_timeout=%ss; live on config reload: %s — everything else "
+            "needs a restart)",
             self.coder_name,
             self.reviewer_name,
             self.interval,
             self.max_concurrent,
             self.merge_poll,
             self.coder_timeout,
+            ", ".join(LIVE_KNOBS),
         )
         if self.coder_solve and self.coder_solve_k > 1:
             peak = self.max_concurrent * self.coder_solve_k
@@ -927,6 +971,42 @@ class BoardLoop:
                 cap_note,
             )
         return self._task
+
+    def reload(self, new_config) -> dict:
+        """Apply the concurrency knobs from a reloaded config to the RUNNING loop.
+
+        The host fires this on every config reload with the new ``LangGraphConfig``
+        (ADR 0018 ``register_surface(reload=)``) — the running surface survives a
+        settings save, so without this hook a ``max_concurrent`` edit in the console
+        only took effect after a restart (the loop reads ``cfg`` once, at
+        construction). ``new_config`` may be the host config object (``.plugin_config
+        [section]``) or the plain section dict; a section with no such key leaves that
+        knob alone (a host without the manifest's defaults merged in). Returns the
+        ``{knob: (old, new)}`` diff and logs it, so the splunk line for "did my
+        settings change land" is one grep. Never raises: a malformed value logs a
+        warning and keeps the current knob — a typo in Settings must not stall the
+        loop mid-drive."""
+        section = _plugin_section(new_config)
+        changed: dict[str, tuple[int, int]] = {}
+        for key in LIVE_KNOBS:
+            if key not in section:
+                continue
+            cur = getattr(self, key)
+            try:
+                new = _knob_int(section, key, cur, floor=LIVE_KNOB_FLOORS[key])
+            except (TypeError, ValueError):
+                log.warning("[project_board] reload: %s=%r is not an integer — keeping %d", key, section.get(key), cur)
+                continue
+            if new != cur:
+                setattr(self, key, new)
+                changed[key] = (cur, new)
+        if changed:
+            log.info(
+                "[project_board] reload applied live: %s (in-flight drives: %d)",
+                ", ".join(f"{k} {o}→{n}" for k, (o, n) in changed.items()),
+                len(self._drives),
+            )
+        return changed
 
     async def stop(self):
         self._shutting_down = True

@@ -414,7 +414,7 @@ def test_register_runs_the_reload_adoption_hook(monkeypatch):
         def register_router(self, router, prefix):
             pass
 
-        def register_surface(self, start, stop=None, name=None):
+        def register_surface(self, start, stop=None, name=None, reload=None):
             pass
 
         def register_subagent(self, config):

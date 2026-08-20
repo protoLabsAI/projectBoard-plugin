@@ -123,6 +123,13 @@ project_board:
                              # concurrently, so peak ACP processes =
                              # max_concurrent × coder_solve_k (default: 1 × 3 = 3).
                              # Use max_concurrent_sessions to cap the within-drive parallelism.
+                             # LIVE: max_concurrent, max_pending_reviews and
+                             # max_concurrent_sessions are console Settings fields
+                             # (Settings → Plugins → Project Board) and a save applies
+                             # them to the RUNNING loop on its next tick — no restart.
+                             # Every other key here is read once at boot. On a
+                             # multi-project board size max_concurrent to the project
+                             # count (one slot per repo) or one deep queue starves the rest.
   merge_poll: true           # poll merged PRs as a fallback to the webhook Done edge
   goal_verify: false         # flip true: verify the coder's diff vs acceptance_criteria before opening a PR
   max_mode_n: 1              # >1 = best-of-N "Max-Mode": N coders per feature, keep the best diff
