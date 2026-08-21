@@ -201,6 +201,33 @@ def test_unusable_board_reads_surface_as_json_400_not_500(monkeypatch):
         assert "beads workspace" in r.json()["detail"], path
 
 
+def test_status_reports_unbound_for_the_shipped_default(monkeypatch):
+    """First-run tell for the view: the shipped default (repo ".", no db_path, no
+    projects map) only works when the process cwd IS the target repo — on a GUI/
+    desktop member every read raises BoardError. /status is a pure config read so
+    it answers even then, letting the view render setup guidance instead of a raw
+    error. It must live on the GATED prefix like every other data route."""
+    c = _client(monkeypatch, FakeStore())
+
+    r = c.get("/api/plugins/project_board/status")
+
+    assert r.status_code == 200
+    assert r.json()["bound"] is False
+    assert c.get("/plugins/project_board/status").status_code == 404  # never public
+
+
+def test_status_reports_bound_once_a_repo_or_db_is_configured(monkeypatch):
+    """Any of the three binding paths — an explicit repo, a db_path pin, or a
+    `projects:` map — flips bound; the view then shows real errors, not setup."""
+    for cfg in (
+        {"repo": "/work/checkout"},
+        {"db_path": "/tmp/board.db"},
+        {"projects": {"web": {"repo": "/work/web"}}},
+    ):
+        c = _client(monkeypatch, FakeStore(), cfg=cfg)
+        assert c.get("/api/plugins/project_board/status").json()["bound"] is True, cfg
+
+
 # ── CRUD + the Ready gate surfacing as 400 ──────────────────────────────────────
 
 
