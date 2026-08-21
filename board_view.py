@@ -287,8 +287,32 @@ async function load(){
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
     render();
   } catch (e) {
-    $("err").hidden = false; $("err").textContent = "Could not load the board: " + e;
+    // First-run tell (#unbound): a board never bound to a repo (shipped default
+    // repo "." + no db_path) fails every read — that is missing SETUP, not an
+    // error. /status is a pure config read, so it answers even when the store
+    // can't; if it can't either, fall through to the raw error.
+    try {
+      const s = await api("/api/plugins/project_board/status");
+      if (s && s.bound === false) { renderSetup(e); return; }
+    } catch (_ignored) {}
+    $("err").hidden = false; $("err").className = "pl-callout pl-callout--error";
+    $("err").textContent = "Could not load the board: " + e;
   }
+}
+
+// The unbound-board setup card — guidance in place of a red error. Static markup
+// + esc()'d error text only.
+function renderSetup(e){
+  $("err").hidden = false;
+  $("err").className = "pl-callout";
+  $("err").innerHTML = '<b>This board isn&#39;t bound to a repo yet.</b>'
+    + '<ol style="margin:6px 0 0 18px;padding:0">'
+    + '<li>Settings &#9656; Plugins &#9656; Project Board &#8594; set <code>repo</code> to the absolute path of the git checkout this agent manages (or <code>db_path</code> to keep the board in a private store).</li>'
+    + '<li>Register a coder delegate (Settings &#9656; Delegates) and set <code>project_board.coder</code> to its name.</li>'
+    + '<li>Turn on <code>loop_enabled</code> when you want the board dispatching builds.</li>'
+    + '</ol>'
+    + '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>';
+  $("sub").textContent = "project_board — not bound to a repo yet";
 }
 
 // ── Live coder monitor drawer (#84) ────────────────────────────────────────────

@@ -223,6 +223,28 @@ def build_data_router(cfg: dict):
         except BoardError as e:
             raise HTTPException(400, str(e))
 
+    @router.get("/status")
+    async def _status():
+        """Is this board BOUND yet? A pure config read — no `br` calls — so it answers
+        even when the store can't, which is exactly when the view needs it. The shipped
+        default (`repo: "."`, no db_path, no projects map) only works when the process
+        cwd IS the target repo; on a GUI/desktop member the cwd is the app bundle
+        (read-only), so a first-run board fails every read with a BoardError. The view
+        asks here to tell "never bound" (render setup guidance) from "bound but broken"
+        (render the real error)."""
+        # NB: read `projects` from the RAW cfg, not store_kw — resolve_projects
+        # back-compat synthesizes an implicit project from the flat keys, so the
+        # resolved map is non-empty even for the unbound shipped default.
+        raw_projects = (cfg or {}).get("projects")
+        explicit_projects = isinstance(raw_projects, dict) and bool(raw_projects)
+        bound = bool(store_kw.get("db")) or explicit_projects or str(store_kw.get("repo") or ".") not in ("", ".")
+        return {
+            "bound": bound,
+            "repo": store_kw.get("repo") or ".",
+            "db_path": bool(store_kw.get("db")),
+            "projects": sorted(raw_projects) if explicit_projects else [],
+        }
+
     async def _reap_worktree(fid: str) -> None:
         """Reap the feature's worktree at a terminal edge (cancel/delete) — the same
         best-effort pattern as the merge webhook's Done-edge reap (``build_router``).
