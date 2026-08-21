@@ -389,3 +389,58 @@ def test_board_create_feature_depends_on_open_but_not_in_review_is_allowed(monke
 
     assert json.loads(out)["id"] == "bd-new1"
     assert len(fake.created) == 1
+
+
+# ── no tool may raise BoardError through the graph ──────────────────────────────
+# An escaped BoardError propagates through the LangChain tool layer and FAILS the
+# whole turn — every tool call the model already completed in it is discarded
+# (observed live 2026-08-21: two turns died this way on an unbound board, one after
+# 21 successful research calls). The board's failure mode must be an `Error: …`
+# tool RESULT the model can adapt to. This sweep pins the contract for EVERY
+# registered tool so the next unguarded one cannot ship.
+
+_MINIMAL_ARGS = {
+    "board_create_epic": {"title": "t"},
+    "board_create_feature": {"title": "t"},
+    "board_update_feature": {"feature_id": "bd-1", "title": "t"},
+    "board_get_feature": {"feature_id": "bd-1"},
+    "board_mark_ready": {"feature_id": "bd-1"},
+    "board_cancel_feature": {"feature_id": "bd-1"},
+    "board_requeue_feature": {"feature_id": "bd-1"},
+    "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
+    "board_unblock_feature": {"feature_id": "bd-1"},
+    "board_list": {},
+    "board_retro": {},
+}
+
+
+class _UnusableStore:
+    """Every store access raises the unbound-board BoardError — the exact failure a
+    fresh desktop member hits before `project_board.repo` is bound."""
+
+    def __getattr__(self, name):
+        def _raise(*a, **k):
+            raise pb.store.BoardError("repo '.' has no beads workspace and `br init` failed — set project_board.repo")
+
+        return _raise
+
+
+def test_every_tool_returns_boarderror_as_result_never_raises(monkeypatch):
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _UnusableStore())
+    tools = pb._board_tools({})
+    missing = set(_MINIMAL_ARGS) - {t.name for t in tools}
+    assert not missing, f"sweep args reference unknown tools: {missing}"
+
+    for t in tools:
+        if t.coroutine is not None:
+            # Async tools (board_register_project) don't go through the beads store —
+            # they work the HOST config seam and build their own `Error: …` strings
+            # (the consent-gate refusal is one). The store sweep is a sync contract.
+            continue
+        assert t.name in _MINIMAL_ARGS, (
+            f"new tool {t.name!r} has no minimal-args entry — add one so the no-raise contract covers it"
+        )
+        out = t.invoke(_MINIMAL_ARGS[t.name])
+        assert isinstance(out, str) and out.startswith("Error:"), (
+            f"{t.name} must return the BoardError as an `Error: …` result, got: {out!r:.120}"
+        )

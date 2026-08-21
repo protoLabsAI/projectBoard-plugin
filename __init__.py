@@ -674,17 +674,24 @@ def _board_tools(cfg: dict):
             with_ci = True
             state = state or "in_review"
         project = _strip_wrapping_quotes(project).strip()
-        store = get_store(**_store_kw_for(project))
-        feats = store.list_features(state=state or None, include_archived=include_archived)
-        # Project filter (#90): keep only the features stamped for `project`. Applied
-        # BEFORE the CI join so a filtered listing never spends a `gh` call on a row it
-        # would drop.
-        if project:
-            feats = [f for f in feats if str(f.get("project") or "") == project]
-        if with_ci:
-            feats = store.annotate_ci_status(feats)
-            if failing_only:
-                feats = [f for f in feats if f.get("ci_status") == "failing"]
+        # Guarded like every other tool: an unusable board (no repo bound, no .beads,
+        # br missing) must reach the model as an `Error: …` tool RESULT it can adapt
+        # to — an escaped BoardError kills the whole turn and discards every tool
+        # call already made in it (observed: 21 completed calls thrown away).
+        try:
+            store = get_store(**_store_kw_for(project))
+            feats = store.list_features(state=state or None, include_archived=include_archived)
+            # Project filter (#90): keep only the features stamped for `project`. Applied
+            # BEFORE the CI join so a filtered listing never spends a `gh` call on a row it
+            # would drop.
+            if project:
+                feats = [f for f in feats if str(f.get("project") or "") == project]
+            if with_ci:
+                feats = store.annotate_ci_status(feats)
+                if failing_only:
+                    feats = [f for f in feats if f.get("ci_status") == "failing"]
+        except BoardError as exc:
+            return f"Error: {exc}"
         rows = []
         for f in feats:
             row = {
@@ -716,7 +723,10 @@ def _board_tools(cfg: dict):
         retrospective never silently shrinks to the archive window."""
         from . import retro
 
-        d = retro.summarize(get_store(**store_kw).raw_features_with_comments())
+        try:
+            d = retro.summarize(get_store(**store_kw).raw_features_with_comments())
+        except BoardError as exc:
+            return f"Error: {exc}"
         return json.dumps(
             {
                 "n_features": d["n_features"],
