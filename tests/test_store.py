@@ -1998,6 +1998,50 @@ def test_list_features_empty_board_skips_show(make_board):
     assert not br.cmds("show")  # no show call issued
 
 
+# ── #201: blocked features float to the top of the projection ───────────────────
+# A blocked card is the board's loudest "needs attention" signal, so list_features
+# sorts blocked ahead of everything else; priority (0 = highest) still ranks within
+# each group, id as the stable tiebreak.
+
+
+def test_list_features_sorts_blocked_to_top(make_board):
+    """Mixed blocked/non-blocked: every blocked feature precedes every non-blocked
+    one, and each group keeps its own priority order."""
+    beads = [
+        {"id": "bd-1", "status": "open", "labels": [], "priority": 0},
+        {"id": "bd-2", "status": "open", "labels": ["blocked"], "priority": 2},
+        {"id": "bd-3", "status": "open", "labels": ["blocked"], "priority": 0},
+        {"id": "bd-4", "status": "open", "labels": [], "priority": 1},
+    ]
+    br = Br({"list": beads, "ready": []})
+    b = make_board(br)
+    assert [f["id"] for f in b.list_features()] == ["bd-3", "bd-2", "bd-1", "bd-4"]
+
+
+def test_list_features_blocked_ties_break_on_id(make_board):
+    """Equal-priority blocked features keep the stable id tiebreak."""
+    beads = [
+        {"id": "bd-b", "status": "open", "labels": ["blocked"], "priority": 1},
+        {"id": "bd-a", "status": "open", "labels": ["blocked"], "priority": 1},
+    ]
+    br = Br({"list": beads, "ready": []})
+    b = make_board(br)
+    assert [f["id"] for f in b.list_features()] == ["bd-a", "bd-b"]
+
+
+def test_list_features_sort_unchanged_when_nothing_blocked(make_board):
+    """With no blocked features the order is exactly the pre-#201 sort:
+    priority ascending, then id."""
+    beads = [
+        {"id": "bd-1", "status": "open", "labels": [], "priority": 2},
+        {"id": "bd-2", "status": "open", "labels": [], "priority": 0},
+        {"id": "bd-3", "status": "open", "labels": [], "priority": 1},
+    ]
+    br = Br({"list": beads, "ready": []})
+    b = make_board(br)
+    assert [f["id"] for f in b.list_features()] == ["bd-2", "bd-3", "bd-1"]
+
+
 def test_find_by_external_ref_scan_is_unbounded(make_board):
     """record_merge's PR lookup scans `br list` unfiltered — it too must be unbounded,
     else a merge webhook for a feature past row 50 would silently never close it."""
