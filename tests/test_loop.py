@@ -4546,3 +4546,67 @@ async def test_auto_merge_honours_merge_method(monkeypatch):
     store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
     await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo")
     assert calls["merge"][0][1] == "rebase"
+
+
+class _BlockedReconcileStore(_ReconcileStore):
+    """A merged-but-blocked card (#196): the reconciler must poll blocked features'
+    PRs and drive MERGED to done, but never touch CLOSED/OPEN ones (their blocked
+    reason is deliberate)."""
+
+    def __init__(self, in_review, blocked):
+        super().__init__(in_review)
+        self._blocked = blocked
+
+    def list_features(self, state=None):
+        if state == "blocked":
+            return self._blocked
+        return super().list_features(state)
+
+
+async def test_reconcile_prs_promotes_a_blocked_card_whose_pr_merged(monkeypatch):
+    """#196 (protoEngineer friction 2026-08-19): bd-2ti/bd-q1i had MERGED PRs but sat
+    in blocked forever because the reconcile scanned in_review only."""
+    store = _BlockedReconcileStore(
+        [],
+        [{"id": "bd-blk", "pr_url": "https://example/pr/7", "board_state": "blocked"}],
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _pr_state(url, *, cwd="."):
+        return "MERGED"
+
+    async def _reap(repo, root, fid):
+        return None
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({})
+    await loop._reconcile_prs()
+    assert store.merged == ["https://example/pr/7"]
+    assert store.blocked == []  # never re-flagged
+
+
+async def test_reconcile_prs_leaves_a_blocked_card_with_an_open_or_closed_pr_alone(monkeypatch):
+    """The blocked scan takes ONLY the merged edge: a CLOSED PR must not rewrite the
+    card's deliberate blocked reason, and the OPEN gates must not run against it."""
+    for pr_state_val in ("OPEN", "CLOSED"):
+        store = _BlockedReconcileStore(
+            [],
+            [{"id": "bd-blk", "pr_url": "https://example/pr/7", "board_state": "blocked"}],
+        )
+        monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+        async def _pr_state(url, *, cwd="."):
+            return pr_state_val
+
+        monkeypatch.setattr(worktree, "pr_state", _pr_state)
+        loop = BoardLoop({})
+        ci_called = []
+
+        async def _ci_spy(store_, fid, pr_url, repo):
+            ci_called.append(fid)
+
+        monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
+        await loop._reconcile_prs()
+        assert store.merged == [] and store.blocked == [] and ci_called == [], pr_state_val
