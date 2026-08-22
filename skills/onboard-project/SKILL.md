@@ -16,6 +16,7 @@ tools:
   - board_create_feature
   - board_mark_ready
   - board_list
+  - board_register_project   # register the repo as a board project — ONLY offered when onboarding.enabled
   - request_user_input   # the readiness human gate
   - write_file       # optional: write the readiness report into the tree
 ---
@@ -74,10 +75,31 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
      single highest-leverage item; it prevents the largest class of coder mistakes.
    - **PR CI** if missing, so PRs are verified independently, not only by the local gate.
 
-5. **Human gate.** Summarize readiness (PASS / auto-FIXED / BOARDED feature ids) and
-   call `request_user_input` to confirm before the team starts feature work.
+5. **Human gate — the readiness/registration form.** Summarize readiness
+   (PASS / auto-FIXED / BOARDED feature ids) and call `request_user_input` to confirm
+   before the team starts feature work. Whether the form offers **registration** is
+   gated on the HOST's `onboarding.enabled` setting — check it BEFORE building the
+   form (it is host config, not repo state: Settings ▸ Project onboarding; if you
+   cannot confirm it is true, treat it as off — `board_register_project` fails closed
+   the same way):
+   - **onboarding enabled** → include a `register_project: true/false` field asking
+     whether to register this repo as a board project (`board_register_project`) so
+     features can be dispatched here.
+   - **onboarding off** → **omit the `register_project` field entirely** — never offer
+     a choice the host will refuse — and add this note to the form description:
+     *"Project registration unavailable — enable Settings ▸ Project onboarding to
+     register repos for filesystem access."*
+
+   If the operator answered `register_project: true`, call
+   `board_register_project(name, repo, base_branch, local_gate_cmd=<the step-3 gate>,
+   repo_conventions=…)` before reporting.
 
 6. **Report.** Output the checklist table with each item's status and the gate command.
+   If registration was attempted and the tool **refused** (an `Error:` return — e.g. a
+   `true` answer from a form built before this gate existed, on a host with onboarding
+   off), the refusal is the **first line** of the completion summary —
+   `⚠ REGISTRATION REFUSED: <the tool's error, verbatim>` — never buried mid-report:
+   the operator must see that their answer did not take effect and what to enable.
 
 ## Rules
 
@@ -89,6 +111,11 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
   criteria don't name the real source.
 - **beads init is a bootstrap**, done via a direct coder delegate, before any feature —
   not a board feature (chicken-and-egg).
+- **Never offer what the host will refuse.** The `register_project` field appears in
+  the human-gate form only when `onboarding.enabled` is true; when it's off the form
+  carries the unavailable-note instead. If a `true` answer arrives anyway (an older
+  form), the refusal leads the completion summary — an operator's answer must never
+  silently evaporate.
 - **Idempotent.** Re-run whenever `loop-retro` surfaces a recurring failure a readiness
   item would have prevented — onboarding and retro are the two halves of the learning
   loop: retro finds the gap, onboarding encodes the fix so the next repo never hits it.
