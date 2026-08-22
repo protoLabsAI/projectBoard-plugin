@@ -108,6 +108,19 @@ def test_internal_state_names_stay_internal():
     assert BOARD_PAGE.count('"on deck"') == 1  # the label lives only in the map — renders go through the lookup
 
 
+# ── blocked-first sort (#201): the view's comparator matches list_features ──────
+
+
+def test_features_sort_puts_blocked_first_then_priority_then_id():
+    """The client re-sorts /features on load, so its comparator must match the
+    store's blocked-first, priority-asc, id-tiebreak order — a blocked card never
+    drowns mid-column."""
+    assert (
+        ".sort((a,b) => (a.blocked?0:1) - (b.blocked?0:1) || a.priority - b.priority || a.id.localeCompare(b.id));"
+        in BOARD_PAGE
+    )
+
+
 def test_monitor_polls_the_progress_endpoint_and_closes_on_esc_or_click_away():
     assert "function openMonitor(fid)" in BOARD_PAGE
     assert "function closeMonitor()" in BOARD_PAGE

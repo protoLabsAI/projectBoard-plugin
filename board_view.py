@@ -288,8 +288,9 @@ async function load(){
   try {
     const r = await api("/api/plugins/project_board/features");
     // the /features API field is `board_state`; normalize to `state` for the views.
+    // blocked floats first (#201, matching list_features), then priority asc, id tiebreak.
     FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
-      .sort((a,b) => a.priority - b.priority || a.id.localeCompare(b.id));
+      .sort((a,b) => (a.blocked?0:1) - (b.blocked?0:1) || a.priority - b.priority || a.id.localeCompare(b.id));
     $("err").hidden = true;
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
     render();
