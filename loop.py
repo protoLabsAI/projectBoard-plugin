@@ -1627,9 +1627,16 @@ class BoardLoop:
             why.append("merge attempts exhausted")
         if why:
             return why
-        if self.auto_rebase:
-            # Verdict currency (#131): the merged-state gate must have run against the
-            # base that will actually land. Stale = unverified, so hold (never block).
+        # Verdict currency (#131): the merged-state gate must have run against the
+        # base that will actually land. Stale = unverified, so hold (never block).
+        # But ONLY when there is a local gate to have verified the merged state WITH:
+        # `_verify_merged_state` returns before stamping when `local_gate_cmd` is
+        # blank (the default), so demanding the stamp regardless made auto_merge
+        # unreachable on every board without a local gate — `merged-verified stamp
+        # (none)` forever, at debug level, while review-clean + CI-green cards sat
+        # in_review (#209). Without a local gate CI + GitHub's CLEAN are the gates,
+        # as the verify edge's own docstring says.
+        if self.auto_rebase and self._local_gate_cmd_for(feature):
             base = self._base_branch_for(feature)
             head = await worktree.origin_head_sha(repo, base)
             if not head:

@@ -4679,7 +4679,9 @@ async def test_auto_merge_is_off_by_default_and_never_called(monkeypatch):
 )
 async def test_auto_merge_holds_on_each_board_side_blocker(monkeypatch, over, reason):
     calls = _merge_env(monkeypatch)
-    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    # A local gate is what writes the merged-verified stamp — the currency rows
+    # above only mean something on a board that has one (#209).
+    loop = BoardLoop({"auto_merge": True, "review_gate": True, "local_gate_cmd": "pytest -q"})
     store = _MergeStore(_reviewed(**over))
     why = await loop._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
     assert any(reason in w for w in why), why
@@ -4706,6 +4708,28 @@ async def test_auto_merge_without_review_gate_needs_no_review_label(monkeypatch)
     store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
     assert len(calls["merge"]) == 1
+
+
+async def test_auto_merge_without_a_local_gate_does_not_wait_for_a_stamp_nobody_writes(monkeypatch):
+    """#209: `local_gate_cmd` blank (the default) ⇒ `_verify_merged_state` never
+    stamps `merged-verified:` — so the merge edge must not require it, or auto_merge
+    is unreachable on a default board (review-clean + CI-green cards sat in_review
+    forever on orbisEngineer with `merged-verified stamp (none)` at debug level).
+    CI + GitHub CLEAN are the gates."""
+    calls = _merge_env(monkeypatch)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})  # auto_rebase defaults ON, no local gate
+    assert loop.auto_rebase and not loop.local_gate_cmd
+    store = _MergeStore(_reviewed(labels=["in-review", "review-clean"]))  # no stamp — nothing ever writes one
+    assert (
+        await loop._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
+        == []
+    )
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
+    # …and WITH a local gate the stamp is still required (the #131 contract is intact).
+    gated = BoardLoop({"auto_merge": True, "review_gate": True, "local_gate_cmd": "pytest -q"})
+    why = await gated._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
+    assert any("merged-verified stamp (none)" in w for w in why), why
 
 
 async def test_auto_merge_without_auto_rebase_skips_the_currency_check(monkeypatch):
