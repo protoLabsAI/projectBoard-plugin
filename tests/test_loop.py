@@ -49,6 +49,10 @@ class FakeLoopStore:
         self.calls.append(("flag_blocked", fid, reason))
         return {"id": fid}
 
+    def record_attempt(self, fid, *, tier, outcome):
+        self.calls.append(("record_attempt", fid, tier, outcome))
+        return {"id": fid}
+
     def record_gens_spent(self, fid, n):
         self.gens_spent[fid] = self.gens_spent.get(fid, 0) + n
         return {"id": fid}
@@ -643,10 +647,158 @@ async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
         raise worktree.NoChangesError("coder produced no commits")
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
-    # No escalation ladder (single coder) → a capability failure blocks immediately.
+    # No diff + no tool activity ⇒ empty_result (#198): one same-tier retry, then
+    # blocked for triage (single coder — there's no ladder to consult anyway).
     assert "flag_blocked" in store.names()
     assert "open_review" not in store.names()
     assert loop._inflight == {}
+
+
+# ── empty_result: a completed dispatch with no diff and no tool activity (#198) ──
+
+
+def test_empty_result_max_config():
+    assert BoardLoop({}).empty_result_max == 2
+    assert BoardLoop({"empty_result_max": 3}).empty_result_max == 3
+    assert BoardLoop({"empty_result_max": 0}).empty_result_max == 1  # floored — 0 could never block
+
+
+async def test_drive_classifies_empty_result_and_records_the_stop_reason(monkeypatch):
+    """No worktree diff + no tool-call activity ⇒ the attempt is `empty_result`, its
+    own failure class (#198) — recorded on the attempt with the ACP adapter's
+    stop-reason so the retro and the monitor drawer can show WHY the coder produced
+    nothing. After empty_result_max (default 2) occurrences the feature blocks with
+    a reason naming the class and the evidence."""
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        # The gen buffer exists (dispatch_coder_tapped ran progress_begin before
+        # falling back to worktree.dispatch_coder in a host-free test env); simulate
+        # the tap stashing the adapter's stop-reason. NO tool events — the coder
+        # connected but never executed.
+        coder_seam.progress_stop_reason("bd-1", 1, "refusal")
+        return ""
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch)
+    # Every empty occurrence is recorded on the attempt, class + stop-reason included.
+    attempts = [c for c in store.calls if c[0] == "record_attempt"]
+    assert len(attempts) == 2 and len(prompts) == 2  # blocked after N=2, not before
+    assert all("empty_result" in a[3] for a in attempts)
+    assert all("stop_reason=refusal" in a[3] for a in attempts)
+    # The block reason names the failure class and the evidence.
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    reason = blocked[0][2]
+    assert reason.startswith("empty_result")
+    assert "empty coder reply — no diff, no tool calls" in reason
+    assert "stop_reason=refusal" in reason
+    assert loop._inflight == {} and loop._empty_results == {}
+
+
+async def test_drive_empty_result_does_not_escalate_the_tier(monkeypatch):
+    """empty_result must NOT climb the coders ladder (#198): a stronger model can't
+    fix "connecting but not executing". Same-tier retry, then Blocked — escalate()
+    is never called even with a full ladder configured."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        return ""
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise worktree.NoChangesError("coder produced no commits")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    assert store.escalated == []  # the ladder was never consulted
+    assert len(dispatches) == 2  # same-tier retry, then blocked
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and "empty coder reply — no diff, no tool calls" in blocked[0][2]
+
+
+async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
+    """The existing capability class is untouched (#198 narrows only the truly-empty
+    case): a no-diff dispatch that DID run tools still climbs the ladder."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        # Real tool activity in the gen buffer — the coder executed, just shipped nothing.
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {"path": "a.py"}})
+        return "I read the files but made no edits"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        raise worktree.NoChangesError("coder produced no commits")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    # fast → smart (one climb), smart is the top → blocked as a capability failure.
+    assert [e[0] for e in store.escalated] == ["bd-1", "bd-1"]
+    assert len(dispatches) == 2
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and "empty coder reply" not in blocked[0][2]
+
+
+async def test_drive_empty_result_retry_recovers_and_resets_the_count(monkeypatch):
+    """One empty occurrence then a real diff: the same-tier retry ships normally and
+    the empty-result count resets (a later empty attempt starts a fresh window)."""
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise worktree.NoChangesError("coder produced no commits")
+        return "https://example/pr/3"
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
+    assert "flag_blocked" not in store.names()
+    assert loop._empty_results == {}  # reset once the PR opened
 
 
 # ── source-issue closed guard (#166) ────────────────────────────────────────────
