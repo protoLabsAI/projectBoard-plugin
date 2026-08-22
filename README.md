@@ -93,8 +93,14 @@ spawn primitive — it does not reimplement it.
   and runs its full long-horizon harness (durable session-memory checkpoint,
   compaction, memory consolidation) over ACP, so it holds context across a long
   feature build. Any ACP agent works (Claude Code, Codex, Gemini CLI), but **proto is
-  the recommended default**. A reviewer `a2a` delegate is optional (review dispatch is
-  off by default — most fleets review PRs via a pipeline on open).
+  the recommended choice** — *recommended*, not defaulted: `project_board.coder` has
+  **no default** and must name the delegate you declared. A reviewer `a2a` delegate is
+  optional (review dispatch is off by default — most fleets review PRs via a pipeline
+  on open).
+
+All four externals — `br`, `gh`, the coder delegate, the bound repo — are checked by
+the **setup preflight** (below) at register time and every loop tick, so a host that
+is missing one says so instead of booting green.
 
 ## Install
 
@@ -113,7 +119,10 @@ delegates:
   - { name: proto, type: acp, command: proto, args: ["--acp"], workdir: ~/dev/my-repo, permissions: allowlist }
 
 project_board:
-  coder: proto               # the first-class ACP coder (protoCLI)
+  coder: proto               # REQUIRED — the acp delegate the loop dispatches to (protoCLI
+                             # here). There is NO default (v0.42.0): unset, the setup
+                             # preflight below flags it and the loop pauses instead of
+                             # dispatching to a phantom name.
   repo: ~/dev/my-repo
   base_branch: main
   loop_enabled: false        # flip true to start the background puller
@@ -283,6 +292,38 @@ that times out is treated as indeterminate → allowed (a slow gate must never w
 board). This is the fail-**closed** complement to the per-PR gate's fail-**open**: a
 flaky gate never blocks good work, but an *unrunnable* gate never starts bad work.
 
+### Setup preflight — can the board run at all? (v0.42.0)
+
+Distinct from the gate preflight above (which asks "can the *repo's tests* run"), the
+setup preflight asks "can the *board* run": four checks, computed by
+`setup_check.setup_status(cfg)` — pure, never raising, never a `br` board op (one
+cached `br --version` at most):
+
+| key | ok when | hint (operator copy) |
+|---|---|---|
+| `br` | the beads CLI (`BR_BIN`, default `br`) is on PATH | install beads-rust (`cargo install beads_rust`) and restart |
+| `gh` | the GitHub CLI is on PATH | install it + `gh auth login`; builds can't open PRs until then |
+| `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure** | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate" / names the unresolvable delegate |
+| `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | set `project_board.repo` to the checkout's absolute path |
+
+Where it surfaces:
+
+- **`GET /api/plugins/project_board/status`** → `setup: {br, gh, coder, repo, loop_enabled,
+  loop_blockers, ready}` alongside the v0.40.0 `bound` keys.
+- **The board page** renders each failing check with its hint (a warning card above the
+  board, or in place of the raw error when the board can't be read at all).
+- **Host operator warnings** — each failing check is forwarded to the host's
+  `registry.report_setup_gap(key, message)` seam (keys `br`/`gh`/`coder`/`repo`; `None`
+  clears it on recovery), which the console shows in `GET /api/runtime/status`.
+  Guarded: a host without the seam just gets the log lines.
+- **The loop pauses, it doesn't traceback.** With `loop_enabled: true` and a blocker
+  standing (`br`, `coder`, `repo` — a missing `gh` only fails the PR edge, so it is
+  reported but not paused on) the puller logs ONE `loop paused: …` warning and
+  re-checks every `loop_interval_s` — install `br`, declare the delegate, bind the repo,
+  and it runs crash recovery + starts ticking on its own. No restart. Before v0.42.0 the
+  same board booted green and logged `crash recovery failed` + `loop tick failed`
+  tracebacks every tick.
+
 ## Layout
 
 | File | What |
@@ -292,12 +333,14 @@ flaky gate never blocks good work, but an *unrunnable* gate never starts bad wor
 | `worktree.py` | per-feature worktree lifecycle, scoped coder dispatch, `open_pr` |
 | `coder_seam.py` | the ADR 0064 P2 seam — dispatches a build through `coder.solve()` when available, else honest-degrades |
 | `api.py` | the HTTP API + the `/webhook/pr` Done edge (HMAC-verified) |
+| `setup_check.py` | the setup preflight (`br`/`gh`/coder/repo) + the host gap reporter — can the board run at all? |
 | `board_view.py` | the Kanban/list console view |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
 | `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `loop-retro` distill skill |
 | `__init__.py` | `register()` — wires it all |
 
-Ships **disabled**; nothing runs until you enable it and declare a coder.
+Ships **disabled**; nothing runs until you enable it, declare a coder delegate and name
+it in `coder:`.
 
 ## Standalone scripts (outside pytest)
 
