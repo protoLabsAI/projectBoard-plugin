@@ -104,6 +104,9 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # loop can't leak memory.
 
 _THOUGHT_TAIL_MAX = 500  # rolling thought tail, in CHARS — never a per-word accumulation
+_ANSWER_TAIL_MAX = 700  # rolling tail of the coder's streamed ANSWER text (its own narration)
+_PLAN_ENTRIES_MAX = 40  # latest ACP plan (the coder's live todo list), entry-capped
+_TOOL_INPUT_PREVIEW_MAX = 200  # first chars of a tool call's raw input (the command/pattern)
 _RECENT_TOOLS_MAX = 200  # rolling tool-lifecycle history per gen (start/end events)
 _MAX_FEATURES = 64  # features retained (LRU-evicted) so a long loop stays bounded
 
@@ -175,6 +178,8 @@ class _GenBuffer:
         "usage",
         "verify",
         "done",
+        "answer_tail",
+        "plan",
     )
 
     def __init__(self, gen: int, tier: str = ""):
@@ -185,6 +190,8 @@ class _GenBuffer:
         self.current_tool: dict | None = None
         self.recent_tools: deque = deque(maxlen=_RECENT_TOOLS_MAX)
         self.thought_tail = ""
+        self.answer_tail = ""
+        self.plan: list | None = None
         self.usage: dict | None = None
         self.verify: dict | None = None
         self.done = False
@@ -196,6 +203,32 @@ class _GenBuffer:
             return
         self.thought_tail = (self.thought_tail + delta)[-_THOUGHT_TAIL_MAX:]
 
+    def add_answer(self, delta: str) -> None:
+        # Same rolling-tail discipline as thoughts: the coder's streamed answer text is
+        # its own narration of what it's doing/finished — the drawer's best plain-words
+        # signal — but unbounded accumulation is exactly what this buffer must never do.
+        if not delta:
+            return
+        self.answer_tail = (self.answer_tail + delta)[-_ANSWER_TAIL_MAX:]
+
+    def set_plan(self, entries) -> None:
+        # Latest-wins: ACP `plan` updates carry the ENTIRE current plan each time
+        # (the coder's live todo list), so replace — never append. Sanitized +
+        # entry-capped so a runaway plan can't bloat the buffer.
+        if not isinstance(entries, (list, tuple)):
+            return
+        plan = []
+        for e in entries[:_PLAN_ENTRIES_MAX]:
+            if isinstance(e, dict):
+                plan.append(
+                    {
+                        "content": str(e.get("content") or "")[:200],
+                        "status": str(e.get("status") or ""),
+                        "priority": str(e.get("priority") or ""),
+                    }
+                )
+        self.plan = plan
+
     def add_tool(self, event: dict) -> None:
         phase = str(event.get("phase") or "")
         name = str(event.get("name") or "tool")
@@ -203,7 +236,17 @@ class _GenBuffer:
         tid = str(event.get("id") or name)
         if phase == "start":
             locs = _extract_locations(event.get("input"))
-            self.current_tool = {"id": tid, "name": name, "kind": kind, "locations": locs, "status": "running"}
+            # The raw input's head is the "what exactly is it running" line (the
+            # command for execute, the pattern for search) — locations alone lose it.
+            preview = str(event.get("input") or "")[:_TOOL_INPUT_PREVIEW_MAX]
+            self.current_tool = {
+                "id": tid,
+                "name": name,
+                "kind": kind,
+                "locations": locs,
+                "status": "running",
+                "input_preview": preview,
+            }
             self.recent_tools.append({"name": name, "kind": kind, "status": "start", "locations": locs})
         elif phase == "end":
             status = str(event.get("status") or "completed")
@@ -227,6 +270,8 @@ class _GenBuffer:
             "current_tool": dict(self.current_tool) if self.current_tool else None,
             "recent_tools": list(self.recent_tools),
             "thought_tail": self.thought_tail,
+            "answer_tail": self.answer_tail,
+            "plan": list(self.plan) if self.plan else None,
             "usage": dict(self.usage) if self.usage else None,
             "verify": dict(self.verify) if self.verify else None,
         }
@@ -366,6 +411,18 @@ def progress_tool(fid: str | None, gen: int, event: dict) -> None:
         b.add_tool(event)
 
 
+def progress_answer(fid: str | None, gen: int, delta: str) -> None:
+    b = _buf(fid, gen)
+    if b is not None:
+        b.add_answer(delta)
+
+
+def progress_plan(fid: str | None, gen: int, entries) -> None:
+    b = _buf(fid, gen)
+    if b is not None and entries is not None:
+        b.set_plan(entries)
+
+
 def progress_usage(fid: str | None, gen: int, usage: dict) -> None:
     b = _buf(fid, gen)
     if b is None or not usage:
@@ -469,18 +526,30 @@ async def dispatch_coder_tapped(
     async def _thought_cb(delta):
         progress_thought(fid, gen, delta)
 
+    async def _answer_cb(delta):
+        progress_answer(fid, gen, delta)
+
     async def _tool_cb(event):
         progress_tool(fid, gen, event)
         # usage_update isn't forwarded as a callback — the client folds it into
         # last_usage as it goes, so sample it on each tool event to keep totals live.
         progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
+        # Same sampling pattern for the coder's live plan (ACP `plan` updates —
+        # its own todo list). Hosts older than the last_plan parse just yield None.
+        progress_plan(fid, gen, getattr(client, "last_plan", None))
 
     # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
     # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
     # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
     prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
     try:
-        coro = client.prompt(prompt, tool_callback=_tool_cb, thought_callback=_thought_cb, timeout=prompt_timeout)
+        coro = client.prompt(
+            prompt,
+            tool_callback=_tool_cb,
+            thought_callback=_thought_cb,
+            text_callback=_answer_cb,
+            timeout=prompt_timeout,
+        )
         reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
         return reply

@@ -95,6 +95,13 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .gen .loc{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px}
   .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:11.5px;color:var(--pl-color-fg-muted);
     max-height:120px;overflow:auto}
+  .gen ul.plan{list-style:none;margin:0;padding:0;max-height:140px;overflow:auto}
+  .gen ul.plan li{font-size:11.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .gen ul.plan li.pl-in_progress{color:var(--pl-color-fg);font-weight:600}
+  .gen ul.plan li.pl-completed{opacity:.6}
+  .gen ul.plan .glyph{display:inline-block;width:12px;color:var(--pl-color-accent)}
+  .gen .inprev{color:var(--pl-color-fg-muted);font-size:10.5px;white-space:pre-wrap;word-break:break-all;
+    max-height:48px;overflow:hidden;margin-top:2px}
   .gen ul.tools{list-style:none;margin:0;padding:0;max-height:150px;overflow:auto}
   .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
   .st-completed{color:var(--pl-color-status-success)}
@@ -334,11 +341,23 @@ function genCard(g){
     + '<span class="pl-badge">'+esc(String(g.elapsed_s))+'s</span>'
     + (g.usage?'<span class="pl-badge">'+esc(String(g.usage.used))+'/'+esc(String(g.usage.size))+' tok</span>':"")
     + '</div>';
+  // The coder's own plan (ACP plan updates — its live todo list): the sharpest
+  // "where is it in the work" signal, rendered as a status-glyphed checklist.
+  if (g.plan && g.plan.length){
+    h += '<div class="lbl">plan</div><ul class="plan">'
+      + g.plan.map(e => {
+          const st = e.status||"";
+          const glyph = st==="completed" ? "✓" : (st==="in_progress" ? "▸" : "·");
+          return '<li class="pl-'+esc(st)+'"><span class="glyph">'+glyph+'</span> '+esc(e.content||"")+'</li>';
+        }).join("") + '</ul>';
+  }
   const cur = g.current_tool;
   h += '<div class="lbl">current tool</div><div class="cur">'
     + (cur ? '<span class="st-'+esc(cur.status||"")+'">'+esc(cur.status||"")+'</span> '+esc(cur.name||"")
         + (cur.locations&&cur.locations.length?' <span class="loc">'+esc(cur.locations.join(", "))+'</span>':"")
+        + (cur.input_preview?'<div class="inprev">'+esc(cur.input_preview)+'</div>':"")
        : "—") + '</div>';
+  if (g.answer_tail){ h += '<div class="lbl">saying</div><div class="thought">'+esc(g.answer_tail)+'</div>'; }
   if (g.thought_tail){ h += '<div class="lbl">thinking</div><div class="thought">'+esc(g.thought_tail)+'</div>'; }
   const rt = (g.recent_tools||[]).slice(-30).reverse();
   if (rt.length){ h += '<div class="lbl">recent tools</div><ul class="tools">'+rt.map(toolLine).join("")+'</ul>'; }
