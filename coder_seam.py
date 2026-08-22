@@ -180,6 +180,7 @@ class _GenBuffer:
         "done",
         "answer_tail",
         "plan",
+        "stop_reason",
     )
 
     def __init__(self, gen: int, tier: str = ""):
@@ -195,6 +196,7 @@ class _GenBuffer:
         self.usage: dict | None = None
         self.verify: dict | None = None
         self.done = False
+        self.stop_reason: str | None = None
 
     def add_thought(self, delta: str) -> None:
         # Coalesce into a ROLLING tail: append the delta, then keep only the last
@@ -274,6 +276,7 @@ class _GenBuffer:
             "plan": list(self.plan) if self.plan else None,
             "usage": dict(self.usage) if self.usage else None,
             "verify": dict(self.verify) if self.verify else None,
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -439,6 +442,16 @@ def progress_verify(fid: str | None, gen: int, *, test_cmd: str, output: str, pa
         b.verify = {"test_cmd": test_cmd, "passed": bool(passed), "tail": (output or "")[-1500:]}
 
 
+def progress_stop_reason(fid: str | None, gen: int, reason) -> None:
+    """Record the ACP adapter's stop-reason / dead-end signal for a gen (#198) —
+    the "why did the coder stop" that the retro and the empty-result classifier
+    (loop) read after a dispatch that produced nothing. Falsy/unknown → no-op
+    (the field stays None); capped so a pathological reason can't bloat the buffer."""
+    b = _buf(fid, gen)
+    if b is not None and reason:
+        b.stop_reason = str(reason)[:200]
+
+
 def progress_end(fid: str | None, gen: int) -> None:
     b = _buf(fid, gen)
     if b is not None and not b.done:  # idempotent — every dispatch exit path may call it
@@ -571,6 +584,12 @@ async def dispatch_coder_tapped(
         # (panel on #89: the client-direct tap had narrowed AcpError-only).
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     finally:
+        # Stash whatever stop-reason / dead-end signal the ACP client reports (#198)
+        # — sampled on EVERY exit so an empty reply still records WHY the coder
+        # stopped. Best-effort getattr: a host without the attribute yields None.
+        progress_stop_reason(
+            fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
+        )
         progress_end(fid, gen)
         try:
             await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess

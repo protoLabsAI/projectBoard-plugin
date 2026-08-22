@@ -26,6 +26,7 @@ _CLASS_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("version drift", re.compile(r"version.*(drift|lockstep)|manifest.*pyproject|pyproject.*manifest", re.I)),
     ("rebase / merge conflict", re.compile(r"rebase|merge conflict|conflicts? with|non-fast-forward", re.I)),
     ("import contracts / layering", re.compile(r"import-linter|lint-imports|forbidden_modules|import contract", re.I)),
+    ("empty result (no diff, no tool calls)", re.compile(r"empty_result|empty coder reply", re.I)),
     ("coder produced no diff", re.compile(r"no commits|no diff|nothing to PR|NoChanges", re.I)),
     ("coder timeout", re.compile(r"timed out|timeout|CoderTimeout", re.I)),
     ("CI failed (unclassified)", re.compile(r"CI fail|checks red|Python tests|E2E|pytest", re.I)),

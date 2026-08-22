@@ -636,6 +636,13 @@ class BoardLoop:
         # `goal_fix_max`, BEFORE escalating/blocking (else a top-tier diff:large
         # feature blocks on attempt 1 with no chance to add the tests).
         self.goal_fix_max = max(0, int(self.cfg.get("goal_fix_max", 2)))
+        # Empty-result cap (#198): a dispatch that COMPLETES with no worktree diff
+        # AND no tool-call activity is `empty_result` — the coder connected but never
+        # executed (a wedged adapter/session, a refusal), NOT a capability ceiling.
+        # A stronger model can't fix "connecting but not executing", so these never
+        # climb the tier ladder: retry same-tier, and after this many occurrences
+        # block for triage with the failure class + evidence in the reason.
+        self.empty_result_max = max(1, int(self.cfg.get("empty_result_max", 2)))
         # Auto-fix command run in the worktree BEFORE opening the PR (e.g.
         # "ruff check --fix . && ruff format ."). The coder is edit-only — it can't run
         # the repo's linter/formatter, so trivial lint/format nits would otherwise fail
@@ -803,6 +810,10 @@ class BoardLoop:
         self._ci_fix_attempts: dict[str, int] = {}
         # Pre-PR goal-verify gap re-dispatches so far (fid → count), same-tier.
         self._goal_fix_attempts: dict[str, int] = {}
+        # empty_result occurrences so far (fid → count, #198) — a completed dispatch
+        # with no diff AND no tool-call activity. Never tier-escalated; blocked for
+        # triage after empty_result_max.
+        self._empty_results: dict[str, int] = {}
         # Pre-PR local-gate failure re-dispatches so far (fid → count), same-tier.
         self._gate_fix_attempts: dict[str, int] = {}
         # Pre-PR requirement-ledger bounces so far (fid → count, #113) — open items
@@ -2221,6 +2232,45 @@ class BoardLoop:
                         self._inflight.pop(fid, None)
                         return
                     policy = classify(str(exc))
+                    # Empty result (#198): a dispatch that COMPLETED with no worktree
+                    # diff AND no tool-call activity is its own failure class — the
+                    # coder connected but never executed. That is not a model-capability
+                    # ceiling, so it must NOT climb the tier ladder (escalating can't
+                    # fix "connecting but not executing"). Record the attempt with the
+                    # ACP stop-reason the monitor tap stashed (the WHY the retro and
+                    # drawer show), retry same-tier, and after empty_result_max
+                    # occurrences block for triage naming the class + evidence.
+                    if isinstance(exc, worktree.NoChangesError):
+                        had_tools, stop = self._empty_result_signals(fid)
+                        if not had_tools:
+                            n = self._empty_results.get(fid, 0) + 1
+                            self._empty_results[fid] = n
+                            evidence = (
+                                f"empty coder reply — no diff, no tool calls (stop_reason={stop or 'none reported'})"
+                            )
+                            try:
+                                store.record_attempt(
+                                    fid, tier=tier or store.current_tier(fid), outcome=f"empty_result: {evidence}"
+                                )
+                            except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
+                                log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
+                            if n < self.empty_result_max:
+                                log.info(
+                                    "[project_board] %s empty_result %d/%d — retry same tier (no escalation): %s",
+                                    fid,
+                                    n,
+                                    self.empty_result_max,
+                                    evidence,
+                                )
+                                continue
+                            reason = f"empty_result: {evidence} — {n} occurrence(s), needs triage"
+                            log.warning("[project_board] %s blocked (%s)", fid, reason)
+                            store.flag_blocked(fid, reason)
+                            self._empty_results.pop(fid, None)
+                            if wt:
+                                await worktree.remove_worktree(repo, wt, branch or "")
+                            self._inflight.pop(fid, None)
+                            return
                     # A capability failure = the coder didn't deliver (no diff / dispatch
                     # error / timed out). Those are NOT transient-retried (re-running the
                     # same coder won't help) — they escalate a tier or block. Only true
@@ -2283,6 +2333,7 @@ class BoardLoop:
                 self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
                 self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
                 self._req_fix_attempts.pop(fid, None)  # and the requirement-ledger budget (#113)
+                self._empty_results.pop(fid, None)  # and the empty-result count (#198)
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.
@@ -3034,6 +3085,25 @@ class BoardLoop:
             if text:
                 lines.append(f"- {text}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _empty_result_signals(fid: str) -> tuple[bool, str]:
+        """(had_tool_activity, stop_reason) for the dispatch that just failed with no
+        diff, mined from the live-monitor ring buffer (#198). No tool events across
+        any gen ⇒ the coder connected but never executed — the ``empty_result``
+        class ``_drive`` refuses to tier-escalate. ``stop_reason`` is whatever
+        signal the ACP adapter reported (``progress_stop_reason``), latest gen wins.
+        Best-effort: an unreadable snapshot reports activity=True, so a monitor
+        hiccup can never misclassify a real capability failure as empty."""
+        try:
+            gens = coder_seam.progress_snapshot(fid).get("gens") or []
+        except Exception:  # noqa: BLE001 — a monitor read must never break the drive
+            return True, ""
+        if not gens:  # no record of the run at all (evicted) — can't call it empty
+            return True, ""
+        had_tools = any(g.get("recent_tools") or g.get("current_tool") for g in gens)
+        stop = next((str(g["stop_reason"]) for g in reversed(gens) if g.get("stop_reason")), "")
+        return had_tools, stop
 
     def _timeout_escalation_context(self, fid: str) -> str:
         """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).
