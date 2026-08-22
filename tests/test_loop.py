@@ -3548,6 +3548,64 @@ async def test_review_gate_unrunnable_block_then_unblock_rearms_the_gate(monkeyp
     assert runs == [store.pr_url, store.pr_url]
 
 
+async def test_review_gate_in_flight_is_not_rearmed_by_the_reconcile(monkeypatch):
+    """#205: the drive's gate is RUNNING (pending label set, panel mid-flight) when
+    the reconcile poll comes round and sees review-pending on an in_review card.
+    That is not an interrupted gate — the reconcile must NOT start a second panel
+    on the same head: exactly one workflow run, one verdict, one bounce increment."""
+    import asyncio as _asyncio
+
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+    started, release = _asyncio.Event(), _asyncio.Event()
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        started.set()
+        await release.wait()  # hold the panel open — minutes in real life
+        return f"brief…\n```json\n{_BLOCKER}\n```", None
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _diff(url, *, cwd=".", max_chars=4000):
+        return "diff --git a/a.py b/a.py"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    # The drive's gate starts and parks inside the panel with review-pending set.
+    gate = _asyncio.create_task(loop._review_gate(store, "bd-1", store.pr_url, "/repo"))
+    await started.wait()
+    assert "review-pending" in store.labels and "bd-1" in loop._review_inflight
+
+    # The reconcile poll fires mid-gate: the resume edge sees the pending label …
+    await loop._reconcile_prs()
+    # … and does nothing — no second panel.
+    assert runs == [store.pr_url]
+
+    # The first gate lands its own verdict: ONE bounce, budget 1 (was 2 — 1/2 → 2/2
+    # with no fix between — when the duplicate run raced it).
+    release.set()
+    await gate
+    assert runs == [store.pr_url]
+    assert loop._review_fix_attempts["bd-1"] == 1
+    assert "changes-requested" in store.labels
+    assert "bd-1" not in loop._review_inflight  # guard released for the real re-review
+
+    # A gate that actually DIED (restart: empty set, label still pending) is still
+    # resumed by the reconcile — the edge keeps its job.
+    store.state = "in_review"
+    store.labels = ["review-pending"]
+    release.set()
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url, store.pr_url]
+
+
 async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     """Round 1 findings ride into round 2's workflow inputs (delta re-review)."""
     _inject_fake_findings(monkeypatch)

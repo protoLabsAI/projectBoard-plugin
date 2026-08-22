@@ -841,6 +841,16 @@ class BoardLoop:
         # prior_findings input so a bounce re-review is a DELTA review
         # (GitHub-native review memory, ADR 0078 D5).
         self._review_prior: dict[str, str] = {}
+        # Features whose review gate is RUNNING in this process right now (#205).
+        # The gate has two call sites — the drive (PR just opened) and the
+        # reconcile's resume edge (an in_review card still review-pending) — and
+        # the resume edge cannot tell an *interrupted* gate from one that is simply
+        # still running: the pending label is set the moment the gate starts and a
+        # panel takes minutes, while the reconcile polls every merge_poll_interval.
+        # Without this guard every PR was reviewed twice on the same head (2× panel
+        # tokens), a duplicate verdict burned the bounce budget (1/2 → 2/2 with no
+        # fix between), and two non-deterministic verdicts raced for the label.
+        self._review_inflight: set[str] = set()
         # Consecutive failed reap attempts per worktree id (not path, so it survives
         # repo-path changes). After _REAP_WARN_CAP failures the noise is downgraded
         # from WARNING to DEBUG; a successful reap resets the counter.
@@ -1575,7 +1585,10 @@ class BoardLoop:
                     # The merge-edge half of the review gate (M5): an in_review PR still
                     # marked review-pending had its gate interrupted (host restart, dead
                     # workflow run) — finish it here so the gate can't silently lapse into
-                    # advisory. Skip when the CI reconcile just requeued the feature.
+                    # advisory. Skip when the CI reconcile just requeued the feature. A
+                    # gate that is merely still RUNNING (the drive's call, minutes long)
+                    # is not interrupted — _review_gate's in-flight guard makes this a
+                    # no-op for it (#205), so this edge never double-reviews a head.
                     if (
                         self.review_gate
                         and LABEL_REVIEW_PENDING in (f.get("labels") or [])
@@ -2405,7 +2418,24 @@ class BoardLoop:
         Sequencing (ADR 0064): this is deliberately a single call-site-agnostic
         method — when the board face of execution-grounded selection lands, moving
         the gate after test-passing candidate selection is a one-line move.
+
+        Re-entrancy (#205): at most ONE gate per feature runs at a time in this
+        process. A second call while the first is still running (the reconcile's
+        resume edge seeing the pending label the running gate just set) is a no-op
+        — the running gate will land its own verdict. The resume edge keeps its
+        job for gates that actually died (host restart: the set is empty on boot).
         """
+        if fid in self._review_inflight:
+            log.debug("[project_board] %s review gate already running — not re-armed", fid)
+            return
+        self._review_inflight.add(fid)
+        try:
+            await self._review_gate_run(store, fid, pr_url, repo)
+        finally:
+            self._review_inflight.discard(fid)
+
+    async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
         store.set_review_substate(fid, LABEL_REVIEW_PENDING)
         output, why = await self._run_review_workflow(fid, pr_url)
         if output is None:
