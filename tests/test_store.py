@@ -2544,3 +2544,28 @@ def test_list_features_trusts_limit_zero_when_no_has_more_shape(monkeypatch):
     b = _json_board(monkeypatch, "[]")  # every br call returns a bare empty list
     assert b.list_features() == []
     assert b._last_json_has_more is None
+
+
+def test_shared_file_gate_ignores_same_filename_in_a_different_project(make_board, monkeypatch):
+    """#197: bd-ke7 (discord) and bd-qjd (promptlab) both name PROTO.md — different
+    repos, no collision possible; the gate must scope to the SAME project."""
+    br = Br()
+    b = make_board(br)
+    first = _shared_feature("bd-ke7", ["PROTO.md (new)"], board_state="in_progress", project="discord")
+    second = _shared_feature("bd-qjd", ["PROTO.md (new)"], project="promptlab")
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
+    b.mark_ready("bd-qjd")
+    assert ("update", "bd-qjd", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_shared_file_gate_still_refuses_within_the_same_project(make_board, monkeypatch):
+    """Project scoping must not loosen the intra-project gate (#143)."""
+    br = Br()
+    b = make_board(br)
+    first = _shared_feature("bd-a", ["PROTO.md (new)"], board_state="in_progress", project="discord")
+    second = _shared_feature("bd-b", ["PROTO.md (new)"], project="discord")
+    monkeypatch.setattr(b, "get_feature", lambda fid: second)
+    monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
+    with pytest.raises(BoardError, match="Shared-file gate"):
+        b.mark_ready("bd-b")

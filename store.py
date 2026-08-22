@@ -1154,9 +1154,16 @@ class BeadsBoard:
         my_files = {p for p in f["files_to_modify"] if str(p).strip()}
         if my_files:
             my_deps = set(f.get("depends_on") or [])
+            my_project = str(f.get("project") or "")
             conflicts: list[tuple[str, list[str]]] = []
             for other in self.list_features():
                 if other["id"] == fid or other["board_state"] in _TERMINAL_STATES:
+                    continue
+                # #197: paths only collide INSIDE a project — every plugin repo carries
+                # PROTO.md/CLAUDE.md/AGENTS.md, so bare-path comparison deadlocks any two
+                # doc-touching cards in different repos on a multi-project board (#90).
+                # Unstamped cards ("" project) keep the old single-repo behavior.
+                if str(other.get("project") or "") != my_project:
                     continue
                 shared = sorted(my_files & {p for p in (other.get("files_to_modify") or []) if str(p).strip()})
                 if not shared:

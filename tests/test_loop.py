@@ -1503,8 +1503,8 @@ class _ClaimStore:
         return [{"id": f"rev-{i}"} for i in range(self._in_review)] if state == "in_review" else []
 
 
-def _ready(fid, files):
-    return {"id": fid, "board_state": "ready", "files_to_modify": files}
+def _ready(fid, files, project=""):
+    return {"id": fid, "board_state": "ready", "files_to_modify": files, "project": project}
 
 
 async def _hold_drives(loop, monkeypatch):
@@ -1590,7 +1590,8 @@ async def test_spawn_ready_skips_a_file_conflicting_candidate(monkeypatch):
         loop._spawn_ready()
         # bd-1 claimed; bd-2 deferred (overlaps bd-1's file); bd-3 claimed (disjoint).
         assert store.claimed == ["bd-1", "bd-3"]
-        assert loop._inflight_files == {"bd-1": {"shared.py"}, "bd-3": {"other.py"}}
+        # #197: guard keys are (project, path); unstamped cards resolve to "default".
+        assert loop._inflight_files == {"bd-1": {("default", "shared.py")}, "bd-3": {("default", "other.py")}}
     finally:
         await finish()
 
@@ -1629,7 +1630,8 @@ async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch,
     store = _ClaimStore([_ready("bd-hi", ["shared.py"]), _ready("bd-lo", ["other.py"])])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     loop = BoardLoop({"max_concurrent": 2})
-    loop._inflight_files = {"bd-live": {"shared.py"}}  # an in-flight build already owns shared.py
+    # #197: guard keys are (project, path); unstamped cards resolve to "default".
+    loop._inflight_files = {"bd-live": {("default", "shared.py")}}  # an in-flight build owns shared.py
     finish = await _hold_drives(loop, monkeypatch)
     try:
         with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
@@ -4610,3 +4612,30 @@ async def test_reconcile_prs_leaves_a_blocked_card_with_an_open_or_closed_pr_alo
         monkeypatch.setattr(loop, "_reconcile_ci", _ci_spy)
         await loop._reconcile_prs()
         assert store.merged == [] and store.blocked == [] and ci_called == [], pr_state_val
+
+
+async def test_spawn_ready_does_not_collide_same_filename_across_projects(monkeypatch):
+    """#197 (protoEngineer friction 2026-08-20): every plugin repo carries PROTO.md —
+    two doc-touching cards in DIFFERENT projects must both claim; only a same-project
+    overlap defers."""
+    store = _ClaimStore(
+        [
+            _ready("bd-ke7", ["PROTO.md"], project="discord"),
+            _ready("bd-qjd", ["PROTO.md"], project="promptlab"),
+            _ready("bd-dup", ["PROTO.md"], project="discord"),
+        ]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 3})
+    monkeypatch.setattr(loop, "_project_name", lambda f: f.get("project") or "")
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        loop._spawn_ready()
+        # cross-project twin claims; the SAME-project twin defers.
+        assert store.claimed == ["bd-ke7", "bd-qjd"]
+        assert loop._inflight_files == {
+            "bd-ke7": {("discord", "PROTO.md")},
+            "bd-qjd": {("promptlab", "PROTO.md")},
+        }
+    finally:
+        await finish()

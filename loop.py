@@ -793,7 +793,7 @@ class BoardLoop:
         self._inflight: dict[str, tuple[str, str, str]] = {}
         # files_to_modify of each in-flight feature, for the hot-file overlap guard
         # (don't run two parallel coders that edit the same file → sure conflict).
-        self._inflight_files: dict[str, set[str]] = {}
+        self._inflight_files: dict[str, set[tuple[str, str]]] = {}  # fid -> {(project, path)} (#197)
         self._last_poll = 0.0  # monotonic ts of the last merge poll
         self._last_sweep = 0.0  # monotonic ts of the last health sweep
         # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
@@ -1411,8 +1411,8 @@ class BoardLoop:
         # skip can NAME the build it collides with, not just report "some overlap".
         file_owner: dict[str, str] = {}
         for owner_fid, owner_files in self._inflight_files.items():
-            for path in owner_files:
-                file_owner.setdefault(path, owner_fid)
+            for key in owner_files:
+                file_owner.setdefault(key, owner_fid)
         busy = set(file_owner)
         selected: list[str] = []
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
@@ -1432,20 +1432,29 @@ class BoardLoop:
             if isinstance(self._preflight_state.get(pname), str):
                 skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
                 continue
-            files = set(candidate.get("files_to_modify") or [])
+            # #197: key by (project, path) — bare paths false-collide across projects
+            # (every repo has PROTO.md); an unstamped card ("" project) behaves as before.
+            files = {(pname, p) for p in (candidate.get("files_to_modify") or [])}
             overlap = files & busy
             if overlap:
                 # would edit a file an in-flight build owns → defer a tick
-                owners = sorted({file_owner[p] for p in overlap})
-                skipped.append({"fid": cid, "reason": "hot-file", "overlaps": owners, "files": sorted(overlap)})
+                owners = sorted({file_owner[k] for k in overlap})
+                skipped.append(
+                    {
+                        "fid": cid,
+                        "reason": "hot-file",
+                        "overlaps": owners,
+                        "files": sorted(path for _proj, path in overlap),
+                    }
+                )
                 continue
             claimed = store.claim(cid, assignee=self.coder_name)
             if claimed is None:
                 skipped.append({"fid": cid, "reason": "claim-race"})  # raced / no longer ready
                 continue
             self._inflight_files[claimed["id"]] = files
-            for path in files:
-                file_owner.setdefault(path, claimed["id"])
+            for key in files:
+                file_owner.setdefault(key, claimed["id"])
             task = asyncio.create_task(self._drive(claimed), name=f"pb-drive-{claimed['id']}")
             self._drives.add(task)
             task.add_done_callback(self._make_drive_done_cb(claimed["id"]))
