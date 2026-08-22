@@ -53,6 +53,27 @@ if "graph" not in sys.modules:
     sys.modules["graph.sdk"] = _graph_sdk
 
 
+@pytest.fixture(autouse=True)
+def _no_real_br_version(monkeypatch):
+    """The setup preflight samples ``br --version`` (setup_check._br_version) from
+    register()/the /status route/the loop gate — every tier this suite exercises
+    with a fake store. Pin its runner so the UNIT tier never shells a real ``br``
+    (the real-br integration tier shells ``subprocess.run`` directly and is
+    untouched), and drop the per-path cache so no test sees another's sample."""
+    from types import SimpleNamespace
+
+    from project_board import setup_check
+
+    monkeypatch.setattr(
+        setup_check, "_subprocess_run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="br 0.0.0-test\n")
+    )
+    setup_check._BR_VERSION_CACHE.clear()
+    setup_check.publish_loop_snapshot(None)  # no running loop between tests
+    yield
+    setup_check._BR_VERSION_CACHE.clear()
+    setup_check.publish_loop_snapshot(None)
+
+
 @pytest.fixture
 def make_board(monkeypatch):
     """Build a ``BeadsBoard`` with the ``br`` PATH check stubbed and ``_run``

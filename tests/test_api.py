@@ -780,10 +780,27 @@ def test_test_rung_400s_when_the_coder_delegate_is_missing(monkeypatch):
     monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: None)
+    # An EXPLICIT coder that the roster can't resolve (v0.42.0 dropped the implicit
+    # `proto` default this test used to lean on).
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q", "coder": "proto"})
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 400
+    assert "acp delegate 'proto'" in r.json()["detail"]
+
+
+def test_test_rung_400s_when_no_coder_is_configured_at_all(monkeypatch):
+    """v0.42.0: there is NO default coder name. An unset `project_board.coder` with no
+    `coder` in the body is a named 400 — not a roster probe for a phantom 'proto'."""
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    probed = []
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: probed.append(name))
     c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})
     r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
     assert r.status_code == 400
-    assert "acp delegate" in r.json()["detail"]
+    assert "no coder configured" in r.json()["detail"]
+    assert probed == []  # never asked the roster about "proto"
 
 
 def test_test_rung_fusion_400s_without_a_configured_fusion_delegate(monkeypatch):
@@ -791,7 +808,7 @@ def test_test_rung_fusion_400s_without_a_configured_fusion_delegate(monkeypatch)
     monkeypatch.setattr(store, "get_feature", lambda fid: _feature_with_ac(fid))
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
-    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})  # no coder_solve_fusion_delegate
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q", "coder": "proto"})  # no fusion delegate
     r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "fusion"})
     assert r.status_code == 400
     assert "coder_solve_fusion_delegate" in r.json()["detail"]
@@ -819,6 +836,7 @@ def test_test_rung_fusion_400s_when_files_are_oversized(monkeypatch, tmp_path):
             "coder_solve_fusion_delegate": "fusion-model",
             "coder_solve_fusion_max_file_chars": 10,
             "repo": str(tmp_path),
+            "coder": "proto",
         },
     )
     r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "fusion"})
@@ -887,7 +905,7 @@ def test_test_rung_surfaces_a_solve_failure_as_400_not_500(monkeypatch):
         raise RuntimeError("worktree op failed")
 
     monkeypatch.setattr(coder_seam, "test_rung", _boom)
-    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q"})
+    c = _client(monkeypatch, store, cfg={"coder_solve_test_cmd": "pytest -q", "coder": "proto"})
     r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
     assert r.status_code == 400
     assert "test-rung failed" in r.json()["detail"]

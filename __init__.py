@@ -9,9 +9,11 @@ spawn primitive.
 Reach used (no core edits): ``register_router`` (the board API), ``register_surface``
 (the background puller), ``register_tool`` (board ops the agent can drive headlessly).
 
-Ships DISABLED. Enable with ``plugins: { enabled: [delegates, project_board] }`` and
-declare ``proto`` (acp) + ``quinn`` (a2a) delegates. The Ready gate + single Done
-edge live in store.py; the teardown + error paths live in loop.py/worktree.py.
+Ships DISABLED. Enable with ``plugins: { enabled: [delegates, project_board] }``,
+declare an ``acp`` coder delegate and set ``project_board.coder`` to its name (there is
+NO default coder — see setup_check.py), optionally a ``quinn`` (a2a) reviewer. The
+Ready gate + single Done edge live in store.py; the teardown + error paths live in
+loop.py/worktree.py.
 """
 
 from __future__ import annotations
@@ -37,6 +39,24 @@ def register(registry) -> None:
 
     cfg = resolve_project_cfg(registry.config or {})
 
+    # Setup preflight (v0.42.0): can this board run at all — `br` on PATH, `gh` on
+    # PATH, every configured coder resolvable in the delegate roster, a bound repo?
+    # Computed ONCE here and forwarded to the host's setup-gap seam
+    # (`registry.report_setup_gap(key, message)` → operator warnings in the console's
+    # runtime status), GUARDED because the seam may not exist on this host yet. The
+    # loop re-reports at every tick boundary where a check changes (GapReporter is
+    # edge-triggered), and pauses instead of ticking while a blocker stands.
+    from .setup_check import GapReporter, setup_status
+
+    gap_reporter = GapReporter(registry)
+    try:
+        gaps = gap_reporter.report(setup_status(cfg))
+        for key, msg in gaps.items():
+            if msg:
+                log.warning("[project_board] setup gap (%s): %s", key, msg)
+    except Exception:  # noqa: BLE001 — the preflight is advisory; registration proceeds
+        log.exception("[project_board] setup preflight failed")
+
     # Board HTTP API + console view, mounted as ONE router under the UNGATED prefix
     # /plugins/project_board (matching the sibling agent-browser/doom plugins, whose
     # browser-loaded views are also ungated). UNGATED because two of these routes are
@@ -54,7 +74,7 @@ def register(registry) -> None:
         from .api import build_data_router, build_router
 
         registry.register_router(build_router(cfg), prefix="/plugins/project_board")
-        registry.register_router(build_data_router(cfg), prefix="/api/plugins/project_board")
+        registry.register_router(build_data_router(cfg, gap_reporter=gap_reporter), prefix="/api/plugins/project_board")
     except Exception:  # noqa: BLE001 — API is best-effort
         log.exception("[project_board] mounting board API + view failed")
 
@@ -62,7 +82,7 @@ def register(registry) -> None:
     try:
         from .loop import BoardLoop
 
-        loop = BoardLoop(cfg)
+        loop = BoardLoop(cfg, gap_reporter=gap_reporter)
         # `reload=` (ADR 0018): the host fires it on every config reload with the new
         # config, so the concurrency knobs (LIVE_KNOBS — max_concurrent et al.) edited
         # in the console Settings land on the RUNNING loop. Without it the surface
@@ -102,7 +122,9 @@ def register(registry) -> None:
 
     log.info(
         "[project_board] registered board API + loop + tools + planning (coder=%s reviewer=%s)",
-        cfg.get("coder", "proto"),
+        # No default coder (v0.42.0): an unset `coder` logs as <unset> and is a
+        # preflight gap above — never a phantom delegate name.
+        str(cfg.get("coder") or "").strip() or "<unset>",
         cfg.get("reviewer", "quinn"),
     )
 

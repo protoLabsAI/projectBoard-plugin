@@ -614,6 +614,32 @@ def resolve_delegate(name: str, expect_type: str):
     return d
 
 
+def delegate_resolver(expect_type: str):
+    """ONE roster read → a ``name -> Delegate | None`` lookup. ``resolve_delegate``
+    re-parses the delegates YAML (+ secrets overlay) per call, which is fine for the
+    dispatch path's single lookup but not for the setup preflight resolving several
+    coder names every tick / every ``/status`` poll. A disabled delegates plugin (or
+    any roster failure) yields a resolver that answers None for every name."""
+    try:
+        from plugins.delegates.registry import DelegateRegistry
+        from plugins.delegates.store import merged_delegates
+
+        registry = DelegateRegistry(merged_delegates())
+    except Exception:  # noqa: BLE001 — delegates plugin may be disabled
+        return lambda _name: None
+
+    def _get(name: str):
+        try:
+            d = registry.get(name)
+        except Exception:  # noqa: BLE001
+            return None
+        if d is None or getattr(d, "type", None) != expect_type:
+            return None
+        return d
+
+    return _get
+
+
 # ``### path/to/file.py`` header, then a fenced block (any/no language hint) holding
 # that file's COMPLETE new content. Deliberately simple/strict: a fusion completion
 # that doesn't follow the format parses to no files, which just fails verify() like

@@ -291,34 +291,97 @@ async function load(){
     // blocked floats first (#201, matching list_features), then priority asc, id tiebreak.
     FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
       .sort((a,b) => (a.blocked?0:1) - (b.blocked?0:1) || a.priority - b.priority || a.id.localeCompare(b.id));
-    $("err").hidden = true;
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
     render();
+    // The board READS fine but may still be unable to RUN (no coder, no gh, br
+    // vanished): the setup preflight on /status says which check fails and how
+    // to fix it — a warning card above the board, never a silent green.
+    const s = await api("/api/plugins/project_board/status").catch(() => null);
+    if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);
+    else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);
+    else $("err").hidden = true;
   } catch (e) {
     // First-run tell (#unbound): a board never bound to a repo (shipped default
     // repo "." + no db_path) fails every read — that is missing SETUP, not an
     // error. /status is a pure config read, so it answers even when the store
-    // can't; if it can't either, fall through to the raw error.
+    // can't; if it can't either, fall through to the raw error. A BOUND board
+    // whose preflight fails (br missing, …) gets the same setup-gap card in
+    // place of the raw BoardError: the card names the failing check + its hint.
     try {
       const s = await api("/api/plugins/project_board/status");
-      if (s && s.bound === false) { renderSetup(e); return; }
+      if (s && s.bound === false) { renderSetup(e, s.setup); return; }
+      if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e); return; }
     } catch (_ignored) {}
     $("err").hidden = false; $("err").className = "pl-callout pl-callout--error";
     $("err").textContent = "Could not load the board: " + e;
   }
 }
 
+// Setup preflight checks (v0.42.0), in render order, with their operator labels.
+// The /status `setup` block carries one {ok, hint, …} per key; only failing ones
+// render. Hints are server-authored operator copy, esc()'d — never raw HTML.
+const SETUP_CHECKS = [["br", "beads CLI (br)"], ["gh", "GitHub CLI (gh)"], ["coder", "coder delegate"], ["repo", "repo"]];
+function setupGapItems(setup){
+  let html = "";
+  for (const [key, label] of SETUP_CHECKS) {
+    const c = setup && setup[key];
+    if (!c || c.ok !== false) continue;
+    html += '<li><b>' + esc(label) + '</b> — ' + esc(String(c.hint || (key + " check failed"))) + '</li>';
+  }
+  return html;
+}
+// Only the checks the loop refuses to tick without make the board "unable to run";
+// a gh-only gap means builds can't open/merge PRs, not that the board is down.
+function setupBlocking(setup){
+  return SETUP_CHECKS.some(([key]) => key !== "gh" && setup && setup[key] && setup[key].ok === false);
+}
+function setupLoopLine(setup){
+  const blockers = (setup && setup.loop_blockers) || [];
+  let html = "";
+  if (!setup || !setup.loop_enabled) html += '<div style="opacity:.65;margin-top:6px;font-size:12px">The build loop is off (<code>loop_enabled: false</code>).</div>';
+  else if (blockers.length) html += '<div style="margin-top:6px;font-size:12px">The build loop is <b>paused</b> on: ' + esc(blockers.join(", ")) + ' — it resumes on its own once they pass (no restart needed).</div>';
+  // Restart-only drift: the running loop was started on an older coders/repo/…
+  // than the config this page (and /status) reads — say so, or the page would
+  // report the NEW config as the loop's state.
+  if (setup && setup.loop_cfg_stale) html += '<div style="margin-top:6px;font-size:12px"><b>Running loop is stale:</b> ' + esc(String(setup.loop_cfg_stale_hint || "config changed since the loop started")) + '</div>';
+  return html;
+}
+
+// A bound board whose setup preflight fails — each failing check with its hint, in
+// place of a raw error. `e` (optional) is the underlying read error.
+function renderSetupGaps(setup, e){
+  const blocking = setupBlocking(setup);
+  $("err").hidden = false;
+  $("err").className = "pl-callout pl-callout--warning";
+  $("err").innerHTML = '<b>' + (blocking ? 'This board can&#39;t run yet — setup is incomplete.' : 'GitHub CLI missing — PRs can&#39;t open or merge until it is installed.') + '</b>'
+    + '<ul style="margin:6px 0 0 18px;padding:0">' + setupGapItems(setup) + '</ul>'
+    + setupLoopLine(setup)
+    + (e ? '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>' : '');
+  $("sub").textContent = blocking ? "project_board — setup incomplete" : "project_board — gh missing";
+}
+
+// A healthy board whose running loop is on an older config than the one this page
+// reads — the restart note alone, as an info callout (no check is failing).
+function renderLoopStale(setup){
+  $("err").hidden = false;
+  $("err").className = "pl-callout pl-callout--info";
+  $("err").innerHTML = setupLoopLine(setup);
+}
+
 // The unbound-board setup card — guidance in place of a red error. Static markup
-// + esc()'d error text only.
-function renderSetup(e){
+// + esc()'d error text only; the preflight's OTHER failing checks (br/gh/coder)
+// ride along so the operator sees every gap at once, not one per restart.
+function renderSetup(e, setup){
+  const gaps = setupGapItems(setup ? {...setup, repo: {ok: true}} : null);
   $("err").hidden = false;
   $("err").className = "pl-callout";
   $("err").innerHTML = '<b>This board isn&#39;t bound to a repo yet.</b>'
     + '<ol style="margin:6px 0 0 18px;padding:0">'
     + '<li>Settings &#9656; Plugins &#9656; Project Board &#8594; set <code>repo</code> to the absolute path of the git checkout this agent manages (or <code>db_path</code> to keep the board in a private store).</li>'
-    + '<li>Register a coder delegate (Settings &#9656; Delegates) and set <code>project_board.coder</code> to its name.</li>'
+    + '<li>Register a coder delegate (Settings &#9656; Delegates) and set <code>project_board.coder</code> to its name — there is no default.</li>'
     + '<li>Turn on <code>loop_enabled</code> when you want the board dispatching builds.</li>'
     + '</ol>'
+    + (gaps ? '<div style="margin-top:6px"><b>Also missing:</b><ul style="margin:4px 0 0 18px;padding:0">' + gaps + '</ul></div>' : '')
     + '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>';
   $("sub").textContent = "project_board — not bound to a repo yet";
 }
