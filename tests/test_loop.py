@@ -98,7 +98,8 @@ async def _noop_coro():
 
 def test_config_defaults():
     loop = BoardLoop({})
-    assert loop.coder_name == "proto" and loop.reviewer_name == "quinn"
+    # v0.42.0: NO default coder — unset is "" (a setup-preflight gap), not "proto".
+    assert loop.coder_name == "" and loop.reviewer_name == "quinn"
     assert loop.review_dispatch is False
     assert loop.interval == 30 and loop.enabled is False
     assert loop.escalation_on is False  # no coders map → single-coder mode
@@ -174,7 +175,7 @@ def test_reload_flips_auto_merge_and_rejects_garbage():
 def test_reload_only_touches_live_knobs():
     loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30})
     assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coder": "other"}) == {}
-    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coder_name == "proto"
+    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coder_name == ""  # coder is NOT live
 
 
 def test_max_mode_n_parsing():

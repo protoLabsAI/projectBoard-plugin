@@ -24,6 +24,7 @@ import os
 
 from fastapi import Request  # module-level so the webhook's stringized annotation resolves
 
+from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import BoardError, escalation_enabled, get_store
@@ -202,12 +203,17 @@ def build_router(cfg: dict):
     return router
 
 
-def build_data_router(cfg: dict):
+def build_data_router(cfg: dict, *, gap_reporter=None):
     """The operator CRUD/transition routes — mounted under
     ``/api/plugins/project_board`` so they inherit the operator bearer gate
     (plugin-view rule 2). Previously these lived under the public ``/plugins/``
     prefix: on a token-gated deployment anyone who could reach the port could
-    create/transition features without the bearer."""
+    create/transition features without the bearer.
+
+    ``gap_reporter`` (v0.42.0) is the ``setup_check.GapReporter`` register() shares
+    with the loop: ``GET /status`` re-reports its fresh preflight through it, so a
+    host warning clears when the operator fixes the gap even on a board whose loop
+    is off (no tick to re-check) — the board page polls /status while open."""
     from fastapi import APIRouter, Body, HTTPException
 
     router = APIRouter()
@@ -231,18 +237,33 @@ def build_data_router(cfg: dict):
         cwd IS the target repo; on a GUI/desktop member the cwd is the app bundle
         (read-only), so a first-run board fails every read with a BoardError. The view
         asks here to tell "never bound" (render setup guidance) from "bound but broken"
-        (render the real error)."""
+        (render the real error).
+
+        ``setup`` (v0.42.0) is the full setup preflight — ``br``/``gh`` on PATH, every
+        configured coder resolvable in the delegate roster, the repo bound and
+        present — each ``{ok, hint, …}`` plus ``ready`` and the ``loop_blockers`` the
+        puller is paused on (see setup_check.py). A board can be *bound* and still
+        unable to run; the view renders each failing check with its hint. Still no
+        ``br`` board op: one cached ``br --version`` at most. Never raises."""
         # NB: read `projects` from the RAW cfg, not store_kw — resolve_projects
         # back-compat synthesizes an implicit project from the flat keys, so the
         # resolved map is non-empty even for the unbound shipped default.
         raw_projects = (cfg or {}).get("projects")
         explicit_projects = isinstance(raw_projects, dict) and bool(raw_projects)
         bound = bool(store_kw.get("db")) or explicit_projects or str(store_kw.get("repo") or ".") not in ("", ".")
+        try:
+            setup = setup_check.setup_status(cfg or {})
+            if gap_reporter is not None:
+                gap_reporter.report(setup)  # edge-triggered; a steady state forwards nothing
+        except Exception as exc:  # noqa: BLE001 — setup_status never raises by contract; belt and braces
+            log.warning("[project_board] /status setup preflight errored", exc_info=True)
+            setup = {"ready": False, "error": str(exc)}
         return {
             "bound": bound,
             "repo": store_kw.get("repo") or ".",
             "db_path": bool(store_kw.get("db")),
             "projects": sorted(raw_projects) if explicit_projects else [],
+            "setup": setup,
         }
 
     async def _reap_worktree(fid: str) -> None:
@@ -469,7 +490,11 @@ def build_data_router(cfg: dict):
         if not test_cmd:
             raise HTTPException(400, "no coder_solve_test_cmd or local_gate_cmd configured — nothing to run tests with")
 
-        coder_name = str(body.get("coder") or (cfg or {}).get("coder", "proto"))
+        # No default coder (v0.42.0): an unset `project_board.coder` is "" — say so
+        # instead of probing the roster for a phantom name.
+        coder_name = str(body.get("coder") or (cfg or {}).get("coder") or "").strip()
+        if not coder_name:
+            raise HTTPException(400, "no coder configured — pass `coder` in the body or set project_board.coder")
         coder = coder_seam.resolve_delegate(coder_name, "acp")
         if coder is None:
             raise HTTPException(400, f"acp delegate {coder_name!r} not found — check `delegates:`")

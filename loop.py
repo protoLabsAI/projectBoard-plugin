@@ -40,9 +40,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 
-from . import coder_seam, config, worktree
+from . import coder_seam, config, setup_check, worktree
 from .failures import classify
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
@@ -499,8 +500,14 @@ _MAX_MODE_JUDGE_SYS = (
 
 
 class BoardLoop:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, *, gap_reporter: setup_check.GapReporter | None = None):
         self.cfg = cfg or {}
+        # Setup preflight (v0.42.0): the host-gap reporter register() built around the
+        # plugin registry (a no-op reporter when the host lacks the seam or — in the
+        # suite — none is handed in), and the PATH probe the preflight uses. Both are
+        # attributes so a test can swap them without touching the environment.
+        self._gap_reporter = gap_reporter or setup_check.GapReporter(None)
+        self._which = shutil.which
         # Per-feature project resolution (#90 slice 2): the board's `projects:` map
         # (name → execution settings, resolved by projects.resolve_projects) so a single
         # loop can serve several repos. Absent a map, resolve_projects synthesizes a
@@ -512,7 +519,10 @@ class BoardLoop:
         # parsed. `_default_project` is the fallback for a feature carrying no label.
         self._projects = resolve_projects(self.cfg)
         self._default_project = resolve_default_project(self.cfg)
-        self.coder_name = self.cfg.get("coder", "proto")
+        # NO default coder name (v0.42.0). An unset `coder` is "" — a preflight failure
+        # the operator sees (setup_check), never a phantom delegate name that exists on
+        # one machine and blocks every feature with "delegate not configured" elsewhere.
+        self.coder_name = str(self.cfg.get("coder") or "").strip()
         self.reviewer_name = self.cfg.get("reviewer", "quinn")
         # Review dispatch is OPT-IN (default off). The fleet's PR-review pipeline
         # already reviews PRs the moment they're opened, so the loop doesn't need to
@@ -1036,7 +1046,7 @@ class BoardLoop:
             "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
             "merge_poll=%s, coder_timeout=%ss; live on config reload: %s — everything else "
             "needs a restart)",
-            self.coder_name,
+            self.coder_name or "<unset>",
             self.reviewer_name,
             self.interval,
             self.max_concurrent,
@@ -1372,14 +1382,65 @@ class BoardLoop:
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
+    # ── setup preflight (v0.42.0) ─────────────────────────────────────────────
+    def _setup_status(self) -> dict:
+        """The board's setup preflight for THIS loop's config — `br`/`gh` via the
+        injectable PATH probe, the coder names via the same delegate lookup the
+        dispatch path uses (so a test that patches `_resolve_delegate` steers both)."""
+        return setup_check.setup_status(
+            self.cfg,
+            which=self._which,
+            delegates=lambda name: self._resolve_delegate(name, "acp"),
+        )
+
+    async def _setup_gate(self) -> bool:
+        """Hold the puller until the setup preflight has no loop blockers (no `br`,
+        an unresolvable coder, an unbound repo — each of which turned EVERY tick into
+        a traceback before v0.42.0). Re-checks every `loop_interval_s`, so installing
+        `br` or declaring the delegate recovers WITHOUT a restart; logs ONE warning
+        when it pauses and one info line when it resumes. Every check is also
+        forwarded to the host's setup-gap seam (edge-triggered, so a steady state is
+        silent). Returns False only when the loop was stopped while paused."""
+        paused = False
+        while not self._stop.is_set() and not self._shutting_down:
+            try:
+                status = self._setup_status()
+                self._gap_reporter.report(status)
+                blockers = setup_check.loop_blockers(status)
+            except Exception:  # noqa: BLE001 — a broken probe must fail OPEN, never wedge the loop
+                log.warning("[project_board] setup preflight errored — proceeding", exc_info=True)
+                blockers = []
+            if not blockers:
+                if paused:
+                    log.info("[project_board] loop resumed — setup gaps cleared")
+                return True
+            if not paused:
+                log.warning("[project_board] loop paused: %s", setup_check.blocker_summary(status))
+                paused = True
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
+            except asyncio.TimeoutError:
+                pass
+        return False
+
     # ── the puller ────────────────────────────────────────────────────────────
     async def _run(self):
+        # Setup gate FIRST: with no `br` the recovery below can't even build a store,
+        # and with no coder the first dispatch blocks every card. Pause (one warning,
+        # cheap re-check each interval) instead of entering the tick loop.
+        if not await self._setup_gate():
+            return
         try:
             await self._recover()
         except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
             log.exception("[project_board] crash recovery failed")
         log.info("[project_board] recovery done — entering tick loop")
         while not self._stop.is_set() and not self._shutting_down:
+            # Re-check at every tick boundary: a gap that opens mid-run (br removed,
+            # the delegate deleted) pauses the ticks again; a passing preflight is a
+            # `which` + a roster read and changes nothing about the tick itself.
+            if not await self._setup_gate():
+                return
             spawned = False
             try:
                 await self._maybe_reconcile()
