@@ -94,6 +94,39 @@ def test_decompose_skill_frontmatter():
         assert t in fm["tools"], f"decompose skill missing tool {t!r}"
 
 
+# ── the onboarding skill: registration gated on onboarding.enabled (#194) ───────
+
+
+def test_onboard_skill_gates_registration_on_onboarding():
+    """The human-gate form offers `register_project` ONLY when the host's
+    `onboarding.enabled` is on — offering it on a disabled host collects an answer
+    `board_register_project` then refuses, and the operator's choice silently
+    evaporates. The skill must gate the field, carry the unavailable-note when off,
+    and lead the completion summary with any refusal (older forms may still answer
+    true)."""
+    text = (ROOT / "skills" / "onboard-project" / "SKILL.md").read_text()
+    fm = yaml.safe_load(text.split("---", 2)[1])
+    assert fm["name"] == "onboard-project"
+    # It must be able to register (when consented) and run the readiness human gate.
+    for t in ("board_register_project", "request_user_input"):
+        assert t in fm["tools"], f"onboard skill missing tool {t!r}"
+
+    flat = " ".join(text.split())  # the procedure wraps across lines in the source
+    # The field is conditional on the HOST setting, and OMITTED — not just refused — when off.
+    assert "`onboarding.enabled`" in flat
+    assert "omit the `register_project` field" in flat
+    # The exact operator-facing note the form carries in the disabled case.
+    note = (
+        "Project registration unavailable — enable Settings ▸ Project onboarding "
+        "to register repos for filesystem access."
+    )
+    assert note in flat
+    # When enabled, the field is offered as before (no regression).
+    assert "`register_project: true/false`" in flat
+    # Backward compat: a refusal must LEAD the summary, not be buried in the turn.
+    assert "REGISTRATION REFUSED" in flat
+
+
 # ── register(): wires the contributions without a host, doesn't throw ────────────
 
 
