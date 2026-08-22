@@ -1357,7 +1357,25 @@ class BeadsBoard:
         if f is None:
             return None
         if f["board_state"] != "done":
-            self._run("close", f["id"], "-r", f"merged: {pr_url}")
+            fid = f["id"]
+            # A merged PR is ground truth (#196): whatever blocked the card is moot once
+            # its change shipped — and `br close` refuses while open blocker edges remain
+            # (the #145 class cancel already handles) — so clear the blocked label and
+            # drop open incoming edges FIRST, or a blocked card whose PR merged sticks in
+            # `blocked` forever and needs a hand-unblock.
+            if LABEL_BLOCKED in (f.get("labels") or []):
+                self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+            for blocker_id in self._open_blockers(fid):
+                try:
+                    self.remove_dependency(fid, blocker_id)
+                    log.info("[project_board] record_merge %s: dropped blocks edge from %s", fid, blocker_id)
+                except BoardError:
+                    log.warning(
+                        "[project_board] record_merge %s: could not drop edge from %s (close may still fail)",
+                        fid,
+                        blocker_id,
+                    )
+            self._run("close", fid, "-r", f"merged: {pr_url}")
         return self.get_feature(f["id"])
 
     # ── the second terminal edge: cancel (not merge) ──────────────────────────

@@ -500,3 +500,36 @@ def test_update_feature_applies_good_deps_and_names_the_failed_one(make_board, m
     assert {c[3] for c in dep_calls} == {"bd-7", "bd-8"}  # good edges landed
     assert f["enrichment_failed"] is True
     assert any("depends_on(bd-bad)" in m for m in f["missing_fields"])
+
+
+# ── #196: record_merge on a blocked card clears the flag + drops open edges ─────
+
+
+def test_record_merge_clears_blocked_and_drops_open_edges_before_close(make_board, monkeypatch):
+    """A merged PR is ground truth: record_merge on a blocked card removes the blocked
+    label and drops open incoming blocks edges (the #145 class — `br close` refuses
+    while they remain) before closing, so the card lands in `done` without a hand-unblock."""
+    br = _StatefulBr({})
+    board = make_board(br)
+    feature = {
+        "id": "bd-blk",
+        "board_state": "blocked",
+        "labels": ["blocked"],
+        "assignee": "",
+    }
+    monkeypatch.setattr(board, "_find_by_external_ref", lambda ref: feature)
+    monkeypatch.setattr(board, "get_feature", lambda fid: {**feature, "board_state": "done"})
+    monkeypatch.setattr(board, "_open_blockers", lambda fid: ["bd-dep"])
+    dropped = []
+    monkeypatch.setattr(board, "remove_dependency", lambda fid, bid: dropped.append((fid, bid)))
+
+    out = board.record_merge(pr_url="https://example/pr/9")
+
+    assert out["board_state"] == "done"
+    assert ("update", "bd-blk", "--remove-label", "blocked") in br.calls
+    assert dropped == [("bd-blk", "bd-dep")]
+    assert ("close", "bd-blk", "-r", "merged: https://example/pr/9") in br.calls
+    # order: the label clear + edge drops land BEFORE the close
+    assert br.calls.index(("update", "bd-blk", "--remove-label", "blocked")) < br.calls.index(
+        ("close", "bd-blk", "-r", "merged: https://example/pr/9")
+    )

@@ -1489,7 +1489,12 @@ class BoardLoop:
         Blocked for triage (+reap; the work was rejected, don't silently re-dispatch);
         ``OPEN`` → leave it in review."""
         store = self._store()
-        for f in store.list_features(state="in_review"):
+        # #196: blocked cards can carry a PR too (review-verify blocks, closed-PR triage,
+        # manual flags) — a merged PR is ground truth for them exactly as for in_review,
+        # and scanning only in_review left merged-but-blocked cards stuck forever. They
+        # take ONLY the MERGED edge below: CLOSED would rewrite their blocked reason, and
+        # the OPEN-branch gates (rebase/CI/review) must not run against held work.
+        for f in [*store.list_features(state="in_review"), *store.list_features(state="blocked")]:
             fid = f["id"]
             pr_url = f.get("pr_url")
             if not pr_url:
@@ -1498,6 +1503,8 @@ class BoardLoop:
             repo = self._repo_for(f)
             try:
                 state = await worktree.pr_state(pr_url, cwd=repo)
+                if f.get("board_state") == "blocked" and state != "MERGED":
+                    continue
                 if state == "MERGED":
                     if store.record_merge(pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
