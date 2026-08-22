@@ -298,6 +298,7 @@ async function load(){
     // to fix it — a warning card above the board, never a silent green.
     const s = await api("/api/plugins/project_board/status").catch(() => null);
     if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);
+    else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);
     else $("err").hidden = true;
   } catch (e) {
     // First-run tell (#unbound): a board never bound to a repo (shipped default
@@ -329,23 +330,42 @@ function setupGapItems(setup){
   }
   return html;
 }
+// Only the checks the loop refuses to tick without make the board "unable to run";
+// a gh-only gap means builds can't open/merge PRs, not that the board is down.
+function setupBlocking(setup){
+  return SETUP_CHECKS.some(([key]) => key !== "gh" && setup && setup[key] && setup[key].ok === false);
+}
 function setupLoopLine(setup){
   const blockers = (setup && setup.loop_blockers) || [];
-  if (!setup || !setup.loop_enabled) return '<div style="opacity:.65;margin-top:6px;font-size:12px">The build loop is off (<code>loop_enabled: false</code>).</div>';
-  if (blockers.length) return '<div style="margin-top:6px;font-size:12px">The build loop is <b>paused</b> on: ' + esc(blockers.join(", ")) + ' — it resumes on its own once they pass (no restart needed).</div>';
-  return "";
+  let html = "";
+  if (!setup || !setup.loop_enabled) html += '<div style="opacity:.65;margin-top:6px;font-size:12px">The build loop is off (<code>loop_enabled: false</code>).</div>';
+  else if (blockers.length) html += '<div style="margin-top:6px;font-size:12px">The build loop is <b>paused</b> on: ' + esc(blockers.join(", ")) + ' — it resumes on its own once they pass (no restart needed).</div>';
+  // Restart-only drift: the running loop was started on an older coders/repo/…
+  // than the config this page (and /status) reads — say so, or the page would
+  // report the NEW config as the loop's state.
+  if (setup && setup.loop_cfg_stale) html += '<div style="margin-top:6px;font-size:12px"><b>Running loop is stale:</b> ' + esc(String(setup.loop_cfg_stale_hint || "config changed since the loop started")) + '</div>';
+  return html;
 }
 
 // A bound board whose setup preflight fails — each failing check with its hint, in
 // place of a raw error. `e` (optional) is the underlying read error.
 function renderSetupGaps(setup, e){
+  const blocking = setupBlocking(setup);
   $("err").hidden = false;
   $("err").className = "pl-callout pl-callout--warning";
-  $("err").innerHTML = '<b>This board can&#39;t run yet — setup is incomplete.</b>'
+  $("err").innerHTML = '<b>' + (blocking ? 'This board can&#39;t run yet — setup is incomplete.' : 'GitHub CLI missing — PRs can&#39;t open or merge until it is installed.') + '</b>'
     + '<ul style="margin:6px 0 0 18px;padding:0">' + setupGapItems(setup) + '</ul>'
     + setupLoopLine(setup)
     + (e ? '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>' : '');
-  $("sub").textContent = "project_board — setup incomplete";
+  $("sub").textContent = blocking ? "project_board — setup incomplete" : "project_board — gh missing";
+}
+
+// A healthy board whose running loop is on an older config than the one this page
+// reads — the restart note alone, as an info callout (no check is failing).
+function renderLoopStale(setup){
+  $("err").hidden = false;
+  $("err").className = "pl-callout pl-callout--info";
+  $("err").innerHTML = setupLoopLine(setup);
 }
 
 // The unbound-board setup card — guidance in place of a red error. Static markup

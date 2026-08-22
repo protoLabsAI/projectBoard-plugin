@@ -20,7 +20,6 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -46,13 +45,6 @@ def _which_only(*present):
 
 def _delegates(*known):
     return lambda name: object() if name in known else None
-
-
-@pytest.fixture(autouse=True)
-def _clear_version_cache():
-    setup_check._BR_VERSION_CACHE.clear()
-    yield
-    setup_check._BR_VERSION_CACHE.clear()
 
 
 def _ok_cfg(tmp_path):
@@ -160,6 +152,7 @@ def test_unset_coder_is_a_failure_with_the_pick_a_delegate_hint(tmp_path):
         assert s["coder"]["hint"] == setup_check.NO_CODER_HINT
         assert "pick a delegate in Settings ▸ Project Board" in s["coder"]["hint"]
         assert "propose_delegate" in s["coder"]["hint"]
+        assert "former implicit default `proto` no longer applies" in s["coder"]["hint"]
         assert "coder" in s["loop_blockers"]
     assert asked == []
 
@@ -186,14 +179,75 @@ def test_every_configured_coder_name_must_resolve(tmp_path):
     assert s["coder"]["ok"] is True
 
 
-def test_coders_map_alone_satisfies_the_coder_check(tmp_path):
+def test_coders_ladder_alone_passes_only_when_every_tier_is_mapped(tmp_path):
+    """Review on #212: with `coder` blank the ladder is the ONLY dispatch path and
+    dispatch resolves `coders.get(tier, "")` — an unmapped TIER_LADDER rung blocks
+    the card with "coder delegate '' not configured". So blank `coder` needs
+    escalation ON and smart/reasoning/opus all mapped."""
+    full = {"smart": "a", "reasoning": "b", "opus": "c"}
     s = setup_status(
-        {"repo": str(tmp_path), "coders": {"fast": "a", "smart": "b"}},
+        {"repo": str(tmp_path), "coders": full}, which=_which_all, delegates=_delegates("a", "b", "c"), run=_fake_run()
+    )
+    assert s["coder"]["ok"] is True and s["coder"]["name"] == "" and s["coder"]["names"] == ["a", "b", "c"]
+    # the manifest's old example shape (fast/smart/reasoning, no opus) → every
+    # `architectural` card would dispatch to '' — not ok, and the hint names the rung
+    s = setup_status(
+        {"repo": str(tmp_path), "coders": {"fast": "a", "smart": "b", "reasoning": "c"}},
         which=_which_all,
-        delegates=_delegates("a", "b"),
+        delegates=_delegates("a", "b", "c"),
         run=_fake_run(),
     )
-    assert s["coder"]["ok"] is True and s["coder"]["name"] == "" and s["coder"]["names"] == ["a", "b"]
+    assert s["coder"]["ok"] is False
+    assert "`coder:` is unset and the coders ladder doesn't cover tier(s) opus" in s["coder"]["hint"]
+    assert "set `coder:` as the fallback" in s["coder"]["hint"]
+    assert "coder" in s["loop_blockers"]
+    # `coder` SET → the ladder may have holes (the fallback covers them)
+    s = setup_status(
+        {"repo": str(tmp_path), "coder": "a", "coders": {"smart": "a", "reasoning": "c"}},
+        which=_which_all,
+        delegates=_delegates("a", "c"),
+        run=_fake_run(),
+    )
+    assert s["coder"]["ok"] is True
+
+
+def test_single_delegate_ladder_with_blank_coder_is_not_ok(tmp_path):
+    """`coders: {smart: a}` + no `coder:` — escalation_enabled needs >1 distinct
+    delegate, so the loop dispatches `coder:` = '' and every card blocks. The
+    reviewer's repro, pinned."""
+    s = setup_status(
+        {"repo": str(tmp_path), "coders": {"smart": "a"}}, which=_which_all, delegates=_delegates("a"), run=_fake_run()
+    )
+    assert s["coder"]["ok"] is False
+    assert "only one distinct delegate" in s["coder"]["hint"] and "set `coder:`" in s["coder"]["hint"]
+    # map a to all three rungs — still ONE distinct delegate → still not ok
+    s = setup_status(
+        {"repo": str(tmp_path), "coders": {"smart": "a", "reasoning": "a", "opus": "a"}},
+        which=_which_all,
+        delegates=_delegates("a"),
+        run=_fake_run(),
+    )
+    assert s["coder"]["ok"] is False
+
+
+def test_blank_coder_requires_every_project_ladder_to_cover_every_tier(tmp_path):
+    """`_coders_for(feature)` prefers the feature's PROJECT map, so a project map
+    with a hole dispatches to '' for that rung even when the instance map is full."""
+    full = {"smart": "a", "reasoning": "b", "opus": "c"}
+    cfg = {
+        "coders": full,
+        "projects": {
+            "web": {"repo": str(tmp_path), "coders": {"smart": "a", "reasoning": "b"}},
+            "api": {"repo": str(tmp_path)},
+        },
+    }
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("a", "b", "c"), run=_fake_run())
+    assert s["coder"]["ok"] is False
+    assert "opus (project 'web')" in s["coder"]["hint"]
+    cfg["projects"]["web"]["coders"]["opus"] = "c"
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("a", "b", "c"), run=_fake_run())
+    assert s["coder"]["ok"] is True  # `api` has no map → falls back to the (full) instance map
+    assert setup_check.uncovered_tiers({"smart": "a", "opus": ""}) == ["reasoning", "opus"]
 
 
 def test_delegate_lookup_errors_count_as_unresolved(tmp_path):
@@ -284,35 +338,56 @@ def _status(**ok):
     return base
 
 
+ALL_CLEAR = {k: None for k in setup_check.REPORT_KEYS}
+
+
 def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
     host = _HostWithSeam()
     rep = GapReporter(host)
     assert rep.available is True
 
-    assert rep.report(_status(br=False, coder=False)) == {"br": "br hint", "coder": "coder hint"}
-    assert host.calls == [("br", "br hint"), ("coder", "coder hint")]
+    # FIRST evaluation: every key, unconditionally — the failing hints AND a clear
+    # for the passing checks (review on #212: a reload builds a fresh reporter that
+    # must not leave the previous instance's warning standing; the clear is idempotent).
+    first = rep.report(_status(br=False, coder=False))
+    assert first == {**ALL_CLEAR, "br": "br hint", "coder": "coder hint"}
+    assert host.calls == [("br", "br hint"), ("gh", None), ("coder", "coder hint"), ("repo", None), ("loop", None)]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
-    assert len(host.calls) == 2
+    assert len(host.calls) == 5
     # br installed → ONE clear for br, coder still standing → silent
     assert rep.report(_status(coder=False)) == {"br": None}
     assert host.calls[-1] == ("br", None)
     # everything passes → coder cleared
     assert rep.report(_status()) == {"coder": None}
     assert host.calls[-1] == ("coder", None)
-    assert rep.reported == {"br": None, "coder": None}
+    assert rep.reported == ALL_CLEAR
 
 
-def test_reporter_never_clears_a_check_that_never_failed():
+def test_fresh_reporter_clears_a_previous_instances_warning():
+    """The reload scenario: boot with no coder → gap reported; operator fixes it →
+    reload → a NEW reporter with empty memory. Its first report must send the clear
+    (None) for the now-passing check, or the host banner outlives the gap."""
     host = _HostWithSeam()
-    GapReporter(host).report(_status())
-    assert host.calls == []  # no spurious `(key, None)` for checks that were fine all along
+    GapReporter(host).report(_status(coder=False))  # the previous instance
+    assert ("coder", "coder hint") in host.calls
+    fresh = GapReporter(host)
+    fresh.report(_status())  # the reloaded instance sees a passing coder
+    assert ("coder", None) in host.calls[5:]
+
+
+def test_reporter_forwards_the_loop_stale_key():
+    host = _HostWithSeam()
+    rep = GapReporter(host)
+    rep.report({**_status(), "loop_cfg_stale_hint": "config changed since the loop started (repo) — restart"})
+    assert host.calls[-1] == ("loop", "config changed since the loop started (repo) — restart")
+    assert rep.report({**_status(), "loop_cfg_stale_hint": ""}) == {"loop": None}
 
 
 def test_reporter_is_a_guarded_noop_on_a_host_without_the_seam():
     rep = GapReporter(_HostWithoutSeam())
     assert rep.available is False
-    assert rep.report(_status(br=False)) == {"br": "br hint"}  # still tracked locally
+    assert rep.report(_status(br=False)) == {**ALL_CLEAR, "br": "br hint"}  # still tracked locally
     assert rep.report(_status()) == {"br": None}
     assert GapReporter(None).available is False
     # a non-callable attribute is NOT the seam
@@ -326,7 +401,7 @@ def test_reporter_swallows_a_host_side_failure(caplog):
 
     rep = GapReporter(_Broken())
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        assert rep.report(_status(gh=False)) == {"gh": "gh hint"}
+        assert rep.report(_status(gh=False)) == {**ALL_CLEAR, "gh": "gh hint"}
     assert any("report_setup_gap('gh') failed" in r.message for r in caplog.records)
 
 
@@ -369,8 +444,8 @@ def _pin_probes(monkeypatch, *, which, delegates):
     """Pin the preflight's live probes for register()/route tests (which otherwise
     read the real PATH + the host roster)."""
     monkeypatch.setattr(setup_check.shutil, "which", which)
-    monkeypatch.setattr(setup_check, "_default_delegates", delegates)
-    monkeypatch.setattr(setup_check.subprocess, "run", _fake_run("br 0.1.23"))
+    monkeypatch.setattr(setup_check, "_default_delegates", lambda: delegates)  # one resolver per call
+    monkeypatch.setattr(setup_check, "_subprocess_run", _fake_run("br 0.1.23"))
 
 
 def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatch, caplog):
@@ -378,9 +453,10 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
     reg = _RegistryWithSeam({"coder": "", "repo": "/nowhere"})
     with caplog.at_level(logging.INFO, logger=LOGGER):
         pb.register(reg)
-    keys = [k for k, _ in reg.gaps]
-    assert keys == ["gh", "coder", "repo"]  # br present; the other three reported, in render order
     msgs = dict(reg.gaps)
+    # every key on the first evaluation (br + loop as clears), in render order
+    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop"]
+    assert msgs["br"] is None and msgs["loop"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT
     assert "gh auth login" in msgs["gh"]
     assert "/nowhere" in msgs["repo"]
@@ -406,7 +482,7 @@ def test_register_reports_nothing_when_setup_is_complete(monkeypatch, tmp_path):
     _pin_probes(monkeypatch, which=_which_all, delegates=_delegates("proto"))
     reg = _RegistryWithSeam({"coder": "proto", "repo": str(tmp_path)})
     pb.register(reg)
-    assert reg.gaps == []
+    assert reg.gaps == [(k, None) for k in setup_check.REPORT_KEYS]  # all clears, nothing standing
 
 
 def test_register_log_names_the_coder_when_set(monkeypatch, tmp_path, caplog):
@@ -430,15 +506,15 @@ class _Probe:
             return "/usr/local/bin/br" if self.br else None
         return f"/usr/local/bin/{name}"
 
-    def resolve(self, name, expect_type):
-        return object() if (self.coder and name == "proto") else None
+    def resolver(self):
+        return lambda name: object() if (self.coder and name == "proto") else None
 
 
 def _wire(monkeypatch, loop, probe, reporter=None):
     """Instrument a loop: fake probes, a recorder for recovery + the tick steps (so
     a paused loop provably runs NONE of them), and a sub-second interval."""
     loop._which = probe.which
-    monkeypatch.setattr(loop, "_resolve_delegate", probe.resolve)
+    monkeypatch.setattr(loop, "_delegate_resolver", probe.resolver)
     if reporter is not None:
         loop._gap_reporter = reporter
     loop.interval = 0.02
@@ -485,7 +561,7 @@ async def test_loop_pauses_on_missing_br_then_resumes_when_it_appears(monkeypatc
         assert len(paused) == 1 and paused[0].levelno == logging.WARNING
         assert "br:" in paused[0].message and "cargo install beads_rust" in paused[0].message
         assert not any("crash recovery failed" in r.message or "loop tick failed" in r.message for r in caplog.records)
-        assert host.calls == [("br", setup_check.BR_HINT)]
+        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 5  # first eval: all keys
 
         probe.br = True  # operator installs beads → the next re-check passes
         await _settle()
@@ -565,7 +641,8 @@ async def test_a_gap_opening_mid_run_pauses_the_ticks_again(monkeypatch, tmp_pat
         n = len(calls)
         await _settle(3)
         assert len(calls) == n  # no further ticks while paused
-        assert host.calls == [("br", setup_check.BR_HINT)]
+        assert host.calls[-1] == ("br", setup_check.BR_HINT)
+        assert [c for c in host.calls if c[1] is not None] == [("br", setup_check.BR_HINT)]
         assert len([r for r in caplog.records if "loop paused:" in r.message]) == 1
     loop._stop.set()
     await asyncio.wait_for(task, 1)
@@ -615,15 +692,66 @@ async def test_start_log_says_coder_unset(monkeypatch, caplog):
     assert started and "coder=<unset>" in started[0]
 
 
-def test_loop_setup_status_uses_the_dispatch_paths_delegate_lookup(tmp_path, monkeypatch):
-    """One roster lookup, not two: the preflight resolves coder names through
-    `_resolve_delegate` (what dispatch uses), so what passes preflight dispatches."""
-    loop = BoardLoop({"coder": "proto", "repo": str(tmp_path)})
+def test_loop_setup_status_builds_one_resolver_per_check(tmp_path, monkeypatch):
+    """One roster read per preflight (review nit on #212): `_delegate_resolver()` is
+    called once per `_setup_status`, and every configured name goes through it."""
+    loop = BoardLoop({"coder": "proto", "coders": {"smart": "proto", "reasoning": "x"}, "repo": str(tmp_path)})
     loop._which = _which_all
-    seen = []
-    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, t: seen.append((name, t)) or object())
+    built, seen = [], []
+
+    def _resolver():
+        built.append(1)
+        return lambda name: seen.append(name) or object()
+
+    monkeypatch.setattr(loop, "_delegate_resolver", _resolver)
     s = loop._setup_status()
-    assert seen == [("proto", "acp")] and s["coder"]["ok"] is True
+    assert built == [1] and seen == ["proto", "x"] and s["coder"]["ok"] is True
+    assert s["loop_cfg_stale"] is False  # compared to its own config — never stale
+
+
+def test_coder_seam_delegate_resolver_answers_none_without_a_roster():
+    from project_board import coder_seam
+
+    resolve = coder_seam.delegate_resolver("acp")  # no `plugins.delegates` in the host-free suite
+    assert callable(resolve) and resolve("proto") is None
+
+
+async def test_reload_naming_the_coder_resumes_the_paused_loop_without_a_restart(monkeypatch, tmp_path, caplog):
+    """The fresh-archetype flow end to end: boot with NO coder → paused; the operator
+    types the delegate into Settings ▸ Project Board → the host fires reload() → the
+    running loop's next check passes → recovery + ticks. No restart."""
+    loop = BoardLoop({"repo": str(tmp_path), "loop_enabled": True})
+    host = _HostWithSeam()
+    calls = _wire(monkeypatch, loop, _Probe(), GapReporter(host))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        task = asyncio.create_task(loop._run())
+        await _settle()
+        assert calls == [] and ("coder", setup_check.NO_CODER_HINT) in host.calls
+        assert loop.reload({"coder": "proto"}) == {"coder": ("", "proto")}
+        await _settle()
+    assert calls and calls[0] == "recover"
+    assert host.calls[-1] == ("coder", None)
+    loop._stop.set()
+    await asyncio.wait_for(task, 1)
+
+
+async def test_setup_gate_runs_the_preflight_off_the_event_loop(monkeypatch, tmp_path):
+    """Review on #212: `br --version` + the roster read must not block the loop —
+    `_setup_gate` awaits the status via `asyncio.to_thread`."""
+    import threading
+
+    loop = BoardLoop({"coder": "proto", "repo": str(tmp_path), "loop_enabled": True})
+    _wire(monkeypatch, loop, _Probe())
+    threads = []
+    real = loop._setup_status
+
+    def _status():
+        threads.append(threading.current_thread())
+        return real()
+
+    monkeypatch.setattr(loop, "_setup_status", _status)
+    assert await loop._setup_gate() is True
+    assert threads and threads[0] is not threading.main_thread()
 
 
 # ── GET /status carries the setup block ──────────────────────────────────────────
@@ -674,12 +802,66 @@ def test_status_route_resyncs_the_host_gap_through_the_shared_reporter(monkeypat
     _pin_probes(monkeypatch, which=_which_only("br"), delegates=_delegates("proto"))
     c = _client(monkeypatch, {"repo": str(tmp_path), "coder": "proto"}, gap_reporter=rep)
     assert c.get("/api/plugins/project_board/status").json()["setup"]["gh"]["ok"] is False
-    assert host.calls == [("gh", setup_check.GH_HINT)]
+    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 5  # first eval: all keys
     c.get("/api/plugins/project_board/status")
-    assert len(host.calls) == 1  # steady state: no re-send per poll
+    assert len(host.calls) == 5  # steady state: no re-send per poll
     monkeypatch.setattr(setup_check.shutil, "which", _which_all)  # gh installed
     assert c.get("/api/plugins/project_board/status").json()["setup"]["ready"] is True
     assert host.calls[-1] == ("gh", None)
+
+
+def test_status_route_reports_the_running_loops_stale_restart_knobs(monkeypatch, tmp_path):
+    """Reload drift (review on #212): the routers see the NEW config, the running
+    loop keeps its construction-time `repo`/`coders`. /status compares the live
+    config to the loop's published snapshot and says "restart to apply" — on its own
+    line and on the affected failing hint — instead of reporting the new config as
+    the loop's state. `coder` is live, so it is never a stale key."""
+    _pin_probes(monkeypatch, which=_which_all, delegates=_delegates("proto"))
+    old = {"repo": str(tmp_path), "coder": "proto", "loop_enabled": True}
+    running = BoardLoop(old)
+    setup_check.publish_loop_snapshot(running.cfg)  # what start() does when the loop actually runs
+    try:
+        # a reload changed repo (restart knob) + coder (live — applied via reload(),
+        # which republishes the snapshot)
+        running.reload({"coder": "other"})
+        assert setup_check.live_loop_snapshot()["coder"] == "other"
+        new = {**old, "repo": "/moved/elsewhere", "coder": "other"}
+        setup = _client(monkeypatch, new).get("/api/plugins/project_board/status").json()["setup"]
+        assert setup["loop_cfg_stale"] is True and setup["loop_cfg_stale_keys"] == ["repo"]
+        assert "restart the agent to apply" in setup["loop_cfg_stale_hint"]
+        assert setup["repo"]["ok"] is False and "restart the agent to apply: repo" in setup["repo"]["hint"]
+        assert setup["coder"]["ok"] is False  # 'other' unresolvable — but NOT stale (live knob)
+        assert "restart" not in setup["coder"]["hint"]
+        # same config as the loop → not stale
+        setup = _client(monkeypatch, {**old, "coder": "other"}).get("/api/plugins/project_board/status").json()["setup"]
+        assert setup["loop_cfg_stale"] is False and setup["loop_cfg_stale_hint"] == ""
+    finally:
+        setup_check.publish_loop_snapshot(None)
+    # no running loop (stopped / never started) → nothing to be stale against
+    setup_check.publish_loop_snapshot(None)
+    setup = _client(monkeypatch, new).get("/api/plugins/project_board/status").json()["setup"]
+    assert setup["loop_cfg_stale"] is False
+
+
+def test_stale_loop_keys_compare_only_restart_knobs():
+    snap = setup_check.snapshot_of({"repo": "/a", "coders": {"smart": "x"}, "coder": "p"})
+    assert setup_check.stale_loop_keys({"repo": "/a", "coders": {"smart": "x"}, "coder": "q"}, snap) == []
+    assert setup_check.stale_loop_keys({"repo": "/b", "coders": {"smart": "y"}}, snap) == ["coders", "repo"]
+    assert setup_check.stale_loop_keys({"repo": "/b"}, None) == []
+
+
+def test_status_route_runs_the_preflight_off_the_event_loop(monkeypatch, tmp_path):
+    import threading
+
+    seen = []
+
+    def _status(cfg, **kw):
+        seen.append(threading.current_thread())
+        return {"ready": True, "loop_cfg_stale_hint": ""}
+
+    monkeypatch.setattr(setup_check, "setup_status", _status)
+    _client(monkeypatch, {"repo": str(tmp_path)}).get("/api/plugins/project_board/status")
+    assert seen and seen[0] is not threading.main_thread()
 
 
 def test_status_route_never_500s_on_a_preflight_error(monkeypatch, tmp_path):
@@ -714,9 +896,18 @@ def test_board_page_renders_setup_gaps_from_the_status_block():
     assert "if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);" in BOARD_PAGE
     assert "if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e); return; }" in BOARD_PAGE
     assert '"pl-callout pl-callout--warning"' in BOARD_PAGE
-    # the loop line tells paused-vs-off
+    # the loop line tells paused-vs-off, and says "restart" when the running loop's
+    # config snapshot lags the live config (review on #212)
     assert "The build loop is <b>paused</b> on: " in BOARD_PAGE
     assert "loop_enabled: false" in BOARD_PAGE
+    assert "if (setup && setup.loop_cfg_stale) html += " in BOARD_PAGE
+    assert "<b>Running loop is stale:</b> " in BOARD_PAGE
+    assert "function renderLoopStale(setup)" in BOARD_PAGE
+    assert "else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);" in BOARD_PAGE
+    # a gh-only gap is NOT "can't run" (gh isn't a loop blocker) — softer copy
+    assert "function setupBlocking(setup)" in BOARD_PAGE
+    assert 'key !== "gh" && setup && setup[key] && setup[key].ok === false' in BOARD_PAGE
+    assert "GitHub CLI missing — PRs can&#39;t open or merge until it is installed." in BOARD_PAGE
     # the unbound card now carries the other gaps too, and says there is no default coder
     assert "function renderSetup(e, setup)" in BOARD_PAGE
     assert "<b>Also missing:</b>" in BOARD_PAGE

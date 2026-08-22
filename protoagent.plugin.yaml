@@ -30,14 +30,18 @@ config:
                             # (v0.42.0): unset = the setup preflight fails `coder`, the host
                             # shows an operator warning, and the loop pauses (no tracebacks)
                             # until a delegate is declared and named here — never a phantom
-                            # name that only resolves on one machine.
+                            # name that only resolves on one machine. LIVE (console field):
+                            # a save applies to the running loop's next dispatch/check.
+                            # Blank + a `coders` ladder below: the ladder must then cover
+                            # EVERY tier (smart/reasoning/opus) in every project map — an
+                            # unmapped tier dispatches to '' and blocks the card.
   # Escalation is OPT-IN and only meaningful with >1 distinct coder. Leave this
   # out for a single-ACP-agent setup (no tier ladder, no redundant retries —
   # one dispatch, then Blocked on failure; `difficulty` is then ignored).
-  # coders:                 # tier → delegate; difficulty picks the starting rung
-  #   fast: proto
-  #   smart: proto-smart
-  #   reasoning: claude-acp
+  # coders:                 # tier → delegate; difficulty picks the starting rung. The
+  #   smart: proto          # rungs are smart → reasoning → opus (store.TIER_LADDER);
+  #   reasoning: proto-smart  # with `coder:` set it is the fallback for an unmapped rung,
+  #   opus: claude-acp      # with `coder:` blank every rung must be mapped.
   reviewer: quinn           # a2a delegate for explicit PR review (review_dispatch, and the
                             # review_gate's fallback when the host has no workflow runner)
   review_dispatch: false    # OPT-IN, advisory. Off = rely on the fleet PR-review pipeline (it
@@ -216,6 +220,8 @@ config:
 # silently needs a restart is worse than no field. Saving writes `project_board.<key>`
 # to the agent layer; the reload hook applies it on the loop's next tick.
 settings:
+  - { key: coder, label: "Coder delegate", type: string, group: "Project Board",
+      description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a loop paused on 'no coder configured' resumes on its next check — no restart." }
   - { key: max_concurrent, label: "Parallel builds", type: number, group: "Project Board",
       description: "How many features the loop drives at once, each in its own worktree (1 = serial). Size it to the board's projects — one slot per repo keeps a deep queue in one project from starving the others. Applies live on save; lowering it never kills a running build, the loop just stops claiming until it is under the cap. Peak coder processes = this × coder_solve_k." }
   - { key: max_concurrent_sessions, label: "Coder sessions per build", type: number, group: "Project Board",

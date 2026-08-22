@@ -39,9 +39,12 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+import types
 
 from . import store as store_mod
 from .projects import resolve_projects
+from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -50,6 +53,20 @@ log = logging.getLogger("protoagent.plugins.project_board")
 SETUP_KEYS: tuple[str, ...] = ("br", "gh", "coder", "repo")
 # The checks the puller will not tick without (see module docstring).
 LOOP_BLOCKING_KEYS: tuple[str, ...] = ("br", "coder", "repo")
+# One extra host-gap key: the running loop's config snapshot lagging the live config
+# on a restart-only knob (see ``loop_cfg_stale`` below).
+LOOP_STALE_KEY = "loop"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY,)
+# The config keys the running loop reads ONCE at construction and cannot pick up on a
+# reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
+# changes one of these leaves the running loop on the old value until a restart, so
+# ``/status`` says so instead of reporting the NEW config as the loop's state.
+LOOP_RESTART_KEYS: tuple[str, ...] = ("coders", "repo", "base_branch", "db_path", "projects")
+
+# The subprocess runner ``_br_version`` uses — a module attribute (not a bare
+# ``subprocess.run`` reference) so the suite's autouse fixture can pin it without
+# touching ``subprocess`` itself (the real-br integration tier still shells out).
+_subprocess_run = subprocess.run
 
 # Operator-facing copy. Each hint is a complete sentence the console can show
 # verbatim (as a runtime warning and on the board page's setup card).
@@ -63,8 +80,10 @@ GH_HINT = (
 )
 NO_CODER_HINT = (
     "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent "
-    "propose_delegate; the board is paused until then"
+    "propose_delegate; the board is paused until then (the former implicit default `proto` "
+    "no longer applies — set `coder: proto` to keep it)"
 )
+RESTART_NOTE = "the running loop still has the previous value — restart the agent to apply"
 REPO_UNBOUND_HINT = (
     "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
     "this agent manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board "
@@ -75,6 +94,68 @@ _BR_VERSION_TIMEOUT_S = 3.0
 # ``br --version`` output per resolved binary path — sampled once per process per
 # path, so the per-tick / per-page-load re-check stays a ``which`` and nothing more.
 _BR_VERSION_CACHE: dict[str, str] = {}
+
+
+_LOOP_SLOT_PREFIX = "project_board.live_loop::"
+
+
+def _loop_slot_name() -> str:
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+    return _LOOP_SLOT_PREFIX + pkg
+
+
+def _loop_slot():
+    """The process-stable holder for the RUNNING loop's config snapshot — a
+    ``sys.modules`` data slot (the coder_seam #178 pattern) so it survives a plugin
+    reload: the reload re-imports this module and rebuilds the routers, but the
+    surface (the loop) keeps running on its construction-time config."""
+    name = _loop_slot_name()
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's running-loop config snapshot — data, not code."
+        holder.snapshot = None
+        sys.modules[name] = holder
+    return holder
+
+
+def snapshot_of(cfg: dict) -> dict:
+    """The restart-only keys of ``cfg`` (plus ``coder``), as the loop reads them."""
+    cfg = cfg or {}
+    out = {k: cfg.get(k) for k in LOOP_RESTART_KEYS}
+    out["coder"] = str(cfg.get("coder") or "").strip()
+    return out
+
+
+def publish_loop_snapshot(cfg: dict | None) -> None:
+    """Record the config the RUNNING loop is on (``BoardLoop.start``/``reload``), or
+    clear it (``None``, on stop)."""
+    _loop_slot().snapshot = snapshot_of(cfg) if cfg is not None else None
+
+
+def live_loop_snapshot() -> dict | None:
+    """The running loop's config snapshot, or None when no loop has started."""
+    snap = getattr(_loop_slot(), "snapshot", None)
+    return dict(snap) if isinstance(snap, dict) else None
+
+
+def stale_loop_keys(cfg: dict, snapshot: dict | None) -> list[str]:
+    """The restart-only keys on which the running loop's snapshot differs from the
+    live ``cfg`` — empty when no loop is running or nothing drifted."""
+    if not snapshot:
+        return []
+    want = snapshot_of(cfg)
+    return [k for k in LOOP_RESTART_KEYS if want.get(k) != snapshot.get(k)]
+
+
+def _normalize_coders(raw) -> dict[str, str]:
+    return {str(k): str(v or "").strip() for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+def uncovered_tiers(coders: dict) -> list[str]:
+    """The ``TIER_LADDER`` rungs a ``coders`` map leaves unmapped (or blank)."""
+    coders = _normalize_coders(coders)
+    return [t for t in TIER_LADDER if not coders.get(t)]
 
 
 def coder_names(cfg: dict) -> list[str]:
@@ -107,13 +188,15 @@ def coder_names(cfg: dict) -> list[str]:
     return out
 
 
-def _default_delegates(name: str):
-    """The live lookup: ``coder_seam.resolve_delegate(name, "acp")`` — lazy, because
-    the delegates plugin is a host package this standalone module must not import at
-    load time (and may be disabled, in which case every name resolves to None)."""
-    from .coder_seam import resolve_delegate
+def _default_delegates():
+    """The live lookup — ONE roster read for the whole call (``coder_seam.
+    delegate_resolver("acp")``: every name resolved against the same
+    ``DelegateRegistry``, not a YAML re-parse per name). Lazy, because the delegates
+    plugin is a host package this standalone module must not import at load time
+    (and may be disabled, in which case every name resolves to None)."""
+    from .coder_seam import delegate_resolver
 
-    return resolve_delegate(name, "acp")
+    return delegate_resolver("acp")
 
 
 def _br_version(path: str, run) -> str:
@@ -169,7 +252,7 @@ def _repo_check(cfg: dict, isdir) -> dict:
     return {"ok": True, "path": default_repo, "hint": ""}
 
 
-def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None) -> dict:
+def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None, loop_snapshot=None) -> dict:
     """The board's setup preflight as a plain dict — pure, never raises, never shells
     out to ``br`` for a board op (one cached ``--version`` at most).
 
@@ -182,20 +265,36 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None)
           "repo":  {"ok", "path", "hint"},
           "loop_enabled": bool,
           "loop_blockers": [key, …],   # the failing checks the puller pauses on
+          "loop_cfg_stale": bool,      # the RUNNING loop is on an older restart-only knob
+          "loop_cfg_stale_keys": [k…], # which ones (coders/repo/base_branch/db_path/projects)
+          "loop_cfg_stale_hint": str,  # operator copy, "" when not stale
           "ready": bool,               # every check ok
         }
 
-    ``which``/``delegates``/``run``/``isdir`` are injection points for tests
-    (defaults: ``shutil.which``, the live delegate roster via
-    ``coder_seam.resolve_delegate``, ``subprocess.run``, ``os.path.isdir`` — resolved
-    at call time so a monkeypatch on the module globals takes); ``delegates(name)``
-    returns a truthy object for a resolvable acp delegate, else None.
+    The ``coder`` rule: with ``coder`` set, every configured name must resolve. With
+    ``coder`` BLANK the ladder is the only dispatch path, and dispatch resolves
+    ``coders.get(tier, coder)`` → ``""`` for any unmapped rung — so blank ``coder``
+    passes only when escalation is on (>1 distinct delegate) AND the instance map and
+    every ``projects:`` entry's map cover EVERY ``TIER_LADDER`` rung; otherwise a card
+    at the unmapped tier blocks with ``coder delegate '' not configured``.
+
+    ``which``/``delegates``/``run``/``isdir``/``loop_snapshot`` are injection points
+    for tests (defaults: ``shutil.which``, one ``coder_seam.delegate_resolver("acp")``
+    per call, ``_subprocess_run``, ``os.path.isdir``, ``live_loop_snapshot()`` —
+    resolved at call time so a monkeypatch on the module globals takes);
+    ``delegates(name)`` returns a truthy object for a resolvable acp delegate, else None.
     """
     cfg = cfg or {}
     which = which or shutil.which
-    delegates = delegates or _default_delegates
-    run = run or subprocess.run
+    if delegates is None:
+        try:
+            delegates = _default_delegates()
+        except Exception:  # noqa: BLE001 — no roster at all ⇒ nothing resolves
+            delegates = lambda _name: None  # noqa: E731
+    run = run or _subprocess_run
     isdir = isdir or os.path.isdir
+    if loop_snapshot is None:
+        loop_snapshot = live_loop_snapshot()
 
     def _which(name: str) -> str:
         try:
@@ -226,8 +325,12 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None)
             found = None
         if found is None:
             missing.append(name)
+    coder_name = str(cfg.get("coder") or "").strip()
+    ladder_gap = _ladder_gap(cfg) if not coder_name else ""
     if not names:
         coder_hint = NO_CODER_HINT
+    elif ladder_gap:
+        coder_hint = ladder_gap
     elif missing:
         listed = ", ".join(repr(n) for n in missing)
         coder_hint = (
@@ -238,8 +341,8 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None)
     else:
         coder_hint = ""
     coder = {
-        "ok": bool(names) and not missing,
-        "name": str(cfg.get("coder") or "").strip(),
+        "ok": bool(names) and not missing and not ladder_gap,
+        "name": coder_name,
         "names": names,
         "missing": missing,
         "hint": coder_hint,
@@ -250,8 +353,64 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None)
     status = {"br": br, "gh": gh, "coder": coder, "repo": repo}
     status["loop_enabled"] = bool(cfg.get("loop_enabled", False))
     status["loop_blockers"] = [k for k in LOOP_BLOCKING_KEYS if not status[k]["ok"]]
+    # Restart-only drift (review on #212): the running loop reads `coders`/`repo`/…
+    # once; after a reload the routers (and this status) see the NEW config while
+    # the loop is still on the old one. Say so — on the failing hints and as its own
+    # line — instead of reporting the new config as the loop's state.
+    stale_keys = stale_loop_keys(cfg, loop_snapshot)
+    status["loop_cfg_stale"] = bool(stale_keys)
+    status["loop_cfg_stale_keys"] = stale_keys
+    status["loop_cfg_stale_hint"] = (
+        f"config changed since the loop started ({', '.join(stale_keys)}) — {RESTART_NOTE}" if stale_keys else ""
+    )
+    for key in ("coder", "repo"):
+        drifted = [k for k in stale_keys if k in _STALE_KEYS_PER_CHECK[key]]
+        if drifted and not status[key]["ok"]:
+            status[key]["hint"] = f"{status[key]['hint']} ({RESTART_NOTE}: {', '.join(drifted)})"
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
+
+
+# Which restart-only knobs feed which check — for the per-check restart note.
+_STALE_KEYS_PER_CHECK = {"coder": ("coders", "projects"), "repo": ("repo", "base_branch", "db_path", "projects")}
+
+
+def _ladder_gap(cfg: dict) -> str:
+    """With ``coder`` blank, the reason the ``coders`` ladder can't stand alone — or
+    ``""`` when it covers every rung everywhere dispatch can land."""
+    cfg = cfg or {}
+    coders = _normalize_coders(cfg.get("coders"))
+    if not coders:
+        return ""  # no ladder either — the no-coder hint covers it
+    if not escalation_enabled(cfg):
+        return (
+            "`coder:` is unset and the coders map has only one distinct delegate, so escalation "
+            "is OFF and the loop dispatches `coder:` — set `coder:` (or map >1 distinct delegates "
+            "across every tier)"
+        )
+    gaps: list[str] = []
+    missing = uncovered_tiers(coders)
+    if missing:
+        gaps.append(", ".join(missing))
+    try:
+        projects = resolve_projects(cfg)
+    except Exception:  # noqa: BLE001 — the repo check owns a malformed map
+        projects = {}
+    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    for name, entry in projects.items():
+        pmap = _normalize_coders((entry or {}).get("coders"))
+        if not pmap or not explicit:
+            continue  # an empty project map falls back to the instance map (checked above)
+        pm = uncovered_tiers(pmap)
+        if pm:
+            gaps.append(f"{', '.join(pm)} (project {name!r})")
+    if not gaps:
+        return ""
+    return (
+        f"`coder:` is unset and the coders ladder doesn't cover tier(s) {'; '.join(gaps)} — "
+        "a card at an unmapped tier dispatches to '' and blocks; set `coder:` as the fallback "
+        "(or map every tier: " + ", ".join(TIER_LADDER) + ")"
+    )
 
 
 def loop_blockers(status: dict) -> list[str]:
@@ -271,15 +430,20 @@ class GapReporter:
     host yet (``getattr(registry, "report_setup_gap", None)`` — older hosts, the
     host-free suite), in which case every report is a recorded no-op.
 
-    Edge-triggered: ``report(status)`` calls the seam only for checks whose message
-    CHANGED since the last report — a newly failing check sends its hint, a
-    recovered one sends ``None`` (the clear), a steady state sends nothing — so a
-    30 s tick never spams the host. Never raises."""
+    Edge-triggered AFTER the first evaluation: ``report(status)`` calls the seam
+    for checks whose message CHANGED since the last report — a newly failing check
+    sends its hint, a recovered one sends ``None`` (the clear), a steady state sends
+    nothing — so a 30 s tick never spams the host. The FIRST evaluation sends every
+    key unconditionally (``None`` for a passing check included): a reload builds a
+    fresh reporter with no memory of what the previous instance reported, and a
+    warning it raised must not outlive the gap (the host's clear is idempotent).
+    Never raises."""
 
     def __init__(self, registry=None):
         fn = getattr(registry, "report_setup_gap", None) if registry is not None else None
         self._fn = fn if callable(fn) else None
         self._reported: dict[str, str | None] = {}
+        self._primed = False
 
     @property
     def available(self) -> bool:
@@ -295,10 +459,15 @@ class GapReporter:
         """Diff ``status`` against the last report and forward the changes. Returns
         ``{key: message_or_None}`` for exactly the keys forwarded this call."""
         changes: dict[str, str | None] = {}
-        for key in SETUP_KEYS:
-            check = (status or {}).get(key) or {}
-            msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
-            if self._reported.get(key) == msg:
+        first = not self._primed
+        self._primed = True
+        for key in REPORT_KEYS:
+            if key == LOOP_STALE_KEY:
+                msg = str((status or {}).get("loop_cfg_stale_hint") or "") or None
+            else:
+                check = (status or {}).get(key) or {}
+                msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
+            if not first and key in self._reported and self._reported[key] == msg:
                 continue
             self._reported[key] = msg
             changes[key] = msg

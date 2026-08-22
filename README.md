@@ -122,7 +122,10 @@ project_board:
   coder: proto               # REQUIRED — the acp delegate the loop dispatches to (protoCLI
                              # here). There is NO default (v0.42.0): unset, the setup
                              # preflight below flags it and the loop pauses instead of
-                             # dispatching to a phantom name.
+                             # dispatching to a phantom name. LIVE: it is a console
+                             # Settings field — naming it there resumes a paused loop
+                             # on its next check, no restart. Leave it blank ONLY with a
+                             # `coders:` ladder that maps every tier (smart/reasoning/opus).
   repo: ~/dev/my-repo
   base_branch: main
   loop_enabled: false        # flip true to start the background puller
@@ -132,7 +135,7 @@ project_board:
                              # concurrently, so peak ACP processes =
                              # max_concurrent × coder_solve_k (default: 1 × 3 = 3).
                              # Use max_concurrent_sessions to cap the within-drive parallelism.
-                             # LIVE: max_concurrent, max_pending_reviews and
+                             # LIVE: coder, max_concurrent, max_pending_reviews and
                              # max_concurrent_sessions are console Settings fields
                              # (Settings → Plugins → Project Board) and a save applies
                              # them to the RUNNING loop on its next tick — no restart.
@@ -303,24 +306,33 @@ cached `br --version` at most):
 |---|---|---|
 | `br` | the beads CLI (`BR_BIN`, default `br`) is on PATH | install beads-rust (`cargo install beads_rust`) and restart |
 | `gh` | the GitHub CLI is on PATH | install it + `gh auth login`; builds can't open PRs until then |
-| `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure** | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate" / names the unresolvable delegate |
+| `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure**. With `coder` **blank**, the ladder is the only dispatch path: escalation must be on (>1 distinct delegate) and the instance map *and* every project map must cover **every** tier (`smart`/`reasoning`/`opus`) — an unmapped rung dispatches to `''` and blocks the card | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)" / names the unresolvable delegate / names the uncovered tier(s) |
 | `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | set `project_board.repo` to the checkout's absolute path |
 
 Where it surfaces:
 
 - **`GET /api/plugins/project_board/status`** → `setup: {br, gh, coder, repo, loop_enabled,
-  loop_blockers, ready}` alongside the v0.40.0 `bound` keys.
+  loop_blockers, loop_cfg_stale, loop_cfg_stale_keys, loop_cfg_stale_hint, ready}` alongside
+  the v0.40.0 `bound` keys. `loop_cfg_stale` is the reload-drift tell: a config reload
+  rebuilds the routers on the NEW config while the running loop keeps its construction-time
+  `coders` / `repo` / `base_branch` / `db_path` / `projects` — the status compares the two
+  and says **"restart the agent to apply"** (on its own line, on the affected hint, and as
+  the `loop` host warning) instead of reporting the new config as the loop's state.
+  `coder` is live (applied by `reload()`), so it never goes stale.
 - **The board page** renders each failing check with its hint (a warning card above the
   board, or in place of the raw error when the board can't be read at all).
 - **Host operator warnings** — each failing check is forwarded to the host's
-  `registry.report_setup_gap(key, message)` seam (keys `br`/`gh`/`coder`/`repo`; `None`
-  clears it on recovery), which the console shows in `GET /api/runtime/status`.
-  Guarded: a host without the seam just gets the log lines.
+  `registry.report_setup_gap(key, message)` seam (keys `br`/`gh`/`coder`/`repo`, plus
+  `loop` for the stale-config note; `None` clears it on recovery), which the console shows
+  in `GET /api/runtime/status`. Edge-triggered after a first evaluation that sends every
+  key unconditionally — so a reload's fresh reporter clears a warning the previous
+  instance raised. Guarded: a host without the seam just gets the log lines.
 - **The loop pauses, it doesn't traceback.** With `loop_enabled: true` and a blocker
   standing (`br`, `coder`, `repo` — a missing `gh` only fails the PR edge, so it is
   reported but not paused on) the puller logs ONE `loop paused: …` warning and
-  re-checks every `loop_interval_s` — install `br`, declare the delegate, bind the repo,
-  and it runs crash recovery + starts ticking on its own. No restart. Before v0.42.0 the
+  re-checks every `loop_interval_s` (off the event loop) — install `br`, declare the
+  delegate, name it in the `coder` Settings field, bind the repo, and it runs crash
+  recovery + starts ticking on its own. No restart. Before v0.42.0 the
   same board booted green and logged `crash recovery failed` + `loop tick failed`
   tracebacks every tick.
 

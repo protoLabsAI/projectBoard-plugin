@@ -16,6 +16,7 @@ against ``X-Hub-Signature-256`` whenever a ``webhook_secret`` is configured.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -252,7 +253,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         explicit_projects = isinstance(raw_projects, dict) and bool(raw_projects)
         bound = bool(store_kw.get("db")) or explicit_projects or str(store_kw.get("repo") or ".") not in ("", ".")
         try:
-            setup = setup_check.setup_status(cfg or {})
+            # Off the event loop (review on #212): the preflight may shell `br
+            # --version` (once per path) and reads the delegates YAML; this route is
+            # polled every 10 s by the board page.
+            setup = await asyncio.to_thread(setup_check.setup_status, cfg or {})
             if gap_reporter is not None:
                 gap_reporter.report(setup)  # edge-triggered; a steady state forwards nothing
         except Exception as exc:  # noqa: BLE001 — setup_status never raises by contract; belt and braces

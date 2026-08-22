@@ -173,9 +173,21 @@ def test_reload_flips_auto_merge_and_rejects_garbage():
 
 
 def test_reload_only_touches_live_knobs():
-    loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30})
-    assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coder": "other"}) == {}
-    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coder_name == ""  # coder is NOT live
+    loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30, "coders": {"smart": "a"}})
+    assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coders": {"smart": "b"}}) == {}
+    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"smart": "a"}
+
+
+def test_reload_applies_coder_live_and_keeps_cfg_in_step():
+    """v0.42.0 (review on #212): `coder` is a live string knob — the drive resolves
+    `self.coder_name` per attempt, and the setup preflight reads `self.cfg`, so a
+    Settings save that names the coder clears the gap on the RUNNING loop."""
+    loop = BoardLoop({"coder": ""})
+    assert loop.reload({"coder": "  proto "}) == {"coder": ("", "proto")}
+    assert loop.coder_name == "proto" and loop.cfg["coder"] == "proto"
+    assert loop.reload({"coder": "proto"}) == {}  # steady
+    assert loop.reload({"coder": ""}) == {"coder": ("proto", "")}  # can be unset live too
+    assert loop.coder_name == "" and loop.cfg["coder"] == ""
 
 
 def test_max_mode_n_parsing():
