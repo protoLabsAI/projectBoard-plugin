@@ -296,3 +296,49 @@ def test_progress_end_is_idempotent(monkeypatch):
     clock[0] = 50.0
     cs.progress_end("bd-t2", 1)  # second close: no-op
     assert cs.progress_snapshot("bd-t2")["gens"][0]["elapsed_s"] == 2.0
+
+
+# ── richer monitor signals: answer tail, live plan, tool-input preview ──────────
+
+
+def test_answer_tail_is_a_rolling_bounded_string():
+    """The coder's streamed ANSWER text (text_callback) rolls exactly like the
+    thought tail — bounded chars, never per-chunk accumulation."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-a", 1)
+    coder_seam.progress_answer("bd-a", 1, "x" * 800)
+    coder_seam.progress_answer("bd-a", 1, "TAIL")
+    (g,) = coder_seam.progress_snapshot("bd-a")["gens"]
+    assert g["answer_tail"].endswith("TAIL")
+    assert len(g["answer_tail"]) == coder_seam._ANSWER_TAIL_MAX
+
+
+def test_plan_is_latest_wins_sanitized_and_capped():
+    """ACP `plan` updates carry the ENTIRE current plan each time — replace, never
+    append; entries sanitized to content/status/priority and capped."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-p", 1)
+    coder_seam.progress_plan("bd-p", 1, [{"content": "old", "status": "completed"}])
+    entries = [{"content": f"step {i}", "status": "pending", "priority": "medium", "junk": object()} for i in range(60)]
+    entries[0]["status"] = "in_progress"
+    coder_seam.progress_plan("bd-p", 1, entries)
+    (g,) = coder_seam.progress_snapshot("bd-p")["gens"]
+    assert len(g["plan"]) == coder_seam._PLAN_ENTRIES_MAX
+    assert g["plan"][0] == {"content": "step 0", "status": "in_progress", "priority": "medium"}
+    assert all(set(e) == {"content", "status", "priority"} for e in g["plan"])
+    # a None sample (older host without last_plan) leaves the recorded plan alone
+    coder_seam.progress_plan("bd-p", 1, None)
+    assert coder_seam.progress_snapshot("bd-p")["gens"][0]["plan"] is not None
+
+
+def test_tool_start_records_an_input_preview():
+    """The raw input's head is the "what exactly is it running" line — kept as a
+    bounded preview on current_tool alongside the mined locations."""
+    coder_seam._progress.clear()
+    coder_seam.progress_begin("bd-i", 1)
+    long_cmd = '{"command": "' + "pytest -q " * 40 + '"}'
+    coder_seam.progress_tool("bd-i", 1, {"phase": "start", "id": "t1", "name": "bash", "input": long_cmd})
+    (g,) = coder_seam.progress_snapshot("bd-i")["gens"]
+    cur = g["current_tool"]
+    assert cur["input_preview"] == long_cmd[: coder_seam._TOOL_INPUT_PREVIEW_MAX]
+    assert len(cur["input_preview"]) == coder_seam._TOOL_INPUT_PREVIEW_MAX
