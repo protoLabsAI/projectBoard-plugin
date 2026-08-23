@@ -199,6 +199,13 @@ def test_max_mode_n_parsing():
 # ── the coder prompt (ProtoMaker discipline: name the files, demand the diff) ────
 
 
+def test_prompt_tells_the_coder_not_to_open_a_pr():
+    """#207: the coder opened its own DRAFT PR before the loop's open_pr ran. The
+    loop owns the PR lifecycle (title/body/ready/merge) — say so in the Rules."""
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    assert "do NOT open a PR (draft or otherwise) — the loop opens it" in prompt
+
+
 def test_build_prompt_is_imperative_and_lists_the_files():
     prompt = BoardLoop({})._build_prompt(FEATURE)
     assert "Add a thing" in prompt
@@ -4636,7 +4643,7 @@ def _reviewed(**over):
     return f
 
 
-def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True):
+def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True, draft=False):
     calls = {"merge": []}
 
     async def _head(repo, ref):
@@ -4644,6 +4651,10 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
 
     async def _mss(pr_url, *, cwd="."):
         return mss
+
+    async def _info(pr_url, *, cwd="."):
+        # the combined read the merge edge uses (#207): status + isDraft in one gh call
+        return {"mergeStateStatus": mss, "isDraft": draft}
 
     async def _merge(pr_url, *, method="squash", cwd="."):
         calls["merge"].append((pr_url, method, cwd))
@@ -4658,6 +4669,7 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
 
     monkeypatch.setattr(worktree, "origin_head_sha", _head)
     monkeypatch.setattr(worktree, "pr_merge_state", _mss)
+    monkeypatch.setattr(worktree, "pr_merge_info", _info)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
     monkeypatch.setattr(worktree, "pr_state", _state)
     monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
@@ -4711,6 +4723,42 @@ async def test_auto_merge_requires_github_clean(monkeypatch, mss):
     store = _MergeStore(_reviewed())
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
     assert calls["merge"] == []
+
+
+async def test_auto_merge_holds_on_a_draft_as_a_named_blocker_without_spending_an_attempt(monkeypatch, caplog):
+    """#207: GitHub reports mergeStateStatus=CLEAN for a draft whose checks pass, so
+    the status alone never said "draft" — `gh pr merge` then refused ("pull request
+    is in draft state") and each poll burned an auto_merge_max attempt until the card
+    parked on "merge attempts exhausted" with no hint. Now `isDraft` rides the same
+    read and is a named blocker with the one-line fix; no merge call, no attempt."""
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=True)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True, "auto_merge_max": 1})
+    store = _MergeStore(_reviewed())
+    why = await loop._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
+    assert len(why) == 1 and why[0].startswith("draft"), why
+    assert "gh pr ready https://github.com/o/r/pull/1" in why[0]
+    assert "never spends a merge attempt" in why[0]
+    with caplog.at_level("DEBUG", logger="protoagent.plugins.project_board"):
+        for _ in range(3):
+            assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert calls["merge"] == []  # never `gh pr merge`
+    assert "bd-1" not in loop._auto_merge_failures  # never an attempt spent — auto_merge_max=1 did NOT exhaust
+    assert store.comments == []  # no give-up comment on the bead
+    assert "not auto-merging: draft" in caplog.text
+    # …and once someone runs `gh pr ready` (isDraft False) the same card merges.
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=False)
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
+
+
+async def test_auto_merge_treats_unknown_isdraft_as_not_a_draft(monkeypatch):
+    """`isDraft: None` (an older gh / field absent) must not hold a CLEAN PR — the
+    status gates as before; only an explicit True is the draft blocker."""
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=None)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
 
 
 async def test_auto_merge_without_review_gate_needs_no_review_label(monkeypatch):

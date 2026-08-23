@@ -1835,7 +1835,17 @@ class BoardLoop:
             )
             if not stamped or not head.startswith(stamped):
                 return [f"merged-verified stamp {stamped or '(none)'} ≠ {base}@{head[:_MERGED_VERIFIED_SHA_LEN]}"]
-        mss = await worktree.pr_merge_state(pr_url, cwd=repo)
+        info = await worktree.pr_merge_info(pr_url, cwd=repo)
+        mss = info.get("mergeStateStatus") or ""
+        if info.get("isDraft") is True:
+            # #207: GitHub reports CLEAN for a draft whose checks pass, so the status
+            # alone never says "draft" — and `gh pr merge` refuses a draft, which used
+            # to burn an auto_merge_max attempt per poll and park the card on "merge
+            # attempts exhausted" with no hint. A named blocker instead; the fix is
+            # one `gh pr ready` (open_pr already does it for an adopted coder draft).
+            return [
+                f"draft (PR is a draft — run `gh pr ready {pr_url}`; the loop never spends a merge attempt on a draft)"
+            ]
         if mss != "CLEAN":
             # BLOCKED = required checks not satisfied; UNSTABLE = a non-required check
             # failing; BEHIND/DIRTY = the rebase edge's job; UNKNOWN = GitHub still
@@ -3600,6 +3610,8 @@ class BoardLoop:
             f"write a single line `NO_TEST_NEEDED: <reason>` in your final message instead.\n"
             f"- You cannot run shell commands (edit-only); the tests you write run in CI "
             f"on the PR, so they must be correct and self-contained.\n"
+            f"- Push the branch if you can; do NOT open a PR (draft or otherwise) — the loop "
+            f"opens it with the title/body it composes and owns the PR lifecycle.\n"
             f"- **Your FINAL message becomes the PR description, verbatim.** End with a "
             f"short, clean summary for a reviewer — what changed and why, 2-6 sentences "
             f"or a few bullet points. Do NOT narrate your process: no step-by-step "

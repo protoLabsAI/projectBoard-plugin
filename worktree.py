@@ -417,8 +417,49 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str,
     if "already exists" in err.lower() or "already exists" in out.lower():
         vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
-            return vout.strip()
+            url = vout.strip()
+            await _promote_adopted_draft(url, branch, cwd=worktree)
+            return url
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
+
+
+async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
+    """#207: the "already exists" PR we adopt may be one the CODER opened itself
+    (``gh pr create --draft`` from its worktree, before the loop got here). The loop
+    owns the PR lifecycle — the coder was told to build and push, not to gate the
+    merge — so a draft is not a signal to honour: mark it ready BEFORE the review /
+    merge gates run. Otherwise the card walks CI-fix → review-clean normally and then
+    parks: GitHub reports ``mergeStateStatus=CLEAN`` for a draft, ``gh pr merge``
+    refuses with "pull request is in draft state", and every retry burns an
+    ``auto_merge_max`` attempt. Best-effort: an ``isDraft`` read or ``gh pr ready``
+    failure logs and proceeds — ``_auto_merge_blockers``' named ``draft`` blocker is
+    the backstop. A non-draft (the loop's own PR on a re-dispatch) is untouched."""
+    try:
+        info = await pr_merge_info(pr_url, cwd=cwd)
+    except WorktreeError as exc:
+        log.warning("[project_board] %s: could not read isDraft for adopted PR %s: %s", branch, pr_url, exc)
+        return
+    if info.get("isDraft") is not True:
+        return
+    try:
+        rc, _out, err = await _gh("pr", "ready", pr_url, cwd=cwd)
+    except WorktreeError as exc:
+        rc, err = 1, str(exc)
+    if rc == 0:
+        log.info(
+            "[project_board] %s adopted the coder's DRAFT PR %s — marked ready (the loop owns the PR lifecycle)",
+            branch,
+            pr_url,
+        )
+    else:
+        log.warning(
+            "[project_board] %s adopted the coder's DRAFT PR %s but `gh pr ready` failed (%s) — "
+            "the auto-merge edge will hold on it as a draft; run `gh pr ready %s`",
+            branch,
+            pr_url,
+            (err or "").strip()[:200],
+            pr_url,
+        )
 
 
 async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
@@ -430,14 +471,38 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def pr_merge_info(pr_url: str, *, cwd: str = ".") -> dict:
+    """ONE ``gh pr view`` read of the merge-relevant PR facts:
+    ``{"mergeStateStatus": str, "isDraft": bool | None}``. ``mergeStateStatus`` is
+    ``CLEAN`` / ``BEHIND`` / ``DIRTY`` / ``BLOCKED`` / ``UNSTABLE`` / ``UNKNOWN`` /
+    ``DRAFT`` / ``HAS_HOOKS`` — or ``""`` on a gh failure; ``isDraft`` is ``None`` when
+    unknown (gh failed / field absent). ``isDraft`` rides the same read (#207) because
+    GitHub reports ``CLEAN`` for a draft whose checks pass, so the status alone never
+    says "draft" — and ``gh pr merge`` on a draft fails. Never raises into the loop."""
+    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "isDraft,mergeStateStatus", cwd=cwd)
+    if rc != 0:
+        return {"mergeStateStatus": "", "isDraft": None}
+    try:
+        data = json.loads(out or "{}")
+    except ValueError:
+        return {"mergeStateStatus": "", "isDraft": None}
+    if not isinstance(data, dict):
+        return {"mergeStateStatus": "", "isDraft": None}
+    draft = data.get("isDraft")
+    return {
+        "mergeStateStatus": str(data.get("mergeStateStatus") or "").strip(),
+        "isDraft": draft if isinstance(draft, bool) else None,
+    }
+
+
 async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     """The PR's ``mergeStateStatus`` — ``CLEAN`` / ``BEHIND`` / ``DIRTY`` / ``BLOCKED``
     / ``UNSTABLE`` / ``UNKNOWN`` / ``DRAFT`` / ``HAS_HOOKS`` — or ``""`` on a gh
     failure. ``BEHIND`` = stale base, no conflict (a clean rebase fixes it); ``DIRTY``
     = a real conflict with base; ``BLOCKED`` = checks not satisfied (the CI reconcile's
-    job, not the rebase's). Never raises into the loop."""
-    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "mergeStateStatus", "--jq", ".mergeStateStatus", cwd=cwd)
-    return out.strip() if rc == 0 else ""
+    job, not the rebase's). Never raises into the loop. (The status half of
+    ``pr_merge_info`` — the rebase edge only needs this.)"""
+    return (await pr_merge_info(pr_url, cwd=cwd))["mergeStateStatus"]
 
 
 async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tuple[bool, str]:
