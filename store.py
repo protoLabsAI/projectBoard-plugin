@@ -180,6 +180,10 @@ LABEL_DELIVERABLE_PREFIX = "deliverable:"
 # What the puller admits (#217): coding features AND task-type beads — everything
 # else (epics, milestones) stays structural and is never claimed.
 PULLABLE_ISSUE_TYPES = ("feature", "task")
+# The board states a MANUAL Done edge (#228, mark_done) accepts: only a feature already
+# in flight can be hand-closed. backlog/ready have shipped nothing to record; done/
+# cancelled are already terminal (re-closing is a no-op or an unwanted state-flip).
+_MANUAL_DONE_SOURCE_STATES = ("in_progress", "in_review", "blocked")
 # Which PROJECT a feature belongs to (#90): a `project:<name>` label naming the entry
 # in the board's `projects:` map (projects.py) that owns this feature — so one board
 # instance can serve multiple repos, the Ready gate validating each feature's paths
@@ -1448,6 +1452,57 @@ class BeadsBoard:
                     )
             self._run("close", fid, "-r", f"merged: {pr_url}")
         return self.get_feature(f["id"])
+
+    # ── the MANUAL Done edge (#228): shipped outside the board's PR lifecycle ──
+    def mark_done(self, fid: str, *, reason: str = "") -> dict:
+        """Mark a feature `done` by hand — for work that shipped OUTSIDE the board's
+        PR lifecycle (a change landed via another repo/tool, a feature completed
+        off-board), where record_merge's pr_url→external_ref match never fires.
+
+        record_merge is the ONLY automatic path to `done` and needs a matching
+        `external_ref`; this is its manual sibling — a THIRD `br close` edge beside
+        record_merge/record_verification (the cancel_feature precedent), deliberately
+        narrow: it accepts only a feature already IN FLIGHT (in_progress / in_review /
+        blocked) and refuses a backlog/ready card (nothing shipped to record) or an
+        already-terminal one (done/cancelled — closing again is a no-op at best, a
+        state-flip at worst).
+
+        Transitions to `done` the SAME way record_merge does — clear the `blocked`
+        label and drop open incoming `blocks` edges FIRST (`br close` refuses while
+        blockers are unresolved), then `br close`. The close also flips this feature's
+        status to `closed`, so every dependent's incoming edge reads `closed` and they
+        stop being dag_blocked (#145). The `reason` is recorded as a comment (the audit
+        trail: WHY this was hand-closed — record_merge points at a PR, here the
+        operator's reason is the only provenance) and echoed into the close reason."""
+        f = self._require(fid)
+        state = f["board_state"]
+        if state not in _MANUAL_DONE_SOURCE_STATES:
+            raise BoardError(
+                f"mark_done accepts in_progress/in_review/blocked, got {state!r} "
+                "(backlog/ready have nothing shipped; done/cancelled are already terminal)"
+            )
+        fid = f["id"]
+        # Same as record_merge: whatever blocked the card is moot once its work shipped —
+        # clear the blocked label and drop open incoming edges FIRST, or `br close` refuses
+        # and a blocked card stays stuck in `blocked` forever needing a hand-unblock.
+        if LABEL_BLOCKED in (f.get("labels") or []):
+            self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+        for blocker_id in self._open_blockers(fid):
+            try:
+                self.remove_dependency(fid, blocker_id)
+                log.info("[project_board] mark_done %s: dropped blocks edge from %s", fid, blocker_id)
+            except BoardError:
+                log.warning(
+                    "[project_board] mark_done %s: could not drop edge from %s (close may still fail)",
+                    fid,
+                    blocker_id,
+                )
+        # Audit trail: record WHY this was hand-closed BEFORE the close (the close is the
+        # last write, so the comment lands even if a later projection read hiccups).
+        if reason:
+            self._comment(fid, f"done: {reason}")
+        self._run("close", fid, "-r", f"done: {reason}" if reason else "done (manual)")
+        return self.get_feature(fid)
 
     # ── the task Done edge (#217): verify, not merge ──────────────────────────
     def record_verification(self, fid: str, approved: bool = True, feedback: str = "") -> dict:

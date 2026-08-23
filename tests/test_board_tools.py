@@ -61,6 +61,7 @@ def test_lifecycle_tools_are_registered():
     names = {t.name for t in pb._board_tools({})}
     assert {
         "board_cancel_feature",
+        "board_mark_done",
         "board_requeue_feature",
         "board_block_feature",
         "board_unblock_feature",
@@ -101,6 +102,41 @@ def test_board_cancel_feature_strips_wrapping_quotes_from_reason(make_board, mon
     # the wrapping quotes are peeled before the reason reaches the audit trail.
     (close,) = br.cmds("close")
     assert close == ("close", "bd-1", "-r", "cancelled: bad decomposition")
+
+
+# ── board_mark_done → store.mark_done (the manual Done edge, #228) ──────────────────
+
+
+def test_board_mark_done_closes_the_feature_with_a_done_reason(make_board, monkeypatch):
+    """The wrapper calls through to store.mark_done: the bead is closed with an auditable
+    `done: <reason>` and the projection reads `done` (get_feature returns the in-flight
+    source first — what mark_done validates — then the closed projection it echoes back)."""
+    br = _RecordingBr()
+    board = make_board(br)
+    calls = {"n": 0}
+
+    def _gf(fid):
+        calls["n"] += 1
+        return {"id": fid, "board_state": "in_progress" if calls["n"] == 1 else "done", "labels": []}
+
+    monkeypatch.setattr(board, "get_feature", _gf)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(_get_tool("board_mark_done").invoke({"feature_id": "bd-1", "reason": "shipped off-board"}))
+
+    assert out == {"id": "bd-1", "state": "done"}
+    (close,) = br.cmds("close")
+    assert close == ("close", "bd-1", "-r", "done: shipped off-board")
+
+
+def test_board_mark_done_strips_wrapping_quotes_from_reason(make_board, monkeypatch):
+    _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_review", "labels": []})
+
+    _get_tool("board_mark_done").invoke({"feature_id": "bd-1", "reason": '"shipped off-board"'})
+
+    # the wrapping quotes are peeled before the reason reaches the audit trail.
+    (close,) = br.cmds("close")
+    assert close == ("close", "bd-1", "-r", "done: shipped off-board")
 
 
 # ── board_requeue_feature → store.requeue ───────────────────────────────────────────
@@ -266,6 +302,7 @@ def test_board_unblock_feature_removes_the_blocked_label(make_board, monkeypatch
     "name,args",
     [
         ("board_cancel_feature", {"feature_id": "bd-x"}),
+        ("board_mark_done", {"feature_id": "bd-x"}),
         ("board_requeue_feature", {"feature_id": "bd-x"}),
         ("board_block_feature", {"feature_id": "bd-x", "reason": "r"}),
         ("board_unblock_feature", {"feature_id": "bd-x"}),
@@ -408,6 +445,7 @@ _MINIMAL_ARGS = {
     "board_get_feature": {"feature_id": "bd-1"},
     "board_mark_ready": {"feature_id": "bd-1"},
     "board_cancel_feature": {"feature_id": "bd-1"},
+    "board_mark_done": {"feature_id": "bd-1"},
     "board_requeue_feature": {"feature_id": "bd-1"},
     "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
     "board_unblock_feature": {"feature_id": "bd-1"},

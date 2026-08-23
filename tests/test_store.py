@@ -926,6 +926,129 @@ def test_record_merge_does_not_reclose_a_done_feature(make_board, monkeypatch):
     assert br.cmds("close") == []  # already done → idempotent, no second close
 
 
+# ── the MANUAL Done edge (#228): mark_done for work shipped off-board ─────────────
+
+
+def _source_then_done(source_state):
+    """A stateful ``get_feature``: the source projection on the FIRST read (what
+    ``mark_done`` validates), then the closed ``done`` projection on every later read
+    (what it returns). A blocked source carries the ``blocked`` label so the
+    clear-blocked step has something to remove — exactly the real projection."""
+    labels = ["blocked"] if source_state == "blocked" else []
+    calls = {"n": 0}
+
+    def _gf(fid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"id": fid, "board_state": source_state, "labels": labels}
+        return {"id": fid, "board_state": "done", "labels": []}
+
+    return _gf
+
+
+@pytest.mark.parametrize("source", ["in_progress", "in_review", "blocked"])
+def test_mark_done_closes_an_in_flight_feature_with_a_done_reason(make_board, monkeypatch, source):
+    """From any in-flight state (in_progress / in_review / blocked) mark_done closes the
+    bead with an auditable `done: <reason>` — the manual sibling of record_merge for work
+    that shipped outside the board's PR lifecycle — and the projection reads `done`."""
+    br = Br()  # `show` → [] : no open blockers gate this feature
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _source_then_done(source))
+    f = b.mark_done("bd-1", reason="shipped in the monorepo")
+    close = next(c for c in br.calls if c[0] == "close")
+    assert close == ("close", "bd-1", "-r", "done: shipped in the monorepo")
+    assert f["board_state"] == "done"
+
+
+def test_mark_done_records_the_reason_as_a_comment(make_board, monkeypatch):
+    """The reason is the only provenance a hand-close has (record_merge points at a PR),
+    so it's written to the bead as a `done: <reason>` comment for the audit trail."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _source_then_done("in_progress"))
+    b.mark_done("bd-1", reason="landed via the CLI rewrite")
+    comment = next(c for c in br.calls if c[0] == "comments")
+    assert comment == ("comments", "add", "bd-1", "done: landed via the CLI rewrite")
+
+
+def test_mark_done_without_a_reason_closes_bare_and_skips_the_comment(make_board, monkeypatch):
+    """No reason → a bare `done (manual)` close and NO comment (nothing to record)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _source_then_done("in_review"))
+    b.mark_done("bd-1")
+    close = next(c for c in br.calls if c[0] == "close")
+    assert close == ("close", "bd-1", "-r", "done (manual)")
+    assert not any(c[0] == "comments" for c in br.calls)
+
+
+def test_mark_done_from_blocked_clears_the_blocked_label_first(make_board, monkeypatch):
+    """A blocked card can be hand-done too: like record_merge, mark_done clears the
+    `blocked` label before closing (or `br close` refuses / the card stays stuck)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _source_then_done("blocked"))
+    b.mark_done("bd-1", reason="unblocked out-of-band")
+    update = next(c for c in br.calls if c[0] == "update")
+    assert update == ("update", "bd-1", "--remove-label", "blocked")
+    assert any(c[0] == "close" for c in br.calls)  # …and it still closes
+
+
+def test_mark_done_drops_open_blocker_edges_so_dependents_unblock(make_board, monkeypatch):
+    """mark_done resolves the feature's open incoming `blocks` edges BEFORE `br close`
+    (which refuses while blockers are open), then closes — flipping the feature to
+    `closed` so every dependent's edge to it reads closed and they stop being
+    dag_blocked (#145). Mirrors record_merge / cancel_feature's drop-then-close."""
+    bead_with_deps = {
+        "id": "bd-1",
+        "dependencies": [
+            {"id": "bd-a", "dependency_type": "blocks", "status": "open"},
+            {"id": "bd-b", "dependency_type": "blocks", "status": "in_progress"},
+        ],
+    }
+    br = Br({"show": [bead_with_deps]})  # `_open_blockers` reads these two open edges
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _source_then_done("in_progress"))
+    b.mark_done("bd-1", reason="done")
+    dep_removes = [c for c in br.calls if c[0] == "dep" and c[1] == "remove"]
+    assert {c[3] for c in dep_removes} == {"bd-a", "bd-b"}
+    assert any(c[0] == "close" for c in br.calls)  # closed AFTER the edges were dropped
+
+
+def test_dependent_unblocks_once_its_blocker_is_marked_done(make_board):
+    """The unblock is real, not just an edge-drop: after mark_done closes a blocker, a
+    dependent whose dep record now reads status=closed projects as NOT dag_blocked —
+    the same resolution record_merge/cancel produce (#145)."""
+    b = make_board(Br())
+    dependent = {
+        "id": "bd-child",
+        "status": "open",
+        "labels": ["ready"],
+        "dependencies": [{"id": "bd-parent", "dependency_type": "blocks", "status": "closed"}],
+    }
+    assert b._project(dependent)["dag_blocked"] is False
+
+
+@pytest.mark.parametrize("bad", ["backlog", "ready", "done", "cancelled"])
+def test_mark_done_rejects_a_feature_not_in_flight(make_board, monkeypatch, bad):
+    """mark_done is a narrow edge: backlog/ready have shipped nothing to record, and
+    done/cancelled are already terminal. Each raises, and writes NOTHING (no close,
+    no comment, no label churn) — the board is untouched on a rejected transition."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": bad, "labels": []})
+    with pytest.raises(BoardError, match="mark_done accepts"):
+        b.mark_done("bd-1", reason="nope")
+    assert not any(c[0] in ("close", "comments", "update") for c in br.calls)
+
+
+def test_mark_done_unknown_id_raises(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "get_feature", lambda fid: None)
+    with pytest.raises(BoardError, match="unknown feature"):
+        b.mark_done("nope", reason="x")
+
+
 # ── foundation flag + the relaxed (review) dependency gate ───────────────────────
 
 

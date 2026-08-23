@@ -619,6 +619,26 @@ def _board_tools(cfg: dict):
         return json.dumps({"id": f["id"], "state": f["board_state"], **side})
 
     @tool
+    def board_mark_done(feature_id: str, reason: str = "") -> str:
+        """Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that
+        shipped OUTSIDE the board's PR lifecycle (the change landed via another repo/tool,
+        or the feature completed off-board), where record_merge's automatic pr_url match
+        never fires. Accepts only an in-flight card (in_progress / in_review / blocked) and
+        errors on a backlog/ready card (nothing shipped yet) or an already-terminal one
+        (done/cancelled). Closes the bead like record_merge — clears the `blocked` flag,
+        drops open blocker edges, then closes — so its dependents unblock. `reason` is
+        recorded as a comment (the audit trail for WHY it was hand-closed) and is stripped
+        of any literal wrapping double quotes first (same hygiene as board_create_feature).
+        Use board_cancel_feature instead to RETIRE a bad card (a distinct `cancelled`
+        state); this marks GENUINELY-completed work done."""
+        try:
+            reason = _strip_wrapping_quotes(reason)
+            f = get_store(**store_kw).mark_done(feature_id, reason=reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_requeue_feature(feature_id: str, findings: str = "") -> str:
         """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
         the fix-round doctrine needs to carry review findings to the SAME branch.
@@ -811,6 +831,7 @@ def _board_tools(cfg: dict):
         board_get_feature,
         board_mark_ready,
         board_cancel_feature,
+        board_mark_done,
         board_requeue_feature,
         board_block_feature,
         board_unblock_feature,
