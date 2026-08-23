@@ -41,7 +41,9 @@ import logging
 import os
 import re
 import shutil
+import sys
 import time
+import types
 
 from . import coder_seam, config, setup_check, worktree
 from .failures import classify
@@ -499,6 +501,87 @@ def _plugin_section(new_config) -> dict:
     return {}
 
 
+# ── operator cancel of an in-flight drive (#211) ──────────────────────────────
+# The cancel verbs (the board_cancel_feature tool, POST …/cancel) live in the same
+# process as the loop but hold no handle on it. This process-stable sys.modules slot
+# (the coder_seam #178 pattern — survives a plugin reload, which re-imports this
+# module while the loop surface keeps running) maps fid → the running drive task, so
+# a cancel can stop the coder instead of letting the drive run on to open a PR.
+_DRIVE_SLOT_PREFIX = "project_board.live_drives::"
+
+
+def _drive_slot():
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+    name = _DRIVE_SLOT_PREFIX + pkg
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's running drive tasks (#211) — data, not code."
+        holder.drives = {}
+        sys.modules[name] = holder
+    return holder
+
+
+def _register_drive(fid: str, task) -> None:
+    _drive_slot().drives[fid] = task
+
+
+def _unregister_drive(fid: str, task) -> None:
+    drives = _drive_slot().drives
+    if drives.get(fid) is task:
+        drives.pop(fid, None)
+
+
+def live_drive(fid: str):
+    """The running drive task for ``fid``, or None."""
+    task = _drive_slot().drives.get(fid)
+    return None if task is None or task.done() else task
+
+
+def request_drive_cancel(fid: str) -> bool:
+    """Cancel the running drive for ``fid`` (its coder subprocess is reaped by
+    dispatch_coder's ``finally``; the drive's own CancelledError handler closes an
+    already-opened PR, reaps the worktree and comments the card). Thread-safe: the
+    cancel verbs run in a worker thread. Returns True if a live drive was signalled."""
+    task = live_drive(fid)
+    if task is None:
+        return False
+    try:
+        task.get_loop().call_soon_threadsafe(task.cancel)
+    except Exception:  # noqa: BLE001 — loop closed / task gone
+        return False
+    return True
+
+
+def cancel_pr_comment(fid: str) -> str:
+    return f"cancelled by operator — see card {fid}"
+
+
+def cancel_side_effects(fid: str, pr_url: str = "", *, cwd: str = ".") -> dict:
+    """What a cancel must do BEYOND the store edge (#211): close the card's open PR
+    (best-effort — a gh failure logs a warning and never blocks the cancel) and stop
+    its in-flight drive, if any. Shared by the tool and the route; sync, so it runs
+    in the tool's worker thread as-is and via ``asyncio.to_thread`` from the route."""
+    out = {"pr_closed": False, "pr_detail": "", "drive_cancelled": False}
+    if pr_url:
+        ok, detail = worktree.close_pr_sync(pr_url, comment=cancel_pr_comment(fid), cwd=cwd)
+        if ok and detail in (worktree.PR_ALREADY_MERGED, worktree.PR_ALREADY_CLOSED):
+            # Nothing to close — say which, never "closed" (and never ask for a by-hand
+            # close of merged work).
+            out["pr_detail"] = detail
+            log.info("[project_board] %s cancelled — %s %s, nothing to close", fid, pr_url, detail)
+        elif ok:
+            out["pr_closed"] = True
+            log.info("[project_board] %s cancelled — closed %s", fid, pr_url)
+        else:
+            out["pr_detail"] = detail[:300]
+            log.warning("[project_board] %s cancelled — could not close %s: %s", fid, pr_url, detail[:300])
+    out["drive_cancelled"] = request_drive_cancel(fid)
+    if out["drive_cancelled"]:
+        log.info("[project_board] %s cancelled — stopping its in-flight drive", fid)
+    return out
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -846,6 +929,10 @@ class BoardLoop:
         # base that moves repeatedly doesn't burn a gate run every poll forever.
         self._merged_verify_attempts: dict[str, int] = {}
         self._auto_merge_failures: dict[str, int] = {}
+        # #211: drives whose operator-cancel cleanup already ran (or is running) — a
+        # second cancel verb landing mid-cleanup re-enters _drive's CancelledError
+        # handler; this keeps the close + trail comment from happening twice.
+        self._cancel_done: set[str] = set()
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
@@ -1569,6 +1656,7 @@ class BoardLoop:
                 file_owner.setdefault(key, claimed["id"])
             task = asyncio.create_task(self._drive(claimed), name=f"pb-drive-{claimed['id']}")
             self._drives.add(task)
+            _register_drive(claimed["id"], task)  # reachable by the cancel verbs (#211)
             task.add_done_callback(self._make_drive_done_cb(claimed["id"]))
             busy |= files
             selected.append(claimed["id"])
@@ -1587,6 +1675,8 @@ class BoardLoop:
         def _cb(task: asyncio.Task):
             self._drives.discard(task)
             self._inflight_files.pop(fid, None)
+            _unregister_drive(fid, task)
+            self._cancel_done.discard(fid)  # a later drive of the same card gets its own cancel edge
 
         return _cb
 
@@ -2079,6 +2169,7 @@ class BoardLoop:
         tier = store.current_tier(fid) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
+        pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
         try:
             while True:
@@ -2335,12 +2426,32 @@ class BoardLoop:
                         await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
                         return
+                    # Operator cancel (#211): re-read the card right before the PR edge.
+                    # A card cancelled while the coder was finishing must NOT get a PR —
+                    # the work is the operator's to salvage, not the loop's to publish
+                    # (the old path opened it, then open_review refused the cancelled
+                    # card and left an orphaned red PR nobody owned).
+                    if self._cancelled(store, fid):
+                        await self._end_cancelled_drive(store, fid, repo, wt, branch)
+                        return
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
+                    # …and again after: a cancel that lands during the push/create
+                    # closes the PR it just opened rather than handing it to open_review.
+                    if self._cancelled(store, fid):
+                        await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
+                        return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     if self._shutting_down:
                         log.info("[project_board] %s dispatch aborted by shutdown — no escalation", fid)
                         self._inflight.pop(fid, None)
+                        return
+                    if self._cancelled(store, fid):
+                        # The cancel verb reaped the worktree under the coder (#175) and the
+                        # dispatch/commit failed on it — that is the cancel, not a blockable
+                        # failure on a closed card.
+                        log.info("[project_board] %s dispatch ended by operator cancel: %s", fid, exc)
+                        await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     policy = classify(str(exc))
                     # Empty result (#198): a dispatch that COMPLETED with no worktree
@@ -2455,7 +2566,23 @@ class BoardLoop:
                 # on a terminal block above, and the coder subprocess is already reaped.
                 self._inflight.pop(fid, None)  # built OK — not an interrupted build to reap
                 return
+        except asyncio.CancelledError:
+            if self._shutting_down or self._stop.is_set():
+                raise  # shutdown owns the reap (stop() sweeps _inflight)
+            # An operator cancel stopped this drive mid-flight (#211): the coder
+            # subprocess is already reaped by dispatch_coder's finally; close any PR
+            # it opened, reap the worktree, leave the trail on the card — and end
+            # quietly (the task completes, never a CancelledError in the loop log).
+            log.info("[project_board] %s drive stopped by operator cancel", fid)
+            await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
         except BoardError as exc:
+            if self._cancelled(store, fid):
+                # The card closed under us (open_review refused a cancelled card): a
+                # cancel edge, not a block — and the PR it would have handed over is ours
+                # to close.
+                log.info("[project_board] %s cancelled under the drive: %s", fid, exc)
+                await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
+                return
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
             store.flag_blocked(fid, str(exc))
             self._inflight.pop(fid, None)
@@ -2465,6 +2592,73 @@ class BoardLoop:
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
             self._inflight.pop(fid, None)
+
+    # ── operator cancel during a drive (#211) ────────────────────────────────
+    @staticmethod
+    def _cancelled(store, fid: str) -> bool:
+        """Is the card ``cancelled`` NOW? A fresh store read at the PR seam — fail OPEN
+        (a read failure is not a cancel): the drive then proceeds exactly as before."""
+        try:
+            f = store.get_feature(fid)
+        except Exception:  # noqa: BLE001 — BoardError, a fake store without the read
+            return False
+        return bool(f) and str(f.get("board_state") or "") == "cancelled"
+
+    async def _end_cancelled_drive(self, store, fid: str, repo: str, wt, branch, *, pr_url: str | None = None) -> None:
+        """Finish a drive whose card was cancelled by the operator: close the PR if one
+        opened (with a comment pointing at the card), reap the worktree (#1 lifecycle
+        rule), comment the trail on the card, release the slot. No flag_blocked, no
+        escalation, nothing raised — a cancel is a terminal edge, not a failure.
+
+        Runs ONCE per drive and to completion: a second cancel verb landing while this
+        is awaiting gh/git cancels the drive task again, which would re-enter via the
+        CancelledError handler — the ``_cancel_done`` mark makes that re-entry a no-op,
+        and the body runs shielded so the repeat cancel can't abandon the reap or the
+        trail halfway (a shutdown cancel is still honoured: ``stop()`` owns that reap)."""
+        if fid in self._cancel_done:
+            return
+        self._cancel_done.add(fid)
+        inner = asyncio.ensure_future(self._finish_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url))
+        while True:
+            try:
+                await asyncio.shield(inner)
+                return
+            except asyncio.CancelledError:
+                if inner.done() or self._shutting_down or self._stop.is_set():
+                    inner.cancel()
+                    raise
+                log.info("[project_board] %s repeat cancel during cancel cleanup — finishing it", fid)
+
+    async def _finish_cancelled_drive(self, store, fid: str, repo: str, wt, branch, *, pr_url: str | None) -> None:
+        if not pr_url and branch:
+            # The cancel may have landed INSIDE `git push` / `gh pr create` (the task
+            # cancel kills the child, but GitHub may already have the PR) — the drive
+            # never got a URL back, so look the branch up before declaring "no PR".
+            try:
+                pr_url = await worktree.pr_url_for_branch(branch, cwd=repo) or None
+            except Exception:  # noqa: BLE001 — a gh failure here is not a cancel failure
+                log.debug("[project_board] %s cancel: pr lookup for %s failed", fid, branch, exc_info=True)
+        note = f"cancelled by operator — drive ended without a PR (branch {branch or '?'})"
+        if pr_url:
+            ok, detail = await worktree.close_pr(pr_url, comment=cancel_pr_comment(fid), cwd=repo)
+            if ok and detail in (worktree.PR_ALREADY_MERGED, worktree.PR_ALREADY_CLOSED):
+                note = f"cancelled by operator — {pr_url} {detail}, nothing to close"
+                log.info("[project_board] %s cancelled — %s %s", fid, pr_url, detail)
+            elif ok:
+                note = f"cancelled by operator — closed {pr_url}"
+                log.info("[project_board] %s cancelled — closed %s", fid, pr_url)
+            else:
+                note = f"cancelled by operator — could not close {pr_url} ({detail[:200]}); close it by hand"
+                log.warning("[project_board] %s cancelled — could not close %s: %s", fid, pr_url, detail[:300])
+        if wt:
+            await worktree.remove_worktree(repo, wt, branch or "")
+            note += "; worktree reaped"
+        try:
+            store._comment(fid, note)
+        except Exception:  # noqa: BLE001 — the trail is best-effort
+            log.debug("[project_board] %s cancel comment failed", fid, exc_info=True)
+        self._inflight.pop(fid, None)
+        log.info("[project_board] %s %s", fid, note)
 
     async def _with_source_issue_ref(self, feature: dict, wt: str, body: str) -> str:
         """Stamp the feature's source issue onto the PR body — ``Fixes #n`` when the

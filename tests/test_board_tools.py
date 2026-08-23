@@ -75,7 +75,9 @@ def test_board_cancel_feature_tags_cancelled_and_closes_with_reason(make_board, 
 
     out = json.loads(_get_tool("board_cancel_feature").invoke({"feature_id": "bd-1", "reason": "duplicate"}))
 
-    assert out == {"id": "bd-1", "state": "cancelled"}
+    # #211: the reply also says what the cancel did beyond the board edge — no PR to
+    # close, no drive in flight here.
+    assert out == {"id": "bd-1", "state": "cancelled", "pr_closed": False, "pr_detail": "", "drive_cancelled": False}
     (update,) = br.cmds("update")
     assert update == ("update", "bd-1", "--add-label", "cancelled", "--assignee", "")
     (close,) = br.cmds("close")
@@ -444,3 +446,28 @@ def test_every_tool_returns_boarderror_as_result_never_raises(monkeypatch):
         assert isinstance(out, str) and out.startswith("Error:"), (
             f"{t.name} must return the BoardError as an `Error: …` result, got: {out!r:.120}"
         )
+
+
+# ── #211: a cancel closes the card's open PR + stops its in-flight drive ────────────
+
+
+def test_board_cancel_feature_closes_an_open_pr_best_effort(make_board, monkeypatch):
+    """Cancel during the CI/review bounce: the card has a pr_url — close it with a
+    comment pointing at the card. A gh failure is logged, never an Error reply."""
+    from project_board import worktree
+
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append((url, comment)) or (True, ""),
+    )
+    _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "cancelled", "pr_url": "https://x/pr/4"})
+    out = json.loads(_get_tool("board_cancel_feature").invoke({"feature_id": "bd-1", "reason": "scope cut"}))
+    assert out["pr_closed"] is True and out["drive_cancelled"] is False
+    assert closed == [("https://x/pr/4", "cancelled by operator — see card bd-1")]
+
+    monkeypatch.setattr(worktree, "close_pr_sync", lambda *a, **k: (False, "gh: not found"))
+    _wire(make_board, monkeypatch, {"id": "bd-2", "board_state": "cancelled", "pr_url": "https://x/pr/5"})
+    out = json.loads(_get_tool("board_cancel_feature").invoke({"feature_id": "bd-2"}))
+    assert out["state"] == "cancelled" and out["pr_closed"] is False  # cancel landed; close didn't — said so
