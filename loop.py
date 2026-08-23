@@ -931,6 +931,11 @@ class BoardLoop:
         # second cancel verb landing mid-cleanup re-enters _drive's CancelledError
         # handler; this keeps the close + trail comment from happening twice.
         self._cancel_done: set[str] = set()
+        # #207: cards whose auto-merge is holding on a DRAFT PR and have been told so
+        # on the bead (ONE comment per hold, mirroring the give-up comment — a failed
+        # `gh pr ready` (fork PR, no write on base) is otherwise a silent permanent
+        # hold at DEBUG). Cleared when the PR is seen non-draft again.
+        self._draft_noted: set[str] = set()
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
@@ -1356,7 +1361,9 @@ class BoardLoop:
                 return False
             title = f"feat: {f.get('title') or fid}"
             body = await self._with_source_issue_ref(f, wt, _pr_body("", f))
-            pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
+            pr_url = await worktree.open_pr(
+                wt, branch, base=base, title=title, body=body, promote_draft=not f.get("pr_url")
+            )
             store.open_review(fid, pr_url=pr_url)
             self._clear_verified(store, fid)
             log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
@@ -1863,8 +1870,10 @@ class BoardLoop:
         feature = store.get_feature(fid)
         why = await self._auto_merge_blockers(store, feature, pr_url, repo)
         if why:
+            self._note_draft_hold(store, fid, pr_url, why)
             log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
             return False
+        self._draft_noted.discard(fid)
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
@@ -1898,6 +1907,29 @@ class BoardLoop:
                 "[project_board] %s auto-merge refused (attempt %d/%d): %s", fid, n, self.auto_merge_max, detail
             )
         return False
+
+    def _note_draft_hold(self, store, fid: str, pr_url: str, why: list[str]) -> None:
+        """ONE bead comment the first time the auto-merge edge holds on a draft (#207):
+        `open_pr`'s `gh pr ready` can fail (a fork PR, no write on base) or the operator
+        may have drafted the PR — either way the hold was only a DEBUG line, invisible
+        on the card. Mirrors the give-up comment; a comment failure never breaks the
+        reconcile. The mark clears when the PR is seen non-draft, so a later re-draft
+        is noted again (once)."""
+        if not any(w.startswith("draft") for w in why):
+            self._draft_noted.discard(fid)
+            return
+        if fid in self._draft_noted:
+            return
+        self._draft_noted.add(fid)
+        try:
+            store._comment(
+                fid,
+                f"auto-merge is holding: the PR is a draft — run `gh pr ready {pr_url}` (or leave it drafted "
+                f"as a hold); the loop never spends a merge attempt on a draft",
+            )
+        except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+            log.warning("[project_board] %s draft-hold comment failed", fid, exc_info=True)
+        log.info("[project_board] %s auto-merge holding on a draft PR: %s", fid, pr_url)
 
     async def _maybe_rebase(self, store, feature: dict, pr_url: str, repo: str) -> bool:
         """If a sibling merge left this in_review PR BEHIND/DIRTY vs base, refresh it.
@@ -2448,7 +2480,13 @@ class BoardLoop:
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
-                    pr_url = await worktree.open_pr(wt, branch, base=base, title=title, body=body)
+                    # #207: un-draft an adopted PR only on the card's FIRST adoption (no
+                    # pr_url yet → the draft is the coder's). A re-dispatch of a card that
+                    # already owns its PR (CI-fail bounce) leaves a draft alone: that is
+                    # the operator's hold on the loop's own PR, not the coder's.
+                    pr_url = await worktree.open_pr(
+                        wt, branch, base=base, title=title, body=body, promote_draft=not feature.get("pr_url")
+                    )
                     # …and again after: a cancel that lands during the push/create
                     # closes the PR it just opened rather than handing it to open_review.
                     if self._cancelled(store, fid):

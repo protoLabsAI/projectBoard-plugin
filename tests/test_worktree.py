@@ -129,6 +129,19 @@ async def test_open_pr_adopting_a_coder_made_draft_marks_it_ready(monkeypatch, c
     assert "the loop owns the PR lifecycle" in caplog.text
 
 
+async def test_open_pr_leaves_a_draft_alone_when_promote_draft_is_off(monkeypatch):
+    """The re-dispatch of a card that already owns its PR (#207 review): the loop
+    passes promote_draft=False, so an operator's draft-as-hold on the loop's own PR
+    survives the CI-fail bounce — the URL is still adopted, no isDraft read, no
+    `gh pr ready`."""
+    git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
+    gh = _adopt_gh(view_json=(0, '{"isDraft": true, "mergeStateStatus": "CLEAN"}', ""))
+    _install(monkeypatch, git, gh)
+    url = await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t", promote_draft=False)
+    assert url == "https://example/pr/existing"
+    assert not [c for c in gh.calls if c[1] == "ready" or "isDraft,mergeStateStatus" in c]
+
+
 async def test_open_pr_adopting_a_non_draft_never_runs_pr_ready(monkeypatch):
     """The loop's OWN PR on a re-dispatch (not a draft) — byte-for-byte the old path."""
     git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})

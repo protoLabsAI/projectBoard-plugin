@@ -383,14 +383,22 @@ async def commit_worktree(worktree: str, message: str) -> None:
         raise WorktreeError(f"commit failed: {(e or o).strip()[:200]}")
 
 
-async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str, body: str = "") -> str:
+async def open_pr(
+    worktree: str, branch: str, *, base: str = "main", title: str, body: str = "", promote_draft: bool = True
+) -> str:
     """Commit + push the worktree's branch and open (or reuse) a PR; return its URL.
 
     Operates **inside the worktree** (the confinement boundary). Raises
     ``NoChangesError`` if the coder produced nothing (no commits vs ``base``) — the
     loop escalates that, vs a push/`gh` failure which it treats as infra → Blocked.
     Idempotent: if a PR already exists for the branch (a re-dispatch after CI fail),
-    it pushes the new commits and returns the existing PR url instead of erroring."""
+    it pushes the new commits and returns the existing PR url instead of erroring.
+
+    ``promote_draft`` (#207): when the existing PR is a DRAFT, mark it ready — meant
+    for the FIRST adoption only (the card has no ``pr_url`` yet, so the draft is the
+    coder's, not the operator's). The loop passes ``False`` on a re-dispatch of a card
+    that already owns a PR: an operator who converted the loop's own PR to draft as a
+    hold must not have it silently un-drafted by the next CI-fail bounce."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     _rc, out, _err = await _git(worktree, "rev-list", "--count", f"{base}..HEAD")
@@ -418,7 +426,8 @@ async def open_pr(worktree: str, branch: str, *, base: str = "main", title: str,
         vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
             url = vout.strip()
-            await _promote_adopted_draft(url, branch, cwd=worktree)
+            if promote_draft:
+                await _promote_adopted_draft(url, branch, cwd=worktree)
             return url
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
 
@@ -433,7 +442,9 @@ async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
     refuses with "pull request is in draft state", and every retry burns an
     ``auto_merge_max`` attempt. Best-effort: an ``isDraft`` read or ``gh pr ready``
     failure logs and proceeds — ``_auto_merge_blockers``' named ``draft`` blocker is
-    the backstop. A non-draft (the loop's own PR on a re-dispatch) is untouched."""
+    the backstop. A non-draft is untouched — and ``open_pr`` only calls this on the
+    card's FIRST adoption (``promote_draft``), never on a re-dispatch of a card that
+    already owns its PR (an operator's draft-as-hold on the loop's own PR stays)."""
     try:
         info = await pr_merge_info(pr_url, cwd=cwd)
     except WorktreeError as exc:
