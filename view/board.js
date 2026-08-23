@@ -383,6 +383,68 @@ function toolLine(t){
   return '<li><span class="st-'+st+'">'+st+'</span> '+esc(t.name||"tool")
     + (t.kind?' <span class="loc">['+esc(t.kind)+']</span>':"")+loc+'</li>';
 }
+// ── "saying" markdown (bd-p87t): the coder's streamed answer_tail is markdown prose
+// (headings, code blocks, inline code, bold/italic, lists, links), so the "saying"
+// section renders it THROUGH a client-side markdown pass instead of showing raw esc()'d
+// syntax. The renderer (marked) loads LAZILY from CDN on the first drawer open and is
+// cached; if it never loads, the section keeps the plain esc()'d text genCard emits
+// inline (the fallback). "thinking" (thought_tail) is internal reasoning, not prose, so
+// it stays plain esc()'d text — only "saying" is upgraded.
+const MARKED_CDN = "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js";
+let MARKED = null, MARKED_LOAD = null;
+function loadMarked(){
+  if (MARKED_LOAD) return MARKED_LOAD;                    // load once; cache the promise
+  MARKED_LOAD = new Promise((resolve) => {
+    if (window.marked) return resolve(window.marked);
+    const s = document.createElement("script");
+    s.src = MARKED_CDN;
+    s.async = true;                                       // lazy — never blocks initial paint
+    s.onload = () => resolve(window.marked || null);
+    s.onerror = () => resolve(null);                      // CDN blocked/offline → plain-text fallback
+    (document.head || document.documentElement).appendChild(s);
+  }).then((m) => (MARKED = m || null));
+  return MARKED_LOAD;
+}
+// Parse markdown → HTML with a hard XSS guard: escape angle brackets in the SOURCE first,
+// so any HTML tags in the coder's text render as literal characters, never live markup
+// (marked passes source HTML through by default). Markdown syntax (#, *, `, -, [](), etc.)
+// is angle-bracket-free, so it is untouched and still renders. breaks:true keeps the
+// coder's newlines; gfm:true enables fenced code + tables.
+function renderMarkdown(marked, src){
+  const safe = String(src).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const parse = (marked && marked.parse) ? marked.parse : marked;   // marked.parse spans UMD versions
+  return parse(safe, {breaks: true, gfm: true});
+}
+// Belt-and-suspenders on top of the source escape: neutralize the only attributes markdown
+// syntax can emit (link href / image src) by dropping dangerous URL schemes, and open any
+// links safely in a new tab.
+function sanitizeSaying(el){
+  el.querySelectorAll("a[href],img[src]").forEach((n) => {
+    const attr = n.tagName === "A" ? "href" : "src";
+    if (/^\s*(?:javascript|data|vbscript):/i.test(n.getAttribute(attr) || "")) n.removeAttribute(attr);
+    if (n.tagName === "A") { n.setAttribute("target", "_blank"); n.setAttribute("rel", "noopener noreferrer nofollow"); }
+  });
+}
+// Upgrade every "saying" block in the just-rendered drawer from its plain esc()'d fallback
+// to rendered markdown. Lazy + best-effort: synchronous (no flash) once the lib is cached,
+// a no-op if the CDN load fails (the esc()'d fallback stays). Re-runs on each poll
+// re-render, since renderMonitor rebuilds innerHTML into fresh nodes.
+function enhanceSaying(root){
+  const nodes = root.querySelectorAll(".md-saying");
+  if (!nodes.length) return;
+  const apply = (marked) => {
+    if (!marked) return;                                  // load failed → keep the esc()'d fallback
+    nodes.forEach((el) => {
+      if (el.dataset.mdOn) return;
+      el.innerHTML = renderMarkdown(marked, el.getAttribute("data-md") || "");
+      sanitizeSaying(el);
+      el.classList.add("md-on");                          // swaps pre-wrap → block flow + markdown CSS
+      el.dataset.mdOn = "1";
+    });
+  };
+  if (MARKED) apply(MARKED);                              // already cached → upgrade synchronously
+  else loadMarked().then(apply);
+}
 function genCard(g){
   let h = '<div class="gen"><div class="gh"><span class="gn">gen '+esc(String(g.gen))+'</span>'
     + (g.tier?'<span class="pl-badge">'+esc(g.tier)+'</span>':"")
@@ -405,7 +467,12 @@ function genCard(g){
         + (cur.locations&&cur.locations.length?' <span class="loc">'+esc(cur.locations.join(", "))+'</span>':"")
         + (cur.input_preview?'<div class="inprev">'+esc(cur.input_preview)+'</div>':"")
        : "—") + '</div>';
-  if (g.answer_tail){ h += '<div class="lbl">saying</div><div class="thought">'+esc(g.answer_tail)+'</div>'; }
+  // "saying" is markdown — carry the raw source on data-md and render esc()'d text inline
+  // as the fallback; enhanceSaying() upgrades it to rendered markdown once marked loads.
+  // The .thought class is kept so it inherits the drawer's scroll/overflow cap + lone-gen
+  // fill (#218/#226-UX); .md-saying is the enhancement hook.
+  if (g.answer_tail){ h += '<div class="lbl">saying</div><div class="thought md-saying" data-md="'+esc(g.answer_tail)+'">'+esc(g.answer_tail)+'</div>'; }
+  // "thinking" stays plain esc()'d text — internal reasoning, not user-facing prose.
   if (g.thought_tail){ h += '<div class="lbl">thinking</div><div class="thought">'+esc(g.thought_tail)+'</div>'; }
   const rt = (g.recent_tools||[]).slice(-30).reverse();
   if (rt.length){ h += '<div class="lbl">recent tools</div><ul class="tools">'+rt.map(toolLine).join("")+'</ul>'; }
@@ -419,6 +486,7 @@ function renderMonitor(data){
   $("drawer-body").innerHTML = gens.length
     ? gens.map(genCard).join("")
     : '<div class="pl-empty">No live coder run for this feature right now.</div>';
+  enhanceSaying($("drawer-body"));   // upgrade "saying" plain text → rendered markdown (lazy, best-effort)
 }
 async function pollMonitor(){
   if (!MON_FID) return;
