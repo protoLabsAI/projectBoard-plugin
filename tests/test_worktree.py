@@ -90,6 +90,113 @@ async def test_open_pr_reuses_an_existing_pr_on_redispatch(monkeypatch):
     assert url == "https://example/pr/existing"
 
 
+def _adopt_gh(*, view_json, ready=(0, "", "")):
+    """A `_gh` stub for the open_pr reuse path (#207): `pr create` says the PR exists,
+    `pr view --json url` resolves it, `pr view --json isDraft,mergeStateStatus` returns
+    ``view_json``, and `pr ready` answers ``ready``. Records every call."""
+    calls = []
+
+    async def _gh(*args, cwd, timeout=60):
+        calls.append(args)
+        verb = args[1] if len(args) > 1 else ""
+        if verb == "create":
+            return (1, "", "a pull request for branch already exists")
+        if verb == "view" and "isDraft,mergeStateStatus" in args:
+            return view_json
+        if verb == "view":
+            return (0, "https://example/pr/existing", "")
+        if verb == "ready":
+            return ready
+        return (0, "", "")
+
+    _gh.calls = calls
+    return _gh
+
+
+async def test_open_pr_adopting_a_coder_made_draft_marks_it_ready(monkeypatch, caplog):
+    """#207: the coder ran `gh pr create --draft` itself; the loop's `pr create` hits
+    "already exists" and adopts the URL. A draft must not ride into the review/merge
+    gates (GitHub says CLEAN for a draft, `gh pr merge` refuses it) — the loop owns
+    the PR lifecycle, so it marks the PR ready right here and says so."""
+    git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
+    gh = _adopt_gh(view_json=(0, '{"isDraft": true, "mergeStateStatus": "CLEAN"}', ""))
+    _install(monkeypatch, git, gh)
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        url = await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t")
+    assert url == "https://example/pr/existing"
+    assert ("pr", "ready", "https://example/pr/existing") in gh.calls
+    assert "adopted the coder's DRAFT PR https://example/pr/existing — marked ready" in caplog.text
+    assert "the loop owns the PR lifecycle" in caplog.text
+
+
+async def test_open_pr_leaves_a_draft_alone_when_promote_draft_is_off(monkeypatch):
+    """The re-dispatch of a card that already owns its PR (#207 review): the loop
+    passes promote_draft=False, so an operator's draft-as-hold on the loop's own PR
+    survives the CI-fail bounce — the URL is still adopted, no isDraft read, no
+    `gh pr ready`."""
+    git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
+    gh = _adopt_gh(view_json=(0, '{"isDraft": true, "mergeStateStatus": "CLEAN"}', ""))
+    _install(monkeypatch, git, gh)
+    url = await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t", promote_draft=False)
+    assert url == "https://example/pr/existing"
+    assert not [c for c in gh.calls if c[1] == "ready" or "isDraft,mergeStateStatus" in c]
+
+
+async def test_open_pr_adopting_a_non_draft_never_runs_pr_ready(monkeypatch):
+    """The loop's OWN PR on a re-dispatch (not a draft) — byte-for-byte the old path."""
+    git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
+    gh = _adopt_gh(view_json=(0, '{"isDraft": false, "mergeStateStatus": "BEHIND"}', ""))
+    _install(monkeypatch, git, gh)
+    url = await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t")
+    assert url == "https://example/pr/existing"
+    assert not [c for c in gh.calls if c[1] == "ready"]
+
+
+async def test_open_pr_draft_promotion_is_best_effort(monkeypatch, caplog):
+    """`gh pr ready` failing (or the isDraft read failing) logs a warning and still
+    returns the PR URL — the auto-merge edge's named `draft` blocker is the backstop."""
+    git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
+    gh = _adopt_gh(
+        view_json=(0, '{"isDraft": true, "mergeStateStatus": "CLEAN"}', ""), ready=(1, "", "GraphQL: forbidden")
+    )
+    _install(monkeypatch, git, gh)
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        url = await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t")
+    assert url == "https://example/pr/existing"
+    assert "`gh pr ready` failed (GraphQL: forbidden)" in caplog.text
+    # the isDraft read itself failing → no `pr ready`, URL still returned
+    gh = _adopt_gh(view_json=(1, "", "boom"))
+    _install(monkeypatch, git, gh)
+    assert await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t") == "https://example/pr/existing"
+    assert not [c for c in gh.calls if c[1] == "ready"]
+
+
+async def test_pr_merge_info_reads_status_and_draft_in_one_call(monkeypatch):
+    calls = []
+
+    async def _gh(*args, cwd, timeout=60):
+        calls.append(args)
+        return (0, '{"isDraft": true, "mergeStateStatus": "CLEAN"}', "")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    assert await worktree.pr_merge_info("https://x/pr/1") == {"mergeStateStatus": "CLEAN", "isDraft": True}
+    assert await worktree.pr_merge_state("https://x/pr/1") == "CLEAN"  # the status half, same read
+    assert all("isDraft,mergeStateStatus" in c for c in calls) and len(calls) == 2
+
+    async def _bad(*args, cwd, timeout=60):
+        return (1, "", "not found")
+
+    monkeypatch.setattr(worktree, "_gh", _bad)
+    assert await worktree.pr_merge_info("https://x/pr/1") == {"mergeStateStatus": "", "isDraft": None}
+    assert await worktree.pr_merge_state("https://x/pr/1") == ""
+
+    async def _garbage(*args, cwd, timeout=60):
+        return (0, "not json", "")
+
+    monkeypatch.setattr(worktree, "_gh", _garbage)
+    assert await worktree.pr_merge_info("https://x/pr/1") == {"mergeStateStatus": "", "isDraft": None}
+
+
 async def test_open_pr_blocks_on_a_push_failure(monkeypatch):
     git = FakeGit({"status": (0, "", ""), "rev-list": (0, "1", ""), "push": (1, "", "remote rejected")})
     _install(monkeypatch, git, FakeGh())

@@ -199,6 +199,13 @@ def test_max_mode_n_parsing():
 # ── the coder prompt (ProtoMaker discipline: name the files, demand the diff) ────
 
 
+def test_prompt_tells_the_coder_not_to_open_a_pr():
+    """#207: the coder opened its own DRAFT PR before the loop's open_pr ran. The
+    loop owns the PR lifecycle (title/body/ready/merge) — say so in the Rules."""
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    assert "do NOT open a PR (draft or otherwise) — the loop opens it" in prompt
+
+
 def test_build_prompt_is_imperative_and_lists_the_files():
     prompt = BoardLoop({})._build_prompt(FEATURE)
     assert "Add a thing" in prompt
@@ -489,7 +496,7 @@ async def _drive_with(
 
 
 async def test_drive_opens_review_on_a_clean_build(monkeypatch):
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/1"
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
@@ -501,7 +508,7 @@ async def test_drive_pr_body_is_the_summary_not_the_raw_stream(monkeypatch):
     """open_pr must receive `_pr_body`'s output, never the coder's raw reply (#56)."""
     bodies = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         bodies.append(body)
         return "https://example/pr/9"
 
@@ -521,7 +528,7 @@ async def test_drive_max_mode_fans_out_and_ships_the_winner(monkeypatch):
     ONLY the winner's PR opens (on the canonical branch)."""
     opened = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append((wt, branch))
         return "https://example/pr/7"
 
@@ -558,7 +565,7 @@ async def test_drive_max_mode_all_empty_reaps_all_and_blocks(monkeypatch):
     """Every candidate empty → judge returns None → all candidates reaped, no PR, and
     the feature blocks (NoChangesError, single coder with no ladder)."""
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("no PR should open when every candidate is empty")
 
     async def _judge(feature, base, worktrees):
@@ -579,7 +586,7 @@ async def test_drive_max_mode_skips_fanout_on_a_carried_forward_fix(monkeypatch)
     """A re-dispatch carrying _ci_feedback (a CI bounce / goal-fix / gate-fix) FIXES the
     existing diff with ONE coder — Max-Mode must not re-fan-out N candidates."""
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/9"
 
     async def _judge(feature, base, worktrees):
@@ -606,7 +613,7 @@ async def test_drive_local_gate_failure_redispatches_then_opens(monkeypatch):
         prompts.append(prompt)
         return "reply"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/1"
 
     gate_seq = iter(["FAILED tests/test_config.py::golden - boom", None])
@@ -637,7 +644,7 @@ async def test_drive_local_gate_exhausted_opens_pr_anyway(monkeypatch):
         prompts.append(prompt)
         return "reply"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/2"
 
     async def _gate(wt, feature=None):
@@ -656,7 +663,7 @@ async def test_drive_local_gate_exhausted_opens_pr_anyway(monkeypatch):
 
 
 async def test_drive_blocks_on_an_empty_diff_with_a_single_coder(monkeypatch):
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise worktree.NoChangesError("coder produced no commits")
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
@@ -693,7 +700,7 @@ async def test_drive_classifies_empty_result_and_records_the_stop_reason(monkeyp
         coder_seam.progress_stop_reason("bd-1", 1, "refusal")
         return ""
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch)
@@ -734,7 +741,7 @@ async def test_drive_empty_result_does_not_escalate_the_tier(monkeypatch):
         dispatches.append(prompt)
         return ""
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise worktree.NoChangesError("coder produced no commits")
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
@@ -777,7 +784,7 @@ async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
         coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {"path": "a.py"}})
         return "I read the files but made no edits"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise worktree.NoChangesError("coder produced no commits")
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
@@ -802,7 +809,7 @@ async def test_drive_empty_result_retry_recovers_and_resets_the_count(monkeypatc
     the empty-result count resets (a later empty attempt starts a fresh window)."""
     calls = {"n": 0}
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         calls["n"] += 1
         if calls["n"] == 1:
             raise worktree.NoChangesError("coder produced no commits")
@@ -920,7 +927,7 @@ async def test_drive_skips_pr_when_source_issue_closed(monkeypatch):
     card is cancelled (cancel_feature is called with the supersede reason)."""
     opened = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append((wt, branch))
         return "https://example/pr/99"
 
@@ -942,7 +949,7 @@ async def test_drive_opens_pr_when_source_issue_still_open(monkeypatch):
     """When source_issue is still open, the PR opens normally."""
     opened = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append("https://example/pr/1")
         return opened[-1]
 
@@ -1121,7 +1128,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     monkeypatch.setattr(coder_seam, "dispatch", _fake_dispatch)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/42"
 
     loop, store = await _drive_with(
@@ -1154,7 +1161,7 @@ async def test_drive_skips_fusion_for_a_dispatch_when_files_are_oversized(monkey
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     monkeypatch.setattr(coder_seam, "dispatch", _fake_dispatch)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/42"
 
     feature = {**FEATURE, "repo": str(tmp_path), "files_to_modify": ["big.py"]}
@@ -1186,7 +1193,7 @@ async def test_drive_falls_back_to_single_shot_without_acceptance_criteria(monke
 
     monkeypatch.setattr(coder_seam, "dispatch", _boom)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/1"
 
     feature = dict(FEATURE, acceptance_criteria="")
@@ -1213,7 +1220,7 @@ async def test_drive_falls_back_to_single_shot_when_coder_plugin_unavailable(mon
 
     monkeypatch.setattr(coder_seam, "dispatch", _boom)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/2"
 
     loop, store = await _drive_with(
@@ -1236,7 +1243,7 @@ async def test_drive_falls_back_to_single_shot_without_a_test_command(monkeypatc
 
     monkeypatch.setattr(coder_seam, "dispatch", _boom)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/3"
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto"})  # no test cmd anywhere
@@ -1255,7 +1262,7 @@ async def test_drive_coder_solve_exhausted_blocks_like_a_capability_failure(monk
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     monkeypatch.setattr(coder_seam, "dispatch", _exhausted)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("open_pr should not run — no candidate passed")
 
     loop, store = await _drive_with(
@@ -1279,7 +1286,7 @@ async def test_drive_coder_solve_skipped_on_a_carried_forward_ci_bounce(monkeypa
 
     monkeypatch.setattr(coder_seam, "dispatch", _boom)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/9"
 
     loop, store = await _drive_with(
@@ -1312,7 +1319,7 @@ async def test_drive_max_mode_wins_precedence_over_coder_solve_when_both_configu
 
     monkeypatch.setattr(coder_seam, "dispatch", _boom)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/11"
 
     async def _judge(feature, base, worktrees):
@@ -1338,7 +1345,7 @@ async def test_goal_verify_pass_opens_the_pr(monkeypatch):
 
     monkeypatch.setattr(BoardLoop, "_verify_goal", _ok)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/9"
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "goal_verify": True})
@@ -1361,7 +1368,7 @@ async def test_goal_verify_gap_retries_same_tier_then_opens(monkeypatch):
         dispatched.append(prompt)
         return "reply"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/77"
 
     loop, store = await _drive_with(
@@ -1388,7 +1395,7 @@ async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
     monkeypatch.setattr(BoardLoop, "_verify_goal", _gap)
     opened = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append(True)
         return "https://example/pr/x"
 
@@ -1420,7 +1427,7 @@ async def test_goal_verify_off_by_default_skips_the_gate(monkeypatch):
 
     monkeypatch.setattr(BoardLoop, "_verify_goal", _spy)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/3"
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # default cfg → off
@@ -1473,7 +1480,7 @@ async def test_verify_goal_fails_open_when_no_criteria(monkeypatch):
 
 
 async def test_drive_blocks_when_the_coder_is_not_configured(monkeypatch):
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("open_pr should not be reached")
 
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, coder=None)
@@ -1490,7 +1497,7 @@ async def _no_sleep(_delay):
 async def test_drive_retries_a_transient_failure_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         calls["n"] += 1
         if calls["n"] == 1:
             raise worktree.WorktreeError("git push failed: connection reset by peer")
@@ -1507,7 +1514,7 @@ async def test_drive_retries_a_transient_failure_then_succeeds(monkeypatch):
 async def test_drive_blocks_after_exhausting_transient_retries(monkeypatch):
     calls = {"n": 0}
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         calls["n"] += 1
         raise worktree.WorktreeError("gh pr create failed: 503 service unavailable")
 
@@ -1521,7 +1528,7 @@ async def test_drive_blocks_after_exhausting_transient_retries(monkeypatch):
 async def test_drive_blocks_immediately_on_a_terminal_failure(monkeypatch):
     calls = {"n": 0}
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         calls["n"] += 1
         raise worktree.WorktreeError("gh pr create failed: 403 forbidden — bad credential")
 
@@ -1541,7 +1548,7 @@ async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch
         calls["n"] += 1
         raise worktree.CoderTimeout("coder timed out after 1800s")
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("open_pr should not run after a coder timeout")
 
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
@@ -1590,7 +1597,7 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     async def _reap(repo, root, fid):
         return None
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/1"
 
     prompts = []
@@ -2826,7 +2833,7 @@ async def _recover_salvage(monkeypatch, tmp_path, *, make_wt=True, head="abc123"
 
     opened = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append((wt, branch, base, title))
         return "https://example/pr/91"
 
@@ -2903,7 +2910,7 @@ async def test_recover_salvage_open_pr_error_falls_back_to_rebuild(monkeypatch, 
 
     monkeypatch.setattr(worktree, "promote_worktree", _promote)
 
-    async def _boom_pr(wt, branch, *, base, title, body):
+    async def _boom_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise worktree.WorktreeError("gh exploded")
 
     monkeypatch.setattr(worktree, "open_pr", _boom_pr)
@@ -3919,7 +3926,7 @@ async def test_drive_builds_in_the_features_project_repo(monkeypatch):
     async def _dispatch(*a, **k):
         return "the coder reply"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         captured["pr_base"] = base
         return "https://example/pr/1"
 
@@ -4391,7 +4398,7 @@ async def test_drive_injects_fixes_line_into_the_pr_body(monkeypatch):
     appended to the body the loop hands to open_pr (the coder stays out of the loop)."""
     bodies = []
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         bodies.append(body)
         return "https://example/pr/1"
 
@@ -4477,7 +4484,7 @@ async def test_drive_requirement_gate_bounces_open_items_then_opens(monkeypatch)
         prompts.append(prompt)
         return next(replies)
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/3"
 
     feature = {
@@ -4509,7 +4516,7 @@ async def test_drive_requirement_gate_exhausted_blocks_never_opens(monkeypatch):
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         return "no requirements section at all"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("no PR may open while ledger items are open")
 
     feature = {**FEATURE, "requirements": [{"id": "r1", "text": "restore dict tolerance", "status": "open"}]}
@@ -4526,7 +4533,7 @@ async def test_drive_requirement_gate_exhausted_blocks_never_opens(monkeypatch):
 
 
 async def test_drive_without_a_ledger_never_touches_set_requirements(monkeypatch):
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/4"
 
     _loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no ledger
@@ -4567,7 +4574,7 @@ async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         raise worktree.CoderTimeout("coder killed during shutdown")
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("open_pr must not be reached when shutting down")
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
@@ -4636,7 +4643,7 @@ def _reviewed(**over):
     return f
 
 
-def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True):
+def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True, draft=False):
     calls = {"merge": []}
 
     async def _head(repo, ref):
@@ -4644,6 +4651,10 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
 
     async def _mss(pr_url, *, cwd="."):
         return mss
+
+    async def _info(pr_url, *, cwd="."):
+        # the combined read the merge edge uses (#207): status + isDraft in one gh call
+        return {"mergeStateStatus": mss, "isDraft": draft}
 
     async def _merge(pr_url, *, method="squash", cwd="."):
         calls["merge"].append((pr_url, method, cwd))
@@ -4658,6 +4669,7 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
 
     monkeypatch.setattr(worktree, "origin_head_sha", _head)
     monkeypatch.setattr(worktree, "pr_merge_state", _mss)
+    monkeypatch.setattr(worktree, "pr_merge_info", _info)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
     monkeypatch.setattr(worktree, "pr_state", _state)
     monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
@@ -4711,6 +4723,87 @@ async def test_auto_merge_requires_github_clean(monkeypatch, mss):
     store = _MergeStore(_reviewed())
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
     assert calls["merge"] == []
+
+
+async def test_auto_merge_holds_on_a_draft_as_a_named_blocker_without_spending_an_attempt(monkeypatch, caplog):
+    """#207: GitHub reports mergeStateStatus=CLEAN for a draft whose checks pass, so
+    the status alone never said "draft" — `gh pr merge` then refused ("pull request
+    is in draft state") and each poll burned an auto_merge_max attempt until the card
+    parked on "merge attempts exhausted" with no hint. Now `isDraft` rides the same
+    read and is a named blocker with the one-line fix; no merge call, no attempt."""
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=True)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True, "auto_merge_max": 1})
+    store = _MergeStore(_reviewed())
+    why = await loop._auto_merge_blockers(store, store.get_feature("bd-1"), "https://github.com/o/r/pull/1", "/repo")
+    assert len(why) == 1 and why[0].startswith("draft"), why
+    assert "gh pr ready https://github.com/o/r/pull/1" in why[0]
+    assert "never spends a merge attempt" in why[0]
+    with caplog.at_level("DEBUG", logger="protoagent.plugins.project_board"):
+        for _ in range(3):
+            assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert calls["merge"] == []  # never `gh pr merge`
+    assert "bd-1" not in loop._auto_merge_failures  # never an attempt spent — auto_merge_max=1 did NOT exhaust
+    # ONE bead comment for the hold (the review on #213: a failed `gh pr ready` — fork PR,
+    # no write on base — was otherwise a silent permanent hold at DEBUG) — not a give-up
+    (comment,) = store.comments
+    assert comment[0] == "bd-1" and "auto-merge is holding: the PR is a draft" in comment[1]
+    assert "gh pr ready https://github.com/o/r/pull/1" in comment[1] and "gave up" not in comment[1]
+    assert "not auto-merging: draft" in caplog.text
+    # …and once someone runs `gh pr ready` (isDraft False) the same card merges.
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=False)
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
+    assert len(store.comments) == 1  # the merge added no draft note
+
+
+async def test_draft_hold_comment_is_once_per_hold_and_survives_a_comment_failure(monkeypatch):
+    """Drafted → noted once; un-drafted (still held on something else) → mark cleared;
+    drafted again → noted once more. A failing _comment never breaks the reconcile."""
+    _merge_env(monkeypatch, mss="CLEAN", draft=True)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    for _ in range(3):
+        await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo")
+    assert len(store.comments) == 1 and "bd-1" in loop._draft_noted
+    _merge_env(monkeypatch, mss="BLOCKED", draft=False)  # ready, but checks pending — held, not a draft
+    await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo")
+    assert "bd-1" not in loop._draft_noted and len(store.comments) == 1
+    _merge_env(monkeypatch, mss="CLEAN", draft=True)  # re-drafted as a hold → one more note
+    await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo")
+    assert len(store.comments) == 2
+
+    def _boom(fid, text):
+        raise RuntimeError("br down")
+
+    store._comment = _boom
+    loop._draft_noted.clear()
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+
+
+async def test_drive_promotes_a_draft_only_on_the_cards_first_adoption(monkeypatch):
+    """#207 review: `_promote_adopted_draft` ran on EVERY "already exists" adoption, so
+    an operator who drafted the loop's OWN PR as a hold got it un-drafted by the next
+    CI-fail re-dispatch. The drive passes promote_draft=False when the card already
+    owns a pr_url; a first adoption (no pr_url) still promotes."""
+    seen = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        seen.append(promote_draft)
+        return "https://example/pr/1"
+
+    await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no pr_url → first adoption
+    await _drive_with(monkeypatch, open_pr=_open_pr, feature={**FEATURE, "pr_url": "https://example/pr/1"})
+    assert seen == [True, False]
+
+
+async def test_auto_merge_treats_unknown_isdraft_as_not_a_draft(monkeypatch):
+    """`isDraft: None` (an older gh / field absent) must not hold a CLEAN PR — the
+    status gates as before; only an explicit True is the draft blocker."""
+    calls = _merge_env(monkeypatch, mss="CLEAN", draft=None)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert len(calls["merge"]) == 1
 
 
 async def test_auto_merge_without_review_gate_needs_no_review_label(monkeypatch):
@@ -4930,7 +5023,7 @@ async def _cancel_drive_with(monkeypatch, *, cancel_at, open_review_raises=False
             store.cancelled = True  # the operator cancels while the coder is finishing
         return "## Summary\n\n- did the thing\n"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append(branch)
         if cancel_at == "open_pr":
             store.cancelled = True  # cancel lands during the push/create
