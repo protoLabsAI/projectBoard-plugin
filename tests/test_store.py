@@ -2613,3 +2613,193 @@ def test_shared_file_gate_still_refuses_within_the_same_project(make_board, monk
     monkeypatch.setattr(b, "list_features", lambda *a, **k: [first, second])
     with pytest.raises(BoardError, match="Shared-file gate"):
         b.mark_ready("bd-b")
+
+
+# ── task-type beads (#217): delivery, verification (the task Done edge), the puller ──
+# A bead with issue_type='task' rides the same rails (ready → claim → in_progress →
+# in_review) but ships a DELIVERABLE instead of a PR: record_delivery is its
+# open_pr→open_review edge, record_verification its Done edge (a second `br close`
+# beside record_merge, like cancel_feature is for cancellation).
+
+
+def test_record_delivery_comments_the_text_and_moves_to_in_review(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    f = b.record_delivery("bd-t", text="triage report written to docs/triage.md")
+    assert ("comments", "add", "bd-t", "deliverable: triage report written to docs/triage.md") in br.calls
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # no ref → external_ref untouched
+    assert f["board_state"] == "in_review"
+
+
+def test_record_delivery_with_a_ref_sets_external_ref(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", text="ADR written", ref="docs/adr/0099-task.md")
+    assert ("update", "bd-t", "--add-label", "in-review", "--external-ref", "docs/adr/0099-task.md") in br.calls
+
+
+def test_record_delivery_rejects_a_non_in_progress_state(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "ready", "issue_type": "task"})
+    with pytest.raises(BoardError, match="record_delivery expects in_progress"):
+        b.record_delivery("bd-t", text="too early")
+    assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
+
+
+def test_record_delivery_rejects_a_coding_feature(make_board, monkeypatch):
+    """A coding feature taking the delivery edge would land in_review with NO
+    pr_url and strand the merge reconciler — the hole open_review's pr_url
+    requirement exists to plug. Code enters review via open_review only."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="record_delivery is task-only"):
+        b.record_delivery("bd-1", text="not a deliverable")
+    assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
+
+
+def test_record_verification_approved_closes_with_a_verified_reason(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    f = b.record_verification("bd-t", approved=True)
+    # the task Done edge: a `br close` like record_merge's, with the verifier in the reason
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified: agent")]  # actor defaults to "agent"
+    assert f["board_state"] == "done"
+
+
+def test_record_verification_rejected_comments_feedback_and_requeues(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    f = b.record_verification("bd-t", approved=False, feedback="the report misses the Q3 numbers")
+    assert ("comments", "add", "bd-t", "verification failed: the report misses the Q3 numbers") in br.calls
+    # requeued through the standard edge: back to open+ready, assignee cleared, in-review dropped
+    (up,) = br.cmds("update")
+    assert "--status" in up and "open" in up
+    assert "--assignee" in up  # cleared (paired with "") so the re-pull's `--claim` won't reject
+    assert "--add-label" in up and "ready" in up and "in-review" in up
+    assert br.cmds("close") == []  # a rejection NEVER closes
+    assert f["board_state"] == "ready"
+
+
+def test_record_verification_rejects_a_non_in_review_state(make_board, monkeypatch):
+    b = make_board(Br())
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    with pytest.raises(BoardError, match="record_verification expects in_review"):
+        b.record_verification("bd-t", approved=True)
+
+
+def test_record_verification_rejects_a_coding_feature(make_board, monkeypatch):
+    """A coding feature closed here would dodge record_merge — the ONE Done edge
+    for code (invariant #2) with its idempotency and `merged:` audit reason. The
+    guard refuses BOTH branches: no verify-close, no reject-requeue."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="record_verification is task-only"):
+        b.record_verification("bd-1", approved=True)
+    with pytest.raises(BoardError, match="record_verification is task-only"):
+        b.record_verification("bd-1", approved=False, feedback="nope")
+    assert br.cmds("close") == [] and br.cmds("update") == [] and br.cmds("comments") == []
+
+
+# ── open_review: pr_url optional for tasks only ──────────────────────────────────
+
+
+def test_open_review_allows_a_task_without_a_pr(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    f = b.open_review("bd-t")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # no --external-ref stamped
+    assert f["board_state"] == "in_review"
+
+
+def test_open_review_still_requires_a_pr_for_coding_features(make_board, monkeypatch):
+    """A coding feature entering review without a PR would strand the merge
+    reconciler — the requirement moved from the signature into a named error."""
+    b = make_board(Br())
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="requires a pr_url"):
+        b.open_review("bd-1")
+
+
+def test_open_review_with_a_pr_is_unchanged_for_coding_features(make_board, monkeypatch):
+    """No regression: the coding path still writes label + external-ref in ONE update."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.open_review("bd-1", pr_url="https://example/pr/5")
+    assert ("update", "bd-1", "--add-label", "in-review", "--external-ref", "https://example/pr/5") in br.calls
+
+
+# ── the puller admits task-type beads (#217) ─────────────────────────────────────
+
+
+def test_claim_next_ready_pulls_task_beads_too(make_board, monkeypatch):
+    ready = [
+        {"id": "bd-ep", "issue_type": "epic", "labels": ["ready"]},
+        {"id": "bd-t", "issue_type": "task", "labels": ["ready"]},
+        {"id": "bd-f", "issue_type": "feature", "labels": ["ready"]},
+    ]
+    br = Br({"ready": ready})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    claimed = b.claim_next_ready()
+    assert claimed["id"] == "bd-t"  # priority order preserved — the task came first
+    assert ("update", "bd-t", "--claim", "--remove-label", "ready") in br.calls
+
+
+def test_ready_queue_includes_task_beads(make_board, monkeypatch):
+    ready = [
+        {"id": "bd-f", "issue_type": "feature", "status": "open"},
+        {"id": "bd-t", "issue_type": "task", "status": "open"},
+        {"id": "bd-ms", "issue_type": "milestone", "status": "open"},
+    ]
+    b = make_board(Br({"ready": ready}))
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    assert [f["id"] for f in b.ready_queue()] == ["bd-f", "bd-t"]  # milestone still excluded
+
+
+# ── _project: the deliverable field (#217) ───────────────────────────────────────
+
+
+def test_project_deliverable_reads_the_latest_comment(make_board):
+    b = make_board(Br())
+    f = b._project(
+        {
+            "id": "bd-t",
+            "status": "in_progress",
+            "labels": ["in-review"],
+            "issue_type": "task",
+            "comments": [
+                "deliverable: first draft",  # bare-string comment shape (br 0.1.x)
+                {"text": "attempt 1 (tier=smart): ok"},
+                {"text": "deliverable: final report at docs/report.md"},
+            ],
+        }
+    )
+    assert f["deliverable"] == "final report at docs/report.md"  # the LATEST wins
+
+
+def test_project_deliverable_falls_back_to_a_label(make_board):
+    b = make_board(Br())
+    bead = {"id": "bd-t", "status": "open", "labels": ["deliverable:docs-report", "ready"], "issue_type": "task"}
+    assert b._project(bead)["deliverable"] == "docs-report"
+
+
+def test_project_deliverable_defaults_empty_for_coding_features(make_board):
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "open", "labels": []})["deliverable"] == ""

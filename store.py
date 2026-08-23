@@ -159,6 +159,23 @@ LABEL_MERGE_HOLD = "merge-hold"
 # the projection/console — the HARD gate is in `mark_ready` (a design referencing an
 # ADR is required at that size before the feature can go ready).
 LABEL_DESIGNING = "designing"
+# Task-type work (#217): a bead with `issue_type: task` rides the SAME board rails as
+# a coding feature (ready → claim → in_progress → in_review) but ships a DELIVERABLE
+# (a doc, a decision, an artifact ref) instead of a PR: `record_delivery` moves it to
+# in_review with no PR, and `record_verification` is its Done edge — a SECOND
+# `br close` edge beside record_merge (the cancel_feature precedent), auditable via
+# the `verified: <actor>` close reason so the projection/retro can tell the two
+# terminal paths apart.
+LABEL_TASK = "task"
+# Where a task's deliverable rides: `record_delivery` writes a `deliverable: <text>`
+# comment (free text can't ride a label — beads' validator, the #101 lesson) and
+# `_project` reads the LATEST one back into the `deliverable` field (only `br show`
+# carries comments; a `br list` row projects ""). A `deliverable:<ref>` label is the
+# fallback for beads authored outside record_delivery with a label-safe ref.
+LABEL_DELIVERABLE_PREFIX = "deliverable:"
+# What the puller admits (#217): coding features AND task-type beads — everything
+# else (epics, milestones) stays structural and is never claimed.
+PULLABLE_ISSUE_TYPES = ("feature", "task")
 # Which PROJECT a feature belongs to (#90): a `project:<name>` label naming the entry
 # in the board's `projects:` map (projects.py) that owns this feature — so one board
 # instance can serve multiple repos, the Ready gate validating each feature's paths
@@ -1235,14 +1252,19 @@ class BeadsBoard:
 
     # ── the puller (Ready → In Progress) ──────────────────────────────────────
     def claim_next_ready(self, assignee: str = "") -> dict | None:
-        """Atomically pull the top-priority unblocked, board-`ready` **feature** →
-        `in_progress`. Returns None if nothing is ready. (`br ready` is priority-
-        ordered; we filter `feature` in Python to dodge the --type+--label quirk.)"""
+        """Atomically pull the top-priority unblocked, board-`ready` **feature or
+        task** (PULLABLE_ISSUE_TYPES, #217) → `in_progress`. Returns None if nothing
+        is ready. (`br ready` is priority-ordered; we filter the type in Python to
+        dodge the --type+--label quirk.)"""
         # `--limit 0` = unlimited: `br ready` defaults `--limit 20`, and we filter to
-        # `feature` (+ non-blocked) in Python AFTER, so a capped queue could hide the only
-        # claimable feature behind 20 epics/blocked rows (the exhaustiveness invariant).
+        # feature/task (+ non-blocked) in Python AFTER, so a capped queue could hide the
+        # only claimable bead behind 20 epics/blocked rows (the exhaustiveness invariant).
         ready = self._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True) or []
-        feats = [b for b in ready if b.get("issue_type") == "feature" and LABEL_BLOCKED not in (b.get("labels") or [])]
+        feats = [
+            b
+            for b in ready
+            if b.get("issue_type") in PULLABLE_ISSUE_TYPES and LABEL_BLOCKED not in (b.get("labels") or [])
+        ]
         if not feats:
             return None
         fid = feats[0]["id"]
@@ -1279,11 +1301,48 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     # ── In Progress → In Review ───────────────────────────────────────────────
-    def open_review(self, fid: str, *, pr_url: str) -> dict:
+    def open_review(self, fid: str, *, pr_url: str = "") -> dict:
+        """In Progress → In Review. ``pr_url`` is still REQUIRED for a coding feature
+        (the review IS the PR — entering review without one would strand the merge
+        reconciler), but optional for a task-type bead (#217), which enters review on
+        a recorded deliverable instead of a PR."""
         f = self._require(fid)
         if f["board_state"] != "in_progress":
             raise BoardError(f"open_review expects in_progress, got {f['board_state']!r}")
-        self._run("update", fid, "--add-label", LABEL_IN_REVIEW, "--external-ref", pr_url)
+        if not pr_url and f.get("issue_type") != LABEL_TASK:
+            raise BoardError(
+                f"open_review requires a pr_url for issue_type {f.get('issue_type')!r} (only tasks may omit it)"
+            )
+        args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
+        if pr_url:
+            args += ["--external-ref", pr_url]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    def record_delivery(self, fid: str, text: str = "", ref: str = "") -> dict:
+        """Record a task-type bead's DELIVERABLE (#217) — the task sibling of the
+        coder's open_pr → open_review edge. ``text`` rides a `deliverable:` comment
+        (the projection's `deliverable` field reads the latest one back); an optional
+        ``ref`` (a doc URL, an artifact path) lands on `external_ref` — the same slot
+        a coding feature's pr_url occupies, so link consumers just work. Moves
+        in_progress → in_review via the same `in-review` label as open_review.
+
+        TASK-ONLY: a coding feature taking this edge would enter review with no
+        pr_url and strand the merge reconciler — the exact hole open_review's
+        pr_url requirement plugs — so anything else is refused here too."""
+        f = self._require(fid)
+        if f.get("issue_type") != LABEL_TASK:
+            raise BoardError(
+                f"record_delivery is task-only — issue_type {f.get('issue_type')!r} enters review via open_review(pr_url=...)"
+            )
+        if f["board_state"] != "in_progress":
+            raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
+        if text:
+            self._comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
+        args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
+        if ref:
+            args += ["--external-ref", ref]
+        self._run(*args)
         return self.get_feature(fid)
 
     def set_review_substate(self, fid: str, label: str | None, note: str = "") -> dict:
@@ -1356,9 +1415,10 @@ class BeadsBoard:
             self._comment(fid, f"escalation exhausted: {reason}")
         return self.get_feature(fid)
 
-    # ── the ONE Done edge (invariant #2) ──────────────────────────────────────
+    # ── the ONE Done edge for coding features (invariant #2) ──────────────────
     def record_merge(self, *, pr_url: str) -> dict | None:
-        """Close the feature whose PR merged — the ONLY path to `done`. Idempotent;
+        """Close the feature whose PR merged — the ONLY path to `done` for a coding
+        feature (task-type beads close via record_verification, #217). Idempotent;
         returns None if no feature carries that PR url (a webhook for another PR)."""
         f = self._find_by_external_ref(pr_url)
         if f is None:
@@ -1384,6 +1444,33 @@ class BeadsBoard:
                     )
             self._run("close", fid, "-r", f"merged: {pr_url}")
         return self.get_feature(f["id"])
+
+    # ── the task Done edge (#217): verify, not merge ──────────────────────────
+    def record_verification(self, fid: str, approved: bool = True, feedback: str = "") -> dict:
+        """The task-type Done edge (#217) — record_merge's verify sibling, and
+        DELIBERATELY a second `br close` edge beside it (the cancel_feature
+        precedent): a task has no PR to merge, so a verifier's approval is what
+        closes it, with an auditable `verified: <actor>` reason. A rejection records
+        the feedback as a comment (the re-dispatch prompt injects it, the adverse-
+        review shape) and requeues the bead back to `ready`. Expects `in_review` —
+        the state record_delivery/open_review left it in.
+
+        TASK-ONLY: a coding feature closed here would dodge record_merge — the ONE
+        Done edge for code (invariant #2), with its idempotency, blocker cleanup,
+        and `merged: <pr_url>` audit reason — so anything else is refused."""
+        f = self._require(fid)
+        if f.get("issue_type") != LABEL_TASK:
+            raise BoardError(
+                f"record_verification is task-only — issue_type {f.get('issue_type')!r} closes via record_merge"
+            )
+        if f["board_state"] != "in_review":
+            raise BoardError(f"record_verification expects in_review, got {f['board_state']!r}")
+        if not approved:
+            if feedback:
+                self._comment(fid, f"verification failed: {feedback}")
+            return self.requeue(fid)
+        self._run("close", fid, "-r", f"verified: {self.actor}")
+        return self.get_feature(fid)
 
     # ── the second terminal edge: cancel (not merge) ──────────────────────────
     def cancel_feature(self, fid: str, reason: str = "") -> dict:
@@ -1783,8 +1870,8 @@ class BeadsBoard:
         return raw
 
     def ready_queue(self, relaxed: bool = False) -> list[dict]:
-        """Board-`ready`, dep-unblocked **features** (priority order) — the puller's
-        queue. `br ready` already excludes a feature with any OPEN `blocks` dep, so by
+        """Board-`ready`, dep-unblocked **features and task-type beads**
+        (PULLABLE_ISSUE_TYPES, #217; priority order) — the puller's queue. `br ready` already excludes a feature with any OPEN `blocks` dep, so by
         default a dependent waits for its blockers to **close** (merge). With
         ``relaxed`` (``dep_gate: review``) also release a dep-blocked feature whose
         every still-open blocker is a NON-foundation feature already at ``in_review``
@@ -1801,7 +1888,9 @@ class BeadsBoard:
         # — `br show` carries labels — so board_state/blocked/diff/dag_blocked project
         # correctly. `br ready` is priority-ordered; iterating it preserves that.
         out = [
-            f for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") == "feature") if f is not None
+            f
+            for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") in PULLABLE_ISSUE_TYPES)
+            if f is not None
         ]
         if not relaxed:
             return out
@@ -1895,6 +1984,19 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
+        # A task-type bead's deliverable (#217): the LATEST `deliverable:` comment
+        # (record_delivery's record — only `br show` carries comments, so a `br list`
+        # row projects "") wins over a `deliverable:<ref>` label (the fallback for
+        # externally-authored beads). "" for coding features / undelivered tasks.
+        deliverable = next(
+            (l[len(LABEL_DELIVERABLE_PREFIX) :].strip() for l in labels if l.startswith(LABEL_DELIVERABLE_PREFIX)),
+            "",
+        )
+        for c in bead.get("comments") or []:
+            txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
+            txt = txt.strip()
+            if txt.startswith(LABEL_DELIVERABLE_PREFIX):
+                deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
         # The bead `notes` field carries files_to_modify (one path per line), the
         # requirement ledger (#113, one `req: {…}` line per item), AND the
         # originating-issue record (#97) as a `source-issue: owner/repo#N` metadata
@@ -1946,6 +2048,7 @@ class BeadsBoard:
             "attempts": attempts,
             "gens_spent": gens_spent,
             "verified_sha": verified_sha,
+            "deliverable": deliverable,
             "source_issue": source_issue,
             "requirements": requirements,
             "project": project,
