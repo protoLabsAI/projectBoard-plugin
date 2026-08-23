@@ -55,6 +55,7 @@ from .store import (
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
+    LABEL_TASK,
     _all_items_disposed,
     apply_requirement_dispositions,
     escalation_enabled,
@@ -1292,6 +1293,18 @@ class BoardLoop:
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
         feature = store.get_feature(fid) or {}
+        # #217: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
+        # salvage below never apply. A task parked on a human/unassigned assignee is
+        # NOT orphaned — it is intentionally in_progress awaiting async delivery
+        # (API/chat), the same "leave it, an out-of-band edge resolves it" posture an
+        # in_review PR gets — so leave it be. A task on an ACP agent assignee whose
+        # drive died mid-flight IS orphaned: requeue it for a clean re-dispatch.
+        if feature.get("issue_type") == LABEL_TASK:
+            assignee = str(feature.get("assignee") or "").strip()
+            if assignee and self._resolve_delegate(assignee, "acp") is not None:
+                store.requeue(fid)
+                log.info("[project_board] %s task reset to ready (ACP drive died — re-dispatch)", fid)
+            return
         pr_url = await worktree.pr_url_for_branch(
             worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
         )
@@ -1640,6 +1653,7 @@ class BoardLoop:
         busy = set(file_owner)
         selected: list[str] = []
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
+        parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
         for candidate in store.ready_queue(relaxed=self.relaxed_gate):  # priority order, dep-unblocked
             if len(self._drives) >= self.max_concurrent:
                 break  # remaining candidates are lower priority than what we already selected
@@ -1655,6 +1669,22 @@ class BoardLoop:
             pname = self._project_name(candidate)
             if isinstance(self._preflight_state.get(pname), str):
                 skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
+                continue
+            # #217: task-type dispatch — a `task` bead ships a DELIVERABLE (a doc, a
+            # decision, an artifact ref), not a diff, so it takes NO git worktree and
+            # skips the hot-file guard below (with no worktree there is no file to
+            # collide on). An ACP agent assignee is driven via `delegate_to` (a real
+            # drive → counts toward max_concurrent); a human/unassigned task is parked
+            # in_progress to await async delivery (API/chat) and does NOT hold a slot.
+            if candidate.get("issue_type") == LABEL_TASK:
+                outcome = self._dispatch_task(store, candidate)
+                if outcome == "acp":
+                    selected.append(cid)
+                    spawned = True
+                elif outcome == "parked":
+                    parked.append(cid)
+                else:  # "race" — lost the atomic claim, still ready for the next tick
+                    skipped.append({"fid": cid, "reason": "claim-race"})
                 continue
             # #197: key by (project, path) — bare paths false-collide across projects
             # (every repo has PROTO.md); an unstamped card ("" project) behaves as before.
@@ -1686,10 +1716,14 @@ class BoardLoop:
             busy |= files
             selected.append(claimed["id"])
             spawned = True
-        if selected or skipped:
+        if selected or skipped or parked:
             log.info(
                 "[project_board] claim_decision %s",
-                json.dumps({"selected": selected, "skipped": skipped}, separators=(",", ":"), sort_keys=True),
+                json.dumps(
+                    {"parked": parked, "selected": selected, "skipped": skipped},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
             )
         return spawned
 
@@ -1704,6 +1738,47 @@ class BoardLoop:
             self._cancel_done.discard(fid)  # a later drive of the same card gets its own cancel edge
 
         return _cb
+
+    # ── task-type dispatch (#217) ─────────────────────────────────────────────
+    def _dispatch_task(self, store, candidate: dict) -> str:
+        """Claim + dispatch a ``task`` bead, branching on its assignee. Returns:
+
+        - ``"acp"``  — the assignee resolves to an ACP agent delegate → claimed and a
+          ``_drive_task`` was spawned (into ``self._drives``, so it counts toward
+          ``max_concurrent`` exactly like a coding drive).
+        - ``"parked"`` — a human/unassigned task → claimed to ``in_progress`` and left
+          there to await async delivery (API/chat). No drive, no slot held.
+        - ``"race"`` — the atomic claim was lost (someone else took it); still ready.
+
+        The assignee is read from the CANDIDATE (the pre-claim projection) and passed
+        back to ``claim`` so the claim preserves it — a task's assignee is its dispatch
+        target, not the coder identity a coding claim stamps."""
+        cid = candidate["id"]
+        assignee = str(candidate.get("assignee") or "").strip()
+        delegate = self._resolve_delegate(assignee, "acp") if assignee else None
+        claimed = store.claim(cid, assignee=assignee)
+        if claimed is None:
+            return "race"
+        if delegate is None:
+            # Human assignee, or none / not an ACP agent: nothing to dispatch. The task
+            # is now in_progress; its deliverable arrives out-of-band (record_delivery
+            # via the API/chat). The loop moves on and this parked card holds no slot.
+            log.info(
+                "[project_board] %s task parked in_progress — awaiting %s delivery (assignee=%s)",
+                cid,
+                "human" if assignee else "unassigned",
+                assignee or "<none>",
+            )
+            return "parked"
+        # ACP agent assignee → drive it via delegate_to. No worktree, so it owns no
+        # files (empty set: present so the done-callback's pop and the sweep's
+        # live-drive check both see it, but colliding with nothing in the hot-file guard).
+        self._inflight_files[cid] = set()
+        task = asyncio.create_task(self._drive_task(claimed, delegate), name=f"pb-task-{cid}")
+        self._drives.add(task)
+        _register_drive(cid, task)  # reachable by the cancel verbs (#211)
+        task.add_done_callback(self._make_drive_done_cb(cid))
+        return "acp"
 
     # ── the PR reconcile (terminal-edge fallback to the webhook) ───────────────
     async def _maybe_reconcile(self):
@@ -2206,6 +2281,55 @@ class BoardLoop:
         _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
         await worktree.reap_feature_worktree(repo, self.root, fid)
         log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
+
+    async def _drive_task(self, feature: dict, delegate) -> None:
+        """Drive a ``task`` bead with an ACP agent assignee (#217) — the task sibling
+        of ``_drive``. No worktree, no git, no PR: dispatch the spec + acceptance
+        criteria to the assignee delegate via ``delegate_to``, then record the reply as
+        the deliverable (``record_delivery`` → in_review, where a human or auto-verify
+        closes it). A dispatch failure is classified like a coder failure and blocks the
+        card for triage — a task has no model ladder to climb (the assignee is fixed),
+        so the capability-escalation edge collapses to the coder path's terminal block."""
+        store = self._store()
+        fid = feature["id"]
+        prompt = self._build_task_prompt(feature)
+        try:
+            reply = await coder_seam.dispatch_task(delegate, prompt, timeout=self.coder_timeout or None)
+        except asyncio.CancelledError:
+            raise  # operator cancel / shutdown owns the edge — never a block
+        except (worktree.WorktreeError, worktree.CoderTimeout) as exc:
+            if self._shutting_down:
+                log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
+                return
+            policy = classify(str(exc))
+            log.warning("[project_board] %s task blocked (%s): %s", fid, policy.category, exc)
+            store.flag_blocked(fid, f"{policy.category}: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
+            log.exception("[project_board] %s task dispatch unexpected failure", fid)
+            store.flag_blocked(fid, f"unexpected: {type(exc).__name__}: {exc}")
+            return
+        store.record_delivery(fid, text=reply or "")
+        log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
+
+    def _build_task_prompt(self, feature: dict) -> str:
+        """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
+        criteria, framed as a request for a DELIVERABLE (a doc, a decision, an artifact
+        ref), NOT a code change — a task has no worktree or PR, and the delegate's reply
+        IS the deliverable ``record_delivery`` records."""
+        title = feature.get("title", "")
+        spec = feature.get("spec", "")
+        criteria = feature.get("acceptance_criteria", "")
+        criteria_block = f"\n## Acceptance criteria (definition of done)\n{criteria}\n" if criteria.strip() else ""
+        return (
+            f"You have been assigned ONE task. Complete it and reply with the "
+            f"deliverable — a document, a decision, or a reference to the artifact you "
+            f"produced. There is no code change, worktree, or PR: your reply IS the "
+            f"deliverable, so make it self-contained.\n\n"
+            f"# {title}\n\n"
+            f"## Task\n{spec}\n"
+            f"{criteria_block}"
+        )
 
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
