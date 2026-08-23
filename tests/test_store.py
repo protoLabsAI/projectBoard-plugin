@@ -2652,6 +2652,18 @@ def test_record_delivery_rejects_a_non_in_progress_state(make_board, monkeypatch
     assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
 
 
+def test_record_delivery_rejects_a_coding_feature(make_board, monkeypatch):
+    """A coding feature taking the delivery edge would land in_review with NO
+    pr_url and strand the merge reconciler — the hole open_review's pr_url
+    requirement exists to plug. Code enters review via open_review only."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="record_delivery is task-only"):
+        b.record_delivery("bd-1", text="not a deliverable")
+    assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
+
+
 def test_record_verification_approved_closes_with_a_verified_reason(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
@@ -2684,6 +2696,20 @@ def test_record_verification_rejects_a_non_in_review_state(make_board, monkeypat
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
     with pytest.raises(BoardError, match="record_verification expects in_review"):
         b.record_verification("bd-t", approved=True)
+
+
+def test_record_verification_rejects_a_coding_feature(make_board, monkeypatch):
+    """A coding feature closed here would dodge record_merge — the ONE Done edge
+    for code (invariant #2) with its idempotency and `merged:` audit reason. The
+    guard refuses BOTH branches: no verify-close, no reject-requeue."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="record_verification is task-only"):
+        b.record_verification("bd-1", approved=True)
+    with pytest.raises(BoardError, match="record_verification is task-only"):
+        b.record_verification("bd-1", approved=False, feedback="nope")
+    assert br.cmds("close") == [] and br.cmds("update") == [] and br.cmds("comments") == []
 
 
 # ── open_review: pr_url optional for tasks only ──────────────────────────────────

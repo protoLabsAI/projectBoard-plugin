@@ -1325,8 +1325,16 @@ class BeadsBoard:
         (the projection's `deliverable` field reads the latest one back); an optional
         ``ref`` (a doc URL, an artifact path) lands on `external_ref` — the same slot
         a coding feature's pr_url occupies, so link consumers just work. Moves
-        in_progress → in_review via the same `in-review` label as open_review."""
+        in_progress → in_review via the same `in-review` label as open_review.
+
+        TASK-ONLY: a coding feature taking this edge would enter review with no
+        pr_url and strand the merge reconciler — the exact hole open_review's
+        pr_url requirement plugs — so anything else is refused here too."""
         f = self._require(fid)
+        if f.get("issue_type") != LABEL_TASK:
+            raise BoardError(
+                f"record_delivery is task-only — issue_type {f.get('issue_type')!r} enters review via open_review(pr_url=...)"
+            )
         if f["board_state"] != "in_progress":
             raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
         if text:
@@ -1445,8 +1453,16 @@ class BeadsBoard:
         closes it, with an auditable `verified: <actor>` reason. A rejection records
         the feedback as a comment (the re-dispatch prompt injects it, the adverse-
         review shape) and requeues the bead back to `ready`. Expects `in_review` —
-        the state record_delivery/open_review left it in."""
+        the state record_delivery/open_review left it in.
+
+        TASK-ONLY: a coding feature closed here would dodge record_merge — the ONE
+        Done edge for code (invariant #2), with its idempotency, blocker cleanup,
+        and `merged: <pr_url>` audit reason — so anything else is refused."""
         f = self._require(fid)
+        if f.get("issue_type") != LABEL_TASK:
+            raise BoardError(
+                f"record_verification is task-only — issue_type {f.get('issue_type')!r} closes via record_merge"
+            )
         if f["board_state"] != "in_review":
             raise BoardError(f"record_verification expects in_review, got {f['board_state']!r}")
         if not approved:
