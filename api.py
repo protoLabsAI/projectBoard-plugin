@@ -477,6 +477,37 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         await _reap_worktree(fid)
         return f
 
+    # ── task-type review lane (#217): deliver → verify, the coder-PR-free siblings
+    #    of open_review → record_merge. deliver moves in_progress → in_review;
+    #    verify is the task Done edge (approve closes, reject requeues to ready).
+    @router.post("/features/{fid}/deliver")
+    async def _deliver(fid: str, body: dict = Body(default={})):
+        """Record a task-type feature's DELIVERABLE (#217) — the task sibling of the
+        coder's open_review edge, moving in_progress → in_review. Body:
+        ``{text?, ref?}``: ``text`` rides a `deliverable:` comment (the projection's
+        `deliverable` reads the latest back), ``ref`` (a doc URL / artifact path)
+        lands on `external_ref` — the slot a coding feature's pr_url occupies.
+        TASK-ONLY: ``record_delivery`` 400s a coding feature (entering review with no
+        pr_url would strand the merge reconciler) or one not in_progress."""
+        body = body or {}
+        return _guard(
+            lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))
+        )
+
+    @router.post("/features/{fid}/verify")
+    async def _verify(fid: str, body: dict = Body(default={})):
+        """The task-type Done edge (#217) — ``record_merge``'s verify sibling. Body:
+        ``{approved?: bool=true, feedback?}``. ``approved=true`` closes the task with
+        a `verified: <actor>` reason; ``approved=false`` records the ``feedback`` as a
+        comment (the re-dispatch prompt injects it, the adverse-review shape) and
+        requeues the bead to ready. Expects in_review. TASK-ONLY: a coding feature is
+        refused (it closes via ``record_merge``, the ONE Done edge for code)."""
+        body = body or {}
+        approved = bool(body.get("approved", True))
+        return _guard(
+            lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")))
+        )
+
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):
         """Hard-delete a feature created in error — a `br` tombstone (the harder sibling

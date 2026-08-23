@@ -108,6 +108,17 @@ class FakeStore:
     def record_review_bounce(self, fid, findings=""):
         return self._rec("record_review_bounce", fid, findings)
 
+    def record_delivery(self, fid, text="", ref=""):
+        # Echo the real store's in_progress → in_review transition (#217) so the
+        # route test can assert the projection is returned verbatim, not just the call.
+        self.calls.append(("record_delivery", (fid,), {"text": text, "ref": ref}))
+        return {"id": fid, "issue_type": "task", "board_state": "in_review", "deliverable": text, "external_ref": ref}
+
+    def record_verification(self, fid, approved=True, feedback=""):
+        # approve → done (closed); reject → requeued to ready — the real store's edges (#217).
+        self.calls.append(("record_verification", (fid,), {"approved": approved, "feedback": feedback}))
+        return {"id": fid, "issue_type": "task", "board_state": "done" if approved else "ready"}
+
     def escalate(self, fid, reason):
         self.calls.append(("escalate", (fid, reason), {}))
         return self._escalate_to
@@ -757,6 +768,119 @@ def test_review_from_a_non_in_review_state_surfaces_as_400(monkeypatch):
     c = _client(monkeypatch, WrongState())
     r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"})
     assert r.status_code == 400 and "in_review" in r.json()["detail"]
+
+
+# ── /features/{fid}/deliver + /verify — the task-type review lane (#217 S2) ──────
+# The coder-PR-free siblings of open_review → record_merge: deliver moves a task
+# in_progress → in_review; verify is the task Done edge (approve closes, reject
+# requeues to ready). Both live on build_data_router → the operator bearer gate.
+
+
+def test_deliver_route_records_the_deliverable_and_returns_in_review(monkeypatch):
+    """POST /features/{fid}/deliver forwards text+ref as keywords to record_delivery
+    and returns the in_review projection verbatim (#217)."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post(
+        "/api/plugins/project_board/features/bd-1/deliver",
+        json={"text": "shipped the doc", "ref": "https://docs/x"},
+    )
+    assert r.status_code == 200
+    assert ("record_delivery", ("bd-1",), {"text": "shipped the doc", "ref": "https://docs/x"}) in store.calls
+    assert r.json()["board_state"] == "in_review"
+
+
+def test_deliver_route_defaults_missing_body_fields_to_empty(monkeypatch):
+    """No body (and a body missing text/ref) → empty strings, not a 422 — the same
+    optional-body shape as /done."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-2/deliver")
+    assert r.status_code == 200
+    assert ("record_delivery", ("bd-2",), {"text": "", "ref": ""}) in store.calls
+    # A partial body (only ref) still defaults the missing field.
+    r2 = c.post("/api/plugins/project_board/features/bd-3/deliver", json={"ref": "artifact://y"})
+    assert r2.status_code == 200
+    assert ("record_delivery", ("bd-3",), {"text": "", "ref": "artifact://y"}) in store.calls
+
+
+def test_deliver_route_surfaces_an_invalid_state_or_type_as_400(monkeypatch):
+    """record_delivery 400s a non-in_progress or non-task feature; the route surfaces
+    the BoardError as a JSON 400 via the shared _guard, not a 500."""
+
+    class WrongState(FakeStore):
+        def record_delivery(self, fid, text="", ref=""):
+            raise BoardError("record_delivery expects in_progress, got 'ready'")
+
+    c = _client(monkeypatch, WrongState())
+    r = c.post("/api/plugins/project_board/features/bd-1/deliver", json={"text": "x"})
+    assert r.status_code == 400 and "in_progress" in r.json()["detail"]
+
+
+def test_verify_route_approve_closes_the_task_to_done(monkeypatch):
+    """POST /features/{fid}/verify with {approved: true} forwards approved+feedback and
+    returns the done (closed) projection (#217)."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True})
+    assert r.status_code == 200
+    assert ("record_verification", ("bd-1",), {"approved": True, "feedback": ""}) in store.calls
+    assert r.json()["board_state"] == "done"
+
+
+def test_verify_route_defaults_approved_true_when_body_omits_it(monkeypatch):
+    """approved defaults to true — an empty body (or one omitting approved) is an
+    approval, not a 422."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-2/verify")
+    assert r.status_code == 200
+    assert ("record_verification", ("bd-2",), {"approved": True, "feedback": ""}) in store.calls
+    assert r.json()["board_state"] == "done"
+
+
+def test_verify_route_reject_requeues_to_ready_with_feedback(monkeypatch):
+    """{approved: false, feedback: "..."} forwards approved=False + the feedback and
+    returns the requeued (ready) projection."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post(
+        "/api/plugins/project_board/features/bd-1/verify",
+        json={"approved": False, "feedback": "missing the summary table"},
+    )
+    assert r.status_code == 200
+    assert (
+        "record_verification",
+        ("bd-1",),
+        {"approved": False, "feedback": "missing the summary table"},
+    ) in store.calls
+    assert r.json()["board_state"] == "ready"
+
+
+def test_verify_route_surfaces_an_invalid_state_or_type_as_400(monkeypatch):
+    """record_verification 400s a non-in_review or non-task feature; the route surfaces
+    the BoardError as a JSON 400 via the shared _guard."""
+
+    class WrongState(FakeStore):
+        def record_verification(self, fid, approved=True, feedback=""):
+            raise BoardError("record_verification expects in_review, got 'in_progress'")
+
+    c = _client(monkeypatch, WrongState())
+    r = c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True})
+    assert r.status_code == 400 and "in_review" in r.json()["detail"]
+
+
+def test_deliver_and_verify_are_operator_gated_not_public(monkeypatch):
+    """Both live on build_data_router → the operator bearer prefix (#217 r6): served
+    under /api/plugins/project_board, NOT on the public build_router prefix (the
+    inverse of /review, which is a public review-infra edge)."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    assert c.post("/api/plugins/project_board/features/bd-1/deliver", json={}).status_code == 200
+    assert c.post("/api/plugins/project_board/features/bd-1/verify", json={}).status_code == 200
+    # …and absent from the public prefix.
+    assert c.post("/plugins/project_board/features/bd-1/deliver", json={}).status_code == 404
+    assert c.post("/plugins/project_board/features/bd-1/verify", json={}).status_code == 404
 
 
 # ── /features/{fid}/test-rung — operator-only diagnostic (ADR 0064) ─────────────
