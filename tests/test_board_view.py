@@ -132,3 +132,24 @@ def test_monitor_polls_the_progress_endpoint_and_closes_on_esc_or_click_away():
     # Delegated listener via data-mon — no dead window.* global (panel round 2 on #89).
     assert "data-mon" in BOARD_PAGE
     assert 'openMonitor(el.getAttribute("data-mon"))' in BOARD_PAGE
+
+
+# ── drawer scroll isolation (#218): drawer scroll must not leak to the board ────
+
+
+def test_drawer_body_contains_its_own_scroll_chain():
+    """Hitting the end of the drawer's scrollable body must not chain the scroll
+    through the scrim to the board — the contain lives on the .db rule itself."""
+    assert (
+        "#drawer .db{padding:var(--pl-space-3) var(--pl-space-4);"
+        "overflow:auto;flex:1;overscroll-behavior:contain}" in BOARD_PAGE
+    )
+
+
+def test_page_scroll_locks_while_drawer_is_open_and_unlocks_on_close():
+    """Belt-and-suspenders with overscroll-behavior: openMonitor locks the page
+    (body.drawer-open → overflow:hidden); closeMonitor is the single close routine
+    (button, scrim, Esc all route through it), so every close path unlocks."""
+    assert "body.drawer-open{overflow:hidden}" in BOARD_PAGE
+    assert 'document.body.classList.add("drawer-open")' in BOARD_PAGE
+    assert 'document.body.classList.remove("drawer-open")' in BOARD_PAGE
