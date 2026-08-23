@@ -5023,7 +5023,7 @@ async def _cancel_drive_with(monkeypatch, *, cancel_at, open_review_raises=False
             store.cancelled = True  # the operator cancels while the coder is finishing
         return "## Summary\n\n- did the thing\n"
 
-    async def _open_pr(wt, branch, *, base, title, body):
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         opened.append(branch)
         if cancel_at == "open_pr":
             store.cancelled = True  # cancel lands during the push/create
