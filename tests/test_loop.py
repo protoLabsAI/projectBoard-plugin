@@ -459,7 +459,7 @@ async def _drive_with(
     store.promotes = []  # (src_wt, src_branch, fid) the Max-Mode winner was promoted with
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         store.creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
@@ -473,7 +473,7 @@ async def _drive_with(
     async def _reap(repo, root, fid):
         store.reaps.append(fid)
 
-    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees", title=""):
         store.promotes.append((src_wt, src_branch, fid))
         return ("/wt/feat-" + fid, "feat/" + fid)
 
@@ -729,7 +729,7 @@ async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatc
     store = _EscalatingStore(tiers=["smart"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -782,7 +782,7 @@ async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
     store = _EscalatingStore(tiers=["smart"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -1166,6 +1166,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         tier="",
         record_verified=None,
         commit_message="",
+        title="",
         max_concurrent_sessions=0,
     ):
         seen["fid"] = fid
@@ -1174,6 +1175,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         seen["env_passthrough"] = env_passthrough
         seen["tier"] = tier
         seen["commit_message"] = commit_message
+        seen["title"] = title
         record_gens(4)
         # dispatch() calls this at the verify boundary (#91) — the loop must have
         # threaded a recorder that lands the record on THIS feature's bead.
@@ -1192,6 +1194,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
     assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
     assert seen["commit_message"] == "feat: Add a thing"  # the verified commit keeps the PR title
+    assert seen["title"] == "Add a thing"  # #227: the RAW title is threaded for the canonical slug
     assert store.gens_spent.get("bd-1") == 4
     # The verify-boundary salvage record (#91) landed on the bead via the store.
     assert ("record_verified", "bd-1", "feat/bd-1", "abc123", "/wt/feat-bd-1") in store.calls
@@ -1643,7 +1646,7 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     ticks = iter([0.0, 1800.0])
     monkeypatch.setattr(coder_seam, "_monotonic", lambda: next(ticks, 1800.0))
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -2844,8 +2847,9 @@ class _SalvageStore:
         self.calls.append(("clear_verified", fid))
 
 
-def _salvage_git(*, head="abc123", branch="feat/bd-1"):
-    """A ``worktree._git`` fake answering the salvage probes (HEAD sha + branch)."""
+def _salvage_git(*, head="abc123", branch="feat/bd-1-add-a-thing"):
+    """A ``worktree._git`` fake answering the salvage probes (HEAD sha + branch). The
+    default branch carries the #227 slug tail of the salvage feature's title."""
 
     async def _git(wt, *args, timeout=60):
         if args == ("rev-parse", "HEAD"):
@@ -2876,11 +2880,12 @@ async def _recover_salvage(monkeypatch, tmp_path, *, make_wt=True, head="abc123"
     monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
     monkeypatch.setattr(worktree, "_git", _salvage_git(head=head))
     if make_wt:
-        (tmp_path / ".worktrees" / "feat-bd-1").mkdir(parents=True)
+        # #227: the verified candidate's canonical worktree carries the slugged tail.
+        (tmp_path / ".worktrees" / "feat-bd-1-add-a-thing").mkdir(parents=True)
 
     promoted = []
 
-    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees", title=""):
         promoted.append((src_wt, src_branch, fid))
         return (src_wt, src_branch)  # already canonical → the real one no-ops too
 
@@ -2911,9 +2916,9 @@ async def test_recover_salvages_a_verified_candidate(monkeypatch, tmp_path):
     its branch+sha match, and the gate passes NOW → resume at promote → fixups →
     gate → open_pr → in_review. No re-solve, no rebuild-fresh requeue."""
     store, promoted, opened, gates = await _recover_salvage(monkeypatch, tmp_path)
-    assert promoted and promoted[0][1:] == ("feat/bd-1", "bd-1")  # resumed at promote
+    assert promoted and promoted[0][1:] == ("feat/bd-1-add-a-thing", "bd-1")  # resumed at promote (#227 slug)
     assert gates  # the gate re-ran on the candidate now
-    assert opened and opened[0][1] == "feat/bd-1" and opened[0][3] == "feat: Add a thing"
+    assert opened and opened[0][1] == "feat/bd-1-add-a-thing" and opened[0][3] == "feat: Add a thing"
     assert ("open_review", "bd-1", "https://example/pr/91") in store.calls
     assert ("clear_verified", "bd-1") in store.calls  # the record's window closed
     assert ("requeue", "bd-1") not in store.calls  # never fell through to rebuild
@@ -2957,10 +2962,10 @@ async def test_recover_salvage_open_pr_error_falls_back_to_rebuild(monkeypatch, 
         return ""
 
     monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
-    monkeypatch.setattr(worktree, "_git", _salvage_git())
-    (tmp_path / ".worktrees" / "feat-bd-1").mkdir(parents=True)
+    monkeypatch.setattr(worktree, "_git", _salvage_git(branch="feat/bd-1-t"))  # title "T" → #227 slug "t"
+    (tmp_path / ".worktrees" / "feat-bd-1-t").mkdir(parents=True)
 
-    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees", title=""):
         return (src_wt, src_branch)
 
     monkeypatch.setattr(worktree, "promote_worktree", _promote)
@@ -3974,7 +3979,7 @@ async def test_drive_builds_in_the_features_project_repo(monkeypatch):
     store = FakeLoopStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         captured["repo"], captured["base"] = repo, base
         return (f"/wt/feat-{fid}", f"feat/{fid}")
 
@@ -4617,7 +4622,7 @@ async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -5070,7 +5075,7 @@ async def _cancel_drive_with(monkeypatch, *, cancel_at, open_review_raises=False
     store.branch_lookups = []
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -5379,7 +5384,7 @@ async def test_request_drive_cancel_stops_a_running_coder_and_ends_the_drive_cle
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     started = asyncio.Event()
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -5423,7 +5428,7 @@ async def test_shutdown_cancel_still_propagates(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     started = asyncio.Event()
 
-    async def _create(repo, base, fid, root):
+    async def _create(repo, base, fid, root, title=""):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):

@@ -213,7 +213,7 @@ async def test_dispatch_records_per_gen_progress_including_the_verify_outcome(mo
     async def _remove(repo, wt, branch=""):
         return None
 
-    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees", title=""):
         return (f"/wt/feat-{fid}", f"feat/{fid}")
 
     monkeypatch.setattr(worktree, "create_worktree", _create)

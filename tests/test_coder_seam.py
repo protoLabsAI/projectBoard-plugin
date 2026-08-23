@@ -97,7 +97,7 @@ def _stub_worktree(monkeypatch, *, created=None, removed=None, promoted=None):
     async def _remove(repo, wt, branch=""):
         removed.append(wt)
 
-    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees"):
+    async def _promote(repo, src_wt, src_branch, fid, root=".worktrees", title=""):
         promoted.append((src_wt, src_branch, fid))
         return (f"/wt/feat-{fid}", f"feat/{fid}")
 
