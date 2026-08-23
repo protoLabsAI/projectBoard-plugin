@@ -45,7 +45,7 @@ import sys
 import time
 import types
 
-from . import coder_seam, config, setup_check, worktree
+from . import br_fetch, coder_seam, config, setup_check, worktree
 from .failures import classify
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
@@ -448,11 +448,13 @@ async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
 # at construction and needs a restart — the startup log says so. Keep this list in
 # step with the manifest's ``settings:`` block (those are the console fields) and
 # the README's "Concurrency" section.
-LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge", "coder")
+LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge", "coder", "br_autofetch")
 LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0}
 # Knobs that are booleans (coerced by _knob_bool) or strings (stripped); everything
 # else in LIVE_KNOBS is an int with a floor in LIVE_KNOB_FLOORS.
-LIVE_BOOL_KNOBS = ("auto_merge",)
+# `br_autofetch` (v0.43.0) is live so an operator who left it off can flip it on and
+# have the paused loop fetch `br` on its next setup check — no restart.
+LIVE_BOOL_KNOBS = ("auto_merge", "br_autofetch")
 # `coder` is live since v0.42.0 (review on #212): the drive resolves `self.coder_name`
 # per attempt, so a reload can hand the running loop a new delegate name — and the
 # setup preflight's coder gap (the fresh-archetype case: boot with no coder, pick one
@@ -718,6 +720,10 @@ class BoardLoop:
         # sat overnight after a restart dropped that session's one-shot). A card
         # labelled `merge-hold` is never auto-merged — the operator's per-card veto.
         self.auto_merge = _knob_bool(self.cfg, "auto_merge", False)
+        # `br` fetched on first run (v0.43.0, br_fetch.py): default on. Read here so the
+        # live-knob machinery (reload) has an attribute to diff against; the fetch itself
+        # is armed by register() and re-armed by the setup gate below.
+        self.br_autofetch = _knob_bool(self.cfg, "br_autofetch", True)
         self.merge_method = str(self.cfg.get("merge_method", "squash")).strip().lower() or "squash"
         # Failed merge attempts (a refusal, a race) before the loop stops trying and
         # leaves the PR for a human — logged once on the bead, never a block.
@@ -1488,6 +1494,11 @@ class BoardLoop:
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
     # ── setup preflight (v0.42.0) ─────────────────────────────────────────────
+    def _ensure_br(self) -> dict:
+        """Arm the `br` auto-fetch for THIS loop's config (br_fetch.ensure_br — once per
+        process, returns at once). Tests swap this."""
+        return br_fetch.ensure_br(self.cfg, which=self._which)
+
     def _delegate_resolver(self):
         """ONE roster read per preflight (``coder_seam.delegate_resolver``) — the
         dispatch path's ``_resolve_delegate`` re-parses the YAML per name, which is
@@ -1518,6 +1529,9 @@ class BoardLoop:
             try:
                 # Off the event loop: the preflight may shell `br --version` (once per
                 # path) and reads the delegates YAML — neither belongs on the loop.
+                # ensure_br first: a no-op once br resolves / the fetch is in flight or
+                # spent; it arms the fetch when `br_autofetch` was flipped on live.
+                await asyncio.to_thread(self._ensure_br)
                 status = await asyncio.to_thread(self._setup_status)
                 self._gap_reporter.report(status)
                 blockers = setup_check.loop_blockers(status)

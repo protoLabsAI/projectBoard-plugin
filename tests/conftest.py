@@ -54,7 +54,7 @@ if "graph" not in sys.modules:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_br_version(monkeypatch):
+def _no_real_br_version(monkeypatch, tmp_path_factory):
     """The setup preflight samples ``br --version`` (setup_check._br_version) from
     register()/the /status route/the loop gate — every tier this suite exercises
     with a fake store. Pin its runner so the UNIT tier never shells a real ``br``
@@ -62,16 +62,32 @@ def _no_real_br_version(monkeypatch):
     untouched), and drop the per-path cache so no test sees another's sample."""
     from types import SimpleNamespace
 
-    from project_board import setup_check
+    from project_board import br_fetch, setup_check
 
     monkeypatch.setattr(
         setup_check, "_subprocess_run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="br 0.0.0-test\n")
     )
     setup_check._BR_VERSION_CACHE.clear()
     setup_check.publish_loop_snapshot(None)  # no running loop between tests
+
+    # The `br` auto-fetch (v0.43.0): NEVER touch the network or ~/.protoagent from the
+    # unit tier. Any test that lets register()/the loop gate see "no br on PATH" would
+    # otherwise start a real 5 MB download in a daemon thread. The default downloader
+    # raises (a test that wants a fetch injects its own), the data dir is a tmp dir,
+    # and the process-stable fetch state is reset so no test sees another's.
+    def _no_network(url, timeout=0.0):
+        raise AssertionError(f"unit tier tried to download {url} — inject a fake downloader")
+
+    _no_network.real = br_fetch._urllib_download  # for the one test that drives the real GET against a fake opener
+    monkeypatch.setattr(br_fetch, "_urllib_download", _no_network)
+    # pytest's own temp root (retained/pruned like tmp_path) — no mkdtemp leak per test.
+    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path_factory.mktemp("pb-data")))
+    monkeypatch.delenv(br_fetch.ENV_BR_BIN, raising=False)
+    br_fetch.reset_state()
     yield
     setup_check._BR_VERSION_CACHE.clear()
     setup_check.publish_loop_snapshot(None)
+    br_fetch.reset_state()
 
 
 @pytest.fixture

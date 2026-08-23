@@ -77,7 +77,13 @@ def test_everything_present_is_ready_with_no_blockers(tmp_path):
     s = _all_ok(tmp_path)
     assert s["ready"] is True
     assert s["loop_blockers"] == []
-    assert s["br"] == {"ok": True, "path": "/usr/local/bin/br", "version": "br 0.1.23", "hint": ""}
+    assert {k: s["br"][k] for k in ("ok", "path", "version", "hint")} == {
+        "ok": True,
+        "path": "/usr/local/bin/br",
+        "version": "br 0.1.23",
+        "hint": "",
+    }
+    assert s["br"]["source"] == "path" and s["br"]["fetch"]["state"] in ("idle", "done")
     assert s["gh"] == {"ok": True, "path": "/usr/local/bin/gh", "hint": ""}
     assert s["coder"]["ok"] is True and s["coder"]["name"] == "proto" and s["coder"]["missing"] == []
     assert s["repo"] == {"ok": True, "path": str(tmp_path), "hint": ""}
@@ -515,6 +521,7 @@ def _wire(monkeypatch, loop, probe, reporter=None):
     a paused loop provably runs NONE of them), and a sub-second interval."""
     loop._which = probe.which
     monkeypatch.setattr(loop, "_delegate_resolver", probe.resolver)
+    monkeypatch.setattr(loop, "_ensure_br", lambda: {"state": "disabled"})  # the fetch has its own tests
     if reporter is not None:
         loop._gap_reporter = reporter
     loop.interval = 0.02

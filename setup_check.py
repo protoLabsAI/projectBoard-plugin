@@ -42,6 +42,7 @@ import subprocess
 import sys
 import types
 
+from . import br_fetch
 from . import store as store_mod
 from .projects import resolve_projects
 from .store import TIER_LADDER, escalation_enabled
@@ -70,10 +71,9 @@ _subprocess_run = subprocess.run
 
 # Operator-facing copy. Each hint is a complete sentence the console can show
 # verbatim (as a runtime warning and on the board page's setup card).
-BR_HINT = (
-    "beads CLI 'br' not found on PATH — install beads-rust (cargo install beads_rust), "
-    "not the homebrew `bd`, and restart (or set BR_BIN); the board is paused until then"
-)
+# The plain "no br, nothing fetching" hint — br_fetch.hint_for's idle copy, so the
+# preflight and the auto-fetch never disagree on the install wording (v0.43.0).
+BR_HINT = br_fetch.hint_for({"state": "idle"})
 GH_HINT = (
     "GitHub CLI 'gh' not found on PATH — install it (brew install gh) and run `gh auth login`; "
     "builds can't push branches or open PRs until then"
@@ -306,11 +306,27 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
     # read at call time so the preflight can never disagree with the board op.
     br_bin = str(store_mod.BR or "br")
     br_path = _which(br_bin)
+    fetch = br_fetch.fetch_state()
+    # v0.43.0: every "no br" hint is the auto-fetch's story (hint_for renders idle /
+    # fetching / failed / disabled / unsupported — idle is the plain install hint).
+    br_hint = "" if br_path else br_fetch.hint_for(fetch, br_bin=br_bin)
     br = {
         "ok": bool(br_path),
         "path": br_path,
         "version": _br_version(br_path, run) if br_path else "",
-        "hint": "" if br_path else (BR_HINT if br_bin == "br" else BR_HINT.replace("'br'", repr(br_bin), 1)),
+        "hint": br_hint,
+        # How the binary was resolved (env / fetched / path) + the auto-fetch state, so
+        # the board page can say "br fetched to …" / "fetching br …".
+        "source": "env"
+        if str(os.environ.get(br_fetch.ENV_BR_BIN) or "").strip()
+        else ("fetched" if fetch["state"] == "done" and fetch.get("path") else "path"),
+        "fetch": {
+            "state": fetch["state"],
+            "version": fetch.get("version", ""),
+            "platform": fetch.get("platform", ""),
+            "path": fetch.get("path", ""),
+            "error": fetch.get("error", ""),
+        },
     }
 
     gh_path = _which("gh")

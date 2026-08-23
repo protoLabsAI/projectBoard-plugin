@@ -23,6 +23,10 @@ jobs:
     #   0.2.16: only `-m br_shape` — the version-agnostic --json SHAPE contract. The
     #          0.1.x-quirk pins would rightly disagree with 0.2.16; running them here would
     #          test beads, not the plugin's shape handling (see tests/test_integration.py).
+    #   0.3.2 (= br_fetch.BR_VERSION, the binary a fresh member AUTO-FETCHES since v0.43.0):
+    #          `-m br_shape` as well. tests/test_br_fetch.py pins this leg's asset + sha256
+    #          to the plugin's own linux_amd64 pin, so the fetched binary is always one CI
+    #          proved the store against — move the pin and this leg together.
     # An upgrade lands deliberately by moving a pin (URL + sha256) alongside the code,
     # never via "latest". Each sha256 is from the release's published checksums.sha256.
     # fail-fast off so a red on one version still reports the other.
@@ -38,6 +42,10 @@ jobs:
             br_asset: "br-0.2.16-linux_amd64.tar.gz" # 0.2.x assets dropped the `v` prefix
             br_sha256: "9ee22d340b56dacfb20460d8e4b2a0065fb66f161910472285d55f51e04512b0"
             pytest_args: "-m br_shape" # only the version-agnostic --json shape contract
+          - br_version: "0.3.2" # the auto-fetch pin (br_fetch.BR_VERSION) — keep in lockstep
+            br_asset: "br-0.3.2-linux_amd64.tar.gz"
+            br_sha256: "e67c560e77e912490e44a65e3e9c13205210d171e729c5d801072ee508207288"
+            pytest_args: "-m br_shape"
     steps:
       - uses: actions/checkout@v4
 

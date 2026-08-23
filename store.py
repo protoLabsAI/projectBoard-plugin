@@ -43,11 +43,15 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
-from . import _TERMINAL_STATES
+from . import _TERMINAL_STATES, br_fetch
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
-BR = os.environ.get("BR_BIN", "br")
+# The binary every board op shells. Resolution (br_fetch.resolve_br_bin): an explicit
+# `BR_BIN` env > a previously auto-fetched binary (v0.43.0, the instance plugin-data
+# dir) > plain `br` on PATH. A module ATTRIBUTE read at call time — the auto-fetch
+# re-points it in place when a fetch lands (no restart), and setup_check probes it.
+BR = br_fetch.resolve_br_bin()
 
 # `br` surfaces a DATABASE_ERROR (SQLite `database is locked`/`busy`) when two br
 # processes write the same `.beads/*.db` concurrently (the loop + a tool call, say) —

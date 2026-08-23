@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.42.0
+version: 0.43.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -209,6 +209,14 @@ config:
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.
+  br_autofetch: true        # `br` fetched on first run (v0.43.0). With no `br` on PATH the
+                            # plugin downloads the PINNED beads-rust release binary
+                            # (br_fetch.BR_VERSION, sha256-verified per platform: darwin
+                            # arm64/x64, linux x64/arm64 — not Windows) into the instance's
+                            # plugin-data dir and uses it; no Rust toolchain, no restart.
+                            # Needs egress to github.com. false = the pre-0.43 posture: a
+                            # missing `br` is a setup gap with the install hint. Resolution
+                            # order for the binary: BR_BIN env > fetched > PATH. LIVE.
   db_path: ""               # beads db path; blank → br auto-discovers .beads/*.db
   webhook_secret: ""        # GitHub webhook HMAC secret for /webhook/pr (the Done
                             # edge). Blank → signature NOT verified (dev only); set
@@ -220,6 +228,8 @@ config:
 # silently needs a restart is worse than no field. Saving writes `project_board.<key>`
 # to the agent layer; the reload hook applies it on the loop's next tick.
 settings:
+  - { key: br_autofetch, label: "Fetch br automatically", type: bool, group: "Project Board",
+      description: "When the beads CLI (br) is not on PATH, download the pinned beads-rust release for this platform into the agent's data dir and use it (sha256-verified; needs github.com). Off = a missing br is a setup gap with the manual install hint. Applies live on save." }
   - { key: coder, label: "Coder delegate", type: string, group: "Project Board",
       description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a loop paused on 'no coder configured' resumes on its next check — no restart." }
   - { key: max_concurrent, label: "Parallel builds", type: number, group: "Project Board",

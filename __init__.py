@@ -48,6 +48,18 @@ def register(registry) -> None:
     # edge-triggered), and pauses instead of ticking while a blocker stands.
     from .setup_check import GapReporter, setup_status
 
+    # `br` fetched on first run (v0.43.0): no `br` on PATH + `br_autofetch` on (the
+    # default) → fetch the pinned beads-rust release for this platform into the
+    # instance plugin-data dir, off the event loop, once per process. Returns at once;
+    # the loop's setup gate / the /status route see it land (the store is re-pointed in
+    # place). A failure is a `br` setup gap with the download error in the hint.
+    try:
+        from .br_fetch import ensure_br
+
+        ensure_br(cfg, host=getattr(registry, "host", None))
+    except Exception:  # noqa: BLE001 — the fetch is best-effort; the preflight reports the gap
+        log.exception("[project_board] br auto-fetch could not start")
+
     gap_reporter = GapReporter(registry)
     try:
         gaps = gap_reporter.report(setup_status(cfg))
