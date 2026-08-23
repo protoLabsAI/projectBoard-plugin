@@ -734,12 +734,14 @@ class BoardLoop:
         # `goal_fix_max`, BEFORE escalating/blocking (else a top-tier diff:large
         # feature blocks on attempt 1 with no chance to add the tests).
         self.goal_fix_max = max(0, int(self.cfg.get("goal_fix_max", 2)))
-        # Empty-result cap (#198): a dispatch that COMPLETES with no worktree diff
-        # AND no tool-call activity is `empty_result` — the coder connected but never
-        # executed (a wedged adapter/session, a refusal), NOT a capability ceiling.
-        # A stronger model can't fix "connecting but not executing", so these never
-        # climb the tier ladder: retry same-tier, and after this many occurrences
-        # block for triage with the failure class + evidence in the reason.
+        # Empty-result cap (#198, retry policy #2991): a dispatch that COMPLETES with
+        # no worktree diff AND no tool-call activity is `empty_result` — the coder
+        # connected but never executed (a wedged adapter/session, a refusal). Often a
+        # transient ACP hiccup, so occurrences below this cap retry on the SAME tier
+        # (same prompt) before any failure is counted — pre-escalation, no ladder
+        # attempt spent. Once the cap is hit the failure IS recorded and the normal
+        # escalation ladder proceeds (single coder / ladder top → blocked for triage
+        # with the failure class + evidence in the reason).
         self.empty_result_max = max(1, int(self.cfg.get("empty_result_max", 2)))
         # Auto-fix command run in the worktree BEFORE opening the PR (e.g.
         # "ruff check --fix . && ruff format ."). The coder is edit-only — it can't run
@@ -909,8 +911,10 @@ class BoardLoop:
         # Pre-PR goal-verify gap re-dispatches so far (fid → count), same-tier.
         self._goal_fix_attempts: dict[str, int] = {}
         # empty_result occurrences so far (fid → count, #198) — a completed dispatch
-        # with no diff AND no tool-call activity. Never tier-escalated; blocked for
-        # triage after empty_result_max.
+        # with no diff AND no tool-call activity. Retried once on the SAME tier
+        # before any failure is counted (#2991); after empty_result_max occurrences
+        # the failure is recorded and the normal escalation ladder proceeds. Reset
+        # on a climb, so each tier gets its own retry window.
         self._empty_results: dict[str, int] = {}
         # Pre-PR local-gate failure re-dispatches so far (fid → count), same-tier.
         self._gate_fix_attempts: dict[str, int] = {}
@@ -2505,14 +2509,17 @@ class BoardLoop:
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     policy = classify(str(exc))
-                    # Empty result (#198): a dispatch that COMPLETED with no worktree
-                    # diff AND no tool-call activity is its own failure class — the
-                    # coder connected but never executed. That is not a model-capability
-                    # ceiling, so it must NOT climb the tier ladder (escalating can't
-                    # fix "connecting but not executing"). Record the attempt with the
-                    # ACP stop-reason the monitor tap stashed (the WHY the retro and
-                    # drawer show), retry same-tier, and after empty_result_max
-                    # occurrences block for triage naming the class + evidence.
+                    # Empty result (#198, retry policy #2991): a dispatch that COMPLETED
+                    # with no worktree diff AND no tool-call activity is its own failure
+                    # class — the coder connected but never executed. That is often a
+                    # transient ACP hiccup, so the first occurrence at a tier retries
+                    # ONCE on the SAME tier with the same prompt BEFORE any failure is
+                    # counted (pre-escalation: the ladder is not consulted, no escalation
+                    # attempt spent). Only when the retry ALSO comes back empty is the
+                    # failure recorded — with the ACP stop-reason the monitor tap stashed
+                    # (the WHY the retro and drawer show) — and the normal escalation
+                    # ladder proceeds (single coder / ladder top → blocked, reason naming
+                    # the class + evidence).
                     if isinstance(exc, worktree.NoChangesError):
                         had_tools, stop = self._empty_result_signals(fid)
                         if not had_tools:
@@ -2521,25 +2528,57 @@ class BoardLoop:
                             evidence = (
                                 f"empty coder reply — no diff, no tool calls (stop_reason={stop or 'none reported'})"
                             )
-                            try:
-                                store.record_attempt(
-                                    fid, tier=tier or store.current_tier(fid), outcome=f"empty_result: {evidence}"
-                                )
-                            except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
-                                log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
                             if n < self.empty_result_max:
+                                # The same_tier_retry marker on the attempt comment is how
+                                # the retro tells this retry from an escalation: the tier
+                                # is unchanged and no failure is counted yet.
+                                try:
+                                    store.record_attempt(
+                                        fid,
+                                        tier=tier or store.current_tier(fid),
+                                        outcome=f"empty_result: {evidence} — same_tier_retry (pre-escalation)",
+                                    )
+                                except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
+                                    log.warning(
+                                        "[project_board] %s empty_result attempt record failed", fid, exc_info=True
+                                    )
                                 log.info(
-                                    "[project_board] %s empty_result %d/%d — retry same tier (no escalation): %s",
+                                    "[project_board] %s Retrying on same tier (empty reply) %d/%d — "
+                                    "no failure counted: %s",
                                     fid,
                                     n,
                                     self.empty_result_max,
                                     evidence,
                                 )
                                 continue
-                            reason = f"empty_result: {evidence} — {n} occurrence(s), needs triage"
+                            # The same-tier retry also returned empty — NOW it is a coder
+                            # failure: record it, then let the normal ladder climb.
+                            reason = f"empty_result: {evidence} — {n} occurrence(s), same-tier retry exhausted"
+                            try:
+                                store.record_attempt(fid, tier=tier or store.current_tier(fid), outcome=reason)
+                            except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
+                                log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
+                            self._empty_results.pop(fid, None)  # a climb gets its own retry window
+                            if self.escalation_on:
+                                nxt = store.escalate(fid, reason[:200])
+                                if nxt:
+                                    log.info(
+                                        "[project_board] %s escalating %s→%s (empty-reply retry exhausted): %s",
+                                        fid,
+                                        tier,
+                                        nxt,
+                                        evidence,
+                                    )
+                                    tier = nxt
+                                    retries = 0
+                                    # Fresh per-tier budgets on the climb — mirrors the
+                                    # shared capability-escalation path below.
+                                    self._goal_fix_attempts.pop(fid, None)
+                                    self._gate_fix_attempts.pop(fid, None)
+                                    self._req_fix_attempts.pop(fid, None)
+                                    continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             store.flag_blocked(fid, reason)
-                            self._empty_results.pop(fid, None)
                             if wt:
                                 await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
@@ -3464,7 +3503,8 @@ class BoardLoop:
         """(had_tool_activity, stop_reason) for the dispatch that just failed with no
         diff, mined from the live-monitor ring buffer (#198). No tool events across
         any gen ⇒ the coder connected but never executed — the ``empty_result``
-        class ``_drive`` refuses to tier-escalate. ``stop_reason`` is whatever
+        class ``_drive`` retries once on the same tier before counting a failure
+        (#2991). ``stop_reason`` is whatever
         signal the ACP adapter reported (``progress_stop_reason``), latest gen wins.
         Best-effort: an unreadable snapshot reports activity=True, so a monitor
         hiccup can never misclassify a real capability failure as empty."""

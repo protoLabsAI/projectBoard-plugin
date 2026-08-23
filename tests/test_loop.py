@@ -30,6 +30,7 @@ from project_board.loop import (
     _source_issue,
     _source_issue_still_open,
 )
+from project_board.retro import classify as retro_classify
 from project_board.store import BeadsBoard, BoardError
 
 
@@ -719,10 +720,12 @@ async def test_drive_classifies_empty_result_and_records_the_stop_reason(monkeyp
     assert loop._inflight == {} and loop._empty_results == {}
 
 
-async def test_drive_empty_result_does_not_escalate_the_tier(monkeypatch):
-    """empty_result must NOT climb the coders ladder (#198): a stronger model can't
-    fix "connecting but not executing". Same-tier retry, then Blocked — escalate()
-    is never called even with a full ladder configured."""
+async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatch):
+    """The empty-reply retry is PRE-escalation (#2991): the first empty at a tier
+    retries once on the SAME tier without consulting the ladder (no escalation
+    attempt spent); only when the retry ALSO returns empty is the failure recorded
+    and the normal escalation ladder climbed. The escalated tier gets its own fresh
+    retry window; the ladder top still empty → Blocked, reason naming the class."""
     store = _EscalatingStore(tiers=["smart"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
@@ -755,10 +758,22 @@ async def test_drive_empty_result_does_not_escalate_the_tier(monkeypatch):
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
     await loop._drive(FEATURE)
 
-    assert store.escalated == []  # the ladder was never consulted
-    assert len(dispatches) == 2  # same-tier retry, then blocked
+    # 4 dispatches for 2 ladder consults: each tier's first empty burned a free
+    # same-tier retry, never an escalation attempt.
+    assert len(dispatches) == 4
+    assert [e[0] for e in store.escalated] == ["bd-1", "bd-1"]  # fast→smart, then the top
+    assert all("empty_result" in e[1] for e in store.escalated)  # the ladder saw the class
+    # The retro marker separates the two shapes: retries carry same_tier_retry
+    # (tier unchanged), recorded failures don't.
+    attempts = [c for c in store.calls if c[0] == "record_attempt"]
+    assert len(attempts) == 4
+    assert "same_tier_retry" in attempts[0][3] and "same_tier_retry" in attempts[2][3]
+    assert "same_tier_retry" not in attempts[1][3] and "same_tier_retry" not in attempts[3][3]
+    assert attempts[0][2] == "fast" and attempts[2][2] == "smart"  # the retry stays on-tier
+    # Ladder exhausted + still empty → blocked, reason naming the class.
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
     assert len(blocked) == 1 and "empty coder reply — no diff, no tool calls" in blocked[0][2]
+    assert loop._empty_results == {}
 
 
 async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
@@ -819,6 +834,46 @@ async def test_drive_empty_result_retry_recovers_and_resets_the_count(monkeypatc
     assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
     assert "flag_blocked" not in store.names()
     assert loop._empty_results == {}  # reset once the PR opened
+
+
+async def test_drive_empty_result_retry_records_the_retro_marker(monkeypatch):
+    """The retry attempt carries the same_tier_retry marker (#2991) so the board
+    retro can tell a pre-escalation retry from an escalation — and a retry that
+    recovers leaves NO recorded failure: only the marker attempt, nothing blocked.
+    The marked outcome still mines as the empty-result class."""
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise worktree.NoChangesError("coder produced no commits")
+        return "https://example/pr/4"
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    attempts = [c for c in store.calls if c[0] == "record_attempt"]
+    assert len(attempts) == 1  # the marker attempt only — the recovery recorded no failure
+    assert "empty_result" in attempts[0][3] and "same_tier_retry" in attempts[0][3]
+    assert "flag_blocked" not in store.names()
+    assert ("open_review", "bd-1", "https://example/pr/4") in store.calls
+    assert retro_classify(attempts[0][3]) == "empty result (no diff, no tool calls)"
+
+
+async def test_drive_empty_result_retry_logs_same_tier_retry(monkeypatch, caplog):
+    """The monitor log names the empty-reply retry distinctly (#2991): an operator
+    tailing the coder monitor can tell "Retrying on same tier (empty reply)" from
+    an escalation line."""
+    calls = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise worktree.NoChangesError("coder produced no commits")
+        return "https://example/pr/5"
+
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert "Retrying on same tier (empty reply)" in caplog.text
+    assert ("open_review", "bd-1", "https://example/pr/5") in store.calls
 
 
 # ── source-issue closed guard (#166) ────────────────────────────────────────────
