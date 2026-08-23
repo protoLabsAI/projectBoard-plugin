@@ -127,6 +127,54 @@ def test_onboard_skill_gates_registration_on_onboarding():
     assert "REGISTRATION REFUSED" in flat
 
 
+# ── the release workflow: a thin caller of the reusable plugin-release ────────────
+
+
+def _release_workflow():
+    """Parse .github/workflows/release.yml. YAML 1.1 folds the bare ``on:`` key into
+    the boolean ``True`` (the on/off/yes/no quirk); irrelevant here — we assert on
+    ``permissions`` and ``jobs``, whose string keys survive."""
+    return yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text())
+
+
+def test_release_workflow_calls_the_reusable_plugin_release_at_v2():
+    """release.yml is a thin caller of protoLabsAI/release-tools' reusable
+    plugin-release workflow — pinned at @v2, not the old @v1 composite action, and
+    carrying NO inline release logic (tag/notes/Discord live in the reusable side)."""
+    wf = _release_workflow()
+    job = wf["jobs"]["release"]
+    # It delegates to the reusable workflow, pinned at @v2.
+    assert job["uses"] == "protoLabsAI/release-tools/.github/workflows/plugin-release.yml@v2"
+    # Org secrets flow through so the reusable side can reach the gateway + Discord.
+    assert job["secrets"] == "inherit"
+    # A reusable-workflow-calling job has no `steps:` — the inline ritual is gone.
+    assert "steps" not in job
+
+    raw = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    # The old @v1 composite action must not linger anywhere in the file.
+    assert "release-tools@v1" not in raw
+    # None of the inline machinery the reusable workflow now owns.
+    for gone in ("gh release create", "git tag", "GATEWAY_API_KEY", "DISCORD_RELEASE_WEBHOOK"):
+        assert gone not in raw, f"inline release logic leaked: {gone!r}"
+
+
+def test_release_workflow_keeps_the_repo_specific_fork_guard():
+    """The fork guard stays in the caller's `if:` — it's repo-specific and can't live
+    in the reusable workflow shared across the fleet."""
+    guard = _release_workflow()["jobs"]["release"]["if"]
+    assert "github.repository == 'protoLabsAI/projectBoard-plugin'" in guard
+    assert "workflow_dispatch" in guard
+    assert "chore: release v" in guard
+
+
+def test_release_workflow_grants_contents_write_to_the_reusable_workflow():
+    """The caller must grant `contents: write` — a called workflow can only DOWNGRADE
+    the caller's GITHUB_TOKEN, never escalate. Drop this and an org/repo default of
+    read-only leaves the reusable workflow unable to create the tag or the release."""
+    wf = _release_workflow()
+    assert wf["permissions"]["contents"] == "write"
+
+
 # ── register(): wires the contributions without a host, doesn't throw ────────────
 
 
