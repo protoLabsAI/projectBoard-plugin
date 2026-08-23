@@ -99,14 +99,47 @@ async def stage_all(worktree: str) -> tuple[int, str, str]:
     return await _git(worktree, "add", "-A", "--", ".", *excludes)
 
 
-async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktrees") -> tuple[str, str]:
-    """``git worktree add <root>/feat-<id> -b feat/<id> <base>``.
+def slugify(title: str, max_len: int = 40) -> str:
+    """A filesystem/branch-safe slug of a feature title (#227): lowercased, every run of
+    non-alphanumerics collapsed to a single hyphen, leading/trailing hyphens stripped,
+    truncated to ``max_len`` chars (then a hyphen the cut left dangling is stripped).
+    Returns ``""`` for a title that is empty or all-punctuation — the branch/dir helpers
+    fall back to the bare ``feat-<fid>`` shape in that case."""
+    s = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s
+
+
+def branch_name(fid: str, title: str = "") -> str:
+    """The git branch for a feature build: ``feat/<fid>-<slug>`` (#227), or the bare
+    ``feat/<fid>`` when the title slugs to nothing. The ``<fid>`` is the machine key at
+    the front — every recovery/parsing path keys off it; the ``-<slug>`` is human sugar
+    for reviewers reading a branch list."""
+    slug = slugify(title)
+    return f"feat/{fid}-{slug}" if slug else f"feat/{fid}"
+
+
+def worktree_dir(fid: str, title: str = "") -> str:
+    """The per-feature worktree directory basename — ``feat-<fid>-<slug>`` (#227), or the
+    bare ``feat-<fid>`` when the title slugs to nothing. Mirrors ``branch_name`` (``/`` →
+    ``-``) so a worktree dir and its branch share the same ``<fid>-<slug>`` tail."""
+    slug = slugify(title)
+    return f"feat-{fid}-{slug}" if slug else f"feat-{fid}"
+
+
+async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "") -> tuple[str, str]:
+    """``git worktree add <root>/feat-<id>[-<slug>] -b feat/<id>[-<slug>] <base>``.
 
     Returns (absolute worktree path, branch). The branch is fresh off ``base`` so
     the blast radius is one throwaway tree. Cleans a stale worktree/branch of the
-    same name first (idempotent re-run after a crashed feature)."""
-    branch = f"feat/{fid}"
-    rel = os.path.join(root, f"feat-{fid}")
+    same name first (idempotent re-run after a crashed feature).
+
+    ``title`` (#227) is slugged onto the canonical branch/dir tail for readability;
+    throwaway candidate worktrees (``.g<n>``/``.c<k>``) pass none, keeping the bare
+    ``feat-<cid>`` shape the candidate-suffix stripping relies on."""
+    branch = branch_name(fid, title)
+    rel = os.path.join(root, worktree_dir(fid, title))
     path = os.path.join(repo, rel)
     # Best-effort cleanup of a prior run's leftovers.
     await _git(repo, "worktree", "remove", "--force", rel)
@@ -202,15 +235,33 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     tree + branch on disk (#175). Each candidate's branch follows the same
     ``feat/<id>.<suffix>`` naming it was created with. Best-effort throughout (an
     already-gone candidate is simply skipped). Returns True if the canonical
-    directory is gone after the call."""
+    directory is gone after the call.
+
+    The canonical tree may carry a human ``-<slug>`` tail (#227) — ``feat-<id>-<slug>``,
+    whose slug isn't recomputable from ``fid`` alone here. The bare ``feat-<id>`` name is
+    always ATTEMPTED (an idempotent no-op when only candidates or a slugged tree exist),
+    then any on-disk ``feat-<id>-*`` slugged variant is discovered by scan and removed
+    with its matching ``feat/<id>-<slug>`` branch. A candidate uses a ``.`` separator, so
+    the ``-`` slug scan can never mistake one for a canonical tree."""
     base = os.path.join(repo, worktrees_root)
     canonical = os.path.join(base, f"feat-{fid}")
     had_canonical = os.path.isdir(canonical)
     removed = await remove_worktree(repo, canonical, f"feat/{fid}")
+    cleaned: list[str] = [f"feat-{fid}"] if (removed and had_canonical) else []
     try:
         names = sorted(os.listdir(base))
     except OSError:
         names = []
+    # The slugged canonical variant(s): `feat-<fid>-<slug>` (a hyphen tail — a candidate
+    # uses a dot). Branch mirrors the dir name (`feat-` → `feat/`).
+    for name in names:
+        if not name.startswith(f"feat-{fid}-") or not os.path.isdir(os.path.join(base, name)):
+            continue
+        had_canonical = True
+        if await remove_worktree(repo, os.path.join(base, name), "feat/" + name[len("feat-") :]):
+            cleaned.append(name)
+        else:
+            removed = False
     reaped: list[str] = []
     for name in names:
         wt_id = name[len("feat-") :]
@@ -223,29 +274,30 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
             continue
         if await remove_worktree(repo, os.path.join(base, name), f"feat/{wt_id}"):
             reaped.append(name)
-    if (removed and had_canonical) or reaped:
-        cleaned = ([f"feat-{fid}"] if removed and had_canonical else []) + reaped
-        log.info("[project_board] reaped worktrees for %s: %s", fid, ", ".join(cleaned))
+    if cleaned or reaped:
+        log.info("[project_board] reaped worktrees for %s: %s", fid, ", ".join(cleaned + reaped))
     return removed
 
 
 async def promote_worktree(
-    repo: str, src_wt: str, src_branch: str, fid: str, root: str = ".worktrees"
+    repo: str, src_wt: str, src_branch: str, fid: str, root: str = ".worktrees", title: str = ""
 ) -> tuple[str, str]:
-    """Promote a Max-Mode candidate worktree to the canonical ``feat-<id>`` /
-    ``feat/<id>`` name (#21). The N candidates build in throwaway ``feat-<id>.c<k>``
-    worktrees; the winner has to take over the canonical name so the rest of the
-    lifecycle — the CI-fail bounce, crash recovery (``pr_url_for_branch(feat/<id>)``),
-    and reaping (``reap_feature_worktree(<id>)``) — all of which key off the canonical
-    names — works unchanged.
+    """Promote a Max-Mode candidate worktree to the canonical ``feat-<id>[-<slug>]`` /
+    ``feat/<id>[-<slug>]`` name (#21, #227). The N candidates build in throwaway
+    ``feat-<id>.c<k>`` worktrees; the winner has to take over the canonical name so the
+    rest of the lifecycle — the CI-fail bounce, crash recovery
+    (``pr_url_for_branch(branch_name(<id>, title))``), and reaping
+    (``reap_feature_worktree(<id>)``) — all of which key off the canonical names — works
+    unchanged. ``title`` (#227) picks the same ``-<slug>`` tail ``create_worktree`` /
+    ``branch_name`` would, so the promoted canonical matches what the loop recomputes.
 
     Moves the worktree dir and renames its branch IN PLACE, so the coder's still-
     uncommitted changes ride along (verified: ``git worktree move`` + ``branch -m``
     preserve the dirty tree). Idempotently clears a stale canonical worktree/branch
     first so ``move`` has a free destination. A winner already at the canonical path is
     a no-op. Returns (canonical_path, canonical_branch)."""
-    canon_branch = f"feat/{fid}"
-    canon_rel = os.path.join(root, f"feat-{fid}")
+    canon_branch = branch_name(fid, title)
+    canon_rel = os.path.join(root, worktree_dir(fid, title))
     canon_path = os.path.join(repo, canon_rel)
     if os.path.abspath(src_wt) == os.path.abspath(canon_path):
         return os.path.abspath(canon_path), canon_branch
@@ -282,16 +334,36 @@ def parent_feature_id(wt_id: str) -> str:
         out = stripped
 
 
+# The feature id at the FRONT of a `feat-<id>[-<slug>]` worktree dir (#227): a `bd-…`
+# bead id plus any `.<sub>`/`.g<n>`/`.c<n>`/`.test` dot-segments (sub-feature + candidate
+# suffixes), stopping at the human slug's leading `-`. The fid body never contains a bare
+# `-` (only the `bd-` prefix does) and the slug never contains a `.`, so the boundary is
+# unambiguous. `parent_feature_id` then strips the candidate suffixes off what this keeps.
+_FID_PREFIX_RE = re.compile(r"^(bd-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)")
+
+
+def _wt_id_from_dirname(name: str) -> str:
+    """The slug-free worktree id (``<fid>`` or ``<fid>.<candidate-suffix>``) from a
+    ``feat-<id>[-<slug>]`` dir name (#227) — the fid is the machine key at the front, the
+    ``-<slug>`` a human suffix that recovery/parsing must ignore. Falls back to the whole
+    post-``feat-`` remainder for a non-``bd`` id, preserving the pre-slug behavior."""
+    tail = name[len("feat-") :]
+    m = _FID_PREFIX_RE.match(tail)
+    return m.group(1) if m else tail
+
+
 def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:
-    """The feature ids that currently have a ``feat-<id>`` worktree dir under
-    ``<repo>/<worktrees_root>`` — for the health sweep's orphan check. Sync (a quick
-    dir listing); returns ``[]`` if the dir is absent."""
+    """The feature ids that currently have a ``feat-<id>[-<slug>]`` worktree dir under
+    ``<repo>/<worktrees_root>`` — for the health sweep's orphan check. The human slug tail
+    (#227) is stripped back to the machine ``<id>`` so the sweep resolves board state by
+    fid, not by the slugged dir name. Sync (a quick dir listing); returns ``[]`` if the
+    dir is absent."""
     base = os.path.join(repo, worktrees_root)
     try:
         names = os.listdir(base)
     except OSError:
         return []
-    return [n[len("feat-") :] for n in names if n.startswith("feat-") and os.path.isdir(os.path.join(base, n))]
+    return [_wt_id_from_dirname(n) for n in names if n.startswith("feat-") and os.path.isdir(os.path.join(base, n))]
 
 
 async def dispatch_coder(

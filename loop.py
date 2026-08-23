@@ -1292,7 +1292,9 @@ class BoardLoop:
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
         feature = store.get_feature(fid) or {}
-        pr_url = await worktree.pr_url_for_branch(f"feat/{fid}", cwd=self._repo_for(feature))
+        pr_url = await worktree.pr_url_for_branch(
+            worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
+        )
         if pr_url:
             store.open_review(fid, pr_url=pr_url)
             log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
@@ -1331,8 +1333,9 @@ class BoardLoop:
                 return False
             repo = self._repo_for(f)
             base = self._base_branch_for(f)
-            branch = f"feat/{fid}"
-            wt = os.path.join(repo, self.root, f"feat-{fid}")
+            title_raw = f.get("title") or ""
+            branch = worktree.branch_name(fid, title_raw)
+            wt = os.path.join(repo, self.root, worktree.worktree_dir(fid, title_raw))
             if not os.path.isdir(wt):
                 log.info("[project_board] %s salvage: verified worktree gone — rebuild fresh", fid)
                 self._clear_verified(store, fid)
@@ -1357,7 +1360,7 @@ class BoardLoop:
             # canonical name) → fixups → gate → open_pr. The gate re-runs NOW: a
             # candidate that verified before the crash but fails today (base moved,
             # env changed) is a doubt, not a ship.
-            wt, branch = await worktree.promote_worktree(repo, wt, branch, fid, self.root)
+            wt, branch = await worktree.promote_worktree(repo, wt, branch, fid, self.root, title=title_raw)
             await self._run_fixups(wt, f)
             if await self._run_local_gate(wt, f) is not None:
                 log.info("[project_board] %s salvage: gate fails on the candidate now — rebuild fresh", fid)
@@ -1891,8 +1894,9 @@ class BoardLoop:
             )
             # Remote-branch cleanup, best-effort; the worktree (which still holds the
             # local branch) is reaped when the reconcile reads MERGED.
-            if not await worktree.delete_remote_branch(repo, f"feat/{fid}"):
-                log.info("[project_board] %s remote branch feat/%s not deleted (already gone or protected)", fid, fid)
+            branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
+            if not await worktree.delete_remote_branch(repo, branch):
+                log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
             return True
         n = self._auto_merge_failures.get(fid, 0) + 1
         self._auto_merge_failures[fid] = n
@@ -1949,7 +1953,8 @@ class BoardLoop:
         if mss not in ("BEHIND", "DIRTY"):
             return False  # CLEAN / BLOCKED(checks) / UNKNOWN(computing) / DRAFT → not ours
         base = self._base_branch_for(feature)
-        outcome, detail = await worktree.rebase_onto_base(repo, f"feat/{fid}", base, root=self.root)
+        branch = worktree.branch_name(fid, feature.get("title") or "")
+        outcome, detail = await worktree.rebase_onto_base(repo, branch, base, root=self.root)
         if outcome == "clean":
             log.info("[project_board] %s auto-rebased onto %s (was %s) — force-pushed", fid, base, mss)
             return True
@@ -2068,7 +2073,8 @@ class BoardLoop:
                         pr_url,
                     )
             return False
-        outcome, detail = await worktree.merged_state_worktree(repo, f"feat/{fid}", base_sha, root=self.root)
+        branch = worktree.branch_name(fid, feature.get("title") or "")
+        outcome, detail = await worktree.merged_state_worktree(repo, branch, base_sha, root=self.root)
         if outcome == "error":
             log.warning("[project_board] %s merged-state verify hit infra trouble — next poll retries: %s", fid, detail)
             return False
@@ -2215,6 +2221,7 @@ class BoardLoop:
         base = self._base_branch_for(feature)
         coders = self._coders_for(feature)
         title = f"feat: {feature['title']}"
+        raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
         tier = store.current_tier(fid) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
@@ -2313,6 +2320,7 @@ class BoardLoop:
                                 fid, branch=br_name, sha=sha, worktree=wt_path
                             ),
                             commit_message=title,
+                            title=raw_title,  # #227: canonical branch/dir slug tail
                             max_concurrent_sessions=solve["max_concurrent_sessions"],
                         )
                         self._inflight[fid] = (repo, wt, branch)
@@ -2324,7 +2332,7 @@ class BoardLoop:
                         self._inflight[fid] = (repo, wt, branch)
                     else:
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
-                        wt, branch = await worktree.create_worktree(repo, base, fid, self.root)
+                        wt, branch = await worktree.create_worktree(repo, base, fid, self.root, title=raw_title)
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
@@ -3456,7 +3464,9 @@ class BoardLoop:
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]
-        canon_wt, canon_branch = await worktree.promote_worktree(repo, win_wt, win_branch, fid, self.root)
+        canon_wt, canon_branch = await worktree.promote_worktree(
+            repo, win_wt, win_branch, fid, self.root, title=feature.get("title") or ""
+        )
         # Reap the losers (the winner was moved out of its candidate name by promote).
         for i, cid in enumerate(cand_ids):
             if i != idx:

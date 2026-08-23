@@ -246,6 +246,49 @@ async def test_commit_worktree_stages_without_the_scratch(monkeypatch):
     assert ":(exclude).proto" in add and git.ran("commit")
 
 
+# ── #227: human-readable branch names — feat/<fid>-<slug> ────────────────────────
+
+
+def test_slugify_lowercases_collapses_strips_and_truncates():
+    assert worktree.slugify("Hello,   World!!") == "hello-world"  # collapse the punctuation run
+    assert worktree.slugify("  --Leading/Trailing.-- ") == "leading-trailing"  # strip both ends
+    assert worktree.slugify("") == "" and worktree.slugify("!!!") == ""  # empty / all-punct → ""
+    assert worktree.slugify("x" * 100) == "x" * 40  # hard cap at max_len
+    # a cut that lands right after a hyphen strips the dangling hyphen
+    assert worktree.slugify("a" * 39 + " boom") == "a" * 39
+
+
+def test_branch_and_dir_carry_the_slugged_title_truncated_to_40():
+    """The acceptance example: fid `bd-t7bk.1`, title `Add reusable plugin-release.yml
+    workflow` → the 40-char slug rides both the branch and the worktree dir."""
+    fid, title = "bd-t7bk.1", "Add reusable plugin-release.yml workflow"
+    assert worktree.slugify(title) == "add-reusable-plugin-release-yml-workflow"
+    assert len(worktree.slugify(title)) == 40
+    assert worktree.branch_name(fid, title) == "feat/bd-t7bk.1-add-reusable-plugin-release-yml-workflow"
+    assert worktree.worktree_dir(fid, title) == "feat-bd-t7bk.1-add-reusable-plugin-release-yml-workflow"
+
+
+def test_branch_and_dir_fall_back_to_the_bare_fid_without_a_slug():
+    """An empty/all-punctuation title (or none at all — the candidate case) keeps the
+    machine-key-only `feat-<fid>` / `feat/<fid>` shape the pre-#227 code produced."""
+    assert worktree.branch_name("bd-1", "") == "feat/bd-1"
+    assert worktree.branch_name("bd-1", "!!!") == "feat/bd-1"
+    assert worktree.worktree_dir("bd-1") == "feat-bd-1"  # title defaults to ""
+
+
+async def test_create_worktree_slugs_the_branch_and_dir_from_the_title(monkeypatch):
+    git = FakeGit({"rev-parse": (0, "abc123", "")})
+    _install(monkeypatch, git, FakeGh())
+    path, branch = await worktree.create_worktree(
+        "/repo", "main", "bd-t7bk.1", root=".worktrees", title="Add reusable plugin-release.yml workflow"
+    )
+    assert branch == "feat/bd-t7bk.1-add-reusable-plugin-release-yml-workflow"
+    assert path.endswith("/.worktrees/feat-bd-t7bk.1-add-reusable-plugin-release-yml-workflow")
+    add = next(a for a in git.calls if a[:2] == ("worktree", "add"))
+    assert add[2].endswith("feat-bd-t7bk.1-add-reusable-plugin-release-yml-workflow")  # the rel path
+    assert add[4] == branch  # ... -b <slugged-branch> ...
+
+
 # ── create_worktree: branch off the freshest base ───────────────────────────────
 
 
@@ -283,6 +326,20 @@ async def test_promote_worktree_moves_dir_and_renames_branch(monkeypatch):
     assert move[2].endswith("/.worktrees/feat-bd-1.c2") and move[3].endswith("/.worktrees/feat-bd-1")
     rename = next(a for a in git.calls if a[:1] == ("branch",) and "-m" in a)
     assert rename == ("branch", "-m", "feat/bd-1.c2", "feat/bd-1")
+
+
+async def test_promote_worktree_slugs_the_canonical_from_the_title(monkeypatch):
+    """#227: the winner is promoted to the SLUGGED canonical name so it matches what the
+    loop later recovers/reaps by `branch_name(fid, title)`."""
+    git = FakeGit()
+    monkeypatch.setattr(worktree, "_git", git)
+    canon_wt, canon_branch = await worktree.promote_worktree(
+        "/repo", "/repo/.worktrees/feat-bd-1.c2", "feat/bd-1.c2", "bd-1", root=".worktrees", title="Add a thing"
+    )
+    assert canon_branch == "feat/bd-1-add-a-thing"
+    assert canon_wt.endswith("/.worktrees/feat-bd-1-add-a-thing")
+    rename = next(a for a in git.calls if a[:1] == ("branch",) and "-m" in a)
+    assert rename == ("branch", "-m", "feat/bd-1.c2", "feat/bd-1-add-a-thing")
 
 
 async def test_promote_worktree_is_a_noop_when_already_canonical(monkeypatch):
@@ -339,6 +396,25 @@ def test_list_feature_worktrees_absent_dir(tmp_path):
     assert worktree.list_feature_worktrees(str(tmp_path), "does-not-exist") == []
 
 
+def test_list_feature_worktrees_strips_the_slug_tail(tmp_path):
+    """#227: a slugged canonical dir resolves to the bare fid (so the sweep looks the
+    feature up by its machine key); a candidate keeps its `.g<n>`/`.c<k>` suffix so
+    `parent_feature_id` can still resolve its owner."""
+    root = tmp_path / "wt"
+    (root / "feat-bd-t7bk.1-add-reusable-plugin-release-yml-workflow").mkdir(parents=True)
+    (root / "feat-bd-9").mkdir()  # bare (empty-slug) canonical — unchanged
+    (root / "feat-bd-9.c1").mkdir()  # a candidate — never slugged
+    assert set(worktree.list_feature_worktrees(str(tmp_path), "wt")) == {"bd-t7bk.1", "bd-9", "bd-9.c1"}
+
+
+def test_wt_id_from_dirname_extracts_the_fid_before_the_slug():
+    assert worktree._wt_id_from_dirname("feat-bd-t7bk.1-add-reusable-thing") == "bd-t7bk.1"
+    assert worktree._wt_id_from_dirname("feat-bd-9") == "bd-9"  # no slug
+    assert worktree._wt_id_from_dirname("feat-bd-9.c1") == "bd-9.c1"  # candidate suffix kept
+    assert worktree._wt_id_from_dirname("feat-bd-9.g2-a-slug") == "bd-9.g2"  # defensive: suffix then slug
+    assert worktree._wt_id_from_dirname("feat-legacy") == "legacy"  # non-bd id → whole remainder
+
+
 # ── parent_feature_id: candidate worktrees resolve to their owning feature (#91) ──
 
 
@@ -369,6 +445,43 @@ async def test_reap_feature_worktree_computes_path_and_branch(monkeypatch):
     monkeypatch.setattr(worktree, "remove_worktree", _remove)
     await worktree.reap_feature_worktree("/repo", ".worktrees", "bd-7")
     assert calls == [("/repo", "/repo/.worktrees/feat-bd-7", "feat/bd-7")]
+
+
+async def test_reap_finds_a_slugged_canonical_and_derives_its_branch(monkeypatch, tmp_path):
+    """#227: the canonical worktree carries a `-<slug>` tail whose slug isn't
+    recomputable from the fid alone. reap discovers `feat-<fid>-<slug>` by scan and
+    removes it with the matching `feat/<fid>-<slug>` branch. The bare-name attempt still
+    fires first (an idempotent no-op)."""
+    (tmp_path / ".worktrees" / "feat-bd-7-add-a-thing").mkdir(parents=True)
+    calls = []
+
+    async def _remove(repo, wt, branch=""):
+        calls.append((os.path.basename(wt), branch))
+        return True
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-7")
+    assert calls[0] == ("feat-bd-7", "feat/bd-7")  # the bare attempt, unchanged
+    assert ("feat-bd-7-add-a-thing", "feat/bd-7-add-a-thing") in calls  # the slugged tree + branch
+
+
+async def test_reap_slug_scan_skips_siblings_and_candidates(monkeypatch, tmp_path):
+    """The `-<slug>` scan (a hyphen) must not grab a prefix-sibling (`feat-bd-70-…`), and
+    a candidate (`.` separator) is left to the candidate sweep — never the slug scan."""
+    root = tmp_path / ".worktrees"
+    for name in ("feat-bd-7-my-slug", "feat-bd-70-other-feature", "feat-bd-7.c1"):
+        (root / name).mkdir(parents=True)
+    reaped = []
+
+    async def _remove(repo, wt, branch=""):
+        reaped.append(os.path.basename(wt))
+        return True
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-7")
+    assert "feat-bd-7-my-slug" in reaped  # bd-7's slugged canonical
+    assert "feat-bd-7.c1" in reaped  # bd-7's candidate (via the candidate sweep)
+    assert "feat-bd-70-other-feature" not in reaped  # the sibling feature is untouched
 
 
 # ── dispatch_coder: the stuck-coder watchdog (hard timeout + reap) ──────────────

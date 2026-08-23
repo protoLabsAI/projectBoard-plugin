@@ -1252,6 +1252,7 @@ async def dispatch(
     tier: str = "",
     record_verified: RecordVerified | None = None,
     commit_message: str = "",
+    title: str = "",
     max_concurrent_sessions: int = 0,
     _solve=None,
     _budget_cls=None,
@@ -1277,6 +1278,11 @@ async def dispatch(
     verified build instead of rebuilding fresh. ``commit_message`` names the commit
     that gives the verified tree its sha (the loop passes the PR title, so the
     shipped commit message is unchanged from what ``open_pr`` would have written).
+    ``title`` (#227) is the RAW feature title — it picks the promoted canonical
+    branch/dir's human ``-<slug>`` tail (via ``worktree.branch_name``), so the branch the
+    loop later recovers/reaps by ``branch_name(fid, title)`` matches the one promoted
+    here. Absent (candidate worktrees never slug), the canonical stays the bare
+    ``feat-<id>``.
     ``_solve``/``_budget_cls``/``_verdict_cls`` are test-injection seams for
     ``solve()``/``Budget``/``Verdict``; production callers never pass them (the real
     import happens here, deferred so this module carries no hard dependency on the
@@ -1396,7 +1402,7 @@ async def dispatch(
 
     win_wt = result.solution
     win_branch = next(b for wt, b in adapter.candidates if wt == win_wt)
-    canon_wt, canon_branch = await worktree.promote_worktree(repo, win_wt, win_branch, fid, root)
+    canon_wt, canon_branch = await worktree.promote_worktree(repo, win_wt, win_branch, fid, root, title=title)
     # The verify boundary's crash-salvage record (#91): the candidate PASSED its
     # acceptance tests but open_pr is still ahead (fixups + the pre-PR gate can take
     # minutes) — a crash in that window used to throw the whole verified build away.
