@@ -96,6 +96,9 @@ class FakeStore:
     def cancel_feature(self, fid, reason=""):
         return self._rec("cancel_feature", fid, reason)
 
+    def mark_done(self, fid, *, reason=""):
+        return self._rec("mark_done", fid, reason=reason)
+
     def delete_feature(self, fid, reason=""):
         return self._rec("delete_feature", fid, reason)
 
@@ -473,6 +476,47 @@ def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
     r2 = c.post("/api/plugins/project_board/features/bd-8/cancel")
     assert r2.status_code == 200
     assert ("cancel_feature", ("bd-8", ""), {}) in store.calls
+
+
+def test_done_route_calls_mark_done_with_reason(monkeypatch):
+    """POST /features/{fid}/done — the manual Done edge (#228). Carries the optional
+    reason through as a keyword (mark_done's signature) and works with no body too."""
+    _stub_reap(monkeypatch)  # the terminal edge reaps; keep it hermetic (no git)
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/done", json={"reason": "shipped off-board"})
+    assert r.status_code == 200
+    assert ("mark_done", ("bd-7",), {"reason": "shipped off-board"}) in store.calls
+    # No body → an empty reason (still a valid request, not a 422).
+    r2 = c.post("/api/plugins/project_board/features/bd-8/done")
+    assert r2.status_code == 200
+    assert ("mark_done", ("bd-8",), {"reason": ""}) in store.calls
+
+
+def test_done_route_reaps_the_worktree_at_the_terminal_edge(monkeypatch):
+    """#109: a hand-done feature is terminal (nothing left to build), so the route reaps
+    its worktree right after mark_done() succeeds — same pattern as cancel/merge."""
+    reaped = _stub_reap(monkeypatch)
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={"repo": "/repo", "worktrees_root": ".wt"})
+    r = c.post("/api/plugins/project_board/features/bd-7/done", json={"reason": "done"})
+    assert r.status_code == 200
+    assert ("mark_done", ("bd-7",), {"reason": "done"}) in store.calls  # mark_done runs first…
+    assert reaped == [("/repo", ".wt", "bd-7")]  # …then the reap fires
+
+
+def test_done_route_surfaces_an_invalid_state_as_400(monkeypatch):
+    """mark_done rejects a not-in-flight feature with a BoardError; the route must
+    surface it as a JSON 400 (the shared _guard), not a 500."""
+
+    class RejectingStore(FakeStore):
+        def mark_done(self, fid, *, reason=""):
+            raise BoardError("mark_done accepts in_progress/in_review/blocked, got 'backlog'")
+
+    _stub_reap(monkeypatch)
+    c = _client(monkeypatch, RejectingStore())
+    r = c.post("/api/plugins/project_board/features/bd-9/done", json={"reason": "x"})
+    assert r.status_code == 400 and "mark_done accepts" in r.json()["detail"]
 
 
 def test_delete_route_calls_delete_feature(monkeypatch):

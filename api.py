@@ -464,6 +464,19 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         await _reap_worktree(fid)
         return {**f, "cancel": side}
 
+    @router.post("/features/{fid}/done")
+    async def _done(fid: str, body: dict = Body(default={})):
+        """Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that
+        shipped OUTSIDE the board's PR lifecycle (record_merge's pr_url→external_ref
+        match never fires). Accepts only an in-flight card (in_progress/in_review/
+        blocked); 400 on a backlog/ready/done/cancelled one. Body: ``{reason}`` — the
+        audit trail for WHY it was hand-closed, recorded as a comment on the bead.
+        Reaps the feature's worktree once done — same terminal-edge reap as
+        cancel/merge (#109)."""
+        f = _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
+        await _reap_worktree(fid)
+        return f
+
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):
         """Hard-delete a feature created in error — a `br` tombstone (the harder sibling
