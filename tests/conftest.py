@@ -62,16 +62,38 @@ def _no_real_br_version(monkeypatch):
     untouched), and drop the per-path cache so no test sees another's sample."""
     from types import SimpleNamespace
 
-    from project_board import setup_check
+    from project_board import br_fetch, setup_check
 
     monkeypatch.setattr(
         setup_check, "_subprocess_run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="br 0.0.0-test\n")
     )
     setup_check._BR_VERSION_CACHE.clear()
     setup_check.publish_loop_snapshot(None)  # no running loop between tests
+
+    # The `br` auto-fetch (v0.43.0): NEVER touch the network or ~/.protoagent from the
+    # unit tier. Any test that lets register()/the loop gate see "no br on PATH" would
+    # otherwise start a real 5 MB download in a daemon thread. The default downloader
+    # raises (a test that wants a fetch injects its own), the data dir is a tmp dir,
+    # and the process-stable fetch state is reset so no test sees another's.
+    def _no_network(url, timeout=0.0):
+        raise AssertionError(f"unit tier tried to download {url} — inject a fake downloader")
+
+    monkeypatch.setattr(br_fetch, "_urllib_download", _no_network)
+    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path_factory_dir(monkeypatch)))
+    monkeypatch.delenv(br_fetch.ENV_BR_BIN, raising=False)
+    br_fetch.reset_state()
     yield
     setup_check._BR_VERSION_CACHE.clear()
     setup_check.publish_loop_snapshot(None)
+    br_fetch.reset_state()
+
+
+def tmp_path_factory_dir(monkeypatch):
+    """A fresh per-test scratch dir for the br auto-fetch data dir (the autouse
+    fixture can't take `tmp_path` without ordering surprises, so make one)."""
+    import tempfile
+
+    return tempfile.mkdtemp(prefix="pb-data-")
 
 
 @pytest.fixture

@@ -82,10 +82,13 @@ spawn primitive — it does not reimplement it.
 ## Requirements
 
 - **protoAgent ≥ 0.27.0** (console views + the ACP delegate teardown).
-- **beads-rust** — the **`br`** CLI on `PATH`, the board's DAG/status store. Install
-  with `cargo install beads_rust`. NOT the stale homebrew `bd` (a different, write-
-  broken package); the `bd-`/`br-` prefix in issue ids is just the workspace
-  namespace. Override the binary with `BR_BIN` if needed.
+- **beads-rust** — the **`br`** CLI, the board's DAG/status store. **Fetched for you on
+  first run (v0.43.0)**: with no `br` on `PATH` the plugin downloads the pinned release
+  (`br_fetch.BR_VERSION`, sha256-verified per platform) into the instance's plugin-data
+  dir and uses it — see "br fetched on first run" below. To install by hand:
+  `cargo install beads_rust`. NOT the stale homebrew `bd` (a different, write-broken
+  package); the `bd-`/`br-` prefix in issue ids is just the workspace namespace.
+  Override the binary with `BR_BIN` (it always wins over a fetched one).
 - `git` + the **`gh`** CLI (authenticated) for branch push + PR creation.
 - The **`delegates`** plugin enabled, with an **`acp`** coder delegate declared.
   **[`proto`](https://github.com/protoLabsAI/protoCLI) is the first-class coder** —
@@ -135,8 +138,8 @@ project_board:
                              # concurrently, so peak ACP processes =
                              # max_concurrent × coder_solve_k (default: 1 × 3 = 3).
                              # Use max_concurrent_sessions to cap the within-drive parallelism.
-                             # LIVE: coder, max_concurrent, max_pending_reviews and
-                             # max_concurrent_sessions are console Settings fields
+                             # LIVE: coder, br_autofetch, max_concurrent, max_pending_reviews
+                             # and max_concurrent_sessions are console Settings fields
                              # (Settings → Plugins → Project Board) and a save applies
                              # them to the RUNNING loop on its next tick — no restart.
                              # Every other key here is read once at boot. On a
@@ -318,7 +321,7 @@ cached `br --version` at most):
 
 | key | ok when | hint (operator copy) |
 |---|---|---|
-| `br` | the beads CLI (`BR_BIN`, default `br`) is on PATH | install beads-rust (`cargo install beads_rust`) and restart |
+| `br` | the beads CLI resolves (`BR_BIN` > the auto-fetched binary > `br` on PATH) | "fetching beads-rust vX for <platform> …" while the auto-fetch runs; the download error + the install hint if it failed; the install hint if `br_autofetch` is off / the platform has no build (Windows) |
 | `gh` | the GitHub CLI is on PATH | install it + `gh auth login`; builds can't open PRs until then |
 | `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure**. With `coder` **blank**, the ladder is the only dispatch path: escalation must be on (>1 distinct delegate) and the instance map *and* every project map must cover **every** tier (`smart`/`reasoning`/`opus`) — an unmapped rung dispatches to `''` and blocks the card | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)" / names the unresolvable delegate / names the uncovered tier(s) |
 | `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | set `project_board.repo` to the checkout's absolute path |
@@ -350,6 +353,37 @@ Where it surfaces:
   same board booted green and logged `crash recovery failed` + `loop tick failed`
   tracebacks every tick.
 
+### br fetched on first run (v0.43.0)
+
+A fresh member should not need a Rust toolchain to get its board store. When the setup
+preflight finds no `br` — and `project_board.br_autofetch` is on (the default; a live
+console Settings field) — the plugin:
+
+1. picks the **pinned** beads-rust release for this platform (`br_fetch.BR_VERSION`;
+   `darwin_arm64`, `darwin_amd64`, `linux_amd64`, `linux_arm64` — **not Windows**, which
+   gets a clear install hint),
+2. downloads `br-<version>-<platform>.tar.gz` from the beads_rust GitHub releases page
+   **off the event loop**, once per process, bounded to 60 s,
+3. verifies its **sha256** against the table in `br_fetch.py` (the release's own
+   per-asset checksums — the same pin-and-checksum discipline as `.github/workflows/ci.yml`,
+   which runs the real-br shape tier on exactly this version; a test pins the two together),
+4. extracts only the `br` binary to `<instance plugin-data>/project_board/bin/br` (the
+   host's `instance_paths().store("plugin-data")` — writable on desktop, never the plugin's
+   own source checkout; override with `PROJECT_BOARD_DATA_DIR`), mode 0755, atomically,
+5. re-points the store at it **in place** — the paused loop resumes on its next check,
+   `/status` reports `br.source: "fetched"`, the board page says "br vX fetched to …".
+
+Resolution order for the binary the store shells: **`BR_BIN` env > fetched binary > `br`
+on PATH** — an explicit `BR_BIN` is never overridden. A failed fetch (offline, a checksum
+mismatch, an egress block) is a `br` setup gap with the error in the hint and the manual
+install as the fallback — never a traceback; it is not retried until a restart. Set
+`br_autofetch: false` for the pre-0.43 posture (a missing `br` is just the install hint).
+
+**Egress:** the download is one HTTPS GET to `github.com` (redirecting to
+`objects.githubusercontent.com`). A deployment with the host's egress allowlist
+(ADR 0008) must allow those hosts; the fetch consults the allowlist first and reports
+its message instead of a socket error.
+
 ## Layout
 
 | File | What |
@@ -360,6 +394,7 @@ Where it surfaces:
 | `coder_seam.py` | the ADR 0064 P2 seam — dispatches a build through `coder.solve()` when available, else honest-degrades |
 | `api.py` | the HTTP API + the `/webhook/pr` Done edge (HMAC-verified) |
 | `setup_check.py` | the setup preflight (`br`/`gh`/coder/repo) + the host gap reporter — can the board run at all? |
+| `br_fetch.py` | `br` fetched on first run: the pinned beads-rust release + sha256 table, the off-loop once-per-process fetch, `BR_BIN` > fetched > PATH resolution |
 | `board_view.py` | the Kanban/list console view |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
 | `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `loop-retro` distill skill |

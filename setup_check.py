@@ -42,6 +42,7 @@ import subprocess
 import sys
 import types
 
+from . import br_fetch
 from . import store as store_mod
 from .projects import resolve_projects
 from .store import TIER_LADDER, escalation_enabled
@@ -306,11 +307,30 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
     # read at call time so the preflight can never disagree with the board op.
     br_bin = str(store_mod.BR or "br")
     br_path = _which(br_bin)
+    fetch = br_fetch.fetch_state()
+    if br_path:
+        br_hint = ""
+    elif fetch["state"] in ("fetching", "failed", "disabled", "unsupported"):
+        br_hint = br_fetch.hint_for(fetch, br_bin=br_bin)  # v0.43.0: the auto-fetch's own story
+    else:
+        br_hint = BR_HINT if br_bin == "br" else BR_HINT.replace("'br'", repr(br_bin), 1)
     br = {
         "ok": bool(br_path),
         "path": br_path,
         "version": _br_version(br_path, run) if br_path else "",
-        "hint": "" if br_path else (BR_HINT if br_bin == "br" else BR_HINT.replace("'br'", repr(br_bin), 1)),
+        "hint": br_hint,
+        # How the binary was resolved (env / fetched / path) + the auto-fetch state, so
+        # the board page can say "br fetched to …" / "fetching br …".
+        "source": "env"
+        if str(os.environ.get(br_fetch.ENV_BR_BIN) or "").strip()
+        else ("fetched" if fetch["state"] == "done" and fetch.get("path") else "path"),
+        "fetch": {
+            "state": fetch["state"],
+            "version": fetch.get("version", ""),
+            "platform": fetch.get("platform", ""),
+            "path": fetch.get("path", ""),
+            "error": fetch.get("error", ""),
+        },
     }
 
     gh_path = _which("gh")

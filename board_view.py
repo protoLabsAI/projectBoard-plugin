@@ -320,6 +320,8 @@ async function load(){
     // vanished): the setup preflight on /status says which check fails and how
     // to fix it — a warning card above the board, never a silent green.
     const s = await api("/api/plugins/project_board/status").catch(() => null);
+    // br fetched on first run (v0.43.0): say so in the subtitle, once it's the store's binary.
+    if (s && s.setup && s.setup.br && s.setup.br.source === "fetched") $("sub").textContent += " · br v" + (s.setup.br.fetch.version || "?") + " fetched to " + s.setup.br.path;
     if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);
     else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);
     else $("err").hidden = true;
