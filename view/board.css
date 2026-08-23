@@ -1,0 +1,113 @@
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
+    font-family:var(--pl-font-sans);font-size:13px}
+  .wrap{max-width:1240px;margin:0 auto;padding:var(--pl-space-4) var(--pl-space-6)}
+  .top{display:flex;align-items:center;gap:var(--pl-space-3);margin-bottom:var(--pl-space-4)}
+  h1{font-size:17px;margin:0;color:var(--pl-color-accent);letter-spacing:.2px}
+  .sub{color:var(--pl-color-fg-muted);font-size:12px;margin:0;flex:1}
+  /* Kanban — no DS primitive for cards/columns; token-driven. */
+  .board{display:grid;grid-template-columns:repeat(5,1fr);gap:var(--pl-space-3)}
+  .col{background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
+    border-radius:var(--pl-radius);padding:var(--pl-space-2);min-height:120px}
+  .col .pl-panel-header{padding:2px 4px var(--pl-space-2);text-transform:uppercase;
+    letter-spacing:.06em;font-size:11px}
+  .card{background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
+    border-left:3px solid var(--pl-color-accent);
+    border-radius:var(--pl-radius);padding:9px 10px;margin-bottom:var(--pl-space-2)}
+  .card .t{font-size:12.5px;line-height:1.35;margin-bottom:6px}
+  .card .m{display:flex;gap:var(--pl-space-2);align-items:center;flex-wrap:wrap;font-size:10.5px;color:var(--pl-color-fg-muted)}
+  .id{font-family:var(--pl-font-mono);font-size:10px}
+  a.pr{color:var(--pl-color-status-info);text-decoration:none}
+  a.pr:hover{text-decoration:underline}
+  .hide{display:none}
+  /* List view — collapsible per-state group headers (#26). Token-driven, mirrors the
+     Kanban column grouping as sections in the dense list. */
+  #list tr.grp{cursor:pointer;user-select:none}
+  #list tr.grp>td{background:var(--pl-color-bg-raised);text-transform:uppercase;
+    letter-spacing:.06em;font-size:11px;font-weight:600;color:var(--pl-color-fg-muted);
+    padding:var(--pl-space-2) 4px}
+  #list tr.grp:hover>td{color:var(--pl-color-fg)}
+  #list tr.grp .tw{display:inline-block;width:1.1em;text-align:center}
+  #list tr.grp .gl{margin-right:var(--pl-space-2)}
+  /* Done cap (#115): the "show all" affordance under the truncated Done column/group. */
+  .showall{display:block;width:100%;margin-top:2px;padding:6px;background:none;cursor:pointer;
+    border:var(--pl-border-width) dashed var(--pl-color-border);border-radius:var(--pl-radius);
+    color:var(--pl-color-fg-muted);font-size:11px}
+  .showall:hover{color:var(--pl-color-fg);border-color:var(--pl-color-accent)}
+  /* in_progress cards/rows open the live monitor drawer (#84) — cue it's clickable. */
+  .card--live{cursor:pointer}
+  .card--live:hover{border-color:var(--pl-color-accent)}
+  #list tr[data-mon]{cursor:pointer}
+  /* ── Live monitor drawer (#84): a slide-over mirroring the console goal-detail-drawer
+     UX — a right-edge panel over a click-away scrim, polling the per-feature progress
+     snapshot while open. Vanilla + token-driven; this page is an iframe, so it owns its
+     own HTML/JS and imports NO console components. */
+  #scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;
+    transition:opacity .15s ease;z-index:40}
+  #scrim.open{opacity:1;pointer-events:auto}
+  #drawer{position:fixed;top:0;right:0;height:100%;width:min(460px,92vw);z-index:41;
+    background:var(--pl-color-bg-raised);border-left:var(--pl-border-width) solid var(--pl-color-border);
+    box-shadow:-8px 0 24px rgba(0,0,0,.25);transform:translateX(100%);transition:transform .18s ease;
+    display:flex;flex-direction:column;overflow:hidden}
+  #drawer.open{transform:translateX(0)}
+  #drawer .dh{display:flex;align-items:center;gap:var(--pl-space-2);padding:var(--pl-space-3) var(--pl-space-4);
+    border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
+  #drawer .dh h2{font-size:14px;margin:0;flex:1;color:var(--pl-color-accent)}
+  #drawer .dx{cursor:pointer;background:none;border:none;color:var(--pl-color-fg-muted);font-size:18px;line-height:1}
+  #drawer .dx:hover{color:var(--pl-color-fg)}
+  #drawer .db{padding:var(--pl-space-3) var(--pl-space-4);overflow:auto;flex:1;overscroll-behavior:contain}
+  body.drawer-open{overflow:hidden}
+  .gen{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
+    padding:var(--pl-space-3);margin-bottom:var(--pl-space-3)}
+  .gen .gh{display:flex;align-items:center;gap:var(--pl-space-2);margin-bottom:var(--pl-space-2);flex-wrap:wrap}
+  .gen .gh .gn{font-weight:600}
+  .gen .lbl{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted);
+    margin:var(--pl-space-2) 0 2px}
+  .gen .cur{font-family:var(--pl-font-mono);font-size:11.5px;word-break:break-word}
+  .gen .loc{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px}
+  .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:11.5px;color:var(--pl-color-fg-muted);
+    max-height:120px;overflow:auto}
+  .gen ul.plan{list-style:none;margin:0;padding:0;max-height:140px;overflow:auto}
+  .gen ul.plan li{font-size:11.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .gen ul.plan li.pl-in_progress{color:var(--pl-color-fg);font-weight:600}
+  .gen ul.plan li.pl-completed{opacity:.6}
+  .gen ul.plan .glyph{display:inline-block;width:12px;color:var(--pl-color-accent)}
+  .gen .inprev{color:var(--pl-color-fg-muted);font-size:10.5px;white-space:pre-wrap;word-break:break-all;
+    max-height:48px;overflow:hidden;margin-top:2px}
+  .gen ul.tools{list-style:none;margin:0;padding:0;max-height:150px;overflow:auto}
+  .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .st-completed{color:var(--pl-color-status-success)}
+  .st-failed{color:var(--pl-color-status-error)}
+  .st-running{color:var(--pl-color-accent)}
+  .st-start{color:var(--pl-color-fg-muted)}
+  /* ── Task cards (#217): a task-type feature ships a DELIVERABLE (a doc, a decision,
+     an artifact ref) instead of a coder PR. A document icon marks it apart from a
+     coding feature card; its in_progress/in_review cards carry their own submit +
+     approve/reject controls and NEVER open the coder monitor (no coder dispatch).
+     Token-driven, vanilla — same discipline as the rest of the page. */
+  .doc-ico{vertical-align:-2px}
+  .doc-ico-w{color:var(--pl-color-status-info);margin-right:4px}
+  .card--task{border-left-style:dashed}
+  .deliv{margin-top:6px;padding:6px 8px;background:var(--pl-color-bg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
+    font-size:11.5px;color:var(--pl-color-fg-muted);white-space:pre-wrap;word-break:break-word;
+    max-height:120px;overflow:auto}
+  .tact{display:flex;gap:var(--pl-space-2);flex-wrap:wrap;margin-top:6px}
+  .tform{flex-direction:column;align-items:stretch}
+  .tarea{width:100%;min-height:54px;resize:vertical;font-family:inherit;font-size:11.5px;padding:5px 6px;
+    background:var(--pl-color-bg);color:var(--pl-color-fg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius)}
+  .tin{width:100%;font-family:inherit;font-size:11.5px;padding:4px 6px;
+    background:var(--pl-color-bg);color:var(--pl-color-fg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius)}
+  .trow{display:flex;gap:var(--pl-space-2)}
+  .tbtn{cursor:pointer;font-size:11px;padding:4px 9px;border-radius:var(--pl-radius);
+    border:var(--pl-border-width) solid var(--pl-color-border);
+    background:var(--pl-color-bg-raised);color:var(--pl-color-fg)}
+  .tbtn:hover{border-color:var(--pl-color-accent)}
+  .tbtn--primary{background:var(--pl-color-accent);color:var(--pl-color-bg);border-color:var(--pl-color-accent)}
+  .tbtn--danger{background:var(--pl-color-status-error);color:var(--pl-color-bg);border-color:var(--pl-color-status-error)}
+  .terr{color:var(--pl-color-status-error);font-size:10.5px;margin-top:2px;white-space:pre-wrap;word-break:break-word}
+  .tsub>td{padding:2px 10px 8px}
+  /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
+  @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }

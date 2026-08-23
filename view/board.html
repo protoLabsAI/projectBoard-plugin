@@ -1,0 +1,38 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board</title>
+<style>
+__BOARD_CSS__</style>
+<script>
+// ── Slug-aware base (ADR 0042): "" on the host window, "/agents/<slug>" when proxied.
+// Split on the prefix this page is served under so EVERY asset + fetch stays
+// same-origin and reaches THIS agent (never the host) through the fleet proxy.
+var BASE = location.pathname.split("/plugins/")[0];
+// Link the DS kit same-origin off BASE (rule 4) — --pl-* tokens, never hardcode hex.
+(function(){ var l=document.createElement("link"); l.rel="stylesheet";
+  l.href=BASE+"/_ds/plugin-kit.css"; document.head.appendChild(l); })();
+</script>
+</head><body><div class="wrap">
+  <div class="top">
+    <h1>Board</h1>
+    <p class="sub" id="sub">project_board — a projection over beads</p>
+    <div class="pl-tabs">
+      <button id="tk" class="pl-tab pl-tab--active" onclick="setView('kanban')">Kanban</button>
+      <button id="tl" class="pl-tab" onclick="setView('list')">List</button>
+    </div>
+  </div>
+  <div id="err" class="pl-callout pl-callout--error" hidden></div>
+  <div id="kanban" class="board"></div>
+  <table id="list" class="pl-table hide"><thead><tr>
+    <th>ID</th><th>Title</th><th>State</th><th>Pri</th><th>Flags</th><th>PR</th></tr></thead>
+    <tbody id="rows"></tbody></table>
+</div>
+<!-- Live monitor drawer (#84): a slide-over over a click-away scrim. -->
+<div id="scrim"></div>
+<div id="drawer" role="dialog" aria-modal="true" aria-label="Coder monitor">
+  <div class="dh"><h2 id="drawer-title">Coder monitor</h2>
+    <button class="dx" id="drawer-close" aria-label="Close">✕</button></div>
+  <div class="db" id="drawer-body"></div>
+</div>
+<script type="module">
+__BOARD_JS__</script></body></html>
