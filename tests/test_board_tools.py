@@ -77,7 +77,7 @@ def test_board_cancel_feature_tags_cancelled_and_closes_with_reason(make_board, 
 
     # #211: the reply also says what the cancel did beyond the board edge — no PR to
     # close, no drive in flight here.
-    assert out == {"id": "bd-1", "state": "cancelled", "pr_closed": False, "drive_cancelled": False}
+    assert out == {"id": "bd-1", "state": "cancelled", "pr_closed": False, "pr_detail": "", "drive_cancelled": False}
     (update,) = br.cmds("update")
     assert update == ("update", "bd-1", "--add-label", "cancelled", "--assignee", "")
     (close,) = br.cmds("close")

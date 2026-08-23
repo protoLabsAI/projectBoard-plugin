@@ -1259,7 +1259,7 @@ def test_cancel_route_closes_the_open_pr_and_reports_it(monkeypatch):
     c = _client(monkeypatch, store, cfg={"repo": "/repo"})
     r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "scope cut"})
     assert r.status_code == 200
-    assert r.json()["cancel"] == {"pr_closed": True, "drive_cancelled": False}
+    assert r.json()["cancel"] == {"pr_closed": True, "pr_detail": "", "drive_cancelled": False}
     assert closed == [("https://x/pr/9", "cancelled by operator — see card bd-7", "/repo")]
     assert ("cancel_feature", ("bd-7", "scope cut"), {}) in store.calls
 

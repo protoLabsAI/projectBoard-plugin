@@ -62,7 +62,21 @@ async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, st
     except asyncio.TimeoutError:
         proc.kill()
         raise WorktreeError(f"git {' '.join(args)} timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # #211: a task cancel (the operator's cancel verb) while the child runs —
+        # wait_for re-raises it but does NOT kill the child, so a `git push` would
+        # finish anyway and the branch land on the remote. Kill, then propagate.
+        _kill_quietly(proc)
+        raise
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+def _kill_quietly(proc) -> None:
+    """``proc.kill()`` that tolerates a child that already exited."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 # Paths the coder writes as its OWN session scratch — the ACP/`proto` coder's private
@@ -348,6 +362,12 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
     except asyncio.TimeoutError:
         proc.kill()
         raise WorktreeError(f"gh {' '.join(args)} timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # #211: same as _git — a cancel mid-`gh pr create` must not let the child
+        # finish and open a PR nobody owns. (If it already did, the drive's cancel
+        # path finds it by branch — pr_url_for_branch — and closes it.)
+        _kill_quietly(proc)
+        raise
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -437,33 +457,52 @@ async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tu
     return rc == 0, detail
 
 
+# ``close_pr`` / ``close_pr_sync`` detail values for a PR that needed NO close — the
+# caller's bead note must say "already merged", never "close it by hand" on a merged PR.
+PR_ALREADY_MERGED = "already merged"
+PR_ALREADY_CLOSED = "already closed"
+_PR_ALREADY = {"MERGED": PR_ALREADY_MERGED, "CLOSED": PR_ALREADY_CLOSED}
+
+
 async def close_pr(pr_url: str, *, comment: str, cwd: str = ".") -> tuple[bool, str]:
     """Close an open PR with a comment (``gh pr close --comment``) — the operator-
     cancel edge (#211): a cancelled card must not leave an open PR nobody owns.
-    Returns ``(ok, detail)``; never raises into the loop (a PR already closed/merged,
-    a gh failure, a timeout — all land as ``(False, detail)`` for the caller to log)."""
+
+    Reads the PR's state FIRST: a ``MERGED`` / ``CLOSED`` PR is left alone and reported
+    as ``(True, PR_ALREADY_MERGED | PR_ALREADY_CLOSED)`` — a blind ``gh pr close`` on a
+    merged PR fails, and "close it by hand" on merged work is the wrong note. Otherwise
+    ``(True, "")`` on a close, ``(False, detail)`` on a gh failure / timeout — never
+    raises into the loop."""
     try:
+        already = _PR_ALREADY.get(await pr_state(pr_url, cwd=cwd))
+        if already:
+            return True, already
         rc, out, err = await _gh("pr", "close", pr_url, "--comment", comment, cwd=cwd, timeout=60)
     except Exception as exc:  # noqa: BLE001 — best-effort
         return False, str(exc)
-    return rc == 0, (err or out or "").strip()
+    return rc == 0, "" if rc == 0 else (err or out or "").strip()
+
+
+def _gh_sync(*args: str, cwd: str, timeout: float) -> tuple[int, str, str]:
+    """``_gh`` for a sync caller (a worker thread with no event loop). Raises on a
+    missing gh / timeout / bad cwd — the callers wrap it."""
+    proc = subprocess.run(["gh", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def close_pr_sync(pr_url: str, *, comment: str, cwd: str = ".", timeout: float = 60) -> tuple[bool, str]:
     """``close_pr`` for a SYNC caller (the ``board_cancel_feature`` tool runs in a
-    worker thread with no event loop of its own). Same contract: ``(ok, detail)``,
-    never raises."""
+    worker thread with no event loop of its own). Same contract: ``(ok, detail)``
+    with the same ``PR_ALREADY_*`` skip for a merged/closed PR, never raises."""
     try:
-        proc = subprocess.run(
-            ["gh", "pr", "close", pr_url, "--comment", comment],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        rc, out, _err = _gh_sync("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd, timeout=timeout)
+        already = _PR_ALREADY.get(out.strip()) if rc == 0 else None
+        if already:
+            return True, already
+        rc, out, err = _gh_sync("pr", "close", pr_url, "--comment", comment, cwd=cwd, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — missing gh, timeout, bad cwd
         return False, str(exc)
-    return proc.returncode == 0, (proc.stderr or proc.stdout or "").strip()
+    return rc == 0, "" if rc == 0 else (err or out or "").strip()
 
 
 async def delete_remote_branch(repo: str, branch: str) -> bool:

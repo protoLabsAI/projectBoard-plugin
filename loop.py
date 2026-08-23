@@ -562,13 +562,19 @@ def cancel_side_effects(fid: str, pr_url: str = "", *, cwd: str = ".") -> dict:
     (best-effort — a gh failure logs a warning and never blocks the cancel) and stop
     its in-flight drive, if any. Shared by the tool and the route; sync, so it runs
     in the tool's worker thread as-is and via ``asyncio.to_thread`` from the route."""
-    out = {"pr_closed": False, "drive_cancelled": False}
+    out = {"pr_closed": False, "pr_detail": "", "drive_cancelled": False}
     if pr_url:
         ok, detail = worktree.close_pr_sync(pr_url, comment=cancel_pr_comment(fid), cwd=cwd)
-        out["pr_closed"] = ok
-        if ok:
+        if ok and detail in (worktree.PR_ALREADY_MERGED, worktree.PR_ALREADY_CLOSED):
+            # Nothing to close — say which, never "closed" (and never ask for a by-hand
+            # close of merged work).
+            out["pr_detail"] = detail
+            log.info("[project_board] %s cancelled — %s %s, nothing to close", fid, pr_url, detail)
+        elif ok:
+            out["pr_closed"] = True
             log.info("[project_board] %s cancelled — closed %s", fid, pr_url)
         else:
+            out["pr_detail"] = detail[:300]
             log.warning("[project_board] %s cancelled — could not close %s: %s", fid, pr_url, detail[:300])
     out["drive_cancelled"] = request_drive_cancel(fid)
     if out["drive_cancelled"]:
@@ -923,6 +929,10 @@ class BoardLoop:
         # base that moves repeatedly doesn't burn a gate run every poll forever.
         self._merged_verify_attempts: dict[str, int] = {}
         self._auto_merge_failures: dict[str, int] = {}
+        # #211: drives whose operator-cancel cleanup already ran (or is running) — a
+        # second cancel verb landing mid-cleanup re-enters _drive's CancelledError
+        # handler; this keeps the close + trail comment from happening twice.
+        self._cancel_done: set[str] = set()
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
@@ -1666,6 +1676,7 @@ class BoardLoop:
             self._drives.discard(task)
             self._inflight_files.pop(fid, None)
             _unregister_drive(fid, task)
+            self._cancel_done.discard(fid)  # a later drive of the same card gets its own cancel edge
 
         return _cb
 
@@ -2597,11 +2608,43 @@ class BoardLoop:
         """Finish a drive whose card was cancelled by the operator: close the PR if one
         opened (with a comment pointing at the card), reap the worktree (#1 lifecycle
         rule), comment the trail on the card, release the slot. No flag_blocked, no
-        escalation, nothing raised — a cancel is a terminal edge, not a failure."""
-        note = f"cancelled by operator — drive ended without a PR; branch {branch or '?'} not pushed"
+        escalation, nothing raised — a cancel is a terminal edge, not a failure.
+
+        Runs ONCE per drive and to completion: a second cancel verb landing while this
+        is awaiting gh/git cancels the drive task again, which would re-enter via the
+        CancelledError handler — the ``_cancel_done`` mark makes that re-entry a no-op,
+        and the body runs shielded so the repeat cancel can't abandon the reap or the
+        trail halfway (a shutdown cancel is still honoured: ``stop()`` owns that reap)."""
+        if fid in self._cancel_done:
+            return
+        self._cancel_done.add(fid)
+        inner = asyncio.ensure_future(self._finish_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url))
+        while True:
+            try:
+                await asyncio.shield(inner)
+                return
+            except asyncio.CancelledError:
+                if inner.done() or self._shutting_down or self._stop.is_set():
+                    inner.cancel()
+                    raise
+                log.info("[project_board] %s repeat cancel during cancel cleanup — finishing it", fid)
+
+    async def _finish_cancelled_drive(self, store, fid: str, repo: str, wt, branch, *, pr_url: str | None) -> None:
+        if not pr_url and branch:
+            # The cancel may have landed INSIDE `git push` / `gh pr create` (the task
+            # cancel kills the child, but GitHub may already have the PR) — the drive
+            # never got a URL back, so look the branch up before declaring "no PR".
+            try:
+                pr_url = await worktree.pr_url_for_branch(branch, cwd=repo) or None
+            except Exception:  # noqa: BLE001 — a gh failure here is not a cancel failure
+                log.debug("[project_board] %s cancel: pr lookup for %s failed", fid, branch, exc_info=True)
+        note = f"cancelled by operator — drive ended without a PR (branch {branch or '?'})"
         if pr_url:
             ok, detail = await worktree.close_pr(pr_url, comment=cancel_pr_comment(fid), cwd=repo)
-            if ok:
+            if ok and detail in (worktree.PR_ALREADY_MERGED, worktree.PR_ALREADY_CLOSED):
+                note = f"cancelled by operator — {pr_url} {detail}, nothing to close"
+                log.info("[project_board] %s cancelled — %s %s", fid, pr_url, detail)
+            elif ok:
                 note = f"cancelled by operator — closed {pr_url}"
                 log.info("[project_board] %s cancelled — closed %s", fid, pr_url)
             else:

@@ -705,17 +705,39 @@ async def test_reap_tolerates_a_candidate_that_fails_to_remove(monkeypatch, tmp_
 # ── #211: close_pr / close_pr_sync — the operator-cancel edge ───────────────────────
 
 
-async def test_close_pr_runs_gh_pr_close_with_the_comment(monkeypatch):
+def _gh_for_close(state="OPEN", close=(0, "✓ Closed pull request #1", "")):
     calls = []
 
     async def _gh(*args, cwd, timeout=60):
         calls.append((args, cwd))
-        return (0, "✓ Closed pull request #1", "")
+        if args[:2] == ("pr", "view"):
+            return (0, state + "\n", "")
+        return close
 
-    monkeypatch.setattr(worktree, "_gh", _gh)
+    _gh.calls = calls
+    return _gh
+
+
+async def test_close_pr_reads_the_state_then_runs_gh_pr_close_with_the_comment(monkeypatch):
+    gh = _gh_for_close()
+    monkeypatch.setattr(worktree, "_gh", gh)
     ok, detail = await worktree.close_pr("https://x/pr/1", comment="cancelled by operator — see card bd-1", cwd="/repo")
-    assert ok is True
-    assert calls == [(("pr", "close", "https://x/pr/1", "--comment", "cancelled by operator — see card bd-1"), "/repo")]
+    assert (ok, detail) == (True, "")
+    assert gh.calls == [
+        (("pr", "view", "https://x/pr/1", "--json", "state", "--jq", ".state"), "/repo"),
+        (("pr", "close", "https://x/pr/1", "--comment", "cancelled by operator — see card bd-1"), "/repo"),
+    ]
+
+
+@pytest.mark.parametrize("state, already", [("MERGED", "already merged"), ("CLOSED", "already closed")])
+async def test_close_pr_skips_a_merged_or_closed_pr(monkeypatch, state, already):
+    """A blind `gh pr close` on a merged PR fails — and "close it by hand" is the wrong
+    note on merged work. Read the state first; MERGED/CLOSED is a named skip."""
+    gh = _gh_for_close(state=state)
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.close_pr("https://x/pr/1", comment="c") == (True, already)
+    assert [c[0][:2] for c in gh.calls] == [("pr", "view")]  # never `pr close`
+    assert already in (worktree.PR_ALREADY_MERGED, worktree.PR_ALREADY_CLOSED)
 
 
 async def test_close_pr_never_raises(monkeypatch):
@@ -729,27 +751,40 @@ async def test_close_pr_never_raises(monkeypatch):
     async def _gh_fail(*args, cwd, timeout=60):
         return (1, "", "GraphQL: Pull request is already closed")
 
+    # the state read failing (rc≠0 → "") falls through to the close, which reports its own failure
     monkeypatch.setattr(worktree, "_gh", _gh_fail)
     assert await worktree.close_pr("https://x/pr/1", comment="c") == (False, "GraphQL: Pull request is already closed")
 
 
-def test_close_pr_sync_shells_gh_and_never_raises(monkeypatch):
+def _run_for_close(state="OPEN", close_rc=0):
     from types import SimpleNamespace
 
     calls = []
 
     def _run(argv, **kw):
         calls.append((argv, kw.get("cwd")))
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=state + "\n", stderr="")
+        return SimpleNamespace(returncode=close_rc, stdout="ok", stderr="" if close_rc == 0 else "refused")
 
-    monkeypatch.setattr(worktree.subprocess, "run", _run)
+    _run.calls = calls
+    return _run
+
+
+def test_close_pr_sync_shells_gh_and_never_raises(monkeypatch):
+    run = _run_for_close()
+    monkeypatch.setattr(worktree.subprocess, "run", run)
     assert worktree.close_pr_sync("https://x/pr/2", comment="cancelled by operator — see card bd-2", cwd="/repo") == (
         True,
-        "ok",
+        "",
     )
-    assert calls == [
-        (["gh", "pr", "close", "https://x/pr/2", "--comment", "cancelled by operator — see card bd-2"], "/repo")
+    assert run.calls == [
+        (["gh", "pr", "view", "https://x/pr/2", "--json", "state", "--jq", ".state"], "/repo"),
+        (["gh", "pr", "close", "https://x/pr/2", "--comment", "cancelled by operator — see card bd-2"], "/repo"),
     ]
+    run = _run_for_close(close_rc=1)
+    monkeypatch.setattr(worktree.subprocess, "run", run)
+    assert worktree.close_pr_sync("https://x/pr/2", comment="c") == (False, "refused")
 
     def _boom(argv, **kw):
         raise FileNotFoundError("gh")
@@ -757,3 +792,71 @@ def test_close_pr_sync_shells_gh_and_never_raises(monkeypatch):
     monkeypatch.setattr(worktree.subprocess, "run", _boom)
     ok, detail = worktree.close_pr_sync("https://x/pr/2", comment="c")
     assert ok is False and "gh" in detail
+
+
+@pytest.mark.parametrize("state, already", [("MERGED", "already merged"), ("CLOSED", "already closed")])
+def test_close_pr_sync_skips_a_merged_or_closed_pr(monkeypatch, state, already):
+    run = _run_for_close(state=state)
+    monkeypatch.setattr(worktree.subprocess, "run", run)
+    assert worktree.close_pr_sync("https://x/pr/2", comment="c") == (True, already)
+    assert [c[0][:3] for c in run.calls] == [["gh", "pr", "view"]]
+
+
+# ── #211: a task cancel mid-`git push` / `gh pr create` kills the child ─────────────
+
+
+class _HangingProc:
+    """A subprocess whose communicate() never returns on its own."""
+
+    def __init__(self):
+        self.killed = False
+        self.returncode = None
+
+    async def communicate(self):
+        await asyncio.Event().wait()
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.parametrize("runner", ["_gh", "_git"])
+async def test_task_cancel_mid_subprocess_kills_the_child_and_propagates(monkeypatch, runner):
+    """`asyncio.wait_for` re-raises a CancelledError but does NOT kill the child — so a
+    cancel during `git push` / `gh pr create` used to let the push/create FINISH (the
+    orphan PR of #211). Kill the child, then propagate."""
+    proc = _HangingProc()
+    spawned = []
+
+    async def _spawn(*argv, **kw):
+        spawned.append(argv)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    coro = worktree._gh("pr", "create", cwd="/wt") if runner == "_gh" else worktree._git("/wt", "push")
+    task = asyncio.create_task(coro)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert spawned and not proc.killed
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed is True
+
+
+async def test_kill_on_cancel_tolerates_an_already_exited_child(monkeypatch):
+    class _Gone(_HangingProc):
+        def kill(self):
+            raise ProcessLookupError()
+
+    proc = _Gone()
+
+    async def _spawn(*argv, **kw):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    task = asyncio.create_task(worktree._gh("pr", "close", cwd="/wt"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):  # the cancel still propagates; no ProcessLookupError leak
+        await task
