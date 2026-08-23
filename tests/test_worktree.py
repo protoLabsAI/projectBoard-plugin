@@ -311,6 +311,130 @@ async def test_create_worktree_falls_back_to_local_base_without_a_remote(monkeyp
     assert add[-1] == "main"  # fell back to the local branch
 
 
+# ── #225: prune stale worktrees so create_worktree survives a corrupt admin dir ──
+
+
+class _SeqGit:
+    """A `_git` fake that keys a canned response on the full SUBCOMMAND (``("worktree",
+    <verb>)`` for a worktree op, else ``args[0]``) and can hand out a SEQUENCE of
+    responses for one key — so a `worktree add` can fail on the first call and succeed
+    on the retry. Records every call."""
+
+    def __init__(self, responses=None):
+        self.calls = []
+        self.responses = responses or {}
+        self._idx = {}
+
+    def _key(self, args):
+        if args and args[0] == "worktree":
+            return ("worktree", args[1]) if len(args) > 1 else ("worktree",)
+        return args[0] if args else ""
+
+    async def __call__(self, repo, *args, timeout=60):
+        self.calls.append(args)
+        key = self._key(args)
+        resp = self.responses.get(key, (0, "", ""))
+        if isinstance(resp, list):
+            i = min(self._idx.get(key, 0), len(resp) - 1)
+            self._idx[key] = i + 1
+            return resp[i]
+        return resp
+
+    def ran(self, *sub):
+        return [a for a in self.calls if a[: len(sub)] == sub]
+
+
+async def test_create_worktree_prunes_stale_worktrees_before_add(monkeypatch):
+    """r2: `git worktree prune` runs BEFORE `worktree add` as a preventive measure."""
+    git = _SeqGit({"rev-parse": (0, "abc", "")})
+    _install(monkeypatch, git, FakeGh())
+    await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees")
+    wt_ops = [a[:2] for a in git.calls if a and a[0] == "worktree"]
+    assert ("worktree", "prune") in wt_ops
+    assert ("worktree", "add") in wt_ops
+    assert wt_ops.index(("worktree", "prune")) < wt_ops.index(("worktree", "add"))
+    # the prune is verbose so pruned entries can be surfaced/logged
+    assert git.ran("worktree", "prune")[0] == ("worktree", "prune", "-v")
+
+
+async def test_create_worktree_logs_pruned_stale_worktrees_at_warning(monkeypatch, caplog):
+    """r4: when the preventive prune actually cleans a stale worktree (non-empty
+    output), it is logged at WARNING."""
+    git = _SeqGit(
+        {
+            "rev-parse": (0, "abc", ""),
+            ("worktree", "prune"): (
+                0,
+                "Removing worktrees/no-fabrication: gitdir file points to non-existent location\n",
+                "",
+            ),
+        }
+    )
+    _install(monkeypatch, git, FakeGh())
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        _path, branch = await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees")
+    assert branch == "feat/bd-1"
+    assert "pruned stale worktree" in caplog.text
+    assert "no-fabrication" in caplog.text
+
+
+async def test_create_worktree_does_not_warn_when_prune_is_clean(monkeypatch, caplog):
+    """r6: a healthy repo (prune finds nothing) creates the worktree with NO stale-
+    cleanup warning — other projects are unaffected by the new prune step."""
+    git = _SeqGit({"rev-parse": (0, "abc", "")})  # prune → default (0, "", "") empty
+    _install(monkeypatch, git, FakeGh())
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees")
+    assert "pruned stale worktree" not in caplog.text
+    assert len(git.ran("worktree", "add")) == 1  # first add succeeded → no retry
+
+
+async def test_create_worktree_retries_add_once_after_prune_on_git_error(monkeypatch, caplog):
+    """r1/r3: a `worktree add` that fails with 'fatal: not a git repository' (the
+    release-tools corruption) triggers a prune + a single retry; the retry succeeds so
+    create_worktree returns the path/branch normally."""
+    git = _SeqGit(
+        {
+            "rev-parse": (0, "abc", ""),
+            ("worktree", "add"): [
+                (128, "", "fatal: not a git repository (or any parent up to mount point /)"),
+                (0, "", ""),
+            ],
+        }
+    )
+    _install(monkeypatch, git, FakeGh())
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        path, branch = await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees")
+    assert branch == "feat/bd-1"
+    assert path.endswith("/.worktrees/feat-bd-1")
+    assert len(git.ran("worktree", "add")) == 2  # failed once, retried once
+    assert len(git.ran("worktree", "prune")) == 2  # preventive prune + the retry prune
+    assert "retrying once" in caplog.text
+
+
+async def test_create_worktree_raises_when_the_retry_also_fails(monkeypatch):
+    """r3: the retry is a SINGLE attempt — if the add still fails after the second
+    prune, the WorktreeError propagates (the loop blocks) rather than looping."""
+    git = _SeqGit(
+        {
+            "rev-parse": (0, "abc", ""),
+            ("worktree", "add"): (128, "", "fatal: not a git repository"),
+        }
+    )
+    _install(monkeypatch, git, FakeGh())
+    with pytest.raises(WorktreeError, match="worktree add failed"):
+        await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees")
+    assert len(git.ran("worktree", "add")) == 2  # original + exactly one retry, then give up
+
+
+async def test_prune_stale_worktrees_is_best_effort_on_nonzero(monkeypatch):
+    """A non-zero prune (rc≠0) is swallowed — the return is its stripped stdout and no
+    exception rides into the loop; the subsequent `worktree add` reports any real error."""
+    git = _SeqGit({("worktree", "prune"): (1, "", "fatal: something")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert await worktree.prune_stale_worktrees("/repo") == ""
+
+
 # ── promote_worktree: the Max-Mode winner takes the canonical name (#21) ─────────
 
 

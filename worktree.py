@@ -128,6 +128,21 @@ def worktree_dir(fid: str, title: str = "") -> str:
     return f"feat-{fid}-{slug}" if slug else f"feat-{fid}"
 
 
+async def prune_stale_worktrees(repo: str) -> str:
+    """``git worktree prune -v`` in ``repo`` — drop stale ``.git/worktrees/*`` admin
+    entries whose working tree is gone (a branch merged + its tree deleted, or a tree
+    created outside the loop and later removed by hand). Verbose so the pruned entries
+    are surfaced; when it cleans anything, it is logged at WARNING (#225): a corrupt
+    worktree admin dir is exactly what makes git refuse a fresh ``worktree add`` with
+    'fatal: not a git repository'. Best-effort — a non-zero prune is ignored (the
+    subsequent ``worktree add`` reports the real error). Returns the stripped output."""
+    _rc, out, _err = await _git(repo, "worktree", "prune", "-v")
+    out = out.strip()
+    if out:
+        log.warning("[project_board] pruned stale worktree(s) in %s:\n%s", repo, out)
+    return out
+
+
 async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "") -> tuple[str, str]:
     """``git worktree add <root>/feat-<id>[-<slug>] -b feat/<id>[-<slug>] <base>``.
 
@@ -135,12 +150,21 @@ async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktree
     the blast radius is one throwaway tree. Cleans a stale worktree/branch of the
     same name first (idempotent re-run after a crashed feature).
 
+    Preventively runs ``git worktree prune`` before the add (#225): stale
+    ``.git/worktrees/*`` entries left behind outside the loop — branches merged and
+    their trees deleted by hand — corrupt the worktree state enough that git refuses a
+    fresh ``worktree add`` with 'fatal: not a git repository' (observed for the
+    release-tools checkout). If the add still fails with a git error, prune again and
+    retry it ONCE before blocking.
+
     ``title`` (#227) is slugged onto the canonical branch/dir tail for readability;
     throwaway candidate worktrees (``.g<n>``/``.c<k>``) pass none, keeping the bare
     ``feat-<cid>`` shape the candidate-suffix stripping relies on."""
     branch = branch_name(fid, title)
     rel = os.path.join(root, worktree_dir(fid, title))
     path = os.path.join(repo, rel)
+    # Preventive: drop stale worktree admin entries before touching anything (#225).
+    await prune_stale_worktrees(repo)
     # Best-effort cleanup of a prior run's leftovers.
     await _git(repo, "worktree", "remove", "--force", rel)
     await _git(repo, "branch", "-D", branch)
@@ -156,7 +180,18 @@ async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktree
         start = base
     rc, _out, err = await _git(repo, "worktree", "add", rel, "-b", branch, start)
     if rc != 0:
-        raise WorktreeError(f"worktree add failed: {err.strip()[:300]}")
+        # A git error here (classically 'fatal: not a git repository' out of a corrupt
+        # worktree admin dir, #225) — prune the stale references and retry the add ONCE.
+        # A single retry, not a loop: if the tree still won't create, the loop blocks.
+        log.warning(
+            "[project_board] worktree add failed for %s (%s) — pruning stale worktrees and retrying once",
+            rel,
+            err.strip()[:200],
+        )
+        await prune_stale_worktrees(repo)
+        rc, _out, err = await _git(repo, "worktree", "add", rel, "-b", branch, start)
+        if rc != 0:
+            raise WorktreeError(f"worktree add failed: {err.strip()[:300]}")
     abspath = os.path.abspath(path)
     # A fresh worktree is a bare checkout with NO node_modules, so an npm/pnpm pre-PR gate
     # (or the coder running the build) can't resolve deps. Symlink the main repo's
