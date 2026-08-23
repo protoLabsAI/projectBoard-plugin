@@ -108,15 +108,17 @@ def test_internal_state_names_stay_internal():
     assert BOARD_PAGE.count('"on deck"') == 1  # the label lives only in the map — renders go through the lookup
 
 
-# ── blocked-first sort (#201): the view's comparator matches list_features ──────
+# ── blocked → in_progress → rest sort (#201/#223): the view's comparator matches
+# list_features ─────────────────────────────────────────────────────────────────
 
 
-def test_features_sort_puts_blocked_first_then_priority_then_id():
+def test_features_sort_puts_blocked_first_then_in_progress_then_priority_then_id():
     """The client re-sorts /features on load, so its comparator must match the
-    store's blocked-first, priority-asc, id-tiebreak order — a blocked card never
-    drowns mid-column."""
+    store's blocked-first, in_progress-second, priority-asc, id-tiebreak order —
+    a blocked card never drowns mid-column, and what's actively building sits
+    right below it."""
     assert (
-        ".sort((a,b) => (a.blocked?0:1) - (b.blocked?0:1) || a.priority - b.priority || a.id.localeCompare(b.id));"
+        ".sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));"
         in BOARD_PAGE
     )
 

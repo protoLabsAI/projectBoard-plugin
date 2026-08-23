@@ -2018,6 +2018,24 @@ def test_list_features_sorts_blocked_to_top(make_board):
     assert [f["id"] for f in b.list_features()] == ["bd-3", "bd-2", "bd-1", "bd-4"]
 
 
+def test_list_features_sorts_in_progress_second_after_blocked(make_board):
+    """#223: in_progress (actively building) ranks as its own second tier — after
+    every blocked feature, before everything else — so the operator never scans
+    the full list to find what a coder is working on. Priority still orders
+    within each tier. An in_review row (in_progress status + label) is NOT in
+    the building tier."""
+    beads = [
+        {"id": "bd-1", "status": "open", "labels": ["ready"], "priority": 0},
+        {"id": "bd-2", "status": "in_progress", "labels": [], "priority": 2},
+        {"id": "bd-3", "status": "open", "labels": ["blocked"], "priority": 3},
+        {"id": "bd-4", "status": "in_progress", "labels": [], "priority": 0},
+        {"id": "bd-5", "status": "in_progress", "labels": ["in-review"], "priority": 0},
+    ]
+    br = Br({"list": beads, "ready": []})
+    b = make_board(br)
+    assert [f["id"] for f in b.list_features()] == ["bd-3", "bd-4", "bd-2", "bd-1", "bd-5"]
+
+
 def test_list_features_blocked_ties_break_on_id(make_board):
     """Equal-priority blocked features keep the stable id tiebreak."""
     beads = [
