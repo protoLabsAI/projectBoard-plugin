@@ -1,89 +1,34 @@
 name: Release
 
-# The fleet release ritual via protoLabsAI/release-tools: tag → LLM-themed release
-# notes → Discord embed → GitHub release body. Fires on a deliberate
-# `chore: release vX.Y.Z` commit to main (the version in protoagent.plugin.yaml /
-# pyproject.toml is bumped in lockstep by feature PRs; the release commit is the cut
-# that batches them into one release) or a manual dispatch. Idempotent: a re-run on a
-# version whose tag already exists skips the tag + release-creation steps.
-#
-# Requires two secrets (org-level across the fleet): GATEWAY_API_KEY (protoLabs LLM
-# gateway, for the notes) and DISCORD_RELEASE_WEBHOOK (the release channel).
+# Thin caller for the fleet release ritual: tag → LLM-themed release notes → Discord
+# embed → GitHub release body. The logic lives in the reusable
+# protoLabsAI/release-tools/.github/workflows/plugin-release.yml (this repo was the
+# template it was extracted from). Fires on a deliberate `chore: release vX.Y.Z` commit
+# to main (the version in protoagent.plugin.yaml / pyproject.toml is bumped in lockstep
+# by feature PRs; the release commit is the cut that batches them) or a manual dispatch.
+# Idempotent: a re-run on a version whose tag already exists skips the tag + release
+# creation. The reusable workflow reads the notes-gateway + Discord webhook secrets from
+# `secrets: inherit` (org-level across the fleet).
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Grant write at the caller so it flows into the reusable workflow's GITHUB_TOKEN — a
+# called workflow can only downgrade the caller's token, never escalate. Without this,
+# an org/repo default of read-only would leave the reusable workflow unable to create
+# the tag or the GitHub release.
 permissions:
-  contents: write # create the tag + the GitHub release
+  contents: write
 
 jobs:
   release:
-    name: Tag + release notes + Discord
-    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
-    timeout-minutes: 10
+    # The fork guard stays here — it's repo-specific and can't live in the reusable
+    # workflow, which is shared across every plugin in the fleet.
     if: >-
       github.repository == 'protoLabsAI/projectBoard-plugin' &&
       (github.event_name == 'workflow_dispatch' ||
        startsWith(github.event.head_commit.message, 'chore: release v'))
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # full history: the notes diff range + previous-tag detection
-          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Resolve version + previous tag
-        id: v
-        run: |
-          # The manifest version is canonical (pyproject mirrors it via the lockstep test).
-          VERSION=$(grep -E '^version:' protoagent.plugin.yaml | head -1 | sed -E 's/^version:[[:space:]]*//')
-          TAG="v$VERSION"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Previous release = the latest existing vX.Y.Z tag (this version isn't tagged
-          # yet); fall back to the root commit for the very first automated release.
-          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.' | head -1)
-          [ -z "$PREV" ] && PREV=$(git rev-list --max-parents=0 HEAD | head -1)
-          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$TAG already tagged — skipping (idempotent re-run)."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Releasing $TAG (notes from $PREV)"
-
-      - name: Create tag + GitHub release
-        if: steps.v.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          git tag "${{ steps.v.outputs.tag }}"
-          git push origin "${{ steps.v.outputs.tag }}"
-          gh release create "${{ steps.v.outputs.tag }}" \
-            --title "${{ steps.v.outputs.tag }}" \
-            --notes "Generating release notes…"
-
-      - name: Generate notes + post to Discord
-        id: notes
-        if: steps.v.outputs.exists == 'false'
-        uses: protoLabsAI/release-tools@v1
-        with:
-          version: ${{ steps.v.outputs.tag }}
-          previous-version: ${{ steps.v.outputs.prev }}
-        env:
-          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
-          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
-
-      - name: Set the GitHub release body to the generated notes
-        if: steps.v.outputs.exists == 'false' && steps.notes.outputs.notes != ''
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-          NOTES: ${{ steps.notes.outputs.notes }}
-        run: |
-          # The action exposes the generated markdown as the `notes` step output (it
-          # logs "Wrote notes + highlights to $GITHUB_OUTPUT"); the `out-file` input is
-          # NOT supported at @v1. Write the output to a file and set the body from it —
-          # safe for multi-line content.
-          printf '%s' "$NOTES" > .release-notes.md
-          gh release edit "${{ steps.v.outputs.tag }}" --notes-file .release-notes.md
+    uses: protoLabsAI/release-tools/.github/workflows/plugin-release.yml@v2
+    secrets: inherit
