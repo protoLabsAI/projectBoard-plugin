@@ -2058,6 +2058,155 @@ class BeadsBoard:
         }
 
 
+# ── in_review posture (#208) ─────────────────────────────────────────────────────
+# The one sentence an in_review card owes the PM/operator: what moves it next. The
+# cheap, board-side half of the loop's `_auto_merge_blockers` (labels + config, NO
+# GitHub read) — shared so the tool rows, the /features payload, the console chip
+# and the merge edge all decode the review sub-state labels the same way.
+NEXT_ACTION_AWAITING_MERGE = "awaiting-merge (auto_merge off)"
+NEXT_ACTION_AUTO_MERGE_PENDING = "auto-merge pending"
+NEXT_ACTION_REVIEW_IN_PROGRESS = "review in progress"
+NEXT_ACTION_CHANGES_REQUESTED = "changes requested"
+NEXT_ACTION_AWAITING_VERDICT = "awaiting review verdict (no review-clean)"
+NEXT_ACTION_MERGE_HOLD = "merge-hold (operator veto)"
+NEXT_ACTION_BLOCKED = "blocked"
+# The PR is a draft (#207): GitHub reports CLEAN for a draft whose checks pass, `gh pr
+# merge` refuses it, and the loop never spends a merge attempt on one — the fix is one
+# `gh pr ready`. Known only when a caller passes `is_draft` / the row carries `pr_draft`.
+NEXT_ACTION_DRAFT = "draft (run `gh pr ready`)"
+# board_list(with_ci=True) stamped a red rollup on the row: "merge #N" on a red PR is
+# the wrong hint — the CI bounce / a fix is what moves it, not a merge.
+NEXT_ACTION_CI_FAILING = "ci failing"
+
+_PR_NUMBER_RE = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
+
+
+def pr_number(pr_url: str) -> str:
+    """``"42"`` for ``https://github.com/o/r/pull/42`` (or ``""``)."""
+    m = _PR_NUMBER_RE.search(str(pr_url or ""))
+    return m.group(1) if m else ""
+
+
+def knob_bool(cfg: dict, key: str, default: bool, *, strict: bool = True) -> bool:
+    """A bool knob that also accepts the YAML/Settings string spellings — the console
+    posts real booleans, but a hand-edited ``"false"`` must not read as on. THE one
+    helper (the loop imports it; it used to have its own copy with drifting
+    unknown-string semantics): ``strict`` raises ``ValueError`` on a spelling that is
+    neither true nor false (the loop's constructor fails loudly, its ``reload`` keeps
+    the current value); ``strict=False`` reads such a value as ``default`` — for a
+    read path like ``annotate_next_action`` where a typo must not break a listing."""
+    raw = (cfg or {}).get(key, default)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off", ""):
+            return False
+        if strict:
+            raise ValueError(f"{key}={raw!r} is not a boolean")
+        return default
+    return bool(raw)
+
+
+def merge_posture(feature: dict, *, auto_merge: bool, review_gate: bool, is_draft: bool | None = None) -> dict:
+    """Decode an in_review feature's review/merge sub-state from its labels + the
+    board's merge posture — pure, no GitHub read. ``is_draft`` (or a ``pr_draft``
+    key on the row, when a join stamped one) says the PR is a GitHub draft — a fact
+    this function never fetches itself.
+
+    Returns ``{"blockers", "next_action", "awaiting_merge", "next_action_hint"}``:
+
+    * ``blockers`` — the board-side reasons the loop's auto-merge edge would NOT merge
+      right now (``state=…``, ``blocked``, ``merge-hold``, ``review in progress /
+      changes requested``, ``no review-clean verdict``) — the exact phrases
+      ``BoardLoop._auto_merge_blockers`` logs, which reuses this as its first half.
+    * ``next_action`` — the operator-facing sentence for an in_review card, ``""``
+      otherwise: ``awaiting-merge (auto_merge off)`` (reviewed + nothing board-side
+      in the way + the loop will NOT merge — a human must, #208), ``auto-merge
+      pending`` (the loop merges once GitHub reports CLEAN), ``review in progress``,
+      ``changes requested``, ``awaiting review verdict (no review-clean)``,
+      ``merge-hold (operator veto)``, ``blocked``, ``draft (run `gh pr ready`)`` (a
+      known draft — ahead of the merge-posture cases, behind the review ones: the
+      review gate still runs on a draft, the merge never does).
+    * ``awaiting_merge`` — True only for the first case.
+    * ``next_action_hint`` — for that case: which PR to merge, or where to turn
+      auto_merge on.
+    """
+    labels = set(feature.get("labels") or [])
+    state = feature.get("board_state")
+    blockers: list[str] = []
+    if state != "in_review":
+        blockers.append(f"state={state}")
+    if feature.get("blocked"):
+        blockers.append("blocked")
+    if LABEL_MERGE_HOLD in labels:
+        blockers.append("merge-hold")
+    if LABEL_REVIEW_PENDING in labels or LABEL_CHANGES_REQUESTED in labels:
+        blockers.append("review in progress / changes requested")
+    elif review_gate and LABEL_REVIEW_CLEAN not in labels:
+        # The gate is on but never recorded a clean verdict for THIS head (an
+        # inert gate, a pre-upgrade card, an operator unblock) — not reviewed.
+        blockers.append("no review-clean verdict")
+
+    out = {"blockers": blockers, "next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    if state != "in_review":
+        return out
+    if feature.get("blocked"):
+        out["next_action"] = NEXT_ACTION_BLOCKED
+    elif LABEL_MERGE_HOLD in labels:
+        out["next_action"] = NEXT_ACTION_MERGE_HOLD
+    elif LABEL_REVIEW_PENDING in labels:
+        out["next_action"] = NEXT_ACTION_REVIEW_IN_PROGRESS
+    elif LABEL_CHANGES_REQUESTED in labels:
+        out["next_action"] = NEXT_ACTION_CHANGES_REQUESTED
+    elif review_gate and LABEL_REVIEW_CLEAN not in labels:
+        out["next_action"] = NEXT_ACTION_AWAITING_VERDICT
+    elif (is_draft if is_draft is not None else feature.get("pr_draft")) is True:
+        out["next_action"] = NEXT_ACTION_DRAFT
+    elif auto_merge:
+        out["next_action"] = NEXT_ACTION_AUTO_MERGE_PENDING
+    else:
+        n = pr_number(feature.get("pr_url", ""))
+        out["next_action"] = NEXT_ACTION_AWAITING_MERGE
+        out["awaiting_merge"] = True
+        out["next_action_hint"] = (
+            f"auto_merge is off — merge {'#' + n if n else 'the PR'} or turn it on in Settings ▸ Project Board"
+        )
+    return out
+
+
+def annotate_next_action(feats: list[dict], cfg: dict) -> list[dict]:
+    """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every
+    ``in_review`` row from the board's config (``auto_merge``, ``review_gate``) —
+    labels + config only, no per-row network. Rows in any other state are left
+    untouched (the payload shape for them is unchanged). Mutates and returns ``feats``.
+
+    ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
+    routers and the tools alike; ``BoardLoop.reload`` writes every changed live knob
+    back into it), so a Settings save flips the posture without a restart.
+
+    A row that ``annotate_ci_status`` stamped ``ci_status == "failing"`` is demoted:
+    "merge #N" / "auto-merge pending" on a red PR is the wrong hint — it reads
+    ``ci failing``, ``awaiting_merge`` False, no hint. The review sub-states stand
+    (a review in progress on a red PR is still a review in progress)."""
+    auto_merge = knob_bool(cfg, "auto_merge", False, strict=False)
+    review_gate = knob_bool(cfg, "review_gate", False, strict=False)
+    for f in feats:
+        posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate)
+        if not posture["next_action"]:
+            continue
+        if f.get("ci_status") == "failing" and posture["next_action"] in (
+            NEXT_ACTION_AWAITING_MERGE,
+            NEXT_ACTION_AUTO_MERGE_PENDING,
+            NEXT_ACTION_DRAFT,
+        ):
+            posture = {"next_action": NEXT_ACTION_CI_FAILING, "awaiting_merge": False, "next_action_hint": ""}
+        f["next_action"] = posture["next_action"]
+        f["awaiting_merge"] = posture["awaiting_merge"]
+        f["next_action_hint"] = posture["next_action_hint"]
+    return feats
+
+
 def escalation_enabled(cfg: dict) -> bool:
     """Escalation is opt-in: a `coders` map (tier → delegate) with >1 distinct
     delegate. A single ACP coder ⇒ no ladder (one dispatch then Blocked; CI fail

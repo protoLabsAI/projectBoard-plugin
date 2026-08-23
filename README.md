@@ -149,7 +149,11 @@ project_board:
                              # the CURRENT base, review gate `review-clean` — merge it; the board
                              # flips to done via the normal Done edge. Off = park green PRs for a
                              # human/agent adjudicator (which is only as durable as whatever
-                             # schedules it). Label a card `merge-hold` to exempt it.
+                             # schedules it) — those cards then carry
+                             # next_action = "awaiting-merge (auto_merge off)" in board_list,
+                             # /features and the console chip (#208), so the PM leads its
+                             # status report with "merge #N or turn auto_merge on" instead
+                             # of re-offering a review. Label a card `merge-hold` to exempt it.
   merge_method: squash       # squash | merge | rebase
   merged_verify_max: 5       # sibling merges a held in_review card can survive (one gate run each,
                              # only when base moved) before its merged-state verdict stops being
@@ -199,7 +203,17 @@ project_board:
 
 - **Headless / via the agent:** `board_create_epic`, `board_create_feature`
   (`title`, `spec`, `acceptance_criteria`, `files_to_modify`, `depends_on`, …),
-  `board_mark_ready`, `board_list`.
+  `board_mark_ready`, `board_list`. Every `in_review` row of `board_list` (and of
+  `GET …/features`) carries `next_action` — `awaiting-merge (auto_merge off)` /
+  `auto-merge pending` / `review in progress` / `changes requested` / `awaiting
+  review verdict (no review-clean)` / `merge-hold (operator veto)` / `blocked` /
+  `draft (run gh pr ready)` — plus `awaiting_merge: true` and a `next_action_hint`
+  ("auto_merge is off — merge #N or turn it on in Settings ▸ Project Board") for the
+  first. Derived from the review sub-state labels + the board's LIVE
+  `auto_merge`/`review_gate` config (the same decoding the loop's merge edge uses;
+  `store.merge_posture`; a Settings save to `auto_merge` flips it with no restart),
+  no network. `board_list(with_ci=true)` demotes a red row to `ci failing` — never
+  "merge #N" on a red PR.
 - **Plan a project:** the `decompose-project` skill ("decompose <idea>") runs the
   adversarial pipeline and populates the board.
 - **HTTP API** (`/plugins/project_board/*`): `epics`, `milestones`, `features`,

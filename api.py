@@ -28,7 +28,7 @@ from fastapi import Request  # module-level so the webhook's stringized annotati
 from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
-from .store import BoardError, escalation_enabled, get_store
+from .store import BoardError, annotate_next_action, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -307,13 +307,16 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # as the board_list tool; nothing is deleted, everything stays queryable.
         # ?project=<name> (#90) narrows the listing to the features stamped for that
         # project — the multi-repo board's per-repo view; absent, every project is listed.
+        # Every row carries `next_action` / `awaiting_merge` / `next_action_hint`
+        # (#208) — derived from labels + the board's auto_merge/review_gate config,
+        # no per-row network — so the console can chip "awaiting merge".
         want = str(project or "").strip()
 
         def _list():
             feats = store().list_features(state=state, include_archived=include_archived)
             if want:
                 feats = [f for f in feats if str(f.get("project") or "") == want]
-            return {"features": feats}
+            return {"features": annotate_next_action(feats, cfg or {})}
 
         return _guard(_list)
 

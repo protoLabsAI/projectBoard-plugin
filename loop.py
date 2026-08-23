@@ -50,16 +50,17 @@ from .failures import classify
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import (
+    BoardError,
     LABEL_CHANGES_REQUESTED,
-    LABEL_MERGE_HOLD,
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
-    BoardError,
     _all_items_disposed,
     apply_requirement_dispositions,
     escalation_enabled,
     get_store,
+    knob_bool,
+    merge_posture,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -468,18 +469,9 @@ def _knob_int(cfg: dict, key: str, default: int, *, floor: int) -> int:
     return max(floor, int(cfg.get(key, default)))
 
 
-def _knob_bool(cfg: dict, key: str, default: bool) -> bool:
-    """A bool knob that also accepts the YAML/Settings string spellings — the
-    console posts real booleans, but a hand-edited ``"false"`` must not read as on."""
-    raw = cfg.get(key, default)
-    if isinstance(raw, str):
-        low = raw.strip().lower()
-        if low in ("1", "true", "yes", "on"):
-            return True
-        if low in ("0", "false", "no", "off", ""):
-            return False
-        raise ValueError(f"{key}={raw!r} is not a boolean")
-    return bool(raw)
+# The bool-knob coercion lives in store.knob_bool (ONE helper — store.annotate_next_action
+# reads the same knobs and must not drift on what "false" means); the loop's name stays.
+_knob_bool = knob_bool
 
 
 def _plugin_section(new_config) -> dict:
@@ -1225,9 +1217,14 @@ class BoardLoop:
                 continue
             if new != cur:
                 setattr(self, attr, new)
-                # Keep the preflight's view of the config in step: `_setup_status`
-                # reads `self.cfg`, and a `coder` edit must clear the coder gap here,
-                # not only on the (new) router's /status.
+                # Write the knob back into the SHARED cfg dict — `self.cfg` is the very
+                # dict register() handed the routers and the tools (one `dict(cfg)`,
+                # never copied), so this is how a live edit reaches every read path that
+                # takes its posture from cfg rather than from the loop: the preflight's
+                # `_setup_status` (a `coder` edit clears the coder gap here, not only on
+                # the router's /status) and store.annotate_next_action (#208: a board_list
+                # / /features after an `auto_merge` save says "auto-merge pending", not
+                # "awaiting-merge", without a restart). Tested in test_next_action.py.
                 self.cfg[key] = new
                 changed[key] = (cur, new)
         if changed:
@@ -1791,19 +1788,11 @@ class BoardLoop:
         mysterious. Order: the cheap board reads first, GitHub last."""
         fid = feature["id"]
         labels = set(feature.get("labels") or [])
-        why: list[str] = []
-        if feature.get("board_state") != "in_review":
-            why.append(f"state={feature.get('board_state')}")
-        if feature.get("blocked"):
-            why.append("blocked")
-        if LABEL_MERGE_HOLD in labels:
-            why.append("merge-hold")
-        if LABEL_REVIEW_PENDING in labels or LABEL_CHANGES_REQUESTED in labels:
-            why.append("review in progress / changes requested")
-        elif self.review_gate and LABEL_REVIEW_CLEAN not in labels:
-            # The gate is on but never recorded a clean verdict for THIS head (an
-            # inert gate, a pre-upgrade card, an operator unblock) — not reviewed.
-            why.append("no review-clean verdict")
+        # The board-side half is shared with the PM-facing `next_action` (#208,
+        # store.merge_posture) — one decoding of the review sub-state labels.
+        why: list[str] = list(
+            merge_posture(feature, auto_merge=self.auto_merge, review_gate=self.review_gate)["blockers"]
+        )
         if self._auto_merge_failures.get(fid, 0) >= self.auto_merge_max:
             why.append("merge attempts exhausted")
         if why:

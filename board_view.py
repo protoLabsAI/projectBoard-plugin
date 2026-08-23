@@ -193,10 +193,32 @@ function setView(v){ VIEW=v; $("tk").classList.toggle("pl-tab--active",v==="kanb
 NARROW.addEventListener("change", (e) => { if (e.matches && VIEW !== "list") setView("list"); });
 
 let FEATURES = [];
+// The in_review sub-state chip (#208): `next_action` is the one sentence that says
+// what moves the card. "awaiting merge" is the case nobody used to be told about —
+// reviewed, green, and the loop will NOT merge (auto_merge off) — so it gets the
+// success chip with the how-to-move-it hint as its tooltip. The other sub-states
+// render as neutral chips (the text is the server's, esc()'d).
+const NEXT_ACTION_CHIP = {
+  "awaiting-merge (auto_merge off)": ["pl-badge--success", "awaiting merge"],
+  "auto-merge pending": ["pl-badge--info", "auto-merge pending"],
+  "review in progress": ["pl-badge--info", "review in progress"],
+  "changes requested": ["pl-badge--warning", "changes requested"],
+  "awaiting review verdict (no review-clean)": ["pl-badge--warning", "awaiting review verdict"],
+  "merge-hold (operator veto)": ["", "merge-hold"],
+  "draft (run `gh pr ready`)": ["pl-badge--warning", "draft"],
+  "ci failing": ["pl-badge--error", "ci failing"],
+};
+function nextActionChip(f){
+  if (!f.next_action || f.next_action === "blocked") return "";  // blocked has its own chip
+  const [cls, label] = NEXT_ACTION_CHIP[f.next_action] || ["", f.next_action];
+  const hint = f.next_action_hint || f.next_action;
+  return '<span class="pl-badge '+cls+'" title="'+esc(hint)+'">'+esc(label)+'</span>';
+}
 function flags(f){
   let out = "";
   if (f.blocked) out += '<span class="pl-badge pl-badge--error">blocked</span>';
   if (f.dag_blocked) out += '<span class="pl-badge pl-badge--warning">waiting on deps</span>';
+  out += nextActionChip(f);
   if (f.difficulty) out += '<span class="pl-badge">'+esc(f.difficulty)+'</span>';
   return out;
 }
