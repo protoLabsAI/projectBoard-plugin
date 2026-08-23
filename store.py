@@ -1804,9 +1804,17 @@ class BeadsBoard:
             out = [f for f in out if f["board_state"] == state]
         # Blocked features float to the top (#201): a blocked card is the board's
         # loudest "needs attention" signal, so it must never drown mid-list among
-        # routine work. Priority (0 = highest) still ranks within each group, id as
-        # the stable tiebreak — with nothing blocked the order is unchanged.
-        out.sort(key=lambda f: (not f["blocked"], f["priority"], f["id"]))
+        # routine work. in_progress ranks second (#223) — what a coder is actively
+        # building shouldn't blend in among ready/in_review/backlog rows. Priority
+        # (0 = highest) still ranks within each group, id as the stable tiebreak —
+        # with nothing blocked or building the order is unchanged.
+        out.sort(
+            key=lambda f: (
+                0 if f["blocked"] else (1 if f["board_state"] == "in_progress" else 2),
+                f["priority"],
+                f["id"],
+            )
+        )
         return out
 
     def annotate_ci_status(self, feats: list[dict]) -> list[dict]:
