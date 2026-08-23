@@ -84,7 +84,8 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   #drawer .dh h2{font-size:14px;margin:0;flex:1;color:var(--pl-color-accent)}
   #drawer .dx{cursor:pointer;background:none;border:none;color:var(--pl-color-fg-muted);font-size:18px;line-height:1}
   #drawer .dx:hover{color:var(--pl-color-fg)}
-  #drawer .db{padding:var(--pl-space-3) var(--pl-space-4);overflow:auto;flex:1}
+  #drawer .db{padding:var(--pl-space-3) var(--pl-space-4);overflow:auto;flex:1;overscroll-behavior:contain}
+  body.drawer-open{overflow:hidden}
   .gen{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
     padding:var(--pl-space-3);margin-bottom:var(--pl-space-3)}
   .gen .gh{display:flex;align-items:center;gap:var(--pl-space-2);margin-bottom:var(--pl-space-2);flex-wrap:wrap}
@@ -445,6 +446,7 @@ function openMonitor(fid){
   MON_FID = fid;
   $("drawer-title").textContent = "Coder monitor — " + fid;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
+  document.body.classList.add("drawer-open");                    // lock page scroll behind the scrim
   $("drawer-body").innerHTML = '<div class="pl-empty">Loading…</div>';
   pollMonitor();
   if (MON_TIMER) clearInterval(MON_TIMER);
@@ -454,6 +456,7 @@ function closeMonitor(){
   MON_FID = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
+  document.body.classList.remove("drawer-open");
 }
 // Delegate clicks: any [data-mon] element (in_progress card or row) opens the drawer.
 document.addEventListener("click", (e) => {
