@@ -441,11 +441,14 @@ def test_board_create_feature_depends_on_open_but_not_in_review_is_allowed(monke
 _MINIMAL_ARGS = {
     "board_create_epic": {"title": "t"},
     "board_create_feature": {"title": "t"},
+    "board_create_task": {"title": "t"},
     "board_update_feature": {"feature_id": "bd-1", "title": "t"},
     "board_get_feature": {"feature_id": "bd-1"},
     "board_mark_ready": {"feature_id": "bd-1"},
     "board_cancel_feature": {"feature_id": "bd-1"},
     "board_mark_done": {"feature_id": "bd-1"},
+    "board_deliver": {"feature_id": "bd-1"},
+    "board_verify": {"feature_id": "bd-1"},
     "board_requeue_feature": {"feature_id": "bd-1"},
     "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
     "board_unblock_feature": {"feature_id": "bd-1"},
@@ -509,3 +512,157 @@ def test_board_cancel_feature_closes_an_open_pr_best_effort(make_board, monkeypa
     _wire(make_board, monkeypatch, {"id": "bd-2", "board_state": "cancelled", "pr_url": "https://x/pr/5"})
     out = json.loads(_get_tool("board_cancel_feature").invoke({"feature_id": "bd-2"}))
     assert out["state"] == "cancelled" and out["pr_closed"] is False  # cancel landed; close didn't — said so
+
+
+# ── task tools (#217): board_create_task / board_deliver / board_verify ──────────────
+#
+# A task-type bead rides the same rails as a coding feature (ready → claim → in_progress →
+# in_review) but ships a DELIVERABLE instead of a PR: board_create_task mints it, board_deliver
+# is its open_pr→open_review edge, board_verify its Done edge. These pin the three tool
+# wrappers — registration, the happy paths, the same dedup as board_create_feature, and the
+# task-only/wrong-state refusals surfacing as `Error: …` strings.
+
+
+def test_task_tools_are_registered():
+    names = {t.name for t in pb._board_tools({})}
+    assert {"board_create_task", "board_deliver", "board_verify"} <= names
+
+
+# ── board_create_task → store.create_feature(issue_type="task") ─────────────────────
+
+
+def test_board_create_task_mints_a_task_bead_without_files(monkeypatch):
+    """A task is minted with issue_type=task and carries NO files_to_modify (a task
+    doesn't touch repo files) — the reply echoes {id, title}."""
+    fake = _BoardWithDeps([])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = json.loads(
+        _get_tool("board_create_task").invoke(
+            {"title": "Write the triage doc", "spec": "s", "acceptance_criteria": "a", "assignee": "quinn"}
+        )
+    )
+
+    assert out["id"] == "bd-new1" and out["title"] == "Write the triage doc"
+    (created,) = fake.created  # exactly one bead stacked
+    assert created["issue_type"] == "task"  # minted as a task, not a feature
+    assert created["assignee"] == "quinn"  # pre-assigned
+    assert "files_to_modify" not in created  # a task never carries files_to_modify
+
+
+def test_board_create_task_refuses_a_duplicate_title(monkeypatch):
+    """Same dedup as board_create_feature: a same-title OPEN card is refused (title
+    match is normalized — trim/lowercase/collapse-whitespace) and nothing is stacked."""
+    board = [{"id": "bd-1", "title": "Write the triage doc", "board_state": "backlog"}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = _get_tool("board_create_task").invoke({"title": "write   the   triage doc", "spec": "s"})
+
+    assert "Skipped" in out and "bd-1" in out
+    assert fake.created == []  # the duplicate was NOT stacked
+
+
+def test_board_create_task_force_bypasses_dedup(monkeypatch):
+    board = [{"id": "bd-1", "title": "Write the triage doc", "board_state": "backlog"}]
+    fake = _BoardWithDeps(board)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = json.loads(_get_tool("board_create_task").invoke({"title": "Write the triage doc", "force": True}))
+
+    assert out["id"] == "bd-new1"  # force bypasses the guard
+    assert fake.created[0]["issue_type"] == "task"
+
+
+# ── board_deliver → store.record_delivery ; board_verify → store.record_verification ──
+
+
+class _TaskEdgeStore:
+    """A store stub exposing just the task edges the deliver/verify wrappers call, so the
+    tool wiring (strip quotes → call through positionally → {id, state} echo) is tested
+    without the real br store. Set ``error`` to make the edge raise the task-only/wrong-state
+    BoardError the wrapper must surface as an `Error: …` string."""
+
+    def __init__(self, reply=None, error=None):
+        self.reply = reply
+        self.error = error
+        self.calls = []
+
+    def _edge(self, name, fid, *rest):
+        self.calls.append((name, fid, *rest))
+        if self.error:
+            raise pb.store.BoardError(self.error)
+        return self.reply
+
+    def record_delivery(self, fid, text="", ref=""):
+        return self._edge("record_delivery", fid, text, ref)
+
+    def record_verification(self, fid, approved=True, feedback=""):
+        return self._edge("record_verification", fid, approved, feedback)
+
+
+def test_board_deliver_records_delivery_and_returns_in_review(monkeypatch):
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "in_review"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(
+        _get_tool("board_deliver").invoke(
+            {"feature_id": "bd-t", "text": "triage report at docs/triage.md", "ref": "docs/triage.md"}
+        )
+    )
+
+    assert out == {"id": "bd-t", "state": "in_review"}
+    assert board.calls == [("record_delivery", "bd-t", "triage report at docs/triage.md", "docs/triage.md")]
+
+
+def test_board_deliver_strips_wrapping_quotes(monkeypatch):
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "in_review"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    _get_tool("board_deliver").invoke({"feature_id": "bd-t", "text": '"the deliverable"', "ref": '"docs/x.md"'})
+
+    # the wrapping quotes are peeled before text/ref reach the store.
+    assert board.calls == [("record_delivery", "bd-t", "the deliverable", "docs/x.md")]
+
+
+def test_board_deliver_surfaces_a_task_only_or_wrong_state_error(monkeypatch):
+    board = _TaskEdgeStore(error="record_delivery is task-only — issue_type 'feature' enters review via open_review")
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = _get_tool("board_deliver").invoke({"feature_id": "bd-1", "text": "x"})
+
+    assert out.startswith("Error: ") and "task-only" in out
+
+
+def test_board_verify_approved_closes_the_task_done(monkeypatch):
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "done"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(_get_tool("board_verify").invoke({"feature_id": "bd-t", "approved": True}))
+
+    assert out == {"id": "bd-t", "state": "done"}
+    assert board.calls == [("record_verification", "bd-t", True, "")]
+
+
+def test_board_verify_rejected_requeues_to_ready_with_feedback(monkeypatch):
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "ready"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(
+        _get_tool("board_verify").invoke(
+            {"feature_id": "bd-t", "approved": False, "feedback": '"misses the Q3 numbers"'}
+        )
+    )
+
+    assert out == {"id": "bd-t", "state": "ready"}
+    # approved flag threads through, and the wrapping quotes are peeled off the feedback.
+    assert board.calls == [("record_verification", "bd-t", False, "misses the Q3 numbers")]
+
+
+def test_board_verify_surfaces_a_task_only_or_wrong_state_error(monkeypatch):
+    board = _TaskEdgeStore(error="record_verification is task-only — issue_type 'feature' closes via record_merge")
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = _get_tool("board_verify").invoke({"feature_id": "bd-1", "approved": True})
+
+    assert out.startswith("Error: ") and "task-only" in out

@@ -2853,6 +2853,98 @@ def test_record_verification_rejects_a_coding_feature(make_board, monkeypatch):
     assert br.cmds("close") == [] and br.cmds("update") == [] and br.cmds("comments") == []
 
 
+# ── the Ready gate relaxes files_to_modify for a task (#217) ─────────────────────
+
+
+def test_mark_ready_accepts_a_task_without_files_to_modify(make_board, monkeypatch):
+    """A task-type bead ships a deliverable, not repo files — so the Ready gate's
+    files_to_modify requirement (and the phantom/breadth/shared-file checks keyed off it)
+    is relaxed: a task goes Ready on spec + acceptance_criteria alone."""
+    br = Br()
+    b = make_board(br)
+    task = {
+        "id": "bd-t",
+        "board_state": "backlog",
+        "issue_type": "task",
+        "spec": "write the triage doc",
+        "acceptance_criteria": "WHEN triaged THE SYSTEM SHALL produce a ranked list",
+        "files_to_modify": [],  # a task carries none — the real projection shape
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: task)
+
+    b.mark_ready("bd-t")  # no files_to_modify, but a task → gate passes
+
+    assert ("update", "bd-t", "--add-label", "ready", "--remove-label", "designing") in br.calls
+
+
+def test_mark_ready_still_requires_spec_and_ac_for_a_task(make_board, monkeypatch):
+    """The relaxation drops ONLY files_to_modify — a task still owes a spec + testable
+    acceptance_criteria (an unspecced task is as unpickable as an unspecced feature)."""
+    br = Br()
+    b = make_board(br)
+    task = {
+        "id": "bd-t",
+        "board_state": "backlog",
+        "issue_type": "task",
+        "spec": "",  # missing
+        "acceptance_criteria": "a",
+        "files_to_modify": [],
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: task)
+
+    with pytest.raises(BoardError, match="spec"):
+        b.mark_ready("bd-t")
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+def test_mark_ready_still_requires_files_for_a_coding_feature(make_board, monkeypatch):
+    """No regression: the relaxation is gated on issue_type — a coding feature with no
+    files_to_modify is still rejected (the #217 relaxation must not leak to features)."""
+    br = Br()
+    b = make_board(br)
+    feature = {
+        "id": "bd-1",
+        "board_state": "backlog",
+        "issue_type": "feature",
+        "spec": "s",
+        "acceptance_criteria": "a",
+        "files_to_modify": [],
+    }
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+
+    with pytest.raises(BoardError, match="files_to_modify"):
+        b.mark_ready("bd-1")
+    assert br.cmds("update") == []
+
+
+def test_create_feature_mints_a_task_type_bead_and_pre_assigns(make_board, monkeypatch):
+    """issue_type='task' mints the bead via `br create --type task`, and assignee
+    pre-assigns it in the enrichment update (the separated `--assignee <name>` form)."""
+    br = Br({"create": "bd-t"})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "backlog", "title": "T"})
+
+    b.create_feature("T", spec="s", acceptance_criteria="a", issue_type="task", assignee="quinn")
+
+    (create,) = br.cmds("create")
+    assert create[:5] == ("create", "T", "--type", "task", "-p")  # minted as a task, not a feature
+    (update,) = br.cmds("update")  # one enrichment update
+    assert "--acceptance-criteria=a" in update
+    assert "--assignee" in update and "quinn" in update  # pre-assigned
+
+
+def test_create_feature_defaults_to_feature_type(make_board, monkeypatch):
+    """No regression: create_feature still mints a `feature` when issue_type is omitted."""
+    br = Br({"create": "bd-1"})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "backlog", "title": "T"})
+
+    b.create_feature("T", spec="s")
+
+    (create,) = br.cmds("create")
+    assert create[:4] == ("create", "T", "--type", "feature")
+
+
 # ── open_review: pr_url optional for tasks only ──────────────────────────────────
 
 

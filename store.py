@@ -691,6 +691,8 @@ class BeadsBoard:
         foundation: bool = False,
         source_issue: str = "",
         project: str = "",
+        issue_type: str = "feature",
+        assignee: str = "",
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -701,12 +703,16 @@ class BeadsBoard:
         normalized) so the PR opener can stamp `Fixes #N` on the feature's PR (#97).
         `project` names the entry in the board's `projects:` map this feature builds in
         (default = the board's `default_project`); it's stamped as a `project:<name>`
-        label so the Ready gate validates the feature's paths against ITS repo (#90)."""
+        label so the Ready gate validates the feature's paths against ITS repo (#90).
+        `issue_type` mints the bead as a `feature` (the default) or a `task` (#217) — a
+        task rides the SAME rails but ships a deliverable instead of a PR, so it needs no
+        files_to_modify (see `_prepare_ready`); `assignee` pre-assigns the bead (else it
+        starts unassigned and the puller claims it)."""
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
         proj = normalize_project(project or self.default_project)
-        fid = self._create(title, itype="feature", parent=parent, priority=priority, description=spec)
+        fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
         # with a follow-up `br update`. Free-text VALUES ride in `--flag=value` form so a
         # value that STARTS WITH '-' (a markdown bullet in acceptance_criteria, e.g.
@@ -746,6 +752,11 @@ class BeadsBoard:
             # the board's default). Validated above, so it can't fail the label validator.
             upd += ["--add-label", f"{LABEL_PROJECT_PREFIX}{proj}"]
             enriched.append("project")
+        if str(assignee or "").strip():
+            # Pre-assign the bead (#217, tasks) — the separated `--assignee <name>` form the
+            # claim path uses; an assignee never starts with '-', so no `=value` guarding.
+            upd += ["--assignee", assignee.strip()]
+            enriched.append("assignee")
         # Dependency edges are independent of the enrichment `br update` — wire them
         # FIRST so an enrichment failure can never silently drop them (QA panel on
         # #88: the early success-with-warning return below used to skip the dep loop,
@@ -1122,7 +1133,13 @@ class BeadsBoard:
         if f["board_state"] not in ("backlog", "ready"):
             raise BoardError(f"can't mark ready from {f['board_state']!r}")
         missing = [k for k in ("spec", "acceptance_criteria") if not str(f.get(k, "")).strip()]
-        if not f.get("files_to_modify"):
+        # files_to_modify is a CODING-feature requirement: a task-type bead (#217) ships a
+        # deliverable (a doc, a decision, an artifact ref), not repo edits, so it goes Ready
+        # on spec + acceptance_criteria alone. It carries no files_to_modify anyway, so the
+        # phantom-path / breadth / shared-file checks below (all keyed off files_to_modify)
+        # are no-ops for it — only this required-field gate needs the relaxation.
+        is_task = f.get("issue_type") == LABEL_TASK
+        if not is_task and not f.get("files_to_modify"):
             missing.append("files_to_modify")
         if missing:
             raise BoardError(

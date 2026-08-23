@@ -296,6 +296,60 @@ def _feature_reply(f: dict) -> str:
     return json.dumps(out)
 
 
+def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str | None:
+    """The ``Skipped — …`` message a create verb returns when a new card would DUPLICATE
+    existing/in-flight work, or None when it's clear to create — the ONE dedup contract
+    board_create_feature and board_create_task (#217) share, so the two verbs can never
+    drift apart. Runs the same three checks in order:
+
+    1. an OPEN same-title card already on the board (the mid-turn double-create);
+    2. a `depends_on` that names a feature already `in_review` with an open PR (work built
+       on in-flight work — a fix round that belongs on THAT feature's PR, steered to
+       board_requeue_feature);
+    3. an open PR in `source_issue`'s repo that already references the issue.
+
+    BEST-EFFORT: a store read (or the gh probe inside `_find_open_pr_for_issue`) failing
+    never blocks creation — a possible dup beats a stuck board."""
+    from .store import BoardError
+
+    try:
+        existing = store.list_features()
+    except BoardError:
+        existing = []  # can't check → don't block creation on a read failure
+    dup = _open_duplicate(existing, title, deps)
+    if dup is not None:
+        if dup.get("_dup_reason") == "depends_on_in_review":
+            # The new card builds on an in-flight feature (in_review, open PR). That's a fix
+            # round, and a fix round belongs on the in-flight feature's OWN PR — point the
+            # author at the requeue verb (#112), not a second card the loop would churn on.
+            return (
+                f"Skipped — this card's depends_on names {dup.get('id', '?')}, which is "
+                f"already in_review with an open PR ({dup.get('pr_url', '')}). Work built "
+                "on an in-flight feature belongs on THAT feature's PR, not a fresh card: "
+                f"call board_requeue_feature({dup.get('id', '?')!r}, findings=...) to carry "
+                "your changes onto the same branch. Pass force=true to stack a new card anyway."
+            )
+        return (
+            f"Skipped — a feature titled {title!r} is already open on this board "
+            f"({dup.get('id', '?')}, {dup.get('board_state', 'open')}). It's likely "
+            "the same work; re-check the board before creating again, or pass "
+            "force=true to create a second copy anyway."
+        )
+    # PR-side dedup (#174): an open PR that already references the source issue means the
+    # work is IN FLIGHT — a new card would dispatch a second coder at it. Mechanical,
+    # best-effort: a gh failure logs a warning inside the helper and never blocks creation.
+    if str(source_issue or "").strip():
+        pr = _find_open_pr_for_issue(source_issue)
+        if pr is not None:
+            return (
+                f"Skipped — open PR #{pr.get('number', '?')} ({pr.get('url', '')}) already "
+                f"references issue {source_issue}: that work is in flight. Review or "
+                "contribute to the existing PR instead of creating a duplicate card. "
+                "Pass force=true to create anyway."
+            )
+    return None
+
+
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
     from .projects import resolve_projects
@@ -416,44 +470,9 @@ def _board_tools(cfg: dict):
             deps = _split_list(depends_on)
             files = _split_list(files_to_modify)
             if not force:
-                try:
-                    existing = store.list_features()
-                except BoardError:
-                    existing = []  # can't check → don't block creation on a read failure
-                dup = _open_duplicate(existing, title, deps)
-                if dup is not None:
-                    if dup.get("_dup_reason") == "depends_on_in_review":
-                        # The new card builds on an in-flight feature (in_review, open PR).
-                        # That's a fix round, and a fix round belongs on the in-flight
-                        # feature's OWN PR — point the author at the requeue verb (#112),
-                        # not a second card the loop would churn on.
-                        return (
-                            f"Skipped — this card's depends_on names {dup.get('id', '?')}, which is "
-                            f"already in_review with an open PR ({dup.get('pr_url', '')}). Work built "
-                            "on an in-flight feature belongs on THAT feature's PR, not a fresh card: "
-                            f"call board_requeue_feature({dup.get('id', '?')!r}, findings=...) to carry "
-                            "your changes onto the same branch. Pass force=true to stack a new card anyway."
-                        )
-                    return (
-                        f"Skipped — a feature titled {title!r} is already open on this board "
-                        f"({dup.get('id', '?')}, {dup.get('board_state', 'open')}). It's likely "
-                        "the same work; re-check the board before creating again, or pass "
-                        "force=true to create a second copy anyway."
-                    )
-                # PR-side dedup (#174): an open PR that already references the source
-                # issue means the work is IN FLIGHT — a new card would dispatch a second
-                # coder at it (the real incident: a card created for an issue that
-                # already had an open, CI-passing PR). Mechanical, best-effort: a gh
-                # failure logs a warning inside the helper and never blocks creation.
-                if str(source_issue or "").strip():
-                    pr = _find_open_pr_for_issue(source_issue)
-                    if pr is not None:
-                        return (
-                            f"Skipped — open PR #{pr.get('number', '?')} ({pr.get('url', '')}) already "
-                            f"references issue {source_issue}: that work is in flight. Review or "
-                            "contribute to the existing PR instead of creating a duplicate card. "
-                            "Pass force=true to create anyway."
-                        )
+                skip = _dedup_skip_message(store, title, deps, source_issue)
+                if skip is not None:
+                    return skip
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -467,6 +486,67 @@ def _board_tools(cfg: dict):
                 foundation=foundation,
                 source_issue=source_issue,
                 project=project,
+            )
+            return _feature_reply(f)
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_create_task(
+        title: str,
+        spec: str = "",
+        acceptance_criteria: str = "",
+        assignee: str = "",
+        priority: int = 2,
+        parent: str = "",
+        depends_on: str = "",
+        project: str = "",
+        source_issue: str = "",
+        force: bool = False,
+    ) -> str:
+        """Create a board TASK (a `task`-type bead; starts in `backlog`) — the sibling of
+        board_create_feature for work that ships a DELIVERABLE (a doc, a decision, an
+        artifact ref) instead of a PR (#217). A task rides the SAME rails as a coding
+        feature (ready → claim → in_progress → in_review) but takes the delivery/verify
+        edges: board_deliver moves it to in_review on a recorded deliverable (no PR), and
+        board_verify is its Done edge. To pass the Ready gate a task needs a self-sufficient
+        `spec` + testable `acceptance_criteria` — but NO `files_to_modify` (a task doesn't
+        touch repo files, so that coding-feature requirement is relaxed for tasks).
+
+        `assignee` pre-assigns the bead; `priority` (0 = highest) ranks it in the ready
+        queue; `parent` is the epic/milestone id; `depends_on` is a comma-separated list of
+        blocking feature ids; `project` (#90) and `source_issue` (#97) behave exactly as on
+        board_create_feature. DEDUP is identical to board_create_feature — a same-title open
+        card, a `depends_on` on an in-flight PR, or a `source_issue` an open PR already
+        references is refused unless `force=true` (a store/GitHub read failure never blocks
+        creation). Inputs are stripped of any literal wrapping double quotes first (same
+        hygiene as board_create_feature)."""
+        try:
+            project = _strip_wrapping_quotes(project)
+            store = get_store(**_store_kw_for(project))
+            title = _strip_wrapping_quotes(title)
+            spec = _strip_wrapping_quotes(spec)
+            acceptance_criteria = _strip_wrapping_quotes(acceptance_criteria)
+            assignee = _strip_wrapping_quotes(assignee)
+            parent = _strip_wrapping_quotes(parent)
+            depends_on = _strip_wrapping_quotes(depends_on)
+            source_issue = _strip_wrapping_quotes(source_issue)
+            deps = _split_list(depends_on)
+            if not force:
+                skip = _dedup_skip_message(store, title, deps, source_issue)
+                if skip is not None:
+                    return skip
+            f = store.create_feature(
+                title,
+                spec=spec,
+                acceptance_criteria=acceptance_criteria,
+                parent=parent,
+                priority=priority,
+                depends_on=deps,
+                source_issue=source_issue,
+                project=project,
+                issue_type="task",
+                assignee=assignee,
             )
             return _feature_reply(f)
         except BoardError as exc:
@@ -634,6 +714,43 @@ def _board_tools(cfg: dict):
         try:
             reason = _strip_wrapping_quotes(reason)
             f = get_store(**store_kw).mark_done(feature_id, reason=reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_deliver(feature_id: str, text: str = "", ref: str = "") -> str:
+        """Record a TASK's deliverable (#217) — the task sibling of a coder's open_pr edge,
+        moving the bead in_progress → in_review with NO PR. `text` is the deliverable itself
+        (recorded as a `deliverable:` comment the board reads back into the `deliverable`
+        field); optional `ref` (a doc URL, an artifact path) lands on the same `external_ref`
+        slot a coding feature's pr_url occupies, so link consumers just work. Then verify it
+        with board_verify. TASK-ONLY and in_progress-ONLY: a coding feature (or a task not
+        yet claimed/in review) is refused with an `Error: …` — a coding feature entering
+        review with no pr_url would strand the merge reconciler. `text`/`ref` are stripped
+        of any literal wrapping double quotes first (same hygiene as board_create_feature)."""
+        try:
+            text = _strip_wrapping_quotes(text)
+            ref = _strip_wrapping_quotes(ref)
+            f = get_store(**store_kw).record_delivery(feature_id, text, ref)
+            return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_verify(feature_id: str, approved: bool = True, feedback: str = "") -> str:
+        """Verify a TASK's delivered work (#217) — the task Done edge, record_merge's
+        verify sibling. `approved=true` CLOSES the task `done` with an auditable
+        `verified: <actor>` reason (a task has no PR to merge, so a verifier's approval is
+        what closes it). `approved=false` records `feedback` as a comment (the next dispatch
+        prompt leads with it, the adverse-review shape) and requeues the bead to `ready` for
+        another pass. TASK-ONLY and in_review-ONLY: a coding feature (closed here it would
+        dodge record_merge, the ONE Done edge for code) or a task not in review is refused
+        with an `Error: …`. `feedback` is stripped of any literal wrapping double quotes
+        first (same hygiene as board_create_feature)."""
+        try:
+            feedback = _strip_wrapping_quotes(feedback)
+            f = get_store(**store_kw).record_verification(feature_id, approved, feedback)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"
@@ -827,11 +944,14 @@ def _board_tools(cfg: dict):
     tools = [
         board_create_epic,
         board_create_feature,
+        board_create_task,
         board_update_feature,
         board_get_feature,
         board_mark_ready,
         board_cancel_feature,
         board_mark_done,
+        board_deliver,
+        board_verify,
         board_requeue_feature,
         board_block_feature,
         board_unblock_feature,
