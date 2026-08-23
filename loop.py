@@ -59,6 +59,7 @@ from .store import (
     apply_requirement_dispositions,
     escalation_enabled,
     get_store,
+    knob_bool,
     merge_posture,
 )
 
@@ -468,18 +469,9 @@ def _knob_int(cfg: dict, key: str, default: int, *, floor: int) -> int:
     return max(floor, int(cfg.get(key, default)))
 
 
-def _knob_bool(cfg: dict, key: str, default: bool) -> bool:
-    """A bool knob that also accepts the YAML/Settings string spellings — the
-    console posts real booleans, but a hand-edited ``"false"`` must not read as on."""
-    raw = cfg.get(key, default)
-    if isinstance(raw, str):
-        low = raw.strip().lower()
-        if low in ("1", "true", "yes", "on"):
-            return True
-        if low in ("0", "false", "no", "off", ""):
-            return False
-        raise ValueError(f"{key}={raw!r} is not a boolean")
-    return bool(raw)
+# The bool-knob coercion lives in store.knob_bool (ONE helper — store.annotate_next_action
+# reads the same knobs and must not drift on what "false" means); the loop's name stays.
+_knob_bool = knob_bool
 
 
 def _plugin_section(new_config) -> dict:
@@ -1225,9 +1217,14 @@ class BoardLoop:
                 continue
             if new != cur:
                 setattr(self, attr, new)
-                # Keep the preflight's view of the config in step: `_setup_status`
-                # reads `self.cfg`, and a `coder` edit must clear the coder gap here,
-                # not only on the (new) router's /status.
+                # Write the knob back into the SHARED cfg dict — `self.cfg` is the very
+                # dict register() handed the routers and the tools (one `dict(cfg)`,
+                # never copied), so this is how a live edit reaches every read path that
+                # takes its posture from cfg rather than from the loop: the preflight's
+                # `_setup_status` (a `coder` edit clears the coder gap here, not only on
+                # the router's /status) and store.annotate_next_action (#208: a board_list
+                # / /features after an `auto_merge` save says "auto-merge pending", not
+                # "awaiting-merge", without a restart). Tested in test_next_action.py.
                 self.cfg[key] = new
                 changed[key] = (cur, new)
         if changed:

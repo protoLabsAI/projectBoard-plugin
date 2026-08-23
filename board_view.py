@@ -205,6 +205,8 @@ const NEXT_ACTION_CHIP = {
   "changes requested": ["pl-badge--warning", "changes requested"],
   "awaiting review verdict (no review-clean)": ["pl-badge--warning", "awaiting review verdict"],
   "merge-hold (operator veto)": ["", "merge-hold"],
+  "draft (run `gh pr ready`)": ["pl-badge--warning", "draft"],
+  "ci failing": ["pl-badge--error", "ci failing"],
 };
 function nextActionChip(f){
   if (!f.next_action || f.next_action === "blocked") return "";  // blocked has its own chip

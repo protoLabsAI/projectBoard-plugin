@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 import project_board as pb
 from project_board import api, store
 from project_board.loop import BoardLoop
-from project_board.store import annotate_next_action, merge_posture, pr_number
+from project_board.store import annotate_next_action, knob_bool, merge_posture, pr_number
 
 PR = "https://github.com/o/r/pull/42"
 
@@ -71,6 +71,26 @@ def test_merge_posture_next_action_table(labels, blocked, auto_merge, review_gat
         assert p["next_action_hint"] == "auto_merge is off — merge #42 or turn it on in Settings ▸ Project Board"
     else:
         assert p["next_action_hint"] == ""
+
+
+def test_merge_posture_names_a_known_draft_behind_the_review_states():
+    """#207 meets #208: a draft is a named next_action — ahead of the merge-posture
+    cases (the merge never happens on a draft), behind the review ones (the review
+    gate still runs on it). Known only via `is_draft` or a stamped `pr_draft` key —
+    merge_posture never fetches it."""
+    f = _feat(labels=["review-clean"])
+    for am in (True, False):
+        p = merge_posture(f, auto_merge=am, review_gate=True, is_draft=True)
+        assert p["next_action"] == "draft (run `gh pr ready`)" and p["awaiting_merge"] is False
+        assert p["next_action_hint"] == ""
+    assert merge_posture({**f, "pr_draft": True}, auto_merge=False, review_gate=True)["next_action"].startswith("draft")
+    assert merge_posture(f, auto_merge=False, review_gate=True, is_draft=False)["awaiting_merge"] is True
+    assert merge_posture(f, auto_merge=False, review_gate=True)["awaiting_merge"] is True  # unknown ≠ draft
+    # the review states win over the draft
+    p = merge_posture(_feat(labels=["review-pending"]), auto_merge=False, review_gate=True, is_draft=True)
+    assert p["next_action"] == "review in progress"
+    # board-side blockers are unchanged by a draft (the loop reads isDraft from GitHub itself)
+    assert merge_posture(f, auto_merge=True, review_gate=True, is_draft=True)["blockers"] == []
 
 
 @pytest.mark.parametrize("state", ["backlog", "ready", "in_progress", "done", "cancelled"])
@@ -134,6 +154,64 @@ def test_annotate_reads_auto_merge_in_every_spelling(raw, on):
     assert row["next_action"] == ("auto-merge pending" if on else "awaiting-merge (auto_merge off)")
 
 
+def test_annotate_demotes_a_red_row_to_ci_failing():
+    """board_list(with_ci=True) stamped ci_status=failing: "merge #N" on a red PR is
+    the wrong hint. awaiting-merge / auto-merge pending / draft → `ci failing`,
+    awaiting_merge False, no hint; the review sub-states stand."""
+    rows = annotate_next_action(
+        [
+            {**_feat(labels=["review-clean"], fid="bd-1"), "ci_status": "failing"},
+            {**_feat(labels=["review-clean"], fid="bd-2"), "ci_status": "failing", "pr_draft": True},
+            {**_feat(labels=["review-pending"], fid="bd-3"), "ci_status": "failing"},
+            {**_feat(labels=["review-clean"], fid="bd-4"), "ci_status": "passing"},
+            {**_feat(labels=["review-clean"], fid="bd-5"), "ci_status": ""},
+        ],
+        {"auto_merge": False, "review_gate": True},
+    )
+    by = {r["id"]: r for r in rows}
+    assert by["bd-1"]["next_action"] == "ci failing" and by["bd-1"]["awaiting_merge"] is False
+    assert by["bd-1"]["next_action_hint"] == ""
+    assert by["bd-2"]["next_action"] == "ci failing"
+    assert by["bd-3"]["next_action"] == "review in progress"
+    assert by["bd-4"]["awaiting_merge"] is True and by["bd-5"]["awaiting_merge"] is True
+    rows = annotate_next_action(
+        [{**_feat(labels=["review-clean"]), "ci_status": "failing"}], {"auto_merge": True, "review_gate": True}
+    )
+    assert rows[0]["next_action"] == "ci failing"
+
+
+def test_board_list_with_ci_reads_ci_failing_not_merge_it(monkeypatch):
+    class _CiStore(_Store):
+        def annotate_ci_status(self, feats):
+            for f in feats:
+                f["ci_status"] = "failing" if f["id"] == "bd-1" else "passing"
+                f["ci_summary"] = "test (br 0.1.23)" if f["id"] == "bd-1" else ""
+            return feats
+
+    fake = _CiStore([_feat(labels=["review-clean"], fid="bd-1"), _feat(labels=["review-clean"], fid="bd-2")])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    rows = {r["id"]: r for r in json.loads(_list_tool({"auto_merge": False}).invoke({"with_ci": True}))}
+    assert rows["bd-1"]["next_action"] == "ci failing" and rows["bd-1"]["awaiting_merge"] is False
+    assert "next_action_hint" not in rows["bd-1"] and rows["bd-1"]["ci_status"] == "failing"
+    assert rows["bd-2"]["next_action"] == "awaiting-merge (auto_merge off)" and rows["bd-2"]["awaiting_merge"] is True
+
+
+def test_knob_bool_is_the_one_helper_with_explicit_unknown_string_semantics():
+    """The loop and the store used to carry two copies that disagreed on "maybe":
+    one helper now — strict raises (the loop's constructor / reload), strict=False
+    reads default (annotate_next_action must not break a listing on a typo)."""
+    from project_board import loop as loop_mod
+
+    assert loop_mod._knob_bool is knob_bool
+    assert knob_bool({"x": "on"}, "x", False) is True and knob_bool({"x": "off"}, "x", True) is False
+    assert knob_bool({"x": ""}, "x", True) is False and knob_bool({}, "x", True) is True
+    with pytest.raises(ValueError):
+        knob_bool({"x": "maybe"}, "x", False)
+    assert knob_bool({"x": "maybe"}, "x", True, strict=False) is True
+    (row,) = annotate_next_action([_feat(labels=["review-clean"])], {"auto_merge": "maybe", "review_gate": True})
+    assert row["next_action"] == "awaiting-merge (auto_merge off)"  # default (off), not a crash
+
+
 def test_annotate_leaves_non_review_rows_untouched():
     rows = annotate_next_action([_feat(state="ready"), _feat(state="done", fid="bd-2")], {})
     assert all(not {"next_action", "awaiting_merge", "next_action_hint"} & set(r) for r in rows)
@@ -179,6 +257,43 @@ def test_board_list_rows_carry_next_action_and_the_merge_hint(monkeypatch):
     assert "next_action_hint" not in rows["bd-2"]
     # non-review rows carry none of the three keys (the row shape stays lean)
     assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(rows["bd-3"])
+
+
+def test_next_action_follows_the_live_auto_merge_knob_without_a_restart(monkeypatch):
+    """The blocker on #214: `auto_merge` is a LIVE knob (BoardLoop.reload), but
+    annotate_next_action reads the register-time cfg dict. The loop, the routers and
+    the tools share ONE dict (register() builds `cfg` once), and reload() writes every
+    changed live knob back into `self.cfg` — so a Settings save flips `next_action`
+    from "awaiting-merge" to "auto-merge pending" on the next board_list, no restart."""
+    fake = _Store([_feat(labels=["review-clean"])])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    cfg = {"auto_merge": False, "review_gate": True, "coder": "p"}
+    loop = BoardLoop(cfg)
+    tool = {t.name: t for t in pb._board_tools(cfg)}["board_list"]  # the SAME dict, as register() wires it
+    assert loop.cfg is cfg
+    (row,) = json.loads(tool.invoke({}))
+    assert row["next_action"] == "awaiting-merge (auto_merge off)" and row["awaiting_merge"] is True
+
+    assert loop.reload({"auto_merge": True}) == {"auto_merge": (False, True)}
+    (row,) = json.loads(tool.invoke({}))
+    assert row["next_action"] == "auto-merge pending" and row["awaiting_merge"] is False
+    assert "next_action_hint" not in row
+
+    assert loop.reload({"auto_merge": "false"}) == {"auto_merge": (True, False)}  # the YAML spelling, coerced
+    (row,) = json.loads(tool.invoke({}))
+    assert row["next_action"] == "awaiting-merge (auto_merge off)"
+    # …and the /features payload the console reads sees the same flip
+    c = _client_with_cfg(monkeypatch, fake, cfg)
+    loop.reload({"auto_merge": True})
+    (f,) = c.get("/api/plugins/project_board/features").json()["features"]
+    assert f["next_action"] == "auto-merge pending"
+
+
+def _client_with_cfg(monkeypatch, fake, cfg):
+    monkeypatch.setattr(api, "get_store", lambda **_kw: fake)
+    app = FastAPI()
+    app.include_router(api.build_data_router(cfg), prefix="/api/plugins/project_board")
+    return TestClient(app)
 
 
 def test_board_list_with_auto_merge_on_never_says_awaiting_merge(monkeypatch):
@@ -232,6 +347,8 @@ def test_board_page_chips_the_in_review_sub_state():
     assert "const NEXT_ACTION_CHIP = {" in BOARD_PAGE
     assert '"awaiting-merge (auto_merge off)": ["pl-badge--success", "awaiting merge"],' in BOARD_PAGE
     assert '"changes requested": ["pl-badge--warning", "changes requested"],' in BOARD_PAGE
+    assert '"draft (run `gh pr ready`)": ["pl-badge--warning", "draft"],' in BOARD_PAGE
+    assert '"ci failing": ["pl-badge--error", "ci failing"],' in BOARD_PAGE
     assert "function nextActionChip(f)" in BOARD_PAGE
     # the hint rides as the chip's tooltip, esc()'d — and `blocked` keeps its own chip
     assert "const hint = f.next_action_hint || f.next_action;" in BOARD_PAGE

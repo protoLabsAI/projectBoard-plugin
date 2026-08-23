@@ -206,11 +206,14 @@ project_board:
   `board_mark_ready`, `board_list`. Every `in_review` row of `board_list` (and of
   `GET …/features`) carries `next_action` — `awaiting-merge (auto_merge off)` /
   `auto-merge pending` / `review in progress` / `changes requested` / `awaiting
-  review verdict (no review-clean)` / `merge-hold (operator veto)` / `blocked` —
-  plus `awaiting_merge: true` and a `next_action_hint` ("auto_merge is off — merge
-  #N or turn it on in Settings ▸ Project Board") for the first. Derived from the
-  review sub-state labels + the board's `auto_merge`/`review_gate` config (the same
-  decoding the loop's merge edge uses; `store.merge_posture`), no network.
+  review verdict (no review-clean)` / `merge-hold (operator veto)` / `blocked` /
+  `draft (run gh pr ready)` — plus `awaiting_merge: true` and a `next_action_hint`
+  ("auto_merge is off — merge #N or turn it on in Settings ▸ Project Board") for the
+  first. Derived from the review sub-state labels + the board's LIVE
+  `auto_merge`/`review_gate` config (the same decoding the loop's merge edge uses;
+  `store.merge_posture`; a Settings save to `auto_merge` flips it with no restart),
+  no network. `board_list(with_ci=true)` demotes a red row to `ci failing` — never
+  "merge #N" on a red PR.
 - **Plan a project:** the `decompose-project` skill ("decompose <idea>") runs the
   adversarial pipeline and populates the board.
 - **HTTP API** (`/plugins/project_board/*`): `epics`, `milestones`, `features`,

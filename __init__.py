@@ -699,12 +699,15 @@ def _board_tools(cfg: dict):
         board-side in the way, and the loop will NOT merge — a human must),
         `auto-merge pending` (the loop merges once GitHub reports CLEAN), `review in
         progress`, `changes requested`, `awaiting review verdict (no review-clean)`,
-        `merge-hold (operator veto)`, `blocked` — plus `awaiting_merge: true` and a
-        `next_action_hint` ("auto_merge is off — merge #N or turn it on in Settings ▸
-        Project Board") for the first case. When ANY row is `awaiting_merge`, LEAD
-        your status report with it and offer the two verbs that actually move it —
-        merge that PR, or enable `auto_merge` — NOT a re-review: the review gate has
-        already cleared it. Derived from labels + config; costs no network.
+        `merge-hold (operator veto)`, `blocked`, `draft (run gh pr ready)` — plus
+        `awaiting_merge: true` and a `next_action_hint` ("auto_merge is off — merge #N
+        or turn it on in Settings ▸ Project Board") for the first case. When ANY row is
+        `awaiting_merge`, LEAD your status report with it and offer the two verbs that
+        actually move it — merge that PR, or enable `auto_merge` — NOT a re-review: the
+        review gate has already cleared it. Derived from labels + the LIVE config (a
+        Settings save to `auto_merge` changes it without a restart); costs no network.
+        With `with_ci=true`, a row whose rollup is red reads `ci failing` instead
+        (never "merge #N" on a red PR).
 
         `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
         (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
