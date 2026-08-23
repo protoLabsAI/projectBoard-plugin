@@ -276,3 +276,72 @@ def test_task_cards_share_lanes_and_ordering_with_coding_features():
         ".sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));"
         in BOARD_PAGE
     )
+
+
+# ── gen log fills the drawer's vertical space (#226-UX) ──────────────────────────
+#
+# The coder monitor drawer already flex-fills the panel height (.db is flex:1;overflow:
+# auto), but each gen section had a small hard cap, leaving whitespace below a lone gen
+# — the common case, watching one live build. A solo gen card now becomes a flex column
+# owning the full body height, with its recent-tools log flexing into the remaining
+# space; several gens keep bounded (but larger) caps so all stay reachable by scrolling.
+
+
+def test_lone_gen_becomes_a_flex_column_that_fills_the_drawer_body():
+    """A single gen (`.gen:only-child` — the sole child of the flex-filled .db) turns
+    into a flex column at 100% of the body height, with margin-bottom:0 so it doesn't
+    spill past 100% and re-introduce a body scroll."""
+    assert ".gen:only-child{display:flex;flex-direction:column;height:100%;margin-bottom:0}" in BOARD_PAGE
+
+
+def test_lone_gen_tools_log_takes_the_remaining_space_uncapped():
+    """The recent-tools list is the primary log the operator watches, so in the lone-gen
+    layout it drops its cap (max-height:none) and grows into the leftover space (flex:1),
+    keeping a sensible floor (min-height) — no dead whitespace below the card."""
+    assert ".gen:only-child ul.tools{flex:1 1 auto;max-height:none;min-height:80px}" in BOARD_PAGE
+
+
+def test_lone_gen_plan_and_thought_stay_bounded_but_can_shrink_and_scroll():
+    """Plan/thinking keep generous caps in the lone-gen layout so they don't crowd out
+    the tools log, and get min-height:0 so a long section shrinks+scrolls (its own
+    overflow:auto) instead of overflowing the fixed-height card."""
+    assert ".gen:only-child ul.plan{max-height:300px;min-height:0}" in BOARD_PAGE
+    assert ".gen:only-child .thought{max-height:280px;min-height:0}" in BOARD_PAGE
+
+
+def test_multi_gen_caps_are_raised_but_still_bounded():
+    """With several gens the per-section caps stay finite (so every gen is reachable by
+    scrolling the body) but are more generous than the old cramped values — thought
+    120→200, plan 140→250, tools 150→300."""
+    # thought's raised cap, pinned in context so it can't collide with .deliv's 120px cap
+    assert "color:var(--pl-color-fg-muted);\n    max-height:200px;overflow:auto}" in BOARD_PAGE
+    assert ".gen ul.plan{list-style:none;margin:0;padding:0;max-height:250px;overflow:auto}" in BOARD_PAGE
+    assert ".gen ul.tools{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}" in BOARD_PAGE
+    # the old cramped plan/tools caps are gone (both values are unique to those rules)
+    assert "max-height:140px" not in BOARD_PAGE  # old plan
+    assert "max-height:150px" not in BOARD_PAGE  # old tools
+    # and the old thought cap is gone — .deliv keeps its own 120px, so pin thought's context
+    assert "color:var(--pl-color-fg-muted);\n    max-height:120px;overflow:auto}" not in BOARD_PAGE
+
+
+def test_input_preview_stays_compact():
+    """The input preview is a peek at the current tool's args, not a log — it keeps its
+    short cap in both the multi-gen and lone-gen layouts (no :only-child override)."""
+    assert "max-height:48px;overflow:hidden;margin-top:2px}" in BOARD_PAGE
+    assert ".gen:only-child .inprev" not in BOARD_PAGE
+
+
+def test_lone_gen_fill_does_not_touch_the_drawer_body_scroll_contract():
+    """The fill is driven off .gen:only-child height:100% — the .db body rule that owns
+    the flex-fill + own-scroll-chain (#218) is left exactly as it was, so the body still
+    scrolls (and contains its scroll) when the content overflows."""
+    assert (
+        "#drawer .db{padding:var(--pl-space-3) var(--pl-space-4);"
+        "overflow:auto;flex:1;overscroll-behavior:contain}" in BOARD_PAGE
+    )
+
+
+def test_drawer_width_still_clamps_to_the_mobile_viewport():
+    """The vertical-fill change is height-only; the drawer's width still clamps to
+    min(460px, 92vw) so a narrow/mobile viewport renders correctly."""
+    assert "width:min(460px,92vw)" in BOARD_PAGE

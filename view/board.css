@@ -65,17 +65,34 @@
     margin:var(--pl-space-2) 0 2px}
   .gen .cur{font-family:var(--pl-font-mono);font-size:11.5px;word-break:break-word}
   .gen .loc{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px}
+  /* Multi-gen caps (#226-UX): with several gens stacked, each section stays bounded so
+     every gen is reachable by scrolling the body — but the old caps were cramped, so
+     they're bumped to be more generous (thought 120→200, plan 140→250, tools 150→300).
+     The lone-gen overrides below drop these entirely for the common single-build case. */
   .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:11.5px;color:var(--pl-color-fg-muted);
-    max-height:120px;overflow:auto}
-  .gen ul.plan{list-style:none;margin:0;padding:0;max-height:140px;overflow:auto}
+    max-height:200px;overflow:auto}
+  .gen ul.plan{list-style:none;margin:0;padding:0;max-height:250px;overflow:auto}
   .gen ul.plan li{font-size:11.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
   .gen ul.plan li.pl-in_progress{color:var(--pl-color-fg);font-weight:600}
   .gen ul.plan li.pl-completed{opacity:.6}
   .gen ul.plan .glyph{display:inline-block;width:12px;color:var(--pl-color-accent)}
+  /* Input preview stays short by nature — a peek at the current tool's args, not a log. */
   .gen .inprev{color:var(--pl-color-fg-muted);font-size:10.5px;white-space:pre-wrap;word-break:break-all;
     max-height:48px;overflow:hidden;margin-top:2px}
-  .gen ul.tools{list-style:none;margin:0;padding:0;max-height:150px;overflow:auto}
+  .gen ul.tools{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}
   .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  /* #226-UX: a LONE gen fills the drawer. The common case is watching ONE live build,
+     so a solo gen card becomes a flex column owning the full drawer-body height
+     (margin-bottom:0 so it doesn't spill past 100% and re-introduce a body scroll), and
+     its recent-tools log — the primary thing the operator watches — grows into the
+     remaining space via flex:1 instead of stopping at a fixed cap, so no dead whitespace
+     is left below. Plan/thinking keep bounded-but-generous caps and can shrink+scroll
+     (min-height:0) when the log is long. With MULTIPLE gens :only-child stops matching,
+     so the capped rules above apply and every gen stays visible by scrolling the body. */
+  .gen:only-child{display:flex;flex-direction:column;height:100%;margin-bottom:0}
+  .gen:only-child ul.tools{flex:1 1 auto;max-height:none;min-height:80px}
+  .gen:only-child ul.plan{max-height:300px;min-height:0}
+  .gen:only-child .thought{max-height:280px;min-height:0}
   .st-completed{color:var(--pl-color-status-success)}
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}
