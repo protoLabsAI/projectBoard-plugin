@@ -155,3 +155,124 @@ def test_page_scroll_locks_while_drawer_is_open_and_unlocks_on_close():
     assert "body.drawer-open{overflow:hidden}" in BOARD_PAGE
     assert 'document.body.classList.add("drawer-open")' in BOARD_PAGE
     assert 'document.body.classList.remove("drawer-open")' in BOARD_PAGE
+
+
+# ── Task-type cards (#217): document icon, deliverable, submit + approve/reject ──
+#
+# A task-type feature (issue_type == "task") rides the SAME board lanes/ordering/deps
+# as a coding feature but ships a deliverable instead of a PR — so the card gets a
+# distinct document icon, in_progress carries a submit form, in_review the deliverable
+# text + Approve/Reject, and it never opens the coder monitor.
+
+
+def test_task_cards_are_marked_by_issue_type_with_a_document_icon():
+    """A task is told apart by issue_type; the card wears a document icon and a dashed
+    left border, stamped onto the title in BOTH the Kanban card and the list row."""
+    assert 'const TASK_TYPE = "task";' in BOARD_PAGE
+    assert "const isTask = (f) => f.issue_type === TASK_TYPE;" in BOARD_PAGE
+    assert "const DOC_ICON =" in BOARD_PAGE
+    assert "doc-ico-w" in BOARD_PAGE
+    assert ".card--task{border-left-style:dashed}" in BOARD_PAGE
+    assert '(isTask(f)?" card--task":"")' in BOARD_PAGE
+    # the icon rides the title in both projections (Kanban card + list row)
+    assert BOARD_PAGE.count("docIco(f)+esc(f.title)") == 2
+
+
+def test_task_in_review_shows_deliverable_text_and_ref_not_a_pr_link():
+    """in_review task card renders the `deliverable` projection field and its external
+    ref (surfaced as pr_url) as a plain 'ref ↗' link — never the coder 'PR ↗'. Both
+    the Kanban card and the list row route their footer through taskFoot()."""
+    assert 'class="deliv"' in BOARD_PAGE
+    assert "esc(f.deliverable)" in BOARD_PAGE
+    assert "function taskRef(f)" in BOARD_PAGE
+    assert ">ref ↗<" in BOARD_PAGE
+    assert "function taskFoot(f){ return isTask(f) ? taskRef(f) : pr(f); }" in BOARD_PAGE
+    assert BOARD_PAGE.count("taskFoot(f)") == 3  # definition + kanban footer + list footer
+
+
+def test_task_in_progress_shows_a_submit_deliverable_form():
+    """in_progress task card carries a submit form: a text area + an optional ref URL
+    field + a Submit button that POSTs /deliver with {text, ref}."""
+    assert 'id="tdtext-' in BOARD_PAGE  # deliverable text area
+    assert 'id="tdref-' in BOARD_PAGE  # optional ref URL field
+    assert ">Submit deliverable<" in BOARD_PAGE
+    assert 'data-deliver="' in BOARD_PAGE
+    assert "function submitDeliver(fid)" in BOARD_PAGE
+    assert '"/deliver", {text: text, ref: ref}' in BOARD_PAGE
+
+
+def test_task_in_review_shows_approve_and_reject_controls():
+    """in_review task card shows Approve + Reject; the buttons carry the data-* verbs
+    the delegated click listener resolves."""
+    assert ">Approve<" in BOARD_PAGE
+    assert ">Reject<" in BOARD_PAGE
+    assert 'data-approve="' in BOARD_PAGE
+    assert 'data-reject-toggle="' in BOARD_PAGE
+    assert 'data-reject="' in BOARD_PAGE
+
+
+def test_approve_posts_verify_with_approved_true():
+    assert "function approveTask(fid)" in BOARD_PAGE
+    assert '"/verify", {approved: true}' in BOARD_PAGE
+
+
+def test_reject_opens_feedback_and_posts_verify_approved_false_with_feedback():
+    """Reject expands a feedback textarea (its open-state lives in a module-scoped Set
+    so the 10s auto-reload keeps it open); sending POSTs approved=false + feedback and
+    collapses the form."""
+    assert "const REJECT_OPEN = new Set();" in BOARD_PAGE
+    assert "function toggleReject(fid)" in BOARD_PAGE
+    assert 'id="trtext-' in BOARD_PAGE  # the feedback textarea
+    assert "function rejectTask(fid)" in BOARD_PAGE
+    assert '"/verify", {approved: false, feedback: feedback}' in BOARD_PAGE
+    assert "REJECT_OPEN.delete(fid); await load();" in BOARD_PAGE
+
+
+def test_verify_error_slot_is_present_on_the_approve_path():
+    """Regression for the review finding: the error slot (terr-<id>) is emitted OUTSIDE
+    the reject-form branch, so a failed Approve (reject form collapsed) still surfaces
+    its error instead of being silently dropped by taskErr's `if (el)` guard. Both
+    action states (in_progress form + in_review) own a slot — two `id="terr-` sites."""
+    assert "return deliv + acts + '<div class=\"terr\" id=\"terr-'+id+'\"></div>';" in BOARD_PAGE
+    assert "function taskErr(fid, e)" in BOARD_PAGE
+    assert BOARD_PAGE.count('id="terr-') == 2
+
+
+def test_task_cards_never_open_the_coder_monitor():
+    """A task never dispatches a coder, so neither its Kanban card nor its list row gets
+    the data-mon monitor handle — the gate excludes tasks in BOTH projections, and the
+    monitor affordance keys on the task-excluding `mon`, not raw in_progress."""
+    assert "const mon = live && !isTask(f);" in BOARD_PAGE  # kanban
+    assert 'const mon = f.state==="in_progress" && !isTask(f);' in BOARD_PAGE  # list
+    assert '(mon?" card--live":"")' in BOARD_PAGE
+
+
+def test_task_action_buttons_are_delegated_like_the_monitor():
+    """The board's first mutation UI — delegated clicks keyed on data-* verbs, no dead
+    window.* globals (same discipline as the data-mon monitor handle)."""
+    assert 'e.target.closest("[data-deliver],[data-approve],[data-reject],[data-reject-toggle]")' in BOARD_PAGE
+    assert 'submitDeliver(act.getAttribute("data-deliver"))' in BOARD_PAGE
+    assert 'approveTask(act.getAttribute("data-approve"))' in BOARD_PAGE
+    assert 'rejectTask(act.getAttribute("data-reject"))' in BOARD_PAGE
+    assert 'toggleReject(act.getAttribute("data-reject-toggle"))' in BOARD_PAGE
+
+
+def test_task_review_lane_posts_through_a_json_apiPost_helper():
+    """Reads go through `api`; the task lane's writes go through `apiPost` — the same
+    slug-aware authed fetch, a JSON body, and the same readable-error decode."""
+    assert "const apiPost = async (p, body) =>" in BOARD_PAGE
+    assert 'method: "POST"' in BOARD_PAGE
+    assert 'headers: {"content-type": "application/json"}' in BOARD_PAGE
+    assert "body: JSON.stringify(body || {})" in BOARD_PAGE
+
+
+def test_task_cards_share_lanes_and_ordering_with_coding_features():
+    """A task is filtered/sorted by the SAME comparator and column filter as a coding
+    feature — no task-only lane, no separate ordering — so it lands in its board state
+    with the shared blocked-first / in_progress-second / priority order."""
+    # one filter/sort path for every feature; task-ness only changes card CHROME
+    assert "FEATURES.filter(f => f.state === state)" in BOARD_PAGE
+    assert (
+        ".sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));"
+        in BOARD_PAGE
+    )

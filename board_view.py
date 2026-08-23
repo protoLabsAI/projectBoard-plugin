@@ -109,6 +109,35 @@ BOARD_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}
   .st-start{color:var(--pl-color-fg-muted)}
+  /* ── Task cards (#217): a task-type feature ships a DELIVERABLE (a doc, a decision,
+     an artifact ref) instead of a coder PR. A document icon marks it apart from a
+     coding feature card; its in_progress/in_review cards carry their own submit +
+     approve/reject controls and NEVER open the coder monitor (no coder dispatch).
+     Token-driven, vanilla — same discipline as the rest of the page. */
+  .doc-ico{vertical-align:-2px}
+  .doc-ico-w{color:var(--pl-color-status-info);margin-right:4px}
+  .card--task{border-left-style:dashed}
+  .deliv{margin-top:6px;padding:6px 8px;background:var(--pl-color-bg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
+    font-size:11.5px;color:var(--pl-color-fg-muted);white-space:pre-wrap;word-break:break-word;
+    max-height:120px;overflow:auto}
+  .tact{display:flex;gap:var(--pl-space-2);flex-wrap:wrap;margin-top:6px}
+  .tform{flex-direction:column;align-items:stretch}
+  .tarea{width:100%;min-height:54px;resize:vertical;font-family:inherit;font-size:11.5px;padding:5px 6px;
+    background:var(--pl-color-bg);color:var(--pl-color-fg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius)}
+  .tin{width:100%;font-family:inherit;font-size:11.5px;padding:4px 6px;
+    background:var(--pl-color-bg);color:var(--pl-color-fg);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius)}
+  .trow{display:flex;gap:var(--pl-space-2)}
+  .tbtn{cursor:pointer;font-size:11px;padding:4px 9px;border-radius:var(--pl-radius);
+    border:var(--pl-border-width) solid var(--pl-color-border);
+    background:var(--pl-color-bg-raised);color:var(--pl-color-fg)}
+  .tbtn:hover{border-color:var(--pl-color-accent)}
+  .tbtn--primary{background:var(--pl-color-accent);color:var(--pl-color-bg);border-color:var(--pl-color-accent)}
+  .tbtn--danger{background:var(--pl-color-status-error);color:var(--pl-color-bg);border-color:var(--pl-color-status-error)}
+  .terr{color:var(--pl-color-status-error);font-size:10.5px;margin-top:2px;white-space:pre-wrap;word-break:break-word}
+  .tsub>td{padding:2px 10px 8px}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
 </style>
@@ -181,6 +210,18 @@ const api = async (p) => {
   if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
   return d;
 };
+// The board's FIRST mutation path (#217): the task-type review lane POSTs a
+// deliverable / a verify verdict. Same slug-aware authed fetch as `api`, but sends a
+// JSON body and decodes the same readable-error shape (a BoardError `detail`, else the
+// HTTP status). Coding features never mutate from here — their lifecycle is the coder
+// + the PR; only task cards call this.
+const apiPost = async (p, body) => {
+  const r = await kit.apiFetch(p, {method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify(body || {})});
+  const d = await r.json().catch(() => { throw new Error("HTTP " + r.status + " (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+  return d;
+};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -224,6 +265,87 @@ function flags(f){
 }
 function pr(f){ return f.pr_url ? '<a class="pr" href="'+esc(f.pr_url)+'" target="_blank">PR ↗</a>' : ""; }
 
+// ── Task-type features (#217) ───────────────────────────────────────────────────
+// A task rides the SAME board lanes / priority ordering / dependency + blocked display
+// as a coding feature, but ships a DELIVERABLE (a doc, a decision, an artifact ref)
+// instead of a coder PR. So it wears a document icon, its in_progress card carries a
+// submit form, its in_review card the deliverable text + Approve/Reject, and it NEVER
+// opens the coder monitor (no coder dispatch). `issue_type === "task"` is the only tell.
+const TASK_TYPE = "task";
+const isTask = (f) => f.issue_type === TASK_TYPE;
+const FEAT = "/api/plugins/project_board/features/";
+// Inline document glyph — sets a task card apart from a coding feature card.
+const DOC_ICON = '<svg class="doc-ico" width="12" height="12" viewBox="0 0 16 16" fill="none"'
+  + ' stroke="currentColor" stroke-width="1.3" aria-hidden="true">'
+  + '<path d="M4 1.75h5L12.5 5.25V13.5a.75.75 0 0 1-.75.75h-7a.75.75 0 0 1-.75-.75z"/>'
+  + '<path d="M8.75 1.75V5.5h3.75"/><path d="M6 8.5h4M6 11h4"/></svg>';
+function docIco(f){ return isTask(f) ? '<span class="doc-ico-w">'+DOC_ICON+'</span>' : ""; }
+// A task's `ref` (doc URL / artifact path) lands on external_ref, which the projection
+// surfaces as `pr_url` — the same slot a coding feature's PR occupies. Rendered as a
+// plain "ref ↗" link, distinct from a coding feature's "PR ↗".
+function taskRef(f){ return f.pr_url ? '<a class="pr" href="'+esc(f.pr_url)+'" target="_blank">ref ↗</a>' : ""; }
+// A card's footer link: a task shows its external ref, a coding feature its PR.
+function taskFoot(f){ return isTask(f) ? taskRef(f) : pr(f); }
+
+// Which in_review task cards have their reject-feedback form expanded — module-scoped
+// so the 10s auto-reload re-render keeps it open (same pattern as COLLAPSED/DONE_ALL).
+const REJECT_OPEN = new Set();
+function toggleReject(fid){ REJECT_OPEN.has(fid) ? REJECT_OPEN.delete(fid) : REJECT_OPEN.add(fid); render(); }
+
+// The task card's action block — the board's first mutation UI.
+//   in_progress → a submit-deliverable form (text + optional ref URL).
+//   in_review   → the deliverable text, then Approve / Reject (Reject expands a
+//                 feedback textarea whose contents re-dispatch to the assignee).
+// Every state with an action carries its OWN error slot (terr-<id>); for in_review it
+// is emitted OUTSIDE the reject-form branch so the Approve path (reject form collapsed)
+// can still surface a failed verify — the review-flagged bug.
+function taskExtra(f){
+  const id = esc(f.id);
+  if (f.state === "in_progress"){
+    return '<div class="tform tact">'
+      + '<textarea class="tarea" id="tdtext-'+id+'" placeholder="Deliverable — a doc, a decision, an artifact ref"></textarea>'
+      + '<input class="tin" id="tdref-'+id+'" type="url" placeholder="Reference URL (optional)">'
+      + '<div class="trow"><button class="tbtn tbtn--primary" data-deliver="'+id+'">Submit deliverable</button></div>'
+      + '<div class="terr" id="terr-'+id+'"></div></div>';
+  }
+  if (f.state === "in_review"){
+    const deliv = f.deliverable ? '<div class="deliv">'+esc(f.deliverable)+'</div>' : "";
+    let acts = '<div class="tact">'
+      + '<button class="tbtn tbtn--primary" data-approve="'+id+'">Approve</button>'
+      + '<button class="tbtn tbtn--danger" data-reject-toggle="'+id+'">Reject</button></div>';
+    if (REJECT_OPEN.has(f.id)){
+      acts += '<div class="tform tact">'
+        + '<textarea class="tarea" id="trtext-'+id+'" placeholder="Feedback — what needs to change (re-dispatched to the assignee)"></textarea>'
+        + '<div class="trow"><button class="tbtn tbtn--danger" data-reject="'+id+'">Send rejection</button>'
+        + '<button class="tbtn" data-reject-toggle="'+id+'">Cancel</button></div></div>';
+    }
+    return deliv + acts + '<div class="terr" id="terr-'+id+'"></div>';
+  }
+  return "";
+}
+// Surface a task-action failure in the card's always-present error slot.
+function taskErr(fid, e){
+  const el = $("terr-"+fid);
+  if (el) el.textContent = "" + ((e && e.message) || e);
+}
+async function submitDeliver(fid){
+  const text = ($("tdtext-"+fid) || {}).value || "";
+  const ref = ($("tdref-"+fid) || {}).value || "";
+  try { await apiPost(FEAT+encodeURIComponent(fid)+"/deliver", {text: text, ref: ref}); await load(); }
+  catch (e) { taskErr(fid, e); }
+}
+async function approveTask(fid){
+  try { await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true}); await load(); }
+  catch (e) { taskErr(fid, e); }
+}
+async function rejectTask(fid){
+  const feedback = ($("trtext-"+fid) || {}).value || "";
+  try {
+    await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: false, feedback: feedback});
+    REJECT_OPEN.delete(fid); await load();
+  } catch (e) { taskErr(fid, e); }
+}
+
 // State → DS dot variant (for the list view chip).
 const DOT_VARIANT = {ready:"pl-dot--success", in_review:"pl-dot--info", blocked:"pl-dot--error"};
 
@@ -262,12 +384,15 @@ function render(){
       const cards = items.map(f => {
         const color = f.blocked ? "var(--pl-color-status-error)" : (f.dag_blocked ? "var(--pl-color-status-warning)" : (STATE_COLOR[state]||"var(--pl-color-accent)"));
         // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
+        // A task never dispatches a coder, so it never opens the monitor (#217).
         const live = state === "in_progress";
-        return '<div class="card'+(live?" card--live":"")+'"'+(live?' data-mon="'+esc(f.id)+'"':"")
+        const mon = live && !isTask(f);
+        return '<div class="card'+(mon?" card--live":"")+(isTask(f)?" card--task":"")+'"'+(mon?' data-mon="'+esc(f.id)+'"':"")
           + ' style="border-left-color:'+color+'">'
-          + '<div class="t">'+esc(f.title)+'</div>'
+          + '<div class="t">'+docIco(f)+esc(f.title)+'</div>'
           + '<div class="m"><span class="id">'+esc(f.id)+'</span><span>P'+f.priority+'</span>'
-          + flags(f)+' '+pr(f)+'</div></div>';
+          + flags(f)+' '+taskFoot(f)+'</div>'
+          + (isTask(f)?taskExtra(f):"")+'</div>';
       }).join("") || '<div class="pl-empty">—</div>';
       const more = total > items.length ? showAllBtn(total) : "";
       return '<div class="col"><div class="pl-panel-header pl-panel-header--compact">'
@@ -277,12 +402,20 @@ function render(){
   } else {
     // List: group rows under a collapsible per-state header (COLS order + blocked +
     // cancelled), mirroring the Kanban's grouping so a dense board stays scannable (#26).
-    const row = (f) =>
-      '<tr'+(f.state==="in_progress"?' data-mon="'+esc(f.id)+'"':"")+'>'  // in_progress → opens the monitor (#84)
-      + '<td class="id">'+esc(f.id)+'</td><td>'+esc(f.title)+'</td>'
-      + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
-      + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
-      + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+pr(f)+'</td></tr>';
+    const row = (f) => {
+      // in_progress CODING rows open the monitor; a task never does (#84/#217).
+      const mon = f.state==="in_progress" && !isTask(f);
+      let tr = '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+'>'
+        + '<td class="id">'+esc(f.id)+'</td><td>'+docIco(f)+esc(f.title)+'</td>'
+        + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
+        + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
+        + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+taskFoot(f)+'</td></tr>';
+      // A task's action controls (submit / approve-reject) ride a sub-row spanning the
+      // table, so the list has the SAME mutation UI as the Kanban card (#217).
+      if (isTask(f) && (f.state==="in_progress" || f.state==="in_review"))
+        tr += '<tr class="tsub"><td colspan="6">'+taskExtra(f)+'</td></tr>';
+      return tr;
+    };
     const byState = {};
     FEATURES.forEach(f => (byState[f.state] = byState[f.state] || []).push(f));
     // COLS order + blocked + cancelled; any unexpected state lands in its own group last.
@@ -483,10 +616,17 @@ function closeMonitor(){
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
   document.body.classList.remove("drawer-open");
 }
-// Delegate clicks: any [data-mon] element (in_progress card or row) opens the drawer.
+// Delegate clicks: any [data-mon] element (in_progress card or row) opens the drawer;
+// the task-card action buttons (#217) are delegated the same way, keyed on data-* verb.
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-mon]");
-  if (el) openMonitor(el.getAttribute("data-mon"));
+  if (el) { openMonitor(el.getAttribute("data-mon")); return; }
+  const act = e.target.closest("[data-deliver],[data-approve],[data-reject],[data-reject-toggle]");
+  if (!act) return;
+  if (act.hasAttribute("data-deliver")) submitDeliver(act.getAttribute("data-deliver"));
+  else if (act.hasAttribute("data-approve")) approveTask(act.getAttribute("data-approve"));
+  else if (act.hasAttribute("data-reject")) rejectTask(act.getAttribute("data-reject"));
+  else if (act.hasAttribute("data-reject-toggle")) toggleReject(act.getAttribute("data-reject-toggle"));
 });
 $("scrim").addEventListener("click", closeMonitor);              // click-away closes
 $("drawer-close").addEventListener("click", closeMonitor);
