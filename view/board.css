@@ -93,6 +93,32 @@
   .gen:only-child ul.tools{flex:1 1 auto;max-height:none;min-height:80px}
   .gen:only-child ul.plan{max-height:300px;min-height:0}
   .gen:only-child .thought{max-height:280px;min-height:0}
+  /* ── "saying" markdown (bd-p87t): the coder's answer_tail renders as markdown, not raw
+     syntax. These style the rendered HTML INSIDE the .thought container, so it keeps the
+     .thought scroll/overflow cap + the lone-gen fill above, scaled DOWN for the compact
+     drawer: headings ~14px (not full-page size), code on a subtle --pl token background,
+     lists properly indented. .md-on is toggled on only once markdown is rendered, so the
+     plain esc()'d fallback (CDN blocked/offline) keeps its pre-wrap whitespace. */
+  .gen .thought.md-on{white-space:normal}
+  .gen .md-on>:first-child{margin-top:0}
+  .gen .md-on>:last-child{margin-bottom:0}
+  .gen .md-on p{margin:4px 0}
+  .gen .md-on h1,.gen .md-on h2,.gen .md-on h3,.gen .md-on h4,.gen .md-on h5,.gen .md-on h6{
+    margin:6px 0 3px;font-weight:600;color:var(--pl-color-fg);line-height:1.3}
+  .gen .md-on h1,.gen .md-on h2{font-size:14px}
+  .gen .md-on h3,.gen .md-on h4,.gen .md-on h5,.gen .md-on h6{font-size:12px}
+  .gen .md-on code{font-family:var(--pl-font-mono);font-size:10.5px;background:var(--pl-color-bg);
+    padding:1px 4px;border-radius:3px}
+  .gen .md-on pre{background:var(--pl-color-bg);border:var(--pl-border-width) solid var(--pl-color-border);
+    border-radius:var(--pl-radius);padding:6px 8px;overflow:auto;margin:4px 0}
+  .gen .md-on pre code{padding:0;background:none;border-radius:0}
+  .gen .md-on ul,.gen .md-on ol{margin:4px 0;padding-left:18px}
+  .gen .md-on li{margin:1px 0}
+  .gen .md-on a{color:var(--pl-color-status-info);text-decoration:none}
+  .gen .md-on a:hover{text-decoration:underline}
+  .gen .md-on blockquote{margin:4px 0;padding-left:8px;border-left:2px solid var(--pl-color-border);
+    color:var(--pl-color-fg-muted)}
+  .gen .md-on img{max-width:100%}
   .st-completed{color:var(--pl-color-status-success)}
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}

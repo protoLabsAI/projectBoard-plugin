@@ -345,3 +345,68 @@ def test_drawer_width_still_clamps_to_the_mobile_viewport():
     """The vertical-fill change is height-only; the drawer's width still clamps to
     min(460px, 92vw) so a narrow/mobile viewport renders correctly."""
     assert "width:min(460px,92vw)" in BOARD_PAGE
+
+
+# ── "saying" renders markdown (bd-p87t) ──────────────────────────────────────────
+#
+# The coder's answer_tail is markdown prose. The "saying" section now renders it through
+# a lazily-CDN-loaded markdown pass (marked) instead of showing raw esc()'d syntax, with
+# a plain-text fallback if the CDN load fails and a hard XSS guard. "thinking" stays plain
+# escaped text — internal reasoning, not user-facing prose.
+
+
+def test_saying_carries_raw_markdown_and_a_plain_text_fallback():
+    """The saying div keeps the .thought class (so it inherits the drawer scroll/overflow
+    cap + the lone-gen fill), adds the .md-saying enhancement hook + a data-md attribute
+    holding the raw markdown, and renders esc()'d text inline as the fallback until the
+    renderer upgrades it — so answer_tail is esc()'d in BOTH the attribute and the body."""
+    assert 'class="thought md-saying" data-md="' in BOARD_PAGE
+    # esc()'d in the data-md attribute AND as the inline fallback body → two sites.
+    assert BOARD_PAGE.count("esc(g.answer_tail)") == 2
+    # the old raw-text saying render (plain .thought straight off the "saying" label) is gone.
+    assert '>saying</div><div class="thought">' not in BOARD_PAGE
+
+
+def test_thinking_section_stays_plain_escaped_text_not_markdown():
+    """thought_tail (internal reasoning) is NOT markdown-rendered — it keeps the plain
+    .thought div and plain esc()'d text, with no md-saying hook."""
+    assert 'thinking</div><div class="thought">\'+esc(g.thought_tail)' in BOARD_PAGE
+
+
+def test_markdown_renderer_loads_lazily_from_cdn_with_a_fallback():
+    """The renderer (marked) loads once, lazily, from cdnjs on first drawer open; a CDN
+    failure resolves to null so the section keeps its plain esc()'d fallback (no throw)."""
+    assert 'const MARKED_CDN = "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js";' in BOARD_PAGE
+    assert "function loadMarked()" in BOARD_PAGE
+    assert "s.async = true;" in BOARD_PAGE  # lazy — never blocks initial paint
+    assert "s.onerror = () => resolve(null);" in BOARD_PAGE  # CDN blocked/offline fallback
+    assert "if (!marked) return;" in BOARD_PAGE  # apply is a no-op when the lib is unavailable
+    # renderMonitor drives the upgrade after each (re-)render of the drawer body.
+    assert 'enhanceSaying($("drawer-body"));' in BOARD_PAGE
+
+
+def test_saying_markdown_is_xss_safe():
+    """No raw HTML passthrough: the source's angle brackets are escaped BEFORE parsing so
+    tags render as literal text, and the only URL-bearing attributes markdown can emit are
+    scrubbed of dangerous schemes."""
+    assert '.replace(/</g, "&lt;").replace(/>/g, "&gt;")' in BOARD_PAGE
+    assert "function sanitizeSaying(el)" in BOARD_PAGE
+    assert "javascript|data|vbscript" in BOARD_PAGE
+    # breaks:true for the coder's newline handling, per the task.
+    assert "{breaks: true, gfm: true}" in BOARD_PAGE
+
+
+def test_saying_markdown_css_scales_down_and_uses_pl_tokens():
+    """Rendered markdown is styled for the compact drawer: headings ~14px (not full-page
+    size), code on a subtle --pl token background (distinct from the raised drawer bg),
+    lists indented — and .md-on only flips whitespace once markdown is rendered, so the
+    plain-text fallback keeps its pre-wrap layout."""
+    assert ".gen .thought.md-on{white-space:normal}" in BOARD_PAGE
+    assert ".gen .md-on h1,.gen .md-on h2{font-size:14px}" in BOARD_PAGE  # r3: scaled-down heading
+    # r2: code block + inline code on a --pl token background (monospace).
+    assert (
+        ".gen .md-on code{font-family:var(--pl-font-mono);font-size:10.5px;background:var(--pl-color-bg);" in BOARD_PAGE
+    )
+    assert ".gen .md-on pre{background:var(--pl-color-bg);" in BOARD_PAGE
+    # lists indent properly.
+    assert ".gen .md-on ul,.gen .md-on ol{margin:4px 0;padding-left:18px}" in BOARD_PAGE
