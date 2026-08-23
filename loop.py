@@ -50,16 +50,16 @@ from .failures import classify
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import (
+    BoardError,
     LABEL_CHANGES_REQUESTED,
-    LABEL_MERGE_HOLD,
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
-    BoardError,
     _all_items_disposed,
     apply_requirement_dispositions,
     escalation_enabled,
     get_store,
+    merge_posture,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -1791,19 +1791,11 @@ class BoardLoop:
         mysterious. Order: the cheap board reads first, GitHub last."""
         fid = feature["id"]
         labels = set(feature.get("labels") or [])
-        why: list[str] = []
-        if feature.get("board_state") != "in_review":
-            why.append(f"state={feature.get('board_state')}")
-        if feature.get("blocked"):
-            why.append("blocked")
-        if LABEL_MERGE_HOLD in labels:
-            why.append("merge-hold")
-        if LABEL_REVIEW_PENDING in labels or LABEL_CHANGES_REQUESTED in labels:
-            why.append("review in progress / changes requested")
-        elif self.review_gate and LABEL_REVIEW_CLEAN not in labels:
-            # The gate is on but never recorded a clean verdict for THIS head (an
-            # inert gate, a pre-upgrade card, an operator unblock) — not reviewed.
-            why.append("no review-clean verdict")
+        # The board-side half is shared with the PM-facing `next_action` (#208,
+        # store.merge_posture) — one decoding of the review sub-state labels.
+        why: list[str] = list(
+            merge_posture(feature, auto_merge=self.auto_merge, review_gate=self.review_gate)["blockers"]
+        )
         if self._auto_merge_failures.get(fid, 0) >= self.auto_merge_max:
             why.append("merge attempts exhausted")
         if why:

@@ -287,7 +287,7 @@ def _feature_reply(f: dict) -> str:
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
     from .projects import resolve_projects
-    from .store import BoardError, get_store
+    from .store import BoardError, annotate_next_action, get_store
 
     # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
     # execution settings) + the default project a create falls back to. Threaded into
@@ -694,6 +694,18 @@ def _board_tools(cfg: dict):
         repo's cards" view. Omitted (the default) lists every project; each row carries
         its `project` field so an unfiltered listing stays legible on a mixed board.
 
+        Every `in_review` row carries `next_action` — the ONE sentence that says what
+        moves it (#208): `awaiting-merge (auto_merge off)` (reviewed, nothing
+        board-side in the way, and the loop will NOT merge — a human must),
+        `auto-merge pending` (the loop merges once GitHub reports CLEAN), `review in
+        progress`, `changes requested`, `awaiting review verdict (no review-clean)`,
+        `merge-hold (operator veto)`, `blocked` — plus `awaiting_merge: true` and a
+        `next_action_hint` ("auto_merge is off — merge #N or turn it on in Settings ▸
+        Project Board") for the first case. When ANY row is `awaiting_merge`, LEAD
+        your status report with it and offer the two verbs that actually move it —
+        merge that PR, or enable `auto_merge` — NOT a re-review: the review gate has
+        already cleared it. Derived from labels + config; costs no network.
+
         `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
         (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
         the failing check names in `ci_summary`. OPT-IN, never default — each
@@ -724,6 +736,7 @@ def _board_tools(cfg: dict):
                     feats = [f for f in feats if f.get("ci_status") == "failing"]
         except BoardError as exc:
             return f"Error: {exc}"
+        annotate_next_action(feats, cfg)  # #208: labels + config only, no network
         rows = []
         for f in feats:
             row = {
@@ -737,6 +750,11 @@ def _board_tools(cfg: dict):
                 "difficulty": f["difficulty"],
                 "project": f.get("project", ""),
             }
+            if f.get("next_action"):
+                row["next_action"] = f["next_action"]
+                row["awaiting_merge"] = bool(f.get("awaiting_merge"))
+                if f.get("next_action_hint"):
+                    row["next_action_hint"] = f["next_action_hint"]
             if with_ci:
                 row["ci_status"] = f.get("ci_status", "")
                 if f.get("ci_summary"):
