@@ -321,7 +321,7 @@ cached `br --version` at most):
 
 | key | ok when | hint (operator copy) |
 |---|---|---|
-| `br` | the beads CLI resolves (`BR_BIN` > the auto-fetched binary > `br` on PATH) | "fetching beads-rust vX for <platform> …" while the auto-fetch runs; the download error + the install hint if it failed; the install hint if `br_autofetch` is off / the platform has no build (Windows) |
+| `br` | the beads CLI resolves (`BR_BIN` > the auto-fetched binary > `br` on PATH) | "fetching beads-rust vX for <platform> …" while the auto-fetch runs; the download error + the install hint if it failed; the install hint if `br_autofetch` is off / `BR_BIN` is set but unresolvable / the platform has no build (Windows, musl) |
 | `gh` | the GitHub CLI is on PATH | install it + `gh auth login`; builds can't open PRs until then |
 | `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure**. With `coder` **blank**, the ladder is the only dispatch path: escalation must be on (>1 distinct delegate) and the instance map *and* every project map must cover **every** tier (`smart`/`reasoning`/`opus`) — an unmapped rung dispatches to `''` and blocks the card | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)" / names the unresolvable delegate / names the uncovered tier(s) |
 | `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | set `project_board.repo` to the checkout's absolute path |
@@ -360,29 +360,37 @@ preflight finds no `br` — and `project_board.br_autofetch` is on (the default;
 console Settings field) — the plugin:
 
 1. picks the **pinned** beads-rust release for this platform (`br_fetch.BR_VERSION`;
-   `darwin_arm64`, `darwin_amd64`, `linux_amd64`, `linux_arm64` — **not Windows**, which
-   gets a clear install hint),
+   `darwin_arm64`, `darwin_amd64`, `linux_amd64`, `linux_arm64` — **not Windows** and
+   **not musl/Alpine** (the assets are glibc builds), both of which get a clear install
+   hint),
 2. downloads `br-<version>-<platform>.tar.gz` from the beads_rust GitHub releases page
    **off the event loop**, once per process, bounded to 60 s,
 3. verifies its **sha256** against the table in `br_fetch.py` (the release's own
    per-asset checksums — the same pin-and-checksum discipline as `.github/workflows/ci.yml`,
    which runs the real-br shape tier on exactly this version; a test pins the two together),
-4. extracts only the `br` binary to `<instance plugin-data>/project_board/bin/br` (the
-   host's `instance_paths().store("plugin-data")` — writable on desktop, never the plugin's
-   own source checkout; override with `PROJECT_BOARD_DATA_DIR`), mode 0755, atomically,
+4. extracts only the `br` binary to `<instance plugin-data>/project_board/bin/<version>/br`
+   (the host's `instance_paths().store("plugin-data")` — writable on desktop, never the
+   plugin's own source checkout; override with `PROJECT_BOARD_DATA_DIR`), mode 0755,
+   atomically. The path is keyed by version, so a pin bump fetches the new release
+   instead of keeping a stale binary; delete `<data>/project_board/bin` to force a
+   re-fetch on the next restart,
 5. re-points the store at it **in place** — the paused loop resumes on its next check,
    `/status` reports `br.source: "fetched"`, the board page says "br vX fetched to …".
 
 Resolution order for the binary the store shells: **`BR_BIN` env > fetched binary > `br`
-on PATH** — an explicit `BR_BIN` is never overridden. A failed fetch (offline, a checksum
-mismatch, an egress block) is a `br` setup gap with the error in the hint and the manual
-install as the fallback — never a traceback; it is not retried until a restart. Set
-`br_autofetch: false` for the pre-0.43 posture (a missing `br` is just the install hint).
+on PATH** — an explicit `BR_BIN` is never overridden, and a `BR_BIN` that does not
+resolve is never "fixed" by a fetch (the hint names it). A failed fetch (offline, a
+checksum mismatch, an egress block) is a `br` setup gap with the error in the hint and
+the manual install as the fallback — never a traceback; the fetch runs once per process,
+so a restart retries it. Set `br_autofetch: false` for the pre-0.43 posture (a missing
+`br` is just the install hint); flipping it off while a download is in flight neither
+aborts nor forgets it, and flipping it back on never starts a second one.
 
-**Egress:** the download is one HTTPS GET to `github.com` (redirecting to
-`objects.githubusercontent.com`). A deployment with the host's egress allowlist
-(ADR 0008) must allow those hosts; the fetch consults the allowlist first and reports
-its message instead of a socket error.
+**Egress:** the download is one HTTPS GET to `github.com`, which 302s to
+`release-assets.githubusercontent.com`. A deployment with the host's egress allowlist
+(ADR 0008) must allow both hosts; the fetch consults the allowlist on the initial URL
+**and on every redirect hop**, and refuses a hop that leaves `*.githubusercontent.com`
+— reporting the allowlist's message instead of a socket error.
 
 ## Layout
 

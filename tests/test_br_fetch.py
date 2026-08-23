@@ -119,6 +119,31 @@ def test_platform_key_maps_machine_aliases_and_rejects_the_rest():
     assert br_fetch.fetch_spec("windows_amd64") is None
 
 
+def test_platform_key_refuses_musl_linux(monkeypatch):
+    """Alpine: the pinned linux assets are glibc builds — a musl host is `unsupported`
+    with its own hint, not a binary that fails to exec."""
+    assert br_fetch.platform_key("linux", "x86_64", musl=True) is None
+    assert br_fetch.platform_key("linux", "x86_64", musl=False) == "linux_amd64"
+    assert br_fetch.platform_key("darwin", "arm64", musl=True) == "darwin_arm64"  # musl is a linux question
+    monkeypatch.setattr(br_fetch, "is_musl", lambda: True)
+    assert br_fetch.platform_key("linux", "aarch64") is None
+    monkeypatch.setattr(br_fetch._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(br_fetch._platform, "machine", lambda: "x86_64")
+    st = br_fetch.ensure_br({}, which=_no_br, downloader=_downloader(), background=False)
+    assert st["state"] == "unsupported" and st["error"] == br_fetch.MUSL_HINT
+    assert br_fetch.hint_for(st) == br_fetch.MUSL_HINT
+
+
+def test_is_musl_detection(monkeypatch):
+    monkeypatch.setattr(br_fetch._platform, "libc_ver", lambda: ("glibc", "2.35"))
+    assert br_fetch.is_musl() is False
+    monkeypatch.setattr(br_fetch._platform, "libc_ver", lambda: ("", ""))
+    monkeypatch.setattr(br_fetch.Path, "glob", lambda self, pat: iter([Path("/lib/ld-musl-x86_64.so.1")]))
+    assert br_fetch.is_musl() is True
+    monkeypatch.setattr(br_fetch.Path, "glob", lambda self, pat: iter([]))
+    assert br_fetch.is_musl() is False
+
+
 # ── resolution order: BR_BIN > fetched > PATH ───────────────────────────────────
 
 
@@ -137,11 +162,52 @@ def test_resolve_br_bin_precedence(tmp_path):
 def test_data_dir_honors_the_env_override_and_never_the_plugin_source_dir(tmp_path, monkeypatch):
     monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path / "data"))
     assert br_fetch.data_dir() == tmp_path / "data"
-    assert br_fetch.fetched_br_path() == tmp_path / "data" / "bin" / "br"
+    assert br_fetch.fetched_br_path() == tmp_path / "data" / "bin" / br_fetch.BR_VERSION / "br"
     monkeypatch.delenv(br_fetch.ENV_DATA_DIR)
     d = br_fetch.data_dir()  # host-free fallback (no infra.paths in the suite)
     assert ROOT not in d.parents and d != ROOT
     assert d.parts[-2:] == ("plugin-data", "project_board")
+
+
+def test_fetched_path_is_keyed_by_version_so_a_pin_bump_refetches(tmp_path, monkeypatch):
+    """Review on #216: the fetched binary was `bin/br`, unversioned — bumping BR_VERSION
+    never re-fetched, and fetch_state()["version"] reported the NEW pin over the OLD
+    binary. Now `bin/<version>/br`: the old binary is simply not the resolved path any
+    more, and the version the state reports is the one the path was built for."""
+    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path))
+    old = br_fetch.fetched_br_path(version="0.2.16")
+    old.parent.mkdir(parents=True)
+    old.write_bytes(FAKE_BR)
+    old.chmod(0o755)
+    assert br_fetch.resolve_br_bin(env={}) == "br"  # the old pin's binary is not "fetched" for THIS pin
+    dl = _downloader()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(br_fetch.BR_SHA256, "linux_amd64", ARCHIVE_SHA)
+        st = br_fetch.ensure_br({}, which=_no_br, downloader=dl, platform="linux_amd64", background=False)
+    assert st["state"] == "done" and len(dl.calls) == 1  # re-fetched into the new version dir
+    assert Path(st["path"]) == tmp_path / "bin" / br_fetch.BR_VERSION / "br"
+    assert st["version"] == br_fetch.BR_VERSION
+    assert old.exists()  # the old one is left alone (delete <data>/bin to clean up)
+
+
+def test_fetch_state_version_is_never_the_bare_pin_over_an_unknown_binary(tmp_path, monkeypatch):
+    """A `br` on PATH: version "" (setup_check samples `br --version` for it). A
+    previously fetched binary found on restart: the version its path was built for."""
+    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path))
+    assert br_fetch.fetch_state()["version"] == ""  # idle: no spec, no path
+    st = br_fetch.ensure_br({}, which=lambda n: "/usr/local/bin/br", downloader=_downloader(), background=False)
+    assert st["state"] == "done" and st["path"] == "" and st["version"] == ""
+    br_fetch.reset_state()
+    fetched = br_fetch.fetched_br_path()
+    fetched.parent.mkdir(parents=True)
+    fetched.write_bytes(FAKE_BR)
+    fetched.chmod(0o755)
+    st = br_fetch.ensure_br(
+        {}, which=lambda n: n if os.path.isabs(n) else None, downloader=_downloader(), background=False
+    )
+    assert st["state"] == "done" and st["path"] == str(fetched) and st["version"] == br_fetch.BR_VERSION
+    assert br_fetch._version_from_path("/x/bin/0.1.23/br") == "0.1.23"
+    assert br_fetch._version_from_path("/x/bin/br") == "" and br_fetch._version_from_path("") == ""
 
 
 # ── fetch_br: the download → verify → extract → atomic install pipeline ─────────
@@ -155,6 +221,10 @@ def test_fetch_br_verifies_sha_extracts_only_br_and_installs_executable(tmp_path
     assert dest.stat().st_mode & stat.S_IXUSR
     assert sorted(p.name for p in dest.parent.iterdir()) == ["br"]  # README/LICENSE never land, no temp left
     assert dl.calls == [("https://github.com/x/y/br.tar.gz", 12.5)]
+    # a temp a previous process died in is swept before the new one is written
+    (dest.parent / ".br-deadbeef").write_bytes(b"x")
+    br_fetch.fetch_br(_spec(), dest, downloader=_downloader())
+    assert sorted(p.name for p in dest.parent.iterdir()) == ["br"]
 
 
 def test_fetch_br_sha_mismatch_refuses_to_install(tmp_path):
@@ -184,6 +254,74 @@ def test_fetch_br_honors_the_hosts_egress_allowlist(tmp_path, monkeypatch):
     with pytest.raises(PermissionError, match="egress blocked"):
         br_fetch.fetch_br(_spec(), tmp_path / "br", downloader=dl)
     assert dl.calls == []  # never even tried
+
+
+def test_redirect_hops_are_pinned_and_egress_checked(monkeypatch):
+    """Review on #216: check_url saw the initial URL only — urllib followed the 302 to
+    release-assets.githubusercontent.com unchecked. Every hop now passes the host's
+    allowlist AND must stay on https *.githubusercontent.com."""
+    import sys
+    import types
+
+    ok = "https://release-assets.githubusercontent.com/github-production-release-asset/x/br.tar.gz"
+    br_fetch.check_redirect_target(ok)  # the real target
+    br_fetch.check_redirect_target("https://objects.githubusercontent.com/x")  # the older one, still allowed
+    with pytest.raises(PermissionError, match="refused"):
+        br_fetch.check_redirect_target("https://evil.example.com/br.tar.gz")
+    with pytest.raises(PermissionError, match="refused"):
+        br_fetch.check_redirect_target("http://release-assets.githubusercontent.com/x")  # no plaintext hop
+    with pytest.raises(PermissionError, match="refused"):
+        br_fetch.check_redirect_target("https://githubusercontent.com.evil.example/x")
+    # the host's allowlist verdict applies to the hop too
+    sec = types.ModuleType("security")
+    sec.__path__ = []
+    eg = types.ModuleType("security.egress")
+    seen = []
+    eg.check_url = lambda url, **kw: (
+        seen.append(url) or "Error: egress to release-assets.githubusercontent.com is blocked"
+    )
+    monkeypatch.setitem(sys.modules, "security", sec)
+    monkeypatch.setitem(sys.modules, "security.egress", eg)
+    with pytest.raises(PermissionError, match="egress blocked on redirect"):
+        br_fetch.check_redirect_target(ok)
+    assert seen == [ok]
+
+
+def test_urllib_download_installs_the_pinned_redirect_handler(monkeypatch):
+    """The opener urllib uses for the GET carries _PinnedRedirects, whose
+    redirect_request runs check_redirect_target on each Location."""
+    import urllib.request
+
+    installed = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=-1):
+            return b""
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            installed.append(("open", req.full_url, timeout))
+            return _Resp()
+
+    def _build(*handlers):
+        installed.extend(type(h) for h in handlers)
+        return _Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", _build)
+    real = br_fetch._urllib_download.real  # conftest swaps the attribute and keeps the real one on the stub
+    assert real("https://github.com/x/br.tar.gz", timeout=12.0) == b""
+    assert br_fetch._PinnedRedirects in installed
+    assert ("open", "https://github.com/x/br.tar.gz", 12.0) in installed
+    # the handler refuses a bad hop before urllib builds the follow-up request
+    h = br_fetch._PinnedRedirects()
+    with pytest.raises(PermissionError):
+        h.redirect_request(urllib.request.Request("https://github.com/x"), None, 302, "Found", {}, "https://evil/x")
 
 
 # ── ensure_br: the once-per-process state machine ───────────────────────────────
@@ -232,6 +370,12 @@ def test_ensure_br_failure_is_a_gap_not_a_traceback_and_stays_failed(tmp_path, c
     assert st["state"] == "failed" and len(dl.calls) == 1
     hint = br_fetch.hint_for(st)
     assert "br auto-fetch failed: TimeoutError" in hint and "install beads-rust" in hint and "restart to retry" in hint
+    # "restart to retry" is TRUE: a restart starts from idle and fetches again (knob toggles never do)
+    br_fetch.reset_state()
+    dl2 = _downloader(raise_exc=TimeoutError("again"))
+    st = br_fetch.ensure_br({}, which=_no_br, downloader=dl2, platform="linux_amd64", dest=dest, background=False)
+    assert st["state"] == "failed" and len(dl2.calls) == 1
+    assert "~60s cap" in br_fetch.hint_for({"state": "fetching", "version": "9", "platform": "p", "started": 0})
 
 
 def test_ensure_br_disabled_is_the_old_install_hint(tmp_path):
@@ -250,6 +394,53 @@ def test_ensure_br_disabled_is_the_old_install_hint(tmp_path):
     assert dl.calls == []
     hint = br_fetch.hint_for(st)
     assert "br_autofetch is off" in hint and "cargo install beads_rust" in hint
+
+
+def test_knob_off_mid_download_never_clobbers_fetching_and_knob_on_never_doubles(tmp_path):
+    """Review on #216: ensure_br with the knob off wrote `disabled` over a `fetching`
+    state, and flipping back on started a SECOND concurrent download. The knob check
+    now runs under the holder lock and only ever moves idle → disabled."""
+    import threading
+
+    gate = threading.Event()
+    calls = []
+
+    def dl(url, timeout=0.0):
+        calls.append(url)
+        gate.wait(5)
+        return ARCHIVE
+
+    dest = tmp_path / "bin" / "br"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(br_fetch.BR_SHA256, "linux_amd64", ARCHIVE_SHA)
+        st = br_fetch.ensure_br({}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest)
+        assert st["state"] == "fetching"
+        # knob off while the download is in flight: state stays `fetching`
+        st = br_fetch.ensure_br({"br_autofetch": False}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest)
+        assert st["state"] == "fetching"
+        # knob back on: no second download
+        st = br_fetch.ensure_br({"br_autofetch": True}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest)
+        assert st["state"] == "fetching"
+        gate.set()
+        for t in threading.enumerate():
+            if t.name == "project-board-br-fetch":
+                t.join(5)
+        assert br_fetch.fetch_state()["state"] == "done" and len(calls) == 1
+        # …and a knob-off AFTER done/failed never rewrites those either
+        st = br_fetch.ensure_br({"br_autofetch": False}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest)
+        assert st["state"] == "done"
+    dest2 = tmp_path / "bin2" / "br"  # a dest that does NOT exist yet (dest landed above)
+    br_fetch._set(state="failed", error="x")
+    st = br_fetch.ensure_br({"br_autofetch": False}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest2)
+    assert st["state"] == "failed"
+    # idle → disabled → (knob on) → fetching is still the normal path
+    br_fetch.reset_state()
+    st = br_fetch.ensure_br({"br_autofetch": False}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest2)
+    assert st["state"] == "disabled"
+    st = br_fetch.ensure_br(
+        {"br_autofetch": True}, which=_no_br, downloader=dl, platform="linux_amd64", dest=dest2, background=False
+    )
+    assert st["state"] in ("done", "failed") and len(calls) == 2
 
 
 def test_ensure_br_present_on_path_never_fetches(tmp_path):
@@ -274,12 +465,19 @@ def test_ensure_br_explicit_br_bin_wins_even_over_a_fetched_binary(tmp_path, mon
     monkeypatch.setenv(br_fetch.ENV_BR_BIN, "/opt/custom/br")
     assert br_fetch.resolve_br_bin(fetched=fetched) == "/opt/custom/br"
     dl = _downloader()
-    # BR_BIN points at nothing resolvable → still NO fetch (the operator's explicit
-    # choice is theirs to fix), the gap hint names the override
-    st = br_fetch.ensure_br(
-        {}, which=lambda n: None, downloader=dl, platform="linux_amd64", dest=fetched, background=False
-    )
-    assert dl.calls == [] or st["state"] != "done"
+    # BR_BIN points at nothing resolvable → NO fetch at all (the operator's explicit
+    # choice is theirs to fix; a download resolve_br_bin would refuse to use is 10 MB
+    # of nothing) — the gap hint names the override
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(br_fetch.BR_SHA256, "linux_amd64", ARCHIVE_SHA)
+        st = br_fetch.ensure_br(
+            {}, which=lambda n: None, downloader=dl, platform="linux_amd64", dest=fetched, background=False
+        )
+    assert dl.calls == []
+    assert st["state"] == "disabled" and st["error"] == "BR_BIN=/opt/custom/br is set — not fetching"
+    hint = br_fetch.hint_for(st, br_bin="/opt/custom/br")
+    assert hint.startswith("beads CLI '/opt/custom/br' not found on PATH — BR_BIN=/opt/custom/br is set — not fetching")
+    assert "cargo install beads_rust" in hint
     # and _activate never overrides an explicit BR_BIN
     br_fetch._activate(fetched)
     assert store_mod.BR != str(fetched)
@@ -350,9 +548,15 @@ def test_setup_status_br_hint_follows_the_fetch_state(tmp_path):
     br_fetch._set(state="disabled", error="")
     s = setup_check.setup_status({"coder": "p", "repo": str(tmp_path)}, **common)
     assert "br_autofetch is off" in s["br"]["hint"]
-    br_fetch.reset_state()  # idle → the plain install hint
+    br_fetch.reset_state()  # idle → the plain install hint — hint_for's idle copy IS BR_HINT
     s = setup_check.setup_status({"coder": "p", "repo": str(tmp_path)}, **common)
-    assert s["br"]["hint"] == setup_check.BR_HINT
+    assert s["br"]["hint"] == setup_check.BR_HINT == br_fetch.hint_for({"state": "idle"})
+    assert "beads CLI 'br' not found on PATH — install beads-rust (cargo install beads_rust)" in setup_check.BR_HINT
+    assert setup_check.BR_HINT.endswith("the board is paused until then")
+    # a custom BR_BIN name rides through the same renderer
+    store_mod.BR = "/opt/custom/br"
+    s = setup_check.setup_status({"coder": "p", "repo": str(tmp_path)}, **common)
+    assert s["br"]["hint"].startswith("beads CLI '/opt/custom/br' not found on PATH")
 
 
 def test_setup_status_reports_a_fetched_binary_as_its_source(tmp_path):

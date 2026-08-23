@@ -23,14 +23,23 @@ above WARNING.
 Egress: the download is a plain HTTPS GET of a GitHub release asset. The host's
 in-process egress allowlist (``security.egress``, ADR 0008) is consulted first when
 importable, so a deny-by-default deployment gets the allowlist's own message instead
-of a socket error — ``github.com`` (and the ``objects.githubusercontent.com``
-redirect target) must be reachable. A host that exposes ``host.fetch_bytes(url,
+of a socket error — ``github.com`` AND the redirect target
+``release-assets.githubusercontent.com`` (verified live; the 302 goes there, not to
+``objects.githubusercontent.com``) must be reachable. Every redirect hop is checked
+too (``_PinnedRedirects``): the allowlist verdict on each ``Location``, and the hop
+must stay on ``*.githubusercontent.com``. A host that exposes ``host.fetch_bytes(url,
 timeout=)`` is used in preference to ``urllib``; none does today, so the guard is
 a ``getattr``.
 
+The install path is keyed by version — ``<data>/bin/<BR_VERSION>/br`` — so bumping
+the pin fetches the new release instead of silently keeping the old binary, and the
+version the state reports is the one the path was built for, never the pin over a
+stale file. Delete ``<data>/bin`` to force a re-fetch on the next restart.
+
 Windows is NOT supported by the auto-fetch (no pin recorded; the store's ``br``
-invocation would need ``.exe`` handling too) — the gap hint says so and points at
-the manual install.
+invocation would need ``.exe`` handling too), and neither is musl (Alpine: the
+pinned assets are glibc builds) — the gap hint says so and points at the manual
+install.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ import tempfile
 import threading
 import time
 import types
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +89,9 @@ FETCH_TIMEOUT_S = 60.0
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024  # a br release tarball is ~5 MB; refuse anything absurd
 ENV_BR_BIN = "BR_BIN"
 ENV_DATA_DIR = "PROJECT_BOARD_DATA_DIR"
+# Where a redirect hop may land: GitHub serves release assets from
+# release-assets.githubusercontent.com (verified live; older docs say objects.…).
+REDIRECT_HOST_SUFFIX = ".githubusercontent.com"
 
 # Operator-facing copy (setup_check composes these into the `br` hint).
 INSTALL_HINT = "install beads-rust (cargo install beads_rust), not the homebrew `bd`, and restart (or set BR_BIN)"
@@ -86,6 +99,10 @@ WINDOWS_HINT = (
     "br auto-fetch does not support Windows — install beads-rust by hand "
     "(cargo install beads_rust, or the windows_amd64 zip from the beads_rust releases page) "
     "and set BR_BIN to the br.exe path"
+)
+MUSL_HINT = (
+    "br auto-fetch has no musl build (Alpine) — the pinned beads-rust assets are glibc binaries; "
+    "install beads-rust by hand (cargo install beads_rust) and restart (or set BR_BIN)"
 )
 
 
@@ -101,12 +118,29 @@ class FetchSpec:
 _MACHINES = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64", "amd64": "amd64"}
 
 
-def platform_key(system: str | None = None, machine: str | None = None) -> str | None:
+def is_musl() -> bool:
+    """A musl libc host (Alpine): the pinned linux assets are glibc builds and would
+    fail to exec. ``platform.libc_ver()`` names glibc when it can read the interpreter;
+    musl shows as an empty name, so also look for musl's loader."""
+    try:
+        if _platform.libc_ver()[0] == "glibc":
+            return False
+    except Exception:  # noqa: BLE001 — an unreadable interpreter is not a verdict
+        pass
+    try:
+        return bool(list(Path("/lib").glob("ld-musl-*.so.1")))
+    except OSError:
+        return False
+
+
+def platform_key(system: str | None = None, machine: str | None = None, *, musl: bool | None = None) -> str | None:
     """``darwin_arm64`` / ``darwin_amd64`` / ``linux_amd64`` / ``linux_arm64`` for this
-    host, or None when there is no pin for it (Windows, musl-only oddities, …)."""
+    host, or None when there is no pin for it (Windows, musl/Alpine, riscv, …)."""
     system = (system or _platform.system()).strip().lower()
     machine = _MACHINES.get((machine or _platform.machine()).strip().lower())
     if system not in ("darwin", "linux") or not machine:
+        return None
+    if system == "linux" and (is_musl() if musl is None else musl):
         return None
     key = f"{system}_{machine}"
     return key if key in BR_SHA256 else None
@@ -142,8 +176,11 @@ def data_dir() -> Path:
         return Path.home() / ".protoagent" / "plugin-data" / "project_board"
 
 
-def fetched_br_path(base: Path | None = None) -> Path:
-    return (base or data_dir()) / "bin" / "br"
+def fetched_br_path(base: Path | None = None, *, version: str = BR_VERSION) -> Path:
+    """``<data>/bin/<version>/br`` — keyed by version, so a pin bump re-fetches (the old
+    binary is simply no longer the resolved path) and the path itself says which
+    release it holds."""
+    return (base or data_dir()) / "bin" / version / "br"
 
 
 def _is_executable_file(p: Path) -> bool:
@@ -187,12 +224,23 @@ def _slot():
 
 def fetch_state() -> dict:
     """A copy of the fetch state: ``{state, path, error, started, finished, version,
-    platform}`` — ``state`` ∈ idle / fetching / done / failed / disabled / unsupported."""
+    platform}`` — ``state`` ∈ idle / fetching / done / failed / disabled / unsupported.
+    ``version`` is the release the fetch spec names, or the one a version-keyed fetched
+    path was built for — never the bare pin over a binary of unknown provenance (a
+    `br` found on PATH reports ``""``; setup_check samples ``br --version`` for it)."""
     st = dict(_slot().state)
     spec = st.pop("spec", None)
-    st["version"] = spec.version if spec else BR_VERSION
+    st["version"] = spec.version if spec else _version_from_path(st.get("path") or "")
     st["platform"] = spec.platform if spec else (platform_key() or "")
     return st
+
+
+def _version_from_path(path: str) -> str:
+    """``"0.3.2"`` for ``…/bin/0.3.2/br`` (a path this module laid out), else ``""``."""
+    p = Path(path) if path else None
+    if p is None or p.name != "br" or p.parent.parent.name != "bin":
+        return ""
+    return p.parent.name
 
 
 def reset_state() -> None:
@@ -222,12 +270,40 @@ def _egress_check(url: str) -> str | None:
         return None
 
 
+def check_redirect_target(newurl: str) -> None:
+    """A redirect hop is allowed only to HTTPS on ``*.githubusercontent.com`` AND past
+    the host's egress allowlist — the initial URL is checked by ``fetch_br``, but urllib
+    follows the 302 on its own, so each ``Location`` is checked here. Raises
+    ``PermissionError`` otherwise."""
+    parts = urllib.parse.urlsplit(newurl)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host.endswith(REDIRECT_HOST_SUFFIX):
+        raise PermissionError(
+            f"redirect to {parts.scheme}://{host or '?'} refused — only https *{REDIRECT_HOST_SUFFIX}"
+        )
+    blocked = _egress_check(newurl)
+    if blocked:
+        raise PermissionError(f"egress blocked on redirect: {blocked}")
+
+
+class _PinnedRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib's redirect handler with every hop run through ``check_redirect_target``."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_redirect_target(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _urllib_download(url: str, timeout: float) -> bytes:
-    """Plain HTTPS GET → bytes, bounded by ``timeout`` overall and ``MAX_ARCHIVE_BYTES``."""
+    """Plain HTTPS GET → bytes, bounded by ``timeout`` overall and ``MAX_ARCHIVE_BYTES``.
+    The deadline is checked between chunks and the socket timeout is 30 s per
+    operation, so the worst case is ``timeout`` + one blocked read — the hint says
+    "~60s" for that reason."""
     deadline = time.monotonic() + timeout
     req = urllib.request.Request(url, headers={"User-Agent": "protoagent-project-board/br-fetch"})
     buf = io.BytesIO()
-    with urllib.request.urlopen(req, timeout=min(30.0, timeout)) as resp:  # noqa: S310 — pinned https URL
+    opener = urllib.request.build_opener(_PinnedRedirects())
+    with opener.open(req, timeout=max(1.0, min(30.0, timeout))) as resp:  # noqa: S310 — pinned https URL
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -279,6 +355,11 @@ def fetch_br(spec: FetchSpec, dest: Path, *, downloader=None, timeout: float = F
         raise ValueError(f"sha256 mismatch for {spec.url}: expected {spec.sha256[:12]}…, got {digest[:12]}…")
     binary = _extract_br(bytes(archive))
     dest.parent.mkdir(parents=True, exist_ok=True)
+    for stale in dest.parent.glob(".br-*"):  # a temp left by a fetch the process died in
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     fd, tmp = tempfile.mkstemp(prefix=".br-", dir=str(dest.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -343,27 +424,46 @@ def ensure_br(
     cfg = cfg or {}
     try:
         current = resolve_br_bin(fetched=dest)
-        if which(current):
-            st = fetch_state()
-            if st["state"] == "idle":
-                _set(state="done", path=str(which(current)) if current != "br" else "", error="")
-            return fetch_state()
-        if not _knob_on(cfg.get("br_autofetch", True)):
-            _set(state="disabled", error="")
-            return fetch_state()
-        spec = fetch_spec(platform)
-        if spec is None:
-            _set(
-                state="unsupported",
-                error=WINDOWS_HINT if (platform or _platform.system()).lower().startswith("win") else "",
-            )
-            return fetch_state()
+        target = dest or fetched_br_path()
         holder = _slot()
+        if which(current):
+            with holder.lock:
+                if holder.state["state"] == "idle":
+                    # `current` is the version-keyed fetched path (a previous run's fetch)
+                    # or a PATH `br` (path "", version "" — setup_check samples it).
+                    fetched = current == str(target)
+                    holder.state.update(
+                        state="done",
+                        path=str(which(current)) if current != "br" else "",
+                        error="",
+                        spec=fetch_spec(platform) if fetched else None,
+                    )
+            return fetch_state()
+        explicit = str(os.environ.get(ENV_BR_BIN) or "").strip()
         with holder.lock:
-            if holder.state["state"] in ("fetching", "done", "failed"):
+            # The knob / BR_BIN / platform verdicts only ever move idle → {disabled,
+            # unsupported}: a fetch in flight, done, or failed is never overwritten (a
+            # knob flipped off mid-download must not clobber `fetching`, and flipping it
+            # back on must not start a SECOND concurrent download).
+            spent = holder.state["state"] in ("fetching", "done", "failed")
+            if explicit:
+                # BR_BIN is the operator's explicit choice — and it does not resolve.
+                # Never download 10 MB that resolve_br_bin would refuse to use anyway.
+                if not spent:
+                    holder.state.update(state="disabled", error=f"{ENV_BR_BIN}={explicit} is set — not fetching")
+                return fetch_state()
+            if not _knob_on(cfg.get("br_autofetch", True)):
+                if not spent:
+                    holder.state.update(state="disabled", error="")
+                return fetch_state()
+            spec = fetch_spec(platform)
+            if spec is None:
+                if not spent:
+                    holder.state.update(state="unsupported", error=_unsupported_hint(platform))
+                return fetch_state()
+            if spent:
                 return fetch_state()  # once per process — a failure stays reported until a restart
             holder.state.update(state="fetching", spec=spec, started=time.time(), finished=0.0, error="", path="")
-        target = dest or fetched_br_path()
         dl = downloader or _host_downloader(host)
         log.info(
             "[project_board] br not on PATH — fetching beads-rust v%s for %s from %s …",
@@ -389,6 +489,17 @@ def _knob_on(raw) -> bool:
     return bool(raw)
 
 
+def _unsupported_hint(platform: str | None) -> str:
+    """Why there is no pin for this host — Windows / musl get their own copy; anything
+    else (riscv, …) leaves ``error`` empty and ``hint_for`` says "no build"."""
+    system = (platform or _platform.system()).lower()
+    if system.startswith("win"):
+        return WINDOWS_HINT
+    if system.startswith("linux") and is_musl():
+        return MUSL_HINT
+    return ""
+
+
 def hint_for(state: dict, *, br_bin: str = "br") -> str:
     """The operator-facing ``br`` gap hint for a fetch ``state`` (when ``br`` is NOT
     resolvable right now)."""
@@ -398,12 +509,15 @@ def hint_for(state: dict, *, br_bin: str = "br") -> str:
         age = max(0, int(time.time() - float(state.get("started") or time.time())))
         return (
             f"{base} — fetching beads-rust v{state.get('version')} for {state.get('platform')} "
-            f"({age}s so far, {int(FETCH_TIMEOUT_S)}s cap); the board resumes on its own once it lands"
+            f"({age}s so far, ~{int(FETCH_TIMEOUT_S)}s cap); the board resumes on its own once it lands"
         )
     if s == "failed":
+        # Honest: the fetch runs once per process; a restart starts from idle and retries.
         return f"{base} — br auto-fetch failed: {state.get('error')}; {INSTALL_HINT}, or restart to retry the fetch"
     if s == "disabled":
-        return f"{base} — br_autofetch is off; {INSTALL_HINT}"
+        why = state.get("error") or "br_autofetch is off"
+        return f"{base} — {why}; {INSTALL_HINT}"
     if s == "unsupported":
         return state.get("error") or f"{base} — br auto-fetch has no build for this platform; {INSTALL_HINT}"
+    # idle (setup_check routes the plain "no br" case here too — one copy of the hint)
     return f"{base} — {INSTALL_HINT}; the board is paused until then"

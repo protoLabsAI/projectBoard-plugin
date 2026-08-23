@@ -54,7 +54,7 @@ if "graph" not in sys.modules:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_br_version(monkeypatch):
+def _no_real_br_version(monkeypatch, tmp_path_factory):
     """The setup preflight samples ``br --version`` (setup_check._br_version) from
     register()/the /status route/the loop gate — every tier this suite exercises
     with a fake store. Pin its runner so the UNIT tier never shells a real ``br``
@@ -78,22 +78,16 @@ def _no_real_br_version(monkeypatch):
     def _no_network(url, timeout=0.0):
         raise AssertionError(f"unit tier tried to download {url} — inject a fake downloader")
 
+    _no_network.real = br_fetch._urllib_download  # for the one test that drives the real GET against a fake opener
     monkeypatch.setattr(br_fetch, "_urllib_download", _no_network)
-    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path_factory_dir(monkeypatch)))
+    # pytest's own temp root (retained/pruned like tmp_path) — no mkdtemp leak per test.
+    monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path_factory.mktemp("pb-data")))
     monkeypatch.delenv(br_fetch.ENV_BR_BIN, raising=False)
     br_fetch.reset_state()
     yield
     setup_check._BR_VERSION_CACHE.clear()
     setup_check.publish_loop_snapshot(None)
     br_fetch.reset_state()
-
-
-def tmp_path_factory_dir(monkeypatch):
-    """A fresh per-test scratch dir for the br auto-fetch data dir (the autouse
-    fixture can't take `tmp_path` without ordering surprises, so make one)."""
-    import tempfile
-
-    return tempfile.mkdtemp(prefix="pb-data-")
 
 
 @pytest.fixture
