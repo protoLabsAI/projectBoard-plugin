@@ -44,6 +44,30 @@ def test_mine_feature_extracts_attempts_tiers_and_blocked():
     assert set(m["classes"]) == {"golden-map / config field", "lint (ruff)"}
 
 
+def test_mine_feature_same_tier_retry_marker_is_not_an_escalation():
+    """An empty-reply same-tier retry (#2991) writes an attempt comment carrying the
+    ``same_tier_retry`` marker on the SAME tier — the retro mines it as the
+    empty-result class with ``escalated`` False, distinguishable from a real climb
+    (which changes the tier and carries no marker)."""
+    feat = {
+        "id": "bd-r",
+        "title": "retry then recover",
+        "status": "closed",
+        "labels": ["diff:small"],
+        "comments": [
+            _c(
+                "attempt 1 (tier=fast): empty_result: empty coder reply — no diff, no tool calls "
+                "(stop_reason=refusal) — same_tier_retry (pre-escalation)"
+            ),
+        ],
+    }
+    m = mine_feature(feat)
+    assert m["n_attempts"] == 1
+    assert m["escalated"] is False  # the retry stayed on-tier — not a climb
+    assert any("same_tier_retry" in o for o in m["outcomes"])  # the marker survives mining
+    assert m["classes"] == ["empty result (no diff, no tool calls)"]
+
+
 def test_mine_feature_clean_build_has_no_attempts_or_classes():
     feat = {"id": "bd-ok", "title": "clean", "status": "closed", "labels": ["diff:small"], "comments": []}
     m = mine_feature(feat)
