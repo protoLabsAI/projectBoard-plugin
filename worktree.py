@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Iterable
 
 from . import config
@@ -434,6 +435,35 @@ async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tu
     rc, out, err = await _gh("pr", "merge", pr_url, flag, cwd=cwd, timeout=120)
     detail = (err or out or "").strip()
     return rc == 0, detail
+
+
+async def close_pr(pr_url: str, *, comment: str, cwd: str = ".") -> tuple[bool, str]:
+    """Close an open PR with a comment (``gh pr close --comment``) — the operator-
+    cancel edge (#211): a cancelled card must not leave an open PR nobody owns.
+    Returns ``(ok, detail)``; never raises into the loop (a PR already closed/merged,
+    a gh failure, a timeout — all land as ``(False, detail)`` for the caller to log)."""
+    try:
+        rc, out, err = await _gh("pr", "close", pr_url, "--comment", comment, cwd=cwd, timeout=60)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        return False, str(exc)
+    return rc == 0, (err or out or "").strip()
+
+
+def close_pr_sync(pr_url: str, *, comment: str, cwd: str = ".", timeout: float = 60) -> tuple[bool, str]:
+    """``close_pr`` for a SYNC caller (the ``board_cancel_feature`` tool runs in a
+    worker thread with no event loop of its own). Same contract: ``(ok, detail)``,
+    never raises."""
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "close", pr_url, "--comment", comment],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 — missing gh, timeout, bad cwd
+        return False, str(exc)
+    return proc.returncode == 0, (proc.stderr or proc.stdout or "").strip()
 
 
 async def delete_remote_branch(repo: str, branch: str) -> bool:

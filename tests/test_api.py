@@ -1234,3 +1234,57 @@ def test_tool_get_feature_includes_project(monkeypatch):
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
     out = json.loads({t.name: t for t in pb._board_tools({})}["board_get_feature"].invoke({"feature_id": "bd-1"}))
     assert out["project"] == "board-plugin"
+
+
+# ── #211: cancel closes the open PR + stops the in-flight drive ────────────────────
+
+
+def test_cancel_route_closes_the_open_pr_and_reports_it(monkeypatch):
+    """A cancel that lands while the card has an open PR (CI/review bounce) closes it
+    with a comment pointing at the card — read BEFORE the cancel (the store edge
+    clears nothing, but the order matters for a future store that does)."""
+    from project_board import worktree
+
+    _stub_reap(monkeypatch)
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append((url, comment, cwd)) or (True, ""),
+    )
+    store = FakeStore()
+    monkeypatch.setattr(
+        store, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "pr_url": "https://x/pr/9"}
+    )
+    c = _client(monkeypatch, store, cfg={"repo": "/repo"})
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "scope cut"})
+    assert r.status_code == 200
+    assert r.json()["cancel"] == {"pr_closed": True, "drive_cancelled": False}
+    assert closed == [("https://x/pr/9", "cancelled by operator — see card bd-7", "/repo")]
+    assert ("cancel_feature", ("bd-7", "scope cut"), {}) in store.calls
+
+
+def test_cancel_route_never_fails_on_a_pr_close_failure(monkeypatch):
+    from project_board import worktree
+
+    _stub_reap(monkeypatch)
+    monkeypatch.setattr(worktree, "close_pr_sync", lambda *a, **k: (False, "gh: HTTP 404"))
+    store = FakeStore()
+    monkeypatch.setattr(
+        store, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "pr_url": "https://x/pr/9"}
+    )
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel")
+    assert r.status_code == 200
+    assert r.json()["cancel"]["pr_closed"] is False
+    assert ("cancel_feature", ("bd-7", ""), {}) in store.calls  # the cancel itself landed
+
+
+def test_cancel_route_without_a_pr_does_not_touch_gh(monkeypatch):
+    from project_board import worktree
+
+    _stub_reap(monkeypatch)
+    monkeypatch.setattr(worktree, "close_pr_sync", lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called")))
+    store = FakeStore()  # get_feature → no pr_url
+    c = _client(monkeypatch, store)
+    assert c.post("/api/plugins/project_board/features/bd-7/cancel").json()["cancel"]["pr_closed"] is False

@@ -700,3 +700,60 @@ async def test_reap_tolerates_a_candidate_that_fails_to_remove(monkeypatch, tmp_
     result = await worktree.reap_feature_worktree(str(tmp_path), ".worktrees", "bd-9")
     assert result is False  # canonical never existed AND its remove reported failure
     assert cand.exists()  # the locked candidate was not force-deleted behind git's back
+
+
+# ── #211: close_pr / close_pr_sync — the operator-cancel edge ───────────────────────
+
+
+async def test_close_pr_runs_gh_pr_close_with_the_comment(monkeypatch):
+    calls = []
+
+    async def _gh(*args, cwd, timeout=60):
+        calls.append((args, cwd))
+        return (0, "✓ Closed pull request #1", "")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    ok, detail = await worktree.close_pr("https://x/pr/1", comment="cancelled by operator — see card bd-1", cwd="/repo")
+    assert ok is True
+    assert calls == [(("pr", "close", "https://x/pr/1", "--comment", "cancelled by operator — see card bd-1"), "/repo")]
+
+
+async def test_close_pr_never_raises(monkeypatch):
+    async def _gh(*args, cwd, timeout=60):
+        raise worktree.WorktreeError("gh pr close timed out after 60s")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    ok, detail = await worktree.close_pr("https://x/pr/1", comment="c")
+    assert ok is False and "timed out" in detail
+
+    async def _gh_fail(*args, cwd, timeout=60):
+        return (1, "", "GraphQL: Pull request is already closed")
+
+    monkeypatch.setattr(worktree, "_gh", _gh_fail)
+    assert await worktree.close_pr("https://x/pr/1", comment="c") == (False, "GraphQL: Pull request is already closed")
+
+
+def test_close_pr_sync_shells_gh_and_never_raises(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def _run(argv, **kw):
+        calls.append((argv, kw.get("cwd")))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(worktree.subprocess, "run", _run)
+    assert worktree.close_pr_sync("https://x/pr/2", comment="cancelled by operator — see card bd-2", cwd="/repo") == (
+        True,
+        "ok",
+    )
+    assert calls == [
+        (["gh", "pr", "close", "https://x/pr/2", "--comment", "cancelled by operator — see card bd-2"], "/repo")
+    ]
+
+    def _boom(argv, **kw):
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(worktree.subprocess, "run", _boom)
+    ok, detail = worktree.close_pr_sync("https://x/pr/2", comment="c")
+    assert ok is False and "gh" in detail

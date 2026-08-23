@@ -588,13 +588,23 @@ def _board_tools(cfg: dict):
         its history) visible in a distinct `cancelled` state — NOT `done`, so the merge/CI
         reconcilers and loop-retro never mistake it for shipped work. The bead survives (a
         cancel, not a hard delete). `reason` is stripped of any literal wrapping double
-        quotes before storage (same hygiene as board_create_feature)."""
+        quotes before storage (same hygiene as board_create_feature). A cancel also
+        closes the card's open PR (with a comment pointing at the card) and stops its
+        in-flight coder, if any (#211) — best-effort; the reply carries `pr_closed` /
+        `drive_cancelled` so you can say what happened."""
         try:
             reason = _strip_wrapping_quotes(reason)
-            f = get_store(**store_kw).cancel_feature(feature_id, reason)
-            return json.dumps({"id": f["id"], "state": f["board_state"]})
+            store = get_store(**store_kw)
+            before = store.get_feature(feature_id)
+            pr_url = str((before or {}).get("pr_url") or "").strip()
+            f = store.cancel_feature(feature_id, reason)
         except BoardError as exc:
             return f"Error: {exc}"
+        # Lazy import (the loop imports from here — a top-level import would be circular).
+        from .loop import cancel_side_effects
+
+        side = cancel_side_effects(feature_id, pr_url, cwd=store_kw["repo"])
+        return json.dumps({"id": f["id"], "state": f["board_state"], **side})
 
     @tool
     def board_requeue_feature(feature_id: str, findings: str = "") -> str:

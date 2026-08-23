@@ -442,10 +442,24 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `done`), so a bad decomposition/duplicate leaves the board cleanly instead of
         being deleted out-of-band (which desyncs the board ↔ JSONL). Reaps the
         feature's worktree once cancel succeeds — a terminal edge leaves nothing left to
-        build — the same reap the merge webhook does at `done` (#109)."""
+        build — the same reap the merge webhook does at `done` (#109).
+
+        #211: a cancel must not leave an open PR or a running coder. The card's open
+        `pr_url` (a cancel during the CI/review bounce) is closed with a comment pointing
+        at the card, and an in-flight drive is stopped (its own cancel path closes a PR
+        it opened meanwhile + reaps). Both best-effort: a gh failure logs, never 400s."""
+        pr_url = ""
+        try:
+            before = store().get_feature(fid)
+            pr_url = str((before or {}).get("pr_url") or "").strip()
+        except BoardError:
+            pass  # the cancel below raises the named error for an unknown card
         f = _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
+        from .loop import cancel_side_effects
+
+        side = await asyncio.to_thread(cancel_side_effects, fid, pr_url, cwd=store_kw["repo"])
         await _reap_worktree(fid)
-        return f
+        return {**f, "cancel": side}
 
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):

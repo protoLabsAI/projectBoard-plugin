@@ -4886,3 +4886,246 @@ async def test_spawn_ready_does_not_collide_same_filename_across_projects(monkey
         }
     finally:
         await finish()
+
+
+# ── #211: operator cancel during a coder run must not leave an orphaned PR ───────────
+
+
+class _CancellableStore(FakeLoopStore):
+    """A loop store whose card can be cancelled mid-drive: ``cancelled`` flips the
+    state ``get_feature`` reports (what the real store reads back from br after the
+    operator's cancel verb), and ``_comment`` records the trail."""
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled = False
+        self.comments = []
+
+    def get_feature(self, fid):
+        return {"id": fid, "board_state": "cancelled" if self.cancelled else "in_progress"}
+
+    def _comment(self, fid, text):
+        self.comments.append((fid, text))
+
+
+async def _cancel_drive_with(monkeypatch, *, cancel_at, open_review_raises=False):
+    """Run a drive with a coder that completes AFTER the operator cancelled the card.
+    ``cancel_at`` = "dispatch" (cancel lands while the coder runs → seen before
+    open_pr), "open_pr" (lands during the push/create → seen after open_pr returns),
+    or "open_review" (the real store refuses: the pre-#211 failure, now a cancel edge).
+    Returns (store, opened, closed)."""
+    store = _CancellableStore()
+    store.removes = []
+    opened, closed = [], []
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        if cancel_at == "dispatch":
+            store.cancelled = True  # the operator cancels while the coder is finishing
+        return "## Summary\n\n- did the thing\n"
+
+    async def _open_pr(wt, branch, *, base, title, body):
+        opened.append(branch)
+        if cancel_at == "open_pr":
+            store.cancelled = True  # cancel lands during the push/create
+        return "https://example/pr/211"
+
+    async def _close_pr(pr_url, *, comment, cwd="."):
+        closed.append((pr_url, comment, cwd))
+        return True, ""
+
+    async def _remove(repo, wt, branch=""):
+        store.removes.append(wt)
+        return True
+
+    if open_review_raises:
+
+        def _open_review(fid, *, pr_url):
+            store.cancelled = True
+            raise BoardError("open_review expects in_progress, got 'cancelled'")
+
+        store.open_review = _open_review
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "close_pr", _close_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    loop = BoardLoop({"coder": "proto", "repo": "/repo"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+    assert loop._inflight == {}  # every exit releases the slot
+    return store, opened, closed
+
+
+async def test_cancel_before_open_pr_skips_the_pr_and_reaps(monkeypatch):
+    """(a) The #211 race: the coder completes after the card was cancelled → NO PR is
+    opened, the worktree is reaped, the card gets the trail, nothing is blocked."""
+    store, opened, closed = await _cancel_drive_with(monkeypatch, cancel_at="dispatch")
+    assert opened == [] and closed == []
+    assert store.removes == ["/wt/feat-bd-1"]
+    assert "flag_blocked" not in store.names() and "open_review" not in store.names()
+    (comment,) = store.comments
+    assert comment[0] == "bd-1"
+    assert "cancelled by operator" in comment[1] and "without a PR" in comment[1] and "feat/bd-1" in comment[1]
+    assert "worktree reaped" in comment[1]
+
+
+async def test_cancel_during_open_pr_closes_the_pr_it_just_opened(monkeypatch):
+    """(b) The cancel lands between push/create and open_review → the PR is closed
+    with a comment pointing at the card, the worktree reaped, open_review never
+    called (it would refuse a cancelled card and block it)."""
+    store, opened, closed = await _cancel_drive_with(monkeypatch, cancel_at="open_pr")
+    assert opened == ["feat/bd-1"]
+    assert closed == [("https://example/pr/211", "cancelled by operator — see card bd-1", "/repo")]
+    assert store.removes == ["/wt/feat-bd-1"]
+    assert "open_review" not in store.names() and "flag_blocked" not in store.names()
+    assert any("closed https://example/pr/211" in c[1] for c in store.comments)
+
+
+async def test_open_review_refusing_a_cancelled_card_is_a_cancel_not_a_block(monkeypatch):
+    """The pre-#211 symptom itself — open_review raises on the cancelled card — now
+    ends as a cancel: PR closed, worktree reaped, no flag_blocked on a closed bead."""
+    store, opened, closed = await _cancel_drive_with(monkeypatch, cancel_at="open_review", open_review_raises=True)
+    assert opened == ["feat/bd-1"]
+    assert closed and closed[0][0] == "https://example/pr/211"
+    assert store.removes == ["/wt/feat-bd-1"]
+    assert "flag_blocked" not in store.names()
+
+
+async def test_uncancelled_drive_is_unchanged_by_the_cancel_checks(monkeypatch):
+    """(c) A card that stays in_progress opens its PR and enters review exactly as
+    before — the checks are a store read, nothing else."""
+    store, opened, closed = await _cancel_drive_with(monkeypatch, cancel_at="never")
+    assert opened == ["feat/bd-1"] and closed == []
+    assert ("open_review", "bd-1", "https://example/pr/211") in store.calls
+    assert store.removes == [] and store.comments == []
+
+
+async def test_cancel_check_fails_open_on_a_store_read_error(monkeypatch):
+    """A get_feature failure is NOT a cancel — the drive proceeds (the old path)."""
+
+    class _Broken:
+        def get_feature(self, fid):
+            raise BoardError("br unavailable")
+
+    assert BoardLoop._cancelled(_Broken(), "bd-1") is False
+    assert BoardLoop._cancelled(FakeLoopStore(), "bd-1") is False  # no get_feature at all
+
+
+async def test_pr_close_failure_leaves_a_by_hand_note_and_still_reaps(monkeypatch):
+    store = _CancellableStore()
+    store.removes = []
+    store.cancelled = True
+
+    async def _close_pr(pr_url, *, comment, cwd="."):
+        return False, "gh: HTTP 422 already closed"
+
+    async def _remove(repo, wt, branch=""):
+        store.removes.append(wt)
+        return True
+
+    monkeypatch.setattr(worktree, "close_pr", _close_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    loop = BoardLoop({"coder": "proto"})
+    loop._inflight["bd-1"] = ("/repo", "/wt/feat-bd-1", "feat/bd-1")
+    await loop._end_cancelled_drive(store, "bd-1", "/repo", "/wt/feat-bd-1", "feat/bd-1", pr_url="https://x/pr/1")
+    assert store.removes == ["/wt/feat-bd-1"] and loop._inflight == {}
+    (comment,) = store.comments
+    assert "could not close https://x/pr/1" in comment[1] and "close it by hand" in comment[1]
+
+
+async def test_request_drive_cancel_stops_a_running_coder_and_ends_the_drive_cleanly(monkeypatch):
+    """The cancel verb reaches the in-flight drive through the process-stable fid →
+    task registry: the coder await is cancelled, the drive's own handler reaps + comments
+    (no PR was opened → nothing to close), and the task COMPLETES — no CancelledError
+    escapes into the loop."""
+    store = _CancellableStore()
+    store.removes = []
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    started = asyncio.Event()
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        started.set()
+        await asyncio.Event().wait()  # a coder that never finishes on its own
+
+    async def _open_pr(*a, **k):
+        raise AssertionError("open_pr must not run for a cancelled drive")
+
+    async def _remove(repo, wt, branch=""):
+        store.removes.append(wt)
+        return True
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    loop = BoardLoop({"coder": "proto", "repo": "/repo"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    task = asyncio.create_task(loop._drive(FEATURE))
+    loop_mod._register_drive("bd-1", task)
+    task.add_done_callback(loop._make_drive_done_cb("bd-1"))
+    await asyncio.wait_for(started.wait(), 1)
+    assert loop_mod.live_drive("bd-1") is task
+    store.cancelled = True  # the operator's cancel landed on the board…
+    assert loop_mod.request_drive_cancel("bd-1") is True  # …and stops the coder
+    await asyncio.wait_for(task, 1)  # completes — the CancelledError is handled inside
+    assert task.exception() is None
+    assert store.removes == ["/wt/feat-bd-1"] and loop._inflight == {}
+    assert any("cancelled by operator" in c[1] for c in store.comments)
+    assert loop_mod.live_drive("bd-1") is None  # unregistered by the done callback
+    assert loop_mod.request_drive_cancel("bd-1") is False  # nothing left to cancel
+
+
+async def test_shutdown_cancel_still_propagates(monkeypatch):
+    """stop() cancels drives and owns their reap — a shutdown cancel must NOT be
+    swallowed as an operator cancel (no PR close, no comment, CancelledError raised)."""
+    store = _CancellableStore()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    started = asyncio.Event()
+
+    async def _create(repo, base, fid, root):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    task = asyncio.create_task(loop._drive(FEATURE))
+    await asyncio.wait_for(started.wait(), 1)
+    loop._shutting_down = True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.comments == [] and "bd-1" in loop._inflight  # stop() sweeps _inflight
+
+
+def test_cancel_side_effects_closes_pr_and_signals_the_drive(monkeypatch):
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append((url, comment, cwd)) or (True, ""),
+    )
+    monkeypatch.setattr(loop_mod, "request_drive_cancel", lambda fid: fid == "bd-live")
+    assert loop_mod.cancel_side_effects("bd-live", "https://x/pr/3", cwd="/repo") == {
+        "pr_closed": True,
+        "drive_cancelled": True,
+    }
+    assert closed == [("https://x/pr/3", "cancelled by operator — see card bd-live", "/repo")]
+    assert loop_mod.cancel_side_effects("bd-idle") == {"pr_closed": False, "drive_cancelled": False}
+    assert len(closed) == 1  # no pr_url → gh untouched
+
+    monkeypatch.setattr(worktree, "close_pr_sync", lambda *a, **k: (False, "boom"))
+    assert loop_mod.cancel_side_effects("bd-idle", "https://x/pr/4")["pr_closed"] is False  # logged, not raised
