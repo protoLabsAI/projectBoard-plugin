@@ -1850,6 +1850,230 @@ async def test_drive_done_releases_its_files(monkeypatch):
     assert loop._drives == set()
 
 
+# ── #217: task-type dispatch (delegate_to for agents, skip-and-wait for humans) ───
+
+
+class _TaskStore:
+    """A ready queue + the store verbs the task dispatch path uses (claim, get_feature,
+    record_delivery, flag_blocked, requeue). Records calls so a test can prove which
+    edge a task took."""
+
+    def __init__(self, features):
+        self._features = [dict(f) for f in features]
+        self.claimed = []
+        self.calls = []  # (verb, fid, extra…)
+
+    def ready_queue(self, relaxed=False):
+        return [f for f in self._features if f["id"] not in self.claimed]
+
+    def claim(self, fid, assignee=""):
+        if fid in self.claimed:
+            return None
+        self.claimed.append(fid)
+        f = next((x for x in self._features if x["id"] == fid), None)
+        if f is None:
+            return None
+        return dict(f, board_state="in_progress", assignee=assignee or f.get("assignee", ""))
+
+    def list_features(self, state=None):
+        return []
+
+    def get_feature(self, fid):
+        return next((dict(x) for x in self._features if x["id"] == fid), None)
+
+    def record_delivery(self, fid, text=""):
+        self.calls.append(("record_delivery", fid, text))
+        return {"id": fid}
+
+    def flag_blocked(self, fid, reason):
+        self.calls.append(("flag_blocked", fid, reason))
+        return {"id": fid}
+
+    def requeue(self, fid):
+        self.calls.append(("requeue", fid))
+        return {"id": fid}
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+def _task(fid, *, assignee="", spec="do the task", criteria="WHEN done THE SYSTEM SHALL deliver"):
+    return {
+        "id": fid,
+        "board_state": "ready",
+        "issue_type": "task",
+        "assignee": assignee,
+        "title": f"Task {fid}",
+        "spec": spec,
+        "acceptance_criteria": criteria,
+        "files_to_modify": [],
+    }
+
+
+def test_build_task_prompt_carries_spec_and_criteria_but_no_coder_rules():
+    """The task prompt leads with the spec + acceptance criteria and frames a
+    deliverable (no worktree/PR), unlike the coder prompt's 'write tests / open no PR'."""
+    loop = BoardLoop({"coder": "proto"})
+    prompt = loop._build_task_prompt(
+        _task("bd-1", assignee="agent-bot", spec="Draft the RFC", criteria="WHEN approved THE SYSTEM SHALL publish")
+    )
+    assert "Draft the RFC" in prompt  # the spec…
+    assert "WHEN approved THE SYSTEM SHALL publish" in prompt  # …and the acceptance criteria
+    assert "## Acceptance criteria" in prompt
+    assert "deliverable" in prompt.lower()
+    assert "worktree" in prompt.lower()  # tells the delegate there is no worktree/PR
+    assert "Write automated tests" not in prompt  # NOT the coder prompt's rules
+
+
+async def test_spawn_ready_dispatches_an_acp_task_via_delegate_to(monkeypatch):
+    """r1/r2/r3/r6: a task with an ACP agent assignee is dispatched via delegate_to with
+    the spec + acceptance criteria as the prompt — NO worktree — and the reply is
+    recorded as the deliverable (→ in_review)."""
+    store = _TaskStore(
+        [_task("bd-task", assignee="agent-bot", spec="Write the ADR", criteria="WHEN merged THE SYSTEM SHALL link it")]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_worktree(*a, **k):
+        raise AssertionError("a task must NOT create a git worktree")
+
+    monkeypatch.setattr(worktree, "create_worktree", _no_worktree)
+
+    prompts = []
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        prompts.append(prompt)
+        return "Here is the ADR deliverable."
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+
+    delegate = object()
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: delegate if name == "agent-bot" else None)
+
+    assert loop._spawn_ready() is True  # an ACP task IS a drive → counts as started
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)  # let the done-callback run
+
+    assert store.claimed == ["bd-task"]
+    assert len(prompts) == 1
+    assert "Write the ADR" in prompts[0]  # the spec…
+    assert "WHEN merged THE SYSTEM SHALL link it" in prompts[0]  # …and the acceptance criteria
+    assert ("record_delivery", "bd-task", "Here is the ADR deliverable.") in store.calls
+    assert loop._drives == set() and loop._inflight_files == {}  # the slot released on completion
+
+
+async def test_spawn_ready_parks_a_human_task_without_dispatching(monkeypatch):
+    """r1/r4: a task with a human (non-ACP) assignee is claimed to in_progress and left
+    there — no worktree, no delegate dispatch — so its delivery can arrive out-of-band."""
+    store = _TaskStore([_task("bd-human", assignee="alice")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_worktree(*a, **k):
+        raise AssertionError("a parked human task must NOT create a worktree")
+
+    async def _no_dispatch(*a, **k):
+        raise AssertionError("a human task must NOT dispatch a delegate")
+
+    monkeypatch.setattr(worktree, "create_worktree", _no_worktree)
+    monkeypatch.setattr(coder_seam, "dispatch_task", _no_dispatch)
+
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # alice is not an ACP agent
+
+    assert loop._spawn_ready() is False  # parked → nothing started this tick
+    assert store.claimed == ["bd-human"]  # …but it WAS claimed to in_progress
+    assert loop._drives == set()  # holds no concurrency slot
+    assert "bd-human" not in loop._inflight_files
+    assert store.calls == []  # no delivery, no block — just parked
+
+
+async def test_a_parked_human_task_does_not_consume_a_concurrency_slot(monkeypatch):
+    """r5: a human-wait task parked in_progress must NOT count toward max_concurrent —
+    a coding feature behind it still gets the single slot."""
+    store = _TaskStore([_task("bd-human", assignee="alice"), _ready("bd-feat", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # human, no ACP agent
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert loop._spawn_ready() is True  # the coding feature started
+        # Both claimed: the human task parked (no slot), the coding feature took the slot.
+        assert store.claimed == ["bd-human", "bd-feat"]
+        assert len(loop._drives) == 1  # ONLY the coding feature's drive — the park held no slot
+    finally:
+        await finish()
+
+
+async def test_acp_task_dispatch_failure_is_classified_and_blocks(monkeypatch):
+    """r7: a delegate error on a task dispatch is classified like a coder failure and
+    blocks the card — no deliverable is recorded."""
+    store = _TaskStore([_task("bd-task", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _boom(delegate, prompt, *, timeout=None):
+        raise worktree.WorktreeError("coder dispatch failed: delegate exploded")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _boom)
+
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert "flag_blocked" in store.names()
+    assert "record_delivery" not in store.names()
+    reason = next(c[2] for c in store.calls if c[0] == "flag_blocked")
+    assert reason.startswith("terminal:")  # classify() → TERMINAL for an unknown error
+
+
+async def test_reconcile_orphan_leaves_a_human_task_parked(monkeypatch):
+    """r4 (durability): a human/unassigned task parked in_progress is NOT orphaned — the
+    sweep/boot reconcile leaves it be (its delivery arrives async) rather than requeueing
+    it to ready and re-parking it every sweep."""
+    store = _TaskStore([_task("bd-human", assignee="alice")])
+    store.claimed.append("bd-human")  # already in_progress
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("bd-human")
+    assert store.names() == []  # not requeued, not blocked — left parked
+
+
+async def test_reconcile_orphan_requeues_a_dead_acp_task(monkeypatch):
+    """#217: an ACP-agent task whose drive died mid-flight IS orphaned — reconcile
+    requeues it to ready for a clean re-dispatch."""
+    store = _TaskStore([_task("bd-task", assignee="agent-bot")])
+    store.claimed.append("bd-task")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._reconcile_orphan("bd-task")
+    assert store.names() == ["requeue"]
+
+
+async def test_spawn_ready_task_branch_leaves_coding_features_unchanged(monkeypatch):
+    """r6: an issue_type=feature card is NOT diverted by the task branch — it takes the
+    normal claim → _drive (worktree) path, stamping its files in _inflight_files."""
+    store = _TaskStore([_ready("bd-feat", ["a.py"])])  # no issue_type → a coding feature
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_task(*a, **k):
+        raise AssertionError("a coding feature must NOT take the task dispatch path")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _no_task)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert loop._spawn_ready() is True
+        assert store.claimed == ["bd-feat"]
+        assert loop._inflight_files == {"bd-feat": {("default", "a.py")}}  # went through the coder path
+    finally:
+        await finish()
+
+
 async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch, caplog):
     """#124: when a lower-priority card claims ahead of a higher one, the single
     per-tick claim_decision line must name the selected fid AND why the higher card

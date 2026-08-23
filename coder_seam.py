@@ -597,6 +597,34 @@ async def dispatch_coder_tapped(
             log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
+async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) -> str:
+    """Dispatch a task-type bead's spec to its assignee delegate via ``delegate_to``
+    (#217) and return the reply — the deliverable a task ships instead of a diff.
+
+    Unlike ``dispatch_coder``/``dispatch_coder_tapped`` there is NO worktree scoping:
+    a task produces a doc/decision/artifact, not a code change, so the delegate runs
+    in its own context and its reply IS the deliverable (the loop hands it straight to
+    ``record_delivery``). Same teardown discipline (reap the ACP subprocess on every
+    exit) and the same error normalisation as ``dispatch_coder`` — a ``DelegateError``
+    surfaces as ``WorktreeError`` and a timeout as ``CoderTimeout`` — so the loop's
+    coder-failure classifier handles a task-dispatch failure with the identical code."""
+    from plugins.delegates.adapters import ADAPTERS, DelegateError
+
+    adapter = ADAPTERS["acp"]
+    try:
+        coro = adapter.dispatch(delegate, prompt, timeout=timeout)
+        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"task delegate timed out after {timeout}s")
+    except DelegateError as exc:
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    finally:
+        try:
+            await adapter.teardown(delegate)
+        except Exception:  # noqa: BLE001 — never let teardown mask the result/error
+            log.warning("[project_board] task delegate teardown failed", exc_info=True)
+
+
 def resolve_delegate(name: str, expect_type: str):
     """Look up a live delegate by name from the delegates registry. Returns the
     Delegate or None (not configured / wrong type / plugin disabled). Shared by
