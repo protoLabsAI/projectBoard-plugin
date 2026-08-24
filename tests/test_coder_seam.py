@@ -9,6 +9,7 @@ needs the (separate, git-URL-installed) `coder` plugin to be present."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1717,3 +1718,133 @@ def test_resolve_delegate_returns_none_when_delegates_plugin_absent():
     """`plugins.delegates` is genuinely absent in this standalone test env — the
     honest-degrade case in production too when the plugin's disabled."""
     assert coder_seam.resolve_delegate("anything", "acp") is None
+
+
+# ── #226 S1: persist a finished gen's snapshot as a `coder-monitor:` bead comment ──
+
+
+class _FakeStore:
+    """Captures ``_comment(fid, text)`` calls — stands in for the board store the
+    persist factory returns, so no `br`/beads is needed."""
+
+    def __init__(self):
+        self.comments: list[tuple[str, str]] = []
+
+    def _comment(self, fid, text):
+        self.comments.append((fid, text))
+
+
+def test_progress_end_persists_a_coder_monitor_snapshot_comment(monkeypatch):
+    """r1/r2: a finished gen writes ONE `coder-monitor: {…}` JSON comment whose payload
+    carries the snapshot (tier, elapsed_s, recent_tools, plan, verify, stop_reason)."""
+    cs = coder_seam
+    cs.progress_new_run("bd-226a")
+    clock = [100.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+    store = _FakeStore()
+    monkeypatch.setattr(cs, "_store_factory", lambda: store)
+
+    cs.progress_begin("bd-226a", 1, "smart")
+    cs.progress_tool("bd-226a", 1, {"phase": "start", "id": "t1", "name": "bash", "input": '{"command": "pytest"}'})
+    cs.progress_plan("bd-226a", 1, [{"content": "do it", "status": "in_progress"}])
+    cs.progress_verify("bd-226a", 1, test_cmd="pytest -q", output="1 passed", passed=True)
+    cs.progress_stop_reason("bd-226a", 1, "end_turn")
+    clock[0] = 107.5
+    cs.progress_end("bd-226a", 1)
+
+    assert len(store.comments) == 1
+    fid, text = store.comments[0]
+    assert fid == "bd-226a"
+    assert text.startswith("coder-monitor: ")
+    payload = json.loads(text[len("coder-monitor: ") :])
+    assert payload["tier"] == "smart"
+    assert payload["elapsed_s"] == 7.5  # frozen at progress_end, not 899.0
+    assert payload["done"] is True
+    assert payload["stop_reason"] == "end_turn"
+    assert payload["verify"]["passed"] is True
+    assert payload["verify"]["test_cmd"] == "pytest -q"
+    assert payload["plan"][0]["content"] == "do it"
+    assert isinstance(payload["recent_tools"], list) and payload["recent_tools"]
+
+
+def test_progress_end_with_no_store_factory_completes_normally(monkeypatch):
+    """r3: with no wired store factory (the standalone/test env) progress_end still
+    finishes normally — done surfaces, the clock freezes, nothing is persisted."""
+    cs = coder_seam
+    cs.progress_new_run("bd-226b")
+    clock = [10.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(cs, "_store_factory", None)  # explicit: standalone env
+
+    cs.progress_begin("bd-226b", 1, "fast")
+    clock[0] = 13.0
+    cs.progress_end("bd-226b", 1)  # must not raise
+    g = cs.progress_snapshot("bd-226b")["gens"][0]
+    assert g["done"] is True
+    assert g["elapsed_s"] == 3.0
+
+
+def test_progress_end_swallows_a_failing_comment_write(monkeypatch):
+    """r3: a store whose comment write blows up must never break a build — progress_end
+    still completes (done set, clock frozen)."""
+    cs = coder_seam
+    cs.progress_new_run("bd-226c")
+    clock = [0.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+
+    class _BoomStore:
+        def _comment(self, fid, text):
+            raise RuntimeError("br exploded")
+
+    monkeypatch.setattr(cs, "_store_factory", lambda: _BoomStore())
+    cs.progress_begin("bd-226c", 1, "smart")
+    clock[0] = 4.0
+    cs.progress_end("bd-226c", 1)  # must not raise
+    g = cs.progress_snapshot("bd-226c")["gens"][0]
+    assert g["done"] is True
+    assert g["elapsed_s"] == 4.0
+
+
+def test_progress_end_handles_a_factory_returning_no_store(monkeypatch):
+    """r3: a factory that yields no store (get_store couldn't build one) is a no-op,
+    not a crash."""
+    cs = coder_seam
+    cs.progress_new_run("bd-226d")
+    monkeypatch.setattr(cs, "_store_factory", lambda: None)
+    cs.progress_begin("bd-226d", 1)
+    cs.progress_end("bd-226d", 1)  # must not raise
+    assert cs.progress_snapshot("bd-226d")["gens"][0]["done"] is True
+
+
+def test_progress_end_persists_once_across_duplicate_calls(monkeypatch):
+    """r4: the persist rides the idempotent first-close (progress_end guards on `not
+    b.done`), so a duplicate exit-path call writes no second comment."""
+    cs = coder_seam
+    cs.progress_new_run("bd-226e")
+    store = _FakeStore()
+    monkeypatch.setattr(cs, "_store_factory", lambda: store)
+    cs.progress_begin("bd-226e", 1, "fast")
+    cs.progress_end("bd-226e", 1)
+    cs.progress_end("bd-226e", 1)  # second close: no-op, no second write
+    assert len(store.comments) == 1
+
+
+def test_set_store_factory_wires_then_clears_the_persist_accessor():
+    """r4: the public setter register() calls — wiring a factory makes progress_end
+    persist through it; clearing it (None) restores the standalone no-op."""
+    cs = coder_seam
+    store = _FakeStore()
+    try:
+        cs.set_store_factory(lambda: store)
+        cs.progress_new_run("bd-226f")
+        cs.progress_begin("bd-226f", 1, "smart")
+        cs.progress_end("bd-226f", 1)
+        assert len(store.comments) == 1
+
+        cs.set_store_factory(None)  # cleared → a subsequent gen persists nothing
+        cs.progress_new_run("bd-226g")
+        cs.progress_begin("bd-226g", 1)
+        cs.progress_end("bd-226g", 1)
+        assert len(store.comments) == 1  # unchanged
+    finally:
+        cs.set_store_factory(None)

@@ -1953,6 +1953,25 @@ class BeadsBoard:
                 raw.append(rows[0] if isinstance(rows, list) else rows)
         return raw
 
+    def feature_comments(self, fid: str) -> list[str]:
+        """The comment text history for ONE feature, oldest-first — a per-feature read
+        via ``br show`` (which carries the full comment thread; ``br list`` omits it,
+        and ``raw_features_with_comments`` fetches by board STATE, not by id). Consumed
+        by the coder-monitor read side (#226 S2), which filters for ``coder-monitor:``
+        gen snapshots. Returns ``[]`` for an unknown feature or one with no comments;
+        each comment is normalized to its text however ``br`` shapes the entry."""
+        rows = self._run("show", fid, want_json=True)
+        if not rows:
+            return []
+        bead = rows[0] if isinstance(rows, list) else rows
+        out: list[str] = []
+        for c in bead.get("comments") or []:
+            txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
+            txt = txt.strip()
+            if txt:
+                out.append(txt)
+        return out
+
     def ready_queue(self, relaxed: bool = False) -> list[dict]:
         """Board-`ready`, dep-unblocked **features and task-type beads**
         (PULLABLE_ISSUE_TYPES, #217; priority order) — the puller's queue. `br ready` already excludes a feature with any OPEN `blocks` dep, so by
