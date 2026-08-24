@@ -118,6 +118,24 @@ def register(registry) -> None:
         from . import coder_seam
 
         coder_seam.ensure_progress_attached()
+
+        # Persist side of the coder monitor (#226): wire the store accessor so a
+        # finished gen's snapshot lands as a `coder-monitor:` bead comment. Scoped to
+        # the board's default project — the same base store the board tools' ops use —
+        # and lazily resolved (get_store memoizes) so registration stays cheap.
+        from .projects import default_project as _resolve_default_project
+        from .projects import resolve_projects as _resolve_projects
+        from .store import get_store
+
+        _persist_store_kw = dict(
+            db=cfg.get("db_path") or None,
+            repo=cfg.get("repo", "."),
+            base_branch=cfg.get("base_branch", "main"),
+            max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+            projects=_resolve_projects(cfg),
+            default_project=_resolve_default_project(cfg),
+        )
+        coder_seam.set_store_factory(lambda: get_store(**_persist_store_kw))
     except Exception:  # noqa: BLE001 — monitoring must never break registration
         log.exception("[project_board] attaching the coder-monitor buffer failed")
 

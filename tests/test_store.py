@@ -2222,6 +2222,37 @@ def test_raw_features_with_comments_listing_is_unbounded(make_board):
     assert all(_passes_unlimited(c) for c in br.cmds("list"))
 
 
+# ── #226 S2 read helper: per-feature comment text via `br show` ──────────────────
+
+
+def test_feature_comments_returns_the_comment_text_history(make_board):
+    """A per-feature read (`br show`, which carries the comment thread) — normalizes
+    each comment to its text however `br` shapes the entry, oldest-first. This is what
+    the coder-monitor read side filters for `coder-monitor:` snapshots (#226)."""
+    bead = {
+        "id": "bd-1",
+        "status": "in_progress",
+        "labels": [],
+        "comments": [
+            {"text": "  attempt 1 (tier=fast): failed  "},
+            {"body": 'coder-monitor: {"gen": 1}'},
+            {"content": ""},  # empty → dropped
+            "bare string comment",
+        ],
+    }
+    b = make_board(Br({"show": [bead]}))
+    assert b.feature_comments("bd-1") == [
+        "attempt 1 (tier=fast): failed",
+        'coder-monitor: {"gen": 1}',
+        "bare string comment",
+    ]
+
+
+def test_feature_comments_empty_for_unknown_or_commentless_feature(make_board):
+    assert make_board(Br({"show": []})).feature_comments("nope") == []
+    assert make_board(Br({"show": [{"id": "bd-2", "status": "open"}]})).feature_comments("bd-2") == []
+
+
 # ── #113: the requirement ledger — decompose, dispose, and the notes round-trip ───
 # Acceptance criteria become tracked items ({id, text, status}) so partial completion
 # is distinguishable from completion: prose stays the authoring interface, mark_ready

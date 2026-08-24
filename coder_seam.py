@@ -452,11 +452,56 @@ def progress_stop_reason(fid: str | None, gen: int, reason) -> None:
         b.stop_reason = str(reason)[:200]
 
 
+# ── Persist finished gens to the bead (#226) ────────────────────────────────────
+# The WRITE side of the coder-monitor history (#226): when a gen finishes, its live
+# snapshot is serialized to a `coder-monitor: {…}` JSON bead comment so the drawer
+# can replay a run the bounded in-memory buffer has since LRU-evicted (or lost to a
+# plugin reload). Wired from register() — which owns store access — via
+# set_store_factory; the factory stays None in a standalone test env, where the
+# persist is simply skipped. Best-effort end to end: no factory, no store, or any
+# failure is swallowed, because a monitoring write must NEVER break a build.
+
+_COMMENT_PREFIX = "coder-monitor: "  # the JSON payload follows; the read side (#226 S2) splits on it
+_store_factory: "Callable[[], object] | None" = None
+
+
+def set_store_factory(fn: "Callable[[], object] | None") -> None:
+    """Wire (or clear) the accessor register() hands us to reach the board store, so
+    ``progress_end`` can persist a finished gen's snapshot as a bead comment (#226).
+    Passing None — or never calling this at all (the standalone/test case) — leaves
+    the persist a silent no-op."""
+    global _store_factory
+    _store_factory = fn
+
+
+def _persist_gen_snapshot(fid: str | None, gen: int) -> None:
+    """Best-effort: write the just-finished gen's ``snapshot()`` as a ``coder-monitor:``
+    JSON bead comment (the #226 write side). Skips silently when there's no fid, no
+    wired store factory (standalone test env), no store, or the write itself fails —
+    a monitoring persist must NEVER break a build."""
+    if not fid or _store_factory is None:
+        return
+    b = _buf(fid, gen)
+    if b is None:
+        return
+    try:
+        store = _store_factory()
+        if store is None:
+            return
+        payload = json.dumps(b.snapshot(), default=str)
+        store._comment(fid, _COMMENT_PREFIX + payload)
+    except Exception:  # noqa: BLE001 — monitoring must never break a build
+        log.debug("[project_board] persisting gen %s snapshot for %s failed", gen, fid, exc_info=True)
+
+
 def progress_end(fid: str | None, gen: int) -> None:
     b = _buf(fid, gen)
     if b is not None and not b.done:  # idempotent — every dispatch exit path may call it
         b.done = True
         b.ended = _monotonic()
+        # Snapshot AFTER freezing done+clock so the persisted record reflects the
+        # finished state (done=True, frozen elapsed_s) — the read side (#226 S2) reads it back.
+        _persist_gen_snapshot(fid, gen)
 
 
 def progress_snapshot(fid: str) -> dict:
