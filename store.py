@@ -559,6 +559,31 @@ class BeadsBoard:
         self.projects = resolved
         self.default_project = default
 
+    def refresh_projects(self, projects: dict | None) -> None:
+        """Pick up a runtime project registration in place, without an explicit default (#246).
+
+        ``board_register_project`` writes the new entry through the host's config apply,
+        but this store is a process-wide singleton whose ``self.projects`` was snapshotted
+        at construction — so without this seam it never sees the new project, ``_repo_for``
+        falls through to ``self.repo`` (typically ``.`` → ``/``), and the Ready gate rejects
+        every feature stamped with the newly-registered project. Unlike
+        :meth:`reconfigure_projects`, the registry tool carries no explicit default, so this
+        recomputes the automatic sole-project default the constructor uses — but only when
+        the map's key set changed (a project added or removed): merely updating an entry's
+        repo (an idempotent re-register) preserves an explicit or implicit default already
+        in force. Idempotent and safe to call repeatedly.
+        """
+        resolved = dict(projects or {})
+        if set(resolved) != set(self.projects):
+            # The shape changed, so the automatic default may no longer hold. Mirror the
+            # constructor: a sole project is its own default; otherwise keep an explicit
+            # default that still names a live project, else clear it.
+            if len(resolved) == 1:
+                self.default_project = next(iter(resolved))
+            elif self.default_project not in resolved:
+                self.default_project = ""
+        self.projects = resolved
+
     # ── workspace pin (ADR 0055 P0, #48) ──────────────────────────────────────
     def _ensure_workspace(self) -> None:
         """Pin the board to THIS repo's beads workspace so `br` can't walk UP the tree
@@ -2370,3 +2395,18 @@ def reconfigure_cached_store(
         return False
     board.reconfigure_projects(projects, default_project)
     return True
+
+
+def refresh_cached_stores(projects: dict | None) -> int:
+    """Push a freshly-written project map into every cached board in place (#246).
+
+    ``board_register_project`` writes ``project_board.projects`` once and globally, but
+    each live board snapshotted that map at construction and would otherwise never see
+    the new entry (``reconfigure_cached_store`` can't help: the registry tool has no
+    db/repo/base_branch workspace key to look one up by). The registry is a single
+    process-wide map every board shares, so refresh them all — a subsequent Ready gate
+    on any of them then resolves the new project. Returns how many boards were refreshed.
+    """
+    for board in _BOARDS.values():
+        board.refresh_projects(projects)
+    return len(_BOARDS)

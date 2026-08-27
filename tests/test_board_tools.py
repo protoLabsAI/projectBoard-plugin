@@ -16,6 +16,12 @@ patched to supply the projection the method reads back — the same tool-level w
 from __future__ import annotations
 
 import json
+import logging
+import os
+import subprocess
+import sys
+import types
+from pathlib import Path
 
 import pytest
 
@@ -666,3 +672,144 @@ def test_board_verify_surfaces_a_task_only_or_wrong_state_error(monkeypatch):
     out = _get_tool("board_verify").invoke({"feature_id": "bd-1", "approved": True})
 
     assert out.startswith("Error: ") and "task-only" in out
+
+
+# ── #246: board_register_project refreshes the LIVE store so _repo_for sees the new project ──
+#
+# HOST.apply_settings writes project_board.projects, but the BeadsBoard store is a
+# process-wide singleton whose self.projects was snapshotted at construction. Without a
+# refresh, _repo_for falls through to the instance default (typically "." → "/") and the
+# Ready gate validates a newly-registered feature's files against the WRONG root — so it
+# rejects every feature stamped with the just-registered project. These pin the refresh
+# seam: the store method that updates the map in place, the tool wiring that calls it after
+# a successful config apply, and the graceful degradation when no live store exists.
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    return path
+
+
+def _wire_register_host(monkeypatch, cfg):
+    """Wire the host config + apply_settings seams board_register_project writes through
+    (mirrors test_project_registry's host double): apply_settings persists the patch into
+    the same live cfg the tool's readback then reads."""
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    fake_sdk = types.ModuleType("graph.sdk")
+    fake_sdk.config = lambda: cfg
+    fake_plugins = types.ModuleType("graph.plugins")
+    fake_plugins.__path__ = []
+    fake_host = types.ModuleType("graph.plugins.host")
+    fake_host.HOST = types.SimpleNamespace(apply_settings=apply_settings)
+    monkeypatch.setitem(sys.modules, "graph.sdk", fake_sdk)
+    monkeypatch.setitem(sys.modules, "graph.plugins", fake_plugins)
+    monkeypatch.setitem(sys.modules, "graph.plugins.host", fake_host)
+
+
+# ── the store seam: refresh_projects updates the map (and sole default) in place ────
+
+
+def test_refresh_projects_updates_map_and_recomputes_sole_default(make_board):
+    """r2: refresh_projects mutates self.projects in place and, when the map's key set
+    changed, recomputes the automatic sole-project default the constructor uses — while an
+    idempotent re-register (same shape) leaves an in-force default untouched."""
+    board = make_board(lambda *_a, **_k: "")  # repo defaults to /repo, empty projects map
+    assert board.projects == {} and board.default_project == ""
+
+    # First registration: a sole project becomes its own default (the key set changed).
+    board.refresh_projects({"solo": {"repo": "/solo"}})
+    assert board.projects == {"solo": {"repo": "/solo"}}
+    assert board.default_project == "solo"
+    assert board._repo_for({"project": "solo"}) == "/solo"
+
+    # Adding a second project preserves the implicit sole default already in force.
+    board.refresh_projects({"solo": {"repo": "/solo"}, "beta": {"repo": "/beta"}})
+    assert board.default_project == "solo"
+    assert board._repo_for({"project": "beta"}) == "/beta"
+
+    # Idempotent re-register (same key set, updated repo): default untouched, entry updated.
+    board.refresh_projects({"solo": {"repo": "/solo2"}, "beta": {"repo": "/beta"}})
+    assert board.default_project == "solo"
+    assert board._repo_for({"project": "solo"}) == "/solo2"
+
+
+# ── the tool wiring: a successful register refreshes the live cached store ───────────
+
+
+async def test_board_register_project_refreshes_live_store_repo_resolution(monkeypatch, tmp_path):
+    """r1 + r4: after board_register_project succeeds, a feature stamped with the new
+    project resolves — and passes the Ready gate's file-existence check — against the
+    REGISTERED repo, not the store's instance default."""
+    from project_board import project_registry as registry
+    from project_board import store as store_mod
+
+    # A live board already cached with a DIFFERENT instance default and no project map —
+    # the #246 staleness: its snapshotted self.projects can't see a later registration.
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    instance_default = _git_repo(tmp_path / "instance-default")
+    board = store_mod.BeadsBoard(db=None, repo=str(instance_default))
+    monkeypatch.setitem(store_mod._BOARDS, (None, str(instance_default), "main"), board)
+
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "test-proj")
+    (repo / "src").mkdir()
+    (repo / "src" / "thing.py").write_text("x = 1\n")  # a real file only the project repo has
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    _wire_register_host(monkeypatch, cfg)
+
+    tool = registry.build_register_tool({})
+    assert tool is not None
+    result = await tool.ainvoke({"name": "test-proj", "repo": str(repo)})
+    assert not result.startswith("Error:")
+
+    # The live store now carries the new entry, so _repo_for resolves the stamped feature
+    # to the REGISTERED repo — not the instance default.
+    assert "test-proj" in board.projects
+    feat = {"project": "test-proj", "files_to_modify": ["src/thing.py"]}
+    resolved = board._repo_for(feat)
+    assert resolved == str(repo.resolve())
+    assert resolved != str(instance_default)
+    # …and the Ready gate's file-existence check (os.path.exists on _repo_for) passes
+    # against the registered repo, where the file actually lives — never the instance root.
+    assert os.path.exists(os.path.join(resolved, "src", "thing.py"))
+    assert not os.path.exists(os.path.join(str(instance_default), "src", "thing.py"))
+
+
+async def test_board_register_project_survives_an_unavailable_store(monkeypatch, tmp_path, caplog):
+    """r3: if the live store can't be refreshed (host-free, or never constructed), the tool
+    still reports success — the config IS written and readback-verified — and logs a
+    warning rather than failing the registration."""
+    from project_board import project_registry as registry
+    from project_board import store as store_mod
+
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "test-proj")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    _wire_register_host(monkeypatch, cfg)
+
+    def _boom(_projects):
+        raise RuntimeError("store not constructed")
+
+    monkeypatch.setattr(store_mod, "refresh_cached_stores", _boom)
+
+    tool = registry.build_register_tool({})
+    assert tool is not None
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        result = await tool.ainvoke({"name": "test-proj", "repo": str(repo)})
+
+    assert not result.startswith("Error:")  # the persisted write still succeeds
+    assert cfg.plugin_config["project_board"]["projects"]["test-proj"]["repo"] == str(repo.resolve())
+    assert "live store refresh failed" in caplog.text

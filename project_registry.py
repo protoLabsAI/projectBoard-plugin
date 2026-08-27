@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import re
 import subprocess
 import sys
@@ -47,6 +48,8 @@ import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("protoagent.plugins.project_board")
 
 #: Fields an operator writes by hand today, and the only ones this tool sets.
 _ENTRY_FIELDS = ("repo", "base_branch", "local_gate_cmd", "repo_conventions")
@@ -294,6 +297,25 @@ async def _apply_registry(
         )
     if default_project is not None and str(persisted_section.get("default_project") or "") != default_project:
         raise ProjectRegistryError("the host reported success, but the default project did not persist")
+
+    # The config IS written and readback-verified; now make the LIVE board see it. The
+    # store is a process-wide singleton whose `self.projects` was snapshotted at
+    # construction, so without this the Ready gate keeps resolving a newly-registered
+    # project against the instance default (#246). A store import failure (host-free test
+    # runs, or the store never constructed) is not a registration failure — the config is
+    # persisted and the next board construction picks it up — so warn and carry on.
+    try:
+        from .store import refresh_cached_stores
+    except ImportError:
+        try:
+            from store import refresh_cached_stores
+        except Exception as exc:  # noqa: BLE001 — host-free: no store to refresh
+            log.warning("board_register_project: could not import store to refresh live projects: %s", exc)
+            return
+    try:
+        refresh_cached_stores(intended)
+    except Exception as exc:  # noqa: BLE001 — a refresh failure must not fail a persisted write
+        log.warning("board_register_project: live store refresh failed (config was written): %s", exc)
 
 
 async def upsert_project(
