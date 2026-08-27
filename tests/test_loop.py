@@ -25,6 +25,7 @@ from project_board.loop import (
     BoardLoop,
     _ci_failure_reason,
     _inject_source_issue_line,
+    _issue_closed_by_board_sibling,
     _pr_body,
     _resolve_gate_cmd,
     _source_issue,
@@ -38,9 +39,16 @@ class FakeLoopStore:
     def __init__(self):
         self.calls = []
         self.gens_spent = {}  # fid -> cumulative gens (record_gens_spent)
+        self.features = []  # rows list_features() returns (the #253 sibling scan reads state="done")
 
     def current_tier(self, fid):
         return "fast"
+
+    def list_features(self, state=None, include_archived=False):
+        rows = self.features
+        if state is not None:
+            rows = [f for f in rows if f.get("board_state") == state]
+        return list(rows)
 
     def open_review(self, fid, *, pr_url):
         self.calls.append(("open_review", fid, pr_url))
@@ -485,14 +493,26 @@ async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
 
 
 async def _drive_with(
-    monkeypatch, *, open_pr, coder=object(), dispatch=None, cfg=None, gate=None, judge=None, seed=None, feature=None
+    monkeypatch,
+    *,
+    open_pr,
+    coder=object(),
+    dispatch=None,
+    cfg=None,
+    gate=None,
+    judge=None,
+    seed=None,
+    feature=None,
+    store_features=None,
 ):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions.
 
     ``judge`` stubs ``_judge_candidates`` (Max-Mode best-of-N); ``seed`` is a callable
-    run on the loop before the drive (e.g. to pre-seed _ci_feedback for a CI-bounce test)."""
+    run on the loop before the drive (e.g. to pre-seed _ci_feedback for a CI-bounce test);
+    ``store_features`` pre-seeds ``store.list_features`` rows (the #253 sibling scan)."""
     store = FakeLoopStore()
+    store.features = store_features or []
     store.creates = []  # fids create_worktree was called for (a goal-fix retry reuses, so won't re-create)
     store.removes = []  # worktrees remove_worktree was called for
     store.reaps = []  # fids reap_feature_worktree was called for (Max-Mode loser teardown)
@@ -1061,6 +1081,123 @@ async def test_drive_opens_pr_when_source_issue_still_open(monkeypatch):
     assert len(opened) == 1
     assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
     assert "cancel_feature" not in store.names()
+
+
+# ── source-issue closed by a board SIBLING vs. an external PR (#253) ──────────────
+
+
+def test_issue_closed_by_board_sibling_matches_done_sibling_with_pr():
+    """A done sibling (different card) carrying the same source_issue WITH a
+    pr_url ⇒ True: the board's own merged PR closed the issue."""
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    store = FakeLoopStore()
+    store.features = [
+        {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#42", "pr_url": "https://x/pr/1"},
+    ]
+    assert _issue_closed_by_board_sibling(store, feature) is True
+
+
+def test_issue_closed_by_board_sibling_normalizes_reference_forms():
+    """The match is on the parsed issue, so a full URL sibling matches an
+    owner/repo#N current (different textual form, same issue)."""
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    store = FakeLoopStore()
+    store.features = [
+        {
+            "id": "bd-1",
+            "board_state": "done",
+            "source_issue": "https://github.com/owner/repo/issues/42",
+            "pr_url": "https://x/pr/1",
+        },
+    ]
+    assert _issue_closed_by_board_sibling(store, feature) is True
+
+
+def test_issue_closed_by_board_sibling_no_match_when_external():
+    """No done sibling names this issue (a done card for a DIFFERENT issue, and a
+    same-issue card that never opened a PR) ⇒ False: the closure was external."""
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    store = FakeLoopStore()
+    store.features = [
+        {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#99", "pr_url": "https://x/pr/1"},
+        {"id": "bd-3", "board_state": "done", "source_issue": "owner/repo#42", "pr_url": ""},
+    ]
+    assert _issue_closed_by_board_sibling(store, feature) is False
+
+
+def test_issue_closed_by_board_sibling_excludes_self():
+    """The current card must not match itself, even if it is (racily) projected
+    as done with a pr_url — a self-match would defeat the external-close cancel."""
+    feature = dict(FEATURE, id="bd-1", source_issue="owner/repo#42")
+    store = FakeLoopStore()
+    store.features = [
+        {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#42", "pr_url": "https://x/pr/1"},
+    ]
+    assert _issue_closed_by_board_sibling(store, feature) is False
+
+
+def test_issue_closed_by_board_sibling_fails_open_on_store_error():
+    """A store read error fails OPEN (True ⇒ skip the cancel) — the same direction
+    as the #166 gh guard, so a flaky read never discards completed work."""
+
+    class _BoomStore:
+        def list_features(self, state=None):
+            raise RuntimeError("board unreachable")
+
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    assert _issue_closed_by_board_sibling(_BoomStore(), feature) is True
+
+
+async def test_drive_proceeds_when_source_issue_closed_by_board_sibling(monkeypatch):
+    """#253: the source issue is closed, but a SIBLING slice on the same board
+    (same source_issue, done, with a pr_url) is what closed it — so the current
+    feature must NOT be cancelled and SHALL open its own PR."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opened.append("https://example/pr/2")
+        return opened[-1]
+
+    async def _closed(si_raw, cwd):
+        return False  # gh reports the shared issue as closed
+
+    async def _slug(*, cwd):
+        return "owner/repo"
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    sibling = {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#42", "pr_url": "https://x/pr/1"}
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature, store_features=[sibling])
+    assert len(opened) == 1  # PR opened despite the closed issue
+    assert ("open_review", "bd-2", "https://example/pr/2") in store.calls
+    assert "cancel_feature" not in store.names()
+    assert loop._inflight == {}
+
+
+async def test_drive_cancels_when_source_issue_closed_externally(monkeypatch):
+    """#253 boundary: the source issue is closed and NO board sibling carries it
+    (only a done card for an unrelated issue), so the closure is external and the
+    #166 supersede-cancel proceeds unchanged."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opened.append((wt, branch))
+        return "https://example/pr/99"
+
+    async def _closed(si_raw, cwd):
+        return False
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
+    unrelated = {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#99", "pr_url": "https://x/pr/1"}
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature, store_features=[unrelated])
+    assert opened == []  # no PR opened
+    assert "cancel_feature" in store.names()
+    assert "open_review" not in store.names()
+    cancel_calls = [c for c in store.calls if c[0] == "cancel_feature"]
+    assert any("superseded" in c[2] for c in cancel_calls)
+    assert loop._inflight == {}
 
 
 # ── coder.solve() board seam (ADR 0064 P2) ───────────────────────────────────────
