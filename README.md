@@ -81,7 +81,8 @@ spawn primitive — it does not reimplement it.
 
 ## Requirements
 
-- **protoAgent ≥ 0.27.0** (console views + the ACP delegate teardown).
+- **protoAgent ≥ 0.154.0** (tabbed plugin Configure dialogs and sandboxed custom
+  Configure views; protoAgent #3179/#3180).
 - **beads-rust** — the **`br`** CLI, the board's DAG/status store. **Fetched for you on
   first run (v0.43.0)**: with no `br` on `PATH` the plugin downloads the pinned release
   (`br_fetch.BR_VERSION`, sha256-verified per platform) into the instance's plugin-data
@@ -229,6 +230,41 @@ project_board:
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
+
+## Configure it in the console
+
+On protoAgent 0.154.0+, **Settings → Plugins → Project Board → Configure** is split
+by operator intent:
+
+- **Projects** is the live registry editor. It lists the configured project map and
+  can add or update repos only inside the host's enabled Project onboarding root.
+  Add/update preserves sibling projects and file-only per-project fields, then reads
+  live config back before reporting success. Delete requires explicit confirmation
+  and is refused while an active board card still names that project.
+- **Automation** contains the loop posture, coder, concurrency/back-pressure, local
+  verification, and candidate-generation controls.
+- **Review & merge** contains review dispatch/gating, CI reconciliation, rebase,
+  dependency release, and auto-merge behavior.
+- **Advanced** contains the webhook HMAC secret. It is stored through the host's
+  secret settings path, never returned by the Projects API.
+
+Every scalar is explicit about apply behavior. `coder`, `br_autofetch`,
+`max_concurrent`, `max_concurrent_sessions`, `max_pending_reviews`, and `auto_merge`
+apply to the running loop; fields marked **restart** are persisted immediately but
+do not change the already-constructed loop/router until the member restarts. Project
+map/default changes apply live as one validated routing policy and do not produce a
+false restart warning.
+
+The console intentionally does not expose every manifest default. Structural legacy
+single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)
+remain file-only; use the Projects editor for multi-repo routing. Low-level timing and
+retry budgets (`review_run_max`, `goal_fix_max`, `local_gate_max`,
+`local_gate_timeout_s`, `coder_solve_test_timeout_s`, `coder_solve_budget`,
+`coder_solve_k`, `coder_solve_tree_depth`, `loop_interval_s`, `coder_timeout_s`,
+`merge_poll_interval_s`, `auto_merge_max`, `merged_verify_max`,
+`health_sweep_interval_s`) also remain YAML-only expert tuning. Nested maps such as
+`coders`, plus per-project advanced fields not owned by the editor, are preserved but
+not flattened into lossy text inputs.
 
 ## The gate — the coder's fast slice of CI
 

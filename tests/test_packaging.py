@@ -232,28 +232,65 @@ def test_register_wires_the_loop_reload_hook():
     assert getattr(reload_cb, "__func__", None) is BoardLoop.reload
 
 
-def test_manifest_settings_are_exactly_the_live_knobs():
-    """Settings → Plugins renders the manifest's `settings:`; every field there MUST be
-    one the running loop re-applies on reload (LIVE_KNOBS), and every live knob must
-    be editable there — a field the operator can edit that silently needs a restart
-    is worse than no field, and a live knob with no field can't be reached from the
-    console. Each must also carry a manifest default (the reload payload is manifest
-    defaults ⊕ YAML, so the hook always sees every knob)."""
+def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
+    """Every live knob is exposed without a restart badge; every other exposed
+    scalar says restart. Structural and internal tuning are an explicit file-only
+    allowlist, so adding a config default forces an expose/hide decision."""
     from project_board.loop import LIVE_BOOL_KNOBS, LIVE_KNOBS, LIVE_STR_KNOBS
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
-    assert set(fields) == set(LIVE_KNOBS)
+    hidden = {
+        # Structural/machine routing belongs in the Projects editor or YAML.
+        "project",
+        "repo",
+        "base_branch",
+        "worktrees_root",
+        "db_path",
+        # Low-level retry/timing budgets remain expert file-only tuning.
+        "review_run_max",
+        "goal_fix_max",
+        "local_gate_max",
+        "local_gate_timeout_s",
+        "coder_solve_test_timeout_s",
+        "coder_solve_budget",
+        "coder_solve_k",
+        "coder_solve_tree_depth",
+        "loop_interval_s",
+        "coder_timeout_s",
+        "merge_poll_interval_s",
+        "auto_merge_max",
+        "merged_verify_max",
+        "health_sweep_interval_s",
+    }
+    assert set(fields) | hidden == set(m["config"])
+    assert set(fields).isdisjoint(hidden)
+    assert set(LIVE_KNOBS) <= set(fields)
     for key, spec in fields.items():
-        want = "bool" if key in LIVE_BOOL_KNOBS else ("string" if key in LIVE_STR_KNOBS else "number")
-        assert spec["type"] == want, key
+        assert bool(spec.get("restart", False)) is (key not in LIVE_KNOBS), key
         assert spec["label"] and spec["description"], key
         assert key in m["config"], f"{key} has no manifest default"
+    for key in LIVE_KNOBS:
+        want = "bool" if key in LIVE_BOOL_KNOBS else ("string" if key in LIVE_STR_KNOBS else "number")
+        assert fields[key]["type"] == want, key
 
 
-def test_manifest_min_host_version_covers_the_reload_hook():
-    """register_surface(reload=) landed in protoAgent v0.31.0 (#509/#511); an older
-    host raises TypeError on the kwarg and the loop never registers."""
+def test_manifest_declares_the_ordered_tabbed_config_contract():
+    m = _manifest()
+    assert m["settings_tabs"] == [
+        {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
+        {"id": "automation", "label": "Automation"},
+        {"id": "review", "label": "Review & merge"},
+        {"id": "advanced", "label": "Advanced"},
+    ]
+    schema_tabs = {t["id"] for t in m["settings_tabs"] if "path" not in t}
+    assert {field["tab"] for field in m["settings"]} <= schema_tabs
+    assert {field["tab"] for field in m["settings"]} == schema_tabs
+    assert next(field for field in m["settings"] if field["key"] == "webhook_secret")["type"] == "secret"
+
+
+def test_manifest_min_host_version_covers_tabbed_plugin_config():
+    """The tab contract lands in protoAgent 0.154.0 (#3179/#3180)."""
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     major, minor, *_ = (int(x) for x in str(m["min_protoagent_version"]).split("."))
-    assert (major, minor) >= (0, 31)
+    assert (major, minor) >= (0, 154)

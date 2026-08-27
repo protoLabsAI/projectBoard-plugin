@@ -176,6 +176,72 @@ def test_board_view_is_served_on_the_declared_public_path(monkeypatch):
     assert c.get("/api/plugins/project_board/board").status_code == 404
 
 
+def test_projects_config_page_is_public_but_its_data_routes_are_not(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    page = c.get("/plugins/project_board/config/projects")
+    assert page.status_code == 200 and "Boarded projects" in page.text
+    assert c.get("/plugins/project_board/projects").status_code == 404
+    assert c.put("/plugins/project_board/projects/demo", json={"repo": "/repo"}).status_code == 404
+
+
+def test_projects_data_route_reads_live_registry_not_router_config(monkeypatch):
+    import project_board.project_registry as registry
+
+    monkeypatch.setattr(
+        registry,
+        "project_registry_snapshot",
+        lambda: {"projects": [{"name": "live"}], "default_project": "live", "onboarding": {}},
+    )
+    c = _client(monkeypatch, FakeStore(), cfg={"projects": {"stale": {"repo": "/old"}}})
+    assert c.get("/api/plugins/project_board/projects").json()["projects"] == [{"name": "live"}]
+
+
+def test_project_put_uses_shared_registry_mutation(monkeypatch):
+    import project_board.project_registry as registry
+
+    seen = {}
+
+    async def save(name, repo, **kwargs):
+        seen.update(name=name, repo=repo, **kwargs)
+        return {"project": name, "entry": {"repo": repo}, "created": True, "default_project": name}
+
+    monkeypatch.setattr(registry, "upsert_project", save)
+    c = _client(monkeypatch, FakeStore())
+    response = c.put(
+        "/api/plugins/project_board/projects/demo",
+        json={"repo": "/dev/demo", "base_branch": "trunk", "make_default": True},
+    )
+    assert response.status_code == 200 and response.json()["ok"] is True
+    assert seen == {
+        "name": "demo",
+        "repo": "/dev/demo",
+        "base_branch": "trunk",
+        "local_gate_cmd": "",
+        "repo_conventions": "",
+        "make_default": True,
+        "replace_optional": True,
+    }
+
+
+def test_project_delete_refuses_an_active_card_before_config_mutation(monkeypatch):
+    import project_board.project_registry as registry
+
+    store = FakeStore()
+    store.list_features = lambda state=None, include_archived=False: [
+        {"id": "bd-live", "project": "demo", "board_state": "in_progress"},
+        {"id": "bd-old", "project": "demo", "board_state": "done"},
+    ]
+
+    async def should_not_run(_name):
+        raise AssertionError("delete_project must not run while an active card references the project")
+
+    monkeypatch.setattr(registry, "delete_project", should_not_run)
+    c = _client(monkeypatch, store)
+    response = c.delete("/api/plugins/project_board/projects/demo")
+    assert response.status_code == 409
+    assert "bd-live" in response.json()["detail"] and "bd-old" not in response.json()["detail"]
+
+
 def test_manifest_view_path_matches_the_served_route():
     import yaml
 

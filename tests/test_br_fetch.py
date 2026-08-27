@@ -646,6 +646,6 @@ def test_loop_gate_rearms_the_fetch_and_br_autofetch_is_live(tmp_path, monkeypat
 def test_manifest_declares_br_autofetch_on_by_default_and_live():
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     assert m["config"]["br_autofetch"] is True
-    assert m["version"] == "0.43.0"
+    assert tuple(int(part) for part in m["version"].split(".")) >= (0, 43, 0)
     field = next(s for s in m["settings"] if s["key"] == "br_autofetch")
     assert field["type"] == "bool" and "github.com" in field["description"]

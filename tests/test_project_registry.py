@@ -11,6 +11,7 @@ idempotency (re-registering updates rather than duplicating).
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import types
@@ -18,7 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from project_registry import _raw_projects, _resolve_under, build_register_tool
+from project_registry import (
+    _raw_projects,
+    _resolve_under,
+    build_register_tool,
+    delete_project,
+    project_registry_snapshot,
+    upsert_project,
+)
 
 
 def _git_repo(path: Path) -> Path:
@@ -206,3 +214,92 @@ async def test_register_does_not_claim_success_when_host_ok_did_not_persist(monk
 
     assert result.startswith("Error:")
     assert "live config readback failed" in result and "no success was assumed" in result
+
+
+async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={
+            "project_board": {
+                "projects": {
+                    "alpha": {"repo": str(repo), "coders": {"smart": "proto"}, "local_gate_cmd": "old"},
+                    "beta": {"repo": "/b"},
+                }
+            }
+        },
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await upsert_project("alpha", str(repo), local_gate_cmd="", replace_optional=True)
+
+    projects = cfg.plugin_config["project_board"]["projects"]
+    assert set(projects) == {"alpha", "beta"}
+    assert projects["alpha"]["coders"] == {"smart": "proto"}
+    assert "local_gate_cmd" not in projects["alpha"]
+
+
+def test_registry_snapshot_names_but_does_not_return_file_only_values(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={
+            "project_board": {
+                "default_project": "alpha",
+                "projects": {"alpha": {"repo": "/dev/a", "coders": {"opus": "secret-agent-name"}}},
+            }
+        },
+    )
+    _wire_host(monkeypatch, cfg, lambda _patch: (True, []))
+
+    snapshot = project_registry_snapshot()
+    assert snapshot["default_project"] == "alpha"
+    assert snapshot["projects"][0]["extra_fields"] == ["coders"]
+    assert "coders" not in snapshot["projects"][0]
+    assert "secret-agent-name" not in str(snapshot)
+
+
+async def test_simultaneous_upserts_serialize_the_live_read_merge_write(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    a, b = _git_repo(root / "a"), _git_repo(root / "b")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await asyncio.gather(upsert_project("a", str(a)), upsert_project("b", str(b)))
+    assert set(cfg.plugin_config["project_board"]["projects"]) == {"a", "b"}
+
+
+async def test_delete_reassigns_a_deleted_default_to_the_only_survivor(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={
+            "project_board": {
+                "default_project": "alpha",
+                "projects": {"alpha": {"repo": "/a"}, "beta": {"repo": "/b"}},
+            }
+        },
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await delete_project("alpha")
+    assert cfg.plugin_config["project_board"]["projects"] == {"beta": {"repo": "/b"}}
+    assert cfg.plugin_config["project_board"]["default_project"] == "beta"

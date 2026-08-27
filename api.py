@@ -56,6 +56,7 @@ def build_router(cfg: dict):
     from fastapi.responses import HTMLResponse
 
     from .board_view import BOARD_PAGE
+    from .projects_view import PROJECTS_PAGE
 
     router = APIRouter()
 
@@ -66,6 +67,15 @@ def build_router(cfg: dict):
     @router.get("/board", response_class=HTMLResponse)
     async def _board():
         return HTMLResponse(BOARD_PAGE)
+
+    @router.get("/config/projects", response_class=HTMLResponse)
+    async def _projects_config():
+        """Public page chrome for the sandboxed Configure tab.
+
+        It contains no config data; every read and mutation goes through the
+        operator-bearer-gated ``/api/plugins/project_board/projects`` routes.
+        """
+        return HTMLResponse(PROJECTS_PAGE)
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
@@ -248,6 +258,57 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             return fn()
         except BoardError as e:
             raise HTTPException(400, str(e))
+
+    @router.get("/projects")
+    async def _projects():
+        """Live project config for the custom Configure tab (no router snapshot)."""
+        from .project_registry import project_registry_snapshot
+
+        return project_registry_snapshot()
+
+    @router.put("/projects/{name}")
+    async def _put_project(name: str, body: dict = Body(default={})):
+        """Add/update one boarded repo through the same bounded seam as the agent tool."""
+        from .project_registry import ProjectRegistryError, upsert_project
+
+        try:
+            result = await upsert_project(
+                name,
+                str((body or {}).get("repo") or ""),
+                base_branch=str((body or {}).get("base_branch") or "main"),
+                local_gate_cmd=str((body or {}).get("local_gate_cmd") or ""),
+                repo_conventions=str((body or {}).get("repo_conventions") or ""),
+                make_default=bool((body or {}).get("make_default", False)),
+                replace_optional=True,
+            )
+        except ProjectRegistryError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, **result}
+
+    @router.delete("/projects/{name}")
+    async def _delete_project(name: str):
+        """Delete a project only after proving no active board card references it."""
+        from .project_registry import ProjectRegistryError, delete_project
+
+        try:
+            features = await asyncio.to_thread(store().list_features, include_archived=True)
+        except BoardError as exc:
+            raise HTTPException(409, f"cannot prove project {name!r} is unused: {exc}")
+        terminal = {"done", "cancelled"}
+        references = [
+            str(f.get("id") or "")
+            for f in features
+            if str(f.get("project") or "") == name and str(f.get("board_state") or f.get("state") or "") not in terminal
+        ]
+        if references:
+            sample = ", ".join(references[:5])
+            more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
+            raise HTTPException(409, f"project {name!r} is still referenced by board card(s): {sample}{more}")
+        try:
+            result = await delete_project(name)
+        except ProjectRegistryError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, **result}
 
     @router.get("/status")
     async def _status():

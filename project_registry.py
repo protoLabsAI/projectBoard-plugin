@@ -38,14 +38,34 @@ that gets expanded before it reaches here.
 
 from __future__ import annotations
 
-import logging
+import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 #: Fields an operator writes by hand today, and the only ones this tool sets.
 _ENTRY_FIELDS = ("repo", "base_branch", "local_gate_cmd", "repo_conventions")
+_PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_MUTATION_LOCK = asyncio.Lock()
+
+
+class ProjectRegistryError(ValueError):
+    """An operator-actionable project registry refusal."""
+
+
+def _live_section() -> dict[str, Any]:
+    """The live ``project_board`` section, read afresh for every operation."""
+    try:
+        from graph.sdk import config as host_config
+
+        live = host_config()
+        plugin_config = getattr(live, "plugin_config", None)
+        section = plugin_config.get("project_board") if isinstance(plugin_config, dict) else None
+        if section is None:
+            section = getattr(live, "project_board", None)
+    except Exception:  # noqa: BLE001 — no host (tests, CLI)
+        return {}
+    return dict(section) if isinstance(section, dict) else {}
 
 
 def _host_onboarding() -> tuple[bool, str]:
@@ -93,24 +113,155 @@ def _raw_projects() -> dict[str, Any]:
     the flat keys when no map is declared, and writing a synthesized entry back would
     persist a default the operator never wrote — turning an additive register into a
     silent config rewrite."""
-    try:
-        from graph.sdk import config as host_config
-
-        live = host_config()
-        plugin_config = getattr(live, "plugin_config", None)
-        section = plugin_config.get("project_board") if isinstance(plugin_config, dict) else None
-        # Compatibility with small host stubs and older embeddings that exposed a
-        # plugin section directly. The production LangGraphConfig contract is the
-        # plugin_config mapping above.
-        if section is None:
-            section = getattr(live, "project_board", None)
-        section = section or {}
-    except Exception:  # noqa: BLE001
-        return {}
-    if not isinstance(section, dict):
-        return {}
+    section = _live_section()
     projects = section.get("projects") or {}
     return dict(projects) if isinstance(projects, dict) else {}
+
+
+def project_registry_snapshot() -> dict[str, Any]:
+    """Public-safe live registry data for the authenticated console editor.
+
+    Only the fields the editor owns are returned. Unknown/per-project advanced keys
+    are named (so the operator knows they exist) but their values remain file-only;
+    an editor save preserves them byte-for-byte.
+    """
+    section = _live_section()
+    projects = _raw_projects()
+    rows = []
+    for name in sorted(projects):
+        raw = projects[name] if isinstance(projects[name], dict) else {}
+        row = {"name": name, **{key: raw.get(key, "") for key in _ENTRY_FIELDS}}
+        row["extra_fields"] = sorted(set(raw) - set(_ENTRY_FIELDS))
+        rows.append(row)
+    enabled, root = _host_onboarding()
+    return {
+        "projects": rows,
+        "default_project": str(section.get("default_project") or ""),
+        "onboarding": {"enabled": enabled, "root": root},
+    }
+
+
+def _validate_name(name: str) -> str:
+    project = str(name or "").strip()
+    if not project:
+        raise ProjectRegistryError("name is required — it is the key features carry")
+    if not _PROJECT_NAME.fullmatch(project):
+        raise ProjectRegistryError(
+            "name must start with a letter or number and contain only letters, numbers, hyphens, or underscores"
+        )
+    return project
+
+
+async def _apply_registry(
+    projects: dict[str, Any],
+    *,
+    expected: dict[str, dict[str, Any]] | None = None,
+    absent: set[str] | None = None,
+    default_project: str | None = None,
+) -> None:
+    """Apply a complete registry and prove the intended live state landed."""
+    from graph.plugins.host import HOST
+
+    if HOST.apply_settings is None:
+        raise ProjectRegistryError("project changes are unavailable — the host is not wired for config apply")
+
+    section: dict[str, Any] = {"projects": projects}
+    if default_project is not None:
+        section["default_project"] = default_project
+    ok, messages = await asyncio.to_thread(HOST.apply_settings, {"project_board": section})
+    if not ok:
+        raise ProjectRegistryError("; ".join(messages) or "the host refused the config update")
+
+    persisted = _raw_projects()
+    missing = sorted(set(projects) - set(persisted))
+    unexpected = sorted((absent or set()) & set(persisted))
+    mismatched = []
+    for name, fields in (expected or {}).items():
+        landed = persisted.get(name)
+        for key, value in fields.items():
+            if not isinstance(landed, dict) or landed.get(key) != value:
+                mismatched.append(f"{name}.{key}")
+    if missing or unexpected or mismatched:
+        detail = []
+        if missing:
+            detail.append("missing project(s): " + ", ".join(missing))
+        if unexpected:
+            detail.append("deleted project(s) still present: " + ", ".join(unexpected))
+        if mismatched:
+            detail.append("fields did not persist: " + ", ".join(mismatched))
+        raise ProjectRegistryError(
+            "the host reported success, but live config readback failed ("
+            + "; ".join(detail)
+            + "); no success was assumed"
+        )
+    if default_project is not None and str(_live_section().get("default_project") or "") != default_project:
+        raise ProjectRegistryError("the host reported success, but the default project did not persist")
+
+
+async def upsert_project(
+    name: str,
+    repo: str,
+    *,
+    base_branch: str = "main",
+    local_gate_cmd: str = "",
+    repo_conventions: str = "",
+    make_default: bool = False,
+    replace_optional: bool = False,
+) -> dict[str, Any]:
+    """Add/update one project while preserving siblings and unowned entry fields."""
+    project = _validate_name(name)
+    if not str(repo or "").strip():
+        raise ProjectRegistryError("repo is required — it is the checkout the board builds in")
+    enabled, root = _host_onboarding()
+    if not enabled:
+        raise ProjectRegistryError(
+            "project onboarding is off — enable Settings ▸ Project onboarding before changing boarded repos"
+        )
+    repo_p, err = _resolve_under(root, repo)
+    if err:
+        raise ProjectRegistryError(err)
+
+    async with _MUTATION_LOCK:
+        existing = _raw_projects()
+        prior = existing.get(project)
+        entry = dict(prior) if isinstance(prior, dict) else {}
+        entry.update({"repo": str(repo_p), "base_branch": str(base_branch or "main").strip() or "main"})
+        optional = {
+            "local_gate_cmd": str(local_gate_cmd or "").strip(),
+            "repo_conventions": str(repo_conventions or "").strip(),
+        }
+        for key, value in optional.items():
+            if value:
+                entry[key] = value
+            elif replace_optional:
+                entry.pop(key, None)
+        merged = dict(existing)
+        merged[project] = entry
+        if not set(existing) <= set(merged):
+            raise ProjectRegistryError("internal safety check failed — the update would drop a sibling project")
+        default = project if make_default else None
+        await _apply_registry(merged, expected={project: entry}, default_project=default)
+        return {
+            "project": project,
+            "entry": entry,
+            "created": project not in existing,
+            "default_project": default,
+        }
+
+
+async def delete_project(name: str) -> dict[str, Any]:
+    """Delete a project after its caller has proved no active card references it."""
+    project = _validate_name(name)
+    async with _MUTATION_LOCK:
+        existing = _raw_projects()
+        if project not in existing:
+            raise ProjectRegistryError(f"unknown project {project!r}")
+        merged = dict(existing)
+        merged.pop(project)
+        current_default = str(_live_section().get("default_project") or "")
+        default = (next(iter(merged)) if len(merged) == 1 else "") if current_default == project else None
+        await _apply_registry(merged, absent={project}, default_project=default)
+        return {"project": project, "deleted": True, "default_project": default}
 
 
 def build_register_tool(cfg: dict):
@@ -149,70 +300,18 @@ def build_register_tool(cfg: dict):
 
         Returns a line naming what was registered, or an error naming the bound it hit.
         """
-        project = (name or "").strip()
-        if not project:
-            return "Error: name is required — it's the key features carry."
-        if not (repo or "").strip():
-            return "Error: repo is required — the path to the checkout on disk."
-
-        enabled, root = _host_onboarding()
-        if not enabled:
-            return (
-                "Error: project onboarding is off, so there is no consented space to register "
-                "within. An operator enables it under Settings ▸ Project onboarding "
-                "(onboarding.enabled) and sets onboarding.root."
+        try:
+            result = await upsert_project(
+                name,
+                repo,
+                base_branch=base_branch,
+                local_gate_cmd=local_gate_cmd,
+                repo_conventions=repo_conventions,
             )
-
-        repo_p, err = _resolve_under(root, repo)
-        if err:
-            return f"Error: {err}."
-
-        existing = _raw_projects()
-        entry = {"repo": str(repo_p), "base_branch": (base_branch or "main").strip()}
-        if local_gate_cmd.strip():
-            entry["local_gate_cmd"] = local_gate_cmd.strip()
-        if repo_conventions.strip():
-            entry["repo_conventions"] = repo_conventions.strip()
-
-        updating = project in existing
-        merged = dict(existing)
-        merged[project] = entry
-
-        # A register must never DROP a sibling — the #2556 shape, where a replace-all
-        # write quietly removed roots and still answered ok.
-        if not set(existing) <= set(merged):
-            log.error("[project_board] refusing to apply: merge would drop an existing project")
-            return "Error: internal safety check failed — registration would have dropped a project; aborted."
-
-        from graph.plugins.host import HOST
-
-        if HOST.apply_settings is None:
-            return "Error: registration is unavailable — the host isn't wired for config apply (no running server)."
-        import asyncio
-
-        ok, messages = await asyncio.to_thread(HOST.apply_settings, {"project_board": {"projects": merged}})
-        if not ok:
-            return f"Error: registering {project} failed: {'; '.join(messages) or 'unknown error'}"
-
-        # apply_settings is synchronous with the graph reload. Never report success
-        # merely because the host returned ok: read the live config back and prove
-        # both the requested entry and every sibling survived the write.
-        persisted = _raw_projects()
-        missing_siblings = sorted(set(existing) - set(persisted))
-        landed = persisted.get(project)
-        mismatched = [key for key, value in entry.items() if not isinstance(landed, dict) or landed.get(key) != value]
-        if missing_siblings or mismatched:
-            detail = []
-            if missing_siblings:
-                detail.append("dropped sibling(s): " + ", ".join(missing_siblings))
-            if mismatched:
-                detail.append("entry did not persist field(s): " + ", ".join(mismatched))
-            return (
-                f"Error: the host reported that project {project!r} was saved, but live config readback failed "
-                f"({'; '.join(detail)}). Registration is not active; no success was assumed."
-            )
-
-        verb = "Updated" if updating else "Registered"
+        except ProjectRegistryError as exc:
+            return f"Error: {exc}."
+        project, entry = result["project"], result["entry"]
+        verb = "Registered" if result["created"] else "Updated"
         gate = "its own gate" if entry.get("local_gate_cmd") else "the default gate"
         conv = "with conventions" if entry.get("repo_conventions") else "WITHOUT conventions"
         note = (
@@ -221,7 +320,7 @@ def build_register_tool(cfg: dict):
             else " — add repo_conventions before dispatching, or the coder will guess this repo's rules"
         )
         return (
-            f"{verb} board project '{project}' → {repo_p} (base {entry['base_branch']}, "
+            f"{verb} board project '{project}' → {entry['repo']} (base {entry['base_branch']}, "
             f"{gate}, {conv}). The running board applied it live; no restart is required.{note}"
         )
 
