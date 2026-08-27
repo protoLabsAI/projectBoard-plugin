@@ -199,6 +199,56 @@ def test_projects_data_route_reads_live_registry_not_router_config(monkeypatch):
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_projects_data_route_surfaces_live_config_read_failure(monkeypatch):
+    import project_board.project_registry as registry
+
+    monkeypatch.setattr(
+        registry,
+        "project_registry_snapshot",
+        lambda: (_ for _ in ()).throw(registry.ProjectRegistryError("live config unavailable")),
+    )
+    response = _client(monkeypatch, FakeStore()).get("/api/plugins/project_board/projects")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "live config unavailable"
+
+
+def test_existing_data_router_constructs_the_first_store_with_live_project_routing(monkeypatch):
+    live_cfg = types.SimpleNamespace(
+        plugin_config={
+            "project_board": {
+                "projects": {"new": {"repo": "/new", "base_branch": "develop"}},
+                "default_project": "new",
+            }
+        }
+    )
+    fake_sdk = types.ModuleType("graph.sdk")
+    fake_sdk.config = lambda: live_cfg
+    monkeypatch.setitem(sys.modules, "graph.sdk", fake_sdk)
+    seen = []
+    board = FakeStore()
+    board.reconfigure_projects = lambda projects, default: seen.append(("reconfigure", projects, default))
+
+    def get_store(**kwargs):
+        seen.append(("construct", kwargs))
+        return board
+
+    monkeypatch.setattr(api, "get_store", get_store)
+    app = FastAPI()
+    app.include_router(
+        api.build_data_router({"projects": {"old": {"repo": "/old"}}, "default_project": "old"}),
+        prefix="/api/plugins/project_board",
+    )
+
+    response = TestClient(app).get("/api/plugins/project_board/features")
+
+    assert response.status_code == 200
+    constructed = next(event[1] for event in seen if event[0] == "construct")
+    assert constructed["projects"] == {"new": {"name": "new", "repo": "/new", "base_branch": "develop"}}
+    assert constructed["default_project"] == "new"
+    assert ("reconfigure", constructed["projects"], "new") in seen
+
+
 def test_project_put_uses_shared_registry_mutation(monkeypatch):
     import project_board.project_registry as registry
 
@@ -252,7 +302,7 @@ def test_project_delete_refuses_an_active_card_before_config_mutation(monkeypatc
     ]
 
     async def guarded_delete(name, *, assert_unused):
-        await assert_unused(name)
+        await assert_unused(name, "")
         raise AssertionError("config mutation must not run after the active-card check refuses")
 
     monkeypatch.setattr(registry, "delete_project", guarded_delete)
@@ -260,6 +310,25 @@ def test_project_delete_refuses_an_active_card_before_config_mutation(monkeypatc
     response = c.delete("/api/plugins/project_board/projects/demo")
     assert response.status_code == 409
     assert "bd-live" in response.json()["detail"] and "bd-old" not in response.json()["detail"]
+
+
+def test_project_delete_refuses_an_unlabelled_active_card_using_the_effective_default(monkeypatch):
+    import project_board.project_registry as registry
+
+    store = FakeStore()
+    store.list_features = lambda state=None, include_archived=False: [
+        {"id": "bd-legacy", "project": "", "board_state": "ready"},
+    ]
+
+    async def guarded_delete(name, *, assert_unused):
+        await assert_unused(name, "demo")
+        raise AssertionError("config mutation must not run after the active-card check refuses")
+
+    monkeypatch.setattr(registry, "delete_project", guarded_delete)
+    response = _client(monkeypatch, store).delete("/api/plugins/project_board/projects/demo")
+
+    assert response.status_code == 409
+    assert "bd-legacy" in response.json()["detail"]
 
 
 def test_manifest_view_path_matches_the_served_route():

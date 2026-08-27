@@ -27,6 +27,7 @@ def test_projects_page_uses_the_fleet_safe_authenticated_plugin_kit():
 
 
 def test_projects_page_has_explicit_failure_retry_busy_and_delete_confirmation_states():
+    assert "[hidden]{display:none!important}" in PROJECTS_PAGE
     assert 'id="retry"' in PROJECTS_PAGE
     assert 'role="alert"' in PROJECTS_PAGE
     assert 'setAttribute("aria-busy"' in PROJECTS_PAGE
@@ -35,6 +36,8 @@ def test_projects_page_has_explicit_failure_retry_busy_and_delete_confirmation_s
     assert 'id="add" class="btn primary" type="button" disabled' in PROJECTS_PAGE
     assert 'id="editor-fields"' in PROJECTS_PAGE
     assert 'event.key === "Escape"' in PROJECTS_PAGE
+    assert 'id="page-title" tabindex="-1"' in PROJECTS_PAGE
+    assert 'h2 tabindex="-1"' in PROJECTS_PAGE
 
 
 def test_projects_page_uses_strict_default_intent_and_no_unauthenticated_fetch_fallback():
@@ -43,6 +46,9 @@ def test_projects_page_uses_strict_default_intent_and_no_unauthenticated_fetch_f
     assert "apiFetch:(p,i)=>fetch" not in PROJECTS_PAGE
     assert "Could not load the authenticated plugin bridge" in PROJECTS_PAGE
     assert "setTimeout(boot" not in PROJECTS_PAGE
+    assert "state.projects.length === 0" in PROJECTS_PAGE
+    assert "state.projects.length === 1" in PROJECTS_PAGE
+    assert "The only project is always the default." in PROJECTS_PAGE
 
 
 def test_projects_page_protects_malformed_entries_and_formats_api_validation_errors():

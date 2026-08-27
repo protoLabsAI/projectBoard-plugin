@@ -70,7 +70,7 @@ function render(){
     const editable = project.editable !== false;
     const extras = project.extra_fields?.length ? `<div class="pl-callout">Preserved file-only fields: ${esc(project.extra_fields.join(", "))}</div>` : "";
     const malformed = editable ? "" : '<div class="pl-callout pl-callout--warning">This entry is not a mapping. Repair it in YAML or delete it; the editor will not overwrite it.</div>';
-    return `<article class="panel project" data-name="${esc(project.name)}"><div class="row"><h2>${esc(project.name)}</h2>${isDefault?'<span class="badge">default</span>':""}</div>
+    return `<article class="panel project" data-name="${esc(project.name)}"><div class="row"><h2 tabindex="-1">${esc(project.name)}</h2>${isDefault?'<span class="badge">default</span>':""}</div>
       <dl class="meta"><dt>Repository</dt><dd>${esc(project.repo || "Not configured")}</dd><dt>Base branch</dt><dd>${esc(project.base_branch || "main")}</dd><dt>Local gate</dt><dd>${esc(project.local_gate_cmd || "Inherited / none")}</dd></dl>${extras}${malformed}
       <div class="actions"><button type="button" class="btn" data-edit="${esc(project.name)}" data-editable="${editable}" aria-label="Edit ${esc(project.name)}">Edit</button><button type="button" class="btn danger" data-delete="${esc(project.name)}" aria-label="Delete ${esc(project.name)}">Delete</button></div></article>`;
   }).join("");
@@ -103,7 +103,8 @@ function openEditor(project){
     $("base").value = editing ? (project.base_branch || "main") : "main";
     $("gate").value = editing ? (project.local_gate_cmd || "") : "";
     $("conventions").value = editing ? (project.repo_conventions || "") : "";
-    $("default").checked = editing && project.name === state.default_project;
+    $("default").checked = editing ? project.name === state.default_project : state.projects.length === 0;
+    $("default").disabled = editing && state.projects.length === 1;
     $("editor").hidden = false;
     (editing ? $("repo") : $("name")).focus();
   }
@@ -115,7 +116,10 @@ function closeEditor(restoreFocus=true, force=false){
 }
 function focusProject(name){
   const target = [...$("projects").querySelectorAll("[data-edit]")].find((button) => button.dataset.edit === name);
-  (target || $("add")).focus();
+  const heading = target?.closest(".project")?.querySelector("h2");
+  const fallback = [...$("projects").querySelectorAll("button")].find((button) => !button.disabled)
+    || (!$("add").disabled ? $("add") : $("page-title"));
+  (target && !target.disabled ? target : heading || fallback).focus();
 }
 
 $("add").addEventListener("click", (event) => { lastTrigger = event.currentTarget; openEditor(null); });
@@ -148,7 +152,7 @@ $("projects").addEventListener("click", async (event) => {
     mutating = false;
     if (applied) render();
     else { button.textContent = "Delete"; button.closest(".project")?.removeAttribute("aria-busy"); syncControls(); }
-    if (applied) $("add").focus();
+    if (applied) focusProject("");
   }
 });
 $("form").addEventListener("submit", async (event) => {

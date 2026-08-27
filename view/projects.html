@@ -10,7 +10,7 @@ var BASE = location.pathname.split("/plugins/")[0];
 <main id="app" class="wrap">
   <div id="notice" class="pl-callout" hidden role="status" aria-live="polite"><span id="notice-text"></span></div>
   <div class="head">
-    <div><h1>Boarded projects</h1><p>Repos this board may dispatch work into. Changes apply live.</p></div>
+    <div><h1 id="page-title" tabindex="-1">Boarded projects</h1><p>Repos this board may dispatch work into. Changes apply live.</p></div>
     <button id="add" class="btn primary" type="button" disabled>Add project</button>
   </div>
   <div id="onboarding" class="pl-callout pl-callout--warning" hidden></div>
@@ -27,7 +27,7 @@ var BASE = location.pathname.split("/plugins/")[0];
         <label>Base branch<input id="base" name="base_branch" type="text" value="main" required maxlength="255" autocomplete="off"></label>
         <label>Local gate command<input id="gate" name="local_gate_cmd" type="text" maxlength="8192" autocomplete="off"><small>Optional repo-specific fast test/lint gate.</small></label>
         <label>Repository conventions<textarea id="conventions" name="repo_conventions" rows="4" maxlength="32768"></textarea><small>Rules injected into coder dispatches: test, changelog, and import conventions.</small></label>
-        <label class="check"><input id="default" name="make_default" type="checkbox"> Use for new cards that do not name a project</label>
+        <label class="check"><input id="default" name="make_default" type="checkbox"> Use for new cards that do not name a project <small>The only project is always the default.</small></label>
         <div class="actions"><button id="save" class="btn primary" type="submit">Save project</button></div>
       </fieldset>
     </form>

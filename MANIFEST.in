@@ -1,5 +1,4 @@
-# The console board view (board_view.py) is assembled at import time from three
-# source files under view/ (board.html + board.css + board.js). They are NOT .py
-# files, so an sdist would drop them without this include — keep them packaged so
-# the drop-in plugin can still render its /board page.
+# The board and Configure views are assembled at import time from source files
+# under view/. They are NOT .py files, so an sdist would drop them without this
+# include — keep both sandboxed pages renderable from an installed plugin.
 recursive-include view *.html *.css *.js

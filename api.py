@@ -266,7 +266,31 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
     def store():
-        return get_store(**store_kw)
+        # Existing routers stay mounted across a host config reload, so their
+        # construction-time `cfg` is stale. Project routing is explicitly live:
+        # resolve that complete unit afresh before the first post-edit store is
+        # constructed (and reconfigure an existing shared store). Boot-only
+        # db/repo/base remain pinned in `store_kw` as promised by the manifest.
+        current = dict(store_kw)
+        try:
+            from .project_registry import _live_section
+
+            live = _live_section(required=True)
+            candidate = dict(cfg or {})
+            if "projects" in live:
+                candidate["projects"] = live.get("projects")
+            if "default_project" in live:
+                candidate["default_project"] = live.get("default_project")
+            current["projects"] = resolve_projects(candidate)
+            current["default_project"] = resolve_default_project(candidate)
+        except Exception:  # noqa: BLE001 — retain the last validated routing unit
+            pass
+        board = get_store(**current)
+        reconfigure = getattr(board, "reconfigure_projects", None)
+        if callable(reconfigure):
+            reconfigure(current["projects"], current["default_project"])
+        store_kw.update(projects=current["projects"], default_project=current["default_project"])
+        return board
 
     def _guard(fn):
         try:
@@ -277,9 +301,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.get("/projects")
     async def _projects():
         """Live project config for the custom Configure tab (no router snapshot)."""
-        from .project_registry import project_registry_snapshot
+        from .project_registry import ProjectRegistryError, project_registry_snapshot
 
-        return JSONResponse(project_registry_snapshot(), headers={"Cache-Control": "no-store"})
+        try:
+            snapshot = project_registry_snapshot()
+        except ProjectRegistryError as exc:
+            raise HTTPException(503, str(exc))
+        return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
     @router.put("/projects/{name}")
     async def _put_project(name: str, body: ProjectUpsertBody):
@@ -306,7 +334,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         """Delete a project only after proving no active board card references it."""
         from .project_registry import ProjectRegistryConflict, ProjectRegistryError, delete_project
 
-        async def assert_unused(project: str) -> None:
+        async def assert_unused(project: str, effective_default: str) -> None:
             try:
                 features = await asyncio.to_thread(store().list_features, include_archived=True)
             except BoardError as exc:
@@ -315,7 +343,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             references = [
                 str(f.get("id") or "")
                 for f in features
-                if str(f.get("project") or "") == project
+                if (
+                    str(f.get("project") or "") == project
+                    or (not str(f.get("project") or "") and effective_default == project)
+                )
                 and str(f.get("board_state") or f.get("state") or "") not in terminal
             ]
             if references:

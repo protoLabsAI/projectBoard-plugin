@@ -241,8 +241,11 @@ by operator intent:
   Add/update preserves sibling projects and file-only per-project fields without
   returning those fields' values to the browser, then reads live config back before
   reporting success. Malformed non-mapping entries stay visible but read-only until
-  repaired in YAML. Delete requires explicit confirmation and is refused while an
-  active board card still names that project.
+  repaired in YAML (the API refuses to overwrite them too). A sole project is the
+  runtime's implicit default; adding a second preserves that choice explicitly, and
+  the sole default cannot be misleadingly “cleared.” Delete requires explicit
+  confirmation and is refused while an active board card names that project—or while
+  a legacy unlabelled active card routes through it as the effective default.
 - **Automation** contains the loop posture, coder, concurrency/back-pressure, local
   verification, and candidate-generation controls.
 - **Review & merge** contains review dispatch/gating, CI reconciliation, rebase,
