@@ -11,6 +11,7 @@ idempotency (re-registering updates rather than duplicating).
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import types
@@ -18,7 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from project_registry import _raw_projects, _resolve_under, build_register_tool
+from project_registry import (
+    ProjectRegistryError,
+    _raw_projects,
+    _resolve_under,
+    build_register_tool,
+    delete_project,
+    project_registry_snapshot,
+    upsert_project,
+)
 
 
 def _git_repo(path: Path) -> Path:
@@ -178,7 +187,7 @@ async def test_register_persists_superset_and_reports_live_without_restart(monke
 
     def apply_settings(patch):
         applied.append(patch)
-        cfg.plugin_config["project_board"]["projects"] = patch["project_board"]["projects"]
+        cfg.plugin_config["project_board"].update(patch["project_board"])
         return True, []
 
     _wire_host(monkeypatch, cfg, apply_settings)
@@ -206,3 +215,307 @@ async def test_register_does_not_claim_success_when_host_ok_did_not_persist(monk
 
     assert result.startswith("Error:")
     assert "live config readback failed" in result and "no success was assumed" in result
+
+
+async def test_register_does_not_claim_success_when_persistence_changes_a_sibling(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "beta")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": "/a", "coders": {"smart": "proto"}}}}},
+    )
+
+    def lossy_apply(patch):
+        landed = patch["project_board"]
+        cfg.plugin_config["project_board"].update(landed)
+        cfg.plugin_config["project_board"]["projects"]["alpha"].pop("coders")
+        return True, []
+
+    _wire_host(monkeypatch, cfg, lossy_apply)
+    tool = build_register_tool({})
+    result = await tool.ainvoke({"name": "beta", "repo": str(repo)})
+
+    assert result.startswith("Error:")
+    assert "project entries changed during persistence: alpha" in result
+
+
+async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={
+            "project_board": {
+                "projects": {
+                    "alpha": {"repo": str(repo), "coders": {"smart": "proto"}, "local_gate_cmd": "old"},
+                    "beta": {"repo": "/b"},
+                }
+            }
+        },
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    result = await upsert_project("alpha", str(repo), local_gate_cmd="", replace_optional=True)
+
+    projects = cfg.plugin_config["project_board"]["projects"]
+    assert set(projects) == {"alpha", "beta"}
+    assert projects["alpha"]["coders"] == {"smart": "proto"}
+    assert "local_gate_cmd" not in projects["alpha"]
+    assert result["entry"]["extra_fields"] == ["coders"]
+    assert "coders" not in result["entry"]
+    assert "proto" not in str(result)
+
+
+def test_registry_snapshot_names_but_does_not_return_file_only_values(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={
+            "project_board": {
+                "default_project": "alpha",
+                "projects": {"alpha": {"repo": "/dev/a", "coders": {"opus": "secret-agent-name"}}},
+            }
+        },
+    )
+    _wire_host(monkeypatch, cfg, lambda _patch: (True, []))
+
+    snapshot = project_registry_snapshot()
+    assert snapshot["default_project"] == "alpha"
+    assert snapshot["projects"][0]["extra_fields"] == ["coders"]
+    assert "coders" not in snapshot["projects"][0]
+    assert "secret-agent-name" not in str(snapshot)
+
+
+def test_registry_snapshot_marks_malformed_file_only_entries_read_only(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={"project_board": {"projects": {"broken": "not-a-mapping"}}},
+    )
+    _wire_host(monkeypatch, cfg, lambda _patch: (True, []))
+    row = project_registry_snapshot()["projects"][0]
+    assert row["name"] == "broken" and row["editable"] is False
+    assert row["repo"] == "" and row["extra_fields"] == []
+
+
+def test_registry_snapshot_reports_the_runtime_effective_sole_default(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": "/dev/a"}}}},
+    )
+    _wire_host(monkeypatch, cfg, lambda _patch: (True, []))
+
+    assert project_registry_snapshot()["default_project"] == "alpha"
+
+
+async def test_simultaneous_upserts_serialize_the_live_read_merge_write(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    a, b = _git_repo(root / "a"), _git_repo(root / "b")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await asyncio.gather(upsert_project("a", str(a)), upsert_project("b", str(b)))
+    assert set(cfg.plugin_config["project_board"]["projects"]) == {"a", "b"}
+
+
+def test_registry_mutation_lock_is_process_stable_across_plugin_reload():
+    import project_registry as registry
+
+    assert sys.modules[registry._LOCK_SLOT].lock is registry._MUTATION_LOCK
+
+
+async def test_adding_a_second_project_preserves_the_implicit_sole_default(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    alpha, beta = _git_repo(root / "alpha"), _git_repo(root / "beta")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": str(alpha)}}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    result = await upsert_project("beta", str(beta))
+
+    assert result["default_project"] == "alpha"
+    assert cfg.plugin_config["project_board"]["default_project"] == "alpha"
+
+
+async def test_editor_refuses_to_overwrite_a_malformed_entry(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "broken")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {"broken": "not-a-mapping"}}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+
+    with pytest.raises(ProjectRegistryError, match="not a mapping"):
+        await upsert_project("broken", str(repo), replace_optional=True)
+    assert applied == []
+
+
+async def test_editor_fails_closed_when_the_live_projects_container_is_malformed(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": ["not", "a", "mapping"]}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+
+    with pytest.raises(ProjectRegistryError, match="projects is not a mapping"):
+        await upsert_project("alpha", str(repo))
+    assert applied == []
+
+
+async def test_queued_upsert_rechecks_live_onboarding_consent_inside_the_lock(monkeypatch, tmp_path):
+    import project_registry as registry
+
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+
+    class ConsentChangesBeforeEntry:
+        async def __aenter__(self):
+            cfg.onboarding_enabled = False
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(registry, "_MUTATION_LOCK", ConsentChangesBeforeEntry())
+
+    with pytest.raises(ProjectRegistryError, match="onboarding is off"):
+        await upsert_project("alpha", str(repo))
+    assert applied == []
+
+
+async def test_delete_reassigns_a_deleted_default_to_the_only_survivor(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={
+            "project_board": {
+                "default_project": "alpha",
+                "projects": {"alpha": {"repo": "/a"}, "beta": {"repo": "/b"}},
+            }
+        },
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await delete_project("alpha")
+    assert cfg.plugin_config["project_board"]["projects"] == {"beta": {"repo": "/b"}}
+    assert cfg.plugin_config["project_board"]["default_project"] == "beta"
+
+
+async def test_editor_refuses_to_claim_it_cleared_an_implicit_sole_default(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"default_project": "alpha", "projects": {"alpha": {"repo": str(repo)}}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    with pytest.raises(ProjectRegistryError, match="only project"):
+        await upsert_project("alpha", str(repo), clear_default=True)
+    assert cfg.plugin_config["project_board"]["default_project"] == "alpha"
+
+
+async def test_editor_can_clear_an_explicit_default_on_a_multi_project_board(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    alpha, beta = _git_repo(root / "alpha"), _git_repo(root / "beta")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={
+            "project_board": {
+                "default_project": "alpha",
+                "projects": {"alpha": {"repo": str(alpha)}, "beta": {"repo": str(beta)}},
+            }
+        },
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    result = await upsert_project("alpha", str(alpha), clear_default=True)
+
+    assert result["default_project"] == ""
+    assert cfg.plugin_config["project_board"]["default_project"] == ""
+
+
+async def test_invalid_base_branch_is_refused_before_config_apply(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+    with pytest.raises(ValueError, match="valid Git branch"):
+        await upsert_project("alpha", str(repo), base_branch="bad branch")
+    assert applied == []
+
+
+async def test_delete_runs_live_unused_check_inside_registry_mutation(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": "/a"}}}},
+    )
+    events = []
+
+    def apply_settings(patch):
+        events.append("apply")
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    async def assert_unused(name, effective_default):
+        events.append(f"check:{name}")
+        assert effective_default == "alpha"
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await delete_project("alpha", assert_unused=assert_unused)
+    assert events == ["check:alpha", "apply"]

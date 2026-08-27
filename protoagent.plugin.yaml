@@ -1,6 +1,6 @@
 id: project_board
 name: Project Board (coding orchestration)
-version: 0.43.0
+version: 0.44.0
 description: >-
   A board-driven coding-orchestration plugin: a lean 6-state board (backlog → ready
   → in_progress → in_review → done, + a blocked flag) backed by **beads** (`br`), an
@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.31.0"   # register_surface(reload=) — live knobs and project routing (#509/#511)
+min_protoagent_version: "0.154.0"  # settings_tabs + sandboxed custom Configure views (#3179/#3180)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
@@ -223,24 +223,73 @@ config:
                             # /features/<id>/ci, and /review. Blank → all three fail
                             # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.
 
-# Console Settings fields (ADR 0019) — rendered under Settings → Plugins → "Project Board".
-# ONLY the knobs the running loop re-applies on a config reload belong here (loop.py
-# LIVE_KNOBS, via register_surface(reload=)): a field the operator can edit but that
-# silently needs a restart is worse than no field. Saving writes `project_board.<key>`
-# to the agent layer; the reload hook applies it on the loop's next tick.
+# Configure-dialog information architecture (protoAgent #3179/#3180). `projects` is
+# plugin-owned UI because a keyed map is not an honest scalar field; the other tabs use
+# the generic schema renderer. min_protoagent_version keeps hosts without this contract
+# from loading a Configure surface they cannot render faithfully.
+settings_tabs:
+  - { id: projects, label: "Projects", path: /plugins/project_board/config/projects }
+  - { id: automation, label: "Automation" }
+  - { id: review, label: "Review & merge" }
+  - { id: security, label: "Security" }
+
+# Console settings. `restart: true` is deliberate: only LIVE_KNOBS are re-applied by
+# BoardLoop.reload; every other exposed scalar is useful/operator-safe but remains the
+# boot-time value until the member restarts. Structural routing lives in Projects, and
+# machine/internal tuning stays file-only (documented in README).
 settings:
-  - { key: br_autofetch, label: "Fetch br automatically", type: bool, group: "Project Board",
+  - { key: loop_enabled, label: "Run orchestration loop", type: bool, group: "Project Board", tab: automation, restart: true,
+      description: "Start the background puller after the member restarts. Off keeps the board and tools available without dispatching work." }
+  - { key: coder, label: "Coder delegate", type: string, group: "Project Board", tab: automation,
+      description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a paused loop resumes on its next check." }
+  - { key: br_autofetch, label: "Fetch br automatically", type: bool, group: "Project Board", tab: automation,
       description: "When the beads CLI (br) is not on PATH, download the pinned beads-rust release for this platform into the agent's data dir and use it (sha256-verified; needs github.com). Off = a missing br is a setup gap with the manual install hint. Applies live on save." }
-  - { key: coder, label: "Coder delegate", type: string, group: "Project Board",
-      description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a loop paused on 'no coder configured' resumes on its next check — no restart." }
-  - { key: max_concurrent, label: "Parallel builds", type: number, group: "Project Board",
+  - { key: max_concurrent, label: "Parallel builds", type: number, minimum: 1, maximum: 64, group: "Project Board", tab: automation,
       description: "How many features the loop drives at once, each in its own worktree (1 = serial). Size it to the board's projects — one slot per repo keeps a deep queue in one project from starving the others. Applies live on save; lowering it never kills a running build, the loop just stops claiming until it is under the cap. Peak coder processes = this × coder_solve_k." }
-  - { key: max_concurrent_sessions, label: "Coder sessions per build", type: number, group: "Project Board",
+  - { key: max_concurrent_sessions, label: "Coder sessions per build", type: number, minimum: 0, maximum: 32, group: "Project Board", tab: automation,
       description: "Caps the best-of-k fan-out INSIDE one build (0 = unlimited within the k budget; 1 = generate candidates one at a time). Applies to the next dispatch. Host-wide peak ACP processes = Parallel builds × this." }
-  - { key: auto_merge, label: "Auto-merge green PRs", type: bool, group: "Project Board",
-      description: "Merge an in-review PR once every gate the loop runs is green and current: GitHub CLEAN (required checks + branch protection), the merged-state verdict stamped against the current base, and a clean review-gate verdict. Off = park green PRs for you to merge. Label a card merge-hold to exempt it. Applies live on save." }
-  - { key: max_pending_reviews, label: "Review-queue limit", type: number, group: "Project Board",
+  - { key: max_pending_reviews, label: "Review-queue limit", type: number, minimum: 0, maximum: 1000, group: "Project Board", tab: automation,
       description: "Back-pressure: stop claiming new work while this many PRs already sit in review (0 = unlimited). Applies live on save. Raise it alongside Parallel builds or the extra slots idle behind the review queue." }
+  - { key: goal_verify, label: "Verify acceptance goals", type: bool, group: "Project Board", tab: automation, restart: true,
+      description: "Before opening a PR, ask an independent model to check the diff against the feature acceptance criteria, including test coverage." }
+  - { key: local_gate_cmd, label: "Default local gate", type: string, group: "Project Board", tab: automation, restart: true,
+      description: "Fast lint/typecheck/unit command run before a PR opens. Project-specific values in the Projects tab override it. Blank disables the default gate." }
+  - { key: coder_solve, label: "Execution-grounded solve ladder", type: bool, group: "Project Board", tab: automation, restart: true,
+      description: "Use coder.solve's greedy, best-of-k, and tree-search ladder when the coder plugin, acceptance criteria, and a runnable test command are available." }
+  - { key: coder_solve_test_cmd, label: "Solve verification command", type: string, group: "Project Board", tab: automation, restart: true,
+      description: "Command that verifies generated candidates. Blank falls back to the local gate; still blank disables the solve ladder." }
+  - { key: max_mode_n, label: "Max-Mode candidates", type: number, minimum: 1, maximum: 16, group: "Project Board", tab: automation, restart: true,
+      description: "Build a fresh feature N ways and keep the best passing diff. 1 disables Max-Mode; larger values multiply coder cost." }
+
+  - { key: auto_merge, label: "Auto-merge green PRs", type: bool, group: "Project Board", tab: review,
+      description: "Merge an in-review PR once every gate the loop runs is green and current: GitHub CLEAN (required checks + branch protection), the merged-state verdict stamped against the current base, and a clean review-gate verdict. Off = park green PRs for you to merge. Label a card merge-hold to exempt it. Applies live on save." }
+  - { key: merge_method, label: "Merge method", type: select, options: [squash, merge, rebase], group: "Project Board", tab: review, restart: true, depends_on: { key: auto_merge },
+      description: "GitHub merge strategy used by auto-merge." }
+  - { key: review_gate, label: "Blocking adversarial review", type: bool, group: "Project Board", tab: review, restart: true,
+      description: "Run the configured review workflow before merge and bounce blocker/major findings back to the coder." }
+  - { key: review_workflow, label: "Review workflow", type: string, group: "Project Board", tab: review, restart: true, depends_on: { key: review_gate },
+      description: "Host workflow recipe used by the blocking review gate." }
+  - { key: reviewer, label: "Reviewer delegate", type: string, group: "Project Board", tab: review, restart: true,
+      description: "A2A reviewer used for advisory dispatch or as the blocking gate's fallback when no workflow runner is available." }
+  - { key: review_dispatch, label: "Advisory reviewer dispatch", type: bool, group: "Project Board", tab: review, restart: true,
+      description: "Also dispatch the reviewer delegate when a PR opens. Leave off when the fleet PR-review pipeline already reviews on open." }
+  - { key: review_fix_max, label: "Review fix attempts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: review_gate },
+      description: "Same-tier re-dispatches for actionable review findings before the card blocks for an operator." }
+  - { key: merge_poll, label: "Reconcile pull requests", type: bool, group: "Project Board", tab: review, restart: true,
+      description: "Poll in-review PRs so merged and closed state lands even when GitHub cannot reach the webhook." }
+  - { key: ci_poll, label: "Bounce failing CI", type: bool, group: "Project Board", tab: review, restart: true,
+      description: "Poll CI for in-review PRs and re-dispatch failures instead of leaving red PRs parked forever." }
+  - { key: ci_fix_max, label: "CI fix attempts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: ci_poll },
+      description: "Automatic CI-fix re-dispatches before the card blocks for human triage. 0 blocks on the first failure." }
+  - { key: auto_rebase, label: "Rebase stale PRs", type: bool, group: "Project Board", tab: review, restart: true,
+      description: "Cleanly rebase behind PRs and re-dispatch genuine conflicts so parallel work remains mergeable." }
+  - { key: rebase_fix_max, label: "Conflict fix attempts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: auto_rebase },
+      description: "Coder re-dispatches allowed for a genuine rebase conflict before the card blocks." }
+  - { key: dep_gate, label: "Dependency release gate", type: select, options: [merge, review], group: "Project Board", tab: review, restart: true,
+      description: "Release non-foundation dependents only after merge (safe) or once the blocker reaches review (more parallel). Foundation work always waits for merge." }
+
+  - { key: webhook_secret, label: "Webhook secret", type: secret, group: "Project Board", tab: security, restart: true,
+      description: "HMAC-SHA256 secret for public merge, CI, and review ingress. Blank disables every public mutation route. Stored in secrets.yaml." }
 
 # Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
 # The list/Kanban view is a projection over the /features API (no separate store).

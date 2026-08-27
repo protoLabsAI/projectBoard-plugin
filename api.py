@@ -23,8 +23,10 @@ import hmac
 import json
 import logging
 import os
+from typing import Literal
 
 from fastapi import Request  # module-level so the webhook's stringized annotation resolves
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import setup_check
 from .projects import default_project as resolve_default_project
@@ -32,6 +34,18 @@ from .projects import resolve_projects
 from .store import BoardError, annotate_next_action, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+class ProjectUpsertBody(BaseModel):
+    """Strict operator API shape for one editor-owned project entry."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    repo: str = Field(min_length=1, max_length=4096)
+    base_branch: str = Field(default="main", min_length=1, max_length=255)
+    local_gate_cmd: str = Field(default="", max_length=8192)
+    repo_conventions: str = Field(default="", max_length=32768)
+    default_action: Literal["keep", "set", "clear"] = "keep"
 
 
 def _store_kw(cfg: dict) -> dict:
@@ -56,6 +70,7 @@ def build_router(cfg: dict):
     from fastapi.responses import HTMLResponse
 
     from .board_view import BOARD_PAGE
+    from .projects_view import PROJECTS_PAGE
 
     router = APIRouter()
 
@@ -66,6 +81,15 @@ def build_router(cfg: dict):
     @router.get("/board", response_class=HTMLResponse)
     async def _board():
         return HTMLResponse(BOARD_PAGE)
+
+    @router.get("/config/projects", response_class=HTMLResponse)
+    async def _projects_config():
+        """Public page chrome for the sandboxed Configure tab.
+
+        It contains no config data; every read and mutation goes through the
+        operator-bearer-gated ``/api/plugins/project_board/projects`` routes.
+        """
+        return HTMLResponse(PROJECTS_PAGE, headers={"Cache-Control": "no-store"})
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
@@ -235,19 +259,110 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     host warning clears when the operator fixes the gap even on a board whose loop
     is off (no tick to re-check) — the board page polls /status while open."""
     from fastapi import APIRouter, Body, HTTPException
+    from fastapi.responses import JSONResponse
 
     router = APIRouter()
     store_kw = _store_kw(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
     def store():
-        return get_store(**store_kw)
+        # Existing routers stay mounted across a host config reload, so their
+        # construction-time `cfg` is stale. Project routing is explicitly live:
+        # resolve that complete unit afresh before the first post-edit store is
+        # constructed (and reconfigure an existing shared store). Boot-only
+        # db/repo/base remain pinned in `store_kw` as promised by the manifest.
+        current = dict(store_kw)
+        try:
+            from .project_registry import _live_section
+
+            live = _live_section(required=True)
+            candidate = dict(cfg or {})
+            if "projects" in live:
+                candidate["projects"] = live.get("projects")
+            if "default_project" in live:
+                candidate["default_project"] = live.get("default_project")
+            current["projects"] = resolve_projects(candidate)
+            current["default_project"] = resolve_default_project(candidate)
+        except Exception:  # noqa: BLE001 — retain the last validated routing unit
+            pass
+        board = get_store(**current)
+        reconfigure = getattr(board, "reconfigure_projects", None)
+        if callable(reconfigure):
+            reconfigure(current["projects"], current["default_project"])
+        store_kw.update(projects=current["projects"], default_project=current["default_project"])
+        return board
 
     def _guard(fn):
         try:
             return fn()
         except BoardError as e:
             raise HTTPException(400, str(e))
+
+    @router.get("/projects")
+    async def _projects():
+        """Live project config for the custom Configure tab (no router snapshot)."""
+        from .project_registry import ProjectRegistryError, project_registry_snapshot
+
+        try:
+            snapshot = project_registry_snapshot()
+        except ProjectRegistryError as exc:
+            raise HTTPException(503, str(exc))
+        return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
+
+    @router.put("/projects/{name}")
+    async def _put_project(name: str, body: ProjectUpsertBody):
+        """Add/update one boarded repo through the same bounded seam as the agent tool."""
+        from .project_registry import ProjectRegistryError, upsert_project
+
+        try:
+            result = await upsert_project(
+                name,
+                body.repo,
+                base_branch=body.base_branch,
+                local_gate_cmd=body.local_gate_cmd,
+                repo_conventions=body.repo_conventions,
+                make_default=body.default_action == "set",
+                clear_default=body.default_action == "clear",
+                replace_optional=True,
+            )
+        except ProjectRegistryError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, **result}
+
+    @router.delete("/projects/{name}")
+    async def _delete_project(name: str):
+        """Delete a project only after proving no active board card references it."""
+        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, delete_project
+
+        async def assert_unused(project: str, effective_default: str) -> None:
+            try:
+                features = await asyncio.to_thread(store().list_features, include_archived=True)
+            except BoardError as exc:
+                raise ProjectRegistryConflict(f"cannot prove project {project!r} is unused: {exc}") from exc
+            terminal = {"done", "cancelled"}
+            references = [
+                str(f.get("id") or "")
+                for f in features
+                if (
+                    str(f.get("project") or "") == project
+                    or (not str(f.get("project") or "") and effective_default == project)
+                )
+                and str(f.get("board_state") or f.get("state") or "") not in terminal
+            ]
+            if references:
+                sample = ", ".join(references[:5])
+                more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
+                raise ProjectRegistryConflict(
+                    f"project {project!r} is still referenced by active board card(s): {sample}{more}"
+                )
+
+        try:
+            result = await delete_project(name, assert_unused=assert_unused)
+        except ProjectRegistryConflict as exc:
+            raise HTTPException(409, str(exc))
+        except ProjectRegistryError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, **result}
 
     @router.get("/status")
     async def _status():
