@@ -40,17 +40,23 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 #: Fields an operator writes by hand today, and the only ones this tool sets.
 _ENTRY_FIELDS = ("repo", "base_branch", "local_gate_cmd", "repo_conventions")
-_PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _MUTATION_LOCK = asyncio.Lock()
 
 
 class ProjectRegistryError(ValueError):
     """An operator-actionable project registry refusal."""
+
+
+class ProjectRegistryConflict(ProjectRegistryError):
+    """A registry mutation refused because current board state makes it unsafe."""
 
 
 def _live_section() -> dict[str, Any]:
@@ -118,6 +124,17 @@ def _raw_projects() -> dict[str, Any]:
     return dict(projects) if isinstance(projects, dict) else {}
 
 
+def _public_entry(raw: Any) -> dict[str, Any]:
+    """Editor-owned values plus names—not values—of preserved file-only fields."""
+    valid = isinstance(raw, dict)
+    entry = raw if valid else {}
+    return {
+        **{key: entry.get(key, "") for key in _ENTRY_FIELDS},
+        "extra_fields": sorted(set(entry) - set(_ENTRY_FIELDS)),
+        "editable": valid,
+    }
+
+
 def project_registry_snapshot() -> dict[str, Any]:
     """Public-safe live registry data for the authenticated console editor.
 
@@ -129,10 +146,7 @@ def project_registry_snapshot() -> dict[str, Any]:
     projects = _raw_projects()
     rows = []
     for name in sorted(projects):
-        raw = projects[name] if isinstance(projects[name], dict) else {}
-        row = {"name": name, **{key: raw.get(key, "") for key in _ENTRY_FIELDS}}
-        row["extra_fields"] = sorted(set(raw) - set(_ENTRY_FIELDS))
-        rows.append(row)
+        rows.append({"name": name, **_public_entry(projects[name])})
     enabled, root = _host_onboarding()
     return {
         "projects": rows,
@@ -147,9 +161,39 @@ def _validate_name(name: str) -> str:
         raise ProjectRegistryError("name is required — it is the key features carry")
     if not _PROJECT_NAME.fullmatch(project):
         raise ProjectRegistryError(
-            "name must start with a letter or number and contain only letters, numbers, hyphens, or underscores"
+            "name must be at most 128 characters, start with a letter or number, "
+            "and contain only letters, numbers, hyphens, or underscores"
         )
     return project
+
+
+def _bounded_text(value: str, label: str, maximum: int, *, required: bool = False) -> str:
+    text = str(value or "").strip()
+    if required and not text:
+        raise ProjectRegistryError(f"{label} is required")
+    if len(text) > maximum:
+        raise ProjectRegistryError(f"{label} must be at most {maximum} characters")
+    if "\0" in text:
+        raise ProjectRegistryError(f"{label} cannot contain a NUL byte")
+    return text
+
+
+def _validate_base_branch(branch: str) -> str:
+    """Return a Git-valid branch name before persisting a failure for dispatch time."""
+    value = _bounded_text(branch or "main", "base branch", 255, required=True)
+    try:
+        checked = subprocess.run(
+            ["git", "check-ref-format", "--branch", value],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProjectRegistryError(f"could not validate base branch {value!r}: {exc}") from exc
+    if checked.returncode != 0:
+        raise ProjectRegistryError(f"base branch {value!r} is not a valid Git branch name")
+    return value
 
 
 async def _apply_registry(
@@ -206,12 +250,14 @@ async def upsert_project(
     local_gate_cmd: str = "",
     repo_conventions: str = "",
     make_default: bool = False,
+    clear_default: bool = False,
     replace_optional: bool = False,
 ) -> dict[str, Any]:
     """Add/update one project while preserving siblings and unowned entry fields."""
     project = _validate_name(name)
-    if not str(repo or "").strip():
-        raise ProjectRegistryError("repo is required — it is the checkout the board builds in")
+    repo = _bounded_text(repo, "repo", 4096, required=True)
+    if make_default and clear_default:
+        raise ProjectRegistryError("default action is ambiguous — set and clear cannot both be requested")
     enabled, root = _host_onboarding()
     if not enabled:
         raise ProjectRegistryError(
@@ -220,15 +266,16 @@ async def upsert_project(
     repo_p, err = _resolve_under(root, repo)
     if err:
         raise ProjectRegistryError(err)
+    branch = await asyncio.to_thread(_validate_base_branch, base_branch)
 
     async with _MUTATION_LOCK:
         existing = _raw_projects()
         prior = existing.get(project)
         entry = dict(prior) if isinstance(prior, dict) else {}
-        entry.update({"repo": str(repo_p), "base_branch": str(base_branch or "main").strip() or "main"})
+        entry.update({"repo": str(repo_p), "base_branch": branch})
         optional = {
-            "local_gate_cmd": str(local_gate_cmd or "").strip(),
-            "repo_conventions": str(repo_conventions or "").strip(),
+            "local_gate_cmd": _bounded_text(local_gate_cmd, "local gate command", 8192),
+            "repo_conventions": _bounded_text(repo_conventions, "repository conventions", 32768),
         }
         for key, value in optional.items():
             if value:
@@ -239,29 +286,50 @@ async def upsert_project(
         merged[project] = entry
         if not set(existing) <= set(merged):
             raise ProjectRegistryError("internal safety check failed — the update would drop a sibling project")
-        default = project if make_default else None
+        current_default = str(_live_section().get("default_project") or "")
+        if make_default:
+            default = project
+        elif clear_default and current_default == project:
+            default = ""
+        else:
+            default = None
         await _apply_registry(merged, expected={project: entry}, default_project=default)
         return {
             "project": project,
-            "entry": entry,
+            # Do not leak preserved file-only values through the PUT response after
+            # deliberately redacting them from GET /projects.
+            "entry": _public_entry(entry),
             "created": project not in existing,
-            "default_project": default,
+            "default_project": default if default is not None else current_default,
         }
 
 
-async def delete_project(name: str) -> dict[str, Any]:
-    """Delete a project after its caller has proved no active card references it."""
+async def delete_project(
+    name: str,
+    *,
+    assert_unused: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Delete a project after a caller-supplied live safety check, under the lock."""
     project = _validate_name(name)
     async with _MUTATION_LOCK:
         existing = _raw_projects()
         if project not in existing:
             raise ProjectRegistryError(f"unknown project {project!r}")
+        # The board store and YAML are separate resources, so they cannot share a
+        # transaction. Running the fresh board check inside the registry mutation
+        # lock at least closes the UI/tool update race before apply_settings.
+        if assert_unused is not None:
+            await assert_unused(project)
         merged = dict(existing)
         merged.pop(project)
         current_default = str(_live_section().get("default_project") or "")
         default = (next(iter(merged)) if len(merged) == 1 else "") if current_default == project else None
         await _apply_registry(merged, absent={project}, default_project=default)
-        return {"project": project, "deleted": True, "default_project": default}
+        return {
+            "project": project,
+            "deleted": True,
+            "default_project": default if default is not None else current_default,
+        }
 
 
 def build_register_tool(cfg: dict):

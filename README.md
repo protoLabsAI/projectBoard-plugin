@@ -238,14 +238,16 @@ by operator intent:
 
 - **Projects** is the live registry editor. It lists the configured project map and
   can add or update repos only inside the host's enabled Project onboarding root.
-  Add/update preserves sibling projects and file-only per-project fields, then reads
-  live config back before reporting success. Delete requires explicit confirmation
-  and is refused while an active board card still names that project.
+  Add/update preserves sibling projects and file-only per-project fields without
+  returning those fields' values to the browser, then reads live config back before
+  reporting success. Malformed non-mapping entries stay visible but read-only until
+  repaired in YAML. Delete requires explicit confirmation and is refused while an
+  active board card still names that project.
 - **Automation** contains the loop posture, coder, concurrency/back-pressure, local
   verification, and candidate-generation controls.
 - **Review & merge** contains review dispatch/gating, CI reconciliation, rebase,
   dependency release, and auto-merge behavior.
-- **Advanced** contains the webhook HMAC secret. It is stored through the host's
+- **Security** contains the webhook HMAC secret. It is stored through the host's
   secret settings path, never returned by the Projects API.
 
 Every scalar is explicit about apply behavior. `coder`, `br_autofetch`,

@@ -237,12 +237,15 @@ async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monke
         return True, []
 
     _wire_host(monkeypatch, cfg, apply_settings)
-    await upsert_project("alpha", str(repo), local_gate_cmd="", replace_optional=True)
+    result = await upsert_project("alpha", str(repo), local_gate_cmd="", replace_optional=True)
 
     projects = cfg.plugin_config["project_board"]["projects"]
     assert set(projects) == {"alpha", "beta"}
     assert projects["alpha"]["coders"] == {"smart": "proto"}
     assert "local_gate_cmd" not in projects["alpha"]
+    assert result["entry"]["extra_fields"] == ["coders"]
+    assert "coders" not in result["entry"]
+    assert "proto" not in str(result)
 
 
 def test_registry_snapshot_names_but_does_not_return_file_only_values(monkeypatch):
@@ -263,6 +266,18 @@ def test_registry_snapshot_names_but_does_not_return_file_only_values(monkeypatc
     assert snapshot["projects"][0]["extra_fields"] == ["coders"]
     assert "coders" not in snapshot["projects"][0]
     assert "secret-agent-name" not in str(snapshot)
+
+
+def test_registry_snapshot_marks_malformed_file_only_entries_read_only(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={"project_board": {"projects": {"broken": "not-a-mapping"}}},
+    )
+    _wire_host(monkeypatch, cfg, lambda _patch: (True, []))
+    row = project_registry_snapshot()["projects"][0]
+    assert row["name"] == "broken" and row["editable"] is False
+    assert row["repo"] == "" and row["extra_fields"] == []
 
 
 async def test_simultaneous_upserts_serialize_the_live_read_merge_write(monkeypatch, tmp_path):
@@ -303,3 +318,58 @@ async def test_delete_reassigns_a_deleted_default_to_the_only_survivor(monkeypat
     await delete_project("alpha")
     assert cfg.plugin_config["project_board"]["projects"] == {"beta": {"repo": "/b"}}
     assert cfg.plugin_config["project_board"]["default_project"] == "beta"
+
+
+async def test_editor_can_clear_the_current_default(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"default_project": "alpha", "projects": {"alpha": {"repo": str(repo)}}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    result = await upsert_project("alpha", str(repo), clear_default=True)
+    assert result["default_project"] == ""
+    assert cfg.plugin_config["project_board"]["default_project"] == ""
+
+
+async def test_invalid_base_branch_is_refused_before_config_apply(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+    with pytest.raises(ValueError, match="valid Git branch"):
+        await upsert_project("alpha", str(repo), base_branch="bad branch")
+    assert applied == []
+
+
+async def test_delete_runs_live_unused_check_inside_registry_mutation(monkeypatch):
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root="/dev",
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": "/a"}}}},
+    )
+    events = []
+
+    def apply_settings(patch):
+        events.append("apply")
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    async def assert_unused(name):
+        events.append(f"check:{name}")
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    await delete_project("alpha", assert_unused=assert_unused)
+    assert events == ["check:alpha", "apply"]

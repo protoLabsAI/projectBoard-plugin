@@ -281,12 +281,21 @@ def test_manifest_declares_the_ordered_tabbed_config_contract():
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
         {"id": "automation", "label": "Automation"},
         {"id": "review", "label": "Review & merge"},
-        {"id": "advanced", "label": "Advanced"},
+        {"id": "security", "label": "Security"},
     ]
     schema_tabs = {t["id"] for t in m["settings_tabs"] if "path" not in t}
     assert {field["tab"] for field in m["settings"]} <= schema_tabs
     assert {field["tab"] for field in m["settings"]} == schema_tabs
     assert next(field for field in m["settings"] if field["key"] == "webhook_secret")["type"] == "secret"
+
+
+def test_manifest_numeric_settings_have_operator_safe_bounds():
+    fields = {field["key"]: field for field in _manifest()["settings"]}
+    for key, field in fields.items():
+        if field["type"] != "number":
+            continue
+        assert "minimum" in field and "maximum" in field, key
+        assert field["minimum"] <= field["maximum"], key
 
 
 def test_manifest_min_host_version_covers_tabbed_plugin_config():

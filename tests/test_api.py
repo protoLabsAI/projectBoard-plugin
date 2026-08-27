@@ -180,6 +180,7 @@ def test_projects_config_page_is_public_but_its_data_routes_are_not(monkeypatch)
     c = _client(monkeypatch, FakeStore())
     page = c.get("/plugins/project_board/config/projects")
     assert page.status_code == 200 and "Boarded projects" in page.text
+    assert page.headers["cache-control"] == "no-store"
     assert c.get("/plugins/project_board/projects").status_code == 404
     assert c.put("/plugins/project_board/projects/demo", json={"repo": "/repo"}).status_code == 404
 
@@ -193,7 +194,9 @@ def test_projects_data_route_reads_live_registry_not_router_config(monkeypatch):
         lambda: {"projects": [{"name": "live"}], "default_project": "live", "onboarding": {}},
     )
     c = _client(monkeypatch, FakeStore(), cfg={"projects": {"stale": {"repo": "/old"}}})
-    assert c.get("/api/plugins/project_board/projects").json()["projects"] == [{"name": "live"}]
+    response = c.get("/api/plugins/project_board/projects")
+    assert response.json()["projects"] == [{"name": "live"}]
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_project_put_uses_shared_registry_mutation(monkeypatch):
@@ -209,7 +212,7 @@ def test_project_put_uses_shared_registry_mutation(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     response = c.put(
         "/api/plugins/project_board/projects/demo",
-        json={"repo": "/dev/demo", "base_branch": "trunk", "make_default": True},
+        json={"repo": "/dev/demo", "base_branch": "trunk", "default_action": "set"},
     )
     assert response.status_code == 200 and response.json()["ok"] is True
     assert seen == {
@@ -219,8 +222,24 @@ def test_project_put_uses_shared_registry_mutation(monkeypatch):
         "local_gate_cmd": "",
         "repo_conventions": "",
         "make_default": True,
+        "clear_default": False,
         "replace_optional": True,
     }
+
+
+def test_project_put_rejects_unknown_fields_and_non_booleanish_default_actions(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    assert (
+        c.put("/api/plugins/project_board/projects/demo", json={"repo": "/dev/demo", "surprise": True}).status_code
+        == 422
+    )
+    assert (
+        c.put(
+            "/api/plugins/project_board/projects/demo",
+            json={"repo": "/dev/demo", "default_action": "false"},
+        ).status_code
+        == 422
+    )
 
 
 def test_project_delete_refuses_an_active_card_before_config_mutation(monkeypatch):
@@ -232,10 +251,11 @@ def test_project_delete_refuses_an_active_card_before_config_mutation(monkeypatc
         {"id": "bd-old", "project": "demo", "board_state": "done"},
     ]
 
-    async def should_not_run(_name):
-        raise AssertionError("delete_project must not run while an active card references the project")
+    async def guarded_delete(name, *, assert_unused):
+        await assert_unused(name)
+        raise AssertionError("config mutation must not run after the active-card check refuses")
 
-    monkeypatch.setattr(registry, "delete_project", should_not_run)
+    monkeypatch.setattr(registry, "delete_project", guarded_delete)
     c = _client(monkeypatch, store)
     response = c.delete("/api/plugins/project_board/projects/demo")
     assert response.status_code == 409

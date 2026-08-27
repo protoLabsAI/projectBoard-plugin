@@ -23,8 +23,10 @@ import hmac
 import json
 import logging
 import os
+from typing import Literal
 
 from fastapi import Request  # module-level so the webhook's stringized annotation resolves
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import setup_check
 from .projects import default_project as resolve_default_project
@@ -32,6 +34,18 @@ from .projects import resolve_projects
 from .store import BoardError, annotate_next_action, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+
+class ProjectUpsertBody(BaseModel):
+    """Strict operator API shape for one editor-owned project entry."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    repo: str = Field(min_length=1, max_length=4096)
+    base_branch: str = Field(default="main", min_length=1, max_length=255)
+    local_gate_cmd: str = Field(default="", max_length=8192)
+    repo_conventions: str = Field(default="", max_length=32768)
+    default_action: Literal["keep", "set", "clear"] = "keep"
 
 
 def _store_kw(cfg: dict) -> dict:
@@ -75,7 +89,7 @@ def build_router(cfg: dict):
         It contains no config data; every read and mutation goes through the
         operator-bearer-gated ``/api/plugins/project_board/projects`` routes.
         """
-        return HTMLResponse(PROJECTS_PAGE)
+        return HTMLResponse(PROJECTS_PAGE, headers={"Cache-Control": "no-store"})
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
@@ -245,6 +259,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     host warning clears when the operator fixes the gap even on a board whose loop
     is off (no tick to re-check) — the board page polls /status while open."""
     from fastapi import APIRouter, Body, HTTPException
+    from fastapi.responses import JSONResponse
 
     router = APIRouter()
     store_kw = _store_kw(cfg)
@@ -264,21 +279,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         """Live project config for the custom Configure tab (no router snapshot)."""
         from .project_registry import project_registry_snapshot
 
-        return project_registry_snapshot()
+        return JSONResponse(project_registry_snapshot(), headers={"Cache-Control": "no-store"})
 
     @router.put("/projects/{name}")
-    async def _put_project(name: str, body: dict = Body(default={})):
+    async def _put_project(name: str, body: ProjectUpsertBody):
         """Add/update one boarded repo through the same bounded seam as the agent tool."""
         from .project_registry import ProjectRegistryError, upsert_project
 
         try:
             result = await upsert_project(
                 name,
-                str((body or {}).get("repo") or ""),
-                base_branch=str((body or {}).get("base_branch") or "main"),
-                local_gate_cmd=str((body or {}).get("local_gate_cmd") or ""),
-                repo_conventions=str((body or {}).get("repo_conventions") or ""),
-                make_default=bool((body or {}).get("make_default", False)),
+                body.repo,
+                base_branch=body.base_branch,
+                local_gate_cmd=body.local_gate_cmd,
+                repo_conventions=body.repo_conventions,
+                make_default=body.default_action == "set",
+                clear_default=body.default_action == "clear",
                 replace_optional=True,
             )
         except ProjectRegistryError as exc:
@@ -288,24 +304,31 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.delete("/projects/{name}")
     async def _delete_project(name: str):
         """Delete a project only after proving no active board card references it."""
-        from .project_registry import ProjectRegistryError, delete_project
+        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, delete_project
+
+        async def assert_unused(project: str) -> None:
+            try:
+                features = await asyncio.to_thread(store().list_features, include_archived=True)
+            except BoardError as exc:
+                raise ProjectRegistryConflict(f"cannot prove project {project!r} is unused: {exc}") from exc
+            terminal = {"done", "cancelled"}
+            references = [
+                str(f.get("id") or "")
+                for f in features
+                if str(f.get("project") or "") == project
+                and str(f.get("board_state") or f.get("state") or "") not in terminal
+            ]
+            if references:
+                sample = ", ".join(references[:5])
+                more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
+                raise ProjectRegistryConflict(
+                    f"project {project!r} is still referenced by active board card(s): {sample}{more}"
+                )
 
         try:
-            features = await asyncio.to_thread(store().list_features, include_archived=True)
-        except BoardError as exc:
-            raise HTTPException(409, f"cannot prove project {name!r} is unused: {exc}")
-        terminal = {"done", "cancelled"}
-        references = [
-            str(f.get("id") or "")
-            for f in features
-            if str(f.get("project") or "") == name and str(f.get("board_state") or f.get("state") or "") not in terminal
-        ]
-        if references:
-            sample = ", ".join(references[:5])
-            more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
-            raise HTTPException(409, f"project {name!r} is still referenced by board card(s): {sample}{more}")
-        try:
-            result = await delete_project(name)
+            result = await delete_project(name, assert_unused=assert_unused)
+        except ProjectRegistryConflict as exc:
+            raise HTTPException(409, str(exc))
         except ProjectRegistryError as exc:
             raise HTTPException(400, str(exc))
         return {"ok": True, **result}
