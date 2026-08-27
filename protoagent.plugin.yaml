@@ -25,6 +25,7 @@ min_protoagent_version: "0.31.0"   # register_surface(reload=) — live knobs an
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
+secrets: [webhook_secret]
 config:
   coder: ""                 # acp delegate name the loop dispatches builds to. NO DEFAULT
                             # (v0.42.0): unset = the setup preflight fails `coder`, the host
@@ -218,9 +219,9 @@ config:
                             # missing `br` is a setup gap with the install hint. Resolution
                             # order for the binary: BR_BIN env > fetched > PATH. LIVE.
   db_path: ""               # beads db path; blank → br auto-discovers .beads/*.db
-  webhook_secret: ""        # GitHub webhook HMAC secret for /webhook/pr (the Done
-                            # edge). Blank → signature NOT verified (dev only); set
-                            # it (or PROJECT_BOARD_WEBHOOK_SECRET) before exposing.
+  webhook_secret: ""        # HMAC secret for every public mutation: /webhook/pr,
+                            # /features/<id>/ci, and /review. Blank → all three fail
+                            # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.
 
 # Console Settings fields (ADR 0019) — rendered under Settings → Plugins → "Project Board".
 # ONLY the knobs the running loop re-applies on a config reload belong here (loop.py

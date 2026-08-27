@@ -2,16 +2,17 @@
 
 TWO routers (plugin-view rule 2): ``build_router`` carries the public-of-necessity
 surface on ``/plugins/project_board`` — GET ``/board`` (an iframe src can't carry a
-bearer), POST ``/webhook/pr`` (GitHub signs with HMAC, and its public URL must stay
-stable), and POST ``/features/{fid}/ci`` (a CI-infra edge). ``build_data_router``
+bearer) plus the HMAC-authenticated external mutation ingress: POST ``/webhook/pr``,
+``/features/{fid}/ci``, and ``/features/{fid}/review``. ``build_data_router``
 carries the operator CRUD/transition routes on ``/api/plugins/project_board``, where
 they inherit the host's operator bearer gate. The whole flow — create project →
 features → Ready gate → (loop dispatches) → in_review → merge webhook → done — is
 drivable here, headlessly.
 
 The ``/webhook/pr`` endpoint is the SINGLE external Done edge: a merged-PR event
-sets ``done`` and nothing else does (invariant #2). The raw body is HMAC-verified
-against ``X-Hub-Signature-256`` whenever a ``webhook_secret`` is configured.
+sets ``done`` and nothing else does (invariant #2). Every public mutation verifies
+its raw body against ``X-Hub-Signature-256`` and fails closed when no
+``webhook_secret`` is configured.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def _store_kw(cfg: dict) -> dict:
 
 
 def build_router(cfg: dict):
-    from fastapi import APIRouter, Body, HTTPException
+    from fastapi import APIRouter, HTTPException
     from fastapi.responses import HTMLResponse
 
     from .board_view import BOARD_PAGE
@@ -69,8 +70,10 @@ def build_router(cfg: dict):
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
-    # GitHub webhook secret (HMAC-SHA256). From config or env; blank ⇒ verification
-    # disabled (dev only) — a warning fires per unsigned request.
+    # Shared external-ingress secret (HMAC-SHA256). GitHub supplies the signature for
+    # /webhook/pr; CI/review callers sign their exact JSON bytes the same way. Blank
+    # fails CLOSED: these public routes mutate board state and cannot have a dev-mode
+    # authentication bypass merely because the host is reachable only on localhost.
     webhook_secret = str(
         (cfg or {}).get("webhook_secret") or os.environ.get("PROJECT_BOARD_WEBHOOK_SECRET", "")
     ).strip()
@@ -84,15 +87,38 @@ def build_router(cfg: dict):
         except BoardError as e:
             raise HTTPException(400, str(e))
 
+    def _verify_external(raw: bytes, signature: str) -> None:
+        if not webhook_secret:
+            raise HTTPException(
+                503,
+                "public board mutations are disabled — configure project_board.webhook_secret "
+                "or PROJECT_BOARD_WEBHOOK_SECRET",
+            )
+        expected = "sha256=" + hmac.new(webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature or ""):
+            raise HTTPException(401, "invalid webhook signature")
+
+    async def _signed_json(request: Request) -> dict:
+        """Authenticate exact raw bytes, then require a JSON object body."""
+        raw = await request.body()
+        _verify_external(raw, request.headers.get("X-Hub-Signature-256", ""))
+        try:
+            body = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            raise HTTPException(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON body must be an object")
+        return body
+
     # The operator CRUD/transition routes moved to build_data_router — gated under
     # /api/plugins/project_board (plugin-view rule 2). What stays here is the
     # PUBLIC-of-necessity surface: the /board page (an iframe page-load can't
     # carry a bearer) and the CI-infra edges — /webhook/pr (GitHub signs with
-    # HMAC, not the operator bearer) and /features/{fid}/ci (posted by CI
-    # runners; a CI-infra edge with bounded semantics).
+    # HMAC, not the operator bearer), /features/{fid}/ci, and /review. Every POST
+    # below crosses the same fail-closed HMAC boundary before touching the store.
 
     @router.post("/features/{fid}/ci")
-    async def _ci(fid: str, body: dict = Body(...)):
+    async def _ci(fid: str, request: Request):
         """CI result for the feature's PR. ``passed: true`` is a no-op (merge sets
         done, via the webhook). ``passed: false``:
           - with an escalation ladder → record + climb a tier and **requeue** to
@@ -100,6 +126,7 @@ def build_router(cfg: dict):
             PR); when the ladder is exhausted → Blocked.
           - with a single coder → bounce to in_progress for the operator (no auto-
             requeue, so a persistently-failing coder can't loop forever)."""
+        body = await _signed_json(request)
         if bool(body.get("passed")):
             return {"ok": True, "note": "CI green — done is set by the merge webhook, not CI"}
         reason = str(body.get("reason", ""))
@@ -121,7 +148,7 @@ def build_router(cfg: dict):
         return _guard(_handle)
 
     @router.post("/features/{fid}/review")
-    async def _review(fid: str, body: dict = Body(...)):
+    async def _review(fid: str, request: Request):
         """Adverse code-review bounce for the feature's open PR — the review sibling
         of ``/ci`` fail. Records the ``findings`` as a DISTINCT review-bounce comment
         on the bead (≠ ci-fail), feeds them into the next dispatch prompt (the same
@@ -133,6 +160,7 @@ def build_router(cfg: dict):
         model ladder (like ``/ci``); the default keeps the same tier. With escalation
         enabled and the ladder already at the top, an escalated bounce → Blocked
         (never a silent re-loop)."""
+        body = await _signed_json(request)
         findings = str(body.get("findings", ""))
         escalate = bool(body.get("escalate", False))
 
@@ -166,18 +194,9 @@ def build_router(cfg: dict):
         """GitHub PR webhook — the SINGLE Done edge. On a ``closed`` event with
         ``merged: true`` it sets the matching feature ``done`` (nothing else does)
         and reaps its worktree. The raw body is HMAC-verified against
-        ``X-Hub-Signature-256`` when a secret is configured."""
+        ``X-Hub-Signature-256``; no configured secret fails closed."""
         raw = await request.body()
-        sig = request.headers.get("X-Hub-Signature-256", "")
-        if webhook_secret:
-            expected = "sha256=" + hmac.new(webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, sig):
-                raise HTTPException(401, "invalid webhook signature")
-        else:
-            log.warning(
-                "[project_board] webhook signature NOT verified — set "
-                "project_board.webhook_secret (or PROJECT_BOARD_WEBHOOK_SECRET)"
-            )
+        _verify_external(raw, request.headers.get("X-Hub-Signature-256", ""))
         try:
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:

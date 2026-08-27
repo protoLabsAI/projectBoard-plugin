@@ -596,6 +596,18 @@ def _signed(secret, raw):
     return "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
 
 
+_EXTERNAL_SECRET = "test-external-secret"
+
+
+def _external_cfg(cfg=None):
+    return {**(cfg or {}), "webhook_secret": _EXTERNAL_SECRET}
+
+
+def _external_post(client, path, body, *, secret=_EXTERNAL_SECRET):
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    return client.post(path, content=raw, headers={"X-Hub-Signature-256": _signed(secret, raw)})
+
+
 def _merge_body(url="https://example/pr/1"):
     return json.dumps({"action": "closed", "pull_request": {"merged": True, "html_url": url}}).encode()
 
@@ -642,11 +654,54 @@ def test_webhook_ignores_a_non_merge_event(monkeypatch):
     assert not any(call[0] == "record_merge" for call in store.calls)
 
 
-def test_webhook_without_a_secret_processes_unsigned(monkeypatch):
-    store = FakeStore(merged=None)  # no feature matches → ignored, but no 401
+def test_webhook_without_a_secret_fails_closed(monkeypatch):
+    store = FakeStore(merged=None)
     c = _client(monkeypatch, store, cfg={"webhook_secret": ""})
     r = c.post("/plugins/project_board/webhook/pr", content=_merge_body())
-    assert r.status_code == 200  # dev mode: signature not verified
+    assert r.status_code == 503
+    assert not store.calls
+
+
+def test_public_ci_and_review_reject_unsigned_or_bad_signatures_before_store_access(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg=_external_cfg())
+    cases = (
+        ("/plugins/project_board/features/bd-1/ci", {"passed": False}),
+        ("/plugins/project_board/features/bd-1/review", {"findings": "block it"}),
+    )
+    for path, body in cases:
+        assert c.post(path, json=body).status_code == 401
+        assert _external_post(c, path, body, secret="wrong-secret").status_code == 401
+    assert not store.calls
+
+
+def test_public_ci_and_review_fail_closed_without_a_secret(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={"webhook_secret": ""})
+    assert c.post("/plugins/project_board/features/bd-1/ci", json={"passed": False}).status_code == 503
+    assert c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 503
+    assert not store.calls
+
+
+def test_public_mutation_authenticates_before_json_parsing(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg=_external_cfg())
+    raw = b"{not-json"
+    r = c.post(
+        "/plugins/project_board/features/bd-1/ci",
+        content=raw,
+        headers={"X-Hub-Signature-256": _signed(_EXTERNAL_SECRET, raw)},
+    )
+    assert r.status_code == 400 and r.json()["detail"] == "invalid JSON body"
+    assert not store.calls
+
+
+def test_external_secret_env_fallback_is_used(monkeypatch):
+    monkeypatch.setenv("PROJECT_BOARD_WEBHOOK_SECRET", "env-secret")
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={})
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": True}, secret="env-secret")
+    assert r.status_code == 200 and r.json()["ok"] is True
 
 
 # ── /ci: escalate when a ladder exists, else bounce ─────────────────────────────
@@ -655,15 +710,15 @@ ESCALATION_CFG = {"coders": {"fast": "proto", "smart": "proto-smart"}}
 
 
 def test_ci_pass_is_a_noop(monkeypatch):
-    c = _client(monkeypatch, FakeStore(), cfg=ESCALATION_CFG)
-    r = c.post("/plugins/project_board/features/bd-1/ci", json={"passed": True})
+    c = _client(monkeypatch, FakeStore(), cfg=_external_cfg(ESCALATION_CFG))
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": True})
     assert r.json()["ok"] is True
 
 
 def test_ci_fail_with_a_ladder_escalates_and_requeues(monkeypatch):
     store = FakeStore(escalate_to="smart")
-    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
-    r = c.post("/plugins/project_board/features/bd-1/ci", json={"passed": False, "reason": "boom"})
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "boom"})
     body = r.json()
     assert body["requeued"] is True and body["escalated"] is True and body["next_tier"] == "smart"
     assert any(call[0] == "requeue" for call in store.calls)
@@ -671,8 +726,8 @@ def test_ci_fail_with_a_ladder_escalates_and_requeues(monkeypatch):
 
 def test_ci_fail_at_the_top_of_the_ladder_blocks(monkeypatch):
     store = FakeStore(escalate_to=None)  # ladder exhausted
-    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
-    r = c.post("/plugins/project_board/features/bd-1/ci", json={"passed": False})
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False})
     body = r.json()
     assert body["exhausted"] is True and body["requeued"] is False
     assert any(call[0] == "block_from_review" for call in store.calls)
@@ -680,8 +735,8 @@ def test_ci_fail_at_the_top_of_the_ladder_blocks(monkeypatch):
 
 def test_ci_fail_with_a_single_coder_bounces_to_in_progress(monkeypatch):
     store = FakeStore()
-    c = _client(monkeypatch, store, cfg={})  # no coders map → no escalation
-    r = c.post("/plugins/project_board/features/bd-1/ci", json={"passed": False, "reason": "x"})
+    c = _client(monkeypatch, store, cfg=_external_cfg())  # no coders map → no escalation
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "x"})
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is False
     assert any(call[0] == "bounce_ci_fail" for call in store.calls)
@@ -698,10 +753,11 @@ def test_review_bounce_requeues_and_records_a_distinct_comment(monkeypatch):
 
     loop_mod._PENDING_FEEDBACK.clear()
     store = FakeStore()
-    c = _client(monkeypatch, store, cfg={})  # no ladder → default keeps the same tier
-    r = c.post(
+    c = _client(monkeypatch, store, cfg=_external_cfg())  # no ladder → default keeps the same tier
+    r = _external_post(
+        c,
         "/plugins/project_board/features/bd-1/review",
-        json={"findings": "auth check missing a null guard"},
+        {"findings": "auth check missing a null guard"},
     )
     assert r.status_code == 200
     body = r.json()
@@ -718,15 +774,15 @@ def test_review_findings_reach_the_loop_feedback_bridge(monkeypatch):
     from project_board import loop as loop_mod
 
     loop_mod._PENDING_FEEDBACK.clear()
-    c = _client(monkeypatch, FakeStore())
-    c.post("/plugins/project_board/features/bd-1/review", json={"findings": "missing a null guard"})
+    c = _client(monkeypatch, FakeStore(), cfg=_external_cfg())
+    _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "missing a null guard"})
     assert "missing a null guard" in loop_mod._PENDING_FEEDBACK.get("bd-1", "")
 
 
 def test_review_escalate_true_climbs_the_ladder(monkeypatch):
     store = FakeStore(escalate_to="smart")
-    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
-    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": True})
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": True})
     body = r.json()
     assert body["escalated"] is True and body["next_tier"] == "smart" and body["requeued"] is True
     assert any(call[0] == "escalate" for call in store.calls)
@@ -735,8 +791,8 @@ def test_review_escalate_true_climbs_the_ladder(monkeypatch):
 
 def test_review_escalate_false_keeps_the_same_tier(monkeypatch):
     store = FakeStore(escalate_to="smart")
-    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)  # a ladder exists…
-    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": False})
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))  # a ladder exists…
+    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": False})
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is True
     assert not any(call[0] == "escalate" for call in store.calls)  # …but the default doesn't climb it
@@ -745,17 +801,17 @@ def test_review_escalate_false_keeps_the_same_tier(monkeypatch):
 
 def test_review_escalate_exhausted_blocks(monkeypatch):
     store = FakeStore(escalate_to=None)  # ladder already at the top
-    c = _client(monkeypatch, store, cfg=ESCALATION_CFG)
-    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x", "escalate": True})
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": True})
     body = r.json()
     assert body["exhausted"] is True and body["requeued"] is False
     assert any(call[0] == "block_from_review" for call in store.calls)
 
 
-def test_review_is_public_not_operator_gated(monkeypatch):
-    c = _client(monkeypatch, FakeStore())
-    # served on the public prefix (a review-infra edge, like /ci + /webhook)…
-    assert c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 200
+def test_review_is_public_hmac_authenticated_not_operator_gated(monkeypatch):
+    c = _client(monkeypatch, FakeStore(), cfg=_external_cfg())
+    # served on the public prefix behind its own HMAC boundary…
+    assert _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"}).status_code == 200
     # …and NOT on the gated /api prefix.
     assert c.post("/api/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 404
 
@@ -765,8 +821,8 @@ def test_review_from_a_non_in_review_state_surfaces_as_400(monkeypatch):
         def record_review_bounce(self, fid, findings=""):
             raise BoardError("review bounce expects in_review, got 'in_progress'")
 
-    c = _client(monkeypatch, WrongState())
-    r = c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"})
+    c = _client(monkeypatch, WrongState(), cfg=_external_cfg())
+    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"})
     assert r.status_code == 400 and "in_review" in r.json()["detail"]
 
 
