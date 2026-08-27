@@ -299,7 +299,7 @@ def test_manifest_numeric_settings_have_operator_safe_bounds():
 
 
 def test_manifest_min_host_version_covers_tabbed_plugin_config():
-    """The tab contract lands in protoAgent 0.154.0 (#3179/#3180)."""
+    """The tab contract shipped in protoAgent 0.153.2 (#3179/#3180)."""
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
-    major, minor, *_ = (int(x) for x in str(m["min_protoagent_version"]).split("."))
-    assert (major, minor) >= (0, 154)
+    version = tuple(int(x) for x in str(m["min_protoagent_version"]).split("."))
+    assert version >= (0, 153, 2)
