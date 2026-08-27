@@ -199,7 +199,7 @@ project_board:
                              # sequentially — useful when the host supports only one ACP
                              # process at a time. Peak without this cap:
                              # max_concurrent × coder_solve_k.
-  # webhook_secret: "..."    # set before exposing /webhook/pr publicly
+  # webhook_secret: "..."    # required HMAC for public merge/CI/review ingress
 ```
 
 ## Use
@@ -219,12 +219,13 @@ project_board:
   "merge #N" on a red PR.
 - **Plan a project:** the `decompose-project` skill ("decompose <idea>") runs the
   adversarial pipeline and populates the board.
-- **HTTP API** (`/plugins/project_board/*`): `epics`, `milestones`, `features`,
-  `features/{id}/{ready,dep,block,unblock,ci}`, and `/webhook/pr` (the Done edge —
-  a stable public URL GitHub posts to; ungated so GitHub, which can't send a bearer,
-  reaches it). `features/{id}/{cancel,test-rung}` and `DELETE features/{id}` are
-  **operator-only** — no `@tool` wrapper, so the board's own lead agent has no way
-  to call them.
+- **HTTP API:** operator reads and mutations live under the bearer-gated
+  `/api/plugins/project_board/*` prefix. The public prefix exposes only the board
+  iframe plus `/webhook/pr`, `/features/{id}/ci`, and `/features/{id}/review` for
+  external systems. Every public POST requires
+  `X-Hub-Signature-256: sha256=<HMAC-SHA256(raw-body, webhook_secret)>`; a blank
+  secret disables public mutations with 503. GitHub signs `/webhook/pr` natively;
+  CI/review callers must sign the exact JSON bytes they send.
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
