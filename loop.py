@@ -444,6 +444,46 @@ async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
     return state == "open"
 
 
+def _issue_closed_by_board_sibling(store, feature: dict) -> bool:
+    """Did the current board's OWN work close this feature's source issue (#253)?
+
+    A multi-slice board can put several features under one ``source_issue`` (one
+    issue split across cards). When one slice merges first, its ``Fixes #N``
+    closes the shared issue — at which point the #166 closed-issue guard would
+    wrongly cancel every REMAINING sibling as "superseded", even though each
+    still has its own slice of work to ship. This distinguishes that case from a
+    genuine external supersede: a SIBLING feature (a different card carrying the
+    same source issue) sitting in ``done`` WITH a ``pr_url`` is the board's own
+    merged PR that closed the issue, so the current feature should still open its
+    own PR rather than be cancelled.
+
+    Returns True when such a sibling exists (⇒ skip the #166 cancel, keep
+    working) OR when the store read fails — the check fails OPEN in the same
+    direction as ``_source_issue_still_open``: a read error must never turn into
+    a cancel that throws away completed coder work. Returns False only when the
+    store was read cleanly and named no done sibling for this issue (⇒ the
+    closure came from outside the board, so the #166 cancel proceeds unchanged).
+    Source issues are compared in parsed ``(slug, n)`` form so a URL, an
+    ``owner/repo#N`` and a bare ``#N`` for the same issue all match."""
+    parsed = _source_issue(feature)
+    if parsed is None:
+        return False  # no resolvable source issue → nothing a sibling could share
+    try:
+        siblings = store.list_features(state="done")
+    except Exception:  # noqa: BLE001 — store read failed → fail open (skip the cancel)
+        return True
+    fid = feature.get("id")
+    for s in siblings:
+        # A sibling is another card whose merged PR could have closed the issue:
+        # skip self, and skip a done card that never opened a PR (nothing of its
+        # could have carried the closing `Fixes #N`).
+        if s.get("id") == fid or not s.get("pr_url"):
+            continue
+        if _source_issue(s) == parsed:
+            return True
+    return False
+
+
 # ── live concurrency knobs ─────────────────────────────────────────────────────
 # The scalar cfg keys a config reload re-applies to the RUNNING loop (BoardLoop.reload,
 # wired through ADR 0018 ``register_surface(reload=)``). Project routing is also live,
@@ -2637,8 +2677,17 @@ class BoardLoop:
                     # opening a PR. A closed source issue means another PR already
                     # resolved the ticket — opening a duplicate wastes reviewer/CI
                     # cycles. Fail-open: any gh error lets the PR proceed normally.
+                    # #253: but on a MULTI-SLICE board several features can share one
+                    # source_issue — when a sibling slice merges first its `Fixes #N`
+                    # closes the shared issue, and this guard must NOT then cancel the
+                    # remaining siblings. Only cancel when the closure came from OUTSIDE
+                    # the board's own feature set (no done sibling with a PR for it).
                     si_raw = str(feature.get("source_issue") or "").strip()
-                    if si_raw and not await _source_issue_still_open(si_raw, wt):
+                    if (
+                        si_raw
+                        and not await _source_issue_still_open(si_raw, wt)
+                        and not _issue_closed_by_board_sibling(store, feature)
+                    ):
                         reason = f"source issue {si_raw} already closed — work superseded"
                         log.info("[project_board] %s skipping PR — %s", fid, reason)
                         try:
