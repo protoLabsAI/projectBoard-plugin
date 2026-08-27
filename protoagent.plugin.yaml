@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.154.0"  # settings_tabs + sandboxed custom Configure views (#3179/#3180)
+min_protoagent_version: "0.153.2"  # settings_tabs + sandboxed custom Configure views (#3179/#3180)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board

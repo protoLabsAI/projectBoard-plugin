@@ -81,7 +81,7 @@ spawn primitive — it does not reimplement it.
 
 ## Requirements
 
-- **protoAgent ≥ 0.154.0** (tabbed plugin Configure dialogs and sandboxed custom
+- **protoAgent ≥ 0.153.2** (tabbed plugin Configure dialogs and sandboxed custom
   Configure views; protoAgent #3179/#3180).
 - **beads-rust** — the **`br`** CLI, the board's DAG/status store. **Fetched for you on
   first run (v0.43.0)**: with no `br` on `PATH` the plugin downloads the pinned release
@@ -233,7 +233,7 @@ project_board:
 
 ## Configure it in the console
 
-On protoAgent 0.154.0+, **Settings → Plugins → Project Board → Configure** is split
+On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is split
 by operator intent:
 
 - **Projects** is the live registry editor. It lists the configured project map and
