@@ -546,6 +546,19 @@ class BeadsBoard:
         # `_run` that set it, before any other want_json call overwrites it.
         self._last_json_has_more = None
 
+    def reconfigure_projects(self, projects: dict | None, default_project: str = "") -> None:
+        """Replace the live multi-project routing map without rebuilding the board.
+
+        The board cache is keyed by its beads workspace, not by routing policy, so a
+        config reload must update the shared object in place: loop, API, and tools all
+        retain references to this instance. Existing in-flight drives have already
+        resolved their repo/base; subsequent ready gates and dispatches use this map.
+        """
+        resolved = dict(projects or {})
+        default = str(default_project or "").strip() or (next(iter(resolved)) if len(resolved) == 1 else "")
+        self.projects = resolved
+        self.default_project = default
+
     # ── workspace pin (ADR 0055 P0, #48) ──────────────────────────────────────
     def _ensure_workspace(self) -> None:
         """Pin the board to THIS repo's beads workspace so `br` can't walk UP the tree
@@ -2335,3 +2348,25 @@ def get_store(db: str | None = None, **kw) -> BeadsBoard:
         board = BeadsBoard(db, **kw)
         _BOARDS[key] = board
     return board
+
+
+def reconfigure_cached_store(
+    db: str | None = None,
+    *,
+    repo: str = ".",
+    base_branch: str = "main",
+    projects: dict | None = None,
+    default_project: str = "",
+) -> bool:
+    """Apply project routing to an existing shared board, if one exists.
+
+    Reload must not call :func:`get_store`: constructing a board can probe/fetch
+    ``br`` while the host is synchronously applying Settings. The loop only needs
+    to refresh the object it has already used; a board first created after reload
+    receives the new routing through its normal constructor kwargs.
+    """
+    board = _BOARDS.get((db or None, repo, base_branch))
+    if board is None:
+        return False
+    board.reconfigure_projects(projects, default_project)
+    return True

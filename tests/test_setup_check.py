@@ -851,8 +851,16 @@ def test_status_route_reports_the_running_loops_stale_restart_knobs(monkeypatch,
 
 
 def test_stale_loop_keys_compare_only_restart_knobs():
-    snap = setup_check.snapshot_of({"repo": "/a", "coders": {"smart": "x"}, "coder": "p"})
-    assert setup_check.stale_loop_keys({"repo": "/a", "coders": {"smart": "x"}, "coder": "q"}, snap) == []
+    snap = setup_check.snapshot_of(
+        {"repo": "/a", "coders": {"smart": "x"}, "coder": "p", "projects": {"old": {"repo": "/old"}}}
+    )
+    assert (
+        setup_check.stale_loop_keys(
+            {"repo": "/a", "coders": {"smart": "x"}, "coder": "q", "projects": {"new": {"repo": "/new"}}},
+            snap,
+        )
+        == []
+    )
     assert setup_check.stale_loop_keys({"repo": "/b", "coders": {"smart": "y"}}, snap) == ["coders", "repo"]
     assert setup_check.stale_loop_keys({"repo": "/b"}, None) == []
 

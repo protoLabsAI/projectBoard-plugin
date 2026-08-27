@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.31.0"   # register_surface(reload=) — the live concurrency knobs (#509/#511)
+min_protoagent_version: "0.31.0"   # register_surface(reload=) — live knobs and project routing (#509/#511)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
