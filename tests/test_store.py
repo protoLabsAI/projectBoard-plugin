@@ -44,9 +44,7 @@ def test_reconfigure_cached_store_updates_shared_project_routing(monkeypatch):
     key = (None, "/instance", "main")
     monkeypatch.setitem(store._BOARDS, key, board)
 
-    assert store.reconfigure_cached_store(
-        repo="/instance", projects={"new": {"repo": "/new"}}, default_project="new"
-    )
+    assert store.reconfigure_cached_store(repo="/instance", projects={"new": {"repo": "/new"}}, default_project="new")
     assert board.projects == {"new": {"repo": "/new"}}
     assert board.default_project == "new"
     assert board._repo_for({"project": "new"}) == "/new"
