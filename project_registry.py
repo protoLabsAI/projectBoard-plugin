@@ -96,7 +96,15 @@ def _raw_projects() -> dict[str, Any]:
     try:
         from graph.sdk import config as host_config
 
-        section = getattr(host_config(), "project_board", None) or {}
+        live = host_config()
+        plugin_config = getattr(live, "plugin_config", None)
+        section = plugin_config.get("project_board") if isinstance(plugin_config, dict) else None
+        # Compatibility with small host stubs and older embeddings that exposed a
+        # plugin section directly. The production LangGraphConfig contract is the
+        # plugin_config mapping above.
+        if section is None:
+            section = getattr(live, "project_board", None)
+        section = section or {}
     except Exception:  # noqa: BLE001
         return {}
     if not isinstance(section, dict):
@@ -186,6 +194,24 @@ def build_register_tool(cfg: dict):
         if not ok:
             return f"Error: registering {project} failed: {'; '.join(messages) or 'unknown error'}"
 
+        # apply_settings is synchronous with the graph reload. Never report success
+        # merely because the host returned ok: read the live config back and prove
+        # both the requested entry and every sibling survived the write.
+        persisted = _raw_projects()
+        missing_siblings = sorted(set(existing) - set(persisted))
+        landed = persisted.get(project)
+        mismatched = [key for key, value in entry.items() if not isinstance(landed, dict) or landed.get(key) != value]
+        if missing_siblings or mismatched:
+            detail = []
+            if missing_siblings:
+                detail.append("dropped sibling(s): " + ", ".join(missing_siblings))
+            if mismatched:
+                detail.append("entry did not persist field(s): " + ", ".join(mismatched))
+            return (
+                f"Error: the host reported that project {project!r} was saved, but live config readback failed "
+                f"({'; '.join(detail)}). Registration is not active; no success was assumed."
+            )
+
         verb = "Updated" if updating else "Registered"
         gate = "its own gate" if entry.get("local_gate_cmd") else "the default gate"
         conv = "with conventions" if entry.get("repo_conventions") else "WITHOUT conventions"
@@ -196,7 +222,7 @@ def build_register_tool(cfg: dict):
         )
         return (
             f"{verb} board project '{project}' → {repo_p} (base {entry['base_branch']}, "
-            f"{gate}, {conv}). The board picks it up on its next dispatch.{note}"
+            f"{gate}, {conv}). The running board applied it live; no restart is required.{note}"
         )
 
     return board_register_project

@@ -191,6 +191,46 @@ def test_reload_applies_coder_live_and_keeps_cfg_in_step():
     assert loop.coder_name == "" and loop.cfg["coder"] == ""
 
 
+def test_reload_applies_project_routing_to_loop_and_cached_store(monkeypatch):
+    loop = BoardLoop({"repo": "/instance", "projects": {"old": {"repo": "/old"}}})
+    loop._preflight_state["old"] = False
+    loop._last_preflight["old"] = 123.0
+    captured = []
+    monkeypatch.setattr(loop_mod, "reconfigure_cached_store", lambda **kw: captured.append(kw) or True)
+
+    changed = loop.reload(
+        _HostConfig(
+            {
+                "projects": {
+                    "old": {"repo": "/old"},
+                    "new": {"repo": "/new", "base_branch": "develop"},
+                },
+                "default_project": "new",
+            }
+        )
+    )
+
+    assert changed == {
+        "projects": (("old",), ("old", "new")),
+        "default_project": ("old", "new"),
+    }
+    assert loop._repo_for({"project": "new"}) == "/new"
+    assert loop._base_branch_for({"project": "new"}) == "develop"
+    assert loop._store_kw["projects"] is loop._projects
+    assert captured[-1]["projects"] is loop._projects and captured[-1]["default_project"] == "new"
+    assert loop._preflight_state == {} and loop._last_preflight == {}
+
+
+def test_reload_rejects_malformed_project_routing_as_one_unit(monkeypatch, caplog):
+    loop = BoardLoop({"projects": {"old": {"repo": "/old"}}})
+    monkeypatch.setattr(loop_mod, "reconfigure_cached_store", lambda **_kw: pytest.fail("must not mutate store"))
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        assert loop.reload({"projects": {"broken": {"base_branch": "main"}}}) == {}
+    assert tuple(loop._projects) == ("old",)
+    assert loop.cfg["projects"] == {"old": {"repo": "/old"}}
+    assert "project routing is malformed" in caplog.text
+
+
 def test_max_mode_n_parsing():
     assert BoardLoop({}).max_mode_n == 1  # off by default
     assert BoardLoop({"max_mode_n": 5}).max_mode_n == 5
@@ -4198,7 +4238,8 @@ def test_coder_solve_settings_resolve_per_project():
 
 
 async def test_drive_builds_in_the_features_project_repo(monkeypatch):
-    # r1 end-to-end: the drive creates the worktree + opens the PR in the project's repo.
+    # r1 end-to-end: a project added by live reload is used by the very next drive to
+    # create its worktree + PR — no construction-time routing leaks through.
     captured = {}
     store = FakeLoopStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
@@ -4223,9 +4264,17 @@ async def test_drive_builds_in_the_features_project_repo(monkeypatch):
             "coder": "proto",
             "coder_solve": False,  # force the single-shot path (no solve ladder)
             "repo": "/instance/repo",
-            "projects": {"board-plugin": {"repo": "/repos/board-plugin", "base_branch": "develop"}},
+            "projects": {"existing": {"repo": "/repos/existing"}},
         }
     )
+    assert loop.reload(
+        {
+            "projects": {
+                "existing": {"repo": "/repos/existing"},
+                "board-plugin": {"repo": "/repos/board-plugin", "base_branch": "develop"},
+            }
+        }
+    )["projects"] == (("existing",), ("existing", "board-plugin"))
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
     await loop._drive({**FEATURE, "project": "board-plugin"})
     assert captured["repo"] == "/repos/board-plugin"  # NOT /instance/repo

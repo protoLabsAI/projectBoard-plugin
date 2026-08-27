@@ -62,6 +62,7 @@ from .store import (
     get_store,
     knob_bool,
     merge_posture,
+    reconfigure_cached_store,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -444,9 +445,10 @@ async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
 
 
 # ── live concurrency knobs ─────────────────────────────────────────────────────
-# The cfg keys a config reload re-applies to the RUNNING loop (BoardLoop.reload, wired
-# through ADR 0018 ``register_surface(reload=)``). Everything else in cfg is read once
-# at construction and needs a restart — the startup log says so. Keep this list in
+# The scalar cfg keys a config reload re-applies to the RUNNING loop (BoardLoop.reload,
+# wired through ADR 0018 ``register_surface(reload=)``). Project routing is also live,
+# but is handled as one validated unit below rather than as independent scalar knobs.
+# Everything else in cfg is read once and needs a restart. Keep this list in
 # step with the manifest's ``settings:`` block (those are the console fields) and
 # the README's "Concurrency" section.
 LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge", "coder", "br_autofetch")
@@ -1150,7 +1152,7 @@ class BoardLoop:
         setup_check.publish_loop_snapshot(self.cfg)
         log.info(
             "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
-            "merge_poll=%s, coder_timeout=%ss; live on config reload: %s — everything else "
+            "merge_poll=%s, coder_timeout=%ss; live on config reload: %s, projects — everything else "
             "needs a restart)",
             self.coder_name or "<unset>",
             self.reviewer_name,
@@ -1201,7 +1203,7 @@ class BoardLoop:
         )
 
     def reload(self, new_config) -> dict:
-        """Apply the concurrency knobs from a reloaded config to the RUNNING loop.
+        """Apply live knobs and project routing to the RUNNING loop.
 
         The host fires this on every config reload with the new ``LangGraphConfig``
         (ADR 0018 ``register_surface(reload=)``) — the running surface survives a
@@ -1216,6 +1218,50 @@ class BoardLoop:
         loop mid-drive."""
         section = _plugin_section(new_config)
         changed: dict[str, tuple] = {}
+
+        # A project's fields form one routing policy: resolving a repo with the old
+        # base/gate/coder map (or vice versa) would cross streams. Validate a complete
+        # candidate first, then atomically replace both the loop's map and the shared
+        # board's map. In-flight drives have already resolved their checkout; new
+        # claims and every subsequent dispatch use the replacement.
+        if "projects" in section or "default_project" in section:
+            candidate = dict(self.cfg)
+            if "projects" in section:
+                candidate["projects"] = section.get("projects")
+            if "default_project" in section:
+                candidate["default_project"] = section.get("default_project")
+            try:
+                projects = resolve_projects(candidate)
+                default = resolve_default_project(candidate)
+            except (TypeError, ValueError) as exc:
+                log.warning("[project_board] reload: project routing is malformed — keeping current map: %s", exc)
+            else:
+                old_projects = self._projects
+                old_default = self._default_project
+                if projects != old_projects or default != old_default:
+                    self._projects = projects
+                    self._default_project = default
+                    if "projects" in section:
+                        self.cfg["projects"] = section.get("projects")
+                    if "default_project" in section:
+                        self.cfg["default_project"] = section.get("default_project")
+                    self._store_kw["projects"] = projects
+                    self._store_kw["default_project"] = default
+                    reconfigure_cached_store(
+                        db=self._store_kw["db"],
+                        repo=self._store_kw["repo"],
+                        base_branch=self._store_kw["base_branch"],
+                        projects=projects,
+                        default_project=default,
+                    )
+                    # A repo that previously failed preflight gets a clean evaluation
+                    # under its new routing. Retain `_preflight_held`: it records cards
+                    # the loop itself blocked and is needed to release them on recovery.
+                    self._preflight_state.clear()
+                    self._last_preflight.clear()
+                    changed["projects"] = (tuple(old_projects), tuple(projects))
+                    if old_default != default:
+                        changed["default_project"] = (old_default, default)
         for key in LIVE_KNOBS:
             if key not in section:
                 continue

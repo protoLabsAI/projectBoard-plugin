@@ -38,6 +38,19 @@ class Br:
         return [a for a in self.calls if a and a[0] == name]
 
 
+def test_reconfigure_cached_store_updates_shared_project_routing(monkeypatch):
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    board = BeadsBoard(repo="/instance", projects={"old": {"repo": "/old"}}, default_project="old")
+    key = (None, "/instance", "main")
+    monkeypatch.setitem(store._BOARDS, key, board)
+
+    assert store.reconfigure_cached_store(repo="/instance", projects={"new": {"repo": "/new"}}, default_project="new")
+    assert board.projects == {"new": {"repo": "/new"}}
+    assert board.default_project == "new"
+    assert board._repo_for({"project": "new"}) == "/new"
+    assert not store.reconfigure_cached_store(repo="/not-cached", projects={})
+
+
 # ── board_state: the projection (status + labels → one of six states) ───────────
 
 
