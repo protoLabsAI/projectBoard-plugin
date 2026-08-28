@@ -3082,7 +3082,7 @@ def test_project_deliverable_defaults_empty_for_coding_features(make_board):
     assert b._project({"id": "x", "status": "open", "labels": []})["deliverable"] == ""
 
 
-# ── `br --json` failures: the reason is on STDOUT, and a missing id is data (#256) ──
+# ── `br --json` failures: the reason is on STDOUT, and a missing id is data (#255) ──
 
 
 def _json_err(code: str, message: str, hint: str = "", rc: int = 3):

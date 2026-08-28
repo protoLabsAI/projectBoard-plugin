@@ -828,7 +828,7 @@ class BoardLoop:
         # reason; `_preflight_held[name]` is the set of fids THIS loop blocked for that
         # project's failed preflight; `_last_preflight[name]` throttles its re-checks.
         self._preflight_state: dict[str, bool | str | None] = {}
-        # Projects whose last preflight ran against a non-base checkout (#256): the
+        # Projects whose last preflight ran against a non-base checkout (#255): the
         # verdict was downgraded to indeterminate, and /status says so rather than
         # leaving the operator with a silently-permissive gate.
         self._preflight_dirty: dict[str, str] = {}
@@ -3402,7 +3402,7 @@ class BoardLoop:
                 self._base_branch_for({"project": name}),
             )
         if ran:
-            # Surface the verdicts on /status (#256) — a board that stops picking work
+            # Surface the verdicts on /status (#255) — a board that stops picking work
             # up must be able to say why without the operator reading the log.
             health.publish_preflight(self._preflight_state, self._preflight_dirty)
 
@@ -3413,7 +3413,7 @@ class BoardLoop:
         hold THIS project's work). A TIMEOUT is indeterminate → allow (a slow gate must
         not wedge the board). Releases this project's holds on recovery.
 
-        A DIRTY checkout is indeterminate too (#256). Coders only touch worktrees, so the
+        A DIRTY checkout is indeterminate too (#255). Coders only touch worktrees, so the
         main checkout normally still sits at base — but the OPERATOR edits it by hand, and
         then the gate we just ran was a verdict on their uncommitted work, not on the base
         every worktree branches from. Holding a project on that is the worse of the two
@@ -3455,7 +3455,7 @@ class BoardLoop:
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             text = text or f"gate exited {proc.returncode} with no output"
-            # Only a CLEAN checkout can convict the base (#256) — see the docstring.
+            # Only a CLEAN checkout can convict the base (#255) — see the docstring.
             dirt = await worktree.base_checkout_dirt(repo, base)
             if dirt:
                 self._preflight_dirty[name] = dirt

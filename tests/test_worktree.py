@@ -1206,7 +1206,7 @@ async def test_kill_on_cancel_tolerates_an_already_exited_child(monkeypatch):
         await task
 
 
-# ── base_checkout_dirt: is the main checkout a fair stand-in for base? (#256) ──────
+# ── base_checkout_dirt: is the main checkout a fair stand-in for base? (#255) ──────
 
 
 async def test_base_checkout_dirt_is_empty_for_a_clean_checkout_on_base(monkeypatch):

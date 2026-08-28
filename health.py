@@ -1,4 +1,4 @@
-"""Loop-health facts the API can read without reaching into the running loop (#256).
+"""Loop-health facts the API can read without reaching into the running loop (#255).
 
 The gate preflight is the board's most consequential piece of hidden state: one project
 whose gate is red fail-closes THAT project's dispatch, and because the held cards drop
@@ -35,7 +35,7 @@ def _attach() -> dict:
     if isinstance(prev, dict):
         return prev
     holder = types.ModuleType(name)
-    holder.__doc__ = "Process-stable holder for project_board's loop-health facts (#256)."
+    holder.__doc__ = "Process-stable holder for project_board's loop-health facts (#255)."
     holder.health = {}
     sys.modules[name] = holder
     return holder.health

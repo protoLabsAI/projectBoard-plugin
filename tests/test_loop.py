@@ -5905,7 +5905,7 @@ def test_cancel_side_effects_closes_pr_and_signals_the_drive(monkeypatch):
     assert side["pr_closed"] is False and side["pr_detail"] == "already merged"  # nothing was closed — say so
 
 
-# ── preflight only convicts a CLEAN checkout (#256) ────────────────────────────────
+# ── preflight only convicts a CLEAN checkout (#255) ────────────────────────────────
 
 
 async def _run_preflight(monkeypatch, *, rc, dirt, out=b"gate is red"):

@@ -1669,7 +1669,7 @@ def test_cancel_route_without_a_pr_does_not_touch_gh(monkeypatch):
     assert c.post("/api/plugins/project_board/features/bd-7/cancel").json()["cancel"]["pr_closed"] is False
 
 
-# ── /status explains an idle board (#256) ─────────────────────────────────────────
+# ── /status explains an idle board (#255) ─────────────────────────────────────────
 
 
 def test_status_reports_the_projects_a_failed_preflight_is_holding(monkeypatch):
