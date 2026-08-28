@@ -1508,7 +1508,7 @@ class BeadsBoard:
             raise BoardError(f"can't mark designing from {f['board_state']!r}")
         self._run("update", fid, "--add-label", LABEL_DESIGNING, "--remove-label", LABEL_READY)
         if note:
-            self._comment(fid, f"designing: {note}")
+            self.comment(fid, f"designing: {note}")
         return self.get_feature(fid)
 
     # ── the puller (Ready → In Progress) ──────────────────────────────────────
@@ -1618,7 +1618,7 @@ class BeadsBoard:
             if ref:
                 text = f"{text} ({ref})" if text else ref
         if text:
-            self._comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
+            self.comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if external_ref:
             args += ["--external-ref", external_ref]
@@ -1639,7 +1639,7 @@ class BeadsBoard:
             args += ["--add-label", label]
         self._run(*args)
         if note:
-            self._comment(fid, note)
+            self.comment(fid, note)
         return self.get_feature(fid)
 
     def bounce_ci_fail(self, fid: str, reason: str = "") -> dict:
@@ -1650,7 +1650,7 @@ class BeadsBoard:
             raise BoardError(f"bounce expects in_review, got {f['board_state']!r}")
         self._run("update", fid, "--remove-label", LABEL_IN_REVIEW)
         if reason:
-            self._comment(fid, f"CI failed: {reason}")
+            self.comment(fid, f"CI failed: {reason}")
         return self.get_feature(fid)
 
     def record_review_bounce(self, fid: str, findings: str = "") -> dict:
@@ -1662,7 +1662,7 @@ class BeadsBoard:
         f = self._require(fid)
         if f["board_state"] != "in_review":
             raise BoardError(f"review bounce expects in_review, got {f['board_state']!r}")
-        self._comment(fid, f"review requested changes: {findings}" if findings else "review requested changes")
+        self.comment(fid, f"review requested changes: {findings}" if findings else "review requested changes")
         return f
 
     def requeue(self, fid: str) -> dict:
@@ -1692,7 +1692,7 @@ class BeadsBoard:
         self._require(fid)
         self._run("update", fid, "--remove-label", LABEL_IN_REVIEW, "--add-label", LABEL_BLOCKED)
         if reason:
-            self._comment(fid, f"escalation exhausted: {reason}")
+            self.comment(fid, f"escalation exhausted: {reason}")
         return self.get_feature(fid)
 
     # ── the ONE Done edge for coding features (invariant #2) ──────────────────
@@ -1772,7 +1772,7 @@ class BeadsBoard:
         # Audit trail: record WHY this was hand-closed BEFORE the close (the close is the
         # last write, so the comment lands even if a later projection read hiccups).
         if reason:
-            self._comment(fid, f"done: {reason}")
+            self.comment(fid, f"done: {reason}")
         self._run("close", fid, "-r", f"done: {reason}" if reason else "done (manual)")
         return self.get_feature(fid)
 
@@ -1798,7 +1798,7 @@ class BeadsBoard:
             raise BoardError(f"record_verification expects in_review, got {f['board_state']!r}")
         if not approved:
             if feedback:
-                self._comment(fid, f"verification failed: {feedback}")
+                self.comment(fid, f"verification failed: {feedback}")
             return self.requeue(fid)
         self._run("close", fid, "-r", f"verified: {self.actor}")
         return self.get_feature(fid)
@@ -1908,7 +1908,7 @@ class BeadsBoard:
         # (`--status open --add-label ready`) be re-claimed without a manual unassign.
         self._run("update", fid, "--add-label", LABEL_BLOCKED, "--assignee", "")
         if reason:
-            self._comment(fid, f"blocked: {reason}")
+            self.comment(fid, f"blocked: {reason}")
         return self.get_feature(fid)
 
     def clear_blocked(self, fid: str) -> dict:
@@ -1949,7 +1949,7 @@ class BeadsBoard:
         f = self._require(fid)
         n = len([a for a in f.get("attempts", [])]) + 1
         self._run("update", fid, "--add-label", f"attempt:{n}", "--add-label", f"tier:{tier}")
-        self._comment(fid, f"attempt {n} (tier={tier}): {outcome}")
+        self.comment(fid, f"attempt {n} (tier={tier}): {outcome}")
         return self.get_feature(fid)
 
     def next_tier(self, current: str) -> str | None:
@@ -1992,7 +1992,7 @@ class BeadsBoard:
             args += ["--remove-label", stale]
         args += ["--add-label", f"{LABEL_VERIFIED_PREFIX}{sha}"]
         self._run(*args)
-        self._comment(fid, f"verified candidate: branch={branch} sha={sha} worktree={worktree}")
+        self.comment(fid, f"verified candidate: branch={branch} sha={sha} worktree={worktree}")
         return self.get_feature(fid)
 
     def clear_verified_candidate(self, fid: str) -> dict:
@@ -2339,11 +2339,20 @@ class BeadsBoard:
         ]
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    def _comment(self, fid: str, text: str) -> None:
+    def comment(self, fid: str, text: str) -> None:
+        """Append a best-effort audit comment to a feature's bead.
+
+        A `br` failure is swallowed (logged, not raised): the trail is
+        best-effort and a comment write must never break the calling edge.
+        """
         try:
             self._run("comments", "add", fid, text)
         except BoardError:
             log.warning("[project_board] could not add comment to %s", fid)
+
+    # Compatibility alias for the pre-#266 private name; retained for one
+    # release so out-of-tree callers migrate to the public `comment()`.
+    _comment = comment
 
     def _require(self, fid: str) -> dict:
         f = self.get_feature(fid)

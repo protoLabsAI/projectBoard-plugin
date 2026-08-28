@@ -1724,13 +1724,13 @@ def test_resolve_delegate_returns_none_when_delegates_plugin_absent():
 
 
 class _FakeStore:
-    """Captures ``_comment(fid, text)`` calls — stands in for the board store the
+    """Captures ``comment(fid, text)`` calls — stands in for the board store the
     persist factory returns, so no `br`/beads is needed."""
 
     def __init__(self):
         self.comments: list[tuple[str, str]] = []
 
-    def _comment(self, fid, text):
+    def comment(self, fid, text):
         self.comments.append((fid, text))
 
 
@@ -1793,7 +1793,7 @@ def test_progress_end_swallows_a_failing_comment_write(monkeypatch):
     monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
 
     class _BoomStore:
-        def _comment(self, fid, text):
+        def comment(self, fid, text):
             raise RuntimeError("br exploded")
 
     monkeypatch.setattr(cs, "_store_factory", lambda: _BoomStore())

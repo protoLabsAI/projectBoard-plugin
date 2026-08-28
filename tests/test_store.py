@@ -1195,7 +1195,7 @@ def test_flag_blocked_clears_the_assignee(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid})
-    monkeypatch.setattr(b, "_comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
     b.flag_blocked("bd-9", "boom")
     assert ("update", "bd-9", "--add-label", "blocked", "--assignee", "") in br.calls
@@ -2121,7 +2121,7 @@ def test_record_review_bounce_comments_from_in_review_distinct_from_ci(make_boar
     br = Br()
     b = make_board(br)
     comments = []
-    monkeypatch.setattr(b, "_comment", lambda fid, text: comments.append((fid, text)))
+    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append((fid, text)))
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
     b.record_review_bounce("bd-9", "auth check missing a null guard")
     assert comments == [("bd-9", "review requested changes: auth check missing a null guard")]
@@ -3723,6 +3723,38 @@ def test_br_invocations_are_single_flight_per_process(monkeypatch):
     for t in threads:
         t.join()
     assert state["peak"] == 1
+
+
+# ── the public comment() seam and its one-release _comment alias (#266) ─────────
+
+
+def test_comment_is_public_and_records_the_br_call(make_board):
+    """comment() is the published audit-trail seam: it writes a `br comments add`."""
+    br = Br()
+    b = make_board(br)
+    b.comment("bd-1", "spec updated: title")
+    assert ("comments", "add", "bd-1", "spec updated: title") in br.calls
+
+
+def test_comment_alias_is_retained_for_one_release(make_board):
+    """_comment stays a live alias for the old private name so out-of-tree callers
+    keep working for one release — it is the SAME callable and behaves identically."""
+    assert BeadsBoard._comment is BeadsBoard.comment
+    br = Br()
+    b = make_board(br)
+    b._comment("bd-2", "legacy caller")
+    assert ("comments", "add", "bd-2", "legacy caller") in br.calls
+
+
+def test_comment_swallows_a_board_error(make_board):
+    """The trail is best-effort: a `br` failure is logged, never raised, so a comment
+    write can't break the edge that called it."""
+
+    def run_impl(*args, want_json=False, with_has_more=False):
+        raise BoardError("br exploded")
+
+    b = make_board(run_impl)
+    b.comment("bd-3", "must not raise")  # no exception escapes
 
 
 def test_br_lock_is_shared_across_module_instances():
