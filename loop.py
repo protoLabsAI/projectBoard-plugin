@@ -372,6 +372,29 @@ def _pr_body(result: str, feature: dict) -> str:
     return body[:4000]
 
 
+# The NO_TEST_NEEDED escape hatch (#264) — structural evidence, not a substring
+# scan: the marker only counts when it stands at line start inside the FINAL
+# ``## Summary`` section (the ``_pr_body`` last-occurrence discipline). A mention
+# mid-narration, or one outside the summary, is prose — not a declaration — and
+# the reason is mandatory: a bare marker carries no evidence.
+_NO_TEST_MARKER_RE = re.compile(r"^NO_TEST_NEEDED\s*:\s*(?P<reason>\S.*)$")
+
+
+def _no_test_marker(reply: str) -> str | None:
+    """The coder's ``NO_TEST_NEEDED: <reason>`` declaration, or ``None``. Keeps the
+    LAST ``## Summary`` heading (a mid-narration mention must not shadow the real
+    section) and accepts only a line-start ``NO_TEST_NEEDED: <reason>`` row inside
+    it — anything else is narration, and narration is not a declaration."""
+    headings = list(_SUMMARY_HEADING_RE.finditer(reply or ""))
+    if not headings:
+        return None
+    for line in reply[headings[-1].end() :].splitlines():
+        m = _NO_TEST_MARKER_RE.match(line.strip())
+        if m:
+            return m.group("reason").strip()
+    return None
+
+
 # ── source-issue → PR "Fixes #N" line (pure metadata; the coder never touches it) ─
 # At PR-open the loop stamps the ORIGINATING issue onto the generated body itself.
 # The source issue is either an explicit ``source_issue`` field or the FIRST GitHub
@@ -3769,8 +3792,10 @@ class BoardLoop:
 
         ESCAPE HATCH: not every code change needs a test (a pure refactor, config/docs-as-
         code, a constant tweak). The coder — which saw the actual change — can declare
-        ``NO_TEST_NEEDED: <reason>`` in its reply; we log the reason and pass, rather than
-        burning retries on a test that doesn't apply. Returns a gap string (→ re-dispatch/
+        ``NO_TEST_NEEDED: <reason>`` at line start inside its final ``## Summary`` section
+        (#264 — structural via ``_no_test_marker``, not a substring scan: a mid-narration
+        mention is not a declaration); we log the reason and pass, rather than burning
+        retries on a test that doesn't apply. Returns a gap string (→ re-dispatch/
         escalate) or None. Fails OPEN on any error (never blocks a good PR on infra)."""
         ac = (feature.get("acceptance_criteria") or "").strip()
         if not ac:
@@ -3785,19 +3810,20 @@ class BoardLoop:
             return None  # an empty diff is open_pr's NoChangesError job, not ours
         code = [n for n in changed if _is_code_path(n) and not _is_test_path(n)]
         if code and not any(_is_test_path(n) for n in changed):
-            if "NO_TEST_NEEDED" in (coder_reply or ""):
-                reason = (coder_reply.split("NO_TEST_NEEDED", 1)[1].lstrip(": ").splitlines() or [""])[0].strip()
+            reason = _no_test_marker(coder_reply or "")
+            if reason is not None:
                 log.info(
                     "[project_board] %s no-test accepted (coder declared): %s",
                     feature.get("id"),
-                    reason[:200] or "(no reason given)",
+                    reason[:200],
                 )
                 return None
             head = ", ".join(code[:6]) + ("…" if len(code) > 6 else "")
             return (
                 "no test was added/updated for the code change — add a test covering the new "
-                f"behavior, or declare `NO_TEST_NEEDED: <reason>` if a test genuinely doesn't "
-                f"apply (refactor/config/docs) (code: {head})"
+                f"behavior, or declare `NO_TEST_NEEDED: <reason>` on its own line in your final "
+                f"`## Summary` section if a test genuinely doesn't apply (refactor/config/docs) "
+                f"(code: {head})"
             )
         return None
 
@@ -4184,7 +4210,8 @@ class BoardLoop:
             f"part of the definition of done, not optional — a code change with no test "
             f"is rejected before the PR opens. If a test GENUINELY doesn't apply (a pure "
             f"refactor, config/docs-as-code, or a change with no behavior to exercise), "
-            f"write a single line `NO_TEST_NEEDED: <reason>` in your final message instead.\n"
+            f"write a single line `NO_TEST_NEEDED: <reason>` inside the final `## Summary` "
+            f"section of your final message instead — it does not count anywhere else.\n"
             f"- You cannot run shell commands (edit-only); the tests you write run in CI "
             f"on the PR, so they must be correct and self-contained.\n"
             f"- Push the branch if you can; do NOT open a PR (draft or otherwise) — the loop "
