@@ -2205,6 +2205,198 @@ async def test_drive_tier_climb_grants_a_fresh_window_despite_stale_budget_label
     assert ("open_review", "bd-1", "https://example/pr/2") in store.calls
 
 
+# ── #282: keep-worktree state + feedback survive an escalation ───────────────────
+
+
+async def test_drive_ledger_gate_exhaustion_escalates_into_the_same_worktree(monkeypatch):
+    """r1 (#282): a requirement-ledger gate that exhausts its keep-worktree fix budget
+    and climbs a tier re-dispatches into the SAME worktree — the verified impl is on
+    disk — so NO fresh create_worktree runs, and the escalated tier still leads with the
+    truthful gate feedback that the work is already in the worktree and the item is open."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    creates = []
+
+    async def _create(repo, base, fid, root, title=""):
+        creates.append(fid)
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        # fast build + fast keep-wt fix leave r1 OPEN (no disposition); the escalated
+        # smart build finally disposes it so the gate passes and the PR opens.
+        if len(prompts) >= 3:
+            return "## Requirements\n- r1: done\n\n## Summary\nshipped"
+        return "## Summary\nwip"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/282"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_fix_max": 1})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    await loop._drive(feature)
+
+    # ONE climb (fast→smart), triggered by the requirement-ledger exhaustion.
+    assert len(store.escalated) == 1
+    assert "requirements unresolved" in store.escalated[0][1]
+    # The escalated dispatch REUSED the worktree — created exactly once, never again.
+    assert creates == ["bd-1"]
+    # fast build, fast keep-wt fix, smart escalated build — all in the one worktree.
+    assert len(prompts) == 3
+    # The escalated (3rd) prompt still carries the truthful keep-worktree gate feedback:
+    # the impl is already in the worktree and the item is still open (feedback intact).
+    assert "ALREADY in this worktree" in prompts[2]
+    assert "still OPEN" in prompts[2]
+    # Shipped on the escalated tier once r1 was disposed.
+    assert ("open_review", "bd-1", "https://example/pr/282") in store.calls
+
+
+async def test_drive_non_keep_worktree_failure_rebuilds_and_drops_stale_feedback(monkeypatch):
+    """r2 (#282): a capability failure that is NOT a keep-worktree class (an empty diff
+    with tool activity) keeps the existing fresh-worktree escalation — a NEW worktree for
+    the climbed tier — and does NOT carry the prior round's keep-worktree feedback/diff
+    (which described a worktree that no longer exists) into the escalated prompt."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    creates = []
+
+    async def _create(repo, base, fid, root, title=""):
+        creates.append(fid)
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    prompts = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            # Fast attempt: real tool activity but no diff → escalates immediately (a
+            # capability failure, not the empty-result same-tier retry).
+            coder_seam.progress_tool(
+                "bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {"path": "a.py"}}
+            )
+        return "reply"
+
+    opens = {"n": 0}
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opens["n"] += 1
+        if opens["n"] == 1:
+            raise worktree.NoChangesError("coder produced no commits")
+        return "https://example/pr/1"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    # Stand in for a prior keep-worktree gate-fix round: feedback + prior diff seeded,
+    # both describing the (now-gone) worktree.
+    loop._ci_feedback["bd-1"] = "Your implementation is ALREADY in this worktree's files — add tests."
+    loop._ci_prior_diff["bd-1"] = "--- a/a.py\n+++ b/a.py\n@@ stale @@"
+    await loop._drive(FEATURE)
+
+    # A non-keep-worktree capability class → the existing fresh-worktree climb: a NEW
+    # worktree for the escalated tier (two creates, not one reused).
+    assert len(store.escalated) == 1
+    assert creates == ["bd-1", "bd-1"]
+    assert len(prompts) == 2
+    # The escalated prompt does NOT carry the stale keep-worktree feedback or diff.
+    assert "ALREADY in this worktree" not in prompts[1]
+    assert "previous attempt was REJECTED" not in prompts[1]
+    assert "@@ stale @@" not in prompts[1]
+    assert loop._ci_feedback.get("bd-1") is None
+    assert loop._ci_prior_diff.get("bd-1") is None
+    # Shipped from the fresh worktree on the climbed tier.
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+
+
+async def test_drive_keep_worktree_exhaustion_clears_feedback_when_no_worktree(monkeypatch):
+    """r3 (#282): when a keep-worktree gate class exhausts but there is no worktree to
+    carry forward (wt unset), the escalated dispatch is a from-scratch build — so both
+    _ci_feedback and _ci_prior_diff are cleared before it, never leaving the fresh build
+    told its work is already on disk."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    # create_worktree hands back NO worktree path — the keep-wt reuse can never fire, so
+    # the ledger exhaustion escalates with wt unset (the "cannot be kept" branch).
+    async def _create(repo, base, fid, root, title=""):
+        return (None, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    prompts = []
+    feedback_seen = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        feedback_seen.append(loop._ci_feedback.get("bd-1"))
+        if len(prompts) >= 3:
+            return "## Requirements\n- r1: done\n\n## Summary\nshipped"
+        return "## Summary\nwip"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/3"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_fix_max": 1})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    await loop._drive(feature)
+
+    # The ledger exhaustion still climbed once.
+    assert len(store.escalated) == 1
+    assert "requirements unresolved" in store.escalated[0][1]
+    # fast build + fast fix seeded the keep-worktree feedback...
+    assert feedback_seen[1] and "ALREADY in this worktree" in feedback_seen[1]
+    # ...but with no worktree to keep, the escalated (3rd) build ran from scratch with the
+    # stale feedback and prior diff cleared.
+    assert feedback_seen[2] is None
+    assert loop._ci_prior_diff.get("bd-1") is None
+    assert ("open_review", "bd-1", "https://example/pr/3") in store.calls
+
+
 # ── concurrency: _spawn_ready claims up to max_concurrent ────────────────────────
 
 
