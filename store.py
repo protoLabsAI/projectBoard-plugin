@@ -611,9 +611,28 @@ def _complete(coro):
         return pool.submit(asyncio.run, coro).result()
 
 
+def default_db_path() -> str:
+    """The INSTANCE board store — where `br` writes when no ``db_path`` is configured
+    (D3, #260): ``<instance_paths().store("project_board")>/.beads/beads.db``, the same
+    ADR 0065 instance seam ``br_fetch.data_dir`` rides (host-free fallback
+    ``~/.protoagent/project_board``). ONE store per instance: with multiple projects
+    and no db_path every project's cards land here, and the board never runs `br init`
+    inside a project repo (the pre-D3 blank-db default, which fragmented the board
+    across per-repo `.beads/` workspaces). An explicit ``db_path`` stays the operator
+    override — ``get_store`` only falls back here when it's blank."""
+    try:
+        from infra.paths import instance_paths
+
+        root = str(instance_paths().store("project_board"))
+    except Exception:  # noqa: BLE001 — no protoAgent host (tests, standalone)
+        root = os.path.join(os.path.expanduser("~"), ".protoagent", "project_board")
+    return os.path.join(root, ".beads", "beads.db")
+
+
 class BeadsBoard:
     """Wraps the `br` CLI. One process-wide instance (the loop, API, and tools share
-    it). `br` auto-discovers `.beads/*.db`; pass ``db`` to pin a workspace."""
+    it). `br` auto-discovers `.beads/*.db`; pass ``db`` to pin a workspace
+    (``get_store`` defaults a blank db to the instance store — ``default_db_path``)."""
 
     def __init__(
         self,
@@ -667,19 +686,32 @@ class BeadsBoard:
         self.projects = resolved
         self.default_project = default
 
-    # ── workspace pin (ADR 0055 P0, #48) ──────────────────────────────────────
+    # ── workspace pin (ADR 0055 P0, #48; instance-default store D3, #260) ─────
     def _ensure_workspace(self) -> None:
-        """Pin the board to THIS repo's beads workspace so `br` can't walk UP the tree
-        and silently adopt a parent/ancestor `.beads/` (the cross-repo bleed of #48).
+        """Pin the board to ITS beads workspace so `br` can't walk UP the tree and
+        silently adopt a parent/ancestor `.beads/` (the cross-repo bleed of #48).
 
-        `br` discovers `.beads/` by walking UP from cwd. With `cwd=self.repo` it stops at
-        the repo's own `.beads/` when one exists — but a repo with NONE escapes to whatever
-        ancestor happens to have one, polluting a shared db with the wrong id prefix. So:
-        an explicit `db` is the hard pin (nothing to do); otherwise, if the repo has no
-        `.beads/`, run `br init` there to give it its own — after which cwd-discovery
-        resolves locally and never walks up (matches the operator's manual workaround).
-        Lazy + idempotent (runs once, guarded by `_workspace_ready`)."""
-        if self._workspace_ready or self.db:
+        A set ``db`` is the pin itself — every op carries ``--db``, so cwd-discovery
+        never runs. Production boards always have one: ``get_store`` defaults a blank
+        ``db_path`` to the INSTANCE store (D3, #260 — ``default_db_path``), and on a
+        fresh instance that store doesn't exist yet, so it's bootstrapped here (`br`
+        refuses to run against an uninitialized --db). Only the DEFAULTED path is
+        bootstrapped — it's the one whose layout this module owns; an operator's
+        explicit db_path keeps the old hard-pin contract (nothing created on their
+        behalf, `br`'s own "run br init first" names the remedy).
+
+        A db-less board (direct construction — the real-br test tier) keeps the repo
+        pin: `br` discovers `.beads/` by walking UP from cwd, and with `cwd=self.repo`
+        it stops at the repo's own `.beads/` when one exists — but a repo with NONE
+        escapes to whatever ancestor happens to have one, polluting a shared db with
+        the wrong id prefix. So if the repo has no `.beads/`, run `br init` there to
+        give it its own — after which cwd-discovery resolves locally and never walks
+        up. Lazy + idempotent (runs once, guarded by `_workspace_ready`)."""
+        if self._workspace_ready:
+            return
+        if self.db:
+            if self.db == default_db_path() and not os.path.isfile(self.db):
+                self._init_default_store()
             self._workspace_ready = True
             return
         repo = self.repo or "."
@@ -701,6 +733,35 @@ class BeadsBoard:
                     f"({proc.stderr.strip()[:200]}) — run `br init` there, or set project_board.db_path"
                 )
         self._workspace_ready = True
+
+    def _init_default_store(self) -> None:
+        """`br init` the instance-default board store (D3, #260) — once, on a fresh
+        instance's first op. Runs with cwd = the store ROOT (…/project_board), so the
+        workspace lands at exactly the `.beads/beads.db` path every op's ``--db``
+        names; the `br init --db <path>` form can't be used because it ALSO drops a
+        `.beads/` in the cwd (verified against real br 0.1.23 and 0.2.16) — with the
+        board's `cwd=self.repo` that would be the project-repo pollution D3 exists to
+        remove. `--prefix bd` keeps ids in the documented `bd-…` shape (br's default
+        prefix is the store dir's name). Raced inits (two per-project boards on one
+        fresh instance) are fine: the loser's failure is ignored when the winner's db
+        is present."""
+        root = os.path.dirname(os.path.dirname(self.db))  # <root>/.beads/beads.db
+        os.makedirs(root, exist_ok=True)
+        log.info(
+            "[project_board] initializing the instance board store at %r (no db_path configured; one "
+            "board db per instance, D3)",
+            root,
+        )
+        # NB: a direct subprocess, NOT self._run — that would recurse here (and carry
+        # --db into an init that must key off cwd alone).
+        proc = subprocess.run(
+            [BR, "init", "--prefix", "bd", "--actor", self.actor], cwd=root, capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode != 0 and not os.path.isfile(self.db):
+            raise BoardError(
+                f"instance board store {root!r} could not be initialized (`br init` failed: "
+                f"{proc.stderr.strip()[:200]}) — run `br init` there, or set project_board.db_path"
+            )
 
     # ── br invocation ─────────────────────────────────────────────────────────
     def _run(self, *args: str, want_json: bool = False, with_has_more: bool = False):
@@ -2546,11 +2607,21 @@ def escalation_enabled(cfg: dict) -> bool:
 # reload with a new db gets a fresh board. The old single global ignored its kwargs
 # after the first call, collapsing every board onto whichever db the first caller
 # happened to use — defeating db_path and any per-instance isolation (ADR 0055 P0).
-_BOARDS: dict[tuple[str | None, str, str], BeadsBoard] = {}
+# The db slot is always the RESOLVED path (a blank db_path resolves to the instance
+# default before keying, D3 #260) — per-project boards then share the one db while
+# keying their own repo/base_branch.
+_BOARDS: dict[tuple[str, str, str], BeadsBoard] = {}
 
 
 def get_store(db: str | None = None, **kw) -> BeadsBoard:
-    key = (db or None, kw.get("repo", "."), kw.get("base_branch", "main"))
+    """The shared board for a workspace. A blank ``db`` (no configured db_path)
+    resolves to the instance-default store (D3, #260 — ``default_db_path``): every
+    project's board then carries the SAME db — one store per instance, no `br init`
+    in any project repo — while keying its own repo/base_branch so per-project reads
+    (the Ready gate's path checks) run against their own checkout. An explicit db is
+    the operator override and pins verbatim."""
+    db = db or default_db_path()
+    key = (db, kw.get("repo", "."), kw.get("base_branch", "main"))
     board = _BOARDS.get(key)
     if board is None:
         board = BeadsBoard(db, **kw)
@@ -2571,9 +2642,11 @@ def reconfigure_cached_store(
     Reload must not call :func:`get_store`: constructing a board can probe/fetch
     ``br`` while the host is synchronously applying Settings. The loop only needs
     to refresh the object it has already used; a board first created after reload
-    receives the new routing through its normal constructor kwargs.
+    receives the new routing through its normal constructor kwargs. A blank ``db``
+    resolves through the same instance default as :func:`get_store`, so a loop
+    configured without db_path finds the board get_store built.
     """
-    board = _BOARDS.get((db or None, repo, base_branch))
+    board = _BOARDS.get((db or default_db_path(), repo, base_branch))
     if board is None:
         return False
     board.reconfigure_projects(projects, default_project)

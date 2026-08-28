@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
@@ -45,8 +47,11 @@ class Br:
 
 def test_reconfigure_cached_store_updates_shared_project_routing(monkeypatch):
     monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    # a blank db resolves through the instance default (D3, #260) — the reconfigure
+    # lookup must land on the same key get_store built the board under.
+    monkeypatch.setattr(store, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
     board = BeadsBoard(repo="/instance", projects={"old": {"repo": "/old"}}, default_project="old")
-    key = (None, "/instance", "main")
+    key = ("/inst/project_board/.beads/beads.db", "/instance", "main")
     monkeypatch.setitem(store._BOARDS, key, board)
 
     assert store.reconfigure_cached_store(repo="/instance", projects={"new": {"repo": "/new"}}, default_project="new")
@@ -158,6 +163,160 @@ def test_ensure_workspace_raises_a_clear_error_when_init_fails(monkeypatch):
     )
     with pytest.raises(BoardError, match="has no beads workspace"):
         _board(monkeypatch, repo="/ro")._ensure_workspace()
+
+
+# ── the instance-default board store (D3, #260) ─────────────────────────────────
+# A blank db_path no longer br-init's in the target repo: get_store defaults the db
+# to the ONE instance store (the ADR 0065 instance_paths seam br_fetch.data_dir
+# rides), and _ensure_workspace bootstraps THAT store — never a project repo.
+
+
+def test_default_db_path_rides_the_instance_paths_seam(monkeypatch):
+    """Hosted: the store lives under ``instance_paths().store("project_board")`` —
+    the same ADR 0065 seam br_fetch.data_dir uses, so per-instance isolation is
+    inherited (two instances on one box get two board stores)."""
+
+    class _Paths:
+        def store(self, name):
+            assert name == "project_board"
+            return "/inst/root/project_board"
+
+    infra = types.ModuleType("infra")
+    infra_paths = types.ModuleType("infra.paths")
+    infra_paths.instance_paths = lambda: _Paths()
+    infra.paths = infra_paths
+    monkeypatch.setitem(sys.modules, "infra", infra)
+    monkeypatch.setitem(sys.modules, "infra.paths", infra_paths)
+    assert store.default_db_path() == os.path.join("/inst/root/project_board", ".beads", "beads.db")
+
+
+def test_default_db_path_host_free_fallback(monkeypatch):
+    """No protoAgent host importable → the ~/.protoagent fallback (the br_fetch
+    pattern), so a standalone/test run still resolves ONE deterministic store."""
+    monkeypatch.setitem(sys.modules, "infra", None)  # None in sys.modules → ImportError
+    monkeypatch.setitem(sys.modules, "infra.paths", None)
+    expected = os.path.join(os.path.expanduser("~"), ".protoagent", "project_board", ".beads", "beads.db")
+    assert store.default_db_path() == expected
+
+
+def test_ensure_workspace_inits_the_default_store_in_the_store_root(monkeypatch, tmp_path):
+    """Fresh instance, defaulted db: ONE `br init`, cwd'd in the STORE root — never
+    the project repo. The plain no-`--db` init form is load-bearing: `br init --db`
+    ALSO drops a `.beads/` in its cwd (real br 0.1.23 and 0.2.16), which with
+    cwd=repo would be exactly the repo pollution D3 removes."""
+    dbfile = tmp_path / "project_board" / ".beads" / "beads.db"
+    monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
+    inits = []
+
+    def _run(cmd, **kw):
+        inits.append((cmd, kw.get("cwd")))
+        dbfile.parent.mkdir(parents=True, exist_ok=True)
+        dbfile.write_text("")  # br init created the workspace
+        return _ok()
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    b = _board(monkeypatch, db=str(dbfile), repo="/some/project/repo")
+    b._ensure_workspace()
+    assert len(inits) == 1 and b._workspace_ready
+    cmd, cwd = inits[0]
+    assert cmd[:2] == [store.BR, "init"] and "--db" not in cmd
+    assert "--prefix" in cmd  # ids keep the documented bd- shape (default = dir name)
+    assert cwd == str(tmp_path / "project_board")  # the store ROOT, not the repo
+    b._ensure_workspace()  # idempotent — no second init
+    assert len(inits) == 1
+
+
+def test_ensure_workspace_default_store_noop_when_db_exists(monkeypatch, tmp_path):
+    """An already-initialized instance store: no init, no writes — the first op goes
+    straight through with --db."""
+    dbfile = tmp_path / "project_board" / ".beads" / "beads.db"
+    dbfile.parent.mkdir(parents=True)
+    dbfile.write_text("")
+    monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
+    calls = []
+    monkeypatch.setattr(store.subprocess, "run", lambda *a, **k: calls.append(a) or _ok())
+    b = _board(monkeypatch, db=str(dbfile))
+    b._ensure_workspace()
+    assert calls == [] and b._workspace_ready
+
+
+def test_ensure_workspace_default_store_init_failure_raises_actionable(monkeypatch, tmp_path):
+    """`br init` fails and the db still doesn't exist → a named BoardError with the
+    remedy (init by hand, or set db_path) — never a silent dead board."""
+    dbfile = tmp_path / "project_board" / ".beads" / "beads.db"
+    monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
+    monkeypatch.setattr(
+        store.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+    )
+    with pytest.raises(BoardError, match="instance board store"):
+        _board(monkeypatch, db=str(dbfile))._ensure_workspace()
+
+
+def test_ensure_workspace_default_store_tolerates_a_raced_init(monkeypatch, tmp_path):
+    """Two per-project boards racing a fresh instance's first init: the loser's
+    `br init` exits non-zero but the winner's db is present — no raise."""
+    dbfile = tmp_path / "project_board" / ".beads" / "beads.db"
+    monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
+
+    def _run(cmd, **kw):
+        dbfile.parent.mkdir(parents=True, exist_ok=True)
+        dbfile.write_text("")  # the OTHER board's init won the race
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="already initialized")
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    b = _board(monkeypatch, db=str(dbfile))
+    b._ensure_workspace()
+    assert b._workspace_ready
+
+
+def test_ensure_workspace_explicit_db_is_never_bootstrapped(monkeypatch):
+    """An operator's explicit db_path keeps the hard-pin contract even when the db
+    file doesn't exist: nothing is created on their behalf (`br`'s own "run br init
+    first" error names the remedy) — only the DEFAULTED store is bootstrapped."""
+    monkeypatch.setattr(store, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    calls = []
+    monkeypatch.setattr(store.subprocess, "run", lambda *a, **k: calls.append(a) or _ok())
+    b = _board(monkeypatch, db="/operator/custom/.beads/beads.db")
+    b._ensure_workspace()
+    assert calls == [] and b._workspace_ready
+
+
+def test_fresh_instance_two_projects_share_one_store_and_never_init_a_repo(monkeypatch, tmp_path):
+    """The #260 acceptance path end to end (fake br): a fresh instance with TWO
+    projects and no db_path — both project stores carry --db <the one instance
+    store> on every op, the single `br init` runs in the store root, and neither
+    project repo ever grows a `.beads/`."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    dbfile = tmp_path / "instance" / "project_board" / ".beads" / "beads.db"
+    monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
+    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    runs = []
+
+    def _run(cmd, **kw):
+        runs.append((list(cmd), kw.get("cwd")))
+        if cmd[1] == "init":
+            dbfile.parent.mkdir(parents=True, exist_ok=True)
+            dbfile.write_text("")
+        return _ok()
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    board_a = store.get_store(repo=str(repo_a))
+    board_b = store.get_store(repo=str(repo_b))
+    assert board_a is not board_b  # per-project boards (own repo for the Ready gate)…
+    assert board_a.db == board_b.db == str(dbfile)  # …sharing the ONE instance store
+    board_a._run("list", want_json=True)
+    board_b._run("list", want_json=True)
+    inits = [(cmd, cwd) for cmd, cwd in runs if cmd[:2] == [store.BR, "init"]]
+    assert len(inits) == 1
+    assert inits[0][1] == str(dbfile.parent.parent)  # cwd = the store root, not a repo
+    lists = [(cmd, cwd) for cmd, cwd in runs if "list" in cmd]
+    assert len(lists) == 2
+    for cmd, cwd in lists:
+        assert cmd[cmd.index("--db") + 1] == str(dbfile)  # every card lands in one store
+    assert {cwd for _, cwd in lists} == {str(repo_a), str(repo_b)}  # per-project cwd kept
+    assert not (repo_a / ".beads").exists() and not (repo_b / ".beads").exists()
 
 
 def test_next_tier_walks_then_stops_at_the_top(make_board):
