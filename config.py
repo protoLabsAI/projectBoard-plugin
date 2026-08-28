@@ -18,6 +18,15 @@ The strip is a **blacklist** (prefixes + exact names below). A deployment that
 genuinely needs a specific variable to reach children keeps it via the
 ``env_passthrough`` **whitelist** config knob — the whitelist wins, so a listed
 name survives even when it also matches the blacklist.
+
+There is a second, stricter tier (F8a): the loop's own gate/format/preflight
+children run repo-defined commands over coder-written code, so they don't get
+"everything minus the host block" — they get a narrow **allowlist** (the baseline
+a build/test toolchain needs: PATH, HOME, locale, TMPDIR, TERM, SHELL, USER, CI,
+and the Windows system mirror of the same — SYSTEMROOT above all) plus
+``env_passthrough``, and nothing else. ``sanitized_env(mode="allowlist")``
+builds that environment. The coder's own ACP session environment is host-managed
+and deliberately stays on the blacklist tier — see the NOTE at the bottom.
 """
 
 from __future__ import annotations
@@ -32,11 +41,59 @@ from collections.abc import Iterable, Mapping
 ENV_BLACKLIST_PREFIXES: tuple[str, ...] = ("PROTOAGENT_", "A2A_")
 ENV_BLACKLIST_EXACT: frozenset[str] = frozenset({"AGENT_NAME"})
 
+# The baseline a gate/format/preflight child legitimately needs (F8a): enough to
+# find its toolchain (PATH), resolve config/caches (HOME, TMPDIR), speak the right
+# locale (LANG, LC_*), and behave sanely in a terminal/CI (TERM, SHELL, USER, CI).
+# Everything outside this baseline is dropped in allowlist mode unless the
+# deployment names it in ``env_passthrough``. Kept deliberately small — extend only
+# for variables a generic build/test toolchain cannot run without.
+#
+# The Windows names mirror the POSIX baseline (HOME → USERPROFILE/HOMEDRIVE/
+# HOMEPATH, TMPDIR → TEMP/TMP, SHELL → COMSPEC, USER → USERNAME, PATH → PATHEXT
+# for executable resolution, dot-dirs → APPDATA/LOCALAPPDATA) plus the system
+# block: subprocess REQUIRES a valid SystemRoot in an explicit child environment
+# on Windows — without it children can fail to start at all. Exact-name matching
+# is safe because Python upper-cases ``os.environ`` keys on Windows.
+ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
+ENV_ALLOWLIST_EXACT: frozenset[str] = frozenset(
+    {
+        # POSIX / cross-platform baseline.
+        "PATH",
+        "HOME",
+        "LANG",
+        "TMPDIR",
+        "TERM",
+        "SHELL",
+        "USER",
+        "CI",
+        # Windows system block + baseline mirror (see comment above).
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    }
+)
+
 
 def is_host_identity_var(name: str) -> bool:
     """True if ``name`` is a host-identity/credential variable that must be stripped
     from subprocess environments (before the ``env_passthrough`` whitelist is applied)."""
     return name in ENV_BLACKLIST_EXACT or name.startswith(ENV_BLACKLIST_PREFIXES)
+
+
+def is_allowlisted_var(name: str) -> bool:
+    """True if ``name`` is in the baseline allowlist for gate/format/preflight child
+    environments (before the ``env_passthrough`` whitelist is applied) — F8a."""
+    return name in ENV_ALLOWLIST_EXACT or name.startswith(ENV_ALLOWLIST_PREFIXES)
 
 
 def parse_env_passthrough(cfg: Mapping | None) -> tuple[str, ...]:
@@ -62,15 +119,28 @@ def sanitized_env(
     passthrough: Iterable[str] = (),
     *,
     environ: Mapping[str, str] | None = None,
+    mode: str = "blacklist",
 ) -> dict[str, str]:
-    """Build a child-process environment from ``environ`` (default: ``os.environ``)
-    with the host-identity/credential block stripped.
+    """Build a child-process environment from ``environ`` (default: ``os.environ``).
 
-    A variable is dropped when :func:`is_host_identity_var` matches it, UNLESS its
-    name is in ``passthrough`` (the whitelist wins). Returns a fresh dict — the
-    source mapping is never mutated — safe to hand to ``subprocess``'s ``env=``."""
+    ``mode="blacklist"`` (default): strip the host-identity/credential block — a
+    variable is dropped when :func:`is_host_identity_var` matches it. This is the
+    posture for the coder's ACP session environment.
+
+    ``mode="allowlist"`` (F8a): keep ONLY the baseline a build/test toolchain needs
+    — a variable is dropped unless :func:`is_allowlisted_var` matches it. This is
+    the posture for the loop's gate/format/preflight children, which run
+    repo-defined commands over coder-written code.
+
+    In both modes a name in ``passthrough`` survives (the whitelist wins). Returns
+    a fresh dict — the source mapping is never mutated — safe to hand to
+    ``subprocess``'s ``env=``."""
+    if mode not in ("blacklist", "allowlist"):
+        raise ValueError(f"sanitized_env: unknown mode {mode!r} (expected 'blacklist' or 'allowlist')")
     src = os.environ if environ is None else environ
     keep = set(passthrough or ())
+    if mode == "allowlist":
+        return {k: v for k, v in src.items() if k in keep or is_allowlisted_var(k)}
     return {k: v for k, v in src.items() if k in keep or not is_host_identity_var(k)}
 
 

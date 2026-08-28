@@ -516,6 +516,21 @@ async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
     assert await BoardLoop({"local_gate_cmd": "anything"})._run_local_gate("/wt") is None
 
 
+def test_child_env_is_narrow_allowlist(monkeypatch):
+    """_child_env (the env for gate/format/preflight children) is allowlist-based
+    (F8a): the toolchain baseline plus env_passthrough, nothing else. An ordinary
+    var outside the baseline does not leak; env_passthrough remains the only door.
+    The full per-spawn-site proofs live in tests/test_env_sanitization.py."""
+    monkeypatch.setenv("EDITOR", "vim")  # ordinary, outside the baseline
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = BoardLoop({})._child_env()
+    assert "EDITOR" not in env and env["PATH"] == "/usr/bin"
+
+    env = BoardLoop({"env_passthrough": ["EDITOR"]})._child_env()
+    assert env["EDITOR"] == "vim"
+
+
 # ── _drive: the state machine ───────────────────────────────────────────────────
 
 

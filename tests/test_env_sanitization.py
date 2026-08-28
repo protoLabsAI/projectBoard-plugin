@@ -1,10 +1,15 @@
-"""Env sanitization tests (#78).
+"""Env sanitization tests (#78, tightened by F8a).
 
 The loop must never hand a subprocess the HOST agent's identity/credentials —
 ``AGENT_NAME``, ``PROTOAGENT_*``, ``A2A_*``. These tests prove the strip on all
 three spawn paths named in the issue (gate preflight, ``local_gate_cmd``, and the
 coder — the last via the process-env scrub the ACP adapter's subprocess inherits),
 and prove the ``env_passthrough`` whitelist lets a named var survive the strip.
+
+F8a adds a second, stricter tier for the loop's OWN children (gate preflight,
+``local_gate_cmd``, ``format_cmd``): a narrow allowlist — the baseline a build/test
+toolchain needs plus ``env_passthrough``, dropping everything else. The ACP/coder
+path deliberately stays blacklist-only; those tests are unchanged below.
 """
 
 from __future__ import annotations
@@ -107,6 +112,112 @@ def test_parse_env_passthrough_accepts_list_and_string():
         "A2A_TOKEN",
         "AGENT_NAME",
     )
+
+
+# ── config.py: the allowlist tier for gate/format/preflight children (F8a) ─────────
+
+
+def test_is_allowlisted_var_matches_baseline():
+    for name in ("PATH", "HOME", "LANG", "TMPDIR", "TERM", "SHELL", "USER", "CI"):
+        assert config.is_allowlisted_var(name), name
+    # The Windows mirror of the same baseline — SYSTEMROOT above all: subprocess
+    # requires it in an explicit child environment for children to start on Windows.
+    for name in (
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ):
+        assert config.is_allowlisted_var(name), name
+    # Locale is a prefix match — every LC_* var is baseline.
+    assert config.is_allowlisted_var("LC_ALL")
+    assert config.is_allowlisted_var("LC_CTYPE")
+    # Outside the baseline — ordinary vars and host-identity vars alike.
+    assert not config.is_allowlisted_var("EDITOR")
+    assert not config.is_allowlisted_var("VIRTUAL_ENV")
+    assert not config.is_allowlisted_var("AGENT_NAME")
+    assert not config.is_allowlisted_var("A2A_TOKEN")
+    # Exact names are exact, not prefixes.
+    assert not config.is_allowlisted_var("HOMEBREW_PREFIX")
+    assert not config.is_allowlisted_var("TERMINFO")
+
+
+def test_sanitized_env_allowlist_keeps_only_baseline():
+    baseline = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "LANG": "en_US.UTF-8",
+        "LC_ALL": "C",
+        "TMPDIR": "/tmp",
+        "TERM": "xterm",
+        "SHELL": "/bin/zsh",
+        "USER": "op",
+        "CI": "true",
+    }
+    src = dict(
+        baseline,
+        # Everything below is outside the baseline and must be dropped — ordinary
+        # vars and the #78 host-identity block alike.
+        EDITOR="vim",
+        VIRTUAL_ENV="/venv",
+        AGENT_NAME="host-agent",
+        PROTOAGENT_ID="abc",
+        A2A_TOKEN="secret",
+    )
+    assert config.sanitized_env(environ=src, mode="allowlist") == baseline
+
+
+def test_sanitized_env_allowlist_keeps_windows_system_baseline():
+    """A Windows-shaped environment keeps the system block with NO env_passthrough —
+    SYSTEMROOT above all: subprocess requires a valid SystemRoot in an explicit
+    child environment, so dropping it can stop children from starting at all
+    (the review finding on the first F8a cut)."""
+    baseline = {
+        "PATH": r"C:\Windows\system32",
+        "SYSTEMROOT": r"C:\Windows",
+        "SYSTEMDRIVE": "C:",
+        "WINDIR": r"C:\Windows",
+        "COMSPEC": r"C:\Windows\system32\cmd.exe",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "TEMP": r"C:\Users\op\AppData\Local\Temp",
+        "TMP": r"C:\Users\op\AppData\Local\Temp",
+        "USERPROFILE": r"C:\Users\op",
+        "HOMEDRIVE": "C:",
+        "HOMEPATH": r"\Users\op",
+        "USERNAME": "op",
+        "APPDATA": r"C:\Users\op\AppData\Roaming",
+        "LOCALAPPDATA": r"C:\Users\op\AppData\Local",
+    }
+    # A Windows var outside the baseline and a host-identity var are still dropped.
+    src = dict(baseline, PROCESSOR_LEVEL="6", AGENT_NAME="host-agent")
+    assert config.sanitized_env(environ=src, mode="allowlist") == baseline
+
+
+def test_sanitized_env_allowlist_passthrough_wins():
+    src = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "EDITOR": "vim", "AGENT_NAME": "host"}
+    out = config.sanitized_env(passthrough=["VIRTUAL_ENV"], environ=src, mode="allowlist")
+    # The passed-through var survives; everything else outside the baseline is dropped.
+    assert out == {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv"}
+
+
+def test_sanitized_env_allowlist_does_not_mutate_source():
+    src = {"PATH": "/usr/bin", "EDITOR": "vim"}
+    config.sanitized_env(environ=src, mode="allowlist")
+    assert src == {"PATH": "/usr/bin", "EDITOR": "vim"}
+
+
+def test_sanitized_env_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        config.sanitized_env(environ={}, mode="denylist")
 
 
 # ── loop.py: wiring the sanitizer into the spawn paths ─────────────────────────────
@@ -223,6 +334,113 @@ async def test_fixups_spawns_with_sanitized_env(monkeypatch):
     env = captured["env"]
     assert "A2A_TOKEN" not in env
     assert env["PATH"] == "/usr/bin"
+
+
+# ── loop.py: gate/format/preflight children see ONLY the allowlist (F8a) ───────────
+#
+# The #78 tests above prove the host-identity block never reaches these children.
+# F8a is stronger: NOTHING outside the baseline allowlist reaches them unless it is
+# named in ``env_passthrough`` — proven against the child's ENTIRE environment, not
+# just the vars a test happened to set.
+
+
+def _assert_allowlist_only(env: dict, passthrough: tuple = ()):
+    """Every var the child sees is baseline-allowlisted or explicitly passed through."""
+    leaked = [k for k in env if not (config.is_allowlisted_var(k) or k in passthrough)]
+    assert not leaked, f"vars outside the allowlist reached the child: {leaked}"
+
+
+async def test_local_gate_env_is_allowlist_only(monkeypatch):
+    """The gate child sees no variable outside the allowlist unless passed through (F8a r1)."""
+    monkeypatch.setenv("EDITOR", "vim")  # ordinary, NOT host-identity — still must not leak
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("LC_ALL", "C")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await BoardLoop({"local_gate_cmd": "ruff check ."})._run_local_gate("/wt")
+
+    env = captured["env"]
+    assert "EDITOR" not in env and "VIRTUAL_ENV" not in env and "AGENT_NAME" not in env
+    assert env["PATH"] == "/usr/bin"  # baseline survives …
+    assert env["LC_ALL"] == "C"  # … including the LC_* prefix
+    _assert_allowlist_only(env)
+
+
+async def test_local_gate_allowlist_honors_passthrough(monkeypatch):
+    """env_passthrough is the only door through the allowlist for the gate child (F8a r1)."""
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("EDITOR", "vim")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await BoardLoop({"local_gate_cmd": "ruff check .", "env_passthrough": ["VIRTUAL_ENV"]})._run_local_gate("/wt")
+
+    env = captured["env"]
+    assert env["VIRTUAL_ENV"] == "/venv"  # passed through → present
+    assert "EDITOR" not in env  # not passed through → dropped
+    _assert_allowlist_only(env, passthrough=("VIRTUAL_ENV",))
+
+
+async def test_preflight_env_is_allowlist_only(monkeypatch):
+    """The gate preflight child sees only the allowlist baseline (F8a r1)."""
+    monkeypatch.setenv("EDITOR", "vim")
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+
+    # #90: preflight only smokes projects with ready work — give it one ready feature.
+    class _Store:
+        def list_features(self, state=None):
+            return [{"id": "bd-1"}] if state == "ready" else []
+
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _Store())
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+
+    env = captured["env"]
+    assert "EDITOR" not in env and "VIRTUAL_ENV" not in env
+    assert env["PATH"] == "/usr/bin"
+    _assert_allowlist_only(env)
+
+
+async def test_fixups_env_is_allowlist_only(monkeypatch):
+    """The pre-PR format_cmd child sees only the allowlist baseline (F8a r1)."""
+    monkeypatch.setenv("EDITOR", "vim")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await BoardLoop({"format_cmd": "ruff format ."})._run_fixups("/wt")
+
+    env = captured["env"]
+    assert "EDITOR" not in env
+    assert env["PATH"] == "/usr/bin"
+    _assert_allowlist_only(env)
 
 
 # ── coder_seam.py: the solve() acceptance-test (verify) subprocess (#86) ────────────
