@@ -298,7 +298,7 @@ async function load(){
     // list rides along on the setup-gap card instead of fighting it for the slot.
     if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null, s);
     else if (s && s.held_projects && s.held_projects.length) renderHeldProjects(s);
-    else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);
+    else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored)) renderLoopStale(s.setup);
     else $("err").hidden = true;
   } catch (e) {
     // First-run tell (#unbound): a board never bound to a repo (shipped default
@@ -344,6 +344,10 @@ function setupLoopLine(setup){
   // than the config this page (and /status) reads — say so, or the page would
   // report the NEW config as the loop's state.
   if (setup && setup.loop_cfg_stale) html += '<div style="margin-top:6px;font-size:12px"><b>Running loop is stale:</b> ' + esc(String(setup.loop_cfg_stale_hint || "config changed since the loop started")) + '</div>';
+  // The D3 advisory (#260): a multi-entry projects: map next to an explicitly blank
+  // db_path — inert since D3 (the board runs on the one instance store), so it is
+  // an info line, never a failing check.
+  if (setup && setup.db_override_ignored) html += '<div style="margin-top:6px;font-size:12px"><b>db_path override ignored:</b> ' + esc(String(setup.db_override_hint || "an explicitly blank db_path resolves to the one instance store")) + '</div>';
   return html;
 }
 
@@ -386,8 +390,9 @@ function renderSetupGaps(setup, e, s){
   $("sub").textContent = blocking ? "project_board — setup incomplete" : "project_board — gh missing";
 }
 
-// A healthy board whose running loop is on an older config than the one this page
-// reads — the restart note alone, as an info callout (no check is failing).
+// A healthy board with an advisory only — the running loop on an older config than
+// the one this page reads, or an inert db_path override — as an info callout (no
+// check is failing, nothing is paused).
 function renderLoopStale(setup){
   $("err").hidden = false;
   $("err").className = "pl-callout pl-callout--info";

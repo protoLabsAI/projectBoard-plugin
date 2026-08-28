@@ -298,64 +298,73 @@ def test_malformed_projects_map_is_the_repo_finding_not_a_raise():
     assert s["coder"]["ok"] is True  # the coder check still ran (names from the flat key)
 
 
-# ── the multi-project + explicit-blank db_path hole (D3, #260) ────────────────────
-# A blank db_path now DEFAULTS to the instance store (store.default_db_path, pinned
-# in test_store), so a multi-project board with NO db_path key shares one db. The one
-# remaining hole is the operator EXPLICITLY writing `db_path: ""` (the pre-D3
-# per-repo-discovery override — distinguishable because the host hands a plugin its
-# config section verbatim, not a per-key merge with manifest defaults) next to a
-# multi-entry projects: map — the exact shape that fragments the board. That must
-# surface as a repo setup gap instead of being silently accepted.
+# ── the multi-project + explicit-blank db_path ADVISORY (D3, #260) ────────────────
+# A blank db_path resolves to the instance store (store.default_db_path — pinned in
+# test_store and store_db_path below), so a multi-project board shares one db whether
+# the key is absent OR explicitly blank. The operator who EXPLICITLY wrote
+# `db_path: ""` (the pre-D3 per-repo-discovery override — distinguishable because the
+# host hands a plugin its config section verbatim, not a per-key merge with manifest
+# defaults) next to a multi-entry projects: map gets a knob that silently does
+# nothing — surfaced as a non-blocking advisory (its own `db` report key), NEVER a
+# failing check or a pause: the board runs correctly on the one shared store.
 
 
 def _two_projects(tmp_path):
     return {"web": {"repo": str(tmp_path)}, "api": {"repo": str(tmp_path)}}
 
 
-def test_multi_project_map_with_explicit_blank_db_path_is_a_repo_gap(tmp_path):
+def test_multi_project_map_with_explicit_blank_db_path_is_a_nonblocking_advisory(tmp_path):
     cfg = {"coder": "proto", "db_path": "", "projects": _two_projects(tmp_path)}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["ok"] is False
-    assert s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
-    assert "fragment" in s["repo"]["hint"] and "one instance store" in s["repo"]["hint"]
-    assert "repo" in s["loop_blockers"] and s["ready"] is False  # not silently accepted — the loop pauses
+    assert s["db_override_ignored"] is True
+    assert s["db_override_hint"] == setup_check.MULTI_PROJECT_DB_HINT
+    assert "ignored" in s["db_override_hint"] and "one instance store" in s["db_override_hint"]
+    # the board is NOT paused: the blank resolves to the same instance store as an
+    # absent key (store_db_path below), so every check passes and the loop runs
+    assert s["repo"] == {"ok": True, "path": ".", "hint": ""}
+    assert s["ready"] is True and s["loop_blockers"] == []
 
 
 def test_whitespace_only_db_path_is_the_same_override(tmp_path):
     cfg = {"coder": "proto", "db_path": "   ", "projects": _two_projects(tmp_path)}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["ok"] is False and s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
+    assert s["db_override_ignored"] is True and s["repo"]["ok"] is True
 
 
 def test_multi_project_map_without_a_db_path_key_rides_the_instance_default(tmp_path):
     """The #260 acceptance shape: two projects, NO db_path key — every card lands in
     the instance-default store (r1; the store half is pinned in test_store), so the
-    repo check stays green and the loop runs."""
+    repo check stays green, the loop runs, and no advisory fires (nothing is stale)."""
     cfg = {"coder": "proto", "projects": _two_projects(tmp_path)}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
     assert s["repo"] == {"ok": True, "path": ".", "hint": ""}
     assert s["ready"] is True and s["loop_blockers"] == []
+    assert s["db_override_ignored"] is False and s["db_override_hint"] == ""
 
 
-def test_multi_project_map_with_a_shared_db_path_passes(tmp_path):
+def test_multi_project_map_with_a_shared_db_path_passes_quietly(tmp_path):
     cfg = {"coder": "proto", "db_path": str(tmp_path / "board" / "beads.db"), "projects": _two_projects(tmp_path)}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["ok"] is True
+    assert s["repo"]["ok"] is True and s["db_override_ignored"] is False
 
 
-def test_single_project_map_with_explicit_blank_db_path_is_not_the_hole(tmp_path):
-    """One entry can't fragment: the explicit blank simply rides the instance default."""
+def test_single_project_map_with_explicit_blank_db_path_is_not_the_advisory(tmp_path):
+    """One entry never had anything to fragment: the explicit blank simply rides the
+    instance default, and there is no multi-project intent to warn about."""
     cfg = {"coder": "proto", "db_path": "", "projects": {"web": {"repo": str(tmp_path)}}}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["ok"] is True
+    assert s["repo"]["ok"] is True and s["db_override_ignored"] is False
 
 
-def test_the_db_hole_outranks_a_missing_project_dir(tmp_path):
-    """Both findings standing → the structural hole is the one reported (a missing
-    dir might just be an un-cloned repo; the blank-db override breaks the whole board)."""
+def test_the_advisory_and_a_missing_project_dir_surface_independently(tmp_path):
+    """Orthogonal findings, orthogonal channels: the missing dir is the repo check's
+    failure (the loop pauses on it), the inert blank override is the advisory — one
+    never masks the other."""
     cfg = {"coder": "proto", "db_path": "", "projects": {"web": {"repo": str(tmp_path)}, "api": {"repo": "/gone"}}}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
+    assert s["repo"]["ok"] is False and "/gone" in s["repo"]["hint"]
+    assert "repo" in s["loop_blockers"]
+    assert s["db_override_ignored"] is True and s["db_override_hint"] == setup_check.MULTI_PROJECT_DB_HINT
 
 
 # ── the config-seam helpers the wiring rides (projects.py, D3 #260) ───────────────
@@ -449,10 +458,17 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
     # must not leave the previous instance's warning standing; the clear is idempotent).
     first = rep.report(_status(br=False, coder=False))
     assert first == {**ALL_CLEAR, "br": "br hint", "coder": "coder hint"}
-    assert host.calls == [("br", "br hint"), ("gh", None), ("coder", "coder hint"), ("repo", None), ("loop", None)]
+    assert host.calls == [
+        ("br", "br hint"),
+        ("gh", None),
+        ("coder", "coder hint"),
+        ("repo", None),
+        ("loop", None),
+        ("db", None),
+    ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
-    assert len(host.calls) == 5
+    assert len(host.calls) == 6
     # br installed → ONE clear for br, coder still standing → silent
     assert rep.report(_status(coder=False)) == {"br": None}
     assert host.calls[-1] == ("br", None)
@@ -471,15 +487,28 @@ def test_fresh_reporter_clears_a_previous_instances_warning():
     assert ("coder", "coder hint") in host.calls
     fresh = GapReporter(host)
     fresh.report(_status())  # the reloaded instance sees a passing coder
-    assert ("coder", None) in host.calls[5:]
+    assert ("coder", None) in host.calls[6:]
 
 
 def test_reporter_forwards_the_loop_stale_key():
     host = _HostWithSeam()
     rep = GapReporter(host)
     rep.report({**_status(), "loop_cfg_stale_hint": "config changed since the loop started (repo) — restart"})
-    assert host.calls[-1] == ("loop", "config changed since the loop started (repo) — restart")
+    assert ("loop", "config changed since the loop started (repo) — restart") in host.calls
     assert rep.report({**_status(), "loop_cfg_stale_hint": ""}) == {"loop": None}
+
+
+def test_reporter_forwards_the_db_override_advisory_key():
+    """The D3 advisory (#260) rides the seam under its own `db` key — edge-triggered
+    like every other key: the hint when the inert override appears, one clear (None)
+    when the operator removes it."""
+    host = _HostWithSeam()
+    rep = GapReporter(host)
+    rep.report({**_status(), "db_override_hint": setup_check.MULTI_PROJECT_DB_HINT})
+    assert ("db", setup_check.MULTI_PROJECT_DB_HINT) in host.calls
+    assert rep.report({**_status(), "db_override_hint": setup_check.MULTI_PROJECT_DB_HINT}) == {}  # steady
+    assert rep.report({**_status(), "db_override_hint": ""}) == {"db": None}
+    assert host.calls[-1] == ("db", None)
 
 
 def test_reporter_is_a_guarded_noop_on_a_host_without_the_seam():
@@ -552,9 +581,9 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
     with caplog.at_level(logging.INFO, logger=LOGGER):
         pb.register(reg)
     msgs = dict(reg.gaps)
-    # every key on the first evaluation (br + loop as clears), in render order
-    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop"]
-    assert msgs["br"] is None and msgs["loop"] is None
+    # every key on the first evaluation (br + loop + db as clears), in render order
+    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db"]
+    assert msgs["br"] is None and msgs["loop"] is None and msgs["db"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT
     assert "gh auth login" in msgs["gh"]
     assert "/nowhere" in msgs["repo"]
@@ -664,7 +693,7 @@ async def test_loop_pauses_on_missing_br_then_resumes_when_it_appears(monkeypatc
         assert len(paused) == 1 and paused[0].levelno == logging.WARNING
         assert "br:" in paused[0].message and "cargo install beads_rust" in paused[0].message
         assert not any("crash recovery failed" in r.message or "loop tick failed" in r.message for r in caplog.records)
-        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 5  # first eval: all keys
+        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 6  # first eval: all keys
 
         probe.br = True  # operator installs beads → the next re-check passes
         await _settle()
@@ -905,9 +934,9 @@ def test_status_route_resyncs_the_host_gap_through_the_shared_reporter(monkeypat
     _pin_probes(monkeypatch, which=_which_only("br"), delegates=_delegates("proto"))
     c = _client(monkeypatch, {"repo": str(tmp_path), "coder": "proto"}, gap_reporter=rep)
     assert c.get("/api/plugins/project_board/status").json()["setup"]["gh"]["ok"] is False
-    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 5  # first eval: all keys
+    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 6  # first eval: all keys
     c.get("/api/plugins/project_board/status")
-    assert len(host.calls) == 5  # steady state: no re-send per poll
+    assert len(host.calls) == 6  # steady state: no re-send per poll
     monkeypatch.setattr(setup_check.shutil, "which", _which_all)  # gh installed
     assert c.get("/api/plugins/project_board/status").json()["setup"]["ready"] is True
     assert host.calls[-1] == ("gh", None)
@@ -1015,7 +1044,14 @@ def test_board_page_renders_setup_gaps_from_the_status_block():
     assert "if (setup && setup.loop_cfg_stale) html += " in BOARD_PAGE
     assert "<b>Running loop is stale:</b> " in BOARD_PAGE
     assert "function renderLoopStale(setup)" in BOARD_PAGE
-    assert "else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);" in BOARD_PAGE
+    assert (
+        "else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored)) renderLoopStale(s.setup);"
+        in BOARD_PAGE
+    )
+    # the D3 advisory (#260) rides the same info callout: an inert db_path override
+    # on a multi-project board is a line, never a failing check or a pause
+    assert "if (setup && setup.db_override_ignored) html += " in BOARD_PAGE
+    assert "<b>db_path override ignored:</b> " in BOARD_PAGE
     # a gh-only gap is NOT "can't run" (gh isn't a loop blocker) — softer copy
     assert "function setupBlocking(setup)" in BOARD_PAGE
     assert 'key !== "gh" && setup && setup[key] && setup[key].ok === false' in BOARD_PAGE
