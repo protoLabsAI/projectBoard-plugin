@@ -910,10 +910,11 @@ def test_board_page_renders_setup_gaps_from_the_status_block():
     assert "if (!c || c.ok !== false) continue;" in BOARD_PAGE  # only FAILING checks render
     assert 'esc(String(c.hint || (key + " check failed")))' in BOARD_PAGE
     # a bound-but-broken board gets the gap card (warning), both on a read failure and
-    # on a successful read whose preflight fails — never a silent green
-    assert "function renderSetupGaps(setup, e)" in BOARD_PAGE
-    assert "if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);" in BOARD_PAGE
-    assert "if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e); return; }" in BOARD_PAGE
+    # on a successful read whose preflight fails — never a silent green. Both call
+    # sites hand the full /status body through so held projects ride along (#261).
+    assert "function renderSetupGaps(setup, e, s)" in BOARD_PAGE
+    assert "if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null, s);" in BOARD_PAGE
+    assert "if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e, s); return; }" in BOARD_PAGE
     assert '"pl-callout pl-callout--warning"' in BOARD_PAGE
     # the loop line tells paused-vs-off, and says "restart" when the running loop's
     # config snapshot lags the live config (review on #212)

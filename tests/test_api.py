@@ -282,6 +282,30 @@ def test_project_put_uses_shared_registry_mutation(monkeypatch):
     }
 
 
+def test_project_put_surfaces_a_red_gate_smoke_as_400_naming_the_failure(monkeypatch):
+    """#261: upsert_project smokes an explicit gate on the clean base BEFORE anything
+    persists; its refusal must reach the Projects editor as a JSON 400 carrying the
+    output tail — the operator is present at the PUT, so this is where the broken
+    gate gets named (not the loop's preflight, hours later)."""
+    import project_board.project_registry as registry
+
+    async def refuse(name, repo, **kwargs):
+        raise registry.ProjectRegistryError(
+            "the gate failed on the clean base checkout (exit 3) — fix the gate or "
+            "the repo before registering it; output tail:\nthe-suite-is-broken"
+        )
+
+    monkeypatch.setattr(registry, "upsert_project", refuse)
+    r = _client(monkeypatch, FakeStore()).put(
+        "/api/plugins/project_board/projects/demo",
+        json={"repo": "/dev/demo", "local_gate_cmd": "pytest -q"},
+    )
+
+    assert r.status_code == 400
+    assert "failed on the clean base" in r.json()["detail"]
+    assert "the-suite-is-broken" in r.json()["detail"]  # the tail rides the 400 body
+
+
 def test_project_put_rejects_unknown_fields_and_non_booleanish_default_actions(monkeypatch):
     c = _client(monkeypatch, FakeStore())
     assert (

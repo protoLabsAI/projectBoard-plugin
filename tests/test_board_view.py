@@ -453,6 +453,50 @@ def test_every_pr_url_href_is_minted_through_safehref():
     assert BOARD_PAGE.count("href=\"'+esc(safeHref(") == 2
 
 
+# ── preflight-held projects render as a warning card (#261) ──────────────────────
+#
+# /status carries `held_projects` (sorted names) + `preflight.held` ({project: reason})
+# — the projects whose ready cards the loop froze behind a gate that fails on the clean
+# base (#255). The page used to drop them on the floor: a fully-`ready` board with every
+# card held just looked idle. They now render as a warning card alongside the setup gap.
+
+
+def test_held_projects_have_a_render_path_that_names_each_reason():
+    """heldGateItems builds one <li> per held project from held_projects + the
+    preflight.held reason map, esc()'d on both halves — server text, never raw HTML."""
+    assert "function heldGateItems(s)" in BOARD_PAGE
+    assert "(s && s.preflight && s.preflight.held) || {};" in BOARD_PAGE
+    assert "(s && s.held_projects) || [];" in BOARD_PAGE
+    assert "esc(name)" in BOARD_PAGE
+    assert 'esc(String(held[name] || "gate preflight failed"))' in BOARD_PAGE
+
+
+def test_held_projects_get_their_own_warning_card_on_an_otherwise_healthy_board():
+    """When setup is fine, held projects render their own pl-callout--warning card —
+    checked BEFORE the loop-stale info callout (a frozen project outranks a restart
+    note) — and the card names the self-healing recovery, matching setupLoopLine's
+    'no restart needed' language."""
+    assert "function renderHeldProjects(s)" in BOARD_PAGE
+    assert "else if (s && s.held_projects && s.held_projects.length) renderHeldProjects(s);" in BOARD_PAGE
+    # held check sits between the setup-gap branch and the loop-stale branch
+    ready_branch = BOARD_PAGE.index("renderSetupGaps(s.setup, null, s);")
+    held_branch = BOARD_PAGE.index("renderHeldProjects(s);")
+    stale_branch = BOARD_PAGE.index("renderLoopStale(s.setup);")
+    assert ready_branch < held_branch < stale_branch
+    assert "releases its cards on its own once the gate passes (no restart needed)" in BOARD_PAGE
+
+
+def test_held_projects_ride_along_the_setup_gap_card_when_both_fail():
+    """A board with a setup gap AND held projects shows both on the one card slot —
+    both /status call sites hand the full status body through to renderSetupGaps,
+    which appends the held list under its own heading (omitted when empty)."""
+    assert "function renderSetupGaps(setup, e, s)" in BOARD_PAGE
+    assert "renderSetupGaps(s.setup, null, s);" in BOARD_PAGE  # load() success path
+    assert "renderSetupGaps(s.setup, e, s); return;" in BOARD_PAGE  # read-error fallback path
+    assert "const held = heldGateItems(s);" in BOARD_PAGE
+    assert "<b>Held projects (gate fails on clean base):</b>" in BOARD_PAGE
+
+
 def test_marked_cdn_script_is_pinned_with_integrity_and_crossorigin():
     """The lazily-injected marked script carries a subresource-integrity pin for the
     12.0.2 artifact plus crossorigin=anonymous (required for SRI enforcement on a
