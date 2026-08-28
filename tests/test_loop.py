@@ -14,6 +14,7 @@ import asyncio
 import json
 import shutil
 import threading
+import time
 
 import pytest
 
@@ -6689,7 +6690,11 @@ async def test_a_red_gate_on_a_dirty_checkout_does_not_hold_the_project(monkeypa
     uncommitted edit that reddens the gate would freeze that project's entire ready
     queue, and the only symptom on the board is `selected: []`."""
     lp = await _run_preflight(monkeypatch, rc=1, dirt="uncommitted changes to store.py")
-    assert lp._preflight_state["default"] is True  # indeterminate → allow, never wedge
+    # The PROPERTY is "this project is not held": the claim scan skips a project only
+    # when its state is a REASON STRING. (This used to assert `is True` — the mechanism
+    # of the first cut, which also acquitted the base and released holds; #300 made dirt
+    # verdict-neutral, so the state simply stays unset.)
+    assert not isinstance(lp._preflight_state.get("default"), str)
     assert "store.py" in lp._preflight_dirty["default"]
 
 
@@ -7005,3 +7010,74 @@ async def test_drive_terminal_dispatch_failure_still_escalates(monkeypatch):
     assert len(dispatches) == 2  # smart, then the one climb to reasoning
     assert [e[0] for e in store.escalated] == ["bd-1", "bd-1"]  # climb, then the top
     assert "flag_blocked" in store.names()
+
+
+# ── a dirty checkout yields NO preflight verdict, in EITHER direction (#300) ──────
+
+
+async def _preflight_with(monkeypatch, *, rc, dirt, prior=None):
+    """One `_maybe_preflight` pass with a canned gate exit code and dirt verdict, over a
+    loop whose `_preflight_state` starts at `prior` (None = never checked, a str = held
+    for an earlier clean red)."""
+    lp = BoardLoop({"local_gate_cmd": "pytest -q"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+    monkeypatch.setattr("project_board.worktree.base_checkout_dirt", _async_return(dirt))
+    released = []
+    monkeypatch.setattr(lp, "_release_preflight_holds", lambda name: released.append(name))
+
+    async def _shell(*a, **k):
+        return _FakeProc(rc, b"gate output")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    if prior is not None:
+        lp._preflight_state["default"] = prior
+        # A KNOWN-failed project's re-check is throttled against `_last_preflight`,
+        # which defaults to 0.0 — so the window has "elapsed" only when
+        # `time.monotonic()` is already larger than the interval. That is true on a
+        # long-running dev box and FALSE in a fresh CI container, where monotonic
+        # starts near zero: these tests passed locally and skipped the preflight
+        # entirely on CI. Seed the timestamp so the elapsed window is explicit.
+        lp._last_preflight["default"] = time.monotonic() - 10_000
+    await lp._maybe_preflight()
+    return lp, released
+
+
+async def test_green_gate_on_a_dirty_checkout_does_not_release_an_existing_hold(monkeypatch):
+    """RED-IS-REACHABLE: the first cut only distrusted a RED result, so a green gate on
+    a dirty tree cleared the state to True and released the holds — an operator's local
+    fix acquitting a base no gate has actually cleared, and coders dispatched onto it."""
+    lp, released = await _preflight_with(
+        monkeypatch, rc=0, dirt="uncommitted changes to store.py", prior="tsc: not found"
+    )
+    assert lp._preflight_state["default"] == "tsc: not found"  # the clean red still stands
+    assert released == []  # nothing was un-held on evidence that can't acquit
+    assert "store.py" in lp._preflight_dirty["default"]
+
+
+async def test_red_gate_on_a_dirty_checkout_does_not_release_an_existing_hold(monkeypatch):
+    """The other half of the same bug: a red gate on a dirty tree took the downgrade
+    path, which ALSO called _release_preflight_holds — so an unrelated local edit
+    un-held a project that was genuinely broken when the tree was clean."""
+    lp, released = await _preflight_with(
+        monkeypatch, rc=1, dirt="uncommitted changes to loop.py", prior="tsc: not found"
+    )
+    assert lp._preflight_state["default"] == "tsc: not found"
+    assert released == []
+
+
+async def test_dirty_checkout_never_newly_holds_an_unchecked_project(monkeypatch):
+    """The property the downgrade existed for is kept: with no prior verdict, dirt
+    leaves state None — the claim scan only skips a project whose state is a REASON
+    STRING, so work keeps dispatching instead of freezing on a local edit."""
+    lp, released = await _preflight_with(monkeypatch, rc=1, dirt="uncommitted changes to x.py")
+    assert lp._preflight_state.get("default") is None
+    assert released == []
+
+
+async def test_clean_gate_verdicts_are_unchanged(monkeypatch):
+    """Fail-closed and recovery both still decide on a CLEAN checkout."""
+    lp, released = await _preflight_with(monkeypatch, rc=1, dirt="")
+    assert isinstance(lp._preflight_state["default"], str)  # clean red still convicts
+    lp2, released2 = await _preflight_with(monkeypatch, rc=0, dirt="", prior="tsc: not found")
+    assert lp2._preflight_state["default"] is True  # clean green still acquits
+    assert released2 == ["default"]  # …and releases the hold

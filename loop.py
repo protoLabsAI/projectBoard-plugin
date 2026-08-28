@@ -3721,14 +3721,24 @@ class BoardLoop:
         hold THIS project's work). A TIMEOUT is indeterminate → allow (a slow gate must
         not wedge the board). Releases this project's holds on recovery.
 
-        A DIRTY checkout is indeterminate too (#255). Coders only touch worktrees, so the
-        main checkout normally still sits at base — but the OPERATOR edits it by hand, and
-        then the gate we just ran was a verdict on their uncommitted work, not on the base
-        every worktree branches from. Holding a project on that is the worse of the two
-        errors: it freezes real work over a local edit, and the only symptom the board
-        shows is an empty ``selected: []``. So a failure on dirty is downgraded to allow
-        with a loud, named warning, and the dirt is recorded for /status. Fail-closed is
-        preserved exactly where it is meaningful — a CLEAN checkout with a red gate."""
+        A DIRTY checkout yields NO VERDICT AT ALL (#255, corrected in #300). Coders only
+        touch worktrees, so the main checkout normally still sits at base — but the
+        OPERATOR edits it by hand, and then whatever the gate just did was about their
+        uncommitted work, not about the base every worktree branches from. That cuts BOTH
+        ways, which the first cut of this got wrong by only distrusting a red result:
+
+        * a red gate on a dirty tree must not CONVICT the base (freezing real work over a
+          local edit, whose only symptom on the board is an empty ``selected: []``), and
+        * a green gate on a dirty tree must not ACQUIT it either — an operator's local fix
+          can make a genuinely broken base pass, and releasing the holds on that evidence
+          dispatches coders onto a base no gate has actually cleared.
+
+        So on dirt this records the dirt for ``/status``, logs, and returns WITHOUT
+        touching ``_preflight_state`` or this project's holds: a project already held for
+        a clean red stays held (only a clean green may release it), and one that was never
+        held is not newly held (state stays ``None``, so the claim scan keeps dispatching
+        — the posture a timeout already had). Fail-closed and fail-open both keep their
+        meaning, and each is decided only on evidence that supports it."""
         log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -3752,10 +3762,27 @@ class BoardLoop:
                 )
                 self._preflight_state[name] = True
                 return
+            # The dirt probe runs BEFORE the exit code is read, because it decides
+            # whether the exit code means anything at all — for a pass exactly as much
+            # as for a failure (see the docstring).
+            dirt = await worktree.base_checkout_dirt(repo, base)
+            if dirt:
+                self._preflight_dirty[name] = dirt
+                log.warning(
+                    "[project_board] preflight[%s]: the checkout at %s is NOT at base (%s), so the gate "
+                    "just ran against those local edits — no verdict either way. State and holds are "
+                    "left exactly as they were (a project held for a clean red stays held; an unheld one "
+                    "keeps dispatching). Commit or stash to get a real verdict. Gate exited %s.",
+                    name,
+                    repo,
+                    dirt,
+                    proc.returncode,
+                )
+                return
+            self._preflight_dirty.pop(name, None)
             if proc.returncode == 0:
                 if isinstance(self._preflight_state.get(name), str):
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
-                self._preflight_dirty.pop(name, None)
                 self._preflight_failed_at.pop(name, None)
                 self._preflight_state[name] = True
                 await asyncio.to_thread(self._release_preflight_holds, name)
@@ -3764,24 +3791,6 @@ class BoardLoop:
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             text = text or f"gate exited {proc.returncode} with no output"
-            # Only a CLEAN checkout can convict the base (#255) — see the docstring.
-            dirt = await worktree.base_checkout_dirt(repo, base)
-            if dirt:
-                self._preflight_dirty[name] = dirt
-                self._preflight_state[name] = True
-                await asyncio.to_thread(self._release_preflight_holds, name)
-                log.warning(
-                    "[project_board] preflight[%s] FAILED but the checkout at %s is NOT at base (%s) — "
-                    "the gate ran against those local edits, not the base every worktree branches from, "
-                    "so this verdict is indeterminate and dispatch is ALLOWED. Commit/stash to get a real "
-                    "verdict. Gate output:\n%s",
-                    name,
-                    repo,
-                    dirt,
-                    text,
-                )
-                return
-            self._preflight_dirty.pop(name, None)
             if self._record_preflight_failure(name, text):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
