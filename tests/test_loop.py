@@ -306,6 +306,32 @@ def test_queue_review_feedback_ignores_blank_findings():
     assert "bd-9" not in _PENDING_FEEDBACK  # nothing to carry back
 
 
+def test_queue_review_feedback_survives_a_plugin_reload():
+    """#256: _PENDING_FEEDBACK lives on a process-stable sys.modules slot (the
+    coder_seam #178 pattern), not a plain module global — a plugin reload
+    re-imports loop.py as a FRESH module object while the running loop holds the
+    old one, and a plain global forked into two dicts (the reloaded router wrote
+    the new one, the loop drained the old: findings silently stranded). Two
+    module objects, ONE dict: write through the reloaded instance, drain through
+    the original's _build_prompt."""
+    import importlib.util
+
+    spec = importlib.util.find_spec("project_board.loop")
+    assert spec is not None and spec.loader is not None
+    reloaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reloaded)  # a second, distinct module object — the reload
+    assert reloaded is not loop_mod
+    assert reloaded._PENDING_FEEDBACK is loop_mod._PENDING_FEEDBACK  # shared via the slot, not copied
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    reloaded.queue_review_feedback("bd-1", "the auth check is missing a null guard")
+    prompt = BoardLoop({})._build_prompt(FEATURE)  # the ORIGINAL module instance drains it
+    assert "REJECTED" in prompt  # the previous-attempt-rejected block fires
+    assert "null guard" in prompt  # the findings crossed the module-object boundary
+    assert "bd-1" not in loop_mod._PENDING_FEEDBACK  # drained one-shot…
+    assert "bd-1" not in reloaded._PENDING_FEEDBACK  # …and both views agree
+
+
 # ── repo standing gate files (#108) ──────────────────────────────────────────────
 
 
