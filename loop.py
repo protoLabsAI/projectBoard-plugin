@@ -136,7 +136,7 @@ def _feedback_slot():
             "Process-stable holder for project_board's queued review-bounce findings (#256) — data, not code."
         )
         holder.pending = {}
-        sys.modules[name] = holder
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder
 
 
@@ -642,7 +642,7 @@ def _drive_slot():
         holder = types.ModuleType(name)
         holder.__doc__ = "Process-stable holder for project_board's running drive tasks (#211) — data, not code."
         holder.drives = {}
-        sys.modules[name] = holder
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder
 
 

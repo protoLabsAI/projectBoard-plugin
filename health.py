@@ -37,7 +37,7 @@ def _attach() -> dict:
     holder = types.ModuleType(name)
     holder.__doc__ = "Process-stable holder for project_board's loop-health facts (#255)."
     holder.health = {}
-    sys.modules[name] = holder
+    holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder.health
 
 
