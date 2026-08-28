@@ -3005,9 +3005,17 @@ class BoardLoop:
                     # error / timed out). Those are NOT transient-retried (re-running the
                     # same coder won't help) — they escalate a tier or block. Only true
                     # infra failures (push/fetch/gh network/rate-limit) get the backoff.
+                    # A dispatch failure is a capability failure ONLY when the classifier
+                    # does not recognize it as transient. A rate limit / session limit /
+                    # network blip inside "coder dispatch failed: …" is the PROVIDER
+                    # refusing the call, not the coder failing the task — escalating on
+                    # it burned the whole tier ladder in ten seconds (three attempts,
+                    # three tiers, a block; 2026-08-28, bd-cwpv.12/.16) and left `tier:`
+                    # labels that misrouted the card when it was requeued after the reset.
+                    dispatch_failed = str(exc).startswith("coder dispatch failed") and not policy.retryable
                     capability = (
                         isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
-                        or str(exc).startswith("coder dispatch failed")
+                        or dispatch_failed
                         or str(exc).startswith("goal verification failed")
                         or str(exc).startswith("requirements unresolved")
                     )

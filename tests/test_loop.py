@@ -32,6 +32,7 @@ from project_board.loop import (
     _source_issue,
     _source_issue_still_open,
 )
+from project_board.failures import classify
 from project_board.retro import classify as retro_classify
 from project_board.store import BeadsBoard, BoardError
 
@@ -6419,3 +6420,86 @@ async def test_record_bg_runs_the_write_off_loop_and_the_barrier_flushes_it():
     loop._record_bg("bd-2", "record_gens", _boom, 1)
     await loop._await_bg_records("bd-2")
     assert loop._bg_records == {}
+
+
+# ── _drive: a rate-limited dispatch is the PROVIDER refusing, not a capability failure (#280)
+
+
+def _ladder_drive_env(monkeypatch, dispatch, tiers):
+    """The escalation-path wiring the empty-reply test uses, factored: an
+    _EscalatingStore handing out ``tiers`` climbs, the worktree helpers stubbed, and a
+    two-coder ladder so ``escalation_on`` is True. Returns (loop, store)."""
+    store = _EscalatingStore(tiers=tiers)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root, title=""):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        raise AssertionError("open_pr must not run — every dispatch in this test fails")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop = BoardLoop({"coders": {"smart": "sonnet", "reasoning": "opus"}})
+    assert loop.escalation_on
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    return loop, store
+
+
+# What the ACP adapter surfaces for a Claude session limit (2026-08-28, bd-cwpv.12/.16):
+# classify() reads the `rate_limit` errorKind → the retryable rate_limit policy.
+_SESSION_LIMIT = (
+    "coder dispatch failed: Internal error: You've hit your session limit · resets 1:30pm "
+    '(America/Los_Angeles) (JSON-RPC -32603): {"errorKind": "rate_limit"}'
+)
+
+
+async def test_drive_rate_limited_dispatch_retries_same_tier_and_never_escalates(monkeypatch):
+    """RED-IS-REACHABLE: before #280 the first attempt escalated (`escalated` had an
+    entry and the ladder was burned in three attempts). A rate-limited dispatch must
+    spend the rate_limit policy's retry budget on the SAME tier, then block with the
+    rate_limit reason — never consulting the ladder, so a requeue after the reset
+    restarts at the tier the card actually deserves."""
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        raise worktree.WorktreeError(_SESSION_LIMIT)
+
+    loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
+    await loop._drive(FEATURE)
+
+    policy = classify(_SESSION_LIMIT)
+    assert policy.category == "rate_limit" and policy.retryable
+    assert len(dispatches) == policy.max_attempts  # the retry budget, all on one tier
+    assert store.escalated == []  # the ladder was never consulted
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][2].startswith("rate_limit:")
+    assert loop._inflight == {}
+
+
+async def test_drive_terminal_dispatch_failure_still_escalates(monkeypatch):
+    """The guard is narrow: a dispatch failure the classifier calls TERMINAL is still
+    the capability failure it always was — one attempt per tier, climb, block at the top."""
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        raise worktree.WorktreeError("coder dispatch failed: adapter rejected the session (unknown error)")
+
+    loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
+    await loop._drive(FEATURE)
+
+    assert len(dispatches) == 2  # smart, then the one climb to reasoning
+    assert [e[0] for e in store.escalated] == ["bd-1", "bd-1"]  # climb, then the top
+    assert "flag_blocked" in store.names()
