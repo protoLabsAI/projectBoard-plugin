@@ -40,13 +40,18 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
+import os
 import re
+import signal
 import subprocess
 import sys
 import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("protoagent.plugins.project_board")
 
 #: Fields an operator writes by hand today, and the only ones this tool sets.
 _ENTRY_FIELDS = ("repo", "base_branch", "local_gate_cmd", "repo_conventions")
@@ -245,6 +250,192 @@ def _validate_base_branch(branch: str) -> str:
     return value
 
 
+#: Registration-time gate smoke bounds (#261) — mirroring the loop's shipped defaults
+#: (``local_gate_timeout_s`` / ``local_gate_output_chars``); the registry has no loop
+#: cfg to read them from.
+_SMOKE_TIMEOUT_S = 600.0
+_SMOKE_OUTPUT_CHARS = 4000
+#: The most of the gate's output kept IN MEMORY while it runs — a rolling tail, so a
+#: gate that prints without end (a runaway test log, a progress bar) cannot grow the
+#: plugin process with it. Sized for the worst-case UTF-8 width of the decoded tail
+#: reported below, so the truncated text is never shorter than ``_SMOKE_OUTPUT_CHARS``.
+_SMOKE_OUTPUT_BYTES = _SMOKE_OUTPUT_CHARS * 4
+#: Bound on reaping a killed smoke. The group kill below takes the whole gate tree
+#: down, but a descendant that re-``setsid``s escapes the group and can keep our
+#: stdout pipe open — the PUT must answer anyway, not wait for it.
+_SMOKE_REAP_TIMEOUT_S = 5.0
+
+
+async def _base_checkout_dirt(repo: str, base: str) -> str:
+    """``worktree.base_checkout_dirt`` behind the dual import this module needs (it is
+    loaded both as a package submodule and as a top-level module in tests). Any failure
+    returns '' — dirt may only ever DOWNGRADE a red verdict to indeterminate, so an
+    unavailable check keeps the strict refusal rather than inventing a pass."""
+    try:
+        try:
+            from . import worktree
+        except ImportError:
+            from project_board import worktree
+        return await worktree.base_checkout_dirt(repo, base)
+    except Exception:  # noqa: BLE001 — no dirt information → keep the strict verdict
+        return ""
+
+
+async def _drain_tail(stream, cap: int) -> bytes:
+    """Read ``stream`` to EOF keeping only its last ``cap`` bytes.
+
+    ``proc.communicate()`` buffers EVERYTHING the child writes before the caller can
+    truncate it, so a gate with unbounded output was an unbounded allocation inside the
+    server process. This reads in chunks and trims to a rolling window (at most
+    ``2 * cap`` bytes resident), so memory is bounded by the cap, not by the gate."""
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return bytes(buf[-cap:])
+        buf += chunk
+        if len(buf) > 2 * cap:
+            del buf[:-cap]
+
+
+async def _run_bounded(proc: asyncio.subprocess.Process, cap: int) -> bytes:
+    """Drain the gate's merged stdout into a bounded tail, then reap it."""
+    out = await _drain_tail(proc.stdout, cap)
+    await proc.wait()
+    return out
+
+
+def _kill_gate_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the smoked gate's whole process group, not just the shell.
+
+    The smoke launches the shell with ``start_new_session=True`` so it leads its own
+    group (pgid == its pid). Killing only the shell leaves descendants alive holding
+    the inherited stdout pipe — and project registration blocked until they exit on
+    their own. The group kill takes the tree down together; the fallback covers a
+    group that is already gone (or a platform without ``killpg``)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *, force: bool = False) -> None:
+    """Smoke-run an incoming explicit gate ONCE on the repo's base checkout, before
+    anything persists (#261).
+
+    upsert used to validate only the command's LENGTH; the first execution was the
+    loop's gate preflight, which discovers a broken gate long after the PUT answered
+    ok — and answers by silently holding the project's ready work. The operator is
+    present NOW, so a gate that fails on the clean base refuses the registration,
+    naming the failure with the output tail. ``force`` downgrades the refusal to a
+    loud warning (persist anyway; the loop's preflight still gates dispatch).
+
+    Mirrors the preflight's posture on indeterminate verdicts: a timeout or a signal
+    kill is NO verdict (allow — a slow gate must not make registration impossible),
+    and a non-zero exit on a checkout that was ALREADY not at base (#255) convicts
+    the operator's local edits rather than the base every worktree branches from, so
+    it too downgrades to a loud warning. Only a checkout that was clean when the
+    gate started, with a red gate, refuses.
+    """
+    log.info("[project_board] register[%s]: smoking the gate on clean base — %s", name, cmd)
+    # Snapshot dirt BEFORE the gate runs. The gate itself may modify tracked files
+    # (an in-place formatter, generated code) before exiting non-zero; a post-run
+    # check would read that self-inflicted dirt as the operator's local edits and
+    # launder a red verdict on the clean base into an indeterminate persist. Only
+    # dirt that predates the gate may downgrade its verdict.
+    dirt = await _base_checkout_dirt(repo, base)
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            cwd=repo,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            # Own process group, so a timeout can kill the whole gate tree — not just
+            # the shell while its descendants keep our stdout pipe (and the PUT) open.
+            start_new_session=True,
+        )
+        try:
+            # Bounded read (not `communicate()`, which buffers the whole stream before any
+            # truncation could apply): only the tail stays resident while the gate runs.
+            out = await asyncio.wait_for(_run_bounded(proc, _SMOKE_OUTPUT_BYTES), timeout=_SMOKE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            _kill_gate_tree(proc)
+            try:
+                # Reap the killed shell before answering the PUT — bounded, so a
+                # descendant that escaped the group kill cannot block registration.
+                await asyncio.wait_for(proc.wait(), timeout=_SMOKE_REAP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[project_board] register[%s]: killed gate smoke did not reap within %ss — "
+                    "abandoning it rather than blocking registration",
+                    name,
+                    _SMOKE_REAP_TIMEOUT_S,
+                )
+            log.warning(
+                "[project_board] register[%s]: gate smoke timed out (%ss) — indeterminate, persisting "
+                "(the loop's preflight still gates dispatch)",
+                name,
+                _SMOKE_TIMEOUT_S,
+            )
+            return
+    except (OSError, subprocess.SubprocessError) as exc:
+        if force:
+            log.warning(
+                "[project_board] register[%s]: gate command could not run (%s) — persisting under force; "
+                "the loop's preflight will HOLD this project's work until it can",
+                name,
+                exc,
+            )
+            return
+        raise ProjectRegistryError(f"gate command could not run: {exc}") from exc
+    if proc.returncode == 0:
+        return
+    if proc.returncode is not None and proc.returncode < 0:
+        # Killed by a signal (shutdown / external kill / OOM) — the gate never reached
+        # a verdict, so it must not produce one. Same posture as the loop's gate runs.
+        log.warning(
+            "[project_board] register[%s]: gate smoke killed by signal %d — no verdict, persisting "
+            "(the loop's preflight still gates dispatch)",
+            name,
+            -proc.returncode,
+        )
+        return
+    text = (out or b"").decode("utf-8", "replace").strip()
+    if len(text) > _SMOKE_OUTPUT_CHARS:
+        text = "…(truncated)…\n" + text[-_SMOKE_OUTPUT_CHARS:]
+    text = text or f"gate exited {proc.returncode} with no output"
+    if force:
+        log.warning(
+            "[project_board] register[%s]: gate FAILED on the clean base (exit %d) — persisting under "
+            "force; the loop's preflight will HOLD this project's work until it passes. Output tail:\n%s",
+            name,
+            proc.returncode,
+            text,
+        )
+        return
+    if dirt:
+        log.warning(
+            "[project_board] register[%s]: gate FAILED but the checkout at %s was NOT at base when the "
+            "gate started (%s) — the gate ran against those local edits, not the base every worktree "
+            "branches from, so the verdict is indeterminate; persisting (the loop's preflight still "
+            "gates dispatch). Output tail:\n%s",
+            name,
+            repo,
+            dirt,
+            text,
+        )
+        return
+    raise ProjectRegistryError(
+        f"the gate failed on the clean base checkout (exit {proc.returncode}) — "
+        f"fix the gate or the repo before registering it; output tail:\n{text}"
+    )
+
+
 async def _apply_registry(
     projects: dict[str, Any],
     *,
@@ -306,8 +497,13 @@ async def upsert_project(
     make_default: bool = False,
     clear_default: bool = False,
     replace_optional: bool = False,
+    force_gate: bool = False,
 ) -> dict[str, Any]:
-    """Add/update one project while preserving siblings and unowned entry fields."""
+    """Add/update one project while preserving siblings and unowned entry fields.
+
+    An incoming EXPLICIT gate command is smoke-run once on the repo's base checkout
+    before anything persists (#261) — see ``_smoke_gate_on_clean_base``. ``force_gate``
+    downgrades a red smoke to a loud warning."""
     project = _validate_name(name)
     repo = _bounded_text(repo, "repo", 4096, required=True)
     if make_default and clear_default:
@@ -344,6 +540,15 @@ async def upsert_project(
                 entry[key] = value
             elif replace_optional:
                 entry.pop(key, None)
+        # Smoke only the gate text THIS call carries: blank keeps/clears (nothing new
+        # to prove), and the "auto" sentinel is resolved by the loop at dispatch time,
+        # not a command — shelling the literal word would manufacture a failure. A
+        # preserved prior gate was proven when it was set (or is the loop preflight's
+        # job for YAML-authored ones); re-running it here would let a red suite refuse
+        # an unrelated conventions update.
+        gate_cmd = optional["local_gate_cmd"]
+        if gate_cmd and gate_cmd != _AGENT_GATE_SENTINEL:
+            await _smoke_gate_on_clean_base(project, gate_cmd, str(repo_p), branch, force=force_gate)
         merged = dict(existing)
         merged[project] = entry
         if not set(existing) <= set(merged):
