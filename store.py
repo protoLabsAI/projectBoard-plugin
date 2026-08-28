@@ -2103,14 +2103,30 @@ class BeadsBoard:
         # `br ready --json` omits the labels field (beads-rust ≤0.1.23), so projecting
         # its rows directly makes board_state() see no `ready` label → "backlog", and
         # the puller's `board_state != "ready"` guard self-rejects every candidate (the
-        # loop ticks forever but silently never claims). Re-fetch each via get_feature
-        # — `br show` carries labels — so board_state/blocked/diff/dag_blocked project
-        # correctly. `br ready` is priority-ordered; iterating it preserves that.
-        out = [
-            f
-            for f in (self.get_feature(b["id"]) for b in ready if b.get("issue_type") in PULLABLE_ISSUE_TYPES)
-            if f is not None
-        ]
+        # loop ticks forever but silently never claims). Re-fetch via `br show` — which
+        # carries labels — so board_state/blocked/diff/dag_blocked project correctly.
+        # ONE batched show for the whole ready set (#257; the same batching as
+        # list_features): this queue is polled every loop tick, so a per-bead
+        # get_feature was R+1 subprocess spawns. `br ready` is priority-ordered;
+        # iterating its ids (not the show's row order) preserves that.
+        ids = [b["id"] for b in ready if b.get("issue_type") in PULLABLE_ISSUE_TYPES and b.get("id")]
+        out: list[dict] = []
+        if ids:
+            try:
+                batch = self._run("show", *ids, want_json=True) or []
+            except BoardNotFound:
+                batch = None
+            if batch is None:
+                # A candidate vanished between `br ready` and the show (the delete race
+                # get_feature folded to None per-row). Never starve the whole queue over
+                # one ghost: fall back to per-id fetches for this tick, which skip
+                # exactly the missing bead(s) and keep the rest flowing.
+                out = [f for f in (self.get_feature(i) for i in ids) if f is not None]
+            else:
+                if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
+                    batch = [batch]
+                show_by_id = {r["id"]: r for r in batch if isinstance(r, dict) and r.get("id")}
+                out = [self._project(show_by_id[i]) for i in ids if i in show_by_id]
         if not relaxed:
             return out
         have = {f["id"] for f in out}

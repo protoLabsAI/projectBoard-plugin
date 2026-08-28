@@ -232,12 +232,14 @@ def test_json_shape_show_for_raw_features_with_comments(board):
 @requires_br  # deliberately NOT @br_shape: a 0.1.x quirk, so it runs only on the 0.1.23 leg
 def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path):
     """`br ready --json` (ready_queue) on 0.1.23 OMITS the `labels` field — the
-    documented quirk the per-row `get_feature` re-fetch works around (without it
+    documented quirk the batched `br show` re-fetch works around (without it
     every candidate projects as `backlog` and the puller silently never claims).
     If an upgrade starts carrying labels here, this failing is the signal the
     workaround is droppable — exactly the class #138 needed surfaced. This asserts a
     version-SPECIFIC absence, so it is intentionally excluded from the br_shape
-    matrix (the 0.2.16 leg would rightly disagree); it stays on the 0.1.23 pin."""
+    matrix (the 0.2.16 leg would rightly disagree); it stays on the 0.1.23 pin.
+    With ONE ready bead the batched show also rides 0.1.x's OTHER quirk end-to-end:
+    a single-id `br show --json` is a bare dict, which ready_queue must fold back."""
     f = _ready_feature(board, tmp_path)
     rows = board._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True)
     assert isinstance(rows, list) and rows
@@ -245,6 +247,30 @@ def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path):
     queue = board.ready_queue()
     assert [q["id"] for q in queue] == [f["id"]]
     assert queue[0]["board_state"] == "ready"  # the re-fetch restored the labels
+
+
+@requires_br
+@pytest.mark.br_shape
+def test_json_shape_batched_show_for_ready_queue(board, tmp_path):
+    """ready_queue's labels re-fetch is ONE `br show <id…>` for the whole ready set
+    (#257) — so the MULTI-id `br show --json` must return a LIST of dicts carrying
+    `id` + `labels` on BOTH matrix legs (the same batched-show contract
+    list_features rides for dependencies), and the queue must project every
+    candidate as `ready` through it."""
+    f1 = _ready_feature(board, tmp_path, title="Ready one")
+    # A second ready feature naming a DIFFERENT file — the same target would trip
+    # the #143 overlapping-worktree gate at mark_ready.
+    (tmp_path / "other.py").write_text("y = 2\n")
+    f2 = board.create_feature(
+        "Ready two", spec="s", acceptance_criteria="- WHEN x THE SYSTEM SHALL y", files_to_modify=["other.py"]
+    )
+    f2 = board.mark_ready(f2["id"])
+    rows = board._run("show", f1["id"], f2["id"], want_json=True)
+    assert isinstance(rows, list) and len(rows) == 2, f"multi-id br show --json shape changed: {type(rows).__name__}"
+    assert all(isinstance(r, dict) and r.get("id") and "labels" in r for r in rows)
+    queue = board.ready_queue()
+    assert {q["id"] for q in queue} == {f1["id"], f2["id"]}
+    assert all(q["board_state"] == "ready" for q in queue)
 
 
 @requires_br  # NOT @br_shape: asserts the 0.1.x `dependencies`-field STRUCTURE, so 0.1.23-pinned

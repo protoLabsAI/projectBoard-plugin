@@ -840,35 +840,88 @@ def test_claim_next_ready_returns_none_when_empty(make_board):
     assert b.claim_next_ready() is None
 
 
-def test_ready_queue_projects_label_less_br_ready_rows_as_ready(make_board, monkeypatch):
+def test_ready_queue_projects_label_less_br_ready_rows_as_ready(make_board):
     """beads-rust ≤0.1.23: `br ready --json` returns rows WITHOUT a `labels` field.
     ready_queue must still project candidates as board_state='ready' (re-fetching via
     `br show`, which carries labels) — otherwise board_state() reads no `ready` label,
     returns 'backlog', and the puller's `board_state != "ready"` guard self-rejects
     every ready feature and the loop silently never claims. Regression for the live
-    dogfood finding."""
+    dogfood finding. On 0.1.x a SINGLE-id `br show --json` is a BARE DICT, not a
+    one-row list — the batched re-fetch must fold it back (the list_features quirk)."""
     # What real `br ready --json` hands back: a feature with NO labels key.
-    br = Br({"ready": [{"id": "bd-1", "title": "T", "status": "open", "issue_type": "feature"}]})
-    b = make_board(br)
-    # get_feature (br show) IS label-bearing — project from it, not the bare ready row.
-    monkeypatch.setattr(
-        b,
-        "get_feature",
-        lambda fid: b._project(
-            {
-                "id": fid,
+    # The `br show` re-fetch IS label-bearing — project from it, not the bare ready row.
+    br = Br(
+        {
+            "ready": [{"id": "bd-1", "title": "T", "status": "open", "issue_type": "feature"}],
+            "show": {  # bare dict: the 0.1.x single-bead shape
+                "id": "bd-1",
                 "title": "T",
                 "status": "open",
                 "issue_type": "feature",
                 "labels": ["ready", "diff:small"],
                 "description": "spec",
                 "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
-            }
-        ),
+            },
+        }
     )
+    b = make_board(br)
     q = b.ready_queue()
     assert [f["id"] for f in q] == ["bd-1"]
     assert q[0]["board_state"] == "ready"  # the bug projected this as "backlog"
+    assert br.cmds("show") == [("show", "bd-1")]
+
+
+def test_ready_queue_batches_the_label_refetch_into_one_show(make_board):
+    """#257: the labels re-fetch is ONE `br show <id…>` for the WHOLE ready set —
+    the queue is polled every loop tick, so the old per-bead get_feature was R+1
+    subprocess spawns for R ready beads. Non-pullable types never make the show's
+    argv, and `br ready`'s priority order survives the batch (the show's row order
+    must NOT reorder the queue)."""
+    ready = [
+        {"id": "bd-1", "issue_type": "feature", "status": "open"},
+        {"id": "bd-ep", "issue_type": "epic", "status": "open"},  # not pullable → not shown
+        {"id": "bd-2", "issue_type": "task", "status": "open"},
+    ]
+    shows = [  # deliberately REVERSED vs `br ready`'s order
+        {"id": "bd-2", "status": "open", "issue_type": "task", "labels": ["ready"]},
+        {"id": "bd-1", "status": "open", "issue_type": "feature", "labels": ["ready"]},
+    ]
+    br = Br({"ready": ready, "show": shows})
+    b = make_board(br)
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-1", "bd-2"]  # priority order, not the show's
+    assert all(f["board_state"] == "ready" for f in q)
+    assert br.cmds("show") == [("show", "bd-1", "bd-2")]  # exactly ONE batched show
+
+
+def test_ready_queue_empty_ready_set_issues_no_show(make_board):
+    """`br show` with no ids is an error — an empty ready set must short-circuit."""
+    br = Br({"ready": []})
+    b = make_board(br)
+    assert b.ready_queue() == []
+    assert br.cmds("show") == []
+
+
+def test_ready_queue_falls_back_per_id_when_the_batched_show_404s(make_board):
+    """The delete race the old per-bead get_feature folded to None: a candidate
+    vanishing between `br ready` and the show makes the batched `br show` raise
+    ISSUE_NOT_FOUND. The queue must not starve over one ghost — fall back to
+    per-id fetches for the tick, skip the ghost, keep the survivors flowing."""
+
+    def show(args):
+        ids = args[1:]
+        if len(ids) > 1 or ids == ("bd-gone",):
+            raise store.BoardNotFound("`br show` failed: ISSUE_NOT_FOUND")
+        return [{"id": ids[0], "status": "open", "issue_type": "feature", "labels": ["ready"]}]
+
+    ready = [
+        {"id": "bd-1", "issue_type": "feature", "status": "open"},
+        {"id": "bd-gone", "issue_type": "feature", "status": "open"},
+    ]
+    b = make_board(Br({"ready": ready, "show": show}))
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-1"]  # ghost skipped, survivor projected
+    assert q[0]["board_state"] == "ready"
 
 
 def test_claim_claims_a_specific_ready_feature(make_board, monkeypatch):
@@ -3159,15 +3212,20 @@ def test_claim_next_ready_pulls_task_beads_too(make_board, monkeypatch):
     assert ("update", "bd-t", "--claim", "--remove-label", "ready") in br.calls
 
 
-def test_ready_queue_includes_task_beads(make_board, monkeypatch):
+def test_ready_queue_includes_task_beads(make_board):
     ready = [
         {"id": "bd-f", "issue_type": "feature", "status": "open"},
         {"id": "bd-t", "issue_type": "task", "status": "open"},
         {"id": "bd-ms", "issue_type": "milestone", "status": "open"},
     ]
-    b = make_board(Br({"ready": ready}))
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    shows = [
+        {"id": "bd-f", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+        {"id": "bd-t", "issue_type": "task", "status": "open", "labels": ["ready"]},
+    ]
+    br = Br({"ready": ready, "show": shows})
+    b = make_board(br)
     assert [f["id"] for f in b.ready_queue()] == ["bd-f", "bd-t"]  # milestone still excluded
+    assert br.cmds("show") == [("show", "bd-f", "bd-t")]  # and never re-fetched
 
 
 # ── _project: the deliverable field (#217) ───────────────────────────────────────
