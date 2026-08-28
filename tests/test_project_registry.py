@@ -732,6 +732,35 @@ async def test_a_red_gate_on_a_dirty_checkout_is_indeterminate_and_persists(monk
     assert "NOT at base" in caplog.text and "indeterminate" in caplog.text
 
 
+async def test_dirt_the_gate_itself_creates_cannot_excuse_its_red_verdict(monkeypatch, tmp_path):
+    """Dirt is snapshotted BEFORE the gate runs. A gate that modifies a tracked file
+    and then exits non-zero would otherwise manufacture its own dirty-checkout
+    excuse and persist as indeterminate — but the checkout it convicted WAS the
+    clean base, so the refusal must stand."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    (repo / "f.txt").write_text("one\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"],
+        cwd=repo,
+        check=True,
+    )
+    # Pin the branch name: with a commit on it, HEAD resolves, and a host whose
+    # init.defaultBranch is not `main` would read as pre-existing dirt vs the
+    # default base — exactly the excuse this test proves the gate cannot create.
+    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    with pytest.raises(ProjectRegistryError, match="failed on the clean base"):
+        await upsert_project("alpha", str(repo), local_gate_cmd="echo self-dirt >> f.txt; exit 3")
+
+    assert applied == []  # refused BEFORE persistence — nothing reached the host
+    assert (repo / "f.txt").read_text() != "one\n"  # the gate really did dirty the checkout
+
+
 async def test_a_gate_smoke_timeout_is_indeterminate_and_persists(monkeypatch, tmp_path, caplog):
     """A slow gate must not make registration impossible — mirror the loop's timeout
     posture: no verdict, allow, and say so loudly."""

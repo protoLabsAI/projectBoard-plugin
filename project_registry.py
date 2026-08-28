@@ -308,11 +308,18 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
 
     Mirrors the preflight's posture on indeterminate verdicts: a timeout or a signal
     kill is NO verdict (allow — a slow gate must not make registration impossible),
-    and a non-zero exit on a checkout that is not at base (#255) convicts the
-    operator's local edits rather than the base every worktree branches from, so it
-    too downgrades to a loud warning. Only a CLEAN checkout with a red gate refuses.
+    and a non-zero exit on a checkout that was ALREADY not at base (#255) convicts
+    the operator's local edits rather than the base every worktree branches from, so
+    it too downgrades to a loud warning. Only a checkout that was clean when the
+    gate started, with a red gate, refuses.
     """
     log.info("[project_board] register[%s]: smoking the gate on clean base — %s", name, cmd)
+    # Snapshot dirt BEFORE the gate runs. The gate itself may modify tracked files
+    # (an in-place formatter, generated code) before exiting non-zero; a post-run
+    # check would read that self-inflicted dirt as the operator's local edits and
+    # launder a red verdict on the clean base into an indeterminate persist. Only
+    # dirt that predates the gate may downgrade its verdict.
+    dirt = await _base_checkout_dirt(repo, base)
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -380,13 +387,12 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             text,
         )
         return
-    dirt = await _base_checkout_dirt(repo, base)
     if dirt:
         log.warning(
-            "[project_board] register[%s]: gate FAILED but the checkout at %s is NOT at base (%s) — "
-            "the gate ran against those local edits, not the base every worktree branches from, so the "
-            "verdict is indeterminate; persisting (the loop's preflight still gates dispatch). "
-            "Output tail:\n%s",
+            "[project_board] register[%s]: gate FAILED but the checkout at %s was NOT at base when the "
+            "gate started (%s) — the gate ran against those local edits, not the base every worktree "
+            "branches from, so the verdict is indeterminate; persisting (the loop's preflight still "
+            "gates dispatch). Output tail:\n%s",
             name,
             repo,
             dirt,
