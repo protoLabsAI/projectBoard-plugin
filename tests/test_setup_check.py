@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import project_board as pb
-from project_board import api, setup_check
+from project_board import api, projects, setup_check
 from project_board.loop import BoardLoop
 from project_board.setup_check import GapReporter, setup_status
 
@@ -296,6 +296,98 @@ def test_malformed_projects_map_is_the_repo_finding_not_a_raise():
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
     assert s["repo"]["ok"] is False and "invalid" in s["repo"]["hint"] and "'web'" in s["repo"]["hint"]
     assert s["coder"]["ok"] is True  # the coder check still ran (names from the flat key)
+
+
+# ── the multi-project + explicit-blank db_path hole (D3, #260) ────────────────────
+# A blank db_path now DEFAULTS to the instance store (store.default_db_path, pinned
+# in test_store), so a multi-project board with NO db_path key shares one db. The one
+# remaining hole is the operator EXPLICITLY writing `db_path: ""` (the pre-D3
+# per-repo-discovery override — distinguishable because the host hands a plugin its
+# config section verbatim, not a per-key merge with manifest defaults) next to a
+# multi-entry projects: map — the exact shape that fragments the board. That must
+# surface as a repo setup gap instead of being silently accepted.
+
+
+def _two_projects(tmp_path):
+    return {"web": {"repo": str(tmp_path)}, "api": {"repo": str(tmp_path)}}
+
+
+def test_multi_project_map_with_explicit_blank_db_path_is_a_repo_gap(tmp_path):
+    cfg = {"coder": "proto", "db_path": "", "projects": _two_projects(tmp_path)}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"]["ok"] is False
+    assert s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
+    assert "fragment" in s["repo"]["hint"] and "one instance store" in s["repo"]["hint"]
+    assert "repo" in s["loop_blockers"] and s["ready"] is False  # not silently accepted — the loop pauses
+
+
+def test_whitespace_only_db_path_is_the_same_override(tmp_path):
+    cfg = {"coder": "proto", "db_path": "   ", "projects": _two_projects(tmp_path)}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"]["ok"] is False and s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
+
+
+def test_multi_project_map_without_a_db_path_key_rides_the_instance_default(tmp_path):
+    """The #260 acceptance shape: two projects, NO db_path key — every card lands in
+    the instance-default store (r1; the store half is pinned in test_store), so the
+    repo check stays green and the loop runs."""
+    cfg = {"coder": "proto", "projects": _two_projects(tmp_path)}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"] == {"ok": True, "path": ".", "hint": ""}
+    assert s["ready"] is True and s["loop_blockers"] == []
+
+
+def test_multi_project_map_with_a_shared_db_path_passes(tmp_path):
+    cfg = {"coder": "proto", "db_path": str(tmp_path / "board" / "beads.db"), "projects": _two_projects(tmp_path)}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"]["ok"] is True
+
+
+def test_single_project_map_with_explicit_blank_db_path_is_not_the_hole(tmp_path):
+    """One entry can't fragment: the explicit blank simply rides the instance default."""
+    cfg = {"coder": "proto", "db_path": "", "projects": {"web": {"repo": str(tmp_path)}}}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"]["ok"] is True
+
+
+def test_the_db_hole_outranks_a_missing_project_dir(tmp_path):
+    """Both findings standing → the structural hole is the one reported (a missing
+    dir might just be an un-cloned repo; the blank-db override breaks the whole board)."""
+    cfg = {"coder": "proto", "db_path": "", "projects": {"web": {"repo": str(tmp_path)}, "api": {"repo": "/gone"}}}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["repo"]["hint"] == setup_check.MULTI_PROJECT_DB_HINT
+
+
+# ── the config-seam helpers the wiring rides (projects.py, D3 #260) ───────────────
+
+
+def test_blank_db_override_means_key_present_and_blank():
+    assert projects.blank_db_override({"db_path": ""}) is True
+    assert projects.blank_db_override({"db_path": "   "}) is True
+    assert projects.blank_db_override({"db_path": None}) is True
+    assert projects.blank_db_override({}) is False  # key absent = no choice = the instance default
+    assert projects.blank_db_override({"db_path": "/x/beads.db"}) is False
+    assert projects.blank_db_override(None) is False
+
+
+def test_multi_project_is_an_explicit_map_with_more_than_one_entry():
+    assert projects.multi_project({"projects": {"a": {"repo": "/x"}, "b": {"repo": "/y"}}}) is True
+    assert projects.multi_project({"projects": {"a": {"repo": "/x"}}}) is False
+    assert projects.multi_project({"projects": {}}) is False
+    assert projects.multi_project({}) is False
+    assert projects.multi_project(None) is False
+
+
+def test_store_db_path_resolves_explicit_else_instance_default(monkeypatch):
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    # explicit pins pass through VERBATIM — the same raw value the loop's store_kw
+    # carries, so both resolutions land on ONE cached board (get_store keys on db)
+    assert projects.store_db_path({"db_path": "/x/board.db"}) == "/x/board.db"
+    assert projects.store_db_path({"db_path": "~/boards/b.db"}) == "~/boards/b.db"
+    for cfg in ({}, {"db_path": ""}, {"db_path": "  "}, {"db_path": None}, None):
+        assert projects.store_db_path(cfg) == "/inst/project_board/.beads/beads.db"
 
 
 def test_setup_status_never_raises_on_a_broken_which(tmp_path):
@@ -948,3 +1040,47 @@ def test_manifest_config_has_no_default_coder():
 
     m = yaml.safe_load((Path(pb.__file__).parent / "protoagent.plugin.yaml").read_text())
     assert m["config"]["coder"] == ""
+
+
+# ── __init__ wires every store construction onto the resolved db (D3, #260) ───────
+# The tool store_kw and register()'s coder-monitor persist factory resolve the db at
+# BUILD time through projects.store_db_path — a blank/absent db_path lands on the ONE
+# instance-default store (never per-repo discovery), an explicit path stays the pin.
+
+
+def test_board_tools_construct_stores_on_the_instance_default_db(monkeypatch, tmp_path):
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    seen = {}
+    monkeypatch.setattr("project_board.store.get_store", lambda **kw: seen.update(kw) or _Store())
+    tools = {t.name: t for t in pb._board_tools({"coder": "proto", "projects": _two_projects(tmp_path)})}
+    assert tools["board_list"].invoke({}) == "[]"
+    assert seen["db"] == "/inst/project_board/.beads/beads.db"
+
+
+def test_board_tools_keep_an_explicit_db_path_pin(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr("project_board.store.get_store", lambda **kw: seen.update(kw) or _Store())
+    tools = {t.name: t for t in pb._board_tools({"db_path": str(tmp_path / "pin.db")})}
+    tools["board_list"].invoke({})
+    assert seen["db"] == str(tmp_path / "pin.db")
+
+
+def test_register_persist_store_factory_rides_the_resolved_db(monkeypatch, tmp_path):
+    """register()'s coder-monitor persist factory (#226) is built from the same
+    resolved db — a blank db_path lands its snapshots in the instance store, never a
+    repo `.beads/`."""
+    from project_board import coder_seam
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    _pin_probes(monkeypatch, which=_which_all, delegates=_delegates("proto"))
+    seen = {}
+    monkeypatch.setattr(store_mod, "get_store", lambda **kw: seen.update(kw) or _Store())
+    captured = {}
+    monkeypatch.setattr(coder_seam, "set_store_factory", lambda fn: captured.update(fn=fn))
+    pb.register(_Registry({"coder": "proto", "repo": str(tmp_path)}))
+    captured["fn"]()
+    assert seen["db"] == "/inst/project_board/.beads/beads.db"
+    assert seen["repo"] == str(tmp_path)

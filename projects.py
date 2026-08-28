@@ -154,6 +154,47 @@ def default_project(cfg: dict) -> str:
     return next(iter(projects)) if len(projects) == 1 else ""
 
 
+def multi_project(cfg: dict) -> bool:
+    """True when the board's own ``projects:`` map EXPLICITLY declares more than one
+    project — the shape whose cards must share ONE store (#260): with several repos on
+    a single board, per-repo ``.beads/`` discovery would give every project its own
+    workspace and fragment the board (a card created for one project invisible to the
+    loop and the others). The implicit single project (no map) is never multi."""
+    raw = (cfg or {}).get("projects")
+    return isinstance(raw, dict) and len(raw) > 1
+
+
+def blank_db_override(cfg: dict) -> bool:
+    """True when the config EXPLICITLY carries a blank ``db_path`` — the operator wrote
+    ``db_path: ""`` (the pre-D3 per-repo-discovery escape hatch) rather than leaving the
+    key out. The two are distinguishable because the host hands a plugin its config
+    section verbatim (whole-section fallback to the manifest defaults, not a per-key
+    merge), so a present-and-blank key is an operator's choice. Harmless on a
+    single-repo board (the instance default applies either way, D3 #260); combined with
+    a multi-entry ``projects:`` map it is the fragmentation hole the setup preflight
+    surfaces (``setup_check.MULTI_PROJECT_DB_HINT``)."""
+    cfg = cfg or {}
+    return "db_path" in cfg and not str(cfg.get("db_path") or "").strip()
+
+
+def store_db_path(cfg: dict) -> str:
+    """The beads db every board-store construction rides (D3, #260): the explicit
+    ``db_path`` when set (passed through VERBATIM — the operator's hard pin, and the
+    same raw value the loop's own store_kw carries, so both land on one cached board),
+    else the ONE instance-default store (``store.default_db_path``). Resolved HERE — at
+    the config seam — so ``store_kw`` carries the real path instead of deferring to
+    ``get_store``'s fallback. An explicitly BLANK ``db_path`` resolves to the instance
+    default too (production stores never do per-repo discovery since D3); on a
+    multi-project board that override is additionally a setup gap rather than a
+    silently-accepted fragmentation."""
+    raw = (cfg or {}).get("db_path")
+    if str(raw or "").strip():
+        return str(raw)
+    from .store import default_db_path  # lazy, matching the other cross-module reaches
+
+    return default_db_path()
+
+
 def registry_projects() -> list[dict]:
     """The host's ADR 0095 registry, or ``[]`` on any host without one.
 
