@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from project_registry import (
+    _drain_tail,
     ProjectRegistryError,
     _raw_projects,
     _resolve_under,
@@ -814,3 +815,43 @@ async def test_a_smoke_timeout_kills_the_whole_gate_tree_not_just_the_shell(monk
     else:
         os.kill(pid, signal.SIGKILL)  # do not leak a two-minute sleeper into the run
         pytest.fail("the gate's descendant survived the smoke timeout — only the shell was killed")
+
+
+# ── the smoke's output read is bounded (review finding on #261) ──────────────────
+
+
+class _EndlessStream:
+    """A stdout that yields ``total`` bytes in ``chunk``-sized reads, then EOF."""
+
+    def __init__(self, total: int, chunk: int = 65536):
+        self.remaining = total
+        self.chunk = chunk
+        self.served = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        take = min(self.chunk, self.remaining, n if n > 0 else self.chunk)
+        self.remaining -= take
+        # Encode position into the bytes so the test can prove it kept the TAIL.
+        start = self.served
+        self.served += take
+        return bytes((start + i) % 251 for i in range(take))
+
+
+async def test_drain_tail_keeps_only_the_last_cap_bytes_of_an_unbounded_stream():
+    """`communicate()` would have buffered all 16 MB before the 4,000-char truncation
+    ran; the bounded drain keeps a rolling window and returns exactly the tail."""
+    total, cap = 16 * 1024 * 1024, 4000
+    stream = _EndlessStream(total)
+    out = await _drain_tail(stream, cap)
+    assert len(out) == cap
+    # The returned bytes are the LAST `cap` of the stream, not the first.
+    expected = bytes(((total - cap) + i) % 251 for i in range(cap))
+    assert out == expected
+
+
+async def test_drain_tail_returns_a_short_stream_whole():
+    stream = _EndlessStream(100)
+    out = await _drain_tail(stream, 4000)
+    assert len(out) == 100

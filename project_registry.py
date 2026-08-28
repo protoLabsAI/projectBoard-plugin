@@ -255,6 +255,11 @@ def _validate_base_branch(branch: str) -> str:
 #: cfg to read them from.
 _SMOKE_TIMEOUT_S = 600.0
 _SMOKE_OUTPUT_CHARS = 4000
+#: The most of the gate's output kept IN MEMORY while it runs — a rolling tail, so a
+#: gate that prints without end (a runaway test log, a progress bar) cannot grow the
+#: plugin process with it. Sized for the worst-case UTF-8 width of the decoded tail
+#: reported below, so the truncated text is never shorter than ``_SMOKE_OUTPUT_CHARS``.
+_SMOKE_OUTPUT_BYTES = _SMOKE_OUTPUT_CHARS * 4
 #: Bound on reaping a killed smoke. The group kill below takes the whole gate tree
 #: down, but a descendant that re-``setsid``s escapes the group and can keep our
 #: stdout pipe open — the PUT must answer anyway, not wait for it.
@@ -274,6 +279,30 @@ async def _base_checkout_dirt(repo: str, base: str) -> str:
         return await worktree.base_checkout_dirt(repo, base)
     except Exception:  # noqa: BLE001 — no dirt information → keep the strict verdict
         return ""
+
+
+async def _drain_tail(stream, cap: int) -> bytes:
+    """Read ``stream`` to EOF keeping only its last ``cap`` bytes.
+
+    ``proc.communicate()`` buffers EVERYTHING the child writes before the caller can
+    truncate it, so a gate with unbounded output was an unbounded allocation inside the
+    server process. This reads in chunks and trims to a rolling window (at most
+    ``2 * cap`` bytes resident), so memory is bounded by the cap, not by the gate."""
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return bytes(buf[-cap:])
+        buf += chunk
+        if len(buf) > 2 * cap:
+            del buf[:-cap]
+
+
+async def _run_bounded(proc: asyncio.subprocess.Process, cap: int) -> bytes:
+    """Drain the gate's merged stdout into a bounded tail, then reap it."""
+    out = await _drain_tail(proc.stdout, cap)
+    await proc.wait()
+    return out
 
 
 def _kill_gate_tree(proc: asyncio.subprocess.Process) -> None:
@@ -331,7 +360,9 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             start_new_session=True,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_SMOKE_TIMEOUT_S)
+            # Bounded read (not `communicate()`, which buffers the whole stream before any
+            # truncation could apply): only the tail stays resident while the gate runs.
+            out = await asyncio.wait_for(_run_bounded(proc, _SMOKE_OUTPUT_BYTES), timeout=_SMOKE_TIMEOUT_S)
         except asyncio.TimeoutError:
             _kill_gate_tree(proc)
             try:
