@@ -2654,6 +2654,58 @@ def test_list_features_hides_archived_by_default_and_flag_restores(make_board):
     assert [f["id"] for f in b.list_features(state="done", include_archived=True)] == ["bd-arch", "bd-live"]
 
 
+def test_list_features_projection_spans_feature_and_task_not_epic_milestone(make_board):
+    """#303 (r1/r2): the board projection must include task-type beads — they ride the
+    SAME rails as coding features (ready → claim → in_progress → in_review) — while
+    structural epic/milestone beads stay out. The query passes the shared
+    PULLABLE_ISSUE_TYPES as repeatable `--type feature --type task` args; the old
+    `--type feature`-only query dropped every task from the projection (and so from
+    board_list / GET /features, both thin pass-throughs), which also left the sweep's
+    task orphan-recovery and terminal-task archival branches structurally unreachable."""
+    everything = [
+        {"id": "bd-feat", "issue_type": "feature", "status": "in_progress", "labels": []},
+        {"id": "bd-task", "issue_type": "task", "status": "in_progress", "labels": []},
+        {"id": "bd-epic", "issue_type": "epic", "status": "open", "labels": []},
+        {"id": "bd-ms", "issue_type": "milestone", "status": "open", "labels": []},
+    ]
+
+    def _typed_list(args):
+        # Honor the `--type` filter beads applies server-side, so the exclusion is
+        # proven behaviorally — not merely by inspecting the query args below.
+        wanted = {args[i + 1] for i, a in enumerate(args) if a == "--type"}
+        return [b for b in everything if b["issue_type"] in wanted]
+
+    br = Br({"list": _typed_list})
+    b = make_board(br)
+    ids = {f["id"] for f in b.list_features()}
+    assert ids == {"bd-feat", "bd-task"}  # the task IS in the projection…
+    assert "bd-epic" not in ids and "bd-ms" not in ids  # …epic/milestone are not
+
+    # …and the query carries the SHARED PULLABLE_ISSUE_TYPES as repeatable `--type` args
+    # (one constant feeds both this projection and ready_queue), never epic/milestone.
+    list_call = br.cmds("list")[0]
+    passed = {list_call[i + 1] for i, a in enumerate(list_call) if a == "--type"}
+    assert passed == set(store.PULLABLE_ISSUE_TYPES) == {"feature", "task"}
+    assert "epic" not in list_call and "milestone" not in list_call
+
+
+def test_archive_stale_archives_a_terminal_task(make_board):
+    """#303 (r4): a task rides the same board rails, so a terminal (closed) task past
+    the archive window is aged out of the live projection exactly like a feature — the
+    archive pass consumes ``list_features``, which now surfaces tasks. A fresh terminal
+    task (inside the window) is left visible."""
+    beads = [
+        {"id": "bd-task-done", "issue_type": "task", "status": "closed", "closed_at": "2026-07-01T00:00:00Z"},
+        # a fresh terminal task (2 days old, inside the 7-day window) stays visible
+        {"id": "bd-task-fresh", "issue_type": "task", "status": "closed", "closed_at": "2026-07-23T12:00:00Z"},
+    ]
+    br = Br({"list": beads})
+    b = make_board(br)
+    assert b.archive_stale(archive_after_days=7, now=_NOW) == ["bd-task-done"]
+    labeled = {a[1] for a in br.cmds("update") if ("--add-label", "archived") == a[-2:]}
+    assert labeled == {"bd-task-done"}
+
+
 def test_project_exposes_archived_and_closed_at(make_board):
     b = make_board(Br())
     f = b._project({"id": "x", "status": "closed", "labels": ["archived"], "closed_at": "2026-07-01T00:00:00Z"})
