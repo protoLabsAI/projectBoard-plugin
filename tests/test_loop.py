@@ -1783,6 +1783,8 @@ async def test_verify_goal_no_test_marker_is_structural_and_summary_scoped(monke
     # marker in a section AFTER the final summary → still a gap (the summary ends
     # at the next heading — a later section is not the summary)
     assert await gap("## Summary\n\nRenamed a variable.\n## Notes\n\nNO_TEST_NEEDED: covered elsewhere") is not None
+    # ...including a LEVEL-ONE heading — any heading level ends the summary
+    assert await gap("## Summary\n\nRenamed a variable.\n# Appendix\n\nNO_TEST_NEEDED: covered elsewhere") is not None
     # ...and the gap tells the coder where the marker belongs
     assert "## Summary" in (await gap("no marker") or "")
 
@@ -1800,8 +1802,10 @@ def test_no_test_marker_last_summary_and_reason_extraction():
     assert _no_test_marker(reply) == "pure refactor, no behavior change"
     assert _no_test_marker("NO_TEST_NEEDED: no summary section") is None
     assert _no_test_marker("") is None
-    # the summary ends at the next heading — a marker in a later section is prose
+    # the summary ends at the next heading of ANY level — a marker in a later
+    # section is prose, whether that section is #, ## or ### deep
     assert _no_test_marker("## Summary\n\nFinal.\n## Appendix\nNO_TEST_NEEDED: outside the summary") is None
+    assert _no_test_marker("## Summary\n\nFinal.\n# Appendix\nNO_TEST_NEEDED: under a level-one heading") is None
     assert _no_test_marker("## Summary\n\nFinal.\n### Details\nNO_TEST_NEEDED: in a subsection") is None
 
 
