@@ -227,6 +227,18 @@ blank `db_path` meant per-repo `.beads/` auto-discovery is gone; on a
 multi-project board an explicitly blank `db_path` is additionally surfaced by the
 setup preflight as a non-blocking "stale override" advisory.
 
+**Upgrading a pre-D3 board.** Before this default existed, a board with no
+`db_path` kept its cards *inside the configured repo* (`br` per-repo discovery,
+`<repo>/.beads/*.db`). Those workspaces are not read anymore — but the switch is
+never silent: the setup preflight detects a configured repo that still carries a
+`.beads/` workspace while no `db_path` is set and raises a non-blocking migration
+advisory (an operator warning and a board-page callout naming the repo). To keep
+reading the old cards, set `db_path` to that `<repo>/.beads/<file>.db` — the
+explicit pin **is** the old store, unchanged. To adopt the instance store instead,
+move the cards over yourself (the old workspace stays untouched); the advisory
+quiets once `db_path` is pinned explicitly or the repo no longer carries a
+`.beads/` workspace.
+
 ## Use
 
 - **Headless / via the agent:** `board_create_epic`, `board_create_feature`

@@ -298,7 +298,7 @@ async function load(){
     // list rides along on the setup-gap card instead of fighting it for the slot.
     if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null, s);
     else if (s && s.held_projects && s.held_projects.length) renderHeldProjects(s);
-    else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored)) renderLoopStale(s.setup);
+    else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored || s.setup.legacy_store_hint)) renderLoopStale(s.setup);
     else $("err").hidden = true;
   } catch (e) {
     // First-run tell (#unbound): a board never bound to a repo (shipped default
@@ -348,6 +348,11 @@ function setupLoopLine(setup){
   // db_path — inert since D3 (the board runs on the one instance store), so it is
   // an info line, never a failing check.
   if (setup && setup.db_override_ignored) html += '<div style="margin-top:6px;font-size:12px"><b>db_path override ignored:</b> ' + esc(String(setup.db_override_hint || "an explicitly blank db_path resolves to the one instance store")) + '</div>';
+  // The D3 migration advisory (#260): a configured repo still carries the pre-D3
+  // per-repo `.beads/` workspace the board no longer reads — cards left there are
+  // invisible until db_path pins back to that file or they are migrated. Info line,
+  // never a failing check.
+  if (setup && setup.legacy_store_hint) html += '<div style="margin-top:6px;font-size:12px"><b>Pre-D3 repo workspace detected:</b> ' + esc(String(setup.legacy_store_hint)) + '</div>';
   return html;
 }
 

@@ -228,7 +228,11 @@ config:
                             # verbatim (`--db`) to every board op and nothing is created
                             # on your behalf (`br init` it yourself). An explicitly
                             # blank value is the same as leaving the key out — the
-                            # pre-D3 per-repo `.beads/` discovery is gone.
+                            # pre-D3 per-repo `.beads/` discovery is gone. A pre-D3
+                            # board kept its cards IN the repo's .beads/: the setup
+                            # preflight flags a repo still carrying one; point db_path
+                            # at that .beads/<file>.db to keep reading those cards
+                            # (see README "Upgrading a pre-D3 board").
   webhook_secret: ""        # HMAC secret for every public mutation: /webhook/pr,
                             # /features/<id>/ci, and /review. Blank → all three fail
                             # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.

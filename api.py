@@ -59,9 +59,12 @@ def _store_kw(cfg: dict) -> dict:
         # D3 (#260): the db is resolved at the config seam, the same way as the tool
         # store_kw and the coder-monitor persist factory — a blank/absent db_path rides
         # the ONE instance-default store (store.default_db_path), an explicit path
-        # stays the operator pin verbatim. Every router store therefore lands on the
-        # same cached board as the loop/tools, and the API can never fall back to
-        # per-repo `.beads/` discovery.
+        # stays the operator pin verbatim. Resolving HERE re-homes nothing: get_store
+        # itself resolves a blank db to the same instance default, so this hands it the
+        # exact path the pre-seam `db=cfg.get("db_path") or None` call already landed
+        # on — same cache key, same board (pinned in test_projects). Cards a pre-D3
+        # install left in a repo's `.beads/` are surfaced by the setup preflight's
+        # migration advisory (setup_check.legacy_store_repos), never silently dropped.
         db=store_db_path(cfg),
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),

@@ -320,3 +320,23 @@ def test_api_two_projects_and_no_db_path_share_the_one_instance_store(monkeypatc
         "web": "/work/web",
         "api": "/work/api",
     }
+
+
+def test_api_blank_db_path_reads_the_same_store_get_store_already_resolved(monkeypatch, tmp_path):
+    """The upgrade-safety pin for the seam move (#260): `get_store` resolves a blank
+    db to the instance default ITSELF (`db = db or default_db_path()`), so the
+    pre-seam API call (`db=cfg.get("db_path") or None`) and the resolved `_store_kw`
+    value land on the SAME cache key — the routers read exactly the board they read
+    before the seam existed, and no installation's store is re-homed by resolving at
+    the config seam instead of inside get_store."""
+    from project_board import api
+    from project_board import store as store_mod
+
+    inst = str(tmp_path / "inst" / ".beads" / "beads.db")
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: inst)
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    monkeypatch.setattr(store_mod, "_BOARDS", {})
+    cfg = {"repo": str(tmp_path)}  # no db_path — the shipped default
+    before = store_mod.get_store(db=cfg.get("db_path") or None, repo=str(tmp_path))  # the pre-seam call
+    after = store_mod.get_store(db=api._store_kw(cfg)["db"], repo=str(tmp_path))  # the resolved seam
+    assert after is before and before.db == inst

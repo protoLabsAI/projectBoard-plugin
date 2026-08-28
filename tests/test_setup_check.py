@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -367,6 +368,81 @@ def test_the_advisory_and_a_missing_project_dir_surface_independently(tmp_path):
     assert s["db_override_ignored"] is True and s["db_override_hint"] == setup_check.MULTI_PROJECT_DB_HINT
 
 
+# ── the pre-D3 per-repo workspace MIGRATION advisory (D3, #260) ───────────────────
+# Before D3, a board with no db_path kept its cards IN the configured repo (`br`
+# per-repo discovery / `br init` in the repo). Post-D3 the same config reads the
+# instance store, so a repo still carrying `.beads/` is the upgrade signature: any
+# cards left there are invisible until db_path pins back to that file or they are
+# migrated — surfaced under its own `db_legacy` report key so the switch is never a
+# silently empty board. Non-blocking: the board itself is healthy on the instance
+# store, so the advisory never fails a check or pauses the loop.
+
+
+def test_repo_with_a_beads_workspace_and_no_db_path_is_the_migration_advisory(tmp_path):
+    (tmp_path / ".beads").mkdir()
+    cfg = {"coder": "proto", "repo": str(tmp_path)}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["legacy_store_repos"] == [str(tmp_path)]
+    assert str(tmp_path) in s["legacy_store_hint"] and "db_path" in s["legacy_store_hint"]
+    # non-blocking: the board runs (on the instance store) — the advisory only informs
+    assert s["ready"] is True and s["loop_blockers"] == []
+
+
+def test_an_explicit_db_path_pin_quiets_the_migration_advisory(tmp_path):
+    """The pin decides, wherever it points — an operator who set db_path (to the
+    legacy file or anywhere else) has already made the migration choice."""
+    (tmp_path / ".beads").mkdir()
+    cfg = {"coder": "proto", "repo": str(tmp_path), "db_path": str(tmp_path / ".beads" / "old.db")}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["legacy_store_repos"] == [] and s["legacy_store_hint"] == ""
+
+
+def test_a_repo_without_a_beads_workspace_is_not_the_migration_advisory(tmp_path):
+    s = setup_status(
+        {"coder": "proto", "repo": str(tmp_path)}, which=_which_all, delegates=_delegates("proto"), run=_fake_run()
+    )
+    assert s["legacy_store_repos"] == [] and s["legacy_store_hint"] == ""
+
+
+def test_an_explicitly_blank_db_path_still_gets_the_migration_advisory(tmp_path):
+    """`db_path: ""` is NOT a pin — it rides the instance store (store_db_path), so a
+    legacy workspace next to it is exactly as invisible as with the key absent."""
+    (tmp_path / ".beads").mkdir()
+    cfg = {"coder": "proto", "repo": str(tmp_path), "db_path": ""}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["legacy_store_repos"] == [str(tmp_path)]
+
+
+def test_migration_advisory_names_only_the_project_repos_that_carry_a_workspace(tmp_path):
+    legacy, fresh = tmp_path / "legacy", tmp_path / "fresh"
+    (legacy / ".beads").mkdir(parents=True)
+    fresh.mkdir()
+    cfg = {"coder": "proto", "projects": {"old": {"repo": str(legacy)}, "new": {"repo": str(fresh)}}}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s["legacy_store_repos"] == [str(legacy)]
+    assert str(legacy) in s["legacy_store_hint"] and str(fresh) not in s["legacy_store_hint"]
+    assert s["ready"] is True and s["loop_blockers"] == []
+    # composes with the stale-override advisory — independent channels, neither masks
+    s2 = setup_status({**cfg, "db_path": ""}, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    assert s2["db_override_ignored"] is True and s2["legacy_store_repos"] == [str(legacy)]
+
+
+def test_legacy_store_repos_dedupes_pins_and_guards():
+    probed = []
+
+    def isdir(p):
+        probed.append(p)
+        return True
+
+    shared = {"a": {"repo": "/x"}, "b": {"repo": "/x"}}
+    assert setup_check.legacy_store_repos({"projects": shared}, isdir=isdir) == ["/x"]  # de-duplicated
+    assert probed == [os.path.join("/x", ".beads")]  # one probe per distinct repo
+    assert setup_check.legacy_store_repos({"db_path": "/pin.db", "repo": "/x"}, isdir=isdir) == []  # pinned
+    # a malformed projects: map is the repo check's finding, not a raise here
+    assert setup_check.legacy_store_repos({"projects": {"a": {"base_branch": "m"}}}, isdir=isdir) == []
+    assert setup_check.legacy_store_hint([]) == ""
+
+
 # ── the config-seam helpers the wiring rides (projects.py, D3 #260) ───────────────
 
 
@@ -465,10 +541,11 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("repo", None),
         ("loop", None),
         ("db", None),
+        ("db_legacy", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
-    assert len(host.calls) == 6
+    assert len(host.calls) == 7
     # br installed → ONE clear for br, coder still standing → silent
     assert rep.report(_status(coder=False)) == {"br": None}
     assert host.calls[-1] == ("br", None)
@@ -487,7 +564,7 @@ def test_fresh_reporter_clears_a_previous_instances_warning():
     assert ("coder", "coder hint") in host.calls
     fresh = GapReporter(host)
     fresh.report(_status())  # the reloaded instance sees a passing coder
-    assert ("coder", None) in host.calls[6:]
+    assert ("coder", None) in host.calls[7:]
 
 
 def test_reporter_forwards_the_loop_stale_key():
@@ -509,6 +586,21 @@ def test_reporter_forwards_the_db_override_advisory_key():
     assert rep.report({**_status(), "db_override_hint": setup_check.MULTI_PROJECT_DB_HINT}) == {}  # steady
     assert rep.report({**_status(), "db_override_hint": ""}) == {"db": None}
     assert host.calls[-1] == ("db", None)
+
+
+def test_reporter_forwards_the_migration_advisory_key():
+    """The pre-D3 workspace advisory (D3, #260) rides the seam under its own
+    `db_legacy` key — edge-triggered like every other key: the hint when a legacy
+    workspace appears, one clear (None) once the operator pins or migrates."""
+    host = _HostWithSeam()
+    rep = GapReporter(host)
+    hint = setup_check.legacy_store_hint(["/old/repo"])
+    assert "/old/repo" in hint and "db_path" in hint
+    rep.report({**_status(), "legacy_store_hint": hint})
+    assert ("db_legacy", hint) in host.calls
+    assert rep.report({**_status(), "legacy_store_hint": hint}) == {}  # steady
+    assert rep.report({**_status(), "legacy_store_hint": ""}) == {"db_legacy": None}
+    assert host.calls[-1] == ("db_legacy", None)
 
 
 def test_reporter_is_a_guarded_noop_on_a_host_without_the_seam():
@@ -581,8 +673,8 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
     with caplog.at_level(logging.INFO, logger=LOGGER):
         pb.register(reg)
     msgs = dict(reg.gaps)
-    # every key on the first evaluation (br + loop + db as clears), in render order
-    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db"]
+    # every key on the first evaluation (br + loop + db + db_legacy as clears), in render order
+    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db", "db_legacy"]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT
     assert "gh auth login" in msgs["gh"]
@@ -693,7 +785,7 @@ async def test_loop_pauses_on_missing_br_then_resumes_when_it_appears(monkeypatc
         assert len(paused) == 1 and paused[0].levelno == logging.WARNING
         assert "br:" in paused[0].message and "cargo install beads_rust" in paused[0].message
         assert not any("crash recovery failed" in r.message or "loop tick failed" in r.message for r in caplog.records)
-        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 6  # first eval: all keys
+        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 7  # first eval: all keys
 
         probe.br = True  # operator installs beads → the next re-check passes
         await _settle()
@@ -934,9 +1026,9 @@ def test_status_route_resyncs_the_host_gap_through_the_shared_reporter(monkeypat
     _pin_probes(monkeypatch, which=_which_only("br"), delegates=_delegates("proto"))
     c = _client(monkeypatch, {"repo": str(tmp_path), "coder": "proto"}, gap_reporter=rep)
     assert c.get("/api/plugins/project_board/status").json()["setup"]["gh"]["ok"] is False
-    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 6  # first eval: all keys
+    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 7  # first eval: all keys
     c.get("/api/plugins/project_board/status")
-    assert len(host.calls) == 6  # steady state: no re-send per poll
+    assert len(host.calls) == 7  # steady state: no re-send per poll
     monkeypatch.setattr(setup_check.shutil, "which", _which_all)  # gh installed
     assert c.get("/api/plugins/project_board/status").json()["setup"]["ready"] is True
     assert host.calls[-1] == ("gh", None)
@@ -1045,13 +1137,16 @@ def test_board_page_renders_setup_gaps_from_the_status_block():
     assert "<b>Running loop is stale:</b> " in BOARD_PAGE
     assert "function renderLoopStale(setup)" in BOARD_PAGE
     assert (
-        "else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored)) renderLoopStale(s.setup);"
-        in BOARD_PAGE
+        "else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored || "
+        "s.setup.legacy_store_hint)) renderLoopStale(s.setup);" in BOARD_PAGE
     )
-    # the D3 advisory (#260) rides the same info callout: an inert db_path override
-    # on a multi-project board is a line, never a failing check or a pause
+    # the D3 advisories (#260) ride the same info callout: an inert db_path override
+    # on a multi-project board, and a repo still carrying the pre-D3 per-repo
+    # workspace — lines, never a failing check or a pause
     assert "if (setup && setup.db_override_ignored) html += " in BOARD_PAGE
     assert "<b>db_path override ignored:</b> " in BOARD_PAGE
+    assert "if (setup && setup.legacy_store_hint) html += " in BOARD_PAGE
+    assert "<b>Pre-D3 repo workspace detected:</b> " in BOARD_PAGE
     # a gh-only gap is NOT "can't run" (gh isn't a loop blocker) — softer copy
     assert "function setupBlocking(setup)" in BOARD_PAGE
     assert 'key !== "gh" && setup && setup[key] && setup[key].ok === false' in BOARD_PAGE
