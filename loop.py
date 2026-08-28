@@ -966,12 +966,15 @@ class BoardLoop:
         # RULES + formats around them. Injected verbatim as a `## Repo conventions`
         # block in the coder prompt (no per-card opt-out). Empty by default → no block.
         self.repo_conventions = str(self.cfg.get("repo_conventions", "") or "")
-        # Env hygiene (#78): the host identifies/authenticates THIS agent via env vars
-        # (AGENT_NAME, PROTOAGENT_*, A2A_* — see config.py). None of them belong to the
-        # gate preflight, the pre-PR local_gate_cmd, or the coder we spawn, so they're
-        # stripped from every subprocess environment. ``env_passthrough`` is the escape
-        # hatch: a deployment that legitimately needs a specific var to reach children
-        # whitelists it here (a list, or a comma/space-separated string).
+        # Env hygiene (#78, tightened by F8a): the host identifies/authenticates THIS
+        # agent via env vars (AGENT_NAME, PROTOAGENT_*, A2A_* — see config.py). None of
+        # them belong to the gate preflight, the pre-PR local_gate_cmd, the format_cmd,
+        # or the coder we spawn. The loop's own gate/format/preflight children get the
+        # narrow allowlist baseline only (config.sanitized_env(mode="allowlist") via
+        # _child_env); the coder's ACP session env stays blacklist-stripped.
+        # ``env_passthrough`` is the escape hatch on both tiers: a deployment that
+        # legitimately needs a specific var to reach children whitelists it here (a
+        # list, or a comma/space-separated string).
         self.env_passthrough = config.parse_env_passthrough(self.cfg)
         self._store_kw = dict(
             db=self.cfg.get("db_path") or None,
@@ -1137,9 +1140,12 @@ class BoardLoop:
 
     def _child_env(self) -> dict[str, str]:
         """The sanitized environment for a subprocess the loop spawns directly (gate
-        preflight, ``local_gate_cmd``, ``format_cmd``) — ``os.environ`` minus the host
-        identity/credential block, honoring ``env_passthrough`` (#78)."""
-        return config.sanitized_env(self.env_passthrough)
+        preflight, ``local_gate_cmd``, ``format_cmd``). These children run repo-defined
+        commands over coder-written code, so they get the narrow ALLOWLIST baseline
+        (PATH/HOME/locale/TMPDIR/TERM/SHELL/USER/CI) plus ``env_passthrough`` — not
+        merely ``os.environ`` minus the host block (F8a, tightening #78). The coder's
+        ACP session environment stays on the blacklist tier (see config.py)."""
+        return config.sanitized_env(self.env_passthrough, mode="allowlist")
 
     # ── per-feature project resolution (#90 slice 2) ──────────────────────────────
     def _project_name(self, feature: dict) -> str:
