@@ -1085,7 +1085,10 @@ class BoardLoop:
         it, else DERIVED from the bead's `budget:<kind>:<n>` label — a freshly
         constructed loop resumes the budget where the last process left it. Pass the
         in-hand ``feature`` projection to derive without a store read; a read hiccup
-        derives 0 (fail open: the budget re-counts, it never blocks spuriously)."""
+        derives 0 (fail open: the budget re-counts, it never blocks spuriously). The
+        cache always wins over the projection: a mid-flow ``_budget_reset`` pins 0
+        there precisely so a caller's pre-reset ``feature`` (its labels still carry
+        the old count) can never rehydrate a budget the reset just granted back."""
         cache = self._budget_cache(kind)
         if fid in cache:
             return cache[fid]
@@ -1111,12 +1114,22 @@ class BoardLoop:
             log.warning("[project_board] %s budget %s=%d not persisted", fid, kind, n, exc_info=True)
 
     async def _budget_reset(self, store, fid: str, *kinds: str) -> None:
-        """Reset counters — cache and bead labels together (the merge, tier-climb
-        and gate-passed edges). No ``kinds`` = ALL of them (the terminal edges).
+        """Reset counters — cache and bead labels together. No ``kinds`` = ALL of
+        them: the terminal edges (merge / PR-closed), where the fid leaves the
+        flow, so the cache keys drop outright. Named ``kinds`` are the MID-FLOW
+        edges (a tier climb, a gate pass, a clean review) — there the caller keeps
+        driving with the ``feature`` projection it already holds, whose labels
+        still carry the pre-reset counts, so the cache must PIN 0 (authoritative
+        "freshly reset"), never just forget the fid: a popped key would let the
+        very next ``_budget_get(..., feature)`` rehydrate the exhausted count from
+        that stale snapshot and block the fresh window the reset granted.
         Best-effort on the bead, like ``_budget_set``."""
         names = kinds or tuple(_BUDGET_KINDS)
         for kind in names:
-            self._budget_cache(kind).pop(fid, None)
+            if kinds:
+                self._budget_cache(kind)[fid] = 0
+            else:
+                self._budget_cache(kind).pop(fid, None)
         try:
             await asyncio.to_thread(store.clear_budgets, fid, list(kinds) if kinds else None)
         except Exception:  # noqa: BLE001 — bookkeeping must never break the edge
