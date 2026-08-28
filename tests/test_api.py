@@ -138,8 +138,8 @@ class FakeStore:
         self.calls.append(("update_feature", (fid,), kwargs))
         return {"id": fid, "board_state": "backlog", **kwargs}
 
-    def _comment(self, fid, text):
-        self.calls.append(("_comment", (fid, text), {}))
+    def comment(self, fid, text):
+        self.calls.append(("comment", (fid, text), {}))
 
     def record_merge(self, *, pr_url):
         self.calls.append(("record_merge", (), {"pr_url": pr_url}))
@@ -1352,7 +1352,7 @@ def test_patch_feature_records_audit_comment_naming_changed_fields(monkeypatch):
         "/api/plugins/project_board/features/bd-5",
         json={"spec": "s", "acceptance_criteria": "ac"},
     )
-    comment_calls = [x for x in store.calls if x[0] == "_comment"]
+    comment_calls = [x for x in store.calls if x[0] == "comment"]
     assert len(comment_calls) == 1
     text = comment_calls[0][1][1]
     assert "spec updated:" in text
@@ -2116,10 +2116,10 @@ def test_run_under_an_async_caller_is_never_on_the_main_thread(monkeypatch):
 
 
 def _probe_store_calls(store, record):
-    """Wrap every store method the routes touch (public + the `_comment` audit write)
-    to record which calls ran with a running event loop on their own thread."""
+    """Wrap every store method the routes touch (all public now that `comment` is the
+    audit write) to record which calls ran with a running event loop on their own thread."""
     probe = _running_loop_probe(record)
-    names = [m for m in dir(store) if (m == "_comment" or not m.startswith("_")) and callable(getattr(store, m))]
+    names = [m for m in dir(store) if not m.startswith("_") and callable(getattr(store, m))]
     for name in names:
         orig = getattr(store, name)
 
@@ -2177,5 +2177,5 @@ def test_every_data_and_ingress_route_offloads_its_store_calls(monkeypatch):
     assert all(r.status_code == 200 for r in sweep), [(r.request.url.path, r.status_code) for r in sweep]
     assert store.calls  # the sweep genuinely exercised the store…
     assert on_loop == []  # …and no call saw a running loop on its own thread (#258)
-    # The PATCH audit comment (`_comment`) is a store write too — prove it was swept.
-    assert any(call[0] == "_comment" for call in store.calls)
+    # The PATCH audit comment (`comment`) is a store write too — prove it was swept.
+    assert any(call[0] == "comment" for call in store.calls)

@@ -489,7 +489,7 @@ def _persist_gen_snapshot(fid: str | None, gen: int) -> None:
         if store is None:
             return
         payload = json.dumps(b.snapshot(), default=str)
-        store._comment(fid, _COMMENT_PREFIX + payload)
+        store.comment(fid, _COMMENT_PREFIX + payload)
     except Exception:  # noqa: BLE001 — monitoring must never break a build
         log.debug("[project_board] persisting gen %s snapshot for %s failed", gen, fid, exc_info=True)
 

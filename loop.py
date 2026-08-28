@@ -2244,7 +2244,7 @@ class BoardLoop:
         if n >= self.auto_merge_max:
             try:
                 await asyncio.to_thread(
-                    store._comment,
+                    store.comment,
                     fid,
                     f"auto-merge gave up after {n} attempt(s) — every gate is green but GitHub refused the "
                     f"merge; needs a human: {pr_url}\n{detail}",
@@ -2272,7 +2272,7 @@ class BoardLoop:
             return
         self._draft_noted.add(fid)
         try:
-            store._comment(
+            store.comment(
                 fid,
                 f"auto-merge is holding: the PR is a draft — run `gh pr ready {pr_url}` (or leave it drafted "
                 f"as a hold); the loop never spends a merge attempt on a draft",
@@ -3203,7 +3203,7 @@ class BoardLoop:
             await worktree.remove_worktree(repo, wt, branch or "")
             note += "; worktree reaped"
         try:
-            await asyncio.to_thread(store._comment, fid, note)
+            await asyncio.to_thread(store.comment, fid, note)
         except Exception:  # noqa: BLE001 — the trail is best-effort
             log.debug("[project_board] %s cancel comment failed", fid, exc_info=True)
         self._inflight.pop(fid, None)

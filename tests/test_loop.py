@@ -5531,7 +5531,7 @@ class _MergeStore:
     def get_feature(self, fid):
         return dict(self.feature)
 
-    def _comment(self, fid, text):
+    def comment(self, fid, text):
         self.comments.append((fid, text))
 
 
@@ -5662,7 +5662,7 @@ async def test_auto_merge_holds_on_a_draft_as_a_named_blocker_without_spending_a
 
 async def test_draft_hold_comment_is_once_per_hold_and_survives_a_comment_failure(monkeypatch):
     """Drafted → noted once; un-drafted (still held on something else) → mark cleared;
-    drafted again → noted once more. A failing _comment never breaks the reconcile."""
+    drafted again → noted once more. A failing comment never breaks the reconcile."""
     _merge_env(monkeypatch, mss="CLEAN", draft=True)
     loop = BoardLoop({"auto_merge": True, "review_gate": True})
     store = _MergeStore(_reviewed())
@@ -5679,7 +5679,7 @@ async def test_draft_hold_comment_is_once_per_hold_and_survives_a_comment_failur
     def _boom(fid, text):
         raise RuntimeError("br down")
 
-    store._comment = _boom
+    store.comment = _boom
     loop._draft_noted.clear()
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
 
@@ -5891,7 +5891,7 @@ async def test_spawn_ready_does_not_collide_same_filename_across_projects(monkey
 class _CancellableStore(FakeLoopStore):
     """A loop store whose card can be cancelled mid-drive: ``cancelled`` flips the
     state ``get_feature`` reports (what the real store reads back from br after the
-    operator's cancel verb), and ``_comment`` records the trail."""
+    operator's cancel verb), and ``comment`` records the trail."""
 
     def __init__(self):
         super().__init__()
@@ -5901,7 +5901,7 @@ class _CancellableStore(FakeLoopStore):
     def get_feature(self, fid):
         return {"id": fid, "board_state": "cancelled" if self.cancelled else "in_progress"}
 
-    def _comment(self, fid, text):
+    def comment(self, fid, text):
         self.comments.append((fid, text))
 
 

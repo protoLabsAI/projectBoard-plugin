@@ -622,7 +622,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         updated = await _guard(lambda: s.update_feature(fid, **kwargs))
         if changed:
-            await asyncio.to_thread(s._comment, fid, f"spec updated: {', '.join(changed)}")
+            await asyncio.to_thread(s.comment, fid, f"spec updated: {', '.join(changed)}")
 
         return updated
 
