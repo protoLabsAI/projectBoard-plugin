@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -3056,18 +3057,26 @@ def test_run_keeps_no_shared_has_more_state(monkeypatch):
 
 
 def test_run_has_more_is_race_free_across_concurrent_callers(monkeypatch):
-    """Two threads inside `_run` at once — one query truncated, one not, both held at a
-    barrier so their subprocess calls genuinely interleave. Each caller must read exactly
-    its own has_more off its own return value (the old shared stash lost this race)."""
+    """Two threads inside `_run` at once — one query truncated, one not — held at a
+    barrier AFTER the subprocess call (which is single-flight per process since #290,
+    so the overlap has to happen downstream of it) so their parse/return paths
+    genuinely interleave. Each caller must read exactly its own has_more off its own
+    return value (the old shared stash lost this race)."""
     b = _board(monkeypatch, db="/x/.beads/beads.db")
     barrier = threading.Barrier(2, timeout=5)
 
     def fake_run(cmd, **_k):
         stdout = '{"issues": [], "has_more": true}' if "list" in cmd else "[]"
-        barrier.wait()  # both callers reach the subprocess seam before either returns
         return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
+    real_envelope = store._issues_envelope
+
+    def interleaved_envelope(parsed):
+        barrier.wait()  # both callers are past the br lock, inside their own parse/return
+        return real_envelope(parsed)
+
     monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store, "_issues_envelope", interleaved_envelope)
     with ThreadPoolExecutor(max_workers=2) as pool:
         truncated = pool.submit(b._run, "list", want_json=True, with_has_more=True)
         clean = pool.submit(b._run, "ready", want_json=True, with_has_more=True)
@@ -3646,3 +3655,87 @@ def test_plain_mode_not_found_is_detected_on_stderr(monkeypatch):
     )
     with pytest.raises(store.BoardNotFound):
         b._run("show", "bd-9")
+
+
+# ── `br` is single-flight per process, and a stdout DATABASE_ERROR is retried whatever the exit (#290) ──
+
+
+def _wal_short_read(rc: int = 1):
+    """What `br show --json` returns when its read races another br's WAL checkpoint:
+    a NON-zero exit, an EMPTY stderr, and the DATABASE_ERROR object on stdout."""
+    body = {
+        "error": {
+            "code": "DATABASE_ERROR",
+            "message": "Database error: WAL file is corrupt: short read at frame 18: got 0, need 4120",
+            "retryable": True,
+        }
+    }
+    return types.SimpleNamespace(returncode=rc, stdout=json.dumps(body), stderr="")
+
+
+def test_stdout_database_error_with_nonzero_exit_is_retried(monkeypatch, caplog):
+    """RED-IS-REACHABLE: before #290 the contention sniff only read stdout on a ZERO
+    exit, so this shape raised on the first attempt — a 400 on /features, a failed
+    tick — instead of taking the backoff that exists for exactly it."""
+    monkeypatch.setattr(store.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    b = BeadsBoard(db="/db/.beads/b.db", repo="/repo")
+    b._workspace_ready = True
+    calls = {"n": 0}
+
+    def _run(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _wal_short_read()
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    with caplog.at_level("WARNING"):
+        assert b._run("show", "bd-1", want_json=True) == []
+    assert calls["n"] == 2
+    assert any("hit DB contention" in r.message for r in caplog.records)
+
+
+def test_br_invocations_are_single_flight_per_process(monkeypatch):
+    """Four threads shelling `br` at once must never overlap inside subprocess.run —
+    two br processes racing the WAL is the failure the lock removes."""
+    import threading
+
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    b = BeadsBoard(db="/db/.beads/b.db", repo="/repo")
+    b._workspace_ready = True
+    state = {"inflight": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def _run(*_a, **_k):
+        with guard:
+            state["inflight"] += 1
+            state["peak"] = max(state["peak"], state["inflight"])
+        time.sleep(0.02)
+        with guard:
+            state["inflight"] -= 1
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(store.subprocess, "run", _run)
+    threads = [threading.Thread(target=lambda: b._run("list", want_json=True)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert state["peak"] == 1
+
+
+def test_br_lock_is_shared_across_module_instances():
+    """A plugin reload re-imports the module: the running loop and the reloaded
+    routers must serialize on the SAME lock, or the race is back (#178 pattern)."""
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("project_board.store_reloaded", store.__file__)
+    other = importlib.util.module_from_spec(spec)
+    sys.modules["project_board.store_reloaded"] = other
+    try:
+        spec.loader.exec_module(other)
+        assert other._br_lock() is store._br_lock()
+    finally:
+        sys.modules.pop("project_board.store_reloaded", None)
