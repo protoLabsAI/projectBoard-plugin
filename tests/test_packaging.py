@@ -127,6 +127,17 @@ def test_onboard_skill_gates_registration_on_onboarding():
     assert "REGISTRATION REFUSED" in flat
 
 
+def test_onboard_skill_registers_with_the_auto_sentinel_never_a_gate_command():
+    """The register tool takes no gate command text (hardening) — the skill must
+    instruct the literal `gate="auto"` and may name `project_board.local_gate_cmd`
+    only as OPERATOR config, never as something the agent passes."""
+    text = (ROOT / "skills" / "onboard-project" / "SKILL.md").read_text()
+    flat = " ".join(text.split())
+    assert 'gate="auto"' in flat
+    # No tool-call argument carrying a gate command — the old call shape is gone.
+    assert "local_gate_cmd=" not in flat
+
+
 # ── the release workflow: a thin caller of the reusable plugin-release ────────────
 
 
@@ -215,6 +226,36 @@ def test_register_wires_routers_surface_and_tools():
     # The four headless board tools the agent (or A2A) can drive.
     names = {getattr(t, "name", "") for t in reg.tools}
     assert {"board_create_epic", "board_create_feature", "board_mark_ready", "board_list"} <= names
+
+
+def test_no_agent_tool_exposes_an_executable_shaped_parameter():
+    """Hardening contract: values persisted into gate config are later run by the
+    loop's shell seam, so command text must only ever enter through the operator's
+    bearer-gated surface (PUT /projects/{name} / YAML) — never through an agent tool.
+    Sweep EVERY agent tool schema (the board tools plus the register tool, which is
+    also asserted standalone in case its wiring moves) for parameter names shaped
+    like an executable. The register tool's `gate` accepts only the literal "auto"
+    discovery sentinel, which carries no command text."""
+    import project_board
+    from project_board.project_registry import build_register_tool
+
+    def executable_shaped(param: str) -> bool:
+        p = param.lower()
+        return p in {"command", "args", "cmd", "executable"} or p.endswith("_cmd")
+
+    tools = list(project_board._board_tools({}))
+    register_tool = build_register_tool({})
+    assert register_tool is not None  # langchain is a test dependency — the guard must cover it
+    tools.append(register_tool)
+    assert {t.name for t in tools} >= {"board_register_project", "board_create_feature"}  # the sweep swept
+    for t in tools:
+        for param in t.args:
+            assert not executable_shaped(param), (
+                f"{t.name}({param}): executable-shaped agent tool input — route it "
+                "through the operator config surface instead"
+            )
+    register = next(t for t in tools if t.name == "board_register_project")
+    assert "local_gate_cmd" not in register.args
 
 
 def test_register_wires_the_loop_reload_hook():

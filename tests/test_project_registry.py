@@ -240,6 +240,84 @@ async def test_register_does_not_claim_success_when_persistence_changes_a_siblin
     assert "project entries changed during persistence: alpha" in result
 
 
+# ── the agent tool surface: no executable-shaped input (hardening) ─────────────
+def test_agent_tool_schema_carries_no_gate_command_parameter():
+    """The persisted gate is executed at dispatch time, so the agent tool must not
+    expose a parameter that carries command text — that write path is operator-only
+    (PUT /projects/{name}). The tool's `gate` takes the discovery sentinel instead."""
+    tool = build_register_tool({})
+    assert tool is not None
+    assert "local_gate_cmd" not in tool.args
+    assert set(tool.args) == {"name", "repo", "base_branch", "gate", "repo_conventions"}
+
+
+async def test_register_with_gate_auto_persists_the_discovery_sentinel(monkeypatch, tmp_path):
+    """`gate="auto"` is the one gate value the agent may set: the loop resolves it
+    against the repo's OWN declared target, so no agent-supplied text is executed."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "beta")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    tool = build_register_tool({})
+    result = await tool.ainvoke({"name": "beta", "repo": str(repo), "gate": "auto"})
+
+    assert not result.startswith("Error:")
+    assert cfg.plugin_config["project_board"]["projects"]["beta"]["local_gate_cmd"] == "auto"
+    assert "an auto-discovered gate" in result
+
+
+async def test_register_refuses_any_gate_value_other_than_the_sentinel(monkeypatch, tmp_path):
+    """Anything but ""/"auto" is refused BEFORE config apply, naming the bound."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "beta")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+    applied = []
+    _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
+
+    tool = build_register_tool({})
+    result = await tool.ainvoke({"name": "beta", "repo": str(repo), "gate": "not-the-sentinel"})
+
+    assert result.startswith("Error:")
+    assert 'only the literal "auto"' in result and "operator configuration" in result
+    assert applied == []
+
+
+async def test_agent_reregister_with_blank_gate_preserves_the_operator_set_one(monkeypatch, tmp_path):
+    """An agent re-register must not clear (or need to restate) the gate the operator
+    configured through the bearer-gated editor."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {"alpha": {"repo": str(repo), "local_gate_cmd": "make gate"}}}},
+    )
+
+    def apply_settings(patch):
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    _wire_host(monkeypatch, cfg, apply_settings)
+    tool = build_register_tool({})
+    result = await tool.ainvoke({"name": "alpha", "repo": str(repo)})
+
+    assert not result.startswith("Error:")
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "make gate"
+
+
 async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monkeypatch, tmp_path):
     root = tmp_path / "dev"
     repo = _git_repo(root / "alpha")
