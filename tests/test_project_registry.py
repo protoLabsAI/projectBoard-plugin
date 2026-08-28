@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import subprocess
 import sys
 import types
@@ -747,3 +749,39 @@ async def test_a_gate_smoke_timeout_is_indeterminate_and_persists(monkeypatch, t
 
     assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "sleep 5; exit 1"
     assert "timed out" in caplog.text
+
+
+async def test_a_smoke_timeout_kills_the_whole_gate_tree_not_just_the_shell(monkeypatch, tmp_path, caplog):
+    """The smoked shell's descendants inherit its stdout pipe, so killing only the
+    shell on timeout leaves them running with the pipe open — and the PUT blocked
+    until they exit on their own. The group kill takes the descendant down with the
+    shell: registration answers promptly and leaks no orphaned gate processes."""
+    import project_registry as registry
+
+    monkeypatch.setattr(registry, "_SMOKE_TIMEOUT_S", 1.0)
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+    pid_file = tmp_path / "descendant.pid"
+    # A background subshell — a DESCENDANT of the smoked shell — records its pid,
+    # then outlives the smoke timeout while holding the inherited stdout pipe open.
+    cmd = f"sh -c 'echo $$ > \"{pid_file}\"; exec sleep 120' & sleep 120"
+
+    with caplog.at_level(logging.WARNING, logger=_LOG):
+        await upsert_project("alpha", str(repo), local_gate_cmd=cmd)
+
+    assert "timed out" in caplog.text  # still the indeterminate-verdict posture
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == cmd
+    assert pid_file.exists(), "the descendant never started — the smoke did not run the gate"
+    pid = int(pid_file.read_text())
+    for _ in range(50):  # SIGKILL lands immediately; init just needs a moment to reap
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)  # do not leak a two-minute sleeper into the run
+        pytest.fail("the gate's descendant survived the smoke timeout — only the shell was killed")

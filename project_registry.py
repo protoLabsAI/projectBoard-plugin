@@ -41,7 +41,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import re
+import signal
 import subprocess
 import sys
 import types
@@ -253,6 +255,10 @@ def _validate_base_branch(branch: str) -> str:
 #: cfg to read them from.
 _SMOKE_TIMEOUT_S = 600.0
 _SMOKE_OUTPUT_CHARS = 4000
+#: Bound on reaping a killed smoke. The group kill below takes the whole gate tree
+#: down, but a descendant that re-``setsid``s escapes the group and can keep our
+#: stdout pipe open — the PUT must answer anyway, not wait for it.
+_SMOKE_REAP_TIMEOUT_S = 5.0
 
 
 async def _base_checkout_dirt(repo: str, base: str) -> str:
@@ -268,6 +274,25 @@ async def _base_checkout_dirt(repo: str, base: str) -> str:
         return await worktree.base_checkout_dirt(repo, base)
     except Exception:  # noqa: BLE001 — no dirt information → keep the strict verdict
         return ""
+
+
+def _kill_gate_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the smoked gate's whole process group, not just the shell.
+
+    The smoke launches the shell with ``start_new_session=True`` so it leads its own
+    group (pgid == its pid). Killing only the shell leaves descendants alive holding
+    the inherited stdout pipe — and project registration blocked until they exit on
+    their own. The group kill takes the tree down together; the fallback covers a
+    group that is already gone (or a platform without ``killpg``)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *, force: bool = False) -> None:
@@ -294,15 +319,25 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             cwd=repo,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Own process group, so a timeout can kill the whole gate tree — not just
+            # the shell while its descendants keep our stdout pipe (and the PUT) open.
+            start_new_session=True,
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=_SMOKE_TIMEOUT_S)
         except asyncio.TimeoutError:
+            _kill_gate_tree(proc)
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()  # reap the killed child before answering the PUT
+                # Reap the killed shell before answering the PUT — bounded, so a
+                # descendant that escaped the group kill cannot block registration.
+                await asyncio.wait_for(proc.wait(), timeout=_SMOKE_REAP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[project_board] register[%s]: killed gate smoke did not reap within %ss — "
+                    "abandoning it rather than blocking registration",
+                    name,
+                    _SMOKE_REAP_TIMEOUT_S,
+                )
             log.warning(
                 "[project_board] register[%s]: gate smoke timed out (%ss) — indeterminate, persisting "
                 "(the loop's preflight still gates dispatch)",
