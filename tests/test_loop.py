@@ -27,6 +27,7 @@ from project_board.loop import (
     _ci_failure_reason,
     _inject_source_issue_line,
     _issue_closed_by_board_sibling,
+    _no_test_marker,
     _pr_body,
     _resolve_gate_cmd,
     _source_issue,
@@ -1735,9 +1736,9 @@ async def test_verify_goal_requires_a_test_deterministically(monkeypatch):
     monkeypatch.setattr(worktree, "_git", _git_listing("inbox/store.py\ntests/test_inbox.py"))
     assert await loop._verify_goal(FEATURE, "/wt", "main") is None
 
-    # code changed, no test, but the coder declared NO_TEST_NEEDED → pass (escape hatch)
+    # code changed, no test, but the coder declared NO_TEST_NEEDED in its summary → pass
     monkeypatch.setattr(worktree, "_git", _git_listing("inbox/store.py"))
-    reply = "Pure rename refactor.\nNO_TEST_NEEDED: behavior unchanged, covered by existing tests"
+    reply = "## Summary\n\nPure rename refactor.\nNO_TEST_NEEDED: behavior unchanged, covered by existing tests"
     assert await loop._verify_goal(FEATURE, "/wt", "main", reply) is None
     # ...but without the declaration, the same change is still a gap
     assert await loop._verify_goal(FEATURE, "/wt", "main", "I changed inbox/store.py") is not None
@@ -1749,6 +1750,63 @@ async def test_verify_goal_requires_a_test_deterministically(monkeypatch):
     # empty diff → None (open_pr's NoChangesError job, not the gate's)
     monkeypatch.setattr(worktree, "_git", _git_listing(""))
     assert await loop._verify_goal(FEATURE, "/wt", "main") is None
+
+
+async def test_verify_goal_no_test_marker_is_structural_and_summary_scoped(monkeypatch):
+    """The NO_TEST_NEEDED escape hatch (#264) is not a substring scan: only a
+    line-start `NO_TEST_NEEDED: <reason>` inside the LAST ## Summary section counts.
+    Mentioning the marker mid-narration, placing it before the summary, or omitting
+    the reason leaves the gap in place."""
+    loop = BoardLoop({"goal_verify": True})
+
+    async def _git(wt, *args, timeout=60):
+        return (0, "inbox/store.py" if "--name-only" in args else "", "")
+
+    monkeypatch.setattr(worktree, "_git", _git)
+
+    async def gap(reply):
+        return await loop._verify_goal(FEATURE, "/wt", "main", reply)
+
+    # mid-narration mention, no summary section at all → still a gap
+    assert await gap("If a test doesn't apply I could write NO_TEST_NEEDED: skip it.") is not None
+    # marker BEFORE the summary section → still a gap (summary-scoped)
+    assert await gap("NO_TEST_NEEDED: config only\n## Summary\n\nTweaked a default.") is not None
+    # mid-sentence inside the summary → still a gap (line start required)
+    assert await gap("## Summary\n\nI decided NO_TEST_NEEDED: because it is a refactor.") is not None
+    # bare marker with no reason → still a gap (the reason is the evidence)
+    assert await gap("## Summary\n\nRenamed a variable.\nNO_TEST_NEEDED:") is not None
+    # marker under an EARLIER summary only → still a gap (last-occurrence, the _pr_body rule)
+    assert (
+        await gap("## Summary\n\ndraft\nNO_TEST_NEEDED: draft reason\n## Summary\n\nFinal: renamed a variable.")
+        is not None
+    )
+    # marker in a section AFTER the final summary → still a gap (the summary ends
+    # at the next heading — a later section is not the summary)
+    assert await gap("## Summary\n\nRenamed a variable.\n## Notes\n\nNO_TEST_NEEDED: covered elsewhere") is not None
+    # ...including a LEVEL-ONE heading — any heading level ends the summary
+    assert await gap("## Summary\n\nRenamed a variable.\n# Appendix\n\nNO_TEST_NEEDED: covered elsewhere") is not None
+    # ...and the gap tells the coder where the marker belongs
+    assert "## Summary" in (await gap("no marker") or "")
+
+    # a well-formed line in the (last) summary → pass, indentation tolerated
+    assert await gap("narration\n## Summary\n\nPure rename.\n  NO_TEST_NEEDED: existing tests cover it\n") is None
+
+
+def test_no_test_marker_last_summary_and_reason_extraction():
+    """_no_test_marker keeps the LAST ## Summary and returns the declared reason."""
+    reply = (
+        "## Summary\n\ndraft\nNO_TEST_NEEDED: stale draft reason\n"
+        "## Requirements\n- r1: done\n"
+        "## Summary\n\nFinal.\nNO_TEST_NEEDED: pure refactor, no behavior change\n"
+    )
+    assert _no_test_marker(reply) == "pure refactor, no behavior change"
+    assert _no_test_marker("NO_TEST_NEEDED: no summary section") is None
+    assert _no_test_marker("") is None
+    # the summary ends at the next heading of ANY level — a marker in a later
+    # section is prose, whether that section is #, ## or ### deep
+    assert _no_test_marker("## Summary\n\nFinal.\n## Appendix\nNO_TEST_NEEDED: outside the summary") is None
+    assert _no_test_marker("## Summary\n\nFinal.\n# Appendix\nNO_TEST_NEEDED: under a level-one heading") is None
+    assert _no_test_marker("## Summary\n\nFinal.\n### Details\nNO_TEST_NEEDED: in a subsection") is None
 
 
 async def test_verify_goal_fails_open_when_no_criteria(monkeypatch):
