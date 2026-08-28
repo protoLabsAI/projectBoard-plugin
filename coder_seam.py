@@ -982,9 +982,10 @@ class _WorktreeSolveAdapter:
         self.test_timeout = test_timeout
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         # The gate's env_passthrough whitelist (#86), threaded from the loop so the
-        # acceptance-test (verify) subprocess strips the SAME host identity/credential
-        # block the gate/preflight/format subprocesses already do — the host's
-        # PROTOAGENT_*/A2A_*/AGENT_NAME must never leak into a candidate's tests.
+        # acceptance-test (verify) subprocess sees the SAME allowlist environment the
+        # gate/preflight/format subprocesses do (F8a/F8b) — the host's
+        # PROTOAGENT_*/A2A_*/AGENT_NAME must never leak into a candidate's tests, and
+        # nothing outside the baseline reaches them unless a deployment names it here.
         self.env_passthrough = tuple(env_passthrough)
         self.fusion_delegate = fusion_delegate  # a resolved `openai`-type Delegate, or None
         self.files_to_modify = files_to_modify or []
@@ -1242,11 +1243,13 @@ class _WorktreeSolveAdapter:
             proc = await asyncio.create_subprocess_shell(
                 self.test_cmd,
                 cwd=candidate_wt,
-                # #86: strip the host identity/credential block from the acceptance-test
-                # env — with NO env= the child inherits os.environ verbatim (the host's
+                # #86: with NO env= the child inherits os.environ verbatim (the host's
                 # PROTOAGENT_*/A2A_*/AGENT_NAME), which burned 15 solve gens on an
-                # unwinnable test. `sanitized_env` mirrors the loop's own gate spawns.
-                env=config.sanitized_env(self.env_passthrough),
+                # unwinnable test. F8b: this child runs a repo-defined command over
+                # coder-written code — exactly the posture of the loop's own gate/
+                # format/preflight children (F8a) — so it gets the narrow allowlist
+                # baseline plus ``env_passthrough``, not os.environ minus the host block.
+                env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

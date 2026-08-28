@@ -354,6 +354,32 @@ that times out is treated as indeterminate → allowed (a slow gate must never w
 board). This is the fail-**closed** complement to the per-PR gate's fail-**open**: a
 flaky gate never blocks good work, but an *unrunnable* gate never starts bad work.
 
+### Environment — what gate, format, and verify children see
+
+Every subprocess the loop spawns to run repo-defined commands over coder-written
+code — the gate preflight, the pre-PR `local_gate_cmd`, the auto-fix `format_cmd`,
+and the `coder.solve()` acceptance-test (verify) run — receives a **narrow
+allowlist** environment, not the host's. The child sees only the baseline a
+build/test toolchain needs — `PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `TERM`,
+`SHELL`, `USER`, `CI`, plus the Windows system mirror of the same (`SYSTEMROOT`
+above all) — and nothing else. In particular the host agent's
+identity/credential block (`AGENT_NAME`, `PROTOAGENT_*`, `A2A_*`) never reaches
+these children.
+
+A deployment whose gate or tests genuinely need another variable names it in the
+`env_passthrough` list — the single escape hatch through the allowlist (a list or
+a comma-separated string):
+
+```yaml
+project_board:
+  env_passthrough: [DATABASE_URL, NODE_OPTIONS]
+```
+
+The coder's own ACP session environment is host-managed and stays on the looser
+**blacklist** tier — it keeps everything except the host identity/credential
+block, with the same `env_passthrough` override; tightening that path is tracked
+separately.
+
 ### Setup preflight — can the board run at all? (v0.42.0)
 
 Distinct from the gate preflight above (which asks "can the *repo's tests* run"), the
