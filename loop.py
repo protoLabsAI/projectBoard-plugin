@@ -374,7 +374,8 @@ def _pr_body(result: str, feature: dict) -> str:
 
 # The NO_TEST_NEEDED escape hatch (#264) — structural evidence, not a substring
 # scan: the marker only counts when it stands at line start inside the FINAL
-# ``## Summary`` section (the ``_pr_body`` last-occurrence discipline). A mention
+# ``## Summary`` section (the ``_pr_body`` last-occurrence discipline), which ends
+# at the next heading (the ``_parse_requirements_reply`` discipline). A mention
 # mid-narration, or one outside the summary, is prose — not a declaration — and
 # the reason is mandatory: a bare marker carries no evidence.
 _NO_TEST_MARKER_RE = re.compile(r"^NO_TEST_NEEDED\s*:\s*(?P<reason>\S.*)$")
@@ -383,12 +384,16 @@ _NO_TEST_MARKER_RE = re.compile(r"^NO_TEST_NEEDED\s*:\s*(?P<reason>\S.*)$")
 def _no_test_marker(reply: str) -> str | None:
     """The coder's ``NO_TEST_NEEDED: <reason>`` declaration, or ``None``. Keeps the
     LAST ``## Summary`` heading (a mid-narration mention must not shadow the real
-    section) and accepts only a line-start ``NO_TEST_NEEDED: <reason>`` row inside
-    it — anything else is narration, and narration is not a declaration."""
+    section), reads until the next heading — a marker in a LATER section is outside
+    the summary and must not count — and accepts only a line-start
+    ``NO_TEST_NEEDED: <reason>`` row inside it — anything else is narration, and
+    narration is not a declaration."""
     headings = list(_SUMMARY_HEADING_RE.finditer(reply or ""))
     if not headings:
         return None
     for line in reply[headings[-1].end() :].splitlines():
+        if line.strip().startswith("##"):
+            break  # the next section — the summary block ended
         m = _NO_TEST_MARKER_RE.match(line.strip())
         if m:
             return m.group("reason").strip()
