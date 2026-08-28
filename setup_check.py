@@ -29,6 +29,15 @@ to tick without (``br``, ``coder``, ``repo``): each of those turns every tick in
 traceback, while a missing ``gh`` only fails the PR edge of a build — reported, not
 paused on.
 
+One ADVISORY beyond the checks (D3, #260): a multi-entry ``projects:`` map combined
+with an EXPLICITLY blank ``db_path`` — the pre-D3 per-repo-discovery override. Since
+D3 that blank is INERT: ``projects.store_db_path`` (and ``get_store`` itself) resolve
+it to the same single instance-default store as an absent key, so the board runs
+correctly on ONE shared db and nothing fragments. The finding is the stale override
+itself — the operator wrote a knob that no longer does anything — so it is surfaced
+through the same gap seam under its own ``db`` key (``MULTI_PROJECT_DB_HINT``) and as
+an info callout on the board page, but it fails no check and never pauses the loop.
+
 Everything the checks touch is injectable (``which``, ``delegates``, ``run``) so the
 suite exercises every pass/fail branch without a host, a PATH, or a subprocess.
 """
@@ -44,7 +53,7 @@ import types
 
 from . import br_fetch
 from . import store as store_mod
-from .projects import resolve_projects
+from .projects import blank_db_override, multi_project, resolve_projects
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -54,10 +63,13 @@ log = logging.getLogger("protoagent.plugins.project_board")
 SETUP_KEYS: tuple[str, ...] = ("br", "gh", "coder", "repo")
 # The checks the puller will not tick without (see module docstring).
 LOOP_BLOCKING_KEYS: tuple[str, ...] = ("br", "coder", "repo")
-# One extra host-gap key: the running loop's config snapshot lagging the live config
-# on a restart-only knob (see ``loop_cfg_stale`` below).
+# Two extra host-gap keys beyond the checks: the running loop's config snapshot
+# lagging the live config on a restart-only knob (see ``loop_cfg_stale`` below), and
+# the inert multi-project blank-``db_path`` override (see ``db_override_ignored``) —
+# both advisories: reported through the seam, never a failing check, never a pause.
 LOOP_STALE_KEY = "loop"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY,)
+DB_OVERRIDE_KEY = "db"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -88,6 +100,13 @@ REPO_UNBOUND_HINT = (
     "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
     "this agent manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board "
     "is paused until then"
+)
+MULTI_PROJECT_DB_HINT = (
+    "projects: declares multiple repos and db_path is explicitly blank — that pre-D3 "
+    "per-repo-discovery override is now ignored: a blank db_path resolves to the one instance "
+    "store (same as leaving the key out), so every project shares one board and nothing "
+    "fragments. The board keeps running; remove the stale db_path override, or set db_path to "
+    "a single shared file in Settings ▸ Project Board"
 )
 
 _BR_VERSION_TIMEOUT_S = 3.0
@@ -239,6 +258,10 @@ def _repo_check(cfg: dict, isdir) -> dict:
             return {"ok": True, "path": default_repo, "hint": ""}
         return {"ok": False, "path": default_repo, "hint": REPO_UNBOUND_HINT}
     explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    # NB: a multi-entry projects: map with an explicitly blank db_path is NOT a repo
+    # failure — since D3 (#260) the blank resolves to the instance store, so the board
+    # runs correctly on one shared db. The stale override is the `db` ADVISORY in
+    # setup_status, not a pause.
     for name, entry in projects.items():
         path = str((entry or {}).get("repo") or "").strip()
         if not path or not isdir(path):
@@ -268,6 +291,8 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
           "loop_cfg_stale": bool,      # the RUNNING loop is on an older restart-only knob
           "loop_cfg_stale_keys": [k…], # which ones (coders/repo/base_branch/db_path/projects)
           "loop_cfg_stale_hint": str,  # operator copy, "" when not stale
+          "db_override_ignored": bool, # multi-entry projects: + explicit db_path: "" (inert, D3 #260)
+          "db_override_hint": str,     # operator copy, "" when the advisory is quiet
           "ready": bool,               # every check ok
         }
 
@@ -383,6 +408,14 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
         drifted = [k for k in stale_keys if k in _STALE_KEYS_PER_CHECK[key]]
         if drifted and not status[key]["ok"]:
             status[key]["hint"] = f"{status[key]['hint']} ({RESTART_NOTE}: {', '.join(drifted)})"
+    # The D3 advisory (#260): a multi-entry projects: map next to an EXPLICITLY blank
+    # db_path (the pre-D3 per-repo-discovery escape hatch). The override is inert —
+    # store_db_path resolves blank to the same instance default as an absent key, so
+    # the board runs correctly on ONE shared store — which is exactly why this is a
+    # warning (a knob that silently does nothing), not a failing check or a pause.
+    ignored = multi_project(cfg) and blank_db_override(cfg)
+    status["db_override_ignored"] = ignored
+    status["db_override_hint"] = MULTI_PROJECT_DB_HINT if ignored else ""
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -480,6 +513,8 @@ class GapReporter:
         for key in REPORT_KEYS:
             if key == LOOP_STALE_KEY:
                 msg = str((status or {}).get("loop_cfg_stale_hint") or "") or None
+            elif key == DB_OVERRIDE_KEY:
+                msg = str((status or {}).get("db_override_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")

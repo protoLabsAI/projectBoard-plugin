@@ -125,10 +125,13 @@ def register(registry) -> None:
         # and lazily resolved (get_store memoizes) so registration stays cheap.
         from .projects import default_project as _resolve_default_project
         from .projects import resolve_projects as _resolve_projects
+        from .projects import store_db_path as _store_db_path
         from .store import get_store
 
         _persist_store_kw = dict(
-            db=cfg.get("db_path") or None,
+            # D3 (#260): the db is resolved at the config seam — a blank db_path rides
+            # the ONE instance-default store, an explicit path stays the operator pin.
+            db=_store_db_path(cfg),
             repo=cfg.get("repo", "."),
             base_branch=cfg.get("base_branch", "main"),
             max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
@@ -370,7 +373,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
-    from .projects import resolve_projects
+    from .projects import resolve_projects, store_db_path
     from .store import BoardError, annotate_next_action, get_store
 
     # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
@@ -381,7 +384,11 @@ def _board_tools(cfg: dict):
     default_proj = resolve_default_project(cfg)
 
     store_kw = dict(
-        db=cfg.get("db_path") or None,
+        # D3 (#260): the db is resolved at the config seam — an unset/blank db_path
+        # rides the ONE instance-default store (store.default_db_path), an explicit
+        # path stays the operator pin. Every per-project store below (`_store_kw_for`)
+        # shares this db while keying its own repo/base_branch.
+        db=store_db_path(cfg),
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),
         max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
@@ -395,8 +402,9 @@ def _board_tools(cfg: dict):
         that project's checkout, not the instance default. An empty or unknown name falls
         back to the base (default-project) repo; the shared `projects`/`default_project`
         ride along unchanged so the resolved store keeps the same per-feature resolution
-        the loop uses. With a shared `db_path` every project store talks to the ONE board
-        DB while carrying its own repo for the Ready gate's path validation."""
+        the loop uses. Every project store shares the one resolved db (the instance
+        default, or the operator's explicit db_path pin — D3, #260) while carrying its
+        own repo for the Ready gate's path validation."""
         name = str(project or "").strip() or default_proj
         entry = projects.get(name) or {}
         kw = dict(store_kw)
