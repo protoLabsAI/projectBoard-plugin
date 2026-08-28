@@ -1204,3 +1204,51 @@ async def test_kill_on_cancel_tolerates_an_already_exited_child(monkeypatch):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):  # the cancel still propagates; no ProcessLookupError leak
         await task
+
+
+# ── base_checkout_dirt: is the main checkout a fair stand-in for base? (#256) ──────
+
+
+async def test_base_checkout_dirt_is_empty_for_a_clean_checkout_on_base(monkeypatch):
+    git = FakeGit({"status": (0, "", ""), "rev-parse": (0, "main\n", "")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert await worktree.base_checkout_dirt("/repo", "main") == ""
+
+
+async def test_base_checkout_dirt_reports_uncommitted_tracked_changes(monkeypatch):
+    git = FakeGit({"status": (0, " M store.py\n M loop.py\n", ""), "rev-parse": (0, "main\n", "")})
+    monkeypatch.setattr(worktree, "_git", git)
+    dirt = await worktree.base_checkout_dirt("/repo", "main")
+    assert "store.py" in dirt and "loop.py" in dirt
+
+
+async def test_base_checkout_dirt_reports_a_head_that_is_not_on_base(monkeypatch):
+    git = FakeGit({"status": (0, "", ""), "rev-parse": (0, "fix/some-branch\n", "")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert "fix/some-branch" in await worktree.base_checkout_dirt("/repo", "main")
+
+
+async def test_base_checkout_dirt_ignores_untracked_files(monkeypatch):
+    """Build output and scratch dirs live in every working checkout and don't change
+    what the gate compiles — treating them as dirt would make the downgrade fire
+    constantly and quietly turn the preflight into a no-op."""
+    git = FakeGit({"status": (0, "", ""), "rev-parse": (0, "main\n", "")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert await worktree.base_checkout_dirt("/repo", "main") == ""
+    # the untracked-files=no flag is what buys that, so pin it
+    assert any("--untracked-files=no" in a for a in git.ran("status")[0])
+
+
+async def test_base_checkout_dirt_returns_empty_when_git_fails(monkeypatch):
+    """Unknown is NOT dirt: this check may only ever downgrade a verdict to
+    indeterminate, so a broken git must not silently disable fail-closed."""
+    git = FakeGit({"status": (128, "", "not a git repository")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert await worktree.base_checkout_dirt("/repo", "main") == ""
+
+
+async def test_base_checkout_dirt_skips_the_branch_check_without_a_base(monkeypatch):
+    git = FakeGit({"status": (0, "", ""), "rev-parse": (0, "whatever\n", "")})
+    monkeypatch.setattr(worktree, "_git", git)
+    assert await worktree.base_checkout_dirt("/repo", "") == ""
+    assert git.ran("rev-parse") == []

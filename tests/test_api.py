@@ -1667,3 +1667,50 @@ def test_cancel_route_without_a_pr_does_not_touch_gh(monkeypatch):
     store = FakeStore()  # get_feature → no pr_url
     c = _client(monkeypatch, store)
     assert c.post("/api/plugins/project_board/features/bd-7/cancel").json()["cancel"]["pr_closed"] is False
+
+
+# ── /status explains an idle board (#256) ─────────────────────────────────────────
+
+
+def test_status_reports_the_projects_a_failed_preflight_is_holding(monkeypatch):
+    """A board can be fully `ready` and still pick up nothing: one project's gate
+    preflight fail-closed, its ready cards got held, and held cards drop out of the
+    ready scan — so the only symptom is `claim_decision {"selected": []}` tick after
+    tick, with the reason buried in the log. /status is what the board page polls."""
+    from project_board import health
+
+    health.publish_preflight({"web": "tsc: not found", "api": True}, {})
+    c = _client(monkeypatch, FakeStore())
+
+    body = c.get("/api/plugins/project_board/status").json()
+
+    assert body["held_projects"] == ["web"]  # 'api' passed — not held
+    assert "tsc: not found" in body["preflight"]["held"]["web"]
+
+
+def test_status_separates_a_dirty_checkout_from_a_held_project(monkeypatch):
+    """Dirty is NOT held — the verdict was downgraded to indeterminate and dispatch
+    was allowed, so the operator needs to see 'your gate result meant nothing', not
+    'your work is frozen'."""
+    from project_board import health
+
+    health.publish_preflight({"web": True}, {"web": "uncommitted changes to store.py"})
+    c = _client(monkeypatch, FakeStore())
+
+    body = c.get("/api/plugins/project_board/status").json()
+
+    assert body["held_projects"] == []
+    assert "store.py" in body["preflight"]["dirty"]["web"]
+
+
+def test_status_reports_nothing_held_before_any_preflight_has_run(monkeypatch):
+    """A board whose loop is off never publishes — that must read as 'nothing held',
+    not as a missing key the view has to defend against."""
+    from project_board import health
+
+    health._health.pop("preflight", None)
+    c = _client(monkeypatch, FakeStore())
+
+    body = c.get("/api/plugins/project_board/status").json()
+
+    assert body["held_projects"] == [] and body["preflight"] == {"held": {}, "dirty": {}}

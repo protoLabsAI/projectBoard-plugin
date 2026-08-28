@@ -68,6 +68,20 @@ BR = br_fetch.resolve_br_bin()
 _DB_RETRY_ATTEMPTS = 6
 _DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2, ~6.3s total)
 _DB_CONTENTION_RE = re.compile(r"DATABASE_ERROR|database is (?:locked|busy)", re.IGNORECASE)
+# `br` plain-mode not-found text (stderr). The --json path is matched on the structured
+# ISSUE_NOT_FOUND code instead, so this only backstops a non-json `show`.
+_NOT_FOUND_RE = re.compile(r"\bissue not found\b", re.IGNORECASE)
+
+
+def _format_br_error(err: dict) -> str:
+    """Render a `br --json` error object as one readable line for a BoardError."""
+    if not err:
+        return ""
+    msg = str(err.get("message") or "").strip()
+    code = str(err.get("code") or "").strip()
+    hint = str(err.get("hint") or "").strip()
+    head = f"{code}: {msg}" if code and msg else (msg or code)
+    return f"{head} ({hint})" if head and hint else head
 
 
 def _contention_in_json(out) -> str:
@@ -377,6 +391,35 @@ class BoardError(Exception):
     """A rejected op (bad gate, unknown feature, `br` failure). Caller → 4xx / tool error."""
 
 
+class BoardNotFound(BoardError):
+    """`br` resolved the command but the id does not exist (ISSUE_NOT_FOUND, exit 3).
+
+    A SUBCLASS of BoardError so every existing `except BoardError` call site keeps its
+    current behavior; readers that treat a vanished id as data rather than an error
+    (``get_feature`` → None, and through it the sweep's orphaned-worktree reap) catch
+    this narrower type instead of pattern-matching an error string."""
+
+
+def _br_json_error(out) -> dict:
+    """The structured error `br --json` writes to STDOUT on a non-zero exit.
+
+    `br` splits its error reporting by mode: plain runs write ``Error: …`` to stderr,
+    but under ``--json`` stderr is EMPTY and the failure is an error-shaped object on
+    stdout. ``_run`` only ever read stderr, so every --json failure raised a BoardError
+    whose message was the empty string — "`br show bd-x3d` failed: " with nothing after
+    the colon, which is undiagnosable. Returns the ``error`` object (``code``/``message``
+    /``hint``) or {} for a normal payload."""
+    s = str(out or "").strip()
+    if not s.startswith("{"):  # normal br JSON payloads are lists ('[') or empty
+        return {}
+    try:
+        obj = json.loads(s)
+    except ValueError:
+        return {}
+    err = obj.get("error") if isinstance(obj, dict) else None
+    return err if isinstance(err, dict) else {}
+
+
 def normalize_source_issue(raw) -> str:
     """Normalize a source-issue reference to the canonical ``owner/repo#N``.
 
@@ -644,7 +687,14 @@ class BeadsBoard:
                 time.sleep(delay)
                 delay *= 2
                 continue
-            raise BoardError(f"`br {' '.join(args)}` failed: {(err or contention)[:300]}")
+            # `br --json` reports failures as an error-shaped object on STDOUT with an
+            # EMPTY stderr, so `err` alone yields "failed: " with no reason. Fall back to
+            # the structured stdout error for both the message and the not-found verdict.
+            jerr = _br_json_error(proc.stdout) if want_json else {}
+            reason = err or contention or _format_br_error(jerr) or f"exit {proc.returncode}"
+            if jerr.get("code") == "ISSUE_NOT_FOUND" or _NOT_FOUND_RE.search(err or ""):
+                raise BoardNotFound(f"`br {' '.join(args)}` failed: {reason[:300]}")
+            raise BoardError(f"`br {' '.join(args)}` failed: {reason[:300]}")
         if not want_json:
             return proc.stdout.strip()
         # `br` prefixes some JSON with INFO log lines on stderr; stdout is clean JSON.
@@ -1801,7 +1851,17 @@ class BeadsBoard:
 
     # ── reads (the projection) ────────────────────────────────────────────────
     def get_feature(self, fid: str) -> dict | None:
-        rows = self._run("show", fid, want_json=True)
+        """The feature row, or None when ``fid`` does not exist.
+
+        A missing id is a NORMAL read outcome here (the sweep asks about worktrees whose
+        feature was deleted), so the ISSUE_NOT_FOUND exit is caught and folded into the
+        documented ``None`` — without it `br`'s exit 3 raised straight through this
+        method's own ``dict | None`` contract and the sweep's ``f is None`` reap branch
+        was unreachable, leaving orphaned worktrees to warn on every pass forever."""
+        try:
+            rows = self._run("show", fid, want_json=True)
+        except BoardNotFound:
+            return None
         if not rows:
             return None
         return self._project(rows[0] if isinstance(rows, list) else rows)

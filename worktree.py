@@ -128,6 +128,44 @@ def worktree_dir(fid: str, title: str = "") -> str:
     return f"feat-{fid}-{slug}" if slug else f"feat-{fid}"
 
 
+async def base_checkout_dirt(repo: str, base: str = "") -> str:
+    """Why ``repo``'s MAIN checkout is not a faithful stand-in for the base branch — ''
+    when it is one.
+
+    The gate preflight smoke-runs a project's gate with ``cwd=<repo>`` on the premise
+    that coders only ever touch worktrees, so the main checkout still sits at base. That
+    premise is about the CODERS; it says nothing about the operator, who edits that same
+    checkout by hand. When it doesn't hold, the preflight's verdict is about the
+    operator's uncommitted work rather than about the base every worktree branches from
+    — which can silently freeze a whole project (a local edit that reddens the gate) or
+    silently clear a genuinely broken one.
+
+    Reports two kinds of dirt, cheaply (two plumbing calls, no fetch, no network):
+    uncommitted tracked changes, and a HEAD that isn't on ``base``. Untracked files are
+    NOT dirt — build output and scratch dirs live in every working checkout and don't
+    change what the gate compiles. A git failure returns '' (unknown → not dirt): this
+    check may only ever downgrade a verdict to indeterminate, never invent one."""
+    try:
+        rc, out, _err = await _git(repo, "status", "--porcelain", "--untracked-files=no")
+        if rc != 0:
+            return ""
+        reasons = []
+        if out.strip():
+            # porcelain v1 is "XY PATH" — slice the 2 status columns off each line as it
+            # comes. NOT off a pre-stripped block: that eats the first line's leading
+            # space and takes a character of the filename with it (" M store.py" then
+            # reads as "tore.py").
+            files = [ln[2:].strip() for ln in out.splitlines() if ln[2:].strip()][:5]
+            reasons.append(f"uncommitted changes to {', '.join(files)}")
+        if base:
+            rc_b, head, _e = await _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            if rc_b == 0 and head.strip() and head.strip() != base:
+                reasons.append(f"HEAD is on {head.strip()!r}, not the base branch {base!r}")
+        return "; ".join(reasons)
+    except Exception:  # noqa: BLE001 — an unavailable git must not manufacture dirt
+        return ""
+
+
 async def prune_stale_worktrees(repo: str) -> str:
     """``git worktree prune -v`` in ``repo`` — drop stale ``.git/worktrees/*`` admin
     entries whose working tree is gone (a branch merged + its tree deleted, or a tree
