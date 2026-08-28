@@ -12,12 +12,14 @@ The store is faked (``api.get_store`` patched) — no ``br``, no DB.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib
 import json
 import logging
 import sys
+import threading
 import types
 from collections import OrderedDict
 from pathlib import Path
@@ -81,6 +83,9 @@ class FakeStore:
 
     def add_dependency(self, fid, dep):
         return self._rec("add_dependency", fid, dep)
+
+    def remove_dependency(self, fid, dep):
+        return self._rec("remove_dependency", fid, dep)
 
     def mark_ready(self, fid):
         if fid == "bad":
@@ -1714,3 +1719,175 @@ def test_status_reports_nothing_held_before_any_preflight_has_run(monkeypatch):
     body = c.get("/api/plugins/project_board/status").json()
 
     assert body["held_projects"] == [] and body["preflight"] == {"held": {}, "dirty": {}}
+
+
+# ── #258 F2c: async routes run their store calls OFF the event-loop thread ──────
+# The API half of the F2a contract: `_run` blocks in subprocess.run (30s timeout)
+# and time.sleep (the contention backoff) — on the loop thread that stalls the tick
+# and every other route. A store call is off the loop iff its own thread has NO
+# running event loop (asyncio.get_running_loop() raises inside a to_thread worker),
+# which is exactly what store._warn_blocking_on_event_loop detects.
+
+
+def _running_loop_probe(record):
+    """Append the op to ``record`` when the calling thread has a RUNNING event loop —
+    i.e. the call is still ON the loop thread. Empty record == fully offloaded."""
+
+    def probe(op):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # a to_thread worker — the right place to block
+        record.append(op)
+
+    return probe
+
+
+def test_features_and_webhook_reach_br_off_the_event_loop_thread(monkeypatch, caplog):
+    """r1 (API): a REAL BeadsBoard under the routes with only its `_run` seam patched
+    — the store methods above it run for real, so this catches any route that reaches
+    `br` on the event-loop thread. Every `_run` must land on a to_thread worker (no
+    running loop, not the loop's own thread), and F2a's on-loop detection warning
+    must stay silent."""
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    board = store_mod.BeadsBoard(db=None, repo="/repo")
+    seen, on_loop = [], []
+    probe = _running_loop_probe(on_loop)
+
+    def run_impl(*args, want_json=False, with_has_more=False):
+        seen.append(threading.current_thread())
+        probe(args[0] if args else "")
+        if with_has_more:
+            return ([], None)
+        return [] if want_json else ""
+
+    monkeypatch.setattr(board, "_run", run_impl)
+    c = _client(monkeypatch, board, cfg=_external_cfg())
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        # GET /features — the audited read (list + ready_queue, several `_run`s)…
+        assert c.get("/api/plugins/project_board/features").json() == {"features": []}
+        # …a point read that folds the empty `br show` into a 404…
+        assert c.get("/api/plugins/project_board/features/missing").status_code == 404
+        # …and the merge webhook's record_merge scan (no match → ignored, but it ran).
+        raw = _merge_body()
+        r = c.post(
+            "/plugins/project_board/webhook/pr",
+            content=raw,
+            headers={"X-Hub-Signature-256": _signed(_EXTERNAL_SECRET, raw)},
+        )
+        assert r.status_code == 200 and "ignored" in r.json()
+    assert seen  # the routes genuinely reached the `br` seam
+    assert on_loop == []  # and never on a thread with a running event loop
+    assert "event-loop thread" not in caplog.text  # F2a's `_run` detection stayed quiet
+
+
+def test_run_under_an_async_caller_is_never_on_the_main_thread(monkeypatch):
+    """r1, stated literally: with the event loop owning the MAIN thread (asyncio.run
+    driving the ASGI app directly — no TestClient portal thread), patch `_run` and
+    assert every call executes with threading.current_thread() is not main_thread().
+    subprocess.run / time.sleep live inside `_run`, so this is exactly the proof that
+    neither blocks the loop during a route."""
+    import httpx
+
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    board = store_mod.BeadsBoard(db=None, repo="/repo")
+    seen = []
+
+    def run_impl(*args, want_json=False, with_has_more=False):
+        seen.append(threading.current_thread())
+        if with_has_more:
+            return ([], None)
+        return [] if want_json else ""
+
+    monkeypatch.setattr(board, "_run", run_impl)
+    monkeypatch.setattr(api, "get_store", lambda **_kw: board)
+    app = FastAPI()
+    app.include_router(api.build_router(_external_cfg()), prefix="/plugins/project_board")
+    app.include_router(api.build_data_router(_external_cfg()), prefix="/api/plugins/project_board")
+
+    async def drive():
+        assert threading.current_thread() is threading.main_thread()  # the loop thread
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://board") as c:
+            assert (await c.get("/api/plugins/project_board/features")).json() == {"features": []}
+            assert (await c.get("/api/plugins/project_board/features/missing")).status_code == 404
+            raw = _merge_body()
+            r = await c.post(
+                "/plugins/project_board/webhook/pr",
+                content=raw,
+                headers={"X-Hub-Signature-256": _signed(_EXTERNAL_SECRET, raw)},
+            )
+            assert r.status_code == 200 and "ignored" in r.json()
+
+    asyncio.run(drive())
+    assert seen and all(t is not threading.main_thread() for t in seen)
+
+
+def _probe_store_calls(store, record):
+    """Wrap every store method the routes touch (public + the `_comment` audit write)
+    to record which calls ran with a running event loop on their own thread."""
+    probe = _running_loop_probe(record)
+    names = [m for m in dir(store) if (m == "_comment" or not m.startswith("_")) and callable(getattr(store, m))]
+    for name in names:
+        orig = getattr(store, name)
+
+        def wrapped(*a, _orig=orig, _name=name, **k):
+            probe(_name)
+            return _orig(*a, **k)
+
+        setattr(store, name, wrapped)
+
+
+def test_every_data_and_ingress_route_offloads_its_store_calls(monkeypatch):
+    """The route-surface sweep: every store call made by the CRUD/transition routes
+    and the HMAC ingress edges (/ci, /review, /webhook/pr) executes on a thread with
+    no running event loop — i.e. off the loop, via asyncio.to_thread (#258)."""
+    from project_board import loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    _stub_reap(monkeypatch)
+    store = FakeStore()
+    on_loop = []
+    _probe_store_calls(store, on_loop)
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+
+    sweep = [
+        c.post("/api/plugins/project_board/epics", json={"title": "E"}),
+        c.post("/api/plugins/project_board/milestones", json={"title": "M", "epic_id": "e"}),
+        c.get("/api/plugins/project_board/features"),
+        c.get("/api/plugins/project_board/features/bd-1"),
+        c.get("/api/plugins/project_board/features/bd-1/progress"),
+        c.patch("/api/plugins/project_board/features/bd-1", json={"spec": "s"}),
+        c.post("/api/plugins/project_board/features", json={"title": "T"}),
+        c.post("/api/plugins/project_board/features/batch", json={"plan": []}),
+        c.post("/api/plugins/project_board/features/bd-1/dep", json={"depends_on": "bd-2"}),
+        c.request("DELETE", "/api/plugins/project_board/features/bd-1/dep", json={"depends_on": "bd-2"}),
+        c.post("/api/plugins/project_board/features/bd-1/ready"),
+        c.post("/api/plugins/project_board/features/bd-1/block", json={"reason": "r"}),
+        c.post("/api/plugins/project_board/features/bd-1/unblock"),
+        c.post("/api/plugins/project_board/features/bd-1/cancel", json={"reason": "r"}),
+        c.post("/api/plugins/project_board/features/bd-1/done", json={"reason": "r"}),
+        c.post("/api/plugins/project_board/features/bd-1/deliver", json={"text": "t"}),
+        c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True}),
+        c.request("DELETE", "/api/plugins/project_board/features/bd-1", json={"reason": "r"}),
+        _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "x"}),
+        _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"}),
+    ]
+    raw = _merge_body()
+    sweep.append(
+        c.post(
+            "/plugins/project_board/webhook/pr",
+            content=raw,
+            headers={"X-Hub-Signature-256": _signed(_EXTERNAL_SECRET, raw)},
+        )
+    )
+
+    assert all(r.status_code == 200 for r in sweep), [(r.request.url.path, r.status_code) for r in sweep]
+    assert store.calls  # the sweep genuinely exercised the store…
+    assert on_loop == []  # …and no call saw a running loop on its own thread (#258)
+    # The PATCH audit comment (`_comment`) is a store write too — prove it was swept.
+    assert any(call[0] == "_comment" for call in store.calls)
