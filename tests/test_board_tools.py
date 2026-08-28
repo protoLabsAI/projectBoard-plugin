@@ -514,6 +514,55 @@ def test_board_cancel_feature_closes_an_open_pr_best_effort(make_board, monkeypa
     assert out["state"] == "cancelled" and out["pr_closed"] is False  # cancel landed; close didn't — said so
 
 
+def test_board_cancel_feature_closes_the_pr_under_the_features_project_repo(make_board, monkeypatch):
+    """#262: a cancel on a project-B card runs its `gh` PR close in B's checkout —
+    resolved from the card's `project:<name>` label through the shared route/tool
+    resolver (api.repo_for_feature, the loop's `_repo_for` order), not the
+    board-default repo the tool's store_kw carries."""
+    from project_board import worktree
+
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append((url, cwd)) or (True, ""),
+    )
+    _wire(
+        make_board,
+        monkeypatch,
+        {"id": "bd-1", "board_state": "cancelled", "pr_url": "https://x/pr/4", "project": "beta"},
+    )
+    cfg = {
+        "repo": "/default",
+        "projects": {"alpha": {"repo": "/alpha"}, "beta": {"repo": "/beta"}},
+        "default_project": "alpha",
+    }
+    out = json.loads(_get_tool("board_cancel_feature", cfg).invoke({"feature_id": "bd-1", "reason": "scope cut"}))
+    assert out["pr_closed"] is True
+    assert closed == [("https://x/pr/4", "/beta")]
+
+
+def test_board_cancel_feature_unlabeled_card_closes_under_the_default_project_repo(make_board, monkeypatch):
+    """Back-compat: a pre-#90 card (no project label) keeps closing its PR under the
+    default project's repo — the resolver changes nothing for single-repo boards."""
+    from project_board import worktree
+
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append(cwd) or (True, ""),
+    )
+    _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "cancelled", "pr_url": "https://x/pr/4"})
+    cfg = {
+        "repo": "/default",
+        "projects": {"alpha": {"repo": "/alpha"}, "beta": {"repo": "/beta"}},
+        "default_project": "alpha",
+    }
+    json.loads(_get_tool("board_cancel_feature", cfg).invoke({"feature_id": "bd-1"}))
+    assert closed == ["/alpha"]
+
+
 # ── task tools (#217): board_create_task / board_deliver / board_verify ──────────────
 #
 # A task-type bead rides the same rails as a coding feature (ready → claim → in_progress →

@@ -74,6 +74,34 @@ def _store_kw(cfg: dict) -> dict:
     )
 
 
+def repo_for_feature(feature: dict | None, store_kw: dict) -> str:
+    """The repo root ``feature`` builds in — the route/tool sibling of the loop's
+    per-feature ``_repo_for`` (loop.py), resolving in the SAME order so the terminal
+    edges act in the project's checkout (#262). A feature carrying an explicit
+    ``project:<name>`` label resolves STRICTLY to that project's ``repo``; an
+    unlabeled feature keeps the store-stamped repo, then the default project's,
+    then the instance default (back-compat). Shared by the merge webhook and the
+    cancel/done/delete edges here and by ``board_cancel_feature`` (__init__.py) —
+    without it every terminal edge reaped (and closed PRs) under the board-default
+    repo, stranding a non-default project's worktree until the health sweep."""
+    feature = feature or {}
+    projects = store_kw.get("projects") or {}
+    default = str(store_kw.get("default_project") or "").strip()
+    name = str(feature.get("project") or "").strip()
+    if name:
+        repo = str((projects.get(name) or {}).get("repo") or "").strip()
+        if repo:
+            return repo
+    entry = projects.get(name or default)
+    if entry is None:
+        entry = projects.get(default)
+    return (
+        str(feature.get("repo") or "").strip()
+        or str((entry or {}).get("repo") or "").strip()
+        or str(store_kw.get("repo") or ".")
+    )
+
+
 def build_router(cfg: dict):
     from fastapi import APIRouter, HTTPException
     from fastapi.responses import HTMLResponse
@@ -248,10 +276,12 @@ def build_router(cfg: dict):
         if f is None:
             return {"ok": True, "ignored": f"no feature for PR {pr_url}"}
         # Reap the feature's worktree now that it's merged → done (stop accumulation).
+        # #262: under ITS project's repo — a project-B feature's worktree lives in B's
+        # checkout, not the board default's.
         try:
             from . import worktree
 
-            await worktree.reap_feature_worktree(store_kw["repo"], worktrees_root, f["id"])
+            await worktree.reap_feature_worktree(repo_for_feature(f, store_kw), worktrees_root, f["id"])
         except Exception:  # noqa: BLE001 — reaping is best-effort; done is already set
             log.warning("[project_board] worktree reap for %s failed", f["id"], exc_info=True)
         log.info("[project_board] merge webhook → done: %s (%s)", f["id"], pr_url)
@@ -434,15 +464,18 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             "held_projects": sorted(preflight["held"]),
         }
 
-    async def _reap_worktree(fid: str) -> None:
+    async def _reap_worktree(fid: str, feature: dict | None = None) -> None:
         """Reap the feature's worktree at a terminal edge (cancel/delete) — the same
         best-effort pattern as the merge webhook's Done-edge reap (``build_router``).
-        The bead is already closed, so a reap failure must never raise into the
-        response; the health sweep stays the crash backstop for anything missed."""
+        ``feature`` is the edge's projection: its project label resolves the repo the
+        worktree actually lives in (#262 — the loop's ``_repo_for`` order), so a
+        project-B card reaps under B's checkout, not the board default's. The bead is
+        already closed, so a reap failure must never raise into the response; the
+        health sweep stays the crash backstop for anything missed."""
         try:
             from . import worktree
 
-            await worktree.reap_feature_worktree(store_kw["repo"], worktrees_root, fid)
+            await worktree.reap_feature_worktree(repo_for_feature(feature, store_kw), worktrees_root, fid)
         except Exception:  # noqa: BLE001 — reaping is best-effort; the edge is already closed
             log.warning("[project_board] worktree reap for %s failed", fid, exc_info=True)
 
@@ -616,6 +649,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         at the card, and an in-flight drive is stopped (its own cancel path closes a PR
         it opened meanwhile + reaps). Both best-effort: a gh failure logs, never 400s."""
         pr_url = ""
+        before = None
         try:
             before = await asyncio.to_thread(lambda: store().get_feature(fid))
             pr_url = str((before or {}).get("pr_url") or "").strip()
@@ -624,8 +658,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
         from .loop import cancel_side_effects
 
-        side = await asyncio.to_thread(cancel_side_effects, fid, pr_url, cwd=store_kw["repo"])
-        await _reap_worktree(fid)
+        # #262: close the PR and reap under the FEATURE's project repo (the pre-cancel
+        # read carries the label; the cancel projection is the fallback), not the default.
+        repo = repo_for_feature(before or f, store_kw)
+        side = await asyncio.to_thread(cancel_side_effects, fid, pr_url, cwd=repo)
+        await _reap_worktree(fid, before or f)
         return {**f, "cancel": side}
 
     @router.post("/features/{fid}/done")
@@ -638,7 +675,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         Reaps the feature's worktree once done — same terminal-edge reap as
         cancel/merge (#109)."""
         f = await _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
-        await _reap_worktree(fid)
+        await _reap_worktree(fid, f)
         return f
 
     # ── task-type review lane (#217): deliver → verify, the coder-PR-free siblings
@@ -681,7 +718,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         Reaps the feature's worktree too — same terminal-edge class as cancel/merge, a
         deleted feature leaves nothing to build (#109)."""
         f = await _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
-        await _reap_worktree(fid)
+        await _reap_worktree(fid, f)
         return f
 
     # ── coder.solve() rung diagnostic (ADR 0064) — OPERATOR ONLY, deliberately no

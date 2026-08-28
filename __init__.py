@@ -719,9 +719,12 @@ def _board_tools(cfg: dict):
         except BoardError as exc:
             return f"Error: {exc}"
         # Lazy import (the loop imports from here — a top-level import would be circular).
+        from .api import repo_for_feature
         from .loop import cancel_side_effects
 
-        side = cancel_side_effects(feature_id, pr_url, cwd=store_kw["repo"])
+        # #262: gh closes the PR in the FEATURE's project repo (its `project:<name>`
+        # label, via the shared route/tool resolver), not the board default's.
+        side = cancel_side_effects(feature_id, pr_url, cwd=repo_for_feature(before or f, store_kw))
         return json.dumps({"id": f["id"], "state": f["board_state"], **side})
 
     @tool
