@@ -3135,15 +3135,32 @@ class BoardLoop:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
                         if nxt:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
-                            # A timeout carries NO diff and NO CI output, so the stronger
-                            # tier would otherwise get a BYTE-IDENTICAL prompt — blind to
-                            # the fact a prior attempt ran out of time and what it was doing
-                            # when killed (#146). Seed the same feedback lever a CI/review
-                            # bounce uses with the ring buffer's timeout context, so the
-                            # escalated dispatch leads with it via the normal prompt path.
-                            if isinstance(exc, worktree.CoderTimeout):
+                            # Keep the worktree ONLY across the escalation classes whose repair
+                            # rounds explicitly retained it (#282): a goal-verify / requirement-
+                            # ledger gate exhausts its keep-worktree fix budget with the VERIFIED
+                            # impl still on disk and _ci_feedback seeded to "your work is already
+                            # in this worktree". Carry that worktree into the escalated dispatch so
+                            # the stronger tier sees the work and the feedback stays truthful.
+                            # Anything else is a from-scratch build: the seeded feedback would lie
+                            # about a worktree that no longer exists, so clear it (+ the prior diff)
+                            # to keep prompt and worktree consistent.
+                            keep_wt_class = str(exc).startswith(("goal verification failed", "requirements unresolved"))
+                            if keep_wt_class and wt is not None:
+                                keep_wt = True  # reuse the verified worktree; _ci_feedback is truthful
+                            elif isinstance(exc, worktree.CoderTimeout):
+                                # A timeout carries NO diff and NO CI output, so the stronger tier
+                                # would otherwise get a BYTE-IDENTICAL prompt — blind to the fact a
+                                # prior attempt ran out of time and what it was doing when killed
+                                # (#146). Seed the CI/review-bounce feedback lever with the ring
+                                # buffer's timeout context so the escalated dispatch leads with it.
                                 self._ci_feedback[fid] = self._timeout_escalation_context(fid)
                                 self._ci_prior_diff.pop(fid, None)  # a timeout produced no diff to echo back
+                            else:
+                                # Fresh worktree ahead — drop any gate-fix feedback describing the
+                                # OLD worktree's files so the new build isn't told its work is on
+                                # disk when it isn't.
+                                self._ci_feedback.pop(fid, None)
+                                self._ci_prior_diff.pop(fid, None)
                             tier = nxt
                             retries = 0
                             # Fresh goal-fix / local-gate / ledger budgets at the new tier —
