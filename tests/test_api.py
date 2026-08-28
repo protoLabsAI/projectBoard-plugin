@@ -1698,6 +1698,131 @@ def test_cancel_route_without_a_pr_does_not_touch_gh(monkeypatch):
     assert c.post("/api/plugins/project_board/features/bd-7/cancel").json()["cancel"]["pr_closed"] is False
 
 
+# ── #262: terminal edges resolve the per-feature project repo ──────────────────────
+#
+# A project-B feature's worktree lives in B's checkout. Before the shared resolver
+# (api.repo_for_feature — the loop's `_repo_for` order) every route-side terminal edge
+# reaped under the board-default repo, silently stranding non-default worktrees until
+# the health sweep; the #211 PR close ran `gh` in the wrong checkout too.
+
+
+_MULTI_PROJECT_CFG = {
+    "repo": "/default",
+    "worktrees_root": ".wt",
+    "projects": {"alpha": {"repo": "/alpha"}, "beta": {"repo": "/beta"}},
+    "default_project": "alpha",
+}
+
+
+class _ProjectEdgeStore(FakeStore):
+    """FakeStore whose terminal-edge projections carry the feature's project label —
+    what the real store's projection does for a `project:<name>`-labeled bead (#90)."""
+
+    def _rec(self, name, *a, **k):
+        self.calls.append((name, a, k))
+        return {"id": a[0] if a else "bd-x", "op": name, "project": "beta"}
+
+
+def test_repo_for_feature_matches_the_loops_resolution_order():
+    """The shared resolver IS the loop's `_repo_for` order: explicit project label →
+    that project's repo (overriding a store-stamped one); unlabeled → the stamped
+    repo, then the default project's, then the instance default. Pinned against a
+    real BoardLoop so the route/tool resolution can never drift from the loop's."""
+    from project_board.loop import BoardLoop
+    from project_board.projects import default_project as resolve_default_project
+    from project_board.projects import resolve_projects
+
+    store_kw = dict(
+        repo=_MULTI_PROJECT_CFG["repo"],
+        projects=resolve_projects(_MULTI_PROJECT_CFG),
+        default_project=resolve_default_project(_MULTI_PROJECT_CFG),
+    )
+    loop = BoardLoop(_MULTI_PROJECT_CFG)
+    cases = [
+        {"id": "bd-1", "project": "beta"},  # labeled → that project's repo
+        {"id": "bd-2", "project": "beta", "repo": "/stamped"},  # the label wins over the stamp
+        {"id": "bd-3", "repo": "/stamped"},  # unlabeled → the store-stamped repo
+        {"id": "bd-4"},  # unlabeled, no stamp → the default project's repo
+        {"id": "bd-5", "project": "ghost"},  # unknown label → default-project fallback
+    ]
+    assert [api.repo_for_feature(f, store_kw) for f in cases] == [loop._repo_for(f) for f in cases]
+    assert api.repo_for_feature({"id": "bd-1", "project": "beta"}, store_kw) == "/beta"
+    assert api.repo_for_feature({"id": "bd-4"}, store_kw) == "/alpha"
+    # No feature at all (a webhook race) still lands somewhere sane: the default repo.
+    assert api.repo_for_feature(None, store_kw) == "/alpha"
+
+
+def test_webhook_reaps_under_the_features_project_repo(monkeypatch):
+    """r1: the merge webhook on a project-B feature reaps its worktree under B's repo
+    — record_merge's projection carries the label; the reap must follow it."""
+    reaped = _stub_reap(monkeypatch)
+    store = FakeStore(merged={"id": "bd-9", "board_state": "done", "project": "beta"})
+    c = _client(monkeypatch, store, cfg={**_MULTI_PROJECT_CFG, "webhook_secret": "s3cret"})
+    raw = _merge_body()
+    r = c.post(
+        "/plugins/project_board/webhook/pr",
+        content=raw,
+        headers={"X-Hub-Signature-256": _signed("s3cret", raw)},
+    )
+    assert r.status_code == 200 and r.json()["feature"]["id"] == "bd-9"
+    assert reaped == [("/beta", ".wt", "bd-9")]
+
+
+def test_cancel_route_reaps_under_the_features_project_repo(monkeypatch):
+    """r1: a cancel on a project-B card reaps under B's repo, and the #211 PR close
+    runs `gh` in B's checkout too — both resolved from the card's project label."""
+    from project_board import worktree
+
+    reaped = _stub_reap(monkeypatch)
+    closed = []
+    monkeypatch.setattr(
+        worktree,
+        "close_pr_sync",
+        lambda url, *, comment, cwd=".", timeout=60: closed.append((url, cwd)) or (True, ""),
+    )
+    store = FakeStore()
+    monkeypatch.setattr(
+        store,
+        "get_feature",
+        lambda fid: {"id": fid, "board_state": "in_review", "project": "beta", "pr_url": "https://x/pr/9"},
+    )
+    c = _client(monkeypatch, store, cfg=_MULTI_PROJECT_CFG)
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "dup"})
+    assert r.status_code == 200
+    assert reaped == [("/beta", ".wt", "bd-7")]
+    assert closed == [("https://x/pr/9", "/beta")]
+
+
+def test_done_route_reaps_under_the_features_project_repo(monkeypatch):
+    """r1: the manual Done edge on a project-B card reaps under B's repo — mark_done's
+    projection carries the label."""
+    reaped = _stub_reap(monkeypatch)
+    c = _client(monkeypatch, _ProjectEdgeStore(), cfg=_MULTI_PROJECT_CFG)
+    r = c.post("/api/plugins/project_board/features/bd-7/done", json={"reason": "shipped"})
+    assert r.status_code == 200
+    assert reaped == [("/beta", ".wt", "bd-7")]
+
+
+def test_delete_route_reaps_under_the_features_project_repo(monkeypatch):
+    """r1: a hard delete on a project-B card reaps under B's repo — delete_feature
+    returns the last projection, which carries the label."""
+    reaped = _stub_reap(monkeypatch)
+    c = _client(monkeypatch, _ProjectEdgeStore(), cfg=_MULTI_PROJECT_CFG)
+    r = c.request("DELETE", "/api/plugins/project_board/features/bd-7", json={"reason": "oops"})
+    assert r.status_code == 200
+    assert reaped == [("/beta", ".wt", "bd-7")]
+
+
+def test_terminal_reap_of_an_unlabeled_feature_falls_back_to_the_default_repo(monkeypatch):
+    """Back-compat: a pre-#90 card (no project label) reaps under the default
+    project's repo — exactly where the loop would have built its worktree."""
+    reaped = _stub_reap(monkeypatch)
+    c = _client(monkeypatch, FakeStore(), cfg=_MULTI_PROJECT_CFG)
+    r = c.post("/api/plugins/project_board/features/bd-7/done", json={"reason": "x"})
+    assert r.status_code == 200
+    assert reaped == [("/alpha", ".wt", "bd-7")]
+
+
 # ── /status explains an idle board (#255) ─────────────────────────────────────────
 
 
