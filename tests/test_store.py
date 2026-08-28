@@ -3080,3 +3080,71 @@ def test_project_deliverable_falls_back_to_a_label(make_board):
 def test_project_deliverable_defaults_empty_for_coding_features(make_board):
     b = make_board(Br())
     assert b._project({"id": "x", "status": "open", "labels": []})["deliverable"] == ""
+
+
+# ── `br --json` failures: the reason is on STDOUT, and a missing id is data (#255) ──
+
+
+def _json_err(code: str, message: str, hint: str = "", rc: int = 3):
+    """What `br <cmd> --json` actually does on a failure: non-zero exit, EMPTY stderr,
+    and an error-shaped object on stdout. Verified against br 0.2.16."""
+    body = {"error": {"code": code, "message": message, "retryable": False}}
+    if hint:
+        body["error"]["hint"] = hint
+    return types.SimpleNamespace(returncode=rc, stdout=json.dumps(body), stderr="")
+
+
+def _failing_board(monkeypatch, result):
+    """A board whose every `br` call returns `result` — a FAILING CompletedProcess
+    (distinct from `_json_board` above, which cans a zero-exit stdout)."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    b = BeadsBoard(db="/db/.beads/b.db", repo="/repo")
+    b._workspace_ready = True  # the pin is not what's under test
+    monkeypatch.setattr(store.subprocess, "run", lambda *a, **k: result)
+    return b
+
+
+def test_get_feature_returns_none_for_an_id_that_does_not_exist(monkeypatch):
+    """The regression that leaked worktrees: `br show <gone> --json` exits 3, which
+    `_run` raised on — straight through get_feature's own ``dict | None`` contract. The
+    sweep's reap branch is guarded by ``f is None``, so it was unreachable and every
+    orphaned worktree just warned, every pass, forever."""
+    b = _failing_board(monkeypatch, _json_err("ISSUE_NOT_FOUND", "Issue not found: abp-2tj.1"))
+    assert b.get_feature("abp-2tj.1") is None
+
+
+def test_a_json_failure_carries_its_reason_instead_of_an_empty_message(monkeypatch):
+    """`_run` only ever read stderr, which `--json` leaves empty — so every failure
+    raised "`br show x` failed: " with nothing after the colon."""
+    b = _failing_board(monkeypatch, _json_err("VALIDATION_ERROR", "bad flag", hint="try --help"))
+    with pytest.raises(BoardError) as exc:
+        b.get_feature("bd-1")
+    msg = str(exc.value)
+    assert "VALIDATION_ERROR" in msg and "bad flag" in msg and "try --help" in msg
+
+
+def test_a_non_not_found_json_failure_still_raises_a_plain_boarderror(monkeypatch):
+    """Only ISSUE_NOT_FOUND is folded into None — a real error must not read as
+    "this feature doesn't exist" and let a caller sail past it."""
+    b = _failing_board(monkeypatch, _json_err("PERMISSION_DENIED", "read-only db"))
+    with pytest.raises(BoardError) as exc:
+        b.get_feature("bd-1")
+    assert not isinstance(exc.value, store.BoardNotFound)
+
+
+def test_not_found_is_a_boarderror_subclass_so_existing_handlers_keep_working(monkeypatch):
+    """Call sites that only know `except BoardError` must be unaffected by the new type."""
+    b = _failing_board(monkeypatch, _json_err("ISSUE_NOT_FOUND", "Issue not found: bd-9"))
+    with pytest.raises(BoardError):
+        b._run("show", "bd-9", want_json=True)
+    assert issubclass(store.BoardNotFound, BoardError)
+
+
+def test_plain_mode_not_found_is_detected_on_stderr(monkeypatch):
+    """Without --json the message is on stderr instead — same verdict."""
+    b = _failing_board(
+        monkeypatch,
+        types.SimpleNamespace(returncode=3, stdout="", stderr="Error: Issue not found: bd-9"),
+    )
+    with pytest.raises(store.BoardNotFound):
+        b._run("show", "bd-9")

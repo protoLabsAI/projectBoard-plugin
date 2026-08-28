@@ -4468,6 +4468,27 @@ class _FakeProc:
         pass
 
 
+@pytest.fixture(autouse=True)
+def _clean_base_checkout(monkeypatch):
+    """Every preflight test below runs against a CLEAN checkout unless it says otherwise.
+
+    Without this the suite shells real git in the repo it is running from, so the same
+    tests pass on a clean tree and fail on a dirty one — the developer's uncommitted work
+    would decide whether fail-closed is asserted. The dirty path has its own explicit
+    tests; this pins the default."""
+    monkeypatch.setattr(
+        "project_board.worktree.base_checkout_dirt",
+        _async_return(""),
+    )
+
+
+def _async_return(value):
+    async def _f(*_a, **_k):
+        return value
+
+    return _f
+
+
 def test_preflight_config_defaults():
     assert BoardLoop({}).preflight is True  # on by default
     assert BoardLoop({})._preflight_state == {}  # per-project dict, empty = nothing checked
@@ -5882,3 +5903,69 @@ def test_cancel_side_effects_closes_pr_and_signals_the_drive(monkeypatch):
     monkeypatch.setattr(worktree, "close_pr_sync", lambda *a, **k: (True, worktree.PR_ALREADY_MERGED))
     side = loop_mod.cancel_side_effects("bd-idle", "https://x/pr/5")
     assert side["pr_closed"] is False and side["pr_detail"] == "already merged"  # nothing was closed — say so
+
+
+# ── preflight only convicts a CLEAN checkout (#255) ────────────────────────────────
+
+
+async def _run_preflight(monkeypatch, *, rc, dirt, out=b"gate is red"):
+    lp = BoardLoop({"local_gate_cmd": "pytest -q"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+    monkeypatch.setattr("project_board.worktree.base_checkout_dirt", _async_return(dirt))
+
+    async def _shell(*a, **k):
+        return _FakeProc(rc, out)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await lp._maybe_preflight()
+    return lp
+
+
+async def test_a_red_gate_on_a_dirty_checkout_does_not_hold_the_project(monkeypatch):
+    """The bug: preflight runs with cwd=<repo>, the operator's main checkout. Its
+    "coders only touch worktrees" premise is about coders, not the operator — a local
+    uncommitted edit that reddens the gate would freeze that project's entire ready
+    queue, and the only symptom on the board is `selected: []`."""
+    lp = await _run_preflight(monkeypatch, rc=1, dirt="uncommitted changes to store.py")
+    assert lp._preflight_state["default"] is True  # indeterminate → allow, never wedge
+    assert "store.py" in lp._preflight_dirty["default"]
+
+
+async def test_a_red_gate_on_a_clean_checkout_still_fails_closed(monkeypatch):
+    """The downgrade must not cost us the case the preflight exists for."""
+    lp = await _run_preflight(monkeypatch, rc=1, dirt="", out=b"tsc: not found")
+    assert isinstance(lp._preflight_state["default"], str)
+    assert "tsc: not found" in lp._preflight_state["default"]
+    assert "default" not in lp._preflight_dirty
+
+
+async def test_a_green_gate_clears_a_previous_dirty_mark(monkeypatch):
+    lp = await _run_preflight(monkeypatch, rc=1, dirt="uncommitted changes to x.py")
+    assert lp._preflight_dirty
+    lp._preflight_state.clear()  # force a re-check
+    monkeypatch.setattr("project_board.worktree.base_checkout_dirt", _async_return(""))
+
+    async def _green(*a, **k):
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _green)
+    await lp._maybe_preflight()
+    assert lp._preflight_state["default"] is True and not lp._preflight_dirty
+
+
+async def test_a_held_project_is_published_for_status(monkeypatch):
+    """An idle board must be able to explain itself without the operator reading logs."""
+    from project_board import health
+
+    await _run_preflight(monkeypatch, rc=1, dirt="", out=b"tsc: not found")
+    snap = health.preflight_snapshot()
+    assert "tsc: not found" in snap["held"]["default"]
+
+
+async def test_an_allowed_dirty_project_is_reported_as_dirty_not_held(monkeypatch):
+    from project_board import health
+
+    await _run_preflight(monkeypatch, rc=1, dirt="uncommitted changes to store.py")
+    snap = health.preflight_snapshot()
+    assert snap["held"] == {}  # nothing frozen
+    assert "store.py" in snap["dirty"]["default"]

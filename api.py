@@ -396,12 +396,21 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         except Exception as exc:  # noqa: BLE001 — setup_status never raises by contract; belt and braces
             log.warning("[project_board] /status setup preflight errored", exc_info=True)
             setup = {"ready": False, "error": str(exc)}
+        # #255: a board can be fully `ready` and still be picking up nothing, because
+        # one project's gate preflight fail-closed and its ready cards got held (they
+        # then drop out of the ready scan, so the board just looks idle). Report it here
+        # — this route is what the board page polls — rather than only in the log.
+        from . import health
+
+        preflight = health.preflight_snapshot()
         return {
             "bound": bound,
             "repo": store_kw.get("repo") or ".",
             "db_path": bool(store_kw.get("db")),
             "projects": sorted(raw_projects) if explicit_projects else [],
             "setup": setup,
+            "preflight": preflight,
+            "held_projects": sorted(preflight["held"]),
         }
 
     async def _reap_worktree(fid: str) -> None:

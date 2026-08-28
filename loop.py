@@ -45,7 +45,7 @@ import sys
 import time
 import types
 
-from . import br_fetch, coder_seam, config, setup_check, worktree
+from . import br_fetch, coder_seam, config, health, setup_check, worktree
 from .failures import classify
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
@@ -828,6 +828,10 @@ class BoardLoop:
         # reason; `_preflight_held[name]` is the set of fids THIS loop blocked for that
         # project's failed preflight; `_last_preflight[name]` throttles its re-checks.
         self._preflight_state: dict[str, bool | str | None] = {}
+        # Projects whose last preflight ran against a non-base checkout (#255): the
+        # verdict was downgraded to indeterminate, and /status says so rather than
+        # leaving the operator with a silently-permissive gate.
+        self._preflight_dirty: dict[str, str] = {}
         self._last_preflight: dict[str, float] = {}
         self._preflight_held: dict[str, set[str]] = {}
         # ── coder.solve() board seam (ADR 0064 P2, opt-in) ─────────────────────────
@@ -1299,6 +1303,7 @@ class BoardLoop:
                     # the loop itself blocked and is needed to release them on recovery.
                     self._preflight_state.clear()
                     self._last_preflight.clear()
+                    self._preflight_dirty.clear()
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)
@@ -1959,7 +1964,7 @@ class BoardLoop:
                     if (
                         self.review_gate
                         and LABEL_REVIEW_PENDING in (f.get("labels") or [])
-                        and store.get_feature(fid).get("board_state") == "in_review"
+                        and (store.get_feature(fid) or {}).get("board_state") == "in_review"
                     ):
                         await self._review_gate(store, fid, pr_url, repo)
                     # The MERGE edge — last, so it sees this pass's rebase / verify /
@@ -2036,6 +2041,9 @@ class BoardLoop:
         ``auto_merge_max`` times, then recorded on the bead and left for a human —
         never a block: the work is good, only the merge didn't land."""
         feature = store.get_feature(fid)
+        if feature is None:  # card deleted between the reconcile snapshot and this re-read
+            log.debug("[project_board] %s vanished before auto-merge — nothing to merge", fid)
+            return False
         why = await self._auto_merge_blockers(store, feature, pr_url, repo)
         if why:
             self._note_draft_hold(store, fid, pr_url, why)
@@ -3372,6 +3380,7 @@ class BoardLoop:
                 seen.add(name)
                 names.append(name)
         now = time.monotonic()
+        ran = False
         for name in names:
             cmd = self._local_gate_cmd_for({"project": name})
             if not cmd:
@@ -3385,15 +3394,33 @@ class BoardLoop:
             if state is not None and (now - self._last_preflight.get(name, 0.0)) < max(self.interval, 60.0):
                 continue
             self._last_preflight[name] = now
-            await self._preflight(name, cmd, self._repo_for({"project": name}))
+            ran = True
+            await self._preflight(
+                name,
+                cmd,
+                self._repo_for({"project": name}),
+                self._base_branch_for({"project": name}),
+            )
+        if ran:
+            # Surface the verdicts on /status (#255) — a board that stops picking work
+            # up must be able to say why without the operator reading the log.
+            health.publish_preflight(self._preflight_state, self._preflight_dirty)
 
-    async def _preflight(self, name: str, cmd: str, repo: str) -> None:
-        """Smoke-run project ``name``'s gate on its CLEAN base checkout (coders only ever
-        touch worktrees, so it stays at base). Sets ``self._preflight_state[name]``:
-        ``True`` when the gate exits 0 (runnable), a reason string on a CLEAN non-zero exit
-        or a launch failure (broken environment → hold THIS project's work). A TIMEOUT is
-        indeterminate → allow (a slow gate must not wedge the board). Releases this
-        project's holds on recovery."""
+    async def _preflight(self, name: str, cmd: str, repo: str, base: str = "") -> None:
+        """Smoke-run project ``name``'s gate on its base checkout. Sets
+        ``self._preflight_state[name]``: ``True`` when the gate exits 0 (runnable), a
+        reason string on a CLEAN non-zero exit or a launch failure (broken environment →
+        hold THIS project's work). A TIMEOUT is indeterminate → allow (a slow gate must
+        not wedge the board). Releases this project's holds on recovery.
+
+        A DIRTY checkout is indeterminate too (#255). Coders only touch worktrees, so the
+        main checkout normally still sits at base — but the OPERATOR edits it by hand, and
+        then the gate we just ran was a verdict on their uncommitted work, not on the base
+        every worktree branches from. Holding a project on that is the worse of the two
+        errors: it freezes real work over a local edit, and the only symptom the board
+        shows is an empty ``selected: []``. So a failure on dirty is downgraded to allow
+        with a loud, named warning, and the dirt is recorded for /status. Fail-closed is
+        preserved exactly where it is meaningful — a CLEAN checkout with a red gate."""
         log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -3420,13 +3447,33 @@ class BoardLoop:
             if proc.returncode == 0:
                 if isinstance(self._preflight_state.get(name), str):
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
+                self._preflight_dirty.pop(name, None)
                 self._preflight_state[name] = True
                 self._release_preflight_holds(name)
                 return
             text = (out or b"").decode("utf-8", "replace").strip()
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
-            self._preflight_state[name] = text or f"gate exited {proc.returncode} with no output"
+            text = text or f"gate exited {proc.returncode} with no output"
+            # Only a CLEAN checkout can convict the base (#255) — see the docstring.
+            dirt = await worktree.base_checkout_dirt(repo, base)
+            if dirt:
+                self._preflight_dirty[name] = dirt
+                self._preflight_state[name] = True
+                self._release_preflight_holds(name)
+                log.warning(
+                    "[project_board] preflight[%s] FAILED but the checkout at %s is NOT at base (%s) — "
+                    "the gate ran against those local edits, not the base every worktree branches from, "
+                    "so this verdict is indeterminate and dispatch is ALLOWED. Commit/stash to get a real "
+                    "verdict. Gate output:\n%s",
+                    name,
+                    repo,
+                    dirt,
+                    text,
+                )
+                return
+            self._preflight_dirty.pop(name, None)
+            self._preflight_state[name] = text
             log.error(
                 "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
                 "HOLDING that project's work until the environment is fixed:\n%s",
