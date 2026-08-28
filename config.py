@@ -22,8 +22,9 @@ name survives even when it also matches the blacklist.
 There is a second, stricter tier (F8a): the loop's own gate/format/preflight
 children run repo-defined commands over coder-written code, so they don't get
 "everything minus the host block" — they get a narrow **allowlist** (the baseline
-a build/test toolchain needs: PATH, HOME, locale, TMPDIR, TERM, SHELL, USER, CI)
-plus ``env_passthrough``, and nothing else. ``sanitized_env(mode="allowlist")``
+a build/test toolchain needs: PATH, HOME, locale, TMPDIR, TERM, SHELL, USER, CI,
+and the Windows system mirror of the same — SYSTEMROOT above all) plus
+``env_passthrough``, and nothing else. ``sanitized_env(mode="allowlist")``
 builds that environment. The coder's own ACP session environment is host-managed
 and deliberately stays on the blacklist tier — see the NOTE at the bottom.
 """
@@ -46,8 +47,41 @@ ENV_BLACKLIST_EXACT: frozenset[str] = frozenset({"AGENT_NAME"})
 # Everything outside this baseline is dropped in allowlist mode unless the
 # deployment names it in ``env_passthrough``. Kept deliberately small — extend only
 # for variables a generic build/test toolchain cannot run without.
+#
+# The Windows names mirror the POSIX baseline (HOME → USERPROFILE/HOMEDRIVE/
+# HOMEPATH, TMPDIR → TEMP/TMP, SHELL → COMSPEC, USER → USERNAME, PATH → PATHEXT
+# for executable resolution, dot-dirs → APPDATA/LOCALAPPDATA) plus the system
+# block: subprocess REQUIRES a valid SystemRoot in an explicit child environment
+# on Windows — without it children can fail to start at all. Exact-name matching
+# is safe because Python upper-cases ``os.environ`` keys on Windows.
 ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
-ENV_ALLOWLIST_EXACT: frozenset[str] = frozenset({"PATH", "HOME", "LANG", "TMPDIR", "TERM", "SHELL", "USER", "CI"})
+ENV_ALLOWLIST_EXACT: frozenset[str] = frozenset(
+    {
+        # POSIX / cross-platform baseline.
+        "PATH",
+        "HOME",
+        "LANG",
+        "TMPDIR",
+        "TERM",
+        "SHELL",
+        "USER",
+        "CI",
+        # Windows system block + baseline mirror (see comment above).
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    }
+)
 
 
 def is_host_identity_var(name: str) -> bool:

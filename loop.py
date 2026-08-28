@@ -1142,9 +1142,10 @@ class BoardLoop:
         """The sanitized environment for a subprocess the loop spawns directly (gate
         preflight, ``local_gate_cmd``, ``format_cmd``). These children run repo-defined
         commands over coder-written code, so they get the narrow ALLOWLIST baseline
-        (PATH/HOME/locale/TMPDIR/TERM/SHELL/USER/CI) plus ``env_passthrough`` — not
-        merely ``os.environ`` minus the host block (F8a, tightening #78). The coder's
-        ACP session environment stays on the blacklist tier (see config.py)."""
+        (PATH/HOME/locale/TMPDIR/TERM/SHELL/USER/CI and its Windows system mirror —
+        see config.py) plus ``env_passthrough`` — not merely ``os.environ`` minus the
+        host block (F8a, tightening #78). The coder's ACP session environment stays
+        on the blacklist tier (see config.py)."""
         return config.sanitized_env(self.env_passthrough, mode="allowlist")
 
     # ── per-feature project resolution (#90 slice 2) ──────────────────────────────

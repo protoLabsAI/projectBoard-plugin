@@ -120,6 +120,24 @@ def test_parse_env_passthrough_accepts_list_and_string():
 def test_is_allowlisted_var_matches_baseline():
     for name in ("PATH", "HOME", "LANG", "TMPDIR", "TERM", "SHELL", "USER", "CI"):
         assert config.is_allowlisted_var(name), name
+    # The Windows mirror of the same baseline — SYSTEMROOT above all: subprocess
+    # requires it in an explicit child environment for children to start on Windows.
+    for name in (
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ):
+        assert config.is_allowlisted_var(name), name
     # Locale is a prefix match — every LC_* var is baseline.
     assert config.is_allowlisted_var("LC_ALL")
     assert config.is_allowlisted_var("LC_CTYPE")
@@ -130,7 +148,7 @@ def test_is_allowlisted_var_matches_baseline():
     assert not config.is_allowlisted_var("A2A_TOKEN")
     # Exact names are exact, not prefixes.
     assert not config.is_allowlisted_var("HOMEBREW_PREFIX")
-    assert not config.is_allowlisted_var("PATHEXT")
+    assert not config.is_allowlisted_var("TERMINFO")
 
 
 def test_sanitized_env_allowlist_keeps_only_baseline():
@@ -155,6 +173,32 @@ def test_sanitized_env_allowlist_keeps_only_baseline():
         PROTOAGENT_ID="abc",
         A2A_TOKEN="secret",
     )
+    assert config.sanitized_env(environ=src, mode="allowlist") == baseline
+
+
+def test_sanitized_env_allowlist_keeps_windows_system_baseline():
+    """A Windows-shaped environment keeps the system block with NO env_passthrough —
+    SYSTEMROOT above all: subprocess requires a valid SystemRoot in an explicit
+    child environment, so dropping it can stop children from starting at all
+    (the review finding on the first F8a cut)."""
+    baseline = {
+        "PATH": r"C:\Windows\system32",
+        "SYSTEMROOT": r"C:\Windows",
+        "SYSTEMDRIVE": "C:",
+        "WINDIR": r"C:\Windows",
+        "COMSPEC": r"C:\Windows\system32\cmd.exe",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "TEMP": r"C:\Users\op\AppData\Local\Temp",
+        "TMP": r"C:\Users\op\AppData\Local\Temp",
+        "USERPROFILE": r"C:\Users\op",
+        "HOMEDRIVE": "C:",
+        "HOMEPATH": r"\Users\op",
+        "USERNAME": "op",
+        "APPDATA": r"C:\Users\op\AppData\Roaming",
+        "LOCALAPPDATA": r"C:\Users\op\AppData\Local",
+    }
+    # A Windows var outside the baseline and a host-identity var are still dropped.
+    src = dict(baseline, PROCESSOR_LEVEL="6", AGENT_NAME="host-agent")
     assert config.sanitized_env(environ=src, mode="allowlist") == baseline
 
 
