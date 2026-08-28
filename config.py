@@ -19,12 +19,13 @@ genuinely needs a specific variable to reach children keeps it via the
 ``env_passthrough`` **whitelist** config knob — the whitelist wins, so a listed
 name survives even when it also matches the blacklist.
 
-There is a second, stricter tier (F8a): the loop's own gate/format/preflight
-children run repo-defined commands over coder-written code, so they don't get
-"everything minus the host block" — they get a narrow **allowlist** (the baseline
-a build/test toolchain needs: PATH, HOME, locale, TMPDIR, TERM, SHELL, USER, CI,
-and the Windows system mirror of the same — SYSTEMROOT above all) plus
-``env_passthrough``, and nothing else. ``sanitized_env(mode="allowlist")``
+There is a second, stricter tier (F8a, extended by F8b): the loop's own
+gate/format/preflight children and the ``coder.solve()`` seam's acceptance-test
+(verify) child all run repo-defined commands over coder-written code, so they
+don't get "everything minus the host block" — they get a narrow **allowlist**
+(the baseline a build/test toolchain needs: PATH, HOME, locale, TMPDIR, TERM,
+SHELL, USER, CI, and the Windows system mirror of the same — SYSTEMROOT above
+all) plus ``env_passthrough``, and nothing else. ``sanitized_env(mode="allowlist")``
 builds that environment. The coder's own ACP session environment is host-managed
 and deliberately stays on the blacklist tier — see the NOTE at the bottom.
 """
@@ -41,7 +42,7 @@ from collections.abc import Iterable, Mapping
 ENV_BLACKLIST_PREFIXES: tuple[str, ...] = ("PROTOAGENT_", "A2A_")
 ENV_BLACKLIST_EXACT: frozenset[str] = frozenset({"AGENT_NAME"})
 
-# The baseline a gate/format/preflight child legitimately needs (F8a): enough to
+# The baseline a gate/format/preflight/verify child legitimately needs (F8a): enough to
 # find its toolchain (PATH), resolve config/caches (HOME, TMPDIR), speak the right
 # locale (LANG, LC_*), and behave sanely in a terminal/CI (TERM, SHELL, USER, CI).
 # Everything outside this baseline is dropped in allowlist mode unless the
@@ -91,8 +92,8 @@ def is_host_identity_var(name: str) -> bool:
 
 
 def is_allowlisted_var(name: str) -> bool:
-    """True if ``name`` is in the baseline allowlist for gate/format/preflight child
-    environments (before the ``env_passthrough`` whitelist is applied) — F8a."""
+    """True if ``name`` is in the baseline allowlist for gate/format/preflight/verify
+    child environments (before the ``env_passthrough`` whitelist is applied) — F8a/F8b."""
     return name in ENV_ALLOWLIST_EXACT or name.startswith(ENV_ALLOWLIST_PREFIXES)
 
 
@@ -127,10 +128,11 @@ def sanitized_env(
     variable is dropped when :func:`is_host_identity_var` matches it. This is the
     posture for the coder's ACP session environment.
 
-    ``mode="allowlist"`` (F8a): keep ONLY the baseline a build/test toolchain needs
-    — a variable is dropped unless :func:`is_allowlisted_var` matches it. This is
-    the posture for the loop's gate/format/preflight children, which run
-    repo-defined commands over coder-written code.
+    ``mode="allowlist"`` (F8a/F8b): keep ONLY the baseline a build/test toolchain
+    needs — a variable is dropped unless :func:`is_allowlisted_var` matches it.
+    This is the posture for the loop's gate/format/preflight children and the
+    ``coder.solve()`` seam's acceptance-test (verify) child, which run repo-defined
+    commands over coder-written code.
 
     In both modes a name in ``passthrough`` survives (the whitelist wins). Returns
     a fresh dict — the source mapping is never mutated — safe to hand to
