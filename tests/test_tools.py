@@ -117,13 +117,13 @@ def _stateful_board(make_board, monkeypatch, labels=()):
     state = {"id": "bd-1", "title": "T", "board_state": "backlog", "labels": list(labels)}
     calls = []
 
-    def run_impl(*args, want_json=False):
+    def run_impl(*args, want_json=False, with_has_more=False):
         calls.append(args)
         if args and args[0] == "create":
             return "bd-1"
         if args and args[0] == "show":
             return [dict(state, status="open")]
-        return [] if want_json else ""
+        return ([], None) if with_has_more else ([] if want_json else "")
 
     b = make_board(run_impl)
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: b)

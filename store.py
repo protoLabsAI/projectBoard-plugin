@@ -132,6 +132,26 @@ def _issues_envelope(parsed):
     return parsed
 
 
+def _warn_blocking_on_event_loop(op: str) -> None:
+    """Detect a blocking ``br`` invocation ON an asyncio event-loop thread (#258).
+
+    ``_run`` blocks in ``subprocess.run`` (30s timeout) and ``time.sleep`` (the
+    contention backoff, ~6.3s worst case) — on the event-loop thread that stalls
+    EVERY coroutine (the tick, all routes) for the duration. Async callers must
+    offload store work via ``asyncio.to_thread``; this module-level seam is how
+    that contract is detected — tests patch/observe it, production logs a warning.
+    Observational, NOT a raise: the loop/API offloads land in their own cards, so
+    the legacy on-loop call sites must degrade to a loud log, not a dead tick."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # a worker/plain thread with no running loop — the right place to block
+    log.warning(
+        "[project_board] blocking `br %s` on the event-loop thread — wrap the store call in asyncio.to_thread (#258)",
+        op,
+    )
+
+
 # Labels that encode board state / escalation (everything else is free-form).
 LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
@@ -608,10 +628,6 @@ class BeadsBoard:
         # mutate the policy under us.
         self.max_files_by_difficulty = dict(max_files_by_difficulty or MAX_FILES_BY_DIFFICULTY)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
-        # has_more off the last want_json `_run` (#138): the 0.2.x envelope carries it,
-        # 0.1.x doesn't → None means "shape absent, trust --limit 0". Read right after the
-        # `_run` that set it, before any other want_json call overwrites it.
-        self._last_json_has_more = None
 
     def reconfigure_projects(self, projects: dict | None, default_project: str = "") -> None:
         """Replace the live multi-project routing map without rebuilding the board.
@@ -662,7 +678,14 @@ class BeadsBoard:
         self._workspace_ready = True
 
     # ── br invocation ─────────────────────────────────────────────────────────
-    def _run(self, *args: str, want_json: bool = False):
+    def _run(self, *args: str, want_json: bool = False, with_has_more: bool = False):
+        """Shell one ``br`` command; THE blocking seam (subprocess + contention sleeps),
+        so async callers must reach it via ``asyncio.to_thread`` (#258 — see
+        ``_warn_blocking_on_event_loop``). With ``want_json`` returns the normalized
+        payload; adding ``with_has_more`` returns ``(payload, has_more)`` instead, the
+        truncation signal riding THIS call's return value — never instance state a
+        concurrent caller could overwrite before it's read."""
+        _warn_blocking_on_event_loop(args[0] if args else "")
         self._ensure_workspace()  # pin to the repo's own .beads/ before any br op (#48)
         cmd = [BR, *args, "--actor", self.actor]
         if self.db:
@@ -728,11 +751,14 @@ class BeadsBoard:
         except json.JSONDecodeError as exc:
             raise BoardError(f"`br {args[0]}` returned non-JSON: {exc} :: {out[:200]}")
         # #138: br 0.2.x wraps list payloads in an envelope ({"issues":[…],"has_more":…})
-        # where 0.1.x returned a bare list. Stash has_more off the envelope (None when the
+        # where 0.1.x returned a bare list. Lift has_more off the envelope (None when the
         # shape is absent, so a truncation check guards on SHAPE, never a version sniff),
         # then normalize the payload to the list/dict every call site already consumes.
-        self._last_json_has_more = parsed["has_more"] if isinstance(parsed, dict) and "has_more" in parsed else None
-        return _issues_envelope(parsed)
+        # has_more travels in the RETURN value (#258): the old instance stash was shared
+        # state a concurrent to_thread caller could clobber between a write and its read.
+        has_more = parsed["has_more"] if isinstance(parsed, dict) and "has_more" in parsed else None
+        payload = _issues_envelope(parsed)
+        return (payload, has_more) if with_has_more else payload
 
     def _create(
         self,
@@ -1933,32 +1959,32 @@ class BeadsBoard:
         # needs `closed` features too (that's the Done column). `--limit 0` = unlimited
         # (see the exhaustiveness invariant above): the 50-row default would truncate the
         # projection before the Python state filter ever ran.
-        rows = (
-            self._run(
-                "list",
-                "--type",
-                "feature",
-                "--status",
-                "open",
-                "--status",
-                "in_progress",
-                "--status",
-                "closed",
-                "--status",
-                "deferred",
-                "--limit",
-                "0",
-                want_json=True,
-            )
-            or []
+        rows, has_more = self._run(
+            "list",
+            "--type",
+            "feature",
+            "--status",
+            "open",
+            "--status",
+            "in_progress",
+            "--status",
+            "closed",
+            "--status",
+            "deferred",
+            "--limit",
+            "0",
+            want_json=True,
+            with_has_more=True,
         )
+        rows = rows or []
         # #138/#114: on br 0.2.x the envelope reports has_more — turn `--limit 0` = unbounded
         # from an ASSUMPTION into an assertion. A `--limit 0` page that still reports more rows
         # means the exhaustiveness invariant is broken and this projection would be silently
         # truncated (every consumer reads it as the whole board); fail loud instead of guessing.
         # Guarded on has_more SHAPE presence — None on 0.1.x, where `--limit 0` stays trusted —
-        # not a version sniff. Checked BEFORE ready_queue() below, whose own _run overwrites it.
-        if self._last_json_has_more:
+        # not a version sniff. The signal rides THIS `_run`'s return value (#258), so no other
+        # call — concurrent or the ready_queue() below — can overwrite it before this check.
+        if has_more:
             raise BoardError(
                 "`br list --limit 0` reported has_more=true — the unbounded feature query was "
                 "truncated, so the board projection would be incomplete (#114/#138). Check the "

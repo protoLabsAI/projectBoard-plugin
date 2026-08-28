@@ -40,7 +40,7 @@ class _StatefulBr:
         self.state = state
         self.calls = []
 
-    def __call__(self, *args, want_json=False):
+    def __call__(self, *args, want_json=False, with_has_more=False):
         self.calls.append(args)
         if args and args[0] == "update":
             i = 2
@@ -65,7 +65,7 @@ class _StatefulBr:
                 elif flag == "--add-label":
                     self.state.setdefault("labels", []).append(val)
                 i += step
-        return [] if want_json else ""
+        return ([], None) if with_has_more else ([] if want_json else "")
 
     def cmds(self, name):
         return [a for a in self.calls if a and a[0] == name]

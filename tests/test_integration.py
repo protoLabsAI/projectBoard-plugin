@@ -408,21 +408,24 @@ def test_limit_zero_is_unbounded_and_a_cap_truncates(board):
 @pytest.mark.br_shape
 def test_has_more_rides_the_0_2_envelope_and_unbounded_never_truncates(board):
     """`has_more` (#138): the 0.2.x envelope carries it, 0.1.x has no envelope at all,
-    so `_run` stashes it as a bool on 0.2.16 and as None on 0.1.23 — the SHAPE-presence
-    signal `list_features` guards truncation on (never a version sniff). A real cap with
-    rows to spare reports more on 0.2.16 (True) / nothing on 0.1.23 (None); the unbounded
-    `--limit 0` the projection actually issues must report has_more=false on 0.2.16 (never
-    None-vs-True ambiguity → no BoardError) and None on 0.1.23. Either way list_features
-    returns the whole board without raising — the assertion the exhaustiveness invariant
-    now IS, rather than merely assumes."""
+    so `_run --json … with_has_more` returns it as a bool on 0.2.16 and as None on 0.1.23
+    — the SHAPE-presence signal `list_features` guards truncation on (never a version
+    sniff), riding each call's return value rather than shared state (#258). A real cap
+    with rows to spare reports more on 0.2.16 (True) / nothing on 0.1.23 (None); the
+    unbounded `--limit 0` the projection actually issues must report has_more=false on
+    0.2.16 (never None-vs-True ambiguity → no BoardError) and None on 0.1.23. Either way
+    list_features returns the whole board without raising — the assertion the
+    exhaustiveness invariant now IS, rather than merely assumes."""
     fids = {board.create_feature(f"feat {i}", spec="s")["id"] for i in range(3)}
-    board._run("list", "--limit", "1", want_json=True)  # a real cap, 2 rows to spare
-    assert board._last_json_has_more in (True, None), (
+    # a real cap, 2 rows to spare
+    _rows, has_more = board._run("list", "--limit", "1", want_json=True, with_has_more=True)
+    assert has_more in (True, None), (
         "a capped query with rows to spare must report has_more=true on the 0.2.x "
-        f"envelope (None on 0.1.x, no envelope) — got {board._last_json_has_more!r}"
+        f"envelope (None on 0.1.x, no envelope) — got {has_more!r}"
     )
-    board._run("list", "--limit", "0", want_json=True)  # the unbounded query the projection uses
-    assert board._last_json_has_more in (False, None)  # never True → the truncation guard stays quiet
+    # the unbounded query the projection uses
+    _rows, has_more = board._run("list", "--limit", "0", want_json=True, with_has_more=True)
+    assert has_more in (False, None)  # never True → the truncation guard stays quiet
     feats = board.list_features()  # so the projection completes without a BoardError…
     assert {f["id"] for f in feats} == fids  # …and really is the whole board
 
