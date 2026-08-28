@@ -88,7 +88,18 @@ function flags(f){
   if (f.difficulty) out += '<span class="pl-badge">'+esc(f.difficulty)+'</span>';
   return out;
 }
-function pr(f){ return f.pr_url ? '<a class="pr" href="'+esc(f.pr_url)+'" target="_blank">PR ↗</a>' : ""; }
+// Render-side half of the external-ref gate (the store's normalize_external_ref is the
+// persistence half), sharing sanitizeSaying()'s scheme discipline: a footer link only
+// goes live when its ref parses as an absolute http(s) URL — anything else renders as
+// the inert "#", so no other scheme ever reaches an href.
+function safeHref(u){
+  try {
+    const p = new URL(String(u));
+    if (p.protocol === "http:" || p.protocol === "https:") return p.href;
+  } catch (e) { /* not an absolute URL → inert */ }
+  return "#";
+}
+function pr(f){ return f.pr_url ? '<a class="pr" href="'+esc(safeHref(f.pr_url))+'" target="_blank" rel="noopener noreferrer">PR ↗</a>' : ""; }
 
 // ── Task-type features (#217) ───────────────────────────────────────────────────
 // A task rides the SAME board lanes / priority ordering / dependency + blocked display
@@ -108,7 +119,7 @@ function docIco(f){ return isTask(f) ? '<span class="doc-ico-w">'+DOC_ICON+'</sp
 // A task's `ref` (doc URL / artifact path) lands on external_ref, which the projection
 // surfaces as `pr_url` — the same slot a coding feature's PR occupies. Rendered as a
 // plain "ref ↗" link, distinct from a coding feature's "PR ↗".
-function taskRef(f){ return f.pr_url ? '<a class="pr" href="'+esc(f.pr_url)+'" target="_blank">ref ↗</a>' : ""; }
+function taskRef(f){ return f.pr_url ? '<a class="pr" href="'+esc(safeHref(f.pr_url))+'" target="_blank" rel="noopener noreferrer">ref ↗</a>' : ""; }
 // A card's footer link: a task shows its external ref, a coding feature its PR.
 function taskFoot(f){ return isTask(f) ? taskRef(f) : pr(f); }
 
@@ -391,6 +402,11 @@ function toolLine(t){
 // inline (the fallback). "thinking" (thought_tail) is internal reasoning, not prose, so
 // it stays plain esc()'d text — only "saying" is upgraded.
 const MARKED_CDN = "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js";
+// Subresource-integrity pin for the 12.0.2 artifact (cdnjs-published sha512): the script
+// only executes if the fetched bytes match, so a tampered CDN response fails closed into
+// s.onerror → the plain esc()'d fallback. crossorigin=anonymous is what makes the
+// integrity check enforceable on a cross-origin script.
+const MARKED_SRI = "sha512-xeUh+KxNyTufZOje++oQHstlMQ8/rpyzPuM+gjMFYK3z5ILJGE7l2NvYL+XfliKURMpBIKKp1XoPN/qswlSMFA==";
 let MARKED = null, MARKED_LOAD = null;
 function loadMarked(){
   if (MARKED_LOAD) return MARKED_LOAD;                    // load once; cache the promise
@@ -398,6 +414,8 @@ function loadMarked(){
     if (window.marked) return resolve(window.marked);
     const s = document.createElement("script");
     s.src = MARKED_CDN;
+    s.integrity = MARKED_SRI;
+    s.crossOrigin = "anonymous";
     s.async = true;                                       // lazy — never blocks initial paint
     s.onload = () => resolve(window.marked || null);
     s.onerror = () => resolve(null);                      // CDN blocked/offline → plain-text fallback
