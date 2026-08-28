@@ -446,9 +446,11 @@ def normalize_external_ref(raw, *, edge: str) -> str:
 
     Trims, then requires a stripped absolute http(s) URL (``urlparse`` scheme in
     {http, https} + a host). Empty input returns "" (no ref recorded). Anything
-    else — another scheme, a bare path — raises a named BoardError at persistence,
-    the first half of the two-sided gate (the view's ``safeHref`` is the render
-    half), so a non-link ref never lands where an href is minted from it."""
+    else raises a named BoardError at persistence, the first half of the two-sided
+    gate (the view's ``safeHref`` is the render half), so a non-http(s) ref never
+    lands where an href is minted from it. Callers with a legitimate non-link slot
+    route around it — record_delivery sends scheme-less artifact paths to the
+    `deliverable:` comment record instead of through this gate."""
     s = str(raw or "").strip()
     if not s:
         return ""
@@ -1435,11 +1437,15 @@ class BeadsBoard:
     def record_delivery(self, fid: str, text: str = "", ref: str = "") -> dict:
         """Record a task-type bead's DELIVERABLE (#217) — the task sibling of the
         coder's open_pr → open_review edge. ``text`` rides a `deliverable:` comment
-        (the projection's `deliverable` field reads the latest one back); an optional
-        ``ref`` (a doc URL — absolute http(s) only, gated by normalize_external_ref)
-        lands on `external_ref` — the same slot a coding feature's pr_url occupies,
-        so link consumers just work. A non-URL artifact ref belongs in ``text``.
-        Moves in_progress → in_review via the same `in-review` label as open_review.
+        (the projection's `deliverable` field reads the latest one back). An optional
+        ``ref`` splits by SHAPE: an absolute http(s) URL lands on `external_ref` —
+        the same slot a coding feature's pr_url occupies, so link consumers just
+        work — while a scheme-less artifact path (`docs/adr/0099-task.md`) stays a
+        first-class deliverable ref but rides the `deliverable:` comment record
+        instead, so it is recorded without ever landing where the board mints an
+        href. A link-shaped ref with any OTHER scheme is refused
+        (normalize_external_ref). Moves in_progress → in_review via the same
+        `in-review` label as open_review.
 
         TASK-ONLY: a coding feature taking this edge would enter review with no
         pr_url and strand the merge reconciler — the exact hole open_review's
@@ -1451,12 +1457,22 @@ class BeadsBoard:
             )
         if f["board_state"] != "in_progress":
             raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
-        ref = normalize_external_ref(ref, edge="record_delivery")  # refuse BEFORE any write lands
+        # Classify the ref by shape BEFORE any write lands: link-shaped (a scheme, or
+        # a protocol-relative //host) must pass the strict http(s) gate to reach
+        # external_ref; a scheme-less artifact path folds into the deliverable record.
+        ref = str(ref or "").strip()
+        parts = urlparse(ref)
+        if parts.scheme or parts.netloc:
+            external_ref = normalize_external_ref(ref, edge="record_delivery")
+        else:
+            external_ref = ""
+            if ref:
+                text = f"{text} ({ref})" if text else ref
         if text:
             self._comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
-        if ref:
-            args += ["--external-ref", ref]
+        if external_ref:
+            args += ["--external-ref", external_ref]
         self._run(*args)
         return self.get_feature(fid)
 

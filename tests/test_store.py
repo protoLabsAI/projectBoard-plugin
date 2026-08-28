@@ -2856,15 +2856,17 @@ def test_record_delivery_strips_the_ref_before_persisting(make_board, monkeypatc
     "bad_ref",
     [
         "ftp://files.example/report.pdf",  # a real URL, wrong scheme
-        "docs/adr/0099-task.md",  # a bare path — no scheme at all
         "artifact://y",  # a made-up scheme
         "https://",  # http(s) scheme but no host — not a usable link
+        "//files.example/report.pdf",  # protocol-relative — link-shaped, no fixed scheme
     ],
 )
-def test_record_delivery_refuses_a_non_http_ref_with_nothing_written(make_board, monkeypatch, bad_ref):
-    """The external-ref slot renders as a live board link, so record_delivery refuses
-    anything but an absolute http(s) URL — with a named rule, and BEFORE the
-    deliverable comment or the state move lands (no half-applied delivery)."""
+def test_record_delivery_refuses_a_non_http_link_ref_with_nothing_written(make_board, monkeypatch, bad_ref):
+    """A LINK-SHAPED ref (it has a scheme, or a protocol-relative //host) must be an
+    absolute http(s) URL to land on external_ref — the slot the board renders as a
+    live link — so anything else is refused with a named rule, BEFORE the deliverable
+    comment or the state move lands (no half-applied delivery). Scheme-less artifact
+    paths are NOT refused — they ride the deliverable comment (tests below)."""
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
@@ -2881,6 +2883,35 @@ def test_record_delivery_accepts_plain_http_refs_too(make_board, monkeypatch):
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
     b.record_delivery("bd-t", ref="http://wiki.internal/adr/7")
     assert ("update", "bd-t", "--add-label", "in-review", "--external-ref", "http://wiki.internal/adr/7") in br.calls
+
+
+def test_record_delivery_still_accepts_a_relative_artifact_ref(make_board, monkeypatch):
+    """The pre-hardening contract holds: a scheme-less artifact path is a first-class
+    deliverable ref — the delivery records it and the bead moves to review. What
+    changed is WHERE it lands: the path folds into the `deliverable:` comment (the
+    record the projection's `deliverable` field reads back), never --external-ref,
+    so the board can't mint an href from it."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    f = b.record_delivery("bd-t", text="ADR written", ref="docs/adr/0099-task.md")
+    assert ("comments", "add", "bd-t", "deliverable: ADR written (docs/adr/0099-task.md)") in br.calls
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # the path never reaches external_ref
+    assert f["board_state"] == "in_review"
+
+
+def test_record_delivery_records_a_path_only_ref_as_the_deliverable(make_board, monkeypatch):
+    """ref-only delivery with an artifact path: the path IS the deliverable record."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", ref="docs/adr/0099-task.md")
+    assert ("comments", "add", "bd-t", "deliverable: docs/adr/0099-task.md") in br.calls
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # the path never reaches external_ref
 
 
 def test_record_delivery_rejects_a_non_in_progress_state(make_board, monkeypatch):
