@@ -4802,6 +4802,101 @@ async def test_preflight_fails_closed_when_gate_cannot_launch(monkeypatch):
     assert "could not run" in lp._preflight_state["default"]
 
 
+async def test_preflight_identical_refailure_one_error_one_line_warning(monkeypatch, caplog):
+    """#263 (r1): the ~60s re-check of a held gate must not repeat the multi-KB tail
+    at ERROR while the failure is unchanged — the full tail is logged ONCE, and each
+    identical re-check collapses to a one-line "still held (Ns)" WARNING."""
+    import logging
+
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+
+    async def _shell(*a, **k):
+        return _FakeProc(1, b"apps/x build: sh: 1: tsc: not found")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        await lp._maybe_preflight()
+        lp._last_preflight["default"] = -10_000.0  # bypass the re-check throttle
+        await lp._maybe_preflight()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "PREFLIGHT" in r.message]
+    assert len(errors) == 1 and "tsc: not found" in errors[0].message
+    stills = [r for r in caplog.records if r.levelno == logging.WARNING and "still held" in r.message]
+    assert len(stills) == 1
+    assert len(stills[0].message.splitlines()) == 1  # one line — no repeated tail
+    assert "tsc: not found" not in stills[0].message
+    assert isinstance(lp._preflight_state["default"], str)  # still fail-closed
+
+
+async def test_preflight_different_failure_logs_full_error_again(monkeypatch, caplog):
+    """#263: a DIFFERENT failure is new diagnostic signal — the full tail is logged
+    at ERROR again, not swallowed by the still-held rate limit."""
+    import logging
+
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+    outs = [b"sh: 1: tsc: not found", b"sh: 1: eslint: not found"]
+
+    async def _shell(*a, **k):
+        return _FakeProc(1, outs.pop(0))
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        await lp._maybe_preflight()
+        lp._last_preflight["default"] = -10_000.0
+        await lp._maybe_preflight()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "PREFLIGHT" in r.message]
+    assert len(errors) == 2
+    assert "tsc: not found" in errors[0].message and "eslint: not found" in errors[1].message
+    assert not [r for r in caplog.records if "still held" in r.message]
+
+
+async def test_preflight_launch_failure_repeat_also_rate_limited(monkeypatch, caplog):
+    """#263: the cannot-launch path re-checks on the same cadence — an unchanged
+    launch failure gets the same one-ERROR-then-WARNING treatment."""
+    import logging
+
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+
+    async def _shell(*a, **k):
+        raise FileNotFoundError("pnpm")
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        await lp._maybe_preflight()
+        lp._last_preflight["default"] = -10_000.0
+        await lp._maybe_preflight()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "PREFLIGHT" in r.message]
+    assert len(errors) == 1 and "could not run" in errors[0].message
+    stills = [r for r in caplog.records if r.levelno == logging.WARNING and "still held" in r.message]
+    assert len(stills) == 1
+
+
+async def test_preflight_refailure_after_recovery_logs_full_error(monkeypatch, caplog):
+    """#263: recovery resets the rate limit — a project that recovers and then fails
+    again (even with the SAME reason) gets the full ERROR, not a "still held" line."""
+    import logging
+
+    lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: _PreflightStore(ready=["bd-1"]))
+    procs = [_FakeProc(1, b"tsc: not found"), _FakeProc(0), _FakeProc(1, b"tsc: not found")]
+
+    async def _shell(*a, **k):
+        return procs.pop(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        await lp._maybe_preflight()  # fail → full ERROR
+        lp._last_preflight["default"] = -10_000.0
+        await lp._maybe_preflight()  # recover
+        lp._preflight_state["default"] = None  # eligible for a fresh check (passed is sticky)
+        await lp._maybe_preflight()  # same failure again → full ERROR again
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "PREFLIGHT" in r.message]
+    assert len(errors) == 2
+    assert not [r for r in caplog.records if "still held" in r.message]
+
+
 async def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
     lp._preflight_state = {"default": "gate exited 1: tsc: not found"}  # simulate a failed preflight

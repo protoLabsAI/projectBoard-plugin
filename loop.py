@@ -880,6 +880,11 @@ class BoardLoop:
         self._preflight_dirty: dict[str, str] = {}
         self._last_preflight: dict[str, float] = {}
         self._preflight_held: dict[str, set[str]] = {}
+        # When each project's CURRENT failure reason was first logged in full (#263).
+        # A held project re-checks every ~60s; the multi-KB gate tail is ERROR-worthy
+        # once per DISTINCT reason, and identical repeats collapse to a one-line
+        # "still held (Ns)" WARNING (see _record_preflight_failure).
+        self._preflight_failed_at: dict[str, float] = {}
         # ── coder.solve() board seam (ADR 0064 P2, opt-in) ─────────────────────────
         # Route a FRESH build (not a keep-worktree/CI-bounce re-dispatch) through the
         # `coder` plugin's execution-grounded solve() ladder (greedy → best-of-k →
@@ -1429,6 +1434,7 @@ class BoardLoop:
                     self._preflight_state.clear()
                     self._last_preflight.clear()
                     self._preflight_dirty.clear()
+                    self._preflight_failed_at.clear()
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)
@@ -3643,6 +3649,7 @@ class BoardLoop:
                 if isinstance(self._preflight_state.get(name), str):
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
                 self._preflight_dirty.pop(name, None)
+                self._preflight_failed_at.pop(name, None)
                 self._preflight_state[name] = True
                 await asyncio.to_thread(self._release_preflight_holds, name)
                 return
@@ -3668,25 +3675,46 @@ class BoardLoop:
                 )
                 return
             self._preflight_dirty.pop(name, None)
-            self._preflight_state[name] = text
-            log.error(
-                "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
-                "HOLDING that project's work until the environment is fixed:\n%s",
-                name,
-                self._preflight_state[name],
-            )
+            if self._record_preflight_failure(name, text):
+                log.error(
+                    "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
+                    "HOLDING that project's work until the environment is fixed:\n%s",
+                    name,
+                    text,
+                )
         except asyncio.CancelledError:
             if self._shutting_down:
                 log.info("[project_board] preflight[%s] cancelled by shutdown — no verdict", name)
                 return
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
-            self._preflight_state[name] = f"gate command could not run: {exc}"
-            log.error(
-                "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
-                name,
-                self._preflight_state[name],
-            )
+            if self._record_preflight_failure(name, f"gate command could not run: {exc}"):
+                log.error(
+                    "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
+                    name,
+                    self._preflight_state[name],
+                )
+
+    def _record_preflight_failure(self, name: str, reason: str) -> bool:
+        """Set project ``name``'s failure ``reason`` and say whether to log it in full
+        (#263). The gate tail is multi-KB diagnostic signal exactly once per DISTINCT
+        failure — but a held project re-checks every ~60s, and an unchanged failure
+        re-logged at ERROR each time buries the log without adding anything. First or
+        DIFFERENT reason → True (caller emits the full ERROR); identical repeat →
+        emits a one-line "still held" WARNING here and returns False."""
+        prev = self._preflight_state.get(name)
+        now = time.monotonic()
+        self._preflight_state[name] = reason
+        if prev != reason:
+            self._preflight_failed_at[name] = now
+            return True
+        held = int(now - self._preflight_failed_at.get(name, now))
+        log.warning(
+            "[project_board] preflight[%s] still held (%ds) — same failure as last check, tail already logged",
+            name,
+            held,
+        )
+        return False
 
     def _hold_ready_for_preflight(self) -> None:
         """Flag every ready feature whose PROJECT's preflight failed blocked with that
