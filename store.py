@@ -2125,10 +2125,21 @@ class BeadsBoard:
         # needs `closed` features too (that's the Done column). `--limit 0` = unlimited
         # (see the exhaustiveness invariant above): the 50-row default would truncate the
         # projection before the Python state filter ever ran.
+        #
+        # #217/#303: the projection must span EVERY pullable issue type, not just
+        # `feature`. A `task` bead rides the same board rails (ready → claim → in_progress
+        # → in_review), so a `--type feature`-only query dropped every task from the board
+        # — invisible to board_list / GET /features, and it left the sweep's task
+        # orphan-recovery and terminal-task archival branches structurally unreachable
+        # (both enumerate list_features). Pass the SAME PULLABLE_ISSUE_TYPES the puller
+        # admits (ready_queue), as REPEATABLE `--type feature --type task` args; structural
+        # `epic`/`milestone` beads carry no such type and stay out of the projection.
+        type_args: list[str] = []
+        for itype in PULLABLE_ISSUE_TYPES:
+            type_args += ["--type", itype]
         rows, has_more = self._run(
             "list",
-            "--type",
-            "feature",
+            *type_args,
             "--status",
             "open",
             "--status",

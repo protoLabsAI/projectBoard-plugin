@@ -217,6 +217,29 @@ def test_json_shape_list_for_list_features(board):
     assert f["id"] in {feat["id"] for feat in board.list_features()}
 
 
+@requires_br  # NOT @br_shape: pins the repeatable `--type` projection behavior on the
+# 0.1.23 full-suite gate — the leg that runs the whole tier — rather than asserting
+# 0.2.16's repeated-`--type` semantics, which the 0.2.16 (`-m br_shape`) leg never runs.
+def test_mixed_type_projection_includes_tasks_excludes_structural_beads(board):
+    """#303 (r1/r2/r5): the board projection spans coding features AND task-type beads
+    (both ride the same rails: ready → claim → in_progress → in_review) but never the
+    STRUCTURAL epic/milestone beads — proven against the REAL ``br list --type feature
+    --type task`` repeatable-arg query, the class the fake ``_run`` tier is blind to. A
+    `feature`-only query dropped every task from ``list_features`` / board_list / GET
+    /features; red-is-reachable — restoring a single `--type feature` query makes the
+    task assertion below FAIL against real `br`."""
+    feat = board.create_feature("Coding feature", spec="s")
+    task = board.create_feature("Task bead", spec="s", issue_type="task")
+    epic = board.create_epic("An epic")
+    milestone = board.create_milestone("A milestone", epic["id"])
+
+    projected = {f["id"]: f for f in board.list_features()}
+    assert feat["id"] in projected and task["id"] in projected  # feature + task are IN…
+    assert epic["id"] not in projected  # …structural beads are OUT
+    assert milestone["id"] not in projected
+    assert projected[task["id"]]["issue_type"] == "task"  # and the task projects as a task
+
+
 @requires_br
 @pytest.mark.br_shape
 def test_json_shape_ready_for_claim_next_ready(board, tmp_path):

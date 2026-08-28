@@ -2746,6 +2746,48 @@ async def test_reconcile_orphan_requeues_a_dead_acp_task(monkeypatch):
     assert store.names() == ["requeue"]
 
 
+async def test_sweep_reclaims_a_dead_acp_task_end_to_end(monkeypatch):
+    """#303 (r3): a task stuck in_progress with a dead ACP drive is reclaimed by the
+    health sweep END TO END. The sweep enumerates ``list_features(state="in_progress")``
+    — which now surfaces task beads (the old `feature`-only projection hid them, so this
+    branch of ``_reconcile_orphan`` was structurally UNREACHABLE) — reaches the task
+    branch, and requeues the task for a clean re-dispatch. The task branch returns before
+    any PR/worktree probe (that path is for coding features), so ``pr_url_for_branch``
+    must never be reached — proving the task, not the feature, path handled it."""
+    task = {"id": "bd-task", "issue_type": "task", "assignee": "agent-bot", "board_state": "in_progress"}
+
+    class _Store:
+        def __init__(self):
+            self.requeued = []
+
+        def list_features(self, state=None):
+            # the fix: the in_progress projection now includes task beads
+            return [dict(task)] if state == "in_progress" else []
+
+        def get_feature(self, fid):
+            return dict(task) if fid == task["id"] else None
+
+        def requeue(self, fid):
+            self.requeued.append(fid)
+
+        def archive_stale(self, archive_after_days=7):
+            return []
+
+    store = _Store()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
+
+    async def _boom_pr(*_a, **_k):
+        raise AssertionError("a task must not probe for a PR branch — that path is for coding features")
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _boom_pr)
+    loop = BoardLoop({})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())  # agent-bot is an ACP agent
+
+    await loop._sweep()
+    assert store.requeued == ["bd-task"]  # the dead-drive task was reclaimed to ready
+
+
 async def test_spawn_ready_task_branch_leaves_coding_features_unchanged(monkeypatch):
     """r6: an issue_type=feature card is NOT diverted by the task branch — it takes the
     normal claim → _drive (worktree) path, stamping its files in _inflight_files."""
