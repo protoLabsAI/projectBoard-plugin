@@ -1783,6 +1783,50 @@ def test_features_and_webhook_reach_br_off_the_event_loop_thread(monkeypatch, ca
     assert "event-loop thread" not in caplog.text  # F2a's `_run` detection stayed quiet
 
 
+def test_run_under_an_async_caller_is_never_on_the_main_thread(monkeypatch):
+    """r1, stated literally: with the event loop owning the MAIN thread (asyncio.run
+    driving the ASGI app directly — no TestClient portal thread), patch `_run` and
+    assert every call executes with threading.current_thread() is not main_thread().
+    subprocess.run / time.sleep live inside `_run`, so this is exactly the proof that
+    neither blocks the loop during a route."""
+    import httpx
+
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    board = store_mod.BeadsBoard(db=None, repo="/repo")
+    seen = []
+
+    def run_impl(*args, want_json=False, with_has_more=False):
+        seen.append(threading.current_thread())
+        if with_has_more:
+            return ([], None)
+        return [] if want_json else ""
+
+    monkeypatch.setattr(board, "_run", run_impl)
+    monkeypatch.setattr(api, "get_store", lambda **_kw: board)
+    app = FastAPI()
+    app.include_router(api.build_router(_external_cfg()), prefix="/plugins/project_board")
+    app.include_router(api.build_data_router(_external_cfg()), prefix="/api/plugins/project_board")
+
+    async def drive():
+        assert threading.current_thread() is threading.main_thread()  # the loop thread
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://board") as c:
+            assert (await c.get("/api/plugins/project_board/features")).json() == {"features": []}
+            assert (await c.get("/api/plugins/project_board/features/missing")).status_code == 404
+            raw = _merge_body()
+            r = await c.post(
+                "/plugins/project_board/webhook/pr",
+                content=raw,
+                headers={"X-Hub-Signature-256": _signed(_EXTERNAL_SECRET, raw)},
+            )
+            assert r.status_code == 200 and "ignored" in r.json()
+
+    asyncio.run(drive())
+    assert seen and all(t is not threading.main_thread() for t in seen)
+
+
 def _probe_store_calls(store, record):
     """Wrap every store method the routes touch (public + the `_comment` audit write)
     to record which calls ran with a running event loop on their own thread."""
