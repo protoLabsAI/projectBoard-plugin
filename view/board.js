@@ -292,7 +292,12 @@ async function load(){
     const s = await api("/api/plugins/project_board/status").catch(() => null);
     // br fetched on first run (v0.43.0): say so in the subtitle, once it's the store's binary.
     if (s && s.setup && s.setup.br && s.setup.br.source === "fetched") $("sub").textContent += " · br v" + (s.setup.br.fetch.version || "?") + " fetched to " + s.setup.br.path;
-    if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null);
+    // Gate-preflight holds (#255/#261): a fully-`ready` board can still pick up nothing
+    // because a project's gate failed on its clean base and the loop held that project's
+    // cards — without a card the board just looks idle. When setup ALSO fails, the held
+    // list rides along on the setup-gap card instead of fighting it for the slot.
+    if (s && s.setup && s.setup.ready === false) renderSetupGaps(s.setup, null, s);
+    else if (s && s.held_projects && s.held_projects.length) renderHeldProjects(s);
     else if (s && s.setup && s.setup.loop_cfg_stale) renderLoopStale(s.setup);
     else $("err").hidden = true;
   } catch (e) {
@@ -305,7 +310,7 @@ async function load(){
     try {
       const s = await api("/api/plugins/project_board/status");
       if (s && s.bound === false) { renderSetup(e, s.setup); return; }
-      if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e); return; }
+      if (s && s.setup && s.setup.ready === false) { renderSetupGaps(s.setup, e, s); return; }
     } catch (_ignored) {}
     $("err").hidden = false; $("err").className = "pl-callout pl-callout--error";
     $("err").textContent = "Could not load the board: " + e;
@@ -342,15 +347,41 @@ function setupLoopLine(setup){
   return html;
 }
 
+// Gate-preflight holds (#255/#261): /status carries `held_projects` (sorted names) and
+// `preflight.held` ({project: reason}) — the projects whose ready cards the loop froze
+// behind a gate that fails on the clean base. Reasons are server-authored operator
+// copy, esc()'d — never raw HTML.
+function heldGateItems(s){
+  const held = (s && s.preflight && s.preflight.held) || {};
+  const names = (s && s.held_projects) || [];
+  let html = "";
+  for (const name of names) html += '<li><b>' + esc(name) + '</b> — ' + esc(String(held[name] || "gate preflight failed")) + '</li>';
+  return html;
+}
+
+// An otherwise-healthy board with held projects — the holds get their own warning card
+// (when setup ALSO fails, renderSetupGaps carries the same list on its card instead).
+function renderHeldProjects(s){
+  $("err").hidden = false;
+  $("err").className = "pl-callout pl-callout--warning";
+  $("err").innerHTML = '<b>Work is held — a gate fails on its project&#39;s clean base.</b>'
+    + '<ul style="margin:6px 0 0 18px;padding:0">' + heldGateItems(s) + '</ul>'
+    + '<div style="opacity:.65;margin-top:6px;font-size:12px">The loop re-checks each held project&#39;s gate and releases its cards on its own once the gate passes (no restart needed).</div>';
+}
+
 // A bound board whose setup preflight fails — each failing check with its hint, in
-// place of a raw error. `e` (optional) is the underlying read error.
-function renderSetupGaps(setup, e){
+// place of a raw error. `e` (optional) is the underlying read error; `s` (optional)
+// is the full /status body, so preflight-held projects ride along on this card
+// instead of hiding behind the setup gap.
+function renderSetupGaps(setup, e, s){
   const blocking = setupBlocking(setup);
+  const held = heldGateItems(s);
   $("err").hidden = false;
   $("err").className = "pl-callout pl-callout--warning";
   $("err").innerHTML = '<b>' + (blocking ? 'This board can&#39;t run yet — setup is incomplete.' : 'GitHub CLI missing — PRs can&#39;t open or merge until it is installed.') + '</b>'
     + '<ul style="margin:6px 0 0 18px;padding:0">' + setupGapItems(setup) + '</ul>'
     + setupLoopLine(setup)
+    + (held ? '<div style="margin-top:6px"><b>Held projects (gate fails on clean base):</b><ul style="margin:4px 0 0 18px;padding:0">' + held + '</ul></div>' : '')
     + (e ? '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>' : '');
   $("sub").textContent = blocking ? "project_board — setup incomplete" : "project_board — gh missing";
 }
