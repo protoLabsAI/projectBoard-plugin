@@ -410,3 +410,57 @@ def test_saying_markdown_css_scales_down_and_uses_pl_tokens():
     assert ".gen .md-on pre{background:var(--pl-color-bg);" in BOARD_PAGE
     # lists indent properly.
     assert ".gen .md-on ul,.gen .md-on ol{margin:4px 0;padding-left:18px}" in BOARD_PAGE
+
+
+# ── safe board hrefs + pinned marked CDN (S2/F3) ─────────────────────────────────
+#
+# The external-ref slot (projected as pr_url) renders as a live footer link, so the
+# view gates it a second time behind the store's persistence check: safeHref lets only
+# an absolute http(s) URL through and collapses everything else to the inert "#". The
+# lazily-loaded markdown renderer is pinned by subresource integrity so only the exact
+# 12.0.2 artifact ever executes.
+
+
+def test_safehref_allows_only_absolute_http_s_urls_and_falls_back_to_inert_hash():
+    """safeHref is the render-side half of the external-ref gate (the store's
+    normalize_external_ref is the persistence half): only a parsed absolute http(s)
+    URL goes live; any other scheme — and any string that isn't a URL at all — comes
+    back as the inert "#", the same scheme discipline sanitizeSaying applies to
+    markdown links."""
+    assert "function safeHref(u)" in BOARD_PAGE
+    assert "const p = new URL(String(u));" in BOARD_PAGE  # no base URL — relative refs stay inert
+    assert 'if (p.protocol === "http:" || p.protocol === "https:") return p.href;' in BOARD_PAGE
+    assert 'return "#";' in BOARD_PAGE
+
+
+def test_every_pr_url_href_is_minted_through_safehref():
+    """The rendered anchor HTML for BOTH footer links (coding 'PR ↗' + task 'ref ↗')
+    routes pr_url through safeHref before esc() — so the emitted href attribute can
+    never carry another scheme — and opens with rel noopener/noreferrer. No render
+    site interpolates the raw pr_url into an href."""
+    assert (
+        '\'<a class="pr" href="\'+esc(safeHref(f.pr_url))+\'" target="_blank" rel="noopener noreferrer">PR ↗</a>\''
+        in BOARD_PAGE
+    )
+    assert (
+        '\'<a class="pr" href="\'+esc(safeHref(f.pr_url))+\'" target="_blank" rel="noopener noreferrer">ref ↗</a>\''
+        in BOARD_PAGE
+    )
+    # the old unguarded interpolation is gone — pr_url reaches an href ONLY via safeHref
+    assert "href=\"'+esc(f.pr_url)" not in BOARD_PAGE
+    # exactly two dynamic href sites exist in the page, and both are the guarded ones
+    assert BOARD_PAGE.count("href=\"'+") == 2
+    assert BOARD_PAGE.count("href=\"'+esc(safeHref(") == 2
+
+
+def test_marked_cdn_script_is_pinned_with_integrity_and_crossorigin():
+    """The lazily-injected marked script carries a subresource-integrity pin for the
+    12.0.2 artifact plus crossorigin=anonymous (required for SRI enforcement on a
+    cross-origin script), so a response that doesn't match the pinned digest never
+    executes — it fails closed into the plain esc()'d fallback via s.onerror."""
+    assert (
+        'const MARKED_SRI = "sha512-xeUh+KxNyTufZOje++oQHstlMQ8/rpyzPuM+gjMFYK3z5ILJGE7l2NvYL+XfliKURMpBIKKp1XoPN/qswlSMFA==";'
+        in BOARD_PAGE
+    )
+    assert "s.integrity = MARKED_SRI;" in BOARD_PAGE
+    assert 's.crossOrigin = "anonymous";' in BOARD_PAGE
