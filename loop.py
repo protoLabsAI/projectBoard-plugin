@@ -110,11 +110,36 @@ def _last_block_reason(feat: dict) -> str:
 # ── external re-dispatch feedback bridge (the /review route → the loop) ──────────
 # An adverse-review bounce POSTed to /features/{fid}/review is handled in the API
 # router — a DIFFERENT object from the running loop (register() mounts both, so they
-# share a process but not an instance). This module-level dict is the seam between
-# them: the router stashes the findings here and the loop drains them into its
-# per-run ``_ci_feedback`` the next time it builds a dispatch prompt — the same
-# lever the in-loop review gate writes directly. Keyed by feature id; last write wins.
-_PENDING_FEEDBACK: dict[str, str] = {}
+# share a process but not an instance). This dict is the seam between them: the
+# router stashes the findings here and the loop drains them into its per-run
+# ``_ci_feedback`` the next time it builds a dispatch prompt — the same lever the
+# in-loop review gate writes directly. Keyed by feature id; last write wins.
+#
+# A plain module global here was reload-unstable (#256): a plugin reload re-imports
+# this module as a FRESH object while the running loop keeps the old one, so the
+# newly-mounted router wrote a NEW dict and the loop drained the old — the findings
+# were silently stranded. The dict now lives on a process-stable ``sys.modules``
+# data slot (the coder_seam #178 pattern, same as ``_drive_slot`` below), which a
+# reload never replaces — every module instance binds the SAME dict. Shared, not
+# copied: a copy would orphan the other instance's future writes all over again.
+_FEEDBACK_SLOT_PREFIX = "project_board.review_feedback::"
+
+
+def _feedback_slot():
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+    name = _FEEDBACK_SLOT_PREFIX + pkg
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = (
+            "Process-stable holder for project_board's queued review-bounce findings (#256) — data, not code."
+        )
+        holder.pending = {}
+        sys.modules[name] = holder
+    return holder
+
+
+_PENDING_FEEDBACK: dict[str, str] = _feedback_slot().pending
 
 
 def queue_review_feedback(fid: str, findings: str) -> None:
