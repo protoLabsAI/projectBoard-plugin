@@ -36,7 +36,7 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
 |---|---|---|
 | 1 | **Board** | a `.beads/` workspace exists in the repo (so the board pins here, not a parent dir) |
 | 2 | **Hygiene** | `.gitignore` ignores the coding agent's **per-session scratch** (for proto: `.proto/memory/`, `.proto/session-notes.md`, `.proto/repo-map-cache.json` — **not** all of `.proto/`, whose `evolve/` holds versioned skills) **and** the build output dir |
-| 3 | **Gate** | the repo's real build/test command is known and set as `project_board.local_gate_cmd` |
+| 3 | **Gate** | the repo **declares** its gate target (a `gate`/`ci`/`check`/`verify` script or Makefile/justfile target) so the board's `"auto"` discovery resolves it |
 | 4 | **Grounding** | a context doc the coder reads: conventions, where shared deps/assets live, build/run/test, do/don'ts |
 | 5 | **Git posture** | a remote + default branch exist, the repo **homepage** points at the deployed URL (`gh repo edit --homepage`), and ideally **PR CI** verifies PRs independently |
 | 6 | **Report** | each item is PASS / FIXED / BOARDED, with the gate command — confirmed at a human gate |
@@ -59,11 +59,16 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
      output dir.
    These are fast and judgment-free, so the coder does them directly rather than through a PR.
 
-3. **Declare the gate.** Record the check command found in step 1. Ensure
-   `project_board.local_gate_cmd` is set to it (e.g. `npm ci && npm run build`,
-   `uv run pytest -q`). If you can't write the host config yourself, state the exact
-   value for the operator to set — the gate is what makes the coder's PRs open
-   already-green instead of bouncing through CI.
+3. **Declare the gate.** Record the check command found in step 1 for the report —
+   you never pass a gate command anywhere; no tool you hold takes one. The board
+   discovers the gate from the repo's **own declared target**: registration (step 5)
+   passes the literal `gate="auto"`, and the loop resolves it from a
+   `gate`/`ci`/`check`/`verify` script (package.json) or Makefile/justfile target.
+   If the repo declares none, board a feature to add one (e.g. a `gate` target
+   running the step-1 command), and name the command in the report so the operator
+   can alternatively set `project_board.local_gate_cmd` themselves (Settings ▸
+   Projects / YAML — operator config, not yours to write). The gate is what makes
+   the coder's PRs open already-green instead of bouncing through CI.
 
 4. **Board the judgment gaps** — `board_create_feature` (+ `board_mark_ready`) for the
    work that needs real authoring + review, so it ships through the normal
@@ -91,8 +96,10 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
      register repos for filesystem access."*
 
    If the operator answered `register_project: true`, call
-   `board_register_project(name, repo, base_branch, local_gate_cmd=<the step-3 gate>,
-   repo_conventions=…)` before reporting.
+   `board_register_project(name, repo, base_branch, gate="auto",
+   repo_conventions=…)` before reporting — the literal `"auto"` (repo-declared
+   target discovery) is the only gate value the tool accepts; it takes no
+   command text.
 
 6. **Report.** Output the checklist table with each item's status and the gate command.
    If registration was attempted and the tool **refused** (an `Error:` return — e.g. a

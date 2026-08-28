@@ -402,6 +402,26 @@ async def delete_project(
         }
 
 
+#: The only non-blank gate value the agent tool accepts: the discovery sentinel the
+#: loop resolves against the repo's OWN declared target. The persisted value is later
+#: executed at dispatch time, so agent input must never carry command text — explicit
+#: commands are operator configuration (the bearer-gated Projects editor / YAML).
+_AGENT_GATE_SENTINEL = "auto"
+
+
+def _validate_agent_gate(gate: str) -> str:
+    """Return ``""`` or the literal ``"auto"`` — the only gate values agent input
+    may carry into the registry."""
+    value = str(gate or "").strip()
+    if value in ("", _AGENT_GATE_SENTINEL):
+        return value
+    raise ProjectRegistryError(
+        'gate accepts only the literal "auto" (discover the gate from the repo\'s own '
+        "declared target) — an explicit gate command is operator configuration "
+        "(Settings ▸ Projects), not agent input"
+    )
+
+
 def build_register_tool(cfg: dict):
     """The ``board_register_project`` tool, or ``None`` when langchain isn't importable
     (host-free test runs import this module for its pure helpers)."""
@@ -415,7 +435,7 @@ def build_register_tool(cfg: dict):
         name: str,
         repo: str,
         base_branch: str = "main",
-        local_gate_cmd: str = "",
+        gate: str = "",
         repo_conventions: str = "",
     ) -> str:
         """Register an already-cloned repo as a board project so features can be dispatched to it.
@@ -429,9 +449,11 @@ def build_register_tool(cfg: dict):
             name: the project key features will carry (e.g. "pr-reviewer").
             repo: path to the checkout on disk.
             base_branch: branch worktrees are cut from. Defaults to main.
-            local_gate_cmd: the pre-PR gate for THIS repo — its own lint/format/test
-                command. A repo whose gate differs from the default will merge red
-                without it.
+            gate: "" (keep/inherit the configured gate) or the literal "auto" to have
+                the loop discover the pre-PR gate from the repo's own declared target
+                (a gate/ci/check/verify script or Makefile/justfile target). This tool
+                takes no gate command text — explicit commands are operator
+                configuration (Settings ▸ Projects), not agent input.
             repo_conventions: repo-specific rules injected into every coder dispatch
                 (changelog policy, import rules, gate quirks). Omitting this is the
                 single most common cause of a coder inventing the wrong convention.
@@ -443,14 +465,19 @@ def build_register_tool(cfg: dict):
                 name,
                 repo,
                 base_branch=base_branch,
-                local_gate_cmd=local_gate_cmd,
+                local_gate_cmd=_validate_agent_gate(gate),
                 repo_conventions=repo_conventions,
             )
         except ProjectRegistryError as exc:
             return f"Error: {exc}."
         project, entry = result["project"], result["entry"]
         verb = "Registered" if result["created"] else "Updated"
-        gate = "its own gate" if entry.get("local_gate_cmd") else "the default gate"
+        raw_gate = str(entry.get("local_gate_cmd") or "")
+        gate_note = (
+            "an auto-discovered gate"
+            if raw_gate == _AGENT_GATE_SENTINEL
+            else ("its own gate" if raw_gate else "the default gate")
+        )
         conv = "with conventions" if entry.get("repo_conventions") else "WITHOUT conventions"
         note = (
             ""
@@ -459,7 +486,7 @@ def build_register_tool(cfg: dict):
         )
         return (
             f"{verb} board project '{project}' → {entry['repo']} (base {entry['base_branch']}, "
-            f"{gate}, {conv}). The running board applied it live; no restart is required.{note}"
+            f"{gate_note}, {conv}). The running board applied it live; no restart is required.{note}"
         )
 
     return board_register_project
