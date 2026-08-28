@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import threading
 
 import pytest
 
@@ -1963,7 +1964,7 @@ async def test_spawn_ready_claims_up_to_max_concurrent(monkeypatch):
     loop = BoardLoop({"max_concurrent": 2})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        assert loop._spawn_ready() is True
+        assert await loop._spawn_ready() is True
         assert len(loop._drives) == 2  # capped at max_concurrent
         assert store.claimed == ["bd-1", "bd-2"]  # stopped claiming once full
     finally:
@@ -1979,10 +1980,10 @@ async def test_reload_raises_the_cap_for_the_next_claim_scan_without_a_restart(m
     loop = BoardLoop({"max_concurrent": 1})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        loop._spawn_ready()
+        await loop._spawn_ready()
         assert store.claimed == ["bd-1"]  # serial: one slot
         assert loop.reload(_HostConfig({"max_concurrent": 3})) == {"max_concurrent": (1, 3)}
-        loop._spawn_ready()
+        await loop._spawn_ready()
         assert store.claimed == ["bd-1", "bd-2", "bd-3"]  # both extra slots filled this tick
         assert len(loop._drives) == 3
     finally:
@@ -1995,11 +1996,11 @@ async def test_reload_lowering_the_cap_never_kills_a_drive(monkeypatch):
     loop = BoardLoop({"max_concurrent": 2})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        loop._spawn_ready()
+        await loop._spawn_ready()
         assert len(loop._drives) == 2
         loop.reload({"max_concurrent": 1})
         assert len(loop._drives) == 2  # in-flight builds keep running…
-        assert loop._spawn_ready() is False  # …the loop just stops claiming until under the cap
+        assert await loop._spawn_ready() is False  # …the loop just stops claiming until under the cap
         assert store.claimed == ["bd-1", "bd-2"]
     finally:
         await finish()
@@ -2009,7 +2010,7 @@ async def test_spawn_ready_is_false_when_nothing_ready(monkeypatch):
     store = _ClaimStore([])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     loop = BoardLoop({"max_concurrent": 2})
-    assert loop._spawn_ready() is False
+    assert await loop._spawn_ready() is False
     assert loop._drives == set()
 
 
@@ -2020,7 +2021,7 @@ async def test_spawn_ready_skips_a_file_conflicting_candidate(monkeypatch):
     loop = BoardLoop({"max_concurrent": 3})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        loop._spawn_ready()
+        await loop._spawn_ready()
         # bd-1 claimed; bd-2 deferred (overlaps bd-1's file); bd-3 claimed (disjoint).
         assert store.claimed == ["bd-1", "bd-3"]
         # #197: guard keys are (project, path); unstamped cards resolve to "default".
@@ -2033,7 +2034,7 @@ async def test_spawn_ready_respects_the_review_wip_limit(monkeypatch):
     store = _ClaimStore([_ready("bd-1", ["a.py"])], in_review=5)  # already at the cap
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     loop = BoardLoop({"max_concurrent": 2, "max_pending_reviews": 5})
-    assert loop._spawn_ready() is False
+    assert await loop._spawn_ready() is False
     assert store.claimed == []  # paused: too many PRs await review
 
 
@@ -2046,7 +2047,7 @@ async def test_drive_done_releases_its_files(monkeypatch):
         return None
 
     monkeypatch.setattr(loop, "_drive", _quick)
-    loop._spawn_ready()
+    await loop._spawn_ready()
     await asyncio.gather(*list(loop._drives), return_exceptions=True)
     await asyncio.sleep(0)  # let the done-callbacks run
     assert loop._inflight_files == {}  # files released when the drive finished
@@ -2154,7 +2155,7 @@ async def test_spawn_ready_dispatches_an_acp_task_via_delegate_to(monkeypatch):
     loop = BoardLoop({"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: delegate if name == "agent-bot" else None)
 
-    assert loop._spawn_ready() is True  # an ACP task IS a drive → counts as started
+    assert await loop._spawn_ready() is True  # an ACP task IS a drive → counts as started
     await asyncio.gather(*list(loop._drives), return_exceptions=True)
     await asyncio.sleep(0)  # let the done-callback run
 
@@ -2184,7 +2185,7 @@ async def test_spawn_ready_parks_a_human_task_without_dispatching(monkeypatch):
     loop = BoardLoop({"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # alice is not an ACP agent
 
-    assert loop._spawn_ready() is False  # parked → nothing started this tick
+    assert await loop._spawn_ready() is False  # parked → nothing started this tick
     assert store.claimed == ["bd-human"]  # …but it WAS claimed to in_progress
     assert loop._drives == set()  # holds no concurrency slot
     assert "bd-human" not in loop._inflight_files
@@ -2200,7 +2201,7 @@ async def test_a_parked_human_task_does_not_consume_a_concurrency_slot(monkeypat
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # human, no ACP agent
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        assert loop._spawn_ready() is True  # the coding feature started
+        assert await loop._spawn_ready() is True  # the coding feature started
         # Both claimed: the human task parked (no slot), the coding feature took the slot.
         assert store.claimed == ["bd-human", "bd-feat"]
         assert len(loop._drives) == 1  # ONLY the coding feature's drive — the park held no slot
@@ -2222,7 +2223,7 @@ async def test_acp_task_dispatch_failure_is_classified_and_blocks(monkeypatch):
     loop = BoardLoop({"coder": "proto"})
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
 
-    loop._spawn_ready()
+    await loop._spawn_ready()
     await asyncio.gather(*list(loop._drives), return_exceptions=True)
     await asyncio.sleep(0)
 
@@ -2270,7 +2271,7 @@ async def test_spawn_ready_task_branch_leaves_coding_features_unchanged(monkeypa
     loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        assert loop._spawn_ready() is True
+        assert await loop._spawn_ready() is True
         assert store.claimed == ["bd-feat"]
         assert loop._inflight_files == {"bd-feat": {("default", "a.py")}}  # went through the coder path
     finally:
@@ -2292,7 +2293,7 @@ async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch,
     finish = await _hold_drives(loop, monkeypatch)
     try:
         with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
-            loop._spawn_ready()
+            await loop._spawn_ready()
     finally:
         await finish()
     assert store.claimed == ["bd-lo"]  # the lower-priority card claimed ahead of bd-hi
@@ -2322,7 +2323,7 @@ async def test_spawn_ready_logs_a_claim_race_skip(monkeypatch, caplog):
     finish = await _hold_drives(loop, monkeypatch)
     try:
         with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
-            loop._spawn_ready()
+            await loop._spawn_ready()
     finally:
         await finish()
     lines = [m for m in caplog.messages if "claim_decision" in m]
@@ -3581,7 +3582,7 @@ async def test_spawn_ready_passes_the_dep_gate_to_ready_queue(monkeypatch):
     loop = BoardLoop({"dep_gate": "review", "max_concurrent": 1})
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        loop._spawn_ready()
+        await loop._spawn_ready()
         assert store.last_relaxed is True  # the relaxed gate reaches ready_queue
     finally:
         await finish()
@@ -4568,13 +4569,13 @@ async def test_preflight_fails_closed_when_gate_cannot_launch(monkeypatch):
     assert "could not run" in lp._preflight_state["default"]
 
 
-def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
+async def test_spawn_ready_holds_all_work_when_preflight_failed(monkeypatch):
     lp = BoardLoop({"local_gate_cmd": "pnpm -r build"})
     lp._preflight_state = {"default": "gate exited 1: tsc: not found"}  # simulate a failed preflight
     store = _PreflightStore(ready=["bd-1", "bd-2"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    spawned = lp._spawn_ready()
+    spawned = await lp._spawn_ready()
 
     assert spawned is False  # dispatched nothing — every ready card is in the held project
     blocked = {c[1]: c[2] for c in store.calls if c[0] == "flag_blocked"}
@@ -4616,7 +4617,7 @@ async def test_spawn_ready_holds_only_the_failed_project(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     finish = await _hold_drives(lp, monkeypatch)
     try:
-        spawned = lp._spawn_ready()
+        spawned = await lp._spawn_ready()
         assert spawned is True  # project B's feature was dispatched despite A's broken gate
         assert len(lp._drives) == 1  # ONLY B — A is held
         claims = [c[1] for c in store.calls if c[0] == "claim"]
@@ -4717,7 +4718,7 @@ async def test_recover_cleared_card_reheld_when_gate_still_broken(monkeypatch):
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     await lp._maybe_preflight()  # the first tick smokes the gate again…
     assert isinstance(lp._preflight_state["default"], str)
-    spawned = lp._spawn_ready()  # …and the claim scan re-holds instead of dispatching
+    spawned = await lp._spawn_ready()  # …and the claim scan re-holds instead of dispatching
     assert spawned is False
     blocked = {c[1]: c[2] for c in store.calls if c[0] == "flag_blocked"}
     assert set(blocked) == {"bd-1"}  # re-held, visibly, one tick after boot
@@ -5487,7 +5488,7 @@ async def test_spawn_ready_does_not_collide_same_filename_across_projects(monkey
     monkeypatch.setattr(loop, "_project_name", lambda f: f.get("project") or "")
     finish = await _hold_drives(loop, monkeypatch)
     try:
-        loop._spawn_ready()
+        await loop._spawn_ready()
         # cross-project twin claims; the SAME-project twin defers.
         assert store.claimed == ["bd-ke7", "bd-qjd"]
         assert loop._inflight_files == {
@@ -5995,3 +5996,194 @@ async def test_an_allowed_dirty_project_is_reported_as_dirty_not_held(monkeypatc
     snap = health.preflight_snapshot()
     assert snap["held"] == {}  # nothing frozen
     assert "store.py" in snap["dirty"]["default"]
+
+
+# ── #258 (F2b): BoardLoop store calls stay OFF the event-loop thread ─────────────
+
+
+class _ThreadProbeStore:
+    """Mimics the store verbs the tick paths use, routing EVERY verb through a
+    ``_run`` seam (the real store's blocking chokepoint — subprocess.run + the
+    contention time.sleep) that records whether it executed on the MAIN thread.
+    pytest-asyncio runs the event loop on the main thread, so `main is True` here
+    means a blocking `br` call would have stalled every coroutine (#258); the loop
+    must reach the store only via asyncio.to_thread."""
+
+    def __init__(self, features=None):
+        self.features = [dict(f) for f in (features or [])]
+        self.ops = []  # (op, ran_on_main_thread)
+
+    def _run(self, op):
+        self.ops.append((op, threading.current_thread() is threading.main_thread()))
+
+    def assert_offloaded(self):
+        assert self.ops, "expected at least one store call to reach the _run seam"
+        on_loop = [op for op, main in self.ops if main]
+        assert not on_loop, f"store calls ran on the event-loop thread: {on_loop}"
+
+    def list_features(self, state=None, include_archived=False):
+        self._run("list")
+        return [dict(f) for f in self.features if state in (None, f.get("board_state"))]
+
+    def ready_queue(self, relaxed=False):
+        self._run("ready")
+        return [dict(f) for f in self.features if f.get("board_state") == "ready"]
+
+    def claim(self, fid, assignee=""):
+        self._run("claim")
+        f = next((x for x in self.features if x["id"] == fid), None)
+        return dict(f, board_state="in_progress") if f else None
+
+    def raw_features_with_comments(self, states=("done", "blocked")):
+        self._run("raw")
+        return []
+
+    def get_feature(self, fid):
+        self._run("show")
+        return next((dict(x) for x in self.features if x["id"] == fid), None)
+
+    def requeue(self, fid):
+        self._run("requeue")
+        return {"id": fid}
+
+    def record_merge(self, pr_url=""):
+        self._run("record_merge")
+        return True
+
+    def archive_stale(self, days):
+        self._run("archive")
+        return []
+
+    def open_review(self, fid, *, pr_url):
+        self._run("open_review")
+        return {"id": fid}
+
+    def flag_blocked(self, fid, reason):
+        self._run("flag_blocked")
+        return {"id": fid}
+
+
+async def test_claim_scan_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: the claim scan's store calls — the review-WIP count, the ready_queue
+    read, and the atomic claim — all reach the blocking ``_run`` seam on a worker
+    thread, never on the event loop that runs the tick and every route."""
+    store = _ThreadProbeStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "max_pending_reviews": 5})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert await loop._spawn_ready() is True
+    finally:
+        await finish()
+    store.assert_offloaded()
+    assert [op for op, _ in store.ops] == ["list", "ready", "claim"]
+
+
+async def test_recovery_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: boot recovery (the in_progress scan, the orphan reconcile's reads and
+    requeue, and the preflight-hold release scan) is fully offloaded."""
+    store = _ThreadProbeStore([{"id": "bd-1", "title": "T", "board_state": "in_progress"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_pr(branch, cwd=""):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    await BoardLoop({})._recover()
+    store.assert_offloaded()
+    assert ("requeue", False) in store.ops  # the orphan actually took the requeue edge
+    assert ("raw", False) in store.ops  # …and the boot preflight-hold scan ran too
+
+
+async def test_sweep_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: the health sweep (in_progress scan, orphan reconcile, archive pass)."""
+    store = _ThreadProbeStore([{"id": "bd-1", "title": "T", "board_state": "in_progress"}])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_pr(branch, cwd=""):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
+    await BoardLoop({})._sweep()
+    store.assert_offloaded()
+    assert ("archive", False) in store.ops
+
+
+async def test_pr_reconcile_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: the PR reconcile's scans and the MERGED edge's record_merge."""
+    feat = {"id": "bd-1", "title": "T", "board_state": "in_review", "pr_url": "https://x/pr/1", "labels": []}
+    store = _ThreadProbeStore([feat])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _state(pr_url, cwd=""):
+        return "MERGED"
+
+    async def _reap(repo, root, fid):
+        return True
+
+    monkeypatch.setattr(worktree, "pr_state", _state)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    await BoardLoop({})._reconcile_prs()
+    store.assert_offloaded()
+    assert ("record_merge", False) in store.ops
+
+
+async def test_preflight_ready_scan_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: the gate preflight's ready-projects scan (its only store touch when no
+    gate command is configured) runs on a worker thread."""
+    store = _ThreadProbeStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await BoardLoop({})._maybe_preflight()
+    store.assert_offloaded()
+    assert [op for op, _ in store.ops] == ["list"]
+
+
+async def test_drive_reaches_the_store_off_the_event_loop_thread(monkeypatch):
+    """#258: a clean drive's board writes — the cancel re-reads at the PR seam and
+    open_review — go through asyncio.to_thread like the tick's scans."""
+    store = _ThreadProbeStore([dict(FEATURE, board_state="in_progress")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root, title=""):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        return "the coder's reply"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/9"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(dict(FEATURE))
+    store.assert_offloaded()
+    assert ("open_review", False) in store.ops
+
+
+async def test_record_bg_runs_the_write_off_loop_and_the_barrier_flushes_it():
+    """#258: coder_seam's record_gens/record_verified callbacks are sync and fire ON
+    the event loop mid-dispatch — _record_bg must run the store write on a worker
+    thread, and _await_bg_records must land it before the drive proceeds (so the
+    pre-offload ordering — records on the bead before the PR opens — is kept)."""
+    loop = BoardLoop({})
+    seen = []
+
+    def _write(n):
+        seen.append((n, threading.current_thread() is threading.main_thread()))
+
+    loop._record_bg("bd-1", "record_gens", _write, 4)
+    await loop._await_bg_records("bd-1")
+    assert seen == [(4, False)]  # landed, and NOT on the event-loop thread
+    assert loop._bg_records == {}  # the barrier drained the parking
+
+    # A failing write is swallowed (fire-and-forget) — the barrier never raises.
+    def _boom(n):
+        raise RuntimeError("br hiccup")
+
+    loop._record_bg("bd-2", "record_gens", _boom, 1)
+    await loop._await_bg_records("bd-2")
+    assert loop._bg_records == {}
