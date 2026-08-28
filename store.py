@@ -252,6 +252,15 @@ MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4}
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
 LABEL_GENS_PREFIX = "gens:"
+# Persisted loop fix budgets (#259) — `budget:<kind>:<n>`, ONE label per kind,
+# replaced (never accumulated) each write: the `gens:` pattern. The loop's bounded
+# re-dispatch counters (ci-fix, goal-fix, rebase, …) used to live only in fid-keyed
+# dicts that died with the process, so a restart re-armed every exhausted budget and
+# a bead the old loop was about to block got re-dispatched forever. Bead state is
+# the durable source of truth: the loop's dicts are CACHES seeded back from these
+# labels on first consult, and the merge / tier-climb edges clear label and cache
+# together (`clear_budgets`).
+LABEL_BUDGET_PREFIX = "budget:"
 # Crash-salvage record (#91) — `verified:<sha>`, replaced (never accumulated) each time
 # coder.solve()'s verify boundary promotes a test-PASSING candidate. Written on the bead
 # (not loop memory) so it survives a crash between verify and open_pr; recovery's no-PR
@@ -299,6 +308,22 @@ REQ_CLOSED_STATUSES = ("done", "declined")
 # A markdown bullet (-/*/+ or `1.`/`1)`) opens a new requirement item; anything else
 # is a continuation of the current one (or, with no bullets at all, plain prose = ONE item).
 _AC_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+
+
+def budgets_from_labels(labels) -> dict[str, int]:
+    """The persisted loop fix-budget counters (#259) from a bead's labels — one
+    `budget:<kind>:<n>` label per kind (see ``LABEL_BUDGET_PREFIX``). Shared by the
+    projection and the loop's derive-on-claim path so both decode the labels the
+    same way. A malformed label (no kind, non-numeric count) is ignored — never
+    guess a count."""
+    out: dict[str, int] = {}
+    for label in labels or []:
+        if not str(label).startswith(LABEL_BUDGET_PREFIX):
+            continue
+        kind, _, num = str(label)[len(LABEL_BUDGET_PREFIX) :].rpartition(":")
+        if kind and num.isdigit():
+            out[kind] = int(num)
+    return out
 
 
 def _decompose_ac(text) -> list[dict]:
@@ -1902,6 +1927,41 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # ── loop fix-budget persistence (#259) ────────────────────────────────────
+    def record_budget(self, fid: str, kind: str, n: int) -> dict:
+        """Persist one loop re-dispatch counter as the single, replaced
+        `budget:<kind>:<n>` label (the `gens:` pattern) — the durable half of the
+        loop's bounded fix budgets: a freshly constructed loop derives the count
+        back from this label, so an exhausted budget still blocks after a process
+        restart instead of silently re-arming. Fire-and-forget at the call sites,
+        like record_gens_spent: a `br` hiccup here must never fail the edge that
+        spent the budget (the in-memory cache still carries it for this process)."""
+        f = self._require(fid)
+        prefix = f"{LABEL_BUDGET_PREFIX}{kind}:"
+        args = ["update", fid]
+        for stale in [l for l in f.get("labels") or [] if l.startswith(prefix)]:
+            args += ["--remove-label", stale]
+        args += ["--add-label", f"{prefix}{max(0, int(n))}"]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    def clear_budgets(self, fid: str, kinds=None) -> dict:
+        """Drop persisted fix-budget labels — EVERY `budget:` label when ``kinds``
+        is None (the merge/closed terminal edges: a requeued card starts with full
+        budgets), or just the named kinds (a tier climb resets only its per-tier
+        budgets; a gate-passed edge only the pre-PR ones). No-op without a matching
+        label, so the routine reset edges never burn a `br` write per poll."""
+        f = self._require(fid)
+        prefixes = [LABEL_BUDGET_PREFIX] if kinds is None else [f"{LABEL_BUDGET_PREFIX}{k}:" for k in kinds]
+        stale = [l for l in f.get("labels") or [] if any(l.startswith(p) for p in prefixes)]
+        if not stale:
+            return f
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
     # ── requirement ledger write-back (#113) ──────────────────────────────────
     def set_requirements(self, fid: str, items) -> dict:
         """Write the requirement ledger back to the bead — the loop calls this after
@@ -2308,6 +2368,9 @@ class BeadsBoard:
             "open_depends_on": open_depends_on,
             "attempts": attempts,
             "gens_spent": gens_spent,
+            # The persisted loop fix budgets (#259): {kind: count} from the replaced
+            # `budget:<kind>:<n>` labels — {} for a feature the loop never bounced.
+            "budgets": budgets_from_labels(labels),
             "verified_sha": verified_sha,
             "deliverable": deliverable,
             "source_issue": source_issue,

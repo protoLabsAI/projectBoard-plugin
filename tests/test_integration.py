@@ -162,6 +162,27 @@ def test_escalation_cost_and_difficulty_labels_land_at_realistic_values(board):
     assert all(len(label) <= BEADS_LABEL_CAP for label in got["labels"])
 
 
+@requires_br
+def test_budget_labels_land_replace_and_clear_through_real_br(board):
+    """The fix-budget family (#259) — `budget:<kind>:<n>` is the only plugin label
+    with TWO colons, so it must be proven through the real validator, not the fake
+    `_run` (the exact class #135 hid). Land, replace (never accumulate), project
+    back, named-kind clear, full clear — all via the real store methods."""
+    f = board.create_feature("Budget target", spec="s")
+    fid = f["id"]
+    got = board.record_budget(fid, "merged-verify", 1)  # the longest kind name
+    assert "budget:merged-verify:1" in (got["labels"] or [])
+    assert got["budgets"] == {"merged-verify": 1}  # and it projects back
+    got = board.record_budget(fid, "merged-verify", 2)  # replaced — never two of one kind
+    assert [label for label in got["labels"] if label.startswith("budget:")] == ["budget:merged-verify:2"]
+    board.record_budget(fid, "ci-fix", 1)
+    got = board.clear_budgets(fid, ["ci-fix"])  # a climb's named-kind clear leaves the rest
+    assert got["budgets"] == {"merged-verify": 2}
+    got = board.clear_budgets(fid)  # the merge edge's full clear
+    assert got["budgets"] == {}
+    assert all(len(label) <= BEADS_LABEL_CAP for label in board.get_feature(fid)["labels"] or [])
+
+
 # ── `--json` output shape: one test per want_json=True call site in store.py (#138) ──
 
 
