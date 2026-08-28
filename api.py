@@ -102,6 +102,50 @@ def repo_for_feature(feature: dict | None, store_kw: dict) -> str:
     )
 
 
+def base_branch_for_feature(feature: dict | None, store_kw: dict) -> str:
+    """The base branch ``feature``'s branches fork from — the route sibling of the
+    loop's ``_base_branch_for`` (#90), same order: a labeled feature whose project
+    declares a ``base_branch`` uses it; otherwise the feature-stamped value, the
+    default project's, then the instance default."""
+    feature = feature or {}
+    projects = store_kw.get("projects") or {}
+    default = str(store_kw.get("default_project") or "").strip()
+    name = str(feature.get("project") or "").strip()
+    if name:
+        base = str((projects.get(name) or {}).get("base_branch") or "").strip()
+        if base:
+            return base
+    entry = projects.get(name or default)
+    if entry is None:
+        entry = projects.get(default)
+    return (
+        str(feature.get("base_branch") or "").strip()
+        or str((entry or {}).get("base_branch") or "").strip()
+        or str(store_kw.get("base_branch") or "main")
+    )
+
+
+def worktrees_root_for_feature(feature: dict | None, store_kw: dict, instance_root: str = ".worktrees") -> str:
+    """The worktrees root ``feature``'s throwaway/build worktrees live under, resolved
+    in the same project-first order as the repo/base resolvers above: the labeled
+    project's ``worktrees_root`` when declared, else the default project's, else the
+    flat instance value. Relative roots are joined under the (per-project) repo by
+    worktree.py, so resolving the REPO right is what lands the worktree in the
+    project's checkout — this keeps a per-project root override honored too."""
+    feature = feature or {}
+    projects = store_kw.get("projects") or {}
+    default = str(store_kw.get("default_project") or "").strip()
+    name = str(feature.get("project") or "").strip()
+    if name:
+        root = str((projects.get(name) or {}).get("worktrees_root") or "").strip()
+        if root:
+            return root
+    entry = projects.get(name or default)
+    if entry is None:
+        entry = projects.get(default)
+    return str((entry or {}).get("worktrees_root") or "").strip() or str(instance_root or "").strip() or ".worktrees"
+
+
 def build_router(cfg: dict):
     from fastapi import APIRouter, HTTPException
     from fastapi.responses import HTMLResponse
@@ -744,6 +788,14 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         if not str(f.get("acceptance_criteria") or "").strip():
             raise HTTPException(400, f"feature {fid!r} has no acceptance_criteria — nothing to verify a rung against")
 
+        # #265: this diagnostic builds a throwaway worktree — it must land in THIS
+        # feature's project checkout (the #262 terminal-edge resolution order), never
+        # the instance/default repo: a project-B rung run against the board-default
+        # repo would test the wrong codebase and litter its worktrees root.
+        repo = repo_for_feature(f, store_kw)
+        base = base_branch_for_feature(f, store_kw)
+        root = worktrees_root_for_feature(f, store_kw, worktrees_root)
+
         from . import coder_seam
 
         if coder_seam._import_solve() is None:
@@ -778,9 +830,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 raise HTTPException(400, f"openai delegate {fusion_name!r} not found — check `delegates:`")
             # Same gate `_drive` applies before a real dispatch — fusion can't
             # tool-call and returns whole-file replacements, so this diagnostic
-            # must refuse the same oversized files a real build would skip.
+            # must refuse the same oversized files a real build would skip. Sized
+            # against the FEATURE's project repo — the files live there (#265).
             viable, reason = coder_seam.fusion_viable_for_files(
-                (cfg or {}).get("repo", "."),
+                repo,
                 f.get("files_to_modify") or [],
                 max_file_chars=fusion_max_file_chars,
                 max_total_chars=max(
@@ -806,9 +859,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 rung=rung,
                 task=task,
                 coder=coder,
-                repo=(cfg or {}).get("repo", "."),
-                base=(cfg or {}).get("base_branch", "main"),
-                root=(cfg or {}).get("worktrees_root", ".worktrees"),
+                repo=repo,
+                base=base,
+                root=root,
                 fid=fid,
                 dispatch_timeout=float((cfg or {}).get("coder_timeout_s", 1800)) or None,
                 test_cmd=test_cmd,
