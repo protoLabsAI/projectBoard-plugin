@@ -12,9 +12,11 @@ needed either.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import dataclass, field
 
-from project_board import coder_seam, worktree
+from project_board import coder_seam, store as store_mod, worktree
 
 
 # ── the ring buffer: current/last tool, history cap, thought bound, usage, verify ──
@@ -407,3 +409,114 @@ async def test_dispatch_coder_tapped_streams_the_public_seam_into_the_buffer(mon
     assert g["answer_tail"].endswith("finished.")
     assert g["stop_reason"] == "end_turn"
     assert g["done"] is True
+
+
+# ── #291: the snapshot persist rides OFF the event loop when a loop is running ────
+# progress_end is a SYNC hook called from dispatch_coder_tapped's finally ON the
+# event-loop thread; the blocking store.comment write (a `br` subprocess) must hop to
+# a worker so it never stalls the tick or trips the #258 event-loop warning. With no
+# running loop (sync callers, tests) the same write runs inline exactly as before.
+
+
+class _ThreadRecordingStore:
+    """Records the thread `comment()` runs on (and whether a running loop was present
+    in that thread) so a test can prove the write ran ON or OFF the loop thread. Sets
+    a threading.Event so the caller can wait for the fire-and-forget worker to land."""
+
+    def __init__(self):
+        self.thread_id: int | None = None
+        self.on_running_loop: bool | None = None
+        self.comments: list[tuple[str, str]] = []
+        self.done = threading.Event()
+
+    def comment(self, fid, text):
+        self.thread_id = threading.get_ident()
+        try:
+            asyncio.get_running_loop()
+            self.on_running_loop = True
+        except RuntimeError:
+            self.on_running_loop = False
+        self.comments.append((fid, text))
+        self.done.set()
+
+
+async def test_persist_runs_off_the_loop_thread_under_a_running_loop(monkeypatch):
+    """r1: with a running event loop (progress_end fired from dispatch_coder_tapped's
+    finally), the blocking store.comment runs on a WORKER thread — a different thread
+    than the loop's — not inline on the loop thread."""
+    cs = coder_seam
+    cs.progress_new_run("bd-291a")
+    store = _ThreadRecordingStore()
+    monkeypatch.setattr(cs, "_store_factory", lambda: store)
+
+    cs.progress_begin("bd-291a", 1, "smart")
+    loop_thread = threading.get_ident()
+    cs.progress_end("bd-291a", 1)  # sync hook, on the loop thread — must offload
+
+    # Wait for the fire-and-forget worker WITHOUT blocking the loop thread itself.
+    landed = await asyncio.get_running_loop().run_in_executor(None, store.done.wait, 5.0)
+    assert landed, "the offloaded snapshot write never ran"
+    assert len(store.comments) == 1
+    assert store.comments[0][0] == "bd-291a"
+    assert store.comments[0][1].startswith("coder-monitor: ")
+    assert store.thread_id != loop_thread  # ran OFF the loop thread
+
+
+def test_persist_runs_inline_when_no_loop_is_running(monkeypatch):
+    """r2: with NO running loop (a synchronous caller / test), the store.comment write
+    runs INLINE on the caller's own thread — same behavior as before #291."""
+    cs = coder_seam
+    cs.progress_new_run("bd-291b")
+    store = _ThreadRecordingStore()
+    monkeypatch.setattr(cs, "_store_factory", lambda: store)
+
+    cs.progress_begin("bd-291b", 1, "fast")
+    cs.progress_end("bd-291b", 1)  # no loop here → inline, no worker needed
+
+    assert len(store.comments) == 1  # already written, synchronously
+    assert store.thread_id == threading.get_ident()  # this very thread
+    assert store.on_running_loop is False
+
+
+async def test_generation_end_does_not_trip_the_258_blocking_warning(monkeypatch):
+    """r3: a store whose comment() exercises the REAL #258 event-loop guard
+    (``store._warn_blocking_on_event_loop``) must NOT log the blocking warning when the
+    write is offloaded — the worker thread has no running loop, so the guard
+    short-circuits. This is the #258 warning no longer firing on a generation end."""
+    cs = coder_seam
+    cs.progress_new_run("bd-291c")
+
+    warnings: list = []
+    monkeypatch.setattr(store_mod.log, "warning", lambda *a, **k: warnings.append(a))
+
+    done = threading.Event()
+
+    class _RealGuardStore:
+        def comment(self, fid, text):
+            # The same guard the real store's `_run` invokes before every `br` shell —
+            # it warns ONLY when a running loop is present in this thread (#258).
+            store_mod._warn_blocking_on_event_loop("comments")
+            done.set()
+
+    monkeypatch.setattr(cs, "_store_factory", lambda: _RealGuardStore())
+    cs.progress_begin("bd-291c", 1, "smart")
+    cs.progress_end("bd-291c", 1)  # on the loop thread → write hops to a worker
+
+    landed = await asyncio.get_running_loop().run_in_executor(None, done.wait, 5.0)
+    assert landed, "the offloaded snapshot write never ran"
+    assert warnings == []  # the #258 blocking-`br comments` warning did NOT fire
+
+
+def test_sync_caller_write_still_trips_the_guard_on_the_loop_thread(monkeypatch):
+    """Control for r3: the #258 guard DOES warn when a loop actually runs in the write's
+    thread — proving the r3 test's silence comes from the offload, not a dead guard.
+    Here the write runs inline INSIDE a running loop (no offload wrapper), so the guard
+    fires exactly as the pre-#291 on-loop persist did."""
+    warnings: list = []
+    monkeypatch.setattr(store_mod.log, "warning", lambda *a, **k: warnings.append(a))
+
+    async def _drive():
+        store_mod._warn_blocking_on_event_loop("comments")
+
+    asyncio.run(_drive())
+    assert warnings, "the #258 guard must still warn when a blocking call runs on a loop thread"

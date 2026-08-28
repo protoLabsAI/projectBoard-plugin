@@ -478,20 +478,49 @@ def _persist_gen_snapshot(fid: str | None, gen: int) -> None:
     """Best-effort: write the just-finished gen's ``snapshot()`` as a ``coder-monitor:``
     JSON bead comment (the #226 write side). Skips silently when there's no fid, no
     wired store factory (standalone test env), no store, or the write itself fails —
-    a monitoring persist must NEVER break a build."""
+    a monitoring persist must NEVER break a build.
+
+    ``progress_end`` is a SYNC hook and ``dispatch_coder_tapped``'s finally path calls
+    it ON the event-loop thread — where a blocking ``store.comment`` (a `br` subprocess
+    plus contention sleeps) stalls every coroutine and trips the #258 "blocking `br
+    comments` on the event-loop thread" warning. So when a loop is running in this
+    thread, the store write is submitted fire-and-forget to a worker via
+    ``loop.run_in_executor`` — ``progress_end`` stays synchronous and returns at once,
+    and the debug-level failure logging is preserved on the worker. With no running
+    loop (synchronous callers, tests) the write runs INLINE exactly as before, which is
+    the correct place to block (#258)."""
     if not fid or _store_factory is None:
         return
     b = _buf(fid, gen)
     if b is None:
         return
+
+    def _write() -> None:
+        try:
+            store = _store_factory()
+            if store is None:
+                return
+            payload = json.dumps(b.snapshot(), default=str)
+            store.comment(fid, _COMMENT_PREFIX + payload)
+        except Exception:  # noqa: BLE001 — monitoring must never break a build
+            log.debug("[project_board] persisting gen %s snapshot for %s failed", gen, fid, exc_info=True)
+
     try:
-        store = _store_factory()
-        if store is None:
-            return
-        payload = json.dumps(b.snapshot(), default=str)
-        store.comment(fid, _COMMENT_PREFIX + payload)
-    except Exception:  # noqa: BLE001 — monitoring must never break a build
-        log.debug("[project_board] persisting gen %s snapshot for %s failed", gen, fid, exc_info=True)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        _write()  # no loop (sync callers, tests) — block here, the right place to block
+        return
+    # A loop is running (progress_end fired from dispatch_coder_tapped's finally): hop
+    # the blocking write off the loop thread so it neither stalls the tick nor trips the
+    # #258 warning. Fire-and-forget — the future isn't awaited. If the loop is already
+    # shutting down and can't accept the job, fall back to an inline write rather than
+    # silently drop the snapshot.
+    try:
+        loop.run_in_executor(None, _write)
+    except RuntimeError:  # loop closed/shutting down → block inline instead
+        _write()
 
 
 def progress_end(fid: str | None, gen: int) -> None:
