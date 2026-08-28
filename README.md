@@ -28,7 +28,9 @@ board to a PR — or fork it as a starting point.
 ## What it does
 
 - **Board = a projection over beads** (`.beads/*.db` + git-committed JSONL) — no
-  separate store, so the work graph can't drift out of sync.
+  separate store, so the work graph can't drift out of sync. By default the whole
+  board — every project's cards — lives in **one store per instance** (see
+  `db_path` under Install), never scattered across per-repo `.beads/` workspaces.
 - **The loop** pulls the top-priority `ready` feature → creates a disposable
   `git worktree` off `origin/<base>` → dispatches a coder (`acp` delegate) scoped to
   it → commits/pushes → opens a PR → `in_review`. A **merge webhook** sets `done`
@@ -132,6 +134,13 @@ project_board:
                              # `coders:` ladder that maps every tier (smart/reasoning/opus).
   repo: ~/dev/my-repo
   base_branch: main
+  # db_path: /somewhere/board/beads.db
+                             # LEAVE UNSET (the default): the board keeps ONE beads store
+                             # per instance — <instance plugin-data>/project_board/.beads/
+                             # beads.db, bootstrapped automatically on first use. Every
+                             # project shares it, and `br init` never runs inside your
+                             # project repos. Set it only to pin the board db to an
+                             # explicit file of your own — see "Where the board lives".
   loop_enabled: false        # flip true to start the background puller
   max_concurrent: 1          # >1 builds features in parallel (each its own worktree).
                              # FEATURE-level: one drive per slot. Within each drive the
@@ -202,6 +211,21 @@ project_board:
                              # max_concurrent × coder_solve_k.
   # webhook_secret: "..."    # required HMAC for public merge/CI/review ingress
 ```
+
+**Where the board lives.** With no `db_path` configured (the shipped default — a
+blank or absent key are the same thing) the board keeps **one beads store per
+instance**: `<instance plugin-data>/project_board/.beads/beads.db`, bootstrapped
+automatically (`br init`, cwd'd in the store root) the first time the board is
+touched. Every project on a multi-repo board shares that one store — one board,
+one work graph, one id namespace — and the plugin **never runs `br init` inside a
+project repo**, so onboarding a second (or tenth) repo can't fragment the board
+across per-repo `.beads/` workspaces. Setting `db_path` to an explicit file is the
+documented operator override: the path is passed **verbatim** (`--db`) to every
+board op — the loop, the HTTP API, and the board tools all pin to it — and nothing
+is created on your behalf (`br init` it yourself). The pre-D3 behavior where a
+blank `db_path` meant per-repo `.beads/` auto-discovery is gone; on a
+multi-project board an explicitly blank `db_path` is additionally surfaced by the
+setup preflight as a non-blocking "stale override" advisory.
 
 ## Use
 

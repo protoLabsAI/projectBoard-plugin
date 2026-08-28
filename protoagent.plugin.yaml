@@ -218,7 +218,17 @@ config:
                             # Needs egress to github.com. false = the pre-0.43 posture: a
                             # missing `br` is a setup gap with the install hint. Resolution
                             # order for the binary: BR_BIN env > fetched > PATH. LIVE.
-  db_path: ""               # beads db path; blank → br auto-discovers .beads/*.db
+  db_path: ""               # beads board db. Blank (the default; D3, #260) → the ONE
+                            # instance-default store — <instance plugin-data>/
+                            # project_board/.beads/beads.db, bootstrapped automatically
+                            # on first use. Every project on this board shares it (a
+                            # multi-repo board is still ONE board), and `br init` never
+                            # runs inside a project repo. Set an explicit path to pin
+                            # the board db somewhere specific instead; the pin is passed
+                            # verbatim (`--db`) to every board op and nothing is created
+                            # on your behalf (`br init` it yourself). An explicitly
+                            # blank value is the same as leaving the key out — the
+                            # pre-D3 per-repo `.beads/` discovery is gone.
   webhook_secret: ""        # HMAC secret for every public mutation: /webhook/pr,
                             # /features/<id>/ci, and /review. Blank → all three fail
                             # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.
