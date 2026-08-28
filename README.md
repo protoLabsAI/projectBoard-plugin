@@ -354,6 +354,33 @@ that times out is treated as indeterminate → allowed (a slow gate must never w
 board). This is the fail-**closed** complement to the per-PR gate's fail-**open**: a
 flaky gate never blocks good work, but an *unrunnable* gate never starts bad work.
 
+### Subprocess environment — what a gate/format/verify child can see
+
+The loop runs inside a protoAgent host that identifies and authenticates itself
+through environment variables. None of that belongs to anything the loop shells out
+to, so every child environment is sanitized — on two tiers:
+
+- **Allowlist (strict)** — the loop's children that run **repo-defined commands over
+  coder-written code**: the gate preflight, the pre-PR `local_gate_cmd`, the auto-fix
+  `format_cmd`, and the `coder.solve()` acceptance-test (verify) run. These see ONLY
+  the baseline a build/test toolchain needs — `PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`,
+  `TERM`, `SHELL`, `USER`, `CI`, plus the Windows system mirror (`SYSTEMROOT` above
+  all) — and nothing else.
+- **Blacklist (looser)** — the coder's own ACP session environment, which is
+  host-managed: it keeps everything EXCEPT the host's identity/credential block
+  (`AGENT_NAME`, `PROTOAGENT_*`, `A2A_*`).
+
+`env_passthrough` is the single escape hatch on both tiers — a variable named there
+reaches the children even when the tier would drop it:
+
+```yaml
+project_board:
+  env_passthrough: [NPM_TOKEN]   # reaches gate/format/verify children AND the coder
+```
+
+A gate that needs, say, a package-registry token names it there — per deployment,
+deliberately — instead of the children inheriting the host's whole environment.
+
 ### Setup preflight — can the board run at all? (v0.42.0)
 
 Distinct from the gate preflight above (which asks "can the *repo's tests* run"), the

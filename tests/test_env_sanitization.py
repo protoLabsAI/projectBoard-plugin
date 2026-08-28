@@ -1,4 +1,4 @@
-"""Env sanitization tests (#78, tightened by F8a).
+"""Env sanitization tests (#78, tightened by F8a/F8b).
 
 The loop must never hand a subprocess the HOST agent's identity/credentials —
 ``AGENT_NAME``, ``PROTOAGENT_*``, ``A2A_*``. These tests prove the strip on all
@@ -8,8 +8,10 @@ and prove the ``env_passthrough`` whitelist lets a named var survive the strip.
 
 F8a adds a second, stricter tier for the loop's OWN children (gate preflight,
 ``local_gate_cmd``, ``format_cmd``): a narrow allowlist — the baseline a build/test
-toolchain needs plus ``env_passthrough``, dropping everything else. The ACP/coder
-path deliberately stays blacklist-only; those tests are unchanged below.
+toolchain needs plus ``env_passthrough``, dropping everything else. F8b extends the
+same tier to the fourth spawn site, the ``coder.solve()`` acceptance-test (verify)
+subprocess. The ACP/coder path deliberately stays blacklist-only; those tests are
+unchanged below.
 """
 
 from __future__ import annotations
@@ -443,7 +445,7 @@ async def test_fixups_env_is_allowlist_only(monkeypatch):
     _assert_allowlist_only(env)
 
 
-# ── coder_seam.py: the solve() acceptance-test (verify) subprocess (#86) ────────────
+# ── coder_seam.py: the solve() acceptance-test (verify) subprocess (#86, F8b) ───────
 
 
 class _FakeVerdict:
@@ -517,6 +519,53 @@ async def test_solve_verify_passes_through_whitelisted_var(monkeypatch):
     assert "AGENT_NAME" not in env  # not whitelisted → stripped
 
 
+async def test_solve_verify_env_is_allowlist_only(monkeypatch):
+    """The verify child sees no variable outside the allowlist unless passed through
+    (F8b r1) — F8's fourth spawn site joins the gate/format/preflight tier: it runs
+    the repo-defined test_cmd over coder-written code, proven against the child's
+    ENTIRE environment, not just the vars a test happened to set."""
+    monkeypatch.setenv("EDITOR", "vim")  # ordinary, NOT host-identity — still must not leak
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("LC_ALL", "C")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await _verify_adapter().verify("/wt")
+
+    env = captured["env"]
+    assert "EDITOR" not in env and "VIRTUAL_ENV" not in env and "AGENT_NAME" not in env
+    assert env["PATH"] == "/usr/bin"  # baseline survives …
+    assert env["LC_ALL"] == "C"  # … including the LC_* prefix
+    _assert_allowlist_only(env)
+
+
+async def test_solve_verify_allowlist_honors_passthrough(monkeypatch):
+    """env_passthrough is the only door through the allowlist for the verify child (F8b r1)."""
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("EDITOR", "vim")
+
+    captured = {}
+
+    async def _shell(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc(0)
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
+    await _verify_adapter(env_passthrough=["VIRTUAL_ENV"]).verify("/wt")
+
+    env = captured["env"]
+    assert env["VIRTUAL_ENV"] == "/venv"  # passed through → present
+    assert "EDITOR" not in env  # not passed through → dropped
+    _assert_allowlist_only(env, passthrough=("VIRTUAL_ENV",))
+
+
 async def test_dispatch_threads_env_passthrough_to_verify(monkeypatch):
     """The loop's env_passthrough reaches the verify subprocess through
     ``coder_seam.dispatch`` → the adapter constructor (#86 criterion 3). A fake
@@ -572,6 +621,7 @@ async def test_dispatch_threads_env_passthrough_to_verify(monkeypatch):
     env = captured["env"]
     assert env["A2A_AUTH_TOKEN"] == "secret"  # whitelisted → present in verify()
     assert "AGENT_NAME" not in env  # not whitelisted → stripped
+    _assert_allowlist_only(env, passthrough=("A2A_AUTH_TOKEN",))  # F8b tier holds end-to-end
 
 
 # ── worktree.dispatch_coder / coder_seam.dispatch_coder_tapped: Delegate env overlay (#142) ──────
