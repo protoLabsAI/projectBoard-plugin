@@ -14,6 +14,7 @@ import asyncio
 import json
 import shutil
 import threading
+import time
 
 import pytest
 
@@ -7030,6 +7031,13 @@ async def _preflight_with(monkeypatch, *, rc, dirt, prior=None):
     monkeypatch.setattr("asyncio.create_subprocess_shell", _shell)
     if prior is not None:
         lp._preflight_state["default"] = prior
+        # A KNOWN-failed project's re-check is throttled against `_last_preflight`,
+        # which defaults to 0.0 — so the window has "elapsed" only when
+        # `time.monotonic()` is already larger than the interval. That is true on a
+        # long-running dev box and FALSE in a fresh CI container, where monotonic
+        # starts near zero: these tests passed locally and skipped the preflight
+        # entirely on CI. Seed the timestamp so the elapsed window is explicit.
+        lp._last_preflight["default"] = time.monotonic() - 10_000
     await lp._maybe_preflight()
     return lp, released
 
