@@ -58,6 +58,7 @@ from .store import (
     LABEL_TASK,
     _all_items_disposed,
     apply_requirement_dispositions,
+    budgets_from_labels,
     escalation_enabled,
     get_store,
     knob_bool,
@@ -650,6 +651,26 @@ _MAX_MODE_JUDGE_SYS = (
     "criteria. Answer with ONLY the candidate number."
 )
 
+# The loop's bounded re-dispatch counters ↔ their persisted `budget:<kind>` label
+# kinds (#259): budget kind → the fid-keyed cache dict on BoardLoop. Bead state is
+# the durable source of truth — every consult goes through `_budget_get` (cache
+# miss → derive from the bead's labels), every spend through `_budget_set` and
+# every reset through `_budget_reset` (cache + label together), so a freshly
+# constructed loop resumes each budget where the old process left it and an
+# exhausted budget blocks instead of silently re-arming.
+_BUDGET_KINDS: dict[str, str] = {
+    "ci-fix": "_ci_fix_attempts",
+    "goal-fix": "_goal_fix_attempts",
+    "gate-fix": "_gate_fix_attempts",
+    "req-fix": "_req_fix_attempts",
+    "empty-result": "_empty_results",
+    "rebase": "_rebase_attempts",
+    "merged-verify": "_merged_verify_attempts",
+    "auto-merge": "_auto_merge_failures",
+    "review-fix": "_review_fix_attempts",
+    "review-run": "_review_run_failures",
+}
+
 
 class BoardLoop:
     def __init__(self, cfg: dict, *, gap_reporter: setup_check.GapReporter | None = None):
@@ -977,6 +998,12 @@ class BoardLoop:
         self._last_sweep = 0.0  # monotonic ts of the last health sweep
         # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
         # into the re-dispatch prompt) and fid → count of CI-fix re-dispatches so far.
+        # The counter dicts below (every `_BUDGET_KINDS` entry) are CACHES over the
+        # bead's persisted `budget:<kind>:<n>` labels (#259) — consult/spend/reset
+        # them ONLY through _budget_get/_budget_set/_budget_reset, so a restart
+        # resumes each budget from the bead and an exhausted budget still blocks.
+        # The prompt-feedback dicts (_ci_feedback/_ci_prior_diff/_review_prior)
+        # stay memory-only: they enrich the next prompt, they never gate anything.
         self._ci_feedback: dict[str, str] = {}
         self._ci_prior_diff: dict[str, str] = {}
         self._ci_fix_attempts: dict[str, int] = {}
@@ -1048,6 +1075,52 @@ class BoardLoop:
 
     def _store(self):
         return get_store(**self._store_kw)
+
+    # ── persisted fix budgets (#259): bead labels are truth, the dicts are caches ─
+    def _budget_cache(self, kind: str) -> dict[str, int]:
+        return getattr(self, _BUDGET_KINDS[kind])
+
+    async def _budget_get(self, store, fid: str, kind: str, feature: dict | None = None) -> int:
+        """The counter's current value: the cache when this process already consulted
+        it, else DERIVED from the bead's `budget:<kind>:<n>` label — a freshly
+        constructed loop resumes the budget where the last process left it. Pass the
+        in-hand ``feature`` projection to derive without a store read; a read hiccup
+        derives 0 (fail open: the budget re-counts, it never blocks spuriously)."""
+        cache = self._budget_cache(kind)
+        if fid in cache:
+            return cache[fid]
+        if feature is None:
+            try:
+                feature = await asyncio.to_thread(store.get_feature, fid)
+            except Exception:  # noqa: BLE001 — a derive hiccup must never break the edge
+                feature = None
+        n = budgets_from_labels((feature or {}).get("labels")).get(kind, 0)
+        if n:  # keep the dicts' "no key ⇒ nothing ever spent" semantics; 0 re-derives
+            cache[fid] = n
+        return n
+
+    async def _budget_set(self, store, fid: str, kind: str, n: int) -> None:
+        """Spend: write the counter to the cache AND the bead (`budget:<kind>:<n>`,
+        replaced — the `gens:` pattern). The label write is best-effort: a `br`
+        hiccup must never fail the edge that spent the budget (the cache still
+        carries it for this process; the next process derives one count lower)."""
+        self._budget_cache(kind)[fid] = n
+        try:
+            await asyncio.to_thread(store.record_budget, fid, kind, n)
+        except Exception:  # noqa: BLE001 — bookkeeping must never break the edge
+            log.warning("[project_board] %s budget %s=%d not persisted", fid, kind, n, exc_info=True)
+
+    async def _budget_reset(self, store, fid: str, *kinds: str) -> None:
+        """Reset counters — cache and bead labels together (the merge, tier-climb
+        and gate-passed edges). No ``kinds`` = ALL of them (the terminal edges).
+        Best-effort on the bead, like ``_budget_set``."""
+        names = kinds or tuple(_BUDGET_KINDS)
+        for kind in names:
+            self._budget_cache(kind).pop(fid, None)
+        try:
+            await asyncio.to_thread(store.clear_budgets, fid, list(kinds) if kinds else None)
+        except Exception:  # noqa: BLE001 — bookkeeping must never break the edge
+            log.warning("[project_board] %s budget reset (%s) not persisted", fid, ", ".join(names), exc_info=True)
 
     def _child_env(self) -> dict[str, str]:
         """The sanitized environment for a subprocess the loop spawns directly (gate
@@ -1955,12 +2028,11 @@ class BoardLoop:
                     if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
                         self._ci_feedback.pop(fid, None)
-                        self._ci_fix_attempts.pop(fid, None)
-                        self._rebase_attempts.pop(fid, None)
-                        self._merged_verify_attempts.pop(fid, None)
-                        self._review_fix_attempts.pop(fid, None)
-                        self._review_run_failures.pop(fid, None)
                         self._review_prior.pop(fid, None)
+                        # Merge edge: EVERY fix budget resets — cache and the bead's
+                        # `budget:` labels together (#259) — so a reopened/requeued
+                        # card starts with full budgets, exactly as pre-persistence.
+                        await self._budget_reset(store, fid)
                         # A merge with the gate still unhappy is a human override —
                         # reality wins, but it must be visible, not silent.
                         if self.review_gate and LABEL_CHANGES_REQUESTED in (f.get("labels") or []):
@@ -1977,12 +2049,10 @@ class BoardLoop:
                     )
                     await worktree.reap_feature_worktree(repo, self.root, fid)
                     self._ci_feedback.pop(fid, None)
-                    self._ci_fix_attempts.pop(fid, None)
-                    self._rebase_attempts.pop(fid, None)
-                    self._merged_verify_attempts.pop(fid, None)
-                    self._review_fix_attempts.pop(fid, None)
-                    self._review_run_failures.pop(fid, None)
                     self._review_prior.pop(fid, None)
+                    # Closed-unmerged is the other terminal edge: same full reset,
+                    # so a post-triage requeue starts with fresh budgets (#259).
+                    await self._budget_reset(store, fid)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                 elif state == "OPEN":
                     # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
@@ -1999,7 +2069,7 @@ class BoardLoop:
                     if self.auto_rebase and await self._verify_merged_state(store, f, pr_url, repo):
                         continue  # blocked on a red merged-state gate → nothing further this pass
                     if self.ci_poll:
-                        await self._reconcile_ci(store, fid, pr_url, repo)
+                        await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
                     # The merge-edge half of the review gate (M5): an in_review PR still
                     # marked review-pending had its gate interrupted (host restart, dead
                     # workflow run) — finish it here so the gate can't silently lapse into
@@ -2033,7 +2103,7 @@ class BoardLoop:
         why: list[str] = list(
             merge_posture(feature, auto_merge=self.auto_merge, review_gate=self.review_gate)["blockers"]
         )
-        if self._auto_merge_failures.get(fid, 0) >= self.auto_merge_max:
+        if await self._budget_get(store, fid, "auto-merge", feature) >= self.auto_merge_max:
             why.append("merge attempts exhausted")
         if why:
             return why
@@ -2104,7 +2174,7 @@ class BoardLoop:
             # PR's real state is.
             ok = (await worktree.pr_state(pr_url, cwd=repo)) == "MERGED"
         if ok:
-            self._auto_merge_failures.pop(fid, None)
+            await self._budget_reset(store, fid, "auto-merge")
             log.info(
                 "[project_board] %s auto-merged (%s, all gates green + current): %s", fid, self.merge_method, pr_url
             )
@@ -2114,8 +2184,8 @@ class BoardLoop:
             if not await worktree.delete_remote_branch(repo, branch):
                 log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
             return True
-        n = self._auto_merge_failures.get(fid, 0) + 1
-        self._auto_merge_failures[fid] = n
+        n = await self._budget_get(store, fid, "auto-merge", feature) + 1
+        await self._budget_set(store, fid, "auto-merge", n)
         if n >= self.auto_merge_max:
             try:
                 await asyncio.to_thread(
@@ -2181,7 +2251,7 @@ class BoardLoop:
             )
             return False  # transient — don't burn the coder budget on an infra blip
         # outcome == "conflict": a real merge conflict only the coder can resolve.
-        n = self._rebase_attempts.get(fid, 0)
+        n = await self._budget_get(store, fid, "rebase", feature)
         if n >= self.rebase_fix_max:
             await asyncio.to_thread(
                 store.flag_blocked,
@@ -2191,7 +2261,7 @@ class BoardLoop:
             await worktree.reap_feature_worktree(repo, self.root, fid)
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
             return True
-        self._rebase_attempts[fid] = n + 1
+        await self._budget_set(store, fid, "rebase", n + 1)
         self._ci_prior_diff.pop(fid, None)
         self._ci_feedback[fid] = (
             f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
@@ -2255,10 +2325,10 @@ class BoardLoop:
         )
         if stamped == base_sha[:_MERGED_VERIFIED_SHA_LEN]:
             return False  # the verdict is current — base hasn't moved since it was stamped
-        n = self._merged_verify_attempts.get(fid, 0)
+        n = await self._budget_get(store, fid, "merged-verify", feature)
         if self.merged_verify_max and n >= self.merged_verify_max:
             if n == self.merged_verify_max:  # log the exhaustion once, then stay quiet
-                self._merged_verify_attempts[fid] = n + 1
+                await self._budget_set(store, fid, "merged-verify", n + 1)
                 if self.auto_merge:
                     # The loop IS the adjudicator here, and a stale stamp is a hard hold
                     # on the merge edge — say so, and say what unsticks it.
@@ -2326,7 +2396,7 @@ class BoardLoop:
                     exc_info=True,
                 )
                 return False
-            self._merged_verify_attempts[fid] = n + 1
+            await self._budget_set(store, fid, "merged-verify", n + 1)
             log.info(
                 "[project_board] %s merged-state gate green — verdict re-verified against %s@%s",
                 fid,
@@ -2334,7 +2404,7 @@ class BoardLoop:
                 short,
             )
             return False
-        self._merged_verify_attempts[fid] = n + 1
+        await self._budget_set(store, fid, "merged-verify", n + 1)
         await asyncio.to_thread(
             store.flag_blocked,
             fid,
@@ -2345,7 +2415,7 @@ class BoardLoop:
         log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, short)
         return True
 
-    async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str):
+    async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str, feature: dict | None = None):
         """Closed-loop verify edge: an OPEN ``in_review`` PR whose checks FAILED is
         bounced back to the coder — and the re-dispatch *improves on the last try*
         rather than blindly repeating it (the missing OODA correction; before this a
@@ -2390,16 +2460,16 @@ class BoardLoop:
             await asyncio.to_thread(store.flag_blocked, fid, reason)
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
-            self._ci_fix_attempts.pop(fid, None)
+            await self._budget_reset(store, fid, "ci-fix")
 
         # Same-tier CI-fix budget FIRST (both ladder and single-coder): a red check
         # is usually a fixable nit the current tier can correct once it sees the
         # error — don't burn a stronger model on a one-line lint fix. The CI error +
         # prior diff are already injected above, so the re-dispatch improves on the
         # last try rather than repeating it.
-        attempts = self._ci_fix_attempts.get(fid, 0)
+        attempts = await self._budget_get(store, fid, "ci-fix", feature)
         if attempts < self.ci_fix_max:
-            self._ci_fix_attempts[fid] = attempts + 1
+            await self._budget_set(store, fid, "ci-fix", attempts + 1)
             await asyncio.to_thread(store.requeue, fid)
             log.info(
                 "[project_board] reconcile → same-tier CI-fix (attempt %d/%d): %s",
@@ -2420,7 +2490,7 @@ class BoardLoop:
                 await worktree.reap_feature_worktree(repo, self.root, fid)
                 log.warning("[project_board] reconcile → blocked (CI fails at top tier): %s", fid)
                 return
-            self._ci_fix_attempts.pop(fid, None)  # fresh same-tier budget at the new rung
+            await self._budget_reset(store, fid, "ci-fix")  # fresh same-tier budget at the new rung
             await asyncio.to_thread(store.requeue, fid)
             log.info("[project_board] reconcile → escalate to %s + re-dispatch (CI failed): %s", nxt, fid)
             return
@@ -2676,9 +2746,9 @@ class BoardLoop:
                             # model-capability failure. Carry the gap (+ the rejected
                             # diff, stashed by _verify_goal) as feedback and re-dispatch
                             # the same tier, bounded by goal_fix_max, BEFORE escalating.
-                            n = self._goal_fix_attempts.get(fid, 0)
+                            n = await self._budget_get(store, fid, "goal-fix", feature)
                             if n < self.goal_fix_max:
-                                self._goal_fix_attempts[fid] = n + 1
+                                await self._budget_set(store, fid, "goal-fix", n + 1)
                                 # KEEP the worktree (the impl is in its files); the coder
                                 # only ADDS what the reviewer flagged. The diff is on disk,
                                 # so don't also carry it as prompt text (redundant/confusing).
@@ -2709,9 +2779,9 @@ class BoardLoop:
                     # local_gate_max; on exhaustion open the PR anyway (CI is the backstop).
                     gate_out = await self._run_local_gate(wt, feature)
                     if gate_out is not None:
-                        n = self._gate_fix_attempts.get(fid, 0)
+                        n = await self._budget_get(store, fid, "gate-fix", feature)
                         if n < self.local_gate_max:
-                            self._gate_fix_attempts[fid] = n + 1
+                            await self._budget_set(store, fid, "gate-fix", n + 1)
                             self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
                             self._ci_feedback[fid] = (
                                 "Your changes are ALREADY in this worktree's files, but the pre-PR "
@@ -2744,9 +2814,9 @@ class BoardLoop:
                     if ledger and not _all_items_disposed(ledger):
                         open_items = [i for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")]
                         listing = "\n".join(f"- {i.get('id')}: {i.get('text')}" for i in open_items)
-                        n = self._req_fix_attempts.get(fid, 0)
+                        n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
-                            self._req_fix_attempts[fid] = n + 1
+                            await self._budget_set(store, fid, "req-fix", n + 1)
                             self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
                             self._ci_feedback[fid] = (
                                 "Your implementation is ALREADY in this worktree's files, but these "
@@ -2847,8 +2917,8 @@ class BoardLoop:
                     if isinstance(exc, worktree.NoChangesError):
                         had_tools, stop = self._empty_result_signals(fid)
                         if not had_tools:
-                            n = self._empty_results.get(fid, 0) + 1
-                            self._empty_results[fid] = n
+                            n = await self._budget_get(store, fid, "empty-result", feature) + 1
+                            await self._budget_set(store, fid, "empty-result", n)
                             evidence = (
                                 f"empty coder reply — no diff, no tool calls (stop_reason={stop or 'none reported'})"
                             )
@@ -2888,7 +2958,7 @@ class BoardLoop:
                                 )
                             except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
                                 log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
-                            self._empty_results.pop(fid, None)  # a climb gets its own retry window
+                            await self._budget_reset(store, fid, "empty-result")  # a climb gets its own retry window
                             if self.escalation_on:
                                 nxt = await asyncio.to_thread(store.escalate, fid, reason[:200])
                                 if nxt:
@@ -2903,9 +2973,7 @@ class BoardLoop:
                                     retries = 0
                                     # Fresh per-tier budgets on the climb — mirrors the
                                     # shared capability-escalation path below.
-                                    self._goal_fix_attempts.pop(fid, None)
-                                    self._gate_fix_attempts.pop(fid, None)
-                                    self._req_fix_attempts.pop(fid, None)
+                                    await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             await asyncio.to_thread(store.flag_blocked, fid, reason)
@@ -2954,12 +3022,11 @@ class BoardLoop:
                                 self._ci_prior_diff.pop(fid, None)  # a timeout produced no diff to echo back
                             tier = nxt
                             retries = 0
-                            # Fresh goal-fix budget at the new tier — otherwise a tier that
-                            # exhausted its goal-fix retries hands the next (stronger) tier a
-                            # spent budget, so it blocks on its first gap without a real shot.
-                            self._goal_fix_attempts.pop(fid, None)
-                            self._gate_fix_attempts.pop(fid, None)  # fresh local-gate budget too
-                            self._req_fix_attempts.pop(fid, None)  # and a fresh ledger budget (#113)
+                            # Fresh goal-fix / local-gate / ledger budgets at the new tier —
+                            # otherwise a tier that exhausted its retries hands the next
+                            # (stronger) tier a spent budget, so it blocks on its first gap
+                            # without a real shot.
+                            await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
@@ -2972,10 +3039,9 @@ class BoardLoop:
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
                 await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
-                self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
-                self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
-                self._req_fix_attempts.pop(fid, None)  # and the requirement-ledger budget (#113)
-                self._empty_results.pop(fid, None)  # and the empty-result count (#198)
+                # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
+                # requirement ledger #113, and the empty-result count #198).
+                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result")
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.
@@ -3158,8 +3224,8 @@ class BoardLoop:
             # poll — but bounded: a persistently unrunnable gate escalates to the
             # operator instead of re-burning the workflow every poll forever.
             reason = why or "review produced no output"
-            n = self._review_run_failures.get(fid, 0) + 1
-            self._review_run_failures[fid] = n
+            n = await self._budget_get(store, fid, "review-run") + 1
+            await self._budget_set(store, fid, "review-run", n)
             if n >= self.review_run_max:
                 # Deliberately KEEP review-pending through the block (#181): blocked
                 # features aren't reconciled, so the label is inert while blocked —
@@ -3173,7 +3239,7 @@ class BoardLoop:
                     f"review gate could not complete after {n} attempt(s) — {reason} — "
                     f"needs operator attention: {pr_url}",
                 )
-                self._review_run_failures.pop(fid, None)
+                await self._budget_reset(store, fid, "review-run")
                 log.warning("[project_board] %s blocked (review gate unrunnable %d times: %s)", fid, n, reason)
                 return
             log.warning(
@@ -3184,7 +3250,7 @@ class BoardLoop:
                 reason,
             )
             return
-        self._review_run_failures.pop(fid, None)
+        await self._budget_reset(store, fid, "review-run")
         findings = self._parse_findings(output)
         if findings is None:
             # Host predates the findings convention (ADR 0077) — the gate can't
@@ -3209,12 +3275,12 @@ class BoardLoop:
                 LABEL_REVIEW_CLEAN,
                 note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
             )
-            self._review_fix_attempts.pop(fid, None)
+            await self._budget_reset(store, fid, "review-fix")
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
             return
 
         rendered = self._render_findings(blocking)
-        n = self._review_fix_attempts.get(fid, 0)
+        n = await self._budget_get(store, fid, "review-fix")
         if n >= self.review_fix_max:
             await asyncio.to_thread(store.set_review_substate, fid, None, note=rendered)
             await asyncio.to_thread(
@@ -3224,10 +3290,10 @@ class BoardLoop:
             )
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
-            self._review_fix_attempts.pop(fid, None)
+            await self._budget_reset(store, fid, "review-fix")
             log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
             return
-        self._review_fix_attempts[fid] = n + 1
+        await self._budget_set(store, fid, "review-fix", n + 1)
         # Carry the lesson exactly like the CI bounce: findings as the rejection
         # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
         self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)

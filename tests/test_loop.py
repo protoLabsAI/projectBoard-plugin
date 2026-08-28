@@ -2342,6 +2342,7 @@ class _ReconcileStore:
         self._in_review = in_review
         self.merged = []
         self.blocked = []
+        self.cleared = []  # (fid, kinds-tuple | None) — clear_budgets calls (#259)
 
     def list_features(self, state=None):
         return self._in_review if state == "in_review" else []
@@ -2352,6 +2353,10 @@ class _ReconcileStore:
 
     def flag_blocked(self, fid, reason):
         self.blocked.append((fid, reason))
+
+    def clear_budgets(self, fid, kinds=None):
+        self.cleared.append((fid, tuple(kinds) if kinds is not None else None))
+        return {"id": fid}
 
 
 async def test_reconcile_drives_merged_to_done_and_closed_to_blocked(monkeypatch):
@@ -2391,6 +2396,33 @@ async def test_reconcile_drives_merged_to_done_and_closed_to_blocked(monkeypatch
     assert set(reaped) == {"bd-merged", "bd-closed"}  # both terminal states reap; open kept
 
 
+async def test_reconcile_terminal_edges_reset_persisted_budgets(monkeypatch):
+    """r2 (#259): the merge edge (and the closed-unmerged sibling) clears EVERY
+    persisted `budget:` label (kinds=None) along with the in-memory caches — a
+    reopened/requeued card starts with full budgets, exactly as pre-persistence."""
+    store = _ReconcileStore(
+        [
+            {"id": "bd-m", "pr_url": "https://example/pr/1"},
+            {"id": "bd-c", "pr_url": "https://example/pr/2"},
+        ]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    states = {"https://example/pr/1": "MERGED", "https://example/pr/2": "CLOSED"}
+
+    async def _pr_state(url, *, cwd="."):
+        return states[url]
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+
+    loop = BoardLoop({})
+    loop._ci_fix_attempts["bd-m"] = 2  # a spent budget the old process was carrying
+    loop._review_fix_attempts["bd-m"] = 1
+    await loop._reconcile_prs()
+    assert ("bd-m", None) in store.cleared and ("bd-c", None) in store.cleared  # None = ALL kinds
+    assert "bd-m" not in loop._ci_fix_attempts and "bd-m" not in loop._review_fix_attempts
+
+
 # ── the CI-feedback edge (closed-loop verify) ────────────────────────────────────
 
 
@@ -2400,6 +2432,8 @@ class _CiStore:
         self.requeued = []
         self.blocked = []
         self.escalated = []
+        self.budgets = []  # (fid, kind, n) — record_budget writes (#259)
+        self.cleared = []  # (fid, kinds-tuple | None) — clear_budgets calls (#259)
         self._escalate_tiers = list(escalate_tiers or [])
 
     def list_features(self, state=None):
@@ -2418,6 +2452,14 @@ class _CiStore:
     def escalate(self, fid, reason):
         self.escalated.append((fid, reason))
         return self._escalate_tiers.pop(0) if self._escalate_tiers else None
+
+    def record_budget(self, fid, kind, n):
+        self.budgets.append((fid, kind, n))
+        return {"id": fid}
+
+    def clear_budgets(self, fid, kinds=None):
+        self.cleared.append((fid, tuple(kinds) if kinds is not None else None))
+        return {"id": fid}
 
 
 async def _stub_ci_worktree(monkeypatch, *, ci, diff="- a\n+ b"):
@@ -2523,6 +2565,61 @@ async def test_reconcile_ci_spends_same_tier_budget_before_escalating(monkeypatc
     # Budget exhausted again → escalate returns None (ladder top) → blocked.
     await loop._reconcile_prs()
     assert [b[0] for b in store.blocked] == ["bd-b"]
+
+
+# ── persisted fix budgets (#259): the bead is truth, the dicts are caches ────────
+
+
+async def test_reconcile_ci_exhausted_budget_on_the_bead_blocks_after_restart(monkeypatch):
+    """r1 (#259): the CI-fix budget rides the bead (`budget:ci-fix:<n>`), so a FRESHLY
+    constructed loop — a restart, every in-memory counter dict empty — against a bead
+    whose budget is already exhausted blocks instead of re-dispatching. Red-is-reachable:
+    the pre-#259 loop derived attempts=0 from its empty dict and REQUEUED this exact
+    card (test_reconcile_ci_bounces_failing_pr_then_blocks shows the requeue path with
+    an unexhausted budget)."""
+    store = _CiStore({"id": "bd-ci", "pr_url": "https://example/pr/9", "labels": ["budget:ci-fix:2"]})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Tests: FAILURE"))
+
+    loop = BoardLoop({"ci_fix_max": 2})  # fresh process: _ci_fix_attempts is empty
+    await loop._reconcile_prs()
+    assert store.requeued == []  # NO re-dispatch — the bead's budget is spent
+    assert [b[0] for b in store.blocked] == ["bd-ci"]
+    assert ("bd-ci", ("ci-fix",)) in store.cleared  # the block clears the spent label too
+
+
+async def test_reconcile_ci_resumes_a_half_spent_budget_from_the_bead(monkeypatch):
+    """#259: a half-spent persisted budget resumes mid-count after a restart — the
+    fresh loop derives 1 from the bead, spends the one remaining attempt (persisting
+    the new count), then blocks."""
+    store = _CiStore({"id": "bd-ci", "pr_url": "https://example/pr/9", "labels": ["budget:ci-fix:1"]})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Tests: FAILURE"))
+
+    loop = BoardLoop({"ci_fix_max": 2})
+    await loop._reconcile_prs()  # bead carries 1 → one more same-tier fix (2/2), persisted
+    assert store.requeued == ["bd-ci"]
+    assert store.budgets == [("bd-ci", "ci-fix", 2)]
+    await loop._reconcile_prs()  # now exhausted → blocked, no further requeue
+    assert store.requeued == ["bd-ci"]
+    assert [b[0] for b in store.blocked] == ["bd-ci"]
+
+
+async def test_reconcile_ci_persists_each_spend_and_the_climb_reset(monkeypatch):
+    """r2 (#259): every same-tier CI-fix spend is written to the bead as it happens,
+    and the tier-climb edge still resets the budget — on the bead as well as in the
+    cache — so the new rung starts its own count."""
+    store = _CiStore({"id": "bd-p", "pr_url": "https://example/pr/5"}, escalate_tiers=["reasoning"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Lint: F841 unused variable"))
+
+    loop = BoardLoop({"coders": {"smart": "a", "reasoning": "b"}, "ci_fix_max": 1})
+    await loop._reconcile_prs()  # spend 1/1 — written through to the bead
+    assert store.budgets == [("bd-p", "ci-fix", 1)]
+    await loop._reconcile_prs()  # exhausted → climb; the persisted budget resets with the cache
+    assert [e[0] for e in store.escalated] == ["bd-p"]
+    assert ("bd-p", ("ci-fix",)) in store.cleared
+    assert loop._ci_fix_attempts.get("bd-p", 0) == 0
 
 
 async def test_reconcile_ci_leaves_passing_and_pending_in_review(monkeypatch):
@@ -2775,6 +2872,21 @@ async def test_maybe_rebase_conflict_redispatches_then_blocks(monkeypatch):
     # budget (1) exhausted → block, no second requeue.
     assert await loop._maybe_rebase(store, FEATURE, "pr", "/repo") is True
     assert store.requeued == ["bd-1"]
+    assert [b[0] for b in store.blocked] == ["bd-1"]
+
+
+async def test_maybe_rebase_exhausted_budget_on_the_bead_blocks_after_restart(monkeypatch):
+    """#259: the rebase budget rides the bead too — a fresh loop (empty dicts) against
+    a card carrying `budget:rebase:1` with rebase_fix_max=1 blocks for a manual rebase
+    instead of burning another coder re-dispatch (the pre-#259 loop requeued here)."""
+    monkeypatch.setattr(worktree, "pr_merge_state", _aret("DIRTY"))
+    monkeypatch.setattr(worktree, "rebase_onto_base", _aret(("conflict", "graph/x.py")))
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+    store = _CiStore({"id": "bd-1"})
+    feature = {**FEATURE, "labels": ["budget:rebase:1"]}
+    loop = BoardLoop({"coder": "proto", "rebase_fix_max": 1})
+    assert await loop._maybe_rebase(store, feature, "pr", "/repo") is True
+    assert store.requeued == []  # no re-dispatch — the persisted budget is spent
     assert [b[0] for b in store.blocked] == ["bd-1"]
 
 
@@ -3759,6 +3871,7 @@ class _GateStore(FakeLoopStore):
         super().__init__()
         self.review_states = []  # (label, note) history
         self.state = "in_review"
+        self.labels = []  # bead labels — carries persisted `budget:` counters (#259)
 
     def set_review_substate(self, fid, label, note=""):
         self.calls.append(("set_review_substate", fid, label))
@@ -3771,7 +3884,7 @@ class _GateStore(FakeLoopStore):
         return {"id": fid}
 
     def get_feature(self, fid):
-        return {"id": fid, "board_state": self.state}
+        return {"id": fid, "board_state": self.state, "labels": list(self.labels)}
 
 
 def _inject_fake_findings(monkeypatch):
@@ -3904,6 +4017,21 @@ async def test_review_gate_exhausted_budget_blocks_never_merges_silently(monkeyp
     assert blocked and "needs human review" in blocked[0][2]
     assert ("requeue", "bd-1") not in store.calls
     assert "bd-1" not in loop._review_fix_attempts  # budget cleared with the block
+
+
+async def test_review_gate_exhausted_persisted_budget_blocks_after_restart(monkeypatch):
+    """#259: the review-fix budget rides the bead (`budget:review-fix:<n>`) — a fresh
+    loop (empty dicts) derives the spent count via store.get_feature and blocks instead
+    of bouncing again (the pre-#259 loop, sibling test above, needed the count pre-seeded
+    in its dict to block; with an empty dict it re-dispatched)."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    store.labels = ["budget:review-fix:1"]  # the spent budget, persisted by the old process
+    loop = _gate_loop(monkeypatch, _BLOCKER, cfg={"review_fix_max": 1})
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "needs human review" in blocked[0][2]
+    assert ("requeue", "bd-1") not in store.calls  # no re-dispatch on a spent budget
 
 
 async def test_review_gate_unrunnable_leaves_pending_for_the_reconcile_retry(monkeypatch):

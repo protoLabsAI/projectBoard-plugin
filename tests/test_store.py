@@ -192,6 +192,78 @@ def test_record_gens_spent_accumulates_and_replaces_the_old_label(make_board, mo
     assert ("update", "bd-1", "--remove-label", "gens:5", "--add-label", "gens:9") in br.calls
 
 
+# ── loop fix-budget persistence (#259) ──────────────────────────────────────────
+
+
+def test_record_budget_adds_a_fresh_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["ready"]})
+    b.record_budget("bd-1", "ci-fix", 1)
+    assert ("update", "bd-1", "--add-label", "budget:ci-fix:1") in br.calls
+
+
+def test_record_budget_replaces_only_its_own_kind(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "labels": ["budget:ci-fix:1", "budget:rebase:2", "ready"]}
+    )
+    b.record_budget("bd-1", "ci-fix", 2)
+    # the stale ci-fix count is replaced (the gens: pattern) — never two labels of one
+    # kind at once; another kind's budget label is untouched
+    assert ("update", "bd-1", "--remove-label", "budget:ci-fix:1", "--add-label", "budget:ci-fix:2") in br.calls
+
+
+def test_clear_budgets_drops_named_kinds_or_all(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    labels = ["budget:ci-fix:2", "budget:goal-fix:1", "budget:rebase:1", "ready"]
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": list(labels)})
+    b.clear_budgets("bd-1", ["ci-fix"])  # a tier climb resets only its per-tier kinds
+    assert ("update", "bd-1", "--remove-label", "budget:ci-fix:2") in br.calls
+    b.clear_budgets("bd-1")  # the merge edge resets EVERY budget label
+    assert (
+        "update",
+        "bd-1",
+        "--remove-label",
+        "budget:ci-fix:2",
+        "--remove-label",
+        "budget:goal-fix:1",
+        "--remove-label",
+        "budget:rebase:1",
+    ) in br.calls
+
+
+def test_clear_budgets_noops_without_matching_labels(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["ready", "gens:3"]})
+    b.clear_budgets("bd-1")
+    b.clear_budgets("bd-1", ["ci-fix"])
+    assert not br.cmds("update")  # nothing to drop → no br write burned
+
+
+def test_budgets_from_labels_parses_and_ignores_junk():
+    assert store.budgets_from_labels(["budget:ci-fix:2", "budget:merged-verify:11", "ready"]) == {
+        "ci-fix": 2,
+        "merged-verify": 11,
+    }
+    # malformed (no kind / non-numeric count / no colon) and non-budget labels → ignored
+    assert store.budgets_from_labels(["budget::3", "budget:ci-fix:x", "budget:bare", "gens:3"]) == {}
+    assert store.budgets_from_labels(None) == {}
+
+
+def test_project_exposes_budgets_from_labels(make_board):
+    b = make_board(Br())
+    f = b._project({"id": "bd-1", "status": "open", "labels": ["budget:ci-fix:2", "budget:review-fix:1", "gens:3"]})
+    assert f["budgets"] == {"ci-fix": 2, "review-fix": 1}
+    assert b._project({"id": "bd-2", "status": "open", "labels": []})["budgets"] == {}
+
+
 # ── verified-candidate salvage record (#91) ─────────────────────────────────────
 
 
