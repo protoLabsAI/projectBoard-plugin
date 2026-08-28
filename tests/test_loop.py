@@ -29,6 +29,8 @@ from project_board.loop import (
     _issue_closed_by_board_sibling,
     _no_test_marker,
     _pr_body,
+    _requirement_gate_diag_line,
+    _requirement_gate_diagnostics,
     _resolve_gate_cmd,
     _source_issue,
     _source_issue_still_open,
@@ -84,6 +86,10 @@ class FakeLoopStore:
     def set_requirements(self, fid, items):
         self.calls.append(("set_requirements", fid, items))
         return {"id": fid, "requirements": items}
+
+    def comment(self, fid, text):
+        self.calls.append(("comment", fid, text))
+        return {"id": fid}
 
     def names(self):
         return [c[0] for c in self.calls]
@@ -1695,6 +1701,157 @@ async def test_goal_verify_gap_exhausts_retries_then_blocks(monkeypatch):
     assert store.creates == ["bd-1"]  # keep-worktree: created ONCE, reused across both retries
     assert "flag_blocked" in store.names()  # then blocked for triage
     assert "open_review" not in store.names()
+
+
+# ── requirement-gate diagnostics (#284) ──────────────────────────────────────────
+
+
+def test_requirement_gate_diagnostics_pure_fields():
+    """The payload the gate logs and persists: parsed dispositions, still-open ids,
+    len(result), whether a `## Requirements` heading is present, and the first 200
+    chars after the LAST such heading."""
+    open_items = [{"id": "r1", "text": "do x", "status": "open"}]
+
+    # No `## Requirements` section at all — silence, not a parse miss.
+    silent = _requirement_gate_diagnostics("just some prose reply", open_items)
+    assert silent["dispositions"] == []
+    assert silent["open_ids"] == ["r1"]
+    assert silent["result_len"] == len("just some prose reply")
+    assert silent["has_requirements_heading"] is False
+    assert silent["after_heading"] == ""
+
+    # A heading whose disposition line is MALFORMED — heading present, nothing parses,
+    # r1 stays open. This is the exact "wrote a section but the loop didn't read it" case.
+    body = "## Requirements\nr1 is basically handled I think\n\n## Summary\ndone"
+    parsed = _requirement_gate_diagnostics(body, open_items)
+    assert parsed["dispositions"] == []  # the malformed row is silence
+    assert parsed["has_requirements_heading"] is True
+    assert parsed["after_heading"].startswith("\nr1 is basically handled")
+    assert len(parsed["after_heading"]) <= 200
+
+
+def test_requirement_gate_diagnostics_after_heading_caps_at_200_and_uses_last():
+    """The window is capped at 200 chars and taken from the LAST heading (a mid-narration
+    mention must not shadow the real section — the #56 discipline)."""
+    tail = "x" * 500
+    body = f"## Requirements (early mention)\nignored\n## Requirements\n{tail}"
+    diag = _requirement_gate_diagnostics(body, [])
+    assert len(diag["after_heading"]) == 200
+    assert diag["after_heading"].strip("\n").startswith("x")
+
+
+def test_requirement_gate_diag_line_carries_every_field():
+    diag = {
+        "dispositions": [{"id": "r1", "status": "done"}],
+        "open_ids": ["r2"],
+        "result_len": 42,
+        "has_requirements_heading": True,
+        "after_heading": "- r1: done",
+    }
+    line = _requirement_gate_diag_line(diag)
+    assert "dispositions=" in line and "r1" in line
+    assert "open_ids=['r2']" in line
+    assert "len(result)=42" in line
+    assert "has_requirements_heading=True" in line
+    assert "after_heading=" in line
+
+
+async def test_requirement_gate_logs_diagnostics_and_persists_bounce_comment(monkeypatch, caplog):
+    """An open requirement item bounces the build: the gate logs the diagnostic payload
+    at INFO AND persists the same fields as a bead comment, then the coder disposes the
+    item on the retry and the PR opens (#284)."""
+    replies = iter(
+        [
+            # First reply: a `## Requirements` heading present but the disposition line
+            # is malformed, so r1 never parses and stays OPEN → the gate bounces.
+            "## Requirements\nr1 — mostly done?\n\n## Summary\nwip",
+            # Second reply: a clean disposition → r1 done → the gate passes.
+            "## Requirements\n- r1: done\n\n## Summary\nshipped",
+        ]
+    )
+
+    async def _disp(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        return next(replies)
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/284"
+
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        loop, store = await _drive_with(
+            monkeypatch,
+            open_pr=_open_pr,
+            dispatch=_disp,
+            cfg={"coder": "proto", "goal_fix_max": 2},
+            feature=feature,
+        )
+
+    # The gate opened the PR once the retry disposed r1.
+    assert ("open_review", "bd-1", "https://example/pr/284") in store.calls
+    assert store.creates == ["bd-1"]  # keep-worktree: one worktree, reused for the fix
+
+    # r1: INFO log records dispositions, still-open ids, len(result), heading presence,
+    # and the first 200 chars after the heading.
+    diag_lines = [m for m in caplog.messages if "requirement gate diagnostics" in m]
+    assert diag_lines, "the gate must log its diagnostics at INFO"
+    line = diag_lines[0]
+    assert "dispositions=[]" in line  # the malformed row parsed to nothing
+    assert "open_ids=['r1']" in line
+    assert "len(result)=" in line
+    assert "has_requirements_heading=True" in line
+    assert "after_heading=" in line and "mostly done" in line
+
+    # r2: the SAME diagnostic fields are persisted on the bead attempt comment.
+    comments = [c for c in store.calls if c[0] == "comment"]
+    assert len(comments) == 1, "one bounce → one diagnostic comment"
+    _, cid, text = comments[0]
+    assert cid == "bd-1"
+    assert "requirement gate bounce" in text and "re-dispatch 1/2" in text
+    assert "dispositions=[]" in text
+    assert "open_ids=['r1']" in text
+    assert "has_requirements_heading=True" in text
+    assert "mostly done" in text  # the first-200-chars window rode along
+
+
+async def test_requirement_gate_diagnostic_comment_failure_never_breaks_the_build(monkeypatch, caplog):
+    """The bounce comment is bookkeeping: a store.comment failure is logged and swallowed,
+    and the build still re-dispatches and opens the PR (#284)."""
+    replies = iter(
+        [
+            "no requirements section here — r1 stays open",
+            "## Requirements\n- r1: done\n\n## Summary\nshipped",
+        ]
+    )
+
+    async def _disp(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        return next(replies)
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/285"
+
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+
+    def _boom(loop):
+        store = loop_mod.get_store()
+
+        def _raise(fid, text):
+            store.calls.append(("comment", fid, text))
+            raise RuntimeError("br is down")
+
+        store.comment = _raise
+
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        loop, store = await _drive_with(
+            monkeypatch,
+            open_pr=_open_pr,
+            dispatch=_disp,
+            cfg={"coder": "proto", "goal_fix_max": 2},
+            feature=feature,
+            seed=_boom,
+        )
+
+    assert ("open_review", "bd-1", "https://example/pr/285") in store.calls  # build survived
+    assert "requirement gate diagnostic comment failed" in caplog.text
 
 
 async def test_goal_verify_off_by_default_skips_the_gate(monkeypatch):
