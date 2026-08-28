@@ -1848,3 +1848,199 @@ def test_set_store_factory_wires_then_clears_the_persist_accessor():
         assert len(store.comments) == 1  # unchanged
     finally:
         cs.set_store_factory(None)
+
+
+# ── F7: the tapped dispatch goes through C1's PUBLIC dispatch_tapped seam ─────────
+
+
+def test_coder_seam_imports_nothing_private_from_the_host_plugins():
+    """r1 (F7): coder_seam reaches plugins.coding_agent / plugins.delegates ONLY
+    through public names — no underscore-prefixed import from either. The tapped
+    dispatch now goes through C1's public ``dispatch_tapped`` seam, so the old
+    ``_client_for``/``_drop_client``/``_make_permission``/``_spec``/``kill_now``
+    reaches are gone (grep test)."""
+    import re
+    from pathlib import Path
+
+    src = Path(coder_seam.__file__).read_text()
+    leaked = []
+    for m in re.finditer(r"from\s+plugins\.(?:coding_agent|delegates)[\w.]*\s+import\s+([^\n#]+)", src):
+        for name in re.split(r"[,\s()]+", m.group(1).strip()):
+            if name and name.startswith("_"):
+                leaked.append(name)
+    assert leaked == [], f"private host imports leaked into coder_seam: {leaked}"
+
+    # And no lingering private ACP attribute/plumbing reaches in the source either.
+    for forbidden in ("_client_for", "_drop_client", "_make_permission", "._spec(", ".kill_now(", "._permission"):
+        assert forbidden not in src, f"coder_seam still references host internal {forbidden!r}"
+
+
+@dataclass
+class _FakeCoder:
+    """A coder Delegate stand-in carrying the fields dispatch_coder_tapped scopes
+    (workdir/manage_git/env), so the board-policy overrides are exercised for real."""
+
+    workdir: str = ""
+    manage_git: bool = True
+    env: dict = field(default_factory=dict)
+
+
+async def test_dispatch_coder_tapped_uses_the_public_seam_when_present(monkeypatch):
+    """r2: with the public C1 seam present (injected as a fake), the tap drives IT —
+    not the untapped fallback — hands it the scoped delegate (board owns git, worktree
+    is the workdir), and every forwarded signal lands in the live buffer."""
+    coder_seam._progress.clear()
+    seen = {}
+
+    async def _fake_seam(
+        delegate,
+        prompt,
+        *,
+        timeout=None,
+        tool_callback=None,
+        thought_callback=None,
+        text_callback=None,
+        usage_callback=None,
+        plan_callback=None,
+        stop_reason_callback=None,
+    ):
+        seen["delegate"] = delegate
+        seen["prompt"] = prompt
+        seen["timeout"] = timeout
+        await thought_callback("thinking about it")
+        await tool_callback({"phase": "start", "id": "t1", "name": "read_file", "input": '{"path": "x.py"}'})
+        usage_callback({"used": 7, "size": 70})
+        plan_callback([{"content": "do the thing", "status": "in_progress"}])
+        await text_callback("all done.")
+        stop_reason_callback("end_turn")
+        return "the tapped reply"
+
+    def _no_fallback(*a, **k):
+        raise AssertionError("must not fall back to worktree.dispatch_coder when the seam is present")
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _no_fallback)
+
+    out = await coder_seam.dispatch_coder_tapped(
+        _FakeCoder(manage_git=True),
+        "/wt/cand",
+        "do it",
+        fid="bd-tap",
+        gen=3,
+        tier="smart",
+        _dispatch_tapped=_fake_seam,
+    )
+    assert out == "the tapped reply"
+    # board policy applied on the scoped copy handed to the seam
+    assert seen["delegate"].workdir == "/wt/cand"
+    assert seen["delegate"].manage_git is False  # the BOARD owns git
+    assert seen["prompt"] == "do it"
+    # every forwarded signal recorded on the gen
+    (g,) = coder_seam.progress_snapshot("bd-tap")["gens"]
+    assert g["gen"] == 3 and g["tier"] == "smart"
+    assert "thinking about it" in g["thought_tail"]
+    assert g["current_tool"]["name"] == "read_file"
+    assert g["current_tool"]["kind"] == "read"
+    assert g["usage"] == {"used": 7, "size": 70}
+    assert g["plan"][0]["content"] == "do the thing"
+    assert g["answer_tail"].endswith("all done.")
+    assert g["stop_reason"] == "end_turn"
+    assert g["done"] is True  # the gen closed on the success path
+
+
+async def test_dispatch_coder_tapped_sanitizes_env_on_the_seam_path(monkeypatch):
+    """The env allowlist (#142) is applied on the tapped path too, not just the
+    fallback: the scoped delegate the seam receives carries the sanitized overlay."""
+    coder_seam._progress.clear()
+    monkeypatch.setenv("AGENT_NAME", "host-agent")
+    monkeypatch.setenv("A2A_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    seen = {}
+
+    async def _fake_seam(delegate, prompt, *, timeout=None, **_cbs):
+        seen["env"] = dict(delegate.env)
+        return "ok"
+
+    await coder_seam.dispatch_coder_tapped(
+        _FakeCoder(),
+        "/wt",
+        "do it",
+        fid="bd-env",
+        gen=1,
+        env_passthrough=["A2A_TOKEN"],
+        _dispatch_tapped=_fake_seam,
+    )
+    assert seen["env"]["A2A_TOKEN"] == "secret"  # whitelisted → present
+    assert "AGENT_NAME" not in seen["env"]  # host identity stripped
+
+
+async def test_dispatch_coder_tapped_normalizes_a_seam_failure_to_worktree_error(monkeypatch):
+    """A real dispatch failure BELOW the seam is normalised to WorktreeError and
+    propagates — it does NOT silently degrade to an untapped retry (the fallback is
+    reserved for a seam that is ABSENT, not one that raised). The gen still closes."""
+    coder_seam._progress.clear()
+
+    async def _boom_seam(delegate, prompt, *, timeout=None, **_cbs):
+        raise RuntimeError("acp session died")
+
+    def _no_fallback(*a, **k):
+        raise AssertionError("a seam failure must not fall back to an untapped dispatch")
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _no_fallback)
+
+    try:
+        await coder_seam.dispatch_coder_tapped(
+            _FakeCoder(), "/wt", "x", fid="bd-err", gen=1, _dispatch_tapped=_boom_seam
+        )
+        raised = False
+    except worktree.WorktreeError as exc:
+        raised = True
+        assert "acp session died" in str(exc)
+    assert raised
+    assert coder_seam.progress_snapshot("bd-err")["gens"][0]["done"] is True
+
+
+async def test_dispatch_coder_tapped_maps_a_seam_timeout_to_coder_timeout(monkeypatch):
+    """A configured timeout hard-bounds the seam via asyncio.wait_for exactly as the
+    untapped path does — a fired deadline surfaces as CoderTimeout, not a raw error."""
+    import asyncio as real_asyncio
+
+    coder_seam._progress.clear()
+
+    async def _hang_seam(delegate, prompt, *, timeout=None, **_cbs):
+        await real_asyncio.sleep(10)
+        return "never"
+
+    async def _boom_wait_for(coro, timeout):
+        coro.close()
+        raise real_asyncio.TimeoutError()
+
+    monkeypatch.setattr("project_board.coder_seam.asyncio.wait_for", _boom_wait_for)
+
+    try:
+        await coder_seam.dispatch_coder_tapped(
+            _FakeCoder(), "/wt", "x", fid="bd-to", gen=1, timeout=0.01, _dispatch_tapped=_hang_seam
+        )
+        raised = False
+    except worktree.CoderTimeout:
+        raised = True
+    assert raised
+
+
+async def test_dispatch_coder_tapped_falls_back_only_when_the_seam_is_absent(monkeypatch):
+    """The default injection path: with no seam handle (``_import_dispatch_tapped``
+    returns None in this host-free env) the tap degrades to the untapped
+    worktree.dispatch_coder and STILL records the gen."""
+    coder_seam._progress.clear()
+    assert coder_seam._import_dispatch_tapped() is None  # genuinely absent here (no host)
+    seen = {}
+
+    async def _fallback(coder, wt, prompt, *, timeout=None, env_passthrough=()):
+        seen["args"] = (wt, prompt)
+        return "fallback reply"
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _fallback)
+    out = await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt/x", "do it", fid="bd-fb", gen=4, tier="fast")
+    assert out == "fallback reply"
+    assert seen["args"] == ("/wt/x", "do it")
+    (g,) = coder_seam.progress_snapshot("bd-fb")["gens"]
+    assert g["gen"] == 4 and g["tier"] == "fast" and g["done"] is True

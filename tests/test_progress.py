@@ -342,3 +342,68 @@ def test_tool_start_records_an_input_preview():
     cur = g["current_tool"]
     assert cur["input_preview"] == long_cmd[: coder_seam._TOOL_INPUT_PREVIEW_MAX]
     assert len(cur["input_preview"]) == coder_seam._TOOL_INPUT_PREVIEW_MAX
+
+
+# ── the tap: PUBLIC seam present (C1) streams live signals into the buffer ────────
+
+
+@dataclass
+class _FakeCoder:
+    workdir: str = ""
+    manage_git: bool = True
+    env: dict = field(default_factory=dict)
+
+
+async def test_dispatch_coder_tapped_streams_the_public_seam_into_the_buffer(monkeypatch):
+    """r2: when C1's public ``dispatch_tapped`` seam is present (injected as a fake),
+    the tap drives it — not the untapped fallback — and its forwarded thought/tool/
+    answer/usage/plan/stop callbacks all land on this gen's live buffer (#84)."""
+    coder_seam._progress.clear()
+
+    def _no_fallback(*a, **k):
+        raise AssertionError("must not fall back when the public seam is present")
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _no_fallback)
+
+    async def _fake_seam(
+        delegate,
+        prompt,
+        *,
+        timeout=None,
+        tool_callback=None,
+        thought_callback=None,
+        text_callback=None,
+        usage_callback=None,
+        plan_callback=None,
+        stop_reason_callback=None,
+    ):
+        await thought_callback("weighing options")
+        await tool_callback({"phase": "start", "id": "t1", "name": "bash", "input": '{"command": "pytest -q"}'})
+        await tool_callback({"phase": "end", "id": "t1", "name": "bash", "status": "completed"})
+        usage_callback({"used": 12, "size": 120})
+        plan_callback([{"content": "run the tests", "status": "in_progress", "priority": "high"}])
+        await text_callback("finished.")
+        stop_reason_callback("end_turn")
+        return "seam reply"
+
+    out = await coder_seam.dispatch_coder_tapped(
+        _FakeCoder(),
+        "/wt/cand",
+        "do it",
+        fid="bd-seam",
+        gen=2,
+        tier="smart",
+        _dispatch_tapped=_fake_seam,
+    )
+    assert out == "seam reply"
+    (g,) = coder_seam.progress_snapshot("bd-seam")["gens"]
+    assert g["gen"] == 2 and g["tier"] == "smart"
+    assert "weighing options" in g["thought_tail"]
+    assert g["current_tool"]["name"] == "bash" and g["current_tool"]["status"] == "completed"
+    assert g["current_tool"]["kind"] == "execute"
+    assert len(g["recent_tools"]) == 2  # start + end forwarded through the tap
+    assert g["usage"] == {"used": 12, "size": 120}
+    assert g["plan"][0] == {"content": "run the tests", "status": "in_progress", "priority": "high"}
+    assert g["answer_tail"].endswith("finished.")
+    assert g["stop_reason"] == "end_turn"
+    assert g["done"] is True

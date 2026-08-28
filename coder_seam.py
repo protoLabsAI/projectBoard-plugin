@@ -518,6 +518,21 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
+def _import_dispatch_tapped():
+    """Best-effort handle on coding_agent's PUBLIC tapped-dispatch seam (C1): the host
+    function that drives the pooled ACP client WITH progress callbacks wired in and
+    owns the whole worktree-scoped session lifecycle (fresh-both forget, by-kind
+    permission policy, cancellation kill, teardown) — so the board taps the live
+    stream through ONE public name, reaching zero coding_agent internals. Returns the
+    callable, or ``None`` when the host predates the seam (a standalone test env, an
+    older host) — the ONE condition ``dispatch_coder_tapped`` degrades on."""
+    try:
+        from plugins.coding_agent import dispatch_tapped
+    except Exception:  # noqa: BLE001 — host predates the public C1 seam → untapped fallback
+        return None
+    return dispatch_tapped
+
+
 async def dispatch_coder_tapped(
     coder,
     worktree_path: str,
@@ -528,36 +543,33 @@ async def dispatch_coder_tapped(
     tier: str = "",
     timeout: float | None = None,
     env_passthrough: Iterable[str] = (),
+    _dispatch_tapped=None,
 ) -> str:
     """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
     — same fresh-both session discipline, same guaranteed subprocess teardown — but
-    with the client's thought/tool callbacks wired into this feature's live-
-    monitoring buffer (#84).
+    with the coder's thought/tool/answer/usage/plan/stop callbacks wired into this
+    feature's live-monitoring buffer (#84).
 
     ``worktree.dispatch_coder`` goes through ``adapter.dispatch``, which does NOT
-    forward the ACP callbacks, so tapping them means driving the pooled ``AcpClient``
-    directly. This only READS host internals — zero protoAgent host changes. Best-
-    effort: if those internals aren't importable/shaped as expected (a standalone
-    test env, an older host), it falls back to the untapped ``worktree.dispatch_coder``
-    (the gen still records its start/tier/elapsed, just without the live stream). A
-    monitoring concern must NEVER break a build."""
+    forward the ACP callbacks. C1 published ``plugins.coding_agent.dispatch_tapped``
+    — a PUBLIC seam that drives the pooled client with those callbacks and owns the
+    session lifecycle end to end — so this taps the live stream WITHOUT reaching a
+    single coding_agent internal (the private client / permission / spec / kill
+    plumbing now lives behind that seam). When the public seam is ABSENT (a host
+    predating C1) it degrades to the untapped ``worktree.dispatch_coder`` — the gen
+    still records its start/tier/elapsed, just without the live stream. That absence
+    is the ONLY fallback trigger: a real dispatch failure BELOW the seam is normalised
+    to a ``WorktreeError``/``CoderTimeout`` and propagates, never silently swallowed
+    into an untapped retry. A monitoring concern must NEVER break a build.
+
+    ``_dispatch_tapped`` is a test-injection seam (mirrors ``_solve``/
+    ``_fusion_dispatch``); production callers never pass it — the real best-effort
+    import happens in ``_import_dispatch_tapped``."""
     progress_begin(fid, gen, tier)
-    try:
-        import dataclasses as _dc
-
-        from plugins.coding_agent import _client_for, _drop_client, _make_permission
-        from plugins.coding_agent.acp_client import AcpError
-        from plugins.delegates.adapters import ADAPTERS, DelegateError
-
-        adapter = ADAPTERS["acp"]
-        overrides: dict = {"workdir": worktree_path}
-        if any(f.name == "manage_git" for f in _dc.fields(coder)):
-            overrides["manage_git"] = False  # the BOARD owns git for scoped dispatches
-        if any(f.name == "env" for f in _dc.fields(coder)):
-            overrides["env"] = config.sanitized_env(env_passthrough)
-        scoped = _dc.replace(coder, **overrides)
-        spec = adapter._spec(scoped)
-    except Exception:  # noqa: BLE001 — host internals absent/changed → untapped fallback
+    tapped = _dispatch_tapped if _dispatch_tapped is not None else _import_dispatch_tapped()
+    if tapped is None:
+        # Public C1 seam absent → the untapped fallback (the gen still records
+        # start/tier/elapsed). Absence-only: NOT a broad except around the tapped path.
         try:
             return await worktree.dispatch_coder(
                 coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
@@ -565,21 +577,18 @@ async def dispatch_coder_tapped(
         finally:
             progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
 
-    # Fresh-both: forget any persisted session first (see worktree.dispatch_coder).
-    try:
-        await adapter.forget_session(scoped)
-    except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build
-        log.warning("[project_board] forget_session failed for %s", worktree_path, exc_info=True)
+    # Board policy on the scoped copy, applied BEFORE the generic public seam and
+    # mirroring worktree.dispatch_coder: the worktree is the workdir, the BOARD owns
+    # git (manage_git=False, so the seam's adapter never opens a second PR), and the
+    # dispatch env is the sanitized allowlist (#86/#142).
+    import dataclasses as _dc
 
-    try:
-        client = _client_for(spec)
-    except Exception as exc:  # noqa: BLE001 — adapter-layer parity: dispatch failures are WorktreeError
-        progress_end(fid, gen)
-        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
-    try:
-        client._permission = _make_permission(spec)  # the adapter's by-kind policy (ADR 0024)
-    except Exception:  # noqa: BLE001 — tolerate a host that resolves permissions differently
-        pass
+    overrides: dict = {"workdir": worktree_path}
+    if any(f.name == "manage_git" for f in _dc.fields(coder)):
+        overrides["manage_git"] = False
+    if any(f.name == "env" for f in _dc.fields(coder)):
+        overrides["env"] = config.sanitized_env(env_passthrough)
+    scoped = _dc.replace(coder, **overrides)
 
     async def _thought_cb(delta):
         progress_thought(fid, gen, delta)
@@ -589,57 +598,48 @@ async def dispatch_coder_tapped(
 
     async def _tool_cb(event):
         progress_tool(fid, gen, event)
-        # usage_update isn't forwarded as a callback — the client folds it into
-        # last_usage as it goes, so sample it on each tool event to keep totals live.
-        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
-        # Same sampling pattern for the coder's live plan (ACP `plan` updates —
-        # its own todo list). Hosts older than the last_plan parse just yield None.
-        progress_plan(fid, gen, getattr(client, "last_plan", None))
 
-    # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
-    # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
-    # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
-    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    def _usage_cb(usage):
+        progress_usage(fid, gen, usage or {})
+
+    def _plan_cb(plan):
+        progress_plan(fid, gen, plan)
+
+    def _stop_cb(reason):
+        # The ACP stop-reason / dead-end signal (#198) — the seam surfaces it via this
+        # callback (called on its own way out) instead of the board reading client fields.
+        progress_stop_reason(fid, gen, reason)
+
+    # Old adapter-path semantics preserved: no configured timeout = UNBOUNDED dispatch,
+    # else hard-bound with asyncio.wait_for exactly as worktree.dispatch_coder does —
+    # on timeout the seam coro is cancelled (its own finally reaps the subprocess) and
+    # we raise CoderTimeout. The seam owns the client's own internal timeout bookkeeping.
     try:
-        coro = client.prompt(
+        coro = tapped(
+            scoped,
             prompt,
+            timeout=timeout,
             tool_callback=_tool_cb,
             thought_callback=_thought_cb,
             text_callback=_answer_cb,
-            timeout=prompt_timeout,
+            usage_callback=_usage_cb,
+            plan_callback=_plan_cb,
+            stop_reason_callback=_stop_cb,
         )
-        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
-        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
-        return reply
+        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
     except asyncio.CancelledError:
-        # Turn stopped (operator/watchdog) — drop the pooled client + SIGKILL the tree
-        # NOW (mirrors AcpAdapter._prompt) so the subprocess can't keep running detached.
-        try:
-            _drop_client(spec)
-            client.kill_now()
-        except Exception:  # noqa: BLE001 — mid-cancellation cleanup is best-effort
-            pass
+        # Turn stopped (operator/watchdog): the public seam already dropped the pooled
+        # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
         raise
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
-    except (AcpError, DelegateError) as exc:
-        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
-    except Exception as exc:  # noqa: BLE001 — restore the adapter path's contract: nothing
-        # below the seam propagates raw; every dispatch failure surfaces as WorktreeError
-        # (panel on #89: the client-direct tap had narrowed AcpError-only).
+    except Exception as exc:  # noqa: BLE001 — normalise every below-seam failure to the
+        # adapter path's contract: nothing propagates raw; a dispatch failure surfaces as
+        # WorktreeError (this is error normalisation, NOT a fallback — see the seam-absent
+        # branch above for the only path that degrades to an untapped dispatch).
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     finally:
-        # Stash whatever stop-reason / dead-end signal the ACP client reports (#198)
-        # — sampled on EVERY exit so an empty reply still records WHY the coder
-        # stopped. Best-effort getattr: a host without the attribute yields None.
-        progress_stop_reason(
-            fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
-        )
         progress_end(fid, gen)
-        try:
-            await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess
-        except Exception:  # noqa: BLE001 — never let teardown mask the result/error
-            log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
 async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) -> str:
