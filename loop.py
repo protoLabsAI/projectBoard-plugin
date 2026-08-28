@@ -357,6 +357,38 @@ def _parse_requirements_reply(text: str) -> list[dict]:
     return out
 
 
+def _requirement_gate_diagnostics(result: str, open_items: list[dict]) -> dict:
+    """The requirement-gate diagnostic payload (#284). When the completion gate bounces
+    a feature for unresolved dispositions, these are the fields that tell a *parse* miss
+    (the coder wrote a ``## Requirements`` section the loop failed to read) apart from
+    genuine *silence* (no section at all): the dispositions the loop DID parse, the ids
+    still open, the reply length, whether a ``## Requirements`` heading is present, and
+    the first 200 chars after the LAST such heading (the same last-occurrence discipline
+    as ``_parse_requirements_reply``). Shared by the gate's INFO log and the persisted
+    bounce comment so the card and the log always report the identical picture."""
+    text = result or ""
+    headings = list(_REQ_HEADING_RE.finditer(text))
+    return {
+        "dispositions": _parse_requirements_reply(text),
+        "open_ids": [i.get("id") for i in open_items],
+        "result_len": len(text),
+        "has_requirements_heading": bool(headings),
+        "after_heading": text[headings[-1].end() :][:200] if headings else "",
+    }
+
+
+def _requirement_gate_diag_line(diag: dict) -> str:
+    """One-line rendering of ``_requirement_gate_diagnostics`` for BOTH the gate's INFO
+    log and the persisted bounce comment — one source so the two can never drift."""
+    return (
+        f"dispositions={diag['dispositions']!r} "
+        f"open_ids={diag['open_ids']!r} "
+        f"len(result)={diag['result_len']} "
+        f"has_requirements_heading={diag['has_requirements_heading']} "
+        f"after_heading={diag['after_heading']!r}"
+    )
+
+
 def _pr_body(result: str, feature: dict) -> str:
     """The feature PR's description: the coder's ``## Summary`` section, never the
     raw output stream. Control-marker lines (``NO_TEST_NEEDED: …``) are dropped from
@@ -2868,6 +2900,19 @@ class BoardLoop:
                     # with a reason is always available, so "can't" has a valid exit.
                     if ledger and not _all_items_disposed(ledger):
                         open_items = [i for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")]
+                        # #284: instrument the gate. An unresolved-disposition bounce is
+                        # only diagnosable if we can tell a PARSE miss (the coder wrote a
+                        # `## Requirements` section the loop failed to read) from genuine
+                        # SILENCE. Record — at the gate, on the merged ledger the write-back
+                        # above produced — the parsed dispositions, the still-open ids,
+                        # len(result), whether the reply carried a `## Requirements` heading,
+                        # and the first 200 chars after it.
+                        diag = _requirement_gate_diagnostics(result or "", open_items)
+                        log.info(
+                            "[project_board] %s requirement gate diagnostics: %s",
+                            fid,
+                            _requirement_gate_diag_line(diag),
+                        )
                         listing = "\n".join(f"- {i.get('id')}: {i.get('text')}" for i in open_items)
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
@@ -2880,6 +2925,22 @@ class BoardLoop:
                                 "`## Requirements` section marking EVERY item `done` or `declined — "
                                 "<concrete reason>` (silence is not a disposition):\n\n" + listing
                             )
+                            # #284: persist the SAME diagnostic payload on the bead so the
+                            # NEXT occurrence is diagnosable from the card, not only the log
+                            # — the log line is process-local, the comment survives a restart.
+                            try:
+                                await asyncio.to_thread(
+                                    store.comment,
+                                    fid,
+                                    f"requirement gate bounce (re-dispatch {n + 1}/{self.goal_fix_max}) — "
+                                    f"diagnostics: {_requirement_gate_diag_line(diag)}",
+                                )
+                            except Exception:  # noqa: BLE001 — bookkeeping must not fail the build
+                                log.warning(
+                                    "[project_board] %s requirement gate diagnostic comment failed",
+                                    fid,
+                                    exc_info=True,
+                                )
                             log.info(
                                 "[project_board] %s requirement gate: %d open item(s) — re-dispatch %d/%d "
                                 "(tier=%s, keep worktree)",
