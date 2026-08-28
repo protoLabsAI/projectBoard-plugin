@@ -22,7 +22,10 @@ Four checks, keyed ``br`` / ``gh`` / ``coder`` / ``repo``:
              failure, not a pass — there is deliberately no default coder name.
 * ``repo`` — the board is bound to a checkout that exists (or, for the shipped
              ``repo: "."`` default, the cwd already carries a ``.beads/``
-             workspace — the one case that default legitimately works).
+             workspace — the one case that default legitimately works). Also
+             refuses the D3 hole (#260): a multi-entry ``projects:`` map combined
+             with an EXPLICITLY blank ``db_path`` — the per-repo-discovery
+             override, which would fragment the board across per-repo stores.
 
 ``ready`` is the AND of all four. ``loop_blockers`` is the subset the puller refuses
 to tick without (``br``, ``coder``, ``repo``): each of those turns every tick into a
@@ -44,7 +47,7 @@ import types
 
 from . import br_fetch
 from . import store as store_mod
-from .projects import resolve_projects
+from .projects import blank_db_override, multi_project, resolve_projects
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -88,6 +91,13 @@ REPO_UNBOUND_HINT = (
     "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
     "this agent manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board "
     "is paused until then"
+)
+MULTI_PROJECT_DB_HINT = (
+    "projects: declares multiple repos but db_path is explicitly blank — the per-repo-discovery "
+    "override would give every project its own .beads/ store and fragment the board (a card "
+    "created for one project is invisible to the loop and the others). Remove the db_path "
+    "override to use the one instance store, or set db_path to a single shared file in "
+    "Settings ▸ Project Board"
 )
 
 _BR_VERSION_TIMEOUT_S = 3.0
@@ -239,6 +249,13 @@ def _repo_check(cfg: dict, isdir) -> dict:
             return {"ok": True, "path": default_repo, "hint": ""}
         return {"ok": False, "path": default_repo, "hint": REPO_UNBOUND_HINT}
     explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    # D3's one remaining hole (#260): a blank db_path DEFAULTS to the instance store
+    # (store.default_db_path), so a multi-project board with no db_path shares one db.
+    # But an operator who explicitly wrote `db_path: ""` (the pre-D3 per-repo-discovery
+    # escape hatch) next to a multi-entry projects: map asked for the exact shape that
+    # fragments the board — surface it instead of silently accepting it.
+    if multi_project(cfg) and blank_db_override(cfg):
+        return {"ok": False, "path": default_repo, "hint": MULTI_PROJECT_DB_HINT}
     for name, entry in projects.items():
         path = str((entry or {}).get("repo") or "").strip()
         if not path or not isdir(path):
