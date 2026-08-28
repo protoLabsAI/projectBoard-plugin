@@ -1038,6 +1038,13 @@ class BoardLoop:
         # repo-path changes). After _REAP_WARN_CAP failures the noise is downgraded
         # from WARNING to DEBUG; a successful reap resets the counter.
         self._reap_failures: dict[str, int] = {}
+        # In-flight background store write-backs per fid (#258): coder_seam's
+        # record_gens/record_verified callbacks are SYNC and invoked ON the event loop
+        # mid-dispatch, so they can't await asyncio.to_thread — _record_bg schedules
+        # the br call on a worker thread instead and parks the future here; the drive
+        # awaits the batch right after dispatch returns (_await_bg_records), keeping
+        # the pre-#258 ordering (records land before the PR opens) minus the stall.
+        self._bg_records: dict[str, list] = {}
 
     def _store(self):
         return get_store(**self._store_kw)
@@ -1408,7 +1415,7 @@ class BoardLoop:
         it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
-        feature = store.get_feature(fid) or {}
+        feature = await asyncio.to_thread(store.get_feature, fid) or {}
         # #217: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
         # salvage below never apply. A task parked on a human/unassigned assignee is
         # NOT orphaned — it is intentionally in_progress awaiting async delivery
@@ -1418,19 +1425,19 @@ class BoardLoop:
         if feature.get("issue_type") == LABEL_TASK:
             assignee = str(feature.get("assignee") or "").strip()
             if assignee and self._resolve_delegate(assignee, "acp") is not None:
-                store.requeue(fid)
+                await asyncio.to_thread(store.requeue, fid)
                 log.info("[project_board] %s task reset to ready (ACP drive died — re-dispatch)", fid)
             return
         pr_url = await worktree.pr_url_for_branch(
             worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
         )
         if pr_url:
-            store.open_review(fid, pr_url=pr_url)
+            await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
             log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
         elif await self._salvage_verified_candidate(store, fid):
             pass  # resumed + PR opened → in_review (logged inside)
         else:
-            store.requeue(fid)
+            await asyncio.to_thread(store.requeue, fid)
             log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
 
     @staticmethod
@@ -1456,7 +1463,7 @@ class BoardLoop:
         unchanged — a wrong salvage ships unverified code; a skipped one only costs a
         rebuild."""
         try:
-            f = store.get_feature(fid) or {}
+            f = await asyncio.to_thread(store.get_feature, fid) or {}
             sha = str(f.get("verified_sha") or "").strip()
             if not sha:
                 return False
@@ -1467,7 +1474,7 @@ class BoardLoop:
             wt = os.path.join(repo, self.root, worktree.worktree_dir(fid, title_raw))
             if not os.path.isdir(wt):
                 log.info("[project_board] %s salvage: verified worktree gone — rebuild fresh", fid)
-                self._clear_verified(store, fid)
+                await asyncio.to_thread(self._clear_verified, store, fid)
                 return False
             rc, head, _err = await worktree._git(wt, "rev-parse", "HEAD")
             if rc != 0 or head.strip() != sha:
@@ -1477,12 +1484,12 @@ class BoardLoop:
                     head.strip()[:12],
                     sha[:12],
                 )
-                self._clear_verified(store, fid)
+                await asyncio.to_thread(self._clear_verified, store, fid)
                 return False
             rc, cur, _err = await worktree._git(wt, "rev-parse", "--abbrev-ref", "HEAD")
             if rc != 0 or cur.strip() != branch:
                 log.info("[project_board] %s salvage: branch drift (%s ≠ %s) — rebuild fresh", fid, cur.strip(), branch)
-                self._clear_verified(store, fid)
+                await asyncio.to_thread(self._clear_verified, store, fid)
                 return False
             # Resume the drive's tail in its normal order: promote (a no-op — the
             # record is written post-promote, so the candidate already holds the
@@ -1493,15 +1500,15 @@ class BoardLoop:
             await self._run_fixups(wt, f)
             if await self._run_local_gate(wt, f) is not None:
                 log.info("[project_board] %s salvage: gate fails on the candidate now — rebuild fresh", fid)
-                self._clear_verified(store, fid)
+                await asyncio.to_thread(self._clear_verified, store, fid)
                 return False
             title = f"feat: {f.get('title') or fid}"
             body = await self._with_source_issue_ref(f, wt, _pr_body("", f))
             pr_url = await worktree.open_pr(
                 wt, branch, base=base, title=title, body=body, promote_draft=not f.get("pr_url")
             )
-            store.open_review(fid, pr_url=pr_url)
-            self._clear_verified(store, fid)
+            await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+            await asyncio.to_thread(self._clear_verified, store, fid)
             log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
             return True
         except Exception:  # noqa: BLE001 — ANY doubt/error → today's rebuild-fresh path
@@ -1515,12 +1522,13 @@ class BoardLoop:
         previous run's orphaned preflight holds (#186) — see
         ``_recover_preflight_holds``."""
         store = self._store()
-        for f in store.list_features(state="in_progress"):
+        for f in await asyncio.to_thread(store.list_features, state="in_progress"):
             try:
                 await self._reconcile_orphan(f["id"])
             except Exception:  # noqa: BLE001 — recovery is best-effort, per feature
                 log.warning("[project_board] recovery for %s failed", f["id"], exc_info=True)
-        self._recover_preflight_holds(store)
+        # Store-only helper — run the whole scan+release off the event loop (#258).
+        await asyncio.to_thread(self._recover_preflight_holds, store)
 
     def _recover_preflight_holds(self, store) -> None:
         """Release the PREVIOUS run's preflight holds on boot (#186). `_preflight_held`
@@ -1570,7 +1578,7 @@ class BoardLoop:
         (#115) — the board's growth valve; archival only, nothing is ever deleted.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
-        for f in store.list_features(state="in_progress"):
+        for f in await asyncio.to_thread(store.list_features, state="in_progress"):
             fid = f["id"]
             if fid in self._inflight_files:
                 continue  # a live drive owns it
@@ -1589,7 +1597,7 @@ class BoardLoop:
         # ONCE per sweep (project-independent — the board db is shared), after the
         # per-repo worktree reap above.
         try:
-            archived = store.archive_stale(self.archive_after_days)
+            archived = await asyncio.to_thread(store.archive_stale, self.archive_after_days)
             if archived:
                 log.info(
                     "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
@@ -1612,7 +1620,7 @@ class BoardLoop:
             if fid in self._inflight_files:
                 continue  # a live drive owns this worktree (or its candidates)
             try:
-                f = store.get_feature(fid)
+                f = await asyncio.to_thread(store.get_feature, fid)
                 if f is None or f["board_state"] in ("done", "cancelled"):
                     reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
                     if reaped:
@@ -1717,7 +1725,7 @@ class BoardLoop:
                 await self._maybe_reconcile()
                 await self._maybe_sweep()
                 await self._maybe_preflight()  # fail-closed: hold work if the gate can't run
-                spawned = self._spawn_ready()
+                spawned = await self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
                 log.exception("[project_board] loop tick failed")
             # Idle (nothing started, nothing running) → sleep the full interval. Busy
@@ -1730,13 +1738,15 @@ class BoardLoop:
             except asyncio.TimeoutError:
                 pass
 
-    def _spawn_ready(self) -> bool:
+    async def _spawn_ready(self) -> bool:
         """Claim Ready features up to the concurrency cap and spawn a drive for each,
         with two back-pressure gates: pause when too many PRs already await review
         (``max_pending_reviews``), and skip a candidate whose ``files_to_modify``
         overlap an in-flight build (the hot-file guard — two parallel coders editing
         the same file are a guaranteed merge conflict). Returns True if it started at
-        least one drive (so the runner stays hot).
+        least one drive (so the runner stays hot). Async so every store read/claim
+        rides ``asyncio.to_thread`` (#258) — the scan must not stall the event loop;
+        the drives themselves are still spawned on the loop (``create_task``).
 
         Every tick that reaches the claim scan emits ONE parseable ``claim_decision``
         ``log.info`` (#124): the fid(s) selected this tick and, for each higher-priority
@@ -1754,10 +1764,13 @@ class BoardLoop:
         # project B, so this holds only the failed projects and the claim loop below skips
         # their candidates while continuing to dispatch every runnable project.
         if any(isinstance(v, str) for v in self._preflight_state.values()):
-            self._hold_ready_for_preflight()
+            await asyncio.to_thread(self._hold_ready_for_preflight)
         store = self._store()
         # Review-queue WIP limit — don't claim new work while the review queue is full.
-        if self.max_pending_reviews and len(store.list_features(state="in_review")) >= self.max_pending_reviews:
+        if (
+            self.max_pending_reviews
+            and len(await asyncio.to_thread(store.list_features, state="in_review")) >= self.max_pending_reviews
+        ):
             return False
         spawned = False
         # file → the in-flight (or claimed-this-tick) fid that owns it, so a hot-file
@@ -1770,7 +1783,8 @@ class BoardLoop:
         selected: list[str] = []
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
         parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
-        for candidate in store.ready_queue(relaxed=self.relaxed_gate):  # priority order, dep-unblocked
+        ready = await asyncio.to_thread(store.ready_queue, relaxed=self.relaxed_gate)
+        for candidate in ready:  # priority order, dep-unblocked
             if len(self._drives) >= self.max_concurrent:
                 break  # remaining candidates are lower priority than what we already selected
             cid = candidate["id"]
@@ -1793,7 +1807,7 @@ class BoardLoop:
             # drive → counts toward max_concurrent); a human/unassigned task is parked
             # in_progress to await async delivery (API/chat) and does NOT hold a slot.
             if candidate.get("issue_type") == LABEL_TASK:
-                outcome = self._dispatch_task(store, candidate)
+                outcome = await self._dispatch_task(store, candidate)
                 if outcome == "acp":
                     selected.append(cid)
                     spawned = True
@@ -1818,7 +1832,7 @@ class BoardLoop:
                     }
                 )
                 continue
-            claimed = store.claim(cid, assignee=self.coder_name)
+            claimed = await asyncio.to_thread(store.claim, cid, assignee=self.coder_name)
             if claimed is None:
                 skipped.append({"fid": cid, "reason": "claim-race"})  # raced / no longer ready
                 continue
@@ -1852,11 +1866,14 @@ class BoardLoop:
             self._inflight_files.pop(fid, None)
             _unregister_drive(fid, task)
             self._cancel_done.discard(fid)  # a later drive of the same card gets its own cancel edge
+            # #258: drop any write-back futures a failed dispatch left un-awaited —
+            # the executor still runs them (fire-and-forget); only the parking is freed.
+            self._bg_records.pop(fid, None)
 
         return _cb
 
     # ── task-type dispatch (#217) ─────────────────────────────────────────────
-    def _dispatch_task(self, store, candidate: dict) -> str:
+    async def _dispatch_task(self, store, candidate: dict) -> str:
         """Claim + dispatch a ``task`` bead, branching on its assignee. Returns:
 
         - ``"acp"``  — the assignee resolves to an ACP agent delegate → claimed and a
@@ -1872,7 +1889,7 @@ class BoardLoop:
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
         delegate = self._resolve_delegate(assignee, "acp") if assignee else None
-        claimed = store.claim(cid, assignee=assignee)
+        claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
         if claimed is None:
             return "race"
         if delegate is None:
@@ -1921,7 +1938,9 @@ class BoardLoop:
         # and scanning only in_review left merged-but-blocked cards stuck forever. They
         # take ONLY the MERGED edge below: CLOSED would rewrite their blocked reason, and
         # the OPEN-branch gates (rebase/CI/review) must not run against held work.
-        for f in [*store.list_features(state="in_review"), *store.list_features(state="blocked")]:
+        in_review = await asyncio.to_thread(store.list_features, state="in_review")
+        blocked = await asyncio.to_thread(store.list_features, state="blocked")
+        for f in [*in_review, *blocked]:
             fid = f["id"]
             pr_url = f.get("pr_url")
             if not pr_url:
@@ -1933,7 +1952,7 @@ class BoardLoop:
                 if f.get("board_state") == "blocked" and state != "MERGED":
                     continue
                 if state == "MERGED":
-                    if store.record_merge(pr_url=pr_url):
+                    if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
                         self._ci_feedback.pop(fid, None)
                         self._ci_fix_attempts.pop(fid, None)
@@ -1953,7 +1972,9 @@ class BoardLoop:
                             )
                         log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                 elif state == "CLOSED":
-                    store.flag_blocked(fid, f"PR closed without merging — needs triage: {pr_url}")
+                    await asyncio.to_thread(
+                        store.flag_blocked, fid, f"PR closed without merging — needs triage: {pr_url}"
+                    )
                     await worktree.reap_feature_worktree(repo, self.root, fid)
                     self._ci_feedback.pop(fid, None)
                     self._ci_fix_attempts.pop(fid, None)
@@ -1989,7 +2010,7 @@ class BoardLoop:
                     if (
                         self.review_gate
                         and LABEL_REVIEW_PENDING in (f.get("labels") or [])
-                        and (store.get_feature(fid) or {}).get("board_state") == "in_review"
+                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
                     ):
                         await self._review_gate(store, fid, pr_url, repo)
                     # The MERGE edge — last, so it sees this pass's rebase / verify /
@@ -2065,13 +2086,14 @@ class BoardLoop:
         idempotent, webhook-compatible). A refusal is retried next pass up to
         ``auto_merge_max`` times, then recorded on the bead and left for a human —
         never a block: the work is good, only the merge didn't land."""
-        feature = store.get_feature(fid)
+        feature = await asyncio.to_thread(store.get_feature, fid)
         if feature is None:  # card deleted between the reconcile snapshot and this re-read
             log.debug("[project_board] %s vanished before auto-merge — nothing to merge", fid)
             return False
         why = await self._auto_merge_blockers(store, feature, pr_url, repo)
         if why:
-            self._note_draft_hold(store, fid, pr_url, why)
+            # Store-only bookkeeping (a bead comment) — off the event loop (#258).
+            await asyncio.to_thread(self._note_draft_hold, store, fid, pr_url, why)
             log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
             return False
         self._draft_noted.discard(fid)
@@ -2096,7 +2118,8 @@ class BoardLoop:
         self._auto_merge_failures[fid] = n
         if n >= self.auto_merge_max:
             try:
-                store._comment(
+                await asyncio.to_thread(
+                    store._comment,
                     fid,
                     f"auto-merge gave up after {n} attempt(s) — every gate is green but GitHub refused the "
                     f"merge; needs a human: {pr_url}\n{detail}",
@@ -2160,8 +2183,10 @@ class BoardLoop:
         # outcome == "conflict": a real merge conflict only the coder can resolve.
         n = self._rebase_attempts.get(fid, 0)
         if n >= self.rebase_fix_max:
-            store.flag_blocked(
-                fid, f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}"
+            await asyncio.to_thread(
+                store.flag_blocked,
+                fid,
+                f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}",
             )
             await worktree.reap_feature_worktree(repo, self.root, fid)
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
@@ -2173,7 +2198,7 @@ class BoardLoop:
             f"file(s): {detail}. Re-apply your change onto the latest `{base}` and resolve the "
             "conflict, keeping BOTH sides' intent. Then stop."
         )
-        store.requeue(fid)
+        await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s rebase conflict — re-dispatch %d/%d to resolve (%s): %s",
             fid,
@@ -2291,7 +2316,7 @@ class BoardLoop:
             # (the merge/CI edges below still have to run) nor burn the re-verify budget
             # on a write that didn't land — the next poll simply re-verifies (#135).
             try:
-                store.record_merged_verified(fid, short)
+                await asyncio.to_thread(store.record_merged_verified, fid, short)
             except BoardError:
                 log.warning(
                     "[project_board] %s merged-state gate green but stamping the verified sha failed — "
@@ -2310,7 +2335,8 @@ class BoardLoop:
             )
             return False
         self._merged_verify_attempts[fid] = n + 1
-        store.flag_blocked(
+        await asyncio.to_thread(
+            store.flag_blocked,
             fid,
             f"gate FAILED on the merged state (branch + {base}@{short}) — the PR merges clean "
             f"but the RESULT is broken; needs triage: {pr_url}\n{failure}",
@@ -2360,8 +2386,8 @@ class BoardLoop:
         self._ci_feedback[fid] = summary
         self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
 
-        def _block(reason: str):
-            store.flag_blocked(fid, reason)
+        async def _block(reason: str):
+            await asyncio.to_thread(store.flag_blocked, fid, reason)
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             self._ci_fix_attempts.pop(fid, None)
@@ -2374,7 +2400,7 @@ class BoardLoop:
         attempts = self._ci_fix_attempts.get(fid, 0)
         if attempts < self.ci_fix_max:
             self._ci_fix_attempts[fid] = attempts + 1
-            store.requeue(fid)
+            await asyncio.to_thread(store.requeue, fid)
             log.info(
                 "[project_board] reconcile → same-tier CI-fix (attempt %d/%d): %s",
                 attempts + 1,
@@ -2386,18 +2412,20 @@ class BoardLoop:
         # Same-tier budget exhausted. With a ladder, climb a model tier and reset the
         # per-tier budget so the new rung gets its own fix attempts; without one, block.
         if self.escalation_on:
-            nxt = store.escalate(fid, f"CI failed: {_ci_failure_reason(summary)}")
+            nxt = await asyncio.to_thread(store.escalate, fid, f"CI failed: {_ci_failure_reason(summary)}")
             if not nxt:
-                _block(f"CI failing at the top model tier after {attempts} same-tier fix(es) — needs triage: {pr_url}")
+                await _block(
+                    f"CI failing at the top model tier after {attempts} same-tier fix(es) — needs triage: {pr_url}"
+                )
                 await worktree.reap_feature_worktree(repo, self.root, fid)
                 log.warning("[project_board] reconcile → blocked (CI fails at top tier): %s", fid)
                 return
             self._ci_fix_attempts.pop(fid, None)  # fresh same-tier budget at the new rung
-            store.requeue(fid)
+            await asyncio.to_thread(store.requeue, fid)
             log.info("[project_board] reconcile → escalate to %s + re-dispatch (CI failed): %s", nxt, fid)
             return
 
-        _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
+        await _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
         await worktree.reap_feature_worktree(repo, self.root, fid)
         log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
 
@@ -2422,13 +2450,13 @@ class BoardLoop:
                 return
             policy = classify(str(exc))
             log.warning("[project_board] %s task blocked (%s): %s", fid, policy.category, exc)
-            store.flag_blocked(fid, f"{policy.category}: {exc}")
+            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s task dispatch unexpected failure", fid)
-            store.flag_blocked(fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
             return
-        store.record_delivery(fid, text=reply or "")
+        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
         log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
 
     def _build_task_prompt(self, feature: dict) -> str:
@@ -2450,6 +2478,30 @@ class BoardLoop:
             f"{criteria_block}"
         )
 
+    def _record_bg(self, fid: str, label: str, fn, *args, **kwargs) -> None:
+        """Run one store write-back on a worker thread WITHOUT awaiting it (#258) —
+        the offload for coder_seam's ``record_gens``/``record_verified`` callbacks,
+        which are sync and invoked ON the event loop mid-dispatch (so the call site
+        can't reach ``asyncio.to_thread`` itself). The future is parked per fid;
+        ``_await_bg_records`` is the drive's barrier. Failures are logged and dropped
+        — both call sites are documented fire-and-forget/best-effort."""
+
+        def _call() -> None:
+            try:
+                fn(*args, **kwargs)
+            except Exception:  # noqa: BLE001 — fire-and-forget: never raise into the executor
+                log.warning("[project_board] %s background %s write failed (ignored)", fid, label, exc_info=True)
+
+        self._bg_records.setdefault(fid, []).append(asyncio.get_running_loop().run_in_executor(None, _call))
+
+    async def _await_bg_records(self, fid: str) -> None:
+        """Barrier for ``_record_bg``'s in-flight write-backs. The drive awaits it as
+        soon as dispatch returns, so gens/verified records have landed on the bead
+        before the PR opens — the same ordering the synchronous callbacks gave, just
+        off the event loop. Never raises (``_record_bg`` swallows per-write)."""
+        for fut in self._bg_records.pop(fid, []):
+            await fut
+
     async def _drive(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
         the merge webhook. With per-tier coders configured, a *capability* failure
@@ -2465,7 +2517,7 @@ class BoardLoop:
         coders = self._coders_for(feature)
         title = f"feat: {feature['title']}"
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
-        tier = store.current_tier(fid) if self.escalation_on else ""
+        tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
@@ -2481,7 +2533,9 @@ class BoardLoop:
                 coder_name = coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
-                    store.flag_blocked(fid, f"coder delegate {coder_name!r} not configured/enabled")
+                    await asyncio.to_thread(
+                        store.flag_blocked, fid, f"coder delegate {coder_name!r} not configured/enabled"
+                    )
                     return
                 try:
                     # How this attempt gets its worktree + coder result:
@@ -2548,7 +2602,7 @@ class BoardLoop:
                             budget=solve["budget"],
                             k=solve["k"],
                             tree_depth=solve["tree_depth"],
-                            record_gens=lambda n: store.record_gens_spent(fid, n),
+                            record_gens=lambda n: self._record_bg(fid, "record_gens", store.record_gens_spent, fid, n),
                             fusion_delegate=fusion,
                             fusion_k=solve["fusion_k"],
                             files_to_modify=files_to_modify,
@@ -2559,8 +2613,14 @@ class BoardLoop:
                             tier=tier,  # #84: label each solve gen with the current tier
                             # #91: persist the verified candidate on the bead at the
                             # verify boundary, so a crash before open_pr is salvageable.
-                            record_verified=lambda br_name, sha, wt_path: store.record_verified_candidate(
-                                fid, branch=br_name, sha=sha, worktree=wt_path
+                            record_verified=lambda br_name, sha, wt_path: self._record_bg(
+                                fid,
+                                "record_verified",
+                                store.record_verified_candidate,
+                                fid,
+                                branch=br_name,
+                                sha=sha,
+                                worktree=wt_path,
                             ),
                             commit_message=title,
                             title=raw_title,  # #227: canonical branch/dir slug tail
@@ -2580,6 +2640,10 @@ class BoardLoop:
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
+                    # #258 barrier: any record_gens/record_verified write-backs the
+                    # dispatch scheduled on worker threads land before the drive
+                    # proceeds toward open_pr (the pre-offload ordering).
+                    await self._await_bg_records(fid)
                     # Requirement-ledger write-back (#113): merge the reply's
                     # `## Requirements` dispositions into the ledger and persist it on
                     # the bead — the LOOP writes dispositions, never the coder, and the
@@ -2593,7 +2657,7 @@ class BoardLoop:
                         ledger = apply_requirement_dispositions(ledger, _parse_requirements_reply(result or ""))
                         feature["requirements"] = ledger
                         try:
-                            store.set_requirements(fid, ledger)
+                            await asyncio.to_thread(store.set_requirements, fid, ledger)
                         except Exception:  # noqa: BLE001 — bookkeeping must not fail the build
                             log.warning(
                                 "[project_board] %s requirement write-back failed (gate still checks "
@@ -2719,19 +2783,19 @@ class BoardLoop:
                     if (
                         si_raw
                         and not await _source_issue_still_open(si_raw, wt)
-                        and not _issue_closed_by_board_sibling(store, feature)
+                        and not await asyncio.to_thread(_issue_closed_by_board_sibling, store, feature)
                     ):
                         reason = f"source issue {si_raw} already closed — work superseded"
                         log.info("[project_board] %s skipping PR — %s", fid, reason)
                         try:
-                            store.cancel_feature(fid, reason)
+                            await asyncio.to_thread(store.cancel_feature, fid, reason)
                         except Exception:  # noqa: BLE001
                             log.warning(
                                 "[project_board] %s cancel_feature failed — flagging blocked instead",
                                 fid,
                                 exc_info=True,
                             )
-                            store.flag_blocked(fid, reason)
+                            await asyncio.to_thread(store.flag_blocked, fid, reason)
                         await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
                         return
@@ -2740,7 +2804,7 @@ class BoardLoop:
                     # the work is the operator's to salvage, not the loop's to publish
                     # (the old path opened it, then open_review refused the cancelled
                     # card and left an orphaned red PR nobody owned).
-                    if self._cancelled(store, fid):
+                    if await asyncio.to_thread(self._cancelled, store, fid):
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
@@ -2753,7 +2817,7 @@ class BoardLoop:
                     )
                     # …and again after: a cancel that lands during the push/create
                     # closes the PR it just opened rather than handing it to open_review.
-                    if self._cancelled(store, fid):
+                    if await asyncio.to_thread(self._cancelled, store, fid):
                         await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
                         return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
@@ -2761,7 +2825,7 @@ class BoardLoop:
                         log.info("[project_board] %s dispatch aborted by shutdown — no escalation", fid)
                         self._inflight.pop(fid, None)
                         return
-                    if self._cancelled(store, fid):
+                    if await asyncio.to_thread(self._cancelled, store, fid):
                         # The cancel verb reaped the worktree under the coder (#175) and the
                         # dispatch/commit failed on it — that is the cancel, not a blockable
                         # failure on a closed card.
@@ -2793,9 +2857,10 @@ class BoardLoop:
                                 # the retro tells this retry from an escalation: the tier
                                 # is unchanged and no failure is counted yet.
                                 try:
-                                    store.record_attempt(
+                                    await asyncio.to_thread(
+                                        store.record_attempt,
                                         fid,
-                                        tier=tier or store.current_tier(fid),
+                                        tier=tier or await asyncio.to_thread(store.current_tier, fid),
                                         outcome=f"empty_result: {evidence} — same_tier_retry (pre-escalation)",
                                     )
                                 except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
@@ -2815,12 +2880,17 @@ class BoardLoop:
                             # failure: record it, then let the normal ladder climb.
                             reason = f"empty_result: {evidence} — {n} occurrence(s), same-tier retry exhausted"
                             try:
-                                store.record_attempt(fid, tier=tier or store.current_tier(fid), outcome=reason)
+                                await asyncio.to_thread(
+                                    store.record_attempt,
+                                    fid,
+                                    tier=tier or await asyncio.to_thread(store.current_tier, fid),
+                                    outcome=reason,
+                                )
                             except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
                                 log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
                             self._empty_results.pop(fid, None)  # a climb gets its own retry window
                             if self.escalation_on:
-                                nxt = store.escalate(fid, reason[:200])
+                                nxt = await asyncio.to_thread(store.escalate, fid, reason[:200])
                                 if nxt:
                                     log.info(
                                         "[project_board] %s escalating %s→%s (empty-reply retry exhausted): %s",
@@ -2838,7 +2908,7 @@ class BoardLoop:
                                     self._req_fix_attempts.pop(fid, None)
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
-                            store.flag_blocked(fid, reason)
+                            await asyncio.to_thread(store.flag_blocked, fid, reason)
                             if wt:
                                 await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
@@ -2870,7 +2940,7 @@ class BoardLoop:
                         continue
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
-                        nxt = store.escalate(fid, str(exc)[:200])
+                        nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
                         if nxt:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
                             # A timeout carries NO diff and NO CI output, so the stronger
@@ -2893,7 +2963,7 @@ class BoardLoop:
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
-                    store.flag_blocked(fid, f"{policy.category}: {exc}")
+                    await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
@@ -2901,7 +2971,7 @@ class BoardLoop:
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
-                store.open_review(fid, pr_url=pr_url)
+                await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 self._goal_fix_attempts.pop(fid, None)  # gate passed — reset the goal-fix budget
                 self._gate_fix_attempts.pop(fid, None)  # and the local-gate budget
                 self._req_fix_attempts.pop(fid, None)  # and the requirement-ledger budget (#113)
@@ -2926,7 +2996,7 @@ class BoardLoop:
             log.info("[project_board] %s drive stopped by operator cancel", fid)
             await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
         except BoardError as exc:
-            if self._cancelled(store, fid):
+            if await asyncio.to_thread(self._cancelled, store, fid):
                 # The card closed under us (open_review refused a cancelled card): a
                 # cancel edge, not a block — and the PR it would have handed over is ours
                 # to close.
@@ -2934,11 +3004,11 @@ class BoardLoop:
                 await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
                 return
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
-            store.flag_blocked(fid, str(exc))
+            await asyncio.to_thread(store.flag_blocked, fid, str(exc))
             self._inflight.pop(fid, None)
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
-            store.flag_blocked(fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
             self._inflight.pop(fid, None)
@@ -3004,7 +3074,7 @@ class BoardLoop:
             await worktree.remove_worktree(repo, wt, branch or "")
             note += "; worktree reaped"
         try:
-            store._comment(fid, note)
+            await asyncio.to_thread(store._comment, fid, note)
         except Exception:  # noqa: BLE001 — the trail is best-effort
             log.debug("[project_board] %s cancel comment failed", fid, exc_info=True)
         self._inflight.pop(fid, None)
@@ -3078,7 +3148,7 @@ class BoardLoop:
 
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
-        store.set_review_substate(fid, LABEL_REVIEW_PENDING)
+        await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
         output, why = await self._run_review_workflow(fid, pr_url)
         if output is None:
             # Could not review — ``why`` names the actual cause (#180: no runner +
@@ -3097,7 +3167,8 @@ class BoardLoop:
                 # with review-pending set and the next poll re-arms the gate. Clearing
                 # it here left an unblocked feature indistinguishable from a clean
                 # review, so its PR could merge un-reviewed.
-                store.flag_blocked(
+                await asyncio.to_thread(
+                    store.flag_blocked,
                     fid,
                     f"review gate could not complete after {n} attempt(s) — {reason} — "
                     f"needs operator attention: {pr_url}",
@@ -3118,7 +3189,9 @@ class BoardLoop:
         if findings is None:
             # Host predates the findings convention (ADR 0077) — the gate can't
             # judge, so it must not pretend to. Record and leave in review.
-            store.set_review_substate(fid, None, note="review gate: host lacks graph.review.findings — gate inert")
+            await asyncio.to_thread(
+                store.set_review_substate, fid, None, note="review gate: host lacks graph.review.findings — gate inert"
+            )
             log.warning("[project_board] %s review gate inert (no findings parser on this host)", fid)
             return
         # Remember this round's findings — the next run (a bounce re-review) passes
@@ -3130,7 +3203,8 @@ class BoardLoop:
             self._review_prior.pop(fid, None)
         blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
         if not blocking:
-            store.set_review_substate(
+            await asyncio.to_thread(
+                store.set_review_substate,
                 fid,
                 LABEL_REVIEW_CLEAN,
                 note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
@@ -3142,8 +3216,9 @@ class BoardLoop:
         rendered = self._render_findings(blocking)
         n = self._review_fix_attempts.get(fid, 0)
         if n >= self.review_fix_max:
-            store.set_review_substate(fid, None, note=rendered)
-            store.flag_blocked(
+            await asyncio.to_thread(store.set_review_substate, fid, None, note=rendered)
+            await asyncio.to_thread(
+                store.flag_blocked,
                 fid,
                 f"review findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
             )
@@ -3161,8 +3236,8 @@ class BoardLoop:
             "below in the existing branch (the PR updates on push) — do not rewrite "
             "unrelated code.\n\n" + rendered
         )
-        store.set_review_substate(fid, LABEL_CHANGES_REQUESTED, note=rendered)
-        store.requeue(fid)
+        await asyncio.to_thread(store.set_review_substate, fid, LABEL_CHANGES_REQUESTED, note=rendered)
+        await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s review gate bounce %d/%d (%d blocking finding(s))",
             fid,
@@ -3396,7 +3471,8 @@ class BoardLoop:
         if not self.preflight:
             return
         store = self._store()
-        names = list(self._ready_projects(store))
+        # Store-only scan — off the event loop (#258).
+        names = list(await asyncio.to_thread(self._ready_projects, store))
         seen = set(names)
         # A failed project may have no ready work left (its cards got held) — keep
         # re-checking it so it can recover and release those holds.
@@ -3474,7 +3550,7 @@ class BoardLoop:
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
                 self._preflight_dirty.pop(name, None)
                 self._preflight_state[name] = True
-                self._release_preflight_holds(name)
+                await asyncio.to_thread(self._release_preflight_holds, name)
                 return
             text = (out or b"").decode("utf-8", "replace").strip()
             if len(text) > self.local_gate_output_chars:
@@ -3485,7 +3561,7 @@ class BoardLoop:
             if dirt:
                 self._preflight_dirty[name] = dirt
                 self._preflight_state[name] = True
-                self._release_preflight_holds(name)
+                await asyncio.to_thread(self._release_preflight_holds, name)
                 log.warning(
                     "[project_board] preflight[%s] FAILED but the checkout at %s is NOT at base (%s) — "
                     "the gate ran against those local edits, not the base every worktree branches from, "

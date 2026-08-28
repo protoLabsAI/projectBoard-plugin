@@ -539,11 +539,15 @@ def _wire(monkeypatch, loop, probe, reporter=None):
     async def _preflight():
         calls.append("preflight")
 
+    async def _spawn():  # _spawn_ready is a coroutine since #258 (store calls offloaded)
+        calls.append("spawn")
+        return False
+
     monkeypatch.setattr(loop, "_recover", _recover)
     monkeypatch.setattr(loop, "_maybe_reconcile", _reconcile)
     monkeypatch.setattr(loop, "_maybe_sweep", _sweep)
     monkeypatch.setattr(loop, "_maybe_preflight", _preflight)
-    monkeypatch.setattr(loop, "_spawn_ready", lambda: calls.append("spawn") or False)
+    monkeypatch.setattr(loop, "_spawn_ready", _spawn)
     return calls
 
 
