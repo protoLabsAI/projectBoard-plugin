@@ -40,6 +40,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
+import types
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -69,6 +72,27 @@ BR = br_fetch.resolve_br_bin()
 _DB_RETRY_ATTEMPTS = 6
 _DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2, ~6.3s total)
 _DB_CONTENTION_RE = re.compile(r"DATABASE_ERROR|database is (?:locked|busy)", re.IGNORECASE)
+
+# ONE `br` at a time per process (the DB-race issue). beads-rust readers can see a
+# short WAL read while another `br` process checkpoints ("WAL file is corrupt: short
+# read at frame N", "could not open storage cursor on root page N") — transient, but
+# the loop, the API routers and the agent's tools all shell `br` from their own
+# threads now (#258), so two `br` processes from THIS member overlap routinely. The
+# lock lives in a process-stable sys.modules slot (the #178 pattern): a plain module
+# global would hand a reloaded router module a DIFFERENT lock from the running loop's.
+_BR_LOCK_SLOT = "project_board.br_lock::" + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
+
+
+def _br_lock() -> threading.Lock:
+    holder = sys.modules.get(_BR_LOCK_SLOT)
+    if holder is None:
+        holder = types.ModuleType(_BR_LOCK_SLOT)
+        holder.__doc__ = "Process-stable holder for project_board's single-flight `br` lock — data, not code."
+        holder.lock = threading.Lock()
+        sys.modules[_BR_LOCK_SLOT] = holder
+    return holder.lock
+
+
 # `br` plain-mode not-found text (stderr). The --json path is matched on the structured
 # ISSUE_NOT_FOUND code instead, so this only backstops a non-json `show`.
 _NOT_FOUND_RE = re.compile(r"\bissue not found\b", re.IGNORECASE)
@@ -103,6 +127,16 @@ def _contention_in_json(out) -> str:
         return ""
     if not isinstance(obj, dict):
         return ""
+    # br 0.2.x nests the failure: {"error": {"code": "DATABASE_ERROR", "message": …}} —
+    # the flat 0.1.x shape this sniff was written for put the text straight on the key.
+    # Look inside a dict-valued `error` too, or every 0.2.x contention error is
+    # invisible here and the retry built for it never fires (#290).
+    nested = obj.get("error")
+    if isinstance(nested, dict):
+        for key in ("code", "message", "detail"):
+            val = nested.get(key)
+            if isinstance(val, str) and _DB_CONTENTION_RE.search(val):
+                return f"{nested.get('code') or ''}: {nested.get('message') or val}".strip(": ")
     for key in ("error", "message", "code", "status", "detail"):
         val = obj.get(key)
         if isinstance(val, str) and _DB_CONTENTION_RE.search(val):
@@ -791,13 +825,16 @@ class BeadsBoard:
         delay = _DB_RETRY_DELAY
         retries = 0
         for attempt in range(_DB_RETRY_ATTEMPTS):
-            proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
+            with _br_lock():  # single-flight per process — see _br_lock
+                proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
             err = proc.stderr.strip()
-            contention = (
-                (err if _DB_CONTENTION_RE.search(err) else "")
-                if proc.returncode != 0
-                else _contention_in_json(proc.stdout)
-            )
+            # Contention surfaces THREE ways: DATABASE_ERROR on stderr with a non-zero exit;
+            # (br 0.1.x) an error object on STDOUT with a ZERO exit (#116); and — the
+            # common --json shape — an error object on STDOUT with a NON-zero exit and an
+            # EMPTY stderr. The old `if returncode != 0: stderr-only` split missed the
+            # third, so a transient WAL short-read raised straight through as a 400 /
+            # a failed tick instead of taking the backoff built for it.
+            contention = (err if _DB_CONTENTION_RE.search(err) else "") or _contention_in_json(proc.stdout)
             if proc.returncode == 0 and not contention:
                 if retries:
                     log.info(
