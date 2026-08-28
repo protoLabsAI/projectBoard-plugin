@@ -105,9 +105,12 @@ def build_router(cfg: dict):
     def store():
         return get_store(**store_kw)
 
-    def _guard(fn):
+    async def _guard(fn):
+        # Off the event loop (#258): every store touch blocks in `_run` (subprocess
+        # + contention sleeps) — on the loop thread that stalls the tick and every
+        # other route for the duration.
         try:
-            return fn()
+            return await asyncio.to_thread(fn)
         except BoardError as e:
             raise HTTPException(400, str(e))
 
@@ -169,7 +172,7 @@ def build_router(cfg: dict):
                 }
             return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": s.requeue(fid)}
 
-        return _guard(_handle)
+        return await _guard(_handle)
 
     @router.post("/features/{fid}/review")
     async def _review(fid: str, request: Request):
@@ -210,7 +213,7 @@ def build_router(cfg: dict):
             # escalate=false (or no ladder configured): requeue at the SAME tier.
             return {"requeued": True, "escalated": False, "feature": s.requeue(fid)}
 
-        return _guard(_handle)
+        return await _guard(_handle)
 
     # ── the ONE Done edge: merge webhook ──────────────────────────────────────
     @router.post("/webhook/pr")
@@ -231,7 +234,8 @@ def build_router(cfg: dict):
         if action != "closed" or not pr.get("merged"):
             return {"ok": True, "ignored": f"action={action} merged={pr.get('merged')}"}
         pr_url = pr.get("html_url") or ""
-        f = store().record_merge(pr_url=pr_url)
+        # Off the event loop (#258): record_merge scans + closes via `br` (subprocess).
+        f = await asyncio.to_thread(lambda: store().record_merge(pr_url=pr_url))
         if f is None:
             return {"ok": True, "ignored": f"no feature for PR {pr_url}"}
         # Reap the feature's worktree now that it's merged → done (stop accumulation).
@@ -292,9 +296,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         store_kw.update(projects=current["projects"], default_project=current["default_project"])
         return board
 
-    def _guard(fn):
+    async def _guard(fn):
+        # Off the event loop (#258): every store touch blocks in `_run` (subprocess
+        # + contention sleeps) — on the loop thread that stalls the tick and every
+        # other route for the duration.
         try:
-            return fn()
+            return await asyncio.to_thread(fn)
         except BoardError as e:
             raise HTTPException(400, str(e))
 
@@ -428,11 +435,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     # ── hierarchy (epic → milestone → feature) ────────────────────────────────
     @router.post("/epics")
     async def _create_epic(body: dict = Body(...)):
-        return _guard(lambda: store().create_epic(body.get("title", ""), body.get("description", "")))
+        return await _guard(lambda: store().create_epic(body.get("title", ""), body.get("description", "")))
 
     @router.post("/milestones")
     async def _create_milestone(body: dict = Body(...)):
-        return _guard(
+        return await _guard(
             lambda: store().create_milestone(
                 body.get("title", ""), body.get("epic_id", ""), body.get("description", "")
             )
@@ -461,11 +468,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 feats = [f for f in feats if str(f.get("project") or "") == want]
             return {"features": annotate_next_action(feats, cfg or {})}
 
-        return _guard(_list)
+        return await _guard(_list)
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):
-        f = _guard(lambda: store().get_feature(fid))
+        f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
         return f
@@ -479,7 +486,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         coder_seam dispatch taps fill. 404 on an unknown feature; an empty-but-valid
         ``{"gens": []}`` for a known feature with no live (or recent) run in this
         process's memory. Read-only + purely in-process — never touches the board."""
-        f = _guard(lambda: store().get_feature(fid))
+        f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
         from . import coder_seam
@@ -497,7 +504,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         force = bool(body.get("force", False))
 
         s = store()
-        f = _guard(lambda: s.get_feature(fid))
+        f = await _guard(lambda: s.get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
 
@@ -522,9 +529,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
         changed = sorted(kwargs)
 
-        updated = _guard(lambda: s.update_feature(fid, **kwargs))
+        updated = await _guard(lambda: s.update_feature(fid, **kwargs))
         if changed:
-            s._comment(fid, f"spec updated: {', '.join(changed)}")
+            await asyncio.to_thread(s._comment, fid, f"spec updated: {', '.join(changed)}")
 
         return updated
 
@@ -534,7 +541,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         accepts every create field, including ``project`` (#90): the entry in the board's
         `projects:` map the feature builds in, stamped as an immutable ``project:<name>``
         label. Absent, it falls back to the board's ``default_project``."""
-        return _guard(lambda: store().create_feature(**body))
+        return await _guard(lambda: store().create_feature(**body))
 
     @router.post("/features/batch")
     async def _create_from_plan(body: dict = Body(default={})):
@@ -543,7 +550,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         "mark_ready": false}``. All-or-report: a malformed item fails itself with a
         named reason, the rest proceed; inter-item ``depends_on`` (by 0-based index or
         title) resolves after every create; ``mark_ready`` promotes only clean items."""
-        return _guard(
+        return await _guard(
             lambda: store().create_from_plan(
                 (body or {}).get("plan") or [], mark_ready=bool((body or {}).get("mark_ready", False))
             )
@@ -553,14 +560,14 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     async def _dep(fid: str, body: dict = Body(...)):
         """Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done.
         (Foundation gating is just a blocks-edge on the foundation feature.)"""
-        return _guard(
+        return await _guard(
             lambda: (store().add_dependency(fid, str(body.get("depends_on", ""))), store().get_feature(fid))[1]
         )
 
     @router.delete("/features/{fid}/dep")
     async def _dep_delete(fid: str, body: dict = Body(default={})):
         """Remove a `blocks` edge — inverse of POST …/dep. Body: ``{"depends_on": "<id>"}``."""
-        return _guard(
+        return await _guard(
             lambda: (
                 store().remove_dependency(fid, str((body or {}).get("depends_on", ""))),
                 store().get_feature(fid),
@@ -571,15 +578,15 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.post("/features/{fid}/ready")
     async def _ready(fid: str):
         """The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing."""
-        return _guard(lambda: store().mark_ready(fid))
+        return await _guard(lambda: store().mark_ready(fid))
 
     @router.post("/features/{fid}/block")
     async def _block(fid: str, body: dict = Body(...)):
-        return _guard(lambda: store().flag_blocked(fid, str(body.get("reason", ""))))
+        return await _guard(lambda: store().flag_blocked(fid, str(body.get("reason", ""))))
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str):
-        return _guard(lambda: store().clear_blocked(fid))
+        return await _guard(lambda: store().clear_blocked(fid))
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):
@@ -596,11 +603,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         it opened meanwhile + reaps). Both best-effort: a gh failure logs, never 400s."""
         pr_url = ""
         try:
-            before = store().get_feature(fid)
+            before = await asyncio.to_thread(lambda: store().get_feature(fid))
             pr_url = str((before or {}).get("pr_url") or "").strip()
         except BoardError:
             pass  # the cancel below raises the named error for an unknown card
-        f = _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
+        f = await _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
         from .loop import cancel_side_effects
 
         side = await asyncio.to_thread(cancel_side_effects, fid, pr_url, cwd=store_kw["repo"])
@@ -616,7 +623,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         audit trail for WHY it was hand-closed, recorded as a comment on the bead.
         Reaps the feature's worktree once done — same terminal-edge reap as
         cancel/merge (#109)."""
-        f = _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
+        f = await _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
         await _reap_worktree(fid)
         return f
 
@@ -633,7 +640,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         TASK-ONLY: ``record_delivery`` 400s a coding feature (entering review with no
         pr_url would strand the merge reconciler) or one not in_progress."""
         body = body or {}
-        return _guard(
+        return await _guard(
             lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))
         )
 
@@ -647,7 +654,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         refused (it closes via ``record_merge``, the ONE Done edge for code)."""
         body = body or {}
         approved = bool(body.get("approved", True))
-        return _guard(
+        return await _guard(
             lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")))
         )
 
@@ -659,7 +666,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         cancel to keep a visible, reopenable audit lane; use delete to leave no trace.
         Reaps the feature's worktree too — same terminal-edge class as cancel/merge, a
         deleted feature leaves nothing to build (#109)."""
-        f = _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
+        f = await _guard(lambda: store().delete_feature(fid, str((body or {}).get("reason", ""))))
         await _reap_worktree(fid)
         return f
 
@@ -680,7 +687,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         if rung not in ("greedy", "best-of-k", "tree-search", "fusion"):
             raise HTTPException(400, "rung must be one of: greedy, best-of-k, tree-search, fusion")
 
-        f = _guard(lambda: store().get_feature(fid))
+        f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
         if not str(f.get("acceptance_criteria") or "").strip():
