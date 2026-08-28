@@ -1563,13 +1563,13 @@ def test_tool_absent_project_stamps_the_board_default_end_to_end(monkeypatch):
     monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
     calls = []
 
-    def run_impl(*args, want_json=False):
+    def run_impl(*args, want_json=False, with_has_more=False):
         calls.append(args)
         if args and args[0] == "create":
             return "bd-1"
         if args and args[0] == "show":
             return [{"id": "bd-1", "status": "open", "labels": ["project:board-plugin"]}]
-        return [] if want_json else ""
+        return ([], None) if with_has_more else ([] if want_json else "")
 
     board = store_mod.BeadsBoard(
         db=None, repo="/repo", projects={"board-plugin": {"repo": "/repo"}}, default_project="board-plugin"

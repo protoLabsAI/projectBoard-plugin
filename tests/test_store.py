@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -23,16 +25,19 @@ from project_board.store import BeadsBoard, BoardError, escalation_enabled
 
 class Br:
     """A fake ``_run``: records every ``br`` call and returns canned values keyed
-    by the leading subcommand. A canned value may be a callable ``(args) -> value``."""
+    by the leading subcommand. A canned value may be a callable ``(args) -> value``.
+    ``with_has_more`` mirrors the real seam's contract — ``(payload, has_more)``,
+    with ``has_more`` None (the 0.1.x no-envelope shape)."""
 
     def __init__(self, returns=None):
         self.calls = []
         self.returns = returns or {}
 
-    def __call__(self, *args, want_json=False):
+    def __call__(self, *args, want_json=False, with_has_more=False):
         self.calls.append(args)
         val = self.returns.get(args[0] if args else "", [] if want_json else "")
-        return val(args) if callable(val) else val
+        val = val(args) if callable(val) else val
+        return (val, None) if with_has_more else val
 
     def cmds(self, name):
         return [a for a in self.calls if a and a[0] == name]
@@ -1787,14 +1792,14 @@ def test_create_from_plan_promotes_the_whole_batch_atomically(make_board, monkey
     observed: list[frozenset[str]] = []  # ready-set snapshot at each br-call boundary
     real_run = b._run
 
-    def instrumented(*args, want_json=False):
+    def instrumented(*args, want_json=False, **kw):
         # A `br update … --add-label ready` is the write that makes a bead claimable;
         # apply it to its target ids so the model tracks exactly what the puller can see.
         if args and args[0] == "update" and "--add-label" in args and store.LABEL_READY in args:
             ready.update(_ids_before_flags(args))
         # Every br call is a boundary a concurrent puller could interleave a claim at.
         observed.append(frozenset(ready))
-        return real_run(*args, want_json=want_json)
+        return real_run(*args, want_json=want_json, **kw)
 
     monkeypatch.setattr(b, "_run", instrumented)
 
@@ -2796,18 +2801,103 @@ def test_issues_envelope_helper_is_non_breaking_in_both_directions():
     assert store._issues_envelope(None) is None
 
 
-def test_run_stashes_has_more_only_when_the_envelope_carries_it(monkeypatch):
-    """`_last_json_has_more` is the truncation signal, guarded on SHAPE presence: a bool
-    off the 0.2.x envelope, None whenever the `has_more` key is absent (0.1.x bare list,
-    or a bare `br show` bead) — so a check on it can never be a version sniff."""
+def test_run_returns_has_more_only_when_the_envelope_carries_it(monkeypatch):
+    """has_more is the truncation signal, guarded on SHAPE presence: a bool off the
+    0.2.x envelope, None whenever the `has_more` key is absent (0.1.x bare list, or a
+    bare `br show` bead) — so a check on it can never be a version sniff. It rides the
+    RETURN value (`with_has_more` → `(payload, has_more)`), never instance state."""
     b = _json_board(monkeypatch, '{"issues": [], "total": 99, "has_more": true}')
-    b._run("list", want_json=True)
-    assert b._last_json_has_more is True
-    monkeypatch.setattr(  # a later 0.1.x-shaped call clears it back to None
+    assert b._run("list", want_json=True, with_has_more=True) == ([], True)
+    monkeypatch.setattr(  # a 0.1.x-shaped payload has no envelope → has_more is None
         store.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
     )
+    assert b._run("list", want_json=True, with_has_more=True) == ([], None)
+
+
+def test_run_keeps_no_shared_has_more_state(monkeypatch):
+    """The #258 race: with the old `_last_json_has_more` stash, caller B's `_run` could
+    overwrite caller A's truncation signal between A's write and A's read once the loop
+    and routes offload store calls to threads. The signal now travels only in each
+    call's return value — the instance carries no stash at all."""
+    b = _json_board(monkeypatch, '{"issues": [], "has_more": true}')
     b._run("list", want_json=True)
-    assert b._last_json_has_more is None
+    assert not hasattr(b, "_last_json_has_more")
+
+
+def test_run_has_more_is_race_free_across_concurrent_callers(monkeypatch):
+    """Two threads inside `_run` at once — one query truncated, one not, both held at a
+    barrier so their subprocess calls genuinely interleave. Each caller must read exactly
+    its own has_more off its own return value (the old shared stash lost this race)."""
+    b = _board(monkeypatch, db="/x/.beads/beads.db")
+    barrier = threading.Barrier(2, timeout=5)
+
+    def fake_run(cmd, **_k):
+        stdout = '{"issues": [], "has_more": true}' if "list" in cmd else "[]"
+        barrier.wait()  # both callers reach the subprocess seam before either returns
+        return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        truncated = pool.submit(b._run, "list", want_json=True, with_has_more=True)
+        clean = pool.submit(b._run, "ready", want_json=True, with_has_more=True)
+        assert truncated.result(timeout=5) == ([], True)
+        assert clean.result(timeout=5) == ([], None)
+
+
+# ── #258: blocking `br` work belongs OFF the event-loop thread ────────────────────
+# `_run` blocks in subprocess.run (30s timeout) and time.sleep (the contention
+# backoff) — on the event-loop thread that stalls every coroutine. These pin the
+# seam both ways: an async caller that offloads via asyncio.to_thread reaches `_run`
+# on a worker thread, and a `_run` executed ON the loop thread is loudly detected.
+
+
+def test_store_call_offloaded_via_to_thread_runs_off_the_loop_thread(make_board):
+    """The seam the loop tick / API routes consume (their offload cards ride this):
+    patch `_run`, record the executing thread, and drive a store read from a coroutine
+    through `asyncio.to_thread` — every `_run` lands on a worker thread, never the
+    thread running the event loop."""
+    seen = []
+
+    def run_impl(*args, want_json=False, with_has_more=False):
+        seen.append(threading.current_thread())
+        val = [] if want_json else ""
+        return (val, None) if with_has_more else val
+
+    b = make_board(run_impl)
+
+    async def route():
+        assert threading.current_thread() is threading.main_thread()  # the loop thread
+        return await asyncio.to_thread(b.list_features)
+
+    assert asyncio.run(route()) == []
+    assert seen and all(t is not threading.main_thread() for t in seen)
+
+
+def test_run_warns_when_invoked_on_the_event_loop_thread(monkeypatch, caplog):
+    """The detector half of the seam: `_run` ON a running loop's thread is exactly the
+    blocking-subprocess bug (#258) and must be loudly visible. Observational (warn, not
+    raise): legacy on-loop call sites keep working until their offload cards land."""
+    b = _json_board(monkeypatch, "[]")
+
+    async def bad_caller():
+        return b._run("list", want_json=True)  # blocking ON the loop thread
+
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        assert asyncio.run(bad_caller()) == []
+    assert any("event-loop thread" in m for m in caplog.messages)
+
+
+def test_run_stays_quiet_off_the_event_loop_thread(monkeypatch, caplog):
+    """The correct pattern — `_run` reached via asyncio.to_thread (no running loop on
+    the executing thread) — must not warn, so the detector never cries wolf."""
+    b = _json_board(monkeypatch, "[]")
+
+    async def good_caller():
+        return await asyncio.to_thread(b._run, "list", want_json=True)
+
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        assert asyncio.run(good_caller()) == []
+    assert not any("event-loop thread" in m for m in caplog.messages)
 
 
 def test_list_features_raises_when_unbounded_query_reports_truncation(monkeypatch):
@@ -2821,11 +2911,10 @@ def test_list_features_raises_when_unbounded_query_reports_truncation(monkeypatc
 
 
 def test_list_features_trusts_limit_zero_when_no_has_more_shape(monkeypatch):
-    """The 0.1.x fallback: no envelope → `_last_json_has_more` stays None → the truncation
+    """The 0.1.x fallback: no envelope → `_run` returns has_more=None → the truncation
     guard never fires and `--limit 0` is trusted exactly as before (non-breaking downgrade)."""
     b = _json_board(monkeypatch, "[]")  # every br call returns a bare empty list
     assert b.list_features() == []
-    assert b._last_json_has_more is None
 
 
 def test_shared_file_gate_ignores_same_filename_in_a_different_project(make_board, monkeypatch):
