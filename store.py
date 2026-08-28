@@ -84,12 +84,20 @@ _BR_LOCK_SLOT = "project_board.br_lock::" + (__name__.rsplit(".", 1)[0] if "." i
 
 
 def _br_lock() -> threading.Lock:
+    """The process-wide `br` mutex, installed ATOMICALLY.
+
+    `get`-then-`set` is two operations: two threads racing the first call each see an
+    absent slot, each build a holder with its OWN Lock, and each return the one it
+    built — so both "hold the lock" at once and two `br` subprocesses overlap, which is
+    the exact race the lock exists to remove. `sys.modules` is a plain dict, so
+    `setdefault` settles it under the GIL: every caller gets whichever holder landed
+    first, including the thread whose holder lost."""
     holder = sys.modules.get(_BR_LOCK_SLOT)
     if holder is None:
         holder = types.ModuleType(_BR_LOCK_SLOT)
         holder.__doc__ = "Process-stable holder for project_board's single-flight `br` lock — data, not code."
         holder.lock = threading.Lock()
-        sys.modules[_BR_LOCK_SLOT] = holder
+        holder = sys.modules.setdefault(_BR_LOCK_SLOT, holder)
     return holder.lock
 
 

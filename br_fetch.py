@@ -218,7 +218,7 @@ def _slot():
         holder.__doc__ = "Process-stable holder for project_board's br auto-fetch state — data, not code."
         holder.state = {"state": "idle", "path": "", "error": "", "started": 0.0, "finished": 0.0, "spec": None}
         holder.lock = threading.Lock()
-        sys.modules[name] = holder
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder
 
 

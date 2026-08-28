@@ -328,8 +328,13 @@ def _attach_progress() -> "tuple[OrderedDict[str, OrderedDict[int, _GenBuffer]],
         "a data slot that survives plugin reloads, not importable code."
     )
     holder.progress = OrderedDict()
-    sys.modules[name] = holder
-    return holder.progress, 0, 0
+    holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
+    # setdefault may hand back a holder ANOTHER caller installed first (ours is then
+    # discarded) — report what that buffer actually carries, not the 0/0 our fresh one
+    # would have. The counts feed the reload warning, so they have to be true.
+    buf = holder.progress
+    live = sum(1 for gens in buf.values() if any(not b.done for b in gens.values()))
+    return buf, len(buf), live
 
 
 # fid -> {gen -> _GenBuffer}. An OrderedDict so whole features LRU-evict cheaply.

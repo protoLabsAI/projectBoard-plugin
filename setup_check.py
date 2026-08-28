@@ -187,7 +187,7 @@ def _loop_slot():
         holder = types.ModuleType(name)
         holder.__doc__ = "Process-stable holder for project_board's running-loop config snapshot — data, not code."
         holder.snapshot = None
-        sys.modules[name] = holder
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder
 
 

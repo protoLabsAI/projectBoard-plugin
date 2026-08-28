@@ -3771,3 +3771,62 @@ def test_br_lock_is_shared_across_module_instances():
         assert other._br_lock() is store._br_lock()
     finally:
         sys.modules.pop("project_board.store_reloaded", None)
+
+
+def test_slot_install_is_atomic_under_a_first_call_race(monkeypatch):
+    """RED-IS-REACHABLE: `get`-then-`set` let two threads racing the FIRST `_br_lock()`
+    each build a holder with its own Lock and each return the one it built — two
+    "holders" of a mutex whose whole job is single-flight. `sys.modules.setdefault`
+    makes the install atomic, so every caller gets the holder that landed first.
+
+    The interleaving is FORCED, not hoped for: the holder factory blocks until both
+    threads are past the `get`-returned-None check, so the window is guaranteed open.
+    (An earlier draft just started 8 threads and hoped — it passed against the UNFIXED
+    code, i.e. it was not a test. The factory is swapped through the store module's own
+    `types` reference, never the global one: patching `types.ModuleType` process-wide
+    breaks pytest's own failure reporting.)"""
+    import sys as _sys
+    import threading
+    import types as _types
+
+    slot = store._BR_LOCK_SLOT
+    saved = _sys.modules.pop(slot, None)
+    both_past_the_check = threading.Barrier(2, timeout=5)
+
+    class _BlockingTypes:
+        """Stands in for the `types` module, for `store` only."""
+
+        @staticmethod
+        def ModuleType(name, *a, **kw):
+            if name == slot:  # hold every builder until BOTH have seen an absent slot
+                both_past_the_check.wait()
+            return _types.ModuleType(name, *a, **kw)
+
+    monkeypatch.setattr(store, "types", _BlockingTypes)
+    try:
+        locks, errors = [], []
+        guard = threading.Lock()
+
+        def grab():
+            try:
+                lk = store._br_lock()
+            except Exception as exc:  # noqa: BLE001 — surfaced by the assertions below
+                with guard:
+                    errors.append(exc)
+                return
+            with guard:
+                locks.append(lk)
+
+        threads = [threading.Thread(target=grab) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors, errors
+        assert len(locks) == 2
+        assert locks[0] is locks[1], "both callers must share ONE lock"
+    finally:
+        if saved is not None:
+            _sys.modules[slot] = saved
+        else:
+            _sys.modules.pop(slot, None)
