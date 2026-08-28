@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,7 @@ from project_board.projects import (
     registry_projects,
     resolve_project_cfg,
     resolve_projects,
+    store_db_path,
 )
 
 
@@ -252,3 +254,89 @@ def test_default_project_falls_back_to_the_sole_project():
 
 def test_default_project_is_empty_for_a_multi_project_map_with_no_default():
     assert default_project({"projects": {"a": {"repo": "/a"}, "b": {"repo": "/b"}}}) == ""
+
+
+# ── the published instance-store db default (D3, #260) ──
+# The manifest ships `db_path: ""` and every store construction resolves that blank
+# through `store_db_path` to the ONE instance-default store — never per-repo
+# `.beads/` discovery. An explicit path is the documented operator override.
+
+
+def test_manifest_ships_a_blank_db_path_default():
+    """The config golden for D3: the manifest declares `db_path: ""`. There are
+    exactly two modes — blank rides the instance store, an explicit path is the
+    operator pin; the pre-D3 per-repo discovery mode is gone, so a manifest that
+    shipped anything else here would silently re-pin every fresh board."""
+    import yaml
+
+    import project_board
+
+    manifest = yaml.safe_load((Path(project_board.__file__).parent / "protoagent.plugin.yaml").read_text())
+    assert manifest["config"]["db_path"] == ""
+
+
+def test_manifest_default_config_resolves_to_the_instance_store(monkeypatch):
+    """The manifest's own shipped config block, fed through the D3 seam, lands on the
+    instance-default store — pinning the manifest default and the runtime resolution
+    together, so neither can drift without this golden moving."""
+    import yaml
+
+    import project_board
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    manifest = yaml.safe_load((Path(project_board.__file__).parent / "protoagent.plugin.yaml").read_text())
+    assert store_db_path(manifest["config"]) == "/inst/project_board/.beads/beads.db"
+
+
+def test_api_store_kw_resolves_the_db_at_the_config_seam(monkeypatch):
+    """api._store_kw (the kwargs BOTH routers construct stores with) resolves the db
+    exactly as __init__'s tool store_kw and the coder-monitor persist factory do (D3):
+    a blank/absent db_path rides the ONE instance store, an explicit path stays the
+    operator pin verbatim — the API can never fall back to per-repo discovery."""
+    from project_board import api
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    for cfg in (None, {}, {"db_path": ""}, {"db_path": "   "}):
+        assert api._store_kw(cfg)["db"] == "/inst/project_board/.beads/beads.db", cfg
+    assert api._store_kw({"db_path": "/pin/board.db"})["db"] == "/pin/board.db"
+
+
+def test_api_two_projects_and_no_db_path_share_the_one_instance_store(monkeypatch):
+    """A fresh instance serving TWO projects with no db_path: every store the API
+    constructs carries the SAME instance db — one board, every card in one store —
+    while each project keeps its own repo for the Ready gate's path checks. The db is
+    a real path (not blank), so `store._ensure_workspace` pins every op with `--db`
+    and never runs `br init` inside either project repo."""
+    from project_board import api
+    from project_board import store as store_mod
+
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    cfg = {"projects": {"web": {"repo": "/work/web"}, "api": {"repo": "/work/api"}}}
+    kw = api._store_kw(cfg)
+    assert kw["db"] == "/inst/project_board/.beads/beads.db"
+    assert {name: entry["repo"] for name, entry in kw["projects"].items()} == {
+        "web": "/work/web",
+        "api": "/work/api",
+    }
+
+
+def test_api_blank_db_path_reads_the_same_store_get_store_already_resolved(monkeypatch, tmp_path):
+    """The upgrade-safety pin for the seam move (#260): `get_store` resolves a blank
+    db to the instance default ITSELF (`db = db or default_db_path()`), so the
+    pre-seam API call (`db=cfg.get("db_path") or None`) and the resolved `_store_kw`
+    value land on the SAME cache key — the routers read exactly the board they read
+    before the seam existed, and no installation's store is re-homed by resolving at
+    the config seam instead of inside get_store."""
+    from project_board import api
+    from project_board import store as store_mod
+
+    inst = str(tmp_path / "inst" / ".beads" / "beads.db")
+    monkeypatch.setattr(store_mod, "default_db_path", lambda: inst)
+    monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    monkeypatch.setattr(store_mod, "_BOARDS", {})
+    cfg = {"repo": str(tmp_path)}  # no db_path — the shipped default
+    before = store_mod.get_store(db=cfg.get("db_path") or None, repo=str(tmp_path))  # the pre-seam call
+    after = store_mod.get_store(db=api._store_kw(cfg)["db"], repo=str(tmp_path))  # the resolved seam
+    assert after is before and before.db == inst

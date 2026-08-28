@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import setup_check
 from .projects import default_project as resolve_default_project
-from .projects import resolve_projects
+from .projects import resolve_projects, store_db_path
 from .store import BoardError, annotate_next_action, escalation_enabled, get_store
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -56,7 +56,16 @@ def _store_kw(cfg: dict) -> dict:
     gate validates against its own repo."""
     cfg = cfg or {}
     return dict(
-        db=cfg.get("db_path") or None,
+        # D3 (#260): the db is resolved at the config seam, the same way as the tool
+        # store_kw and the coder-monitor persist factory — a blank/absent db_path rides
+        # the ONE instance-default store (store.default_db_path), an explicit path
+        # stays the operator pin verbatim. Resolving HERE re-homes nothing: get_store
+        # itself resolves a blank db to the same instance default, so this hands it the
+        # exact path the pre-seam `db=cfg.get("db_path") or None` call already landed
+        # on — same cache key, same board (pinned in test_projects). Cards a pre-D3
+        # install left in a repo's `.beads/` are surfaced by the setup preflight's
+        # migration advisory (setup_check.legacy_store_repos), never silently dropped.
+        db=store_db_path(cfg),
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),
         max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
@@ -392,7 +401,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # resolved map is non-empty even for the unbound shipped default.
         raw_projects = (cfg or {}).get("projects")
         explicit_projects = isinstance(raw_projects, dict) and bool(raw_projects)
-        bound = bool(store_kw.get("db")) or explicit_projects or str(store_kw.get("repo") or ".") not in ("", ".")
+        # Same for the db (D3, #260): store_kw's `db` ALWAYS carries a real path now
+        # (a blank db_path resolves to the instance-default store at the seam), so the
+        # resolved value can no longer tell an operator's pin from the shipped default.
+        # Only an EXPLICIT db_path is a binding signal — the setup_check._is_bound rule.
+        explicit_db = bool(str((cfg or {}).get("db_path") or "").strip())
+        bound = explicit_db or explicit_projects or str(store_kw.get("repo") or ".") not in ("", ".")
         try:
             # Off the event loop (review on #212): the preflight may shell `br
             # --version` (once per path) and reads the delegates YAML; this route is
@@ -413,7 +427,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         return {
             "bound": bound,
             "repo": store_kw.get("repo") or ".",
-            "db_path": bool(store_kw.get("db")),
+            "db_path": explicit_db,
             "projects": sorted(raw_projects) if explicit_projects else [],
             "setup": setup,
             "preflight": preflight,

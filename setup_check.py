@@ -29,14 +29,21 @@ to tick without (``br``, ``coder``, ``repo``): each of those turns every tick in
 traceback, while a missing ``gh`` only fails the PR edge of a build — reported, not
 paused on.
 
-One ADVISORY beyond the checks (D3, #260): a multi-entry ``projects:`` map combined
-with an EXPLICITLY blank ``db_path`` — the pre-D3 per-repo-discovery override. Since
-D3 that blank is INERT: ``projects.store_db_path`` (and ``get_store`` itself) resolve
-it to the same single instance-default store as an absent key, so the board runs
-correctly on ONE shared db and nothing fragments. The finding is the stale override
-itself — the operator wrote a knob that no longer does anything — so it is surfaced
-through the same gap seam under its own ``db`` key (``MULTI_PROJECT_DB_HINT``) and as
-an info callout on the board page, but it fails no check and never pauses the loop.
+Two ADVISORIES beyond the checks (D3, #260), both info-level: reported through the
+same gap seam, rendered as callouts on the board page, but never a failing check and
+never a pause. First, the stale-override advisory: a multi-entry ``projects:`` map
+combined with an EXPLICITLY blank ``db_path`` — the pre-D3 per-repo-discovery
+override. Since D3 that blank is INERT: ``projects.store_db_path`` (and ``get_store``
+itself) resolve it to the same single instance-default store as an absent key, so the
+board runs correctly on ONE shared db and nothing fragments. The finding is the stale
+override itself — the operator wrote a knob that no longer does anything — surfaced
+under its own ``db`` key (``MULTI_PROJECT_DB_HINT``). Second, the MIGRATION advisory:
+with no explicit ``db_path`` the board reads the instance store — but the SAME config
+on a pre-D3 board kept its cards inside the configured repo (`br` per-repo
+discovery), so a repo that still carries a ``.beads/`` workspace is the upgrade
+signature: any cards left there are invisible to this board until the operator pins
+``db_path`` back to that file or migrates them. Surfaced under its own ``db_legacy``
+key (``legacy_store_hint``), so the switch is never a silently empty board.
 
 Everything the checks touch is injectable (``which``, ``delegates``, ``run``) so the
 suite exercises every pass/fail branch without a host, a PATH, or a subprocess.
@@ -63,13 +70,15 @@ log = logging.getLogger("protoagent.plugins.project_board")
 SETUP_KEYS: tuple[str, ...] = ("br", "gh", "coder", "repo")
 # The checks the puller will not tick without (see module docstring).
 LOOP_BLOCKING_KEYS: tuple[str, ...] = ("br", "coder", "repo")
-# Two extra host-gap keys beyond the checks: the running loop's config snapshot
-# lagging the live config on a restart-only knob (see ``loop_cfg_stale`` below), and
-# the inert multi-project blank-``db_path`` override (see ``db_override_ignored``) —
-# both advisories: reported through the seam, never a failing check, never a pause.
+# Three extra host-gap keys beyond the checks: the running loop's config snapshot
+# lagging the live config on a restart-only knob (see ``loop_cfg_stale`` below), the
+# inert multi-project blank-``db_path`` override (see ``db_override_ignored``), and
+# the pre-D3 per-repo workspace migration advisory (see ``legacy_store_repos``) —
+# all advisories: reported through the seam, never a failing check, never a pause.
 LOOP_STALE_KEY = "loop"
 DB_OVERRIDE_KEY = "db"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY)
+LEGACY_STORE_KEY = "db_legacy"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY, LEGACY_STORE_KEY)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -108,6 +117,50 @@ MULTI_PROJECT_DB_HINT = (
     "fragments. The board keeps running; remove the stale db_path override, or set db_path to "
     "a single shared file in Settings ▸ Project Board"
 )
+
+
+def legacy_store_hint(repos: list[str]) -> str:
+    """Operator copy for the pre-D3 migration advisory — names every configured repo
+    still carrying a ``.beads/`` workspace the board no longer reads. ``""`` when
+    there are none (the advisory's quiet state)."""
+    if not repos:
+        return ""
+    listed = ", ".join(repr(r) for r in repos)
+    return (
+        f"repo {listed} carries a .beads/ workspace the board does not read — with no db_path "
+        "configured the board keeps its own instance store (one shared db). A pre-D3 board with "
+        "this config kept its cards IN the repo's .beads/; if yours did, those cards are not on "
+        "this board: set db_path to that .beads/<file>.db in Settings ▸ Project Board to keep "
+        "reading them, or migrate them into the instance store. If the workspace belongs to the "
+        "repo's own beads tracking, set an explicit db_path to pin the board and quiet this note"
+    )
+
+
+def legacy_store_repos(cfg: dict, isdir=None) -> list[str]:
+    """The configured project repos still carrying a ``.beads/`` workspace while the
+    board rides the instance store (no explicit ``db_path``) — the pre-D3 upgrade
+    signature: per-repo discovery made each of those the board's store, so cards left
+    there are invisible until ``db_path`` pins back to the file or they are migrated.
+    Empty when ``db_path`` is set (the operator's pin decides, wherever it points — an
+    EXPLICITLY blank value is not a pin, it rides the instance store like an absent
+    key), when the ``projects:`` map is malformed (the repo check owns that finding),
+    or when no repo carries one. De-duplicated in first-seen order (several projects
+    may share a repo)."""
+    cfg = cfg or {}
+    isdir = isdir or os.path.isdir
+    if str(cfg.get("db_path") or "").strip():
+        return []
+    try:
+        resolved = resolve_projects(cfg)
+    except Exception:  # noqa: BLE001 — a malformed projects: map is the repo check's finding
+        return []
+    out: list[str] = []
+    for entry in resolved.values():
+        path = str((entry or {}).get("repo") or "").strip()
+        if path and path not in out and isdir(os.path.join(path, ".beads")):
+            out.append(path)
+    return out
+
 
 _BR_VERSION_TIMEOUT_S = 3.0
 # ``br --version`` output per resolved binary path — sampled once per process per
@@ -293,6 +346,8 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
           "loop_cfg_stale_hint": str,  # operator copy, "" when not stale
           "db_override_ignored": bool, # multi-entry projects: + explicit db_path: "" (inert, D3 #260)
           "db_override_hint": str,     # operator copy, "" when the advisory is quiet
+          "legacy_store_repos": [p…],  # repos still carrying a pre-D3 `.beads/` workspace (D3 #260)
+          "legacy_store_hint": str,    # migration copy, "" when the advisory is quiet
           "ready": bool,               # every check ok
         }
 
@@ -416,6 +471,15 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
     ignored = multi_project(cfg) and blank_db_override(cfg)
     status["db_override_ignored"] = ignored
     status["db_override_hint"] = MULTI_PROJECT_DB_HINT if ignored else ""
+    # The D3 MIGRATION advisory (#260): with no explicit db_path the board reads the
+    # instance store — but the SAME config on a pre-D3 board kept its cards in the
+    # repo's `.beads/` (per-repo discovery), so a repo still carrying one means any
+    # cards left there are invisible here until db_path pins back to that file or
+    # they are migrated. Info-level like the override above: the board itself is
+    # healthy, so it never fails a check or pauses the loop.
+    legacy = legacy_store_repos(cfg, isdir=isdir)
+    status["legacy_store_repos"] = legacy
+    status["legacy_store_hint"] = legacy_store_hint(legacy)
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -515,6 +579,8 @@ class GapReporter:
                 msg = str((status or {}).get("loop_cfg_stale_hint") or "") or None
             elif key == DB_OVERRIDE_KEY:
                 msg = str((status or {}).get("db_override_hint") or "") or None
+            elif key == LEGACY_STORE_KEY:
+                msg = str((status or {}).get("legacy_store_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
