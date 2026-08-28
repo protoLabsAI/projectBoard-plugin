@@ -2824,8 +2824,94 @@ def test_record_delivery_with_a_ref_sets_external_ref(make_board, monkeypatch):
     b = make_board(br)
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
-    b.record_delivery("bd-t", text="ADR written", ref="docs/adr/0099-task.md")
-    assert ("update", "bd-t", "--add-label", "in-review", "--external-ref", "docs/adr/0099-task.md") in br.calls
+    b.record_delivery("bd-t", text="ADR written", ref="https://docs.example/adr/0099-task.md")
+    assert (
+        "update",
+        "bd-t",
+        "--add-label",
+        "in-review",
+        "--external-ref",
+        "https://docs.example/adr/0099-task.md",
+    ) in br.calls
+
+
+def test_record_delivery_strips_the_ref_before_persisting(make_board, monkeypatch):
+    """normalize_external_ref hands `br` the STRIPPED URL — no whitespace ride-along."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", ref="  https://docs.example/adr/0099.md  ")
+    assert (
+        "update",
+        "bd-t",
+        "--add-label",
+        "in-review",
+        "--external-ref",
+        "https://docs.example/adr/0099.md",
+    ) in br.calls
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        "ftp://files.example/report.pdf",  # a real URL, wrong scheme
+        "artifact://y",  # a made-up scheme
+        "https://",  # http(s) scheme but no host — not a usable link
+        "//files.example/report.pdf",  # protocol-relative — link-shaped, no fixed scheme
+    ],
+)
+def test_record_delivery_refuses_a_non_http_link_ref_with_nothing_written(make_board, monkeypatch, bad_ref):
+    """A LINK-SHAPED ref (it has a scheme, or a protocol-relative //host) must be an
+    absolute http(s) URL to land on external_ref — the slot the board renders as a
+    live link — so anything else is refused with a named rule, BEFORE the deliverable
+    comment or the state move lands (no half-applied delivery). Scheme-less artifact
+    paths are NOT refused — they ride the deliverable comment (tests below)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    with pytest.raises(BoardError, match=r"record_delivery ref must be an absolute http\(s\) URL"):
+        b.record_delivery("bd-t", text="ADR written", ref=bad_ref)
+    assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
+
+
+def test_record_delivery_accepts_plain_http_refs_too(make_board, monkeypatch):
+    """The gate is http(s), not https-only — an internal http doc host is a valid ref."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", ref="http://wiki.internal/adr/7")
+    assert ("update", "bd-t", "--add-label", "in-review", "--external-ref", "http://wiki.internal/adr/7") in br.calls
+
+
+def test_record_delivery_still_accepts_a_relative_artifact_ref(make_board, monkeypatch):
+    """The pre-hardening contract holds: a scheme-less artifact path is a first-class
+    deliverable ref — the delivery records it and the bead moves to review. What
+    changed is WHERE it lands: the path folds into the `deliverable:` comment (the
+    record the projection's `deliverable` field reads back), never --external-ref,
+    so the board can't mint an href from it."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    f = b.record_delivery("bd-t", text="ADR written", ref="docs/adr/0099-task.md")
+    assert ("comments", "add", "bd-t", "deliverable: ADR written (docs/adr/0099-task.md)") in br.calls
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # the path never reaches external_ref
+    assert f["board_state"] == "in_review"
+
+
+def test_record_delivery_records_a_path_only_ref_as_the_deliverable(make_board, monkeypatch):
+    """ref-only delivery with an artifact path: the path IS the deliverable record."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", ref="docs/adr/0099-task.md")
+    assert ("comments", "add", "bd-t", "deliverable: docs/adr/0099-task.md") in br.calls
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # the path never reaches external_ref
 
 
 def test_record_delivery_rejects_a_non_in_progress_state(make_board, monkeypatch):
@@ -3020,6 +3106,40 @@ def test_open_review_with_a_pr_is_unchanged_for_coding_features(make_board, monk
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
     b.open_review("bd-1", pr_url="https://example/pr/5")
     assert ("update", "bd-1", "--add-label", "in-review", "--external-ref", "https://example/pr/5") in br.calls
+
+
+def test_open_review_refuses_a_non_http_pr_url_with_nothing_written(make_board, monkeypatch):
+    """open_review shares record_delivery's external-ref gate — the same slot renders
+    as the card's live PR link, so a non-http(s) pr_url is refused before any write."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match=r"open_review ref must be an absolute http\(s\) URL"):
+        b.open_review("bd-1", pr_url="file:/tmp/pr.html")
+    assert br.cmds("update") == []  # nothing written on the refusal
+
+
+def test_open_review_refuses_a_whitespace_only_pr_url_for_coding_features(make_board, monkeypatch):
+    """A whitespace-only pr_url is truthy but normalizes to "" — it must hit the
+    required-pr_url refusal, not sneak a coding feature into review with no ref."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="requires a pr_url"):
+        b.open_review("bd-1", pr_url="   ")
+    assert br.cmds("update") == []  # nothing written on the refusal
+
+
+def test_open_review_whitespace_only_pr_url_is_a_no_ref_review_for_tasks(make_board, monkeypatch):
+    """Tasks may enter review PR-less, so their whitespace-only pr_url just strips
+    to no ref — same update as omitting it, never a blank --external-ref."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.open_review("bd-t", pr_url="   ")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # no --external-ref stamped
 
 
 # ── the puller admits task-type beads (#217) ─────────────────────────────────────

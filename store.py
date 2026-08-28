@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from . import _TERMINAL_STATES, br_fetch
 
@@ -437,6 +438,29 @@ def normalize_source_issue(raw) -> str:
         f"invalid source_issue {raw!r} — expected a GitHub issue URL "
         "(https://github.com/owner/repo/issues/N) or owner/repo#N"
     )
+
+
+def normalize_external_ref(raw, *, edge: str) -> str:
+    """Normalize + validate a value bound for ``--external-ref`` (the slot the
+    projection surfaces as ``pr_url`` and the board renders as a live link).
+
+    Trims, then requires a stripped absolute http(s) URL (``urlparse`` scheme in
+    {http, https} + a host). Empty input returns "" (no ref recorded). Anything
+    else raises a named BoardError at persistence, the first half of the two-sided
+    gate (the view's ``safeHref`` is the render half), so a non-http(s) ref never
+    lands where an href is minted from it. Callers with a legitimate non-link slot
+    route around it — record_delivery sends scheme-less artifact paths to the
+    `deliverable:` comment record instead of through this gate."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    parts = urlparse(s)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise BoardError(
+            f"{edge} ref must be an absolute http(s) URL, got {s!r} — external refs "
+            "render as board links, so only http/https may land on external_ref"
+        )
+    return s
 
 
 def normalize_project(raw) -> str:
@@ -1397,6 +1421,9 @@ class BeadsBoard:
         f = self._require(fid)
         if f["board_state"] != "in_progress":
             raise BoardError(f"open_review expects in_progress, got {f['board_state']!r}")
+        # Normalize FIRST: a whitespace-only pr_url strips to "" and must hit the
+        # required-pr_url refusal below, not slip past it and enter review ref-less.
+        pr_url = normalize_external_ref(pr_url, edge="open_review")
         if not pr_url and f.get("issue_type") != LABEL_TASK:
             raise BoardError(
                 f"open_review requires a pr_url for issue_type {f.get('issue_type')!r} (only tasks may omit it)"
@@ -1410,10 +1437,15 @@ class BeadsBoard:
     def record_delivery(self, fid: str, text: str = "", ref: str = "") -> dict:
         """Record a task-type bead's DELIVERABLE (#217) — the task sibling of the
         coder's open_pr → open_review edge. ``text`` rides a `deliverable:` comment
-        (the projection's `deliverable` field reads the latest one back); an optional
-        ``ref`` (a doc URL, an artifact path) lands on `external_ref` — the same slot
-        a coding feature's pr_url occupies, so link consumers just work. Moves
-        in_progress → in_review via the same `in-review` label as open_review.
+        (the projection's `deliverable` field reads the latest one back). An optional
+        ``ref`` splits by SHAPE: an absolute http(s) URL lands on `external_ref` —
+        the same slot a coding feature's pr_url occupies, so link consumers just
+        work — while a scheme-less artifact path (`docs/adr/0099-task.md`) stays a
+        first-class deliverable ref but rides the `deliverable:` comment record
+        instead, so it is recorded without ever landing where the board mints an
+        href. A link-shaped ref with any OTHER scheme is refused
+        (normalize_external_ref). Moves in_progress → in_review via the same
+        `in-review` label as open_review.
 
         TASK-ONLY: a coding feature taking this edge would enter review with no
         pr_url and strand the merge reconciler — the exact hole open_review's
@@ -1425,11 +1457,22 @@ class BeadsBoard:
             )
         if f["board_state"] != "in_progress":
             raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
+        # Classify the ref by shape BEFORE any write lands: link-shaped (a scheme, or
+        # a protocol-relative //host) must pass the strict http(s) gate to reach
+        # external_ref; a scheme-less artifact path folds into the deliverable record.
+        ref = str(ref or "").strip()
+        parts = urlparse(ref)
+        if parts.scheme or parts.netloc:
+            external_ref = normalize_external_ref(ref, edge="record_delivery")
+        else:
+            external_ref = ""
+            if ref:
+                text = f"{text} ({ref})" if text else ref
         if text:
             self._comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
-        if ref:
-            args += ["--external-ref", ref]
+        if external_ref:
+            args += ["--external-ref", external_ref]
         self._run(*args)
         return self.get_feature(fid)
 
