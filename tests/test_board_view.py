@@ -486,6 +486,21 @@ def test_held_projects_get_their_own_warning_card_on_an_otherwise_healthy_board(
     assert "releases its cards on its own once the gate passes (no restart needed)" in BOARD_PAGE
 
 
+def test_held_card_still_shows_the_stale_loop_and_paused_advisories():
+    """The held branch OUTRANKS the loop-stale branch, so it has to carry that branch's
+    advisories itself — otherwise a board that is both held and running a stale config
+    shows only the hold, and its "releases on its own (no restart needed)" line is
+    actively wrong: the restart is what applies the config the operator just changed.
+
+    RED-IS-REACHABLE: drop `setupLoopLine` from renderHeldProjects and this fails
+    (found by the retroactive adversarial review of #273, which merged without one)."""
+    body = BOARD_PAGE[BOARD_PAGE.index("function renderHeldProjects(s)") :]
+    body = body[: body.index("\n}")]
+    assert "setupLoopLine(" in body, "the held card must carry the advisories it outranks"
+    # the same source both other cards read it from — no second copy to drift
+    assert BOARD_PAGE.count("function setupLoopLine(setup)") == 1
+
+
 def test_held_projects_ride_along_the_setup_gap_card_when_both_fail():
     """A board with a setup gap AND held projects shows both on the one card slot —
     both /status call sites hand the full status body through to renderSetupGaps,

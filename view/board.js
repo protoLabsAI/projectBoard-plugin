@@ -373,9 +373,16 @@ function heldGateItems(s){
 function renderHeldProjects(s){
   $("err").hidden = false;
   $("err").className = "pl-callout pl-callout--warning";
+  // setupLoopLine rides along for the same reason it does on the setup-gap card: this
+  // branch OUTRANKS the loop-stale one, so without it a board that is both held and
+  // running a stale config shows only the hold — and its "releases on its own, no
+  // restart needed" line is then actively wrong, since the restart is what applies the
+  // config the operator just changed. Every advisory the suppressed branch would have
+  // rendered is carried here instead of being swallowed by priority.
   $("err").innerHTML = '<b>Work is held — a gate fails on its project&#39;s clean base.</b>'
     + '<ul style="margin:6px 0 0 18px;padding:0">' + heldGateItems(s) + '</ul>'
-    + '<div style="opacity:.65;margin-top:6px;font-size:12px">The loop re-checks each held project&#39;s gate and releases its cards on its own once the gate passes (no restart needed).</div>';
+    + '<div style="opacity:.65;margin-top:6px;font-size:12px">The loop re-checks each held project&#39;s gate and releases its cards on its own once the gate passes (no restart needed).</div>'
+    + setupLoopLine((s && s.setup) || null);
 }
 
 // A bound board whose setup preflight fails — each failing check with its hint, in
