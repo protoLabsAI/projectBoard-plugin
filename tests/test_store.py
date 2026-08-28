@@ -3088,6 +3088,29 @@ def test_open_review_refuses_a_non_http_pr_url_with_nothing_written(make_board, 
     assert br.cmds("update") == []  # nothing written on the refusal
 
 
+def test_open_review_refuses_a_whitespace_only_pr_url_for_coding_features(make_board, monkeypatch):
+    """A whitespace-only pr_url is truthy but normalizes to "" — it must hit the
+    required-pr_url refusal, not sneak a coding feature into review with no ref."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "feature"})
+    with pytest.raises(BoardError, match="requires a pr_url"):
+        b.open_review("bd-1", pr_url="   ")
+    assert br.cmds("update") == []  # nothing written on the refusal
+
+
+def test_open_review_whitespace_only_pr_url_is_a_no_ref_review_for_tasks(make_board, monkeypatch):
+    """Tasks may enter review PR-less, so their whitespace-only pr_url just strips
+    to no ref — same update as omitting it, never a blank --external-ref."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.open_review("bd-t", pr_url="   ")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")  # no --external-ref stamped
+
+
 # ── the puller admits task-type beads (#217) ─────────────────────────────────────
 
 

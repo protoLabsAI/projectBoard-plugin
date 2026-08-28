@@ -1419,11 +1419,13 @@ class BeadsBoard:
         f = self._require(fid)
         if f["board_state"] != "in_progress":
             raise BoardError(f"open_review expects in_progress, got {f['board_state']!r}")
+        # Normalize FIRST: a whitespace-only pr_url strips to "" and must hit the
+        # required-pr_url refusal below, not slip past it and enter review ref-less.
+        pr_url = normalize_external_ref(pr_url, edge="open_review")
         if not pr_url and f.get("issue_type") != LABEL_TASK:
             raise BoardError(
                 f"open_review requires a pr_url for issue_type {f.get('issue_type')!r} (only tasks may omit it)"
             )
-        pr_url = normalize_external_ref(pr_url, edge="open_review")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if pr_url:
             args += ["--external-ref", pr_url]
