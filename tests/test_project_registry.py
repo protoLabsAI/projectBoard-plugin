@@ -12,6 +12,7 @@ idempotency (re-registering updates rather than duplicating).
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import sys
 import types
@@ -597,3 +598,152 @@ async def test_delete_runs_live_unused_check_inside_registry_mutation(monkeypatc
     _wire_host(monkeypatch, cfg, apply_settings)
     await delete_project("alpha", assert_unused=assert_unused)
     assert events == ["check:alpha", "apply"]
+
+
+# ── registration-time gate smoke (#261) ───────────────────────────────────────
+# upsert used to validate only the gate command's LENGTH; its first execution was the
+# loop's gate preflight, which discovers a broken gate long after the PUT answered ok —
+# and answers by silently holding the project's ready work. The operator is present at
+# registration, so an incoming explicit gate is smoked once on the clean base BEFORE
+# anything persists: a red gate refuses (naming the failure with the output tail), an
+# indeterminate verdict (timeout / dirty checkout / force) warns loudly and persists.
+
+_LOG = "protoagent.plugins.project_board"
+
+
+def _smoke_cfg(root: Path) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        onboarding_enabled=True,
+        onboarding_root=str(root),
+        plugin_config={"project_board": {"projects": {}}},
+    )
+
+
+def _recording_apply(cfg, applied):
+    def apply_settings(patch):
+        applied.append(patch)
+        cfg.plugin_config["project_board"].update(patch["project_board"])
+        return True, []
+
+    return apply_settings
+
+
+async def test_a_gate_that_fails_on_the_clean_base_refuses_naming_the_output_tail(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")  # fresh init: clean, so the red verdict convicts the base
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    with pytest.raises(ProjectRegistryError, match="failed on the clean base") as exc:
+        await upsert_project("alpha", str(repo), local_gate_cmd="echo the-suite-is-broken; exit 3")
+
+    assert "the-suite-is-broken" in str(exc.value)  # the output tail names the failure
+    assert "exit 3" in str(exc.value)
+    assert applied == []  # refused BEFORE persistence — nothing reached the host
+
+
+async def test_a_passing_gate_persists_as_before(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    result = await upsert_project("alpha", str(repo), local_gate_cmd="exit 0")
+
+    assert applied  # persisted exactly as a gate-less register would
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "exit 0"
+    assert result["entry"]["local_gate_cmd"] == "exit 0"
+
+
+async def test_the_auto_sentinel_is_never_executed_at_registration(monkeypatch, tmp_path):
+    """`auto` is the loop's dispatch-time discovery sentinel, not a command — smoking it
+    would shell the literal word `auto` and refuse on 'command not found'. Persisting
+    cleanly proves it was not run."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    await upsert_project("alpha", str(repo), local_gate_cmd="auto")
+
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "auto"
+
+
+async def test_a_reregister_that_preserves_the_prior_gate_does_not_resmoke_it(monkeypatch, tmp_path):
+    """Only the gate text THIS call carries is smoked. A re-register with a blank gate
+    keeps the operator's configured one untouched — re-running it here would let a red
+    suite refuse an unrelated conventions update (the loop's preflight already gates
+    dispatch on the preserved command)."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    cfg.plugin_config["project_board"]["projects"]["alpha"] = {"repo": str(repo.resolve()), "local_gate_cmd": "exit 7"}
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    await upsert_project("alpha", str(repo), repo_conventions="Run tests")
+
+    assert applied  # the update landed even though the preserved gate is red
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "exit 7"
+
+
+async def test_force_gate_downgrades_a_red_smoke_to_a_loud_warning(monkeypatch, tmp_path, caplog):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    with caplog.at_level(logging.WARNING, logger=_LOG):
+        await upsert_project("alpha", str(repo), local_gate_cmd="exit 3", force_gate=True)
+
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "exit 3"
+    assert "persisting under" in caplog.text and "force" in caplog.text  # loud, not silent
+
+
+async def test_a_red_gate_on_a_dirty_checkout_is_indeterminate_and_persists(monkeypatch, tmp_path, caplog):
+    """#255 transplanted to registration: a checkout carrying the operator's uncommitted
+    edits makes the gate's verdict about THOSE edits, not the base every worktree
+    branches from — so the refusal downgrades to a loud warning and the loop's
+    preflight stays the dispatch-time enforcement."""
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    (repo / "f.txt").write_text("one\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "f.txt").write_text("two\n")  # uncommitted tracked change → dirt
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    with caplog.at_level(logging.WARNING, logger=_LOG):
+        await upsert_project("alpha", str(repo), local_gate_cmd="exit 3")
+
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "exit 3"
+    assert "NOT at base" in caplog.text and "indeterminate" in caplog.text
+
+
+async def test_a_gate_smoke_timeout_is_indeterminate_and_persists(monkeypatch, tmp_path, caplog):
+    """A slow gate must not make registration impossible — mirror the loop's timeout
+    posture: no verdict, allow, and say so loudly."""
+    import project_registry as registry
+
+    monkeypatch.setattr(registry, "_SMOKE_TIMEOUT_S", 0.2)
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "alpha")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+
+    with caplog.at_level(logging.WARNING, logger=_LOG):
+        await upsert_project("alpha", str(repo), local_gate_cmd="sleep 5; exit 1")
+
+    assert cfg.plugin_config["project_board"]["projects"]["alpha"]["local_gate_cmd"] == "sleep 5; exit 1"
+    assert "timed out" in caplog.text
