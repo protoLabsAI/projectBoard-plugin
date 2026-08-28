@@ -1823,6 +1823,145 @@ def test_terminal_reap_of_an_unlabeled_feature_falls_back_to_the_default_repo(mo
     assert reaped == [("/alpha", ".wt", "bd-7")]
 
 
+# ── #265: the test-rung diagnostic resolves the feature's project too ──────────────
+#
+# Same class of bug as #262, one edge later: POST /features/{fid}/test-rung read the
+# flat repo/base_branch/worktrees_root, so a project-B diagnostic built (and reaped)
+# its throwaway worktree in the board-default checkout — testing the wrong codebase.
+
+
+_TEST_RUNG_PROJECTS_CFG = {
+    "repo": "/default",
+    "base_branch": "main",
+    "worktrees_root": ".wt",
+    "projects": {
+        "alpha": {"repo": "/alpha"},
+        "beta": {"repo": "/beta", "base_branch": "develop", "worktrees_root": ".beta-wt"},
+    },
+    "default_project": "alpha",
+    "coder_solve_test_cmd": "pytest -q",
+    "coder": "proto",
+}
+
+
+def _stub_test_rung(monkeypatch, store, feature):
+    """Wire the diagnostic's seams for a happy-path dispatch and return the kwargs
+    coder_seam.test_rung was called with."""
+    monkeypatch.setattr(store, "get_feature", lambda fid: feature)
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
+    seen = {}
+
+    async def _fake_test_rung(**kwargs):
+        seen.update(kwargs)
+        return {"rung": kwargs["rung"], "passed": True}
+
+    monkeypatch.setattr(coder_seam, "test_rung", _fake_test_rung)
+    return seen
+
+
+def test_test_rung_builds_in_the_features_project_repo(monkeypatch):
+    """r1: a test-rung on a project-B feature creates its throwaway worktree under
+    B's repo — repo, base AND worktrees_root all resolve from the feature's project
+    label (the #262 terminal-edge order), never the instance default."""
+    store = FakeStore()
+    seen = _stub_test_rung(monkeypatch, store, {**_feature_with_ac("bd-7"), "project": "beta"})
+    c = _client(monkeypatch, store, cfg=_TEST_RUNG_PROJECTS_CFG)
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 200
+    assert seen["repo"] == "/beta"
+    assert seen["base"] == "develop"
+    assert seen["root"] == ".beta-wt"
+
+
+def test_test_rung_on_an_unlabeled_feature_keeps_the_default_project_resolution(monkeypatch):
+    """Back-compat: an unlabeled card resolves like every #262 edge — the default
+    project's repo, then the instance base/worktrees_root (alpha declares neither)."""
+    store = FakeStore()
+    seen = _stub_test_rung(monkeypatch, store, _feature_with_ac("bd-7"))
+    c = _client(monkeypatch, store, cfg=_TEST_RUNG_PROJECTS_CFG)
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"})
+    assert r.status_code == 200
+    assert seen["repo"] == "/alpha"
+    assert seen["base"] == "main"
+    assert seen["root"] == ".wt"
+
+
+def test_test_rung_fusion_gate_sizes_files_in_the_features_project_repo(monkeypatch, tmp_path):
+    """The fusion viability pre-gate reads the declared files where they actually
+    live — the feature's project repo. big.py is oversized in B's repo and absent
+    from the board-default repo; sizing the wrong checkout would wave fusion through
+    (a missing file is 'viable') and reach coder_seam.test_rung."""
+    default_repo = tmp_path / "default"
+    beta_repo = tmp_path / "beta"
+    default_repo.mkdir()
+    beta_repo.mkdir()
+    (beta_repo / "big.py").write_text("x" * 1000)
+
+    store = FakeStore()
+    monkeypatch.setattr(
+        store, "get_feature", lambda fid: {**_feature_with_ac(fid, files=["big.py"]), "project": "beta"}
+    )
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, t: object())
+
+    async def _boom(**kwargs):
+        raise AssertionError("fusion sized the wrong repo — an oversized project-B file must refuse before dispatch")
+
+    monkeypatch.setattr(coder_seam, "test_rung", _boom)
+    c = _client(
+        monkeypatch,
+        store,
+        cfg={
+            "repo": str(default_repo),
+            "projects": {"beta": {"repo": str(beta_repo)}},
+            "default_project": "beta",
+            "coder_solve_test_cmd": "pytest -q",
+            "coder": "proto",
+            "coder_solve_fusion_delegate": "fusion-model",
+            "coder_solve_fusion_max_file_chars": 10,
+        },
+    )
+    r = c.post("/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "fusion"})
+    assert r.status_code == 400
+    assert "not viable" in r.json()["detail"] and "big.py" in r.json()["detail"]
+
+
+def test_base_branch_and_worktrees_root_for_feature_match_the_loops_order():
+    """The #265 siblings of api.repo_for_feature: base_branch is pinned against a
+    real BoardLoop's `_base_branch_for` so the route can never drift from the loop;
+    worktrees_root (no loop sibling — `_drive` passes its instance root) prefers the
+    labeled project's declared root, then the default project's, then the instance
+    value."""
+    from project_board.loop import BoardLoop
+    from project_board.projects import default_project as resolve_default_project
+    from project_board.projects import resolve_projects
+
+    store_kw = dict(
+        repo=_TEST_RUNG_PROJECTS_CFG["repo"],
+        base_branch=_TEST_RUNG_PROJECTS_CFG["base_branch"],
+        projects=resolve_projects(_TEST_RUNG_PROJECTS_CFG),
+        default_project=resolve_default_project(_TEST_RUNG_PROJECTS_CFG),
+    )
+    loop = BoardLoop(_TEST_RUNG_PROJECTS_CFG)
+    cases = [
+        {"id": "bd-1", "project": "beta"},  # labeled → that project's base
+        {"id": "bd-2", "project": "beta", "base_branch": "stamped"},  # the label wins over the stamp
+        {"id": "bd-3", "base_branch": "stamped"},  # unlabeled → the stamped value
+        {"id": "bd-4"},  # unlabeled, no stamp → the instance default
+        {"id": "bd-5", "project": "ghost"},  # unknown label → default-project fallback
+    ]
+    assert [api.base_branch_for_feature(f, store_kw) for f in cases] == [loop._base_branch_for(f) for f in cases]
+    assert api.base_branch_for_feature({"id": "bd-1", "project": "beta"}, store_kw) == "develop"
+    assert api.base_branch_for_feature({"id": "bd-4"}, store_kw) == "main"
+    assert api.base_branch_for_feature(None, store_kw) == "main"
+    # worktrees_root: the labeled project's declared root → the default project's →
+    # the instance value (alpha declares none, so unlabeled falls through).
+    assert api.worktrees_root_for_feature({"id": "bd-1", "project": "beta"}, store_kw, ".wt") == ".beta-wt"
+    assert api.worktrees_root_for_feature({"id": "bd-4"}, store_kw, ".wt") == ".wt"
+    assert api.worktrees_root_for_feature(None, store_kw, ".wt") == ".wt"
+
+
 # ── /status explains an idle board (#255) ─────────────────────────────────────────
 
 
