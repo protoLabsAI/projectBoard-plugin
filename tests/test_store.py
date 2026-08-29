@@ -3836,6 +3836,73 @@ def test_project_delivered_by_defaults_empty_with_no_stamp_or_assignee(make_boar
     assert b._project({"id": "x", "status": "open", "labels": []})["delivered_by"] == ""
 
 
+# ── _project: verification provenance — self_verified + verified_by (#316 S3a) ─────
+
+
+def test_project_self_verified_reads_the_label(make_board):
+    """#316 S3a r1: a task carrying the `self-verified` label (record_verification's flag
+    for an approval by the deliverer) projects `self_verified is True`; a task without it
+    projects False — a plain cross-identity verify, or unverified work."""
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "closed", "labels": ["self-verified"]})["self_verified"] is True
+    assert b._project({"id": "y", "status": "closed", "labels": []})["self_verified"] is False
+
+
+def test_project_verified_by_reads_the_close_reason(make_board):
+    """#316 S3a r2: verified_by is the `<by>` parsed from the `verified: <by>` close reason
+    record_verification writes on the task Done edge (br exposes it as `close_reason`)."""
+    b = make_board(Br())
+    bead = {"id": "bd-t", "status": "closed", "labels": [], "close_reason": "verified: bob"}
+    assert b._project(bead)["verified_by"] == "bob"
+
+
+def test_project_verified_by_strips_the_self_verified_suffix(make_board):
+    """#316 S3a r2: a self-verified close reason preserves the verifier text verbatim and
+    appends ` (self-verified)` (the flag itself rides the label, projected separately) — so
+    verified_by strips that suffix and the surrounding spaces down to the identity alone."""
+    b = make_board(Br())
+    bead = {
+        "id": "bd-t",
+        "status": "closed",
+        "labels": ["self-verified"],
+        "close_reason": "verified:  alice  (self-verified)",  # verbatim ` alice ` from record_verification
+    }
+    f = b._project(bead)
+    assert f["verified_by"] == "alice"
+    assert f["self_verified"] is True
+
+
+def test_project_verified_by_defaults_empty_without_a_verified_reason(make_board):
+    """#316 S3a r2: verified_by is "" for anything that is not a `verified:` close reason —
+    an open feature (no close reason at all), and the OTHER terminal edges (merge, cancel,
+    manual done) whose reasons name no verifier, so a verifier never leaks from them."""
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "open", "labels": []})["verified_by"] == ""
+    merged = {"id": "y", "status": "closed", "labels": [], "close_reason": "merged: https://gh/o/r/pull/1"}
+    assert b._project(merged)["verified_by"] == ""
+    cancelled = {"id": "z", "status": "closed", "labels": ["cancelled"], "close_reason": "cancelled: duplicate"}
+    assert b._project(cancelled)["verified_by"] == ""
+
+
+def test_project_verification_provenance_coexists_with_the_delivery_fallback(make_board):
+    """#316 S3a r3: adding verified_by/self_verified leaves the S1 delivered_by assignee
+    fallback intact — a legacy self-verified task (no `delivered-by:` stamp) projects the
+    assignee as the deliverer AND, via the close reason, the same identity as the verifier."""
+    b = make_board(Br())
+    bead = {
+        "id": "bd-t",
+        "status": "closed",
+        "labels": ["self-verified"],
+        "issue_type": "task",
+        "assignee": "dave",  # no `delivered-by:` comment → the S1 fallback credits the assignee
+        "close_reason": "verified: dave (self-verified)",
+    }
+    f = b._project(bead)
+    assert f["delivered_by"] == "dave"  # S1 legacy-delivery fallback preserved
+    assert f["verified_by"] == "dave"
+    assert f["self_verified"] is True
+
+
 # ── `br --json` failures: the reason is on STDOUT, and a missing id is data (#255) ──
 
 
