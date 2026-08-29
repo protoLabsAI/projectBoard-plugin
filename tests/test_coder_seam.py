@@ -1720,6 +1720,152 @@ def test_resolve_delegate_returns_none_when_delegates_plugin_absent():
     assert coder_seam.resolve_delegate("anything", "acp") is None
 
 
+# ── #304: dispatch_task selects the adapter by the delegate's type (acp | a2a) ─────
+
+
+class _FakeAdapter:
+    """A delegates ADAPTERS entry stand-in: records ``dispatch``/``teardown`` calls so a
+    test can prove which adapter ran and that teardown fired on every exit."""
+
+    def __init__(self, *, reply="ok", raises=None, hang=False):
+        self.reply = reply
+        self.raises = raises
+        self.hang = hang
+        self.dispatched: list = []
+        self.torn_down: list = []
+
+    async def dispatch(self, delegate, prompt, *, timeout=None):
+        self.dispatched.append((delegate, prompt, timeout))
+        if self.hang:
+            import asyncio
+
+            await asyncio.sleep(10)  # outlive the wait_for deadline → CoderTimeout
+        if self.raises is not None:
+            raise self.raises
+        return self.reply
+
+    async def teardown(self, delegate):
+        self.torn_down.append(delegate)
+
+
+def _inject_task_adapters(monkeypatch, **adapters):
+    """Stand in for the HOST's plugins.delegates.adapters (absent in this suite) with an
+    ADAPTERS registry + DelegateError, so ``dispatch_task`` can be exercised for real.
+    Returns the DelegateError class so a test can build an adapter that raises it."""
+    import sys
+    import types as _types
+
+    class DelegateError(Exception):
+        pass
+
+    mod = _types.ModuleType("plugins.delegates.adapters")
+    mod.DelegateError = DelegateError
+    mod.ADAPTERS = dict(adapters)
+    plugins = _types.ModuleType("plugins")
+    delegates = _types.ModuleType("plugins.delegates")
+    plugins.delegates = delegates
+    delegates.adapters = mod
+    monkeypatch.setitem(sys.modules, "plugins", plugins)
+    monkeypatch.setitem(sys.modules, "plugins.delegates", delegates)
+    monkeypatch.setitem(sys.modules, "plugins.delegates.adapters", mod)
+    return DelegateError
+
+
+def _delegate(kind: str):
+    import types as _types
+
+    return _types.SimpleNamespace(type=kind, name=f"{kind}-agent")
+
+
+async def test_dispatch_task_routes_an_a2a_delegate_through_the_a2a_adapter(monkeypatch):
+    """#304 r1: a task delegate of type ``a2a`` is dispatched over ADAPTERS["a2a"] — the
+    same transport review dispatch uses — NOT the acp adapter, bounded by the given
+    timeout, and its reply is returned for record_delivery. Torn down on the way out."""
+    acp = _FakeAdapter(reply="ACP")
+    a2a = _FakeAdapter(reply="A2A deliverable")
+    _inject_task_adapters(monkeypatch, acp=acp, a2a=a2a)
+
+    delegate = _delegate("a2a")
+    out = await coder_seam.dispatch_task(delegate, "audit the API", timeout=1800)
+
+    assert out == "A2A deliverable"
+    assert a2a.dispatched == [(delegate, "audit the API", 1800)]  # the a2a adapter ran…
+    assert acp.dispatched == []  # …and the acp adapter did NOT
+    assert a2a.torn_down == [delegate]  # torn down on the success exit (r5)
+
+
+async def test_dispatch_task_routes_an_acp_delegate_through_the_acp_adapter(monkeypatch):
+    """#304 r2 (seam-level regression pin): an ``acp`` task delegate still dispatches
+    over ADAPTERS["acp"] exactly as before — the a2a branch doesn't touch the acp path."""
+    acp = _FakeAdapter(reply="ACP deliverable")
+    a2a = _FakeAdapter(reply="A2A")
+    _inject_task_adapters(monkeypatch, acp=acp, a2a=a2a)
+
+    delegate = _delegate("acp")
+    out = await coder_seam.dispatch_task(delegate, "write the ADR", timeout=1800)
+
+    assert out == "ACP deliverable"
+    assert acp.dispatched == [(delegate, "write the ADR", 1800)]
+    assert a2a.dispatched == []
+    assert acp.torn_down == [delegate]
+
+
+async def test_dispatch_task_defaults_a_typeless_delegate_to_acp(monkeypatch):
+    """A delegate with no ``type`` attribute defaults to the acp adapter — the pre-#304
+    behaviour, kept as a safety net for a typeless double / unset delegate."""
+    import types as _types
+
+    acp = _FakeAdapter(reply="ok")
+    _inject_task_adapters(monkeypatch, acp=acp, a2a=_FakeAdapter())
+
+    delegate = _types.SimpleNamespace(name="bare")  # no .type
+    out = await coder_seam.dispatch_task(delegate, "do it")
+
+    assert out == "ok"
+    assert acp.dispatched and acp.dispatched[0][0] is delegate
+    assert acp.torn_down == [delegate]
+
+
+async def test_dispatch_task_normalizes_an_a2a_delegate_error_and_still_tears_down(monkeypatch):
+    """#304 r4/r5: an A2A DelegateError surfaces as WorktreeError (so the loop's coder
+    classifier blocks the card with a classified reason), and the delegate is still torn
+    down on the error exit."""
+    DelegateError = _inject_task_adapters(monkeypatch)
+    import sys
+
+    a2a = _FakeAdapter(raises=DelegateError("agent unreachable"))
+    sys.modules["plugins.delegates.adapters"].ADAPTERS["a2a"] = a2a
+
+    delegate = _delegate("a2a")
+    raised = False
+    try:
+        await coder_seam.dispatch_task(delegate, "x", timeout=1800)
+    except worktree.WorktreeError as exc:
+        raised = True
+        assert "agent unreachable" in str(exc)
+    assert raised
+    assert a2a.torn_down == [delegate]  # torn down even on the failure exit
+
+
+async def test_dispatch_task_maps_an_a2a_timeout_to_coder_timeout_and_tears_down(monkeypatch):
+    """#304 r4/r5: a task dispatch that exceeds ``timeout`` surfaces as CoderTimeout
+    (mapped from asyncio.TimeoutError) and the delegate is still torn down."""
+    _inject_task_adapters(monkeypatch)
+    import sys
+
+    a2a = _FakeAdapter(hang=True)
+    sys.modules["plugins.delegates.adapters"].ADAPTERS["a2a"] = a2a
+
+    delegate = _delegate("a2a")
+    raised = False
+    try:
+        await coder_seam.dispatch_task(delegate, "x", timeout=0.01)
+    except worktree.CoderTimeout:
+        raised = True
+    assert raised
+    assert a2a.torn_down == [delegate]  # torn down on the timeout exit
+
+
 # ── #226 S1: persist a finished gen's snapshot as a `coder-monitor:` bead comment ──
 
 

@@ -2808,6 +2808,128 @@ async def test_spawn_ready_task_branch_leaves_coding_features_unchanged(monkeypa
         await finish()
 
 
+# ── #304: dispatch a named A2A sister-agent task assignee over A2A ────────────────
+
+
+def _sister(kind: str):
+    """A resolved sister-agent Delegate stand-in carrying just the ``type`` the task
+    dispatch path branches on (``acp`` | ``a2a``)."""
+    import types
+
+    return types.SimpleNamespace(type=kind, name=f"{kind}-agent")
+
+
+async def test_spawn_ready_dispatches_an_a2a_sister_agent_task(monkeypatch):
+    """#304 r1: a task whose assignee names an A2A sister agent (not an ACP coder) is
+    claimed, driven, and its reply recorded via record_delivery → in_review. Today it
+    parks: resolution was ACP-only, so a named A2A agent fell through to the
+    human/unassigned path. Resolution is now ACP-first, then A2A — the acp lookup
+    misses, the a2a lookup resolves the sister agent."""
+    store = _TaskStore(
+        [_task("bd-a2a", assignee="quinn", spec="Audit the API", criteria="WHEN done THE SYSTEM SHALL report")]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_worktree(*a, **k):
+        raise AssertionError("a task must NOT create a git worktree")
+
+    monkeypatch.setattr(worktree, "create_worktree", _no_worktree)
+
+    seen = {}
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        seen["delegate"] = delegate
+        seen["prompt"] = prompt
+        seen["timeout"] = timeout
+        return "The audit deliverable."
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+
+    a2a = _sister("a2a")
+
+    def _resolve(name, expect):
+        # ACP lookup misses; the A2A lookup is what resolves the sister agent — proving
+        # the ACP-first-then-A2A order (r2's regression pin lives in the acp test above).
+        return a2a if (name == "quinn" and expect == "a2a") else None
+
+    loop = BoardLoop({"coder": "proto", "coder_timeout_s": 1800})
+    monkeypatch.setattr(loop, "_resolve_delegate", _resolve)
+
+    assert await loop._spawn_ready() is True  # an A2A task IS a drive → counts as started
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)  # let the done-callback run
+
+    assert store.claimed == ["bd-a2a"]
+    assert seen["delegate"] is a2a  # the A2A sister agent, not the (missing) ACP coder
+    assert seen["timeout"] == 1800  # bounded by coder_timeout_s (30 min default)
+    assert "Audit the API" in seen["prompt"]  # the spec…
+    assert "WHEN done THE SYSTEM SHALL report" in seen["prompt"]  # …and the acceptance criteria
+    assert ("record_delivery", "bd-a2a", "The audit deliverable.") in store.calls
+    assert loop._drives == set() and loop._inflight_files == {}  # slot released on completion
+
+
+async def test_spawn_ready_parks_a_task_that_resolves_to_neither_agent_type(monkeypatch):
+    """#304 r3: an assignee that resolves to NEITHER an ACP coder nor an A2A sister
+    agent still parks in_progress with the existing log line — no dispatch, no block."""
+    store = _TaskStore([_task("bd-ghost", assignee="ghost")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_dispatch(*a, **k):
+        raise AssertionError("an unresolvable assignee must NOT dispatch a delegate")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _no_dispatch)
+
+    loop = BoardLoop({"coder": "proto"})
+    # every lookup misses — 'ghost' is neither an acp coder nor an a2a agent
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    assert await loop._spawn_ready() is False  # parked → nothing started this tick
+    assert store.claimed == ["bd-ghost"]  # …but it WAS claimed to in_progress
+    assert loop._drives == set()  # holds no concurrency slot
+    assert "bd-ghost" not in loop._inflight_files
+    assert store.calls == []  # no delivery, no block — just parked
+
+
+async def test_a2a_task_dispatch_failure_is_classified_and_blocks(monkeypatch):
+    """#304 r4: an A2A dispatch failure (surfaced as WorktreeError by coder_seam) is
+    classified like a coder failure and blocks the card with the CLASSIFIED reason — no
+    deliverable recorded. Same terminal block-for-triage edge as the ACP path, whose
+    classification is unchanged (test_acp_task_dispatch_failure_is_classified_and_blocks)."""
+    store = _TaskStore([_task("bd-a2a-fail", assignee="quinn")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _boom(delegate, prompt, *, timeout=None):
+        raise worktree.WorktreeError("coder dispatch failed: a2a agent refused the task")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _boom)
+
+    a2a = _sister("a2a")
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: a2a if expect == "a2a" else None)
+
+    await loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert "flag_blocked" in store.names()
+    assert "record_delivery" not in store.names()
+    reason = next(c[2] for c in store.calls if c[0] == "flag_blocked")
+    assert reason.startswith("terminal:")  # classify() → TERMINAL — the classified reason
+
+
+async def test_reconcile_orphan_requeues_a_dead_a2a_task(monkeypatch):
+    """#304: an A2A sister-agent task whose drive died mid-flight IS orphaned — the
+    ACP-first-then-A2A resolution recognizes it as a dispatchable agent (not a parked
+    human), so reconcile requeues it for a clean re-dispatch."""
+    store = _TaskStore([_task("bd-a2a", assignee="quinn")])
+    store.claimed.append("bd-a2a")  # already in_progress
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: _sister("a2a") if expect == "a2a" else None)
+    await loop._reconcile_orphan("bd-a2a")
+    assert store.names() == ["requeue"]
+
+
 async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch, caplog):
     """#124: when a lower-priority card claims ahead of a higher one, the single
     per-tick claim_decision line must name the selected fid AND why the higher card

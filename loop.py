@@ -1576,17 +1576,18 @@ class BoardLoop:
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
         feature = await asyncio.to_thread(store.get_feature, fid) or {}
-        # #217: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
+        # #217/#304: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
         # salvage below never apply. A task parked on a human/unassigned assignee is
         # NOT orphaned — it is intentionally in_progress awaiting async delivery
         # (API/chat), the same "leave it, an out-of-band edge resolves it" posture an
-        # in_review PR gets — so leave it be. A task on an ACP agent assignee whose
-        # drive died mid-flight IS orphaned: requeue it for a clean re-dispatch.
+        # in_review PR gets — so leave it be. A task on a SISTER-AGENT assignee (ACP
+        # coder OR A2A agent) whose drive died mid-flight IS orphaned: requeue it for a
+        # clean re-dispatch.
         if feature.get("issue_type") == LABEL_TASK:
             assignee = str(feature.get("assignee") or "").strip()
-            if assignee and self._resolve_delegate(assignee, "acp") is not None:
+            if self._resolve_task_delegate(assignee) is not None:
                 await asyncio.to_thread(store.requeue, fid)
-                log.info("[project_board] %s task reset to ready (ACP drive died — re-dispatch)", fid)
+                log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
             return
         pr_url = await worktree.pr_url_for_branch(
             worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
@@ -1963,12 +1964,13 @@ class BoardLoop:
             # #217: task-type dispatch — a `task` bead ships a DELIVERABLE (a doc, a
             # decision, an artifact ref), not a diff, so it takes NO git worktree and
             # skips the hot-file guard below (with no worktree there is no file to
-            # collide on). An ACP agent assignee is driven via `delegate_to` (a real
-            # drive → counts toward max_concurrent); a human/unassigned task is parked
-            # in_progress to await async delivery (API/chat) and does NOT hold a slot.
+            # collide on). A sister-agent assignee — an ACP coder OR an A2A agent
+            # (#304) — is driven via its native adapter (a real drive → counts toward
+            # max_concurrent); a human/unassigned task is parked in_progress to await
+            # async delivery (API/chat) and does NOT hold a slot.
             if candidate.get("issue_type") == LABEL_TASK:
                 outcome = await self._dispatch_task(store, candidate)
-                if outcome == "acp":
+                if outcome in ("acp", "a2a"):
                     selected.append(cid)
                     spawned = True
                 elif outcome == "parked":
@@ -2036,11 +2038,13 @@ class BoardLoop:
     async def _dispatch_task(self, store, candidate: dict) -> str:
         """Claim + dispatch a ``task`` bead, branching on its assignee. Returns:
 
-        - ``"acp"``  — the assignee resolves to an ACP agent delegate → claimed and a
-          ``_drive_task`` was spawned (into ``self._drives``, so it counts toward
-          ``max_concurrent`` exactly like a coding drive).
-        - ``"parked"`` — a human/unassigned task → claimed to ``in_progress`` and left
-          there to await async delivery (API/chat). No drive, no slot held.
+        - ``"acp"`` / ``"a2a"`` — the assignee resolves to a sister-agent delegate of
+          that type (ACP coder or A2A agent, #304) → claimed and a ``_drive_task`` was
+          spawned (into ``self._drives``, so it counts toward ``max_concurrent`` exactly
+          like a coding drive). The caller treats both alike: a drive was started.
+        - ``"parked"`` — a human/unassigned task, or a name that resolves to NEITHER
+          type → claimed to ``in_progress`` and left there to await async delivery
+          (API/chat). No drive, no slot held.
         - ``"race"`` — the atomic claim was lost (someone else took it); still ready.
 
         The assignee is read from the CANDIDATE (the pre-claim projection) and passed
@@ -2048,14 +2052,15 @@ class BoardLoop:
         target, not the coder identity a coding claim stamps."""
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
-        delegate = self._resolve_delegate(assignee, "acp") if assignee else None
+        delegate = self._resolve_task_delegate(assignee)
         claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
         if claimed is None:
             return "race"
         if delegate is None:
-            # Human assignee, or none / not an ACP agent: nothing to dispatch. The task
-            # is now in_progress; its deliverable arrives out-of-band (record_delivery
-            # via the API/chat). The loop moves on and this parked card holds no slot.
+            # Human assignee, none, or a name that resolves to NEITHER an ACP coder nor
+            # an A2A sister agent: nothing to dispatch. The task is now in_progress; its
+            # deliverable arrives out-of-band (record_delivery via the API/chat). The
+            # loop moves on and this parked card holds no slot.
             log.info(
                 "[project_board] %s task parked in_progress — awaiting %s delivery (assignee=%s)",
                 cid,
@@ -2063,15 +2068,16 @@ class BoardLoop:
                 assignee or "<none>",
             )
             return "parked"
-        # ACP agent assignee → drive it via delegate_to. No worktree, so it owns no
-        # files (empty set: present so the done-callback's pop and the sweep's
-        # live-drive check both see it, but colliding with nothing in the hot-file guard).
+        # A sister-agent assignee (ACP coder OR A2A agent, #304) → drive it via its
+        # native adapter. No worktree, so it owns no files (empty set: present so the
+        # done-callback's pop and the sweep's live-drive check both see it, but colliding
+        # with nothing in the hot-file guard).
         self._inflight_files[cid] = set()
         task = asyncio.create_task(self._drive_task(claimed, delegate), name=f"pb-task-{cid}")
         self._drives.add(task)
         _register_drive(cid, task)  # reachable by the cancel verbs (#211)
         task.add_done_callback(self._make_drive_done_cb(cid))
-        return "acp"
+        return str(getattr(delegate, "type", "") or "acp")
 
     # ── the PR reconcile (terminal-edge fallback to the webhook) ───────────────
     async def _maybe_reconcile(self):
@@ -2587,13 +2593,15 @@ class BoardLoop:
         log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
 
     async def _drive_task(self, feature: dict, delegate) -> None:
-        """Drive a ``task`` bead with an ACP agent assignee (#217) — the task sibling
-        of ``_drive``. No worktree, no git, no PR: dispatch the spec + acceptance
-        criteria to the assignee delegate via ``delegate_to``, then record the reply as
-        the deliverable (``record_delivery`` → in_review, where a human or auto-verify
-        closes it). A dispatch failure is classified like a coder failure and blocks the
-        card for triage — a task has no model ladder to climb (the assignee is fixed),
-        so the capability-escalation edge collapses to the coder path's terminal block."""
+        """Drive a ``task`` bead with a sister-agent assignee — an ACP coder OR an A2A
+        agent (#217/#304) — the task sibling of ``_drive``. No worktree, no git, no PR:
+        dispatch the spec + acceptance criteria to the assignee delegate over its native
+        adapter (``coder_seam.dispatch_task`` picks acp/a2a by the delegate's type),
+        then record the reply as the deliverable (``record_delivery`` → in_review, where
+        a human or auto-verify closes it). A dispatch failure/timeout is classified like
+        a coder failure and blocks the card for triage — a task has no model ladder to
+        climb (the assignee is fixed), so the capability-escalation edge collapses to the
+        coder path's terminal block."""
         store = self._store()
         fid = feature["id"]
         prompt = self._build_task_prompt(feature)
@@ -3578,6 +3586,16 @@ class BoardLoop:
         wrapper — the real lookup is shared with api.py's test-rung route via
         ``coder_seam.resolve_delegate``."""
         return coder_seam.resolve_delegate(name, expect_type)
+
+    def _resolve_task_delegate(self, assignee: str):
+        """Resolve a task assignee to its dispatchable SISTER-AGENT delegate — ACP
+        first, then A2A (#304). Review dispatch already reaches an ``a2a`` agent, but a
+        task assignee was resolved as ``acp`` only, so a named A2A sister agent fell
+        through to the human/unassigned park. Returns the Delegate (of either type) or
+        None (empty/human assignee, or a name that resolves to NEITHER type)."""
+        if not assignee:
+            return None
+        return self._resolve_delegate(assignee, "acp") or self._resolve_delegate(assignee, "a2a")
 
     async def _run_fixups(self, wt: str, feature: dict | None = None) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.
