@@ -263,6 +263,12 @@ LABEL_DELIVERABLE_PREFIX = "deliverable:"
 # reads the LATEST one back into `delivered_by`, mirroring the deliverable scan; a task
 # delivered before this stamp existed has none, so it falls back to `assignee`.
 DELIVERED_BY_PREFIX = "delivered-by:"
+# Self-verification (#316 S2): when the verifier who approves a task is the same identity
+# that delivered it, `record_verification` FLAGS the close with this label rather than
+# refusing it — refusal is deliberately out of scope for this slice. Label-safe (a fixed
+# token, not free-text actor values, so beads' validator accepts it, unlike the
+# `delivered-by:` stamp) and a LABEL so the projection/view can surface self-verified work.
+LABEL_SELF_VERIFIED = "self-verified"
 # What the puller admits (#217): coding features AND task-type beads — everything
 # else (epics, milestones) stays structural and is never claimed.
 PULLABLE_ISSUE_TYPES = ("feature", "task")
@@ -1801,14 +1807,25 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     # ── the task Done edge (#217): verify, not merge ──────────────────────────
-    def record_verification(self, fid: str, approved: bool = True, feedback: str = "") -> dict:
+    def record_verification(self, fid: str, approved: bool = True, feedback: str = "", by: str = "") -> dict:
         """The task-type Done edge (#217) — record_merge's verify sibling, and
         DELIBERATELY a second `br close` edge beside it (the cancel_feature
         precedent): a task has no PR to merge, so a verifier's approval is what
-        closes it, with an auditable `verified: <actor>` reason. A rejection records
-        the feedback as a comment (the re-dispatch prompt injects it, the adverse-
-        review shape) and requeues the bead back to `ready`. Expects `in_review` —
-        the state record_delivery/open_review left it in.
+        closes it, with an auditable `verified: <by>` reason. ``by`` names the
+        verifier (empty → the store actor). A rejection records the feedback as a
+        comment (the re-dispatch prompt injects it, the adverse-review shape) and
+        requeues the bead back to `ready`. Expects `in_review` — the state
+        record_delivery/open_review left it in.
+
+        SELF-VERIFICATION (#316 S2): on approval, the verifier's identity is compared
+        (casefolded + stripped) against the projected `delivered_by`. A MATCH flags the
+        close with the `self-verified` label and appends `(self-verified)` to the reason
+        — this slice FLAGS rather than refuses (refusal is out of scope); the reason still
+        preserves the caller's displayed verifier text verbatim while the comparison
+        normalizes identity. An unattributed delivery (no `delivered-by:` stamp and no
+        assignee, so `delivered_by` projects empty) has the STORE ACTOR stand in as the
+        deliverer, so the actor verifying its own unattributed delivery is flagged too.
+        The rejection path is untouched — it never writes the label or an approval close.
 
         TASK-ONLY: a coding feature closed here would dodge record_merge — the ONE
         Done edge for code (invariant #2), with its idempotency, blocker cleanup,
@@ -1824,7 +1841,16 @@ class BeadsBoard:
             if feedback:
                 self.comment(fid, f"verification failed: {feedback}")
             return self.requeue(fid)
-        self._run("close", fid, "-r", f"verified: {self.actor}")
+        by = by or self.actor
+        # The deliverer of record: the projected `delivered_by` (a `delivered-by:` stamp,
+        # else the legacy assignee fallback). Empty means an unattributed delivery — the
+        # store actor stands in, so the actor closing its own unattributed task is flagged.
+        deliverer = str(f.get("delivered_by") or "").strip() or self.actor
+        reason = f"verified: {by}"
+        if by.strip().casefold() == deliverer.casefold():
+            self._run("update", fid, "--add-label", LABEL_SELF_VERIFIED)
+            reason = f"{reason} (self-verified)"
+        self._run("close", fid, "-r", reason)
         return self.get_feature(fid)
 
     # ── the second terminal edge: cancel (not merge) ──────────────────────────
