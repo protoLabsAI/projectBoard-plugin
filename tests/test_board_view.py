@@ -619,7 +619,8 @@ def test_r2_open_task_drawer_tracks_state_across_re_renders():
     assert "function syncTaskDrawer()" in BOARD_PAGE
     assert "if (!TASK_FID) return;" in BOARD_PAGE
     assert "const f = FEATURES.find(x => x.id === TASK_FID);" in BOARD_PAGE
-    assert BOARD_PAGE.count("syncTaskDrawer();") == 2  # render()'s tail + openTask
+    # render()'s tail + openTask + fetchTaskDetail's post-fetch re-render (#312)
+    assert BOARD_PAGE.count("syncTaskDrawer();") == 3
 
 
 def test_r3_monitor_stays_coding_only_and_tasks_never_poll():
@@ -664,3 +665,75 @@ def test_r4_drawer_close_behavior_is_preserved_and_clears_both_modes():
     assert '$("scrim").addEventListener("click", closeMonitor)' in BOARD_PAGE
     assert '$("drawer-close").addEventListener("click", closeMonitor)' in BOARD_PAGE
     assert "MON_FID = null; TASK_FID = null;" in BOARD_PAGE  # close clears both modes
+
+
+# ── task drawer fetches the single-feature deliverable (#312) ────────────────────
+#
+# The drawer's `deliverable` can't come from the 10s /features poll: that list projection
+# (br list) intentionally omits bead comments, so its deliverable field is always "". On
+# open — and after every deliver/approve/reject — the drawer fetches the single-feature
+# route (/features/{fid} → get_feature → br show, which carries the comment-derived
+# deliverable), caches it, and splices it onto the list-driven summary; a failed fetch
+# surfaces in the drawer. These are structural assertions on the page source (no JS runtime
+# in the suite — see the module docstring), so a "rendered-HTML"-style check pins the paths.
+
+
+def test_r1_drawer_fetches_the_single_feature_route_for_the_deliverable():
+    """r1: opening the drawer fetches GET /features/{fid} (the single-card route that
+    follows get_feature → br show and carries the comment-derived deliverable the list
+    projection omits). The fetch is fenced on TASK_FID like pollMonitor, so a late resolve
+    can't clobber a closed/switched drawer, and openTask kicks it on open."""
+    assert "async function fetchTaskDetail(fid)" in BOARD_PAGE
+    assert "const f = await api(FEAT + encodeURIComponent(fid));" in BOARD_PAGE  # …/features/{fid}
+    assert "TASK_DETAIL = {fid: fid, feature: f};" in BOARD_PAGE
+    # fenced on TASK_FID on BOTH the success and the error path (mirrors pollMonitor)
+    assert BOARD_PAGE.count("if (TASK_FID !== fid) return;") == 2
+    assert "fetchTaskDetail(fid);" in BOARD_PAGE  # kicked from openTask
+
+
+def test_r1_drawer_splices_the_fetched_deliverable_onto_the_list_summary():
+    """r1: syncTaskDrawer keeps the list projection (state/spec/controls) as the base and
+    overlays ONLY the single-fetch deliverable once it has landed for THIS task — so a
+    recorded deliverable renders in the drawer, which it never did off the list poll."""
+    assert "const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;" in BOARD_PAGE
+    assert "const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable} : f;" in BOARD_PAGE
+    assert '$("drawer-body").innerHTML = err + taskDetail(merged);' in BOARD_PAGE
+
+
+def test_r2_single_fetch_is_on_open_and_after_actions_not_every_poll():
+    """r2: the single-card fetch fires on open (openTask) and after each mutation
+    (deliver/approve/reject), NOT on the 10s poll — load()/render() never call it, so a
+    poll tick re-renders the drawer from the cached TASK_DETAIL with no per-task br show."""
+    # openTask (1) + the three action handlers (3) + the definition (1) = 5 name sites
+    assert BOARD_PAGE.count("fetchTaskDetail(fid)") == 5
+    # each action re-fetches right after its list reload — three sites, one per action
+    assert BOARD_PAGE.count("await load(); await fetchTaskDetail(fid);") == 3
+    # neither render() nor load() fetches per-task detail (no poll-tick / list-route br show)
+    render_body = BOARD_PAGE[BOARD_PAGE.index("function render(){") : BOARD_PAGE.index("async function load(){")]
+    assert "fetchTaskDetail" not in render_body
+    load_body = BOARD_PAGE[BOARD_PAGE.index("async function load(){") : BOARD_PAGE.index("// Setup preflight checks")]
+    assert "fetchTaskDetail" not in load_body
+
+
+def test_r3_no_deliverable_and_coding_cards_are_unaffected():
+    """r3: with no landed single-fetch (a fresh open, a task with no deliverable), the
+    drawer renders straight off the list projection `f` exactly as before; the 10s poll
+    still reads only /features (no deliverable added to the list route), and TASK_DETAIL
+    starts null and is dropped on every open so a task never inherits the prior one's."""
+    assert "let TASK_DETAIL = null;" in BOARD_PAGE
+    # the merge falls back to the bare list `f` when nothing has been fetched
+    assert "? {...f, deliverable: d.feature.deliverable} : f;" in BOARD_PAGE
+    # the poll still pulls the plain list route — deliverable is NOT added there
+    assert 'const r = await api("/api/plugins/project_board/features");' in BOARD_PAGE
+    # openTask drops the prior task's fetched detail
+    assert "TASK_DETAIL = null;" in BOARD_PAGE
+
+
+def test_r4_failed_single_fetch_surfaces_in_the_drawer():
+    """r4: a failed single-fetch is stored as {fid, error} and rendered as an error callout
+    ABOVE the (list-driven) detail, so the drawer never goes blank — carrying the readable
+    error `api` decodes (a BoardError detail, else the HTTP status)."""
+    assert 'TASK_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};' in BOARD_PAGE
+    assert "const err = d && d.error" in BOARD_PAGE
+    assert '<div class="pl-callout pl-callout--error">' in BOARD_PAGE
+    assert 'esc("Couldn\'t load task detail: " + d.error)' in BOARD_PAGE
