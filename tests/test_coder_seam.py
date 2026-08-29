@@ -13,6 +13,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from project_board import coder_seam, worktree
 from project_board.coder_seam import SolveExhausted, _WorktreeSolveAdapter, dispatch, should_use_solve
 
@@ -2035,6 +2037,21 @@ def test_only_the_legacy_tap_reaches_host_internals():
     assert src.index("_import_dispatch_tapped()") < legacy_start
 
 
+@dataclass(frozen=True)
+class _TappedResult:
+    """Stand-in for the host's ``plugins.coding_agent.acp_client.TappedResult`` — the
+    frozen record C1's ``dispatch_tapped`` returns. The host is not importable from the
+    plugin's test env, so the shape is mirrored here: the reply the board passes up,
+    plus the wire signals (usage / plan / stop_reason / dead_end) the seam snapshots off
+    the client at end-of-turn INSTEAD of forwarding through callbacks."""
+
+    reply: str
+    usage: dict | None = None
+    plan: list | None = None
+    stop_reason: str | None = None
+    dead_end: str | None = None
+
+
 @dataclass
 class _FakeCoder:
     """A coder Delegate stand-in carrying the fields dispatch_coder_tapped scopes
@@ -2052,28 +2069,25 @@ async def test_dispatch_coder_tapped_uses_the_public_seam_when_present(monkeypat
     coder_seam._progress.clear()
     seen = {}
 
-    async def _fake_seam(
-        delegate,
-        prompt,
-        *,
-        timeout=None,
-        tool_callback=None,
-        thought_callback=None,
-        text_callback=None,
-        usage_callback=None,
-        plan_callback=None,
-        stop_reason_callback=None,
-    ):
+    async def _fake_seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
+        # MIRRORS THE REAL SEAM EXACTLY (plugins/coding_agent.dispatch_tapped): three
+        # keyword-only stream callbacks + timeout, and NO **kwargs — so a rename on
+        # either side raises TypeError here. The permissive fake this replaced accepted
+        # `tool_callback=`/`usage_callback=`/… , names the seam never had, which is why
+        # a green suite shipped a call that died on the first host that carried C1.
         seen["delegate"] = delegate
         seen["prompt"] = prompt
         seen["timeout"] = timeout
-        await thought_callback("thinking about it")
-        await tool_callback({"phase": "start", "id": "t1", "name": "read_file", "input": '{"path": "x.py"}'})
-        usage_callback({"used": 7, "size": 70})
-        plan_callback([{"content": "do the thing", "status": "in_progress"}])
-        await text_callback("all done.")
-        stop_reason_callback("end_turn")
-        return "the tapped reply"
+        await on_thought("thinking about it")
+        await on_tool({"phase": "start", "id": "t1", "name": "read_file", "input": '{"path": "x.py"}'})
+        await on_text("all done.")
+        # The wire signals ride the RESULT, not callbacks.
+        return _TappedResult(
+            reply="the tapped reply",
+            usage={"used": 7, "size": 70},
+            plan=[{"content": "do the thing", "status": "in_progress"}],
+            stop_reason="end_turn",
+        )
 
     def _no_fallback(*a, **k):
         raise AssertionError("must not fall back to worktree.dispatch_coder when the seam is present")
@@ -2116,9 +2130,9 @@ async def test_dispatch_coder_tapped_sanitizes_env_on_the_seam_path(monkeypatch)
     monkeypatch.setenv("PATH", "/usr/bin")
     seen = {}
 
-    async def _fake_seam(delegate, prompt, *, timeout=None, **_cbs):
+    async def _fake_seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
         seen["env"] = dict(delegate.env)
-        return "ok"
+        return _TappedResult(reply="ok")
 
     await coder_seam.dispatch_coder_tapped(
         _FakeCoder(),
@@ -2322,3 +2336,53 @@ async def test_the_legacy_tap_warns_once_so_the_degrade_is_never_silent(monkeypa
         await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt/x", "b", fid="bd-w2", gen=1)
     hits = [r for r in caplog.records if "predates coding_agent.dispatch_tapped" in r.message]
     assert len(hits) == 1, "warn once per process, not once per dispatch"
+
+
+async def test_the_seam_is_called_with_c1s_exact_keyword_names(monkeypatch):
+    """The signature contract, pinned. F7 shipped a call using the PRIVATE client's
+    kwarg names (`tool_callback` / `thought_callback` / `text_callback` plus
+    usage/plan/stop_reason callbacks the seam never had). No host carried C1 yet, so no
+    test could catch it — every fake accepted whatever it was handed. The day a release
+    carried the seam, every dispatch died on `dispatch_tapped() got an unexpected
+    keyword argument 'tool_callback'` and the board blocked cards terminally.
+
+    So assert the wire names directly: exactly `on_tool`, `on_thought`, `on_text`,
+    `timeout`, and nothing else. If C1 renames a parameter, this fails HERE."""
+    coder_seam._progress.clear()
+    got = {}
+
+    async def _recording_seam(delegate, prompt, /, **kwargs):
+        got.update(kwargs)
+        return _TappedResult(reply="ok")
+
+    await coder_seam.dispatch_coder_tapped(
+        _FakeCoder(), "/wt", "do it", fid="bd-sig", gen=1, timeout=None, _dispatch_tapped=_recording_seam
+    )
+    assert set(got) == {"on_tool", "on_thought", "on_text", "timeout"}
+    assert callable(got["on_tool"]) and callable(got["on_thought"]) and callable(got["on_text"])
+
+
+async def test_a_seam_returning_a_non_result_is_refused_not_passed_up(monkeypatch):
+    """A reply is written into a PR body, so an unexpected return SHAPE must fail loudly
+    rather than travel up the board's reply path. A bare string still works (the other
+    known shape); an object that is neither is a WorktreeError."""
+    coder_seam._progress.clear()
+
+    async def _bare_string_seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
+        return "just the reply"
+
+    assert (
+        await coder_seam.dispatch_coder_tapped(
+            _FakeCoder(), "/wt", "x", fid="bd-bare", gen=1, _dispatch_tapped=_bare_string_seam
+        )
+        == "just the reply"
+    )
+
+    async def _junk_seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
+        return {"reply": "in a dict, not a result"}
+
+    with pytest.raises(worktree.WorktreeError, match="expected a TappedResult"):
+        await coder_seam.dispatch_coder_tapped(
+            _FakeCoder(), "/wt", "x", fid="bd-junk", gen=1, _dispatch_tapped=_junk_seam
+        )
+    assert coder_seam.progress_snapshot("bd-junk")["gens"][0]["done"] is True  # gen still closed

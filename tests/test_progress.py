@@ -349,6 +349,19 @@ def test_tool_start_records_an_input_preview():
 # ── the tap: PUBLIC seam present (C1) streams live signals into the buffer ────────
 
 
+@dataclass(frozen=True)
+class _TappedResult:
+    """Stand-in for the host's ``TappedResult`` — what C1's ``dispatch_tapped``
+    returns. Mirrors the real shape (the host is not importable here): the reply plus
+    the end-of-turn wire signals the seam returns instead of forwarding as callbacks."""
+
+    reply: str
+    usage: dict | None = None
+    plan: list | None = None
+    stop_reason: str | None = None
+    dead_end: str | None = None
+
+
 @dataclass
 class _FakeCoder:
     workdir: str = ""
@@ -367,26 +380,19 @@ async def test_dispatch_coder_tapped_streams_the_public_seam_into_the_buffer(mon
 
     monkeypatch.setattr(worktree, "dispatch_coder", _no_fallback)
 
-    async def _fake_seam(
-        delegate,
-        prompt,
-        *,
-        timeout=None,
-        tool_callback=None,
-        thought_callback=None,
-        text_callback=None,
-        usage_callback=None,
-        plan_callback=None,
-        stop_reason_callback=None,
-    ):
-        await thought_callback("weighing options")
-        await tool_callback({"phase": "start", "id": "t1", "name": "bash", "input": '{"command": "pytest -q"}'})
-        await tool_callback({"phase": "end", "id": "t1", "name": "bash", "status": "completed"})
-        usage_callback({"used": 12, "size": 120})
-        plan_callback([{"content": "run the tests", "status": "in_progress", "priority": "high"}])
-        await text_callback("finished.")
-        stop_reason_callback("end_turn")
-        return "seam reply"
+    async def _fake_seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
+        # C1's real signature — three keyword-only stream callbacks + timeout, no
+        # **kwargs, and the wire signals (usage/plan/stop_reason) on the RESULT.
+        await on_thought("weighing options")
+        await on_tool({"phase": "start", "id": "t1", "name": "bash", "input": '{"command": "pytest -q"}'})
+        await on_tool({"phase": "end", "id": "t1", "name": "bash", "status": "completed"})
+        await on_text("finished.")
+        return _TappedResult(
+            reply="seam reply",
+            usage={"used": 12, "size": 120},
+            plan=[{"content": "run the tests", "status": "in_progress", "priority": "high"}],
+            stop_reason="end_turn",
+        )
 
     out = await coder_seam.dispatch_coder_tapped(
         _FakeCoder(),
