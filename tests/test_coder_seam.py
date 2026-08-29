@@ -1999,26 +1999,40 @@ def test_set_store_factory_wires_then_clears_the_persist_accessor():
 # ── F7: the tapped dispatch goes through C1's PUBLIC dispatch_tapped seam ─────────
 
 
-def test_coder_seam_imports_nothing_private_from_the_host_plugins():
-    """r1 (F7): coder_seam reaches plugins.coding_agent / plugins.delegates ONLY
-    through public names — no underscore-prefixed import from either. The tapped
-    dispatch now goes through C1's public ``dispatch_tapped`` seam, so the old
-    ``_client_for``/``_drop_client``/``_make_permission``/``_spec``/``kill_now``
-    reaches are gone (grep test)."""
+def test_only_the_legacy_tap_reaches_host_internals():
+    """r1 (F7), corrected: the PREFERRED path reaches no host internals — but the
+    public C1 seam (`coding_agent.dispatch_tapped`) shipped in protoAgent AFTER this
+    plugin's `min_protoagent_version` floor, so on every currently-released host it is
+    absent. F7's first cut degraded straight to the UNTAPPED dispatch there, which
+    records a gen with no tools/thoughts/plan — the coder monitor silently stopped
+    working on a live board the day it landed.
+
+    So the contract this pins is not "zero privates anywhere"; it is: every private
+    reach lives INSIDE the one legacy fallback function, which exists to be deleted
+    once a C1-carrying release is the floor. Everything outside it stays public-only."""
     import re
     from pathlib import Path
 
     src = Path(coder_seam.__file__).read_text()
+    marker = "async def _dispatch_coder_tapped_legacy("
+    assert marker in src, "the legacy tap is the only sanctioned home for private reaches"
+    legacy_start = src.index(marker)
+    nxt = src.find("\nasync def ", legacy_start + len(marker))
+    legacy_end = nxt if nxt != -1 else len(src)
+    outside = src[:legacy_start] + src[legacy_end:]
+
     leaked = []
-    for m in re.finditer(r"from\s+plugins\.(?:coding_agent|delegates)[\w.]*\s+import\s+([^\n#]+)", src):
+    for m in re.finditer(r"from\s+plugins\.(?:coding_agent|delegates)[\w.]*\s+import\s+([^\n#]+)", outside):
         for name in re.split(r"[,\s()]+", m.group(1).strip()):
             if name and name.startswith("_"):
                 leaked.append(name)
-    assert leaked == [], f"private host imports leaked into coder_seam: {leaked}"
-
-    # And no lingering private ACP attribute/plumbing reaches in the source either.
+    assert leaked == [], f"private host imports outside the legacy tap: {leaked}"
     for forbidden in ("_client_for", "_drop_client", "_make_permission", "._spec(", ".kill_now(", "._permission"):
-        assert forbidden not in src, f"coder_seam still references host internal {forbidden!r}"
+        assert forbidden not in outside, f"host internal {forbidden!r} reached outside the legacy tap"
+
+    # The preferred path is still the public seam, and it is tried FIRST.
+    assert "from plugins.coding_agent import dispatch_tapped" in src
+    assert src.index("_import_dispatch_tapped()") < legacy_start
 
 
 @dataclass
@@ -2172,10 +2186,11 @@ async def test_dispatch_coder_tapped_maps_a_seam_timeout_to_coder_timeout(monkey
     assert raised
 
 
-async def test_dispatch_coder_tapped_falls_back_only_when_the_seam_is_absent(monkeypatch):
-    """The default injection path: with no seam handle (``_import_dispatch_tapped``
-    returns None in this host-free env) the tap degrades to the untapped
-    worktree.dispatch_coder and STILL records the gen."""
+async def test_untapped_only_when_neither_the_public_seam_nor_the_internals_are_reachable(monkeypatch):
+    """Rung 3, and ONLY rung 3: in this host-free env the public C1 seam is absent AND
+    `plugins.coding_agent` cannot be imported, so the legacy tap can't run either — the
+    dispatch degrades to the untapped worktree.dispatch_coder and still records the gen.
+    A host that has the internals takes rung 2 instead (the test below)."""
     coder_seam._progress.clear()
     assert coder_seam._import_dispatch_tapped() is None  # genuinely absent here (no host)
     seen = {}
@@ -2190,3 +2205,120 @@ async def test_dispatch_coder_tapped_falls_back_only_when_the_seam_is_absent(mon
     assert seen["args"] == ("/wt/x", "do it")
     (g,) = coder_seam.progress_snapshot("bd-fb")["gens"]
     assert g["gen"] == 4 and g["tier"] == "fast" and g["done"] is True
+
+
+# ── rung 2: a pre-C1 host still gets a LIVE monitor (the regression Josh hit) ──────
+
+
+class _FakeAcpClient:
+    """Enough of the pooled AcpClient for the legacy tap: it streams a tool event and a
+    thought through the callbacks it is handed, then returns a reply."""
+
+    def __init__(self):
+        self.last_usage = {"used": 12, "size": 100}
+        self.last_plan = [{"content": "do the thing", "status": "in_progress"}]
+        self.last_stop_reason = "end_turn"
+        self._permission = None
+        self.killed = False
+
+    def kill_now(self):
+        self.killed = True
+
+    async def prompt(self, text, *, tool_callback=None, thought_callback=None, text_callback=None, timeout=None):
+        await tool_callback({"phase": "start", "id": "t1", "name": "edit_file", "input": '{"path": "store.py"}'})
+        await thought_callback("weighing the options")
+        await text_callback("here is what I changed")
+        await tool_callback({"phase": "end", "id": "t1", "name": "edit_file", "status": "completed"})
+        return "the coder reply"
+
+
+def _install_pre_c1_host(monkeypatch, client):
+    """Put a `plugins.coding_agent` (WITHOUT dispatch_tapped) + `plugins.delegates`
+    into sys.modules — a host that predates C1 but has the internals the legacy tap
+    uses. Exactly the shape of every currently-released protoAgent."""
+    import sys
+    import types as _t
+
+    torn = []
+    pkg = _t.ModuleType("plugins")
+    pkg.__path__ = []
+    ca = _t.ModuleType("plugins.coding_agent")
+    ca.__path__ = []
+    ca._client_for = lambda spec: client
+    ca._drop_client = lambda spec: None
+    ca._make_permission = lambda spec: "policy"
+    acp = _t.ModuleType("plugins.coding_agent.acp_client")
+    acp.AcpError = type("AcpError", (Exception,), {})
+    dele = _t.ModuleType("plugins.delegates")
+    dele.__path__ = []
+    ad = _t.ModuleType("plugins.delegates.adapters")
+    ad.DelegateError = type("DelegateError", (Exception,), {})
+
+    class _Adapter:
+        @staticmethod
+        def _spec(scoped):
+            return {"workdir": getattr(scoped, "workdir", None)}
+
+        async def forget_session(self, scoped):
+            return None
+
+        async def teardown(self, scoped):
+            torn.append(scoped)
+            return True
+
+    ad.ADAPTERS = {"acp": _Adapter()}
+    for name, mod in (
+        ("plugins", pkg),
+        ("plugins.coding_agent", ca),
+        ("plugins.coding_agent.acp_client", acp),
+        ("plugins.delegates", dele),
+        ("plugins.delegates.adapters", ad),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return torn
+
+
+async def test_a_pre_c1_host_taps_the_live_stream_through_the_legacy_path(monkeypatch):
+    """RED-IS-REACHABLE — this is the regression that shipped: F7 moved the tap onto
+    `coding_agent.dispatch_tapped`, which landed in protoAgent AFTER this plugin's
+    supported floor. On every released host the seam is absent, F7's first cut went
+    straight to the UNTAPPED dispatch, and the drawer recorded a gen with ZERO tools,
+    no thoughts and no plan — the coder monitor silently stopped working. Rung 2 keeps
+    it alive: the same host must produce a real stream."""
+    coder_seam._progress.clear()
+    coder_seam._LEGACY_TAP_WARNED = False
+    client = _FakeAcpClient()
+    torn = _install_pre_c1_host(monkeypatch, client)
+    assert coder_seam._import_dispatch_tapped() is None  # the public seam really is absent
+
+    async def _never(*a, **kw):
+        raise AssertionError("must not degrade to the untapped dispatch on a host with internals")
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _never)
+
+    out = await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt/x", "do it", fid="bd-l1", gen=2, tier="smart")
+
+    assert out == "the coder reply"
+    (g,) = coder_seam.progress_snapshot("bd-l1")["gens"]
+    assert g["gen"] == 2 and g["tier"] == "smart" and g["done"] is True
+    assert g["recent_tools"], "the monitor recorded NO tools — this is the broken state"
+    assert g["recent_tools"][0]["name"] == "edit_file"
+    assert "weighing the options" in g["thought_tail"]
+    assert "here is what I changed" in g["answer_tail"]
+    assert g["usage"] == {"used": 12, "size": 100}
+    assert g["plan"] and g["plan"][0]["content"] == "do the thing"
+    assert g["stop_reason"] == "end_turn"
+    assert torn, "the worktree-scoped subprocess must still be torn down"
+
+
+async def test_the_legacy_tap_warns_once_so_the_degrade_is_never_silent(monkeypatch, caplog):
+    """The first cut degraded with no log line at all, which is why it took a human
+    noticing an empty drawer to find it."""
+    coder_seam._progress.clear()
+    coder_seam._LEGACY_TAP_WARNED = False
+    _install_pre_c1_host(monkeypatch, _FakeAcpClient())
+    with caplog.at_level("WARNING"):
+        await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt/x", "a", fid="bd-w1", gen=1)
+        await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt/x", "b", fid="bd-w2", gen=1)
+    hits = [r for r in caplog.records if "predates coding_agent.dispatch_tapped" in r.message]
+    assert len(hits) == 1, "warn once per process, not once per dispatch"
