@@ -131,10 +131,13 @@ function taskFoot(f){ return isTask(f) ? taskRef(f) : pr(f); }
 const REJECT_OPEN = new Set();
 function toggleReject(fid){ REJECT_OPEN.has(fid) ? REJECT_OPEN.delete(fid) : REJECT_OPEN.add(fid); render(); }
 
-// The task card's action block — the board's first mutation UI.
+// The task's action block — the board's first mutation UI. Lives in the shared
+// #drawer (bd-rdmh), appended below the spec / acceptance-criteria / deliverable that
+// taskDetail() renders (it no longer rides an inline card).
 //   in_progress → a submit-deliverable form (text + optional ref URL).
-//   in_review   → the deliverable text, then Approve / Reject (Reject expands a
-//                 feedback textarea whose contents re-dispatch to the assignee).
+//   in_review   → Approve / Reject (Reject expands a feedback textarea whose contents
+//                 re-dispatch to the assignee); the deliverable itself is shown by
+//                 taskDetail above these controls.
 // Every state with an action carries its OWN error slot (terr-<id>); for in_review it
 // is emitted OUTSIDE the reject-form branch so the Approve path (reject form collapsed)
 // can still surface a failed verify — the review-flagged bug.
@@ -148,7 +151,6 @@ function taskExtra(f){
       + '<div class="terr" id="terr-'+id+'"></div></div>';
   }
   if (f.state === "in_review"){
-    const deliv = f.deliverable ? '<div class="deliv">'+esc(f.deliverable)+'</div>' : "";
     let acts = '<div class="tact">'
       + '<button class="tbtn tbtn--primary" data-approve="'+id+'">Approve</button>'
       + '<button class="tbtn tbtn--danger" data-reject-toggle="'+id+'">Reject</button></div>';
@@ -158,9 +160,20 @@ function taskExtra(f){
         + '<div class="trow"><button class="tbtn tbtn--danger" data-reject="'+id+'">Send rejection</button>'
         + '<button class="tbtn" data-reject-toggle="'+id+'">Cancel</button></div></div>';
     }
-    return deliv + acts + '<div class="terr" id="terr-'+id+'"></div>';
+    return acts + '<div class="terr" id="terr-'+id+'"></div>';
   }
   return "";
+}
+// The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
+// #drawer instead of inline on the Kanban card / list row. Renders the spec, the
+// acceptance criteria, any recorded deliverable, then the state-appropriate controls
+// (taskExtra). Everything is esc()'d — server-authored text, never raw HTML.
+function taskDetail(f){
+  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
+  let h = '<div class="tdlbl">spec</div>' + prose(f.spec)
+    + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
+  if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
+  return h + taskExtra(f);
 }
 // Surface a task-action failure in the card's always-present error slot.
 function taskErr(fid, e){
@@ -223,15 +236,17 @@ function render(){
       const cards = items.map(f => {
         const color = f.blocked ? "var(--pl-color-status-error)" : (f.dag_blocked ? "var(--pl-color-status-warning)" : (STATE_COLOR[state]||"var(--pl-color-accent)"));
         // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
-        // A task never dispatches a coder, so it never opens the monitor (#217).
+        // A task never dispatches a coder, so it never opens the MONITOR (#217); it opens
+        // the same drawer showing its detail + controls (bd-rdmh) via a data-task handle,
+        // with no polling. The card itself is summary-only — no inline form/controls.
         const live = state === "in_progress";
         const mon = live && !isTask(f);
-        return '<div class="card'+(mon?" card--live":"")+(isTask(f)?" card--task":"")+'"'+(mon?' data-mon="'+esc(f.id)+'"':"")
+        return '<div class="card'+(mon?" card--live":"")+(isTask(f)?" card--task":"")+'"'
+          + (mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':"")
           + ' style="border-left-color:'+color+'">'
           + '<div class="t">'+docIco(f)+esc(f.title)+'</div>'
           + '<div class="m"><span class="id">'+esc(f.id)+'</span><span>P'+f.priority+'</span>'
-          + flags(f)+' '+taskFoot(f)+'</div>'
-          + (isTask(f)?taskExtra(f):"")+'</div>';
+          + flags(f)+' '+taskFoot(f)+'</div></div>';
       }).join("") || '<div class="pl-empty">—</div>';
       const more = total > items.length ? showAllBtn(total) : "";
       return '<div class="col"><div class="pl-panel-header pl-panel-header--compact">'
@@ -242,18 +257,14 @@ function render(){
     // List: group rows under a collapsible per-state header (COLS order + blocked +
     // cancelled), mirroring the Kanban's grouping so a dense board stays scannable (#26).
     const row = (f) => {
-      // in_progress CODING rows open the monitor; a task never does (#84/#217).
+      // in_progress CODING rows open the monitor; a task row opens its detail drawer
+      // (bd-rdmh) via a data-task handle — no inline sub-row, no monitor poll (#84/#217).
       const mon = f.state==="in_progress" && !isTask(f);
-      let tr = '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+'>'
+      return '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':"")+'>'
         + '<td class="id">'+esc(f.id)+'</td><td>'+docIco(f)+esc(f.title)+'</td>'
         + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
         + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
         + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+taskFoot(f)+'</td></tr>';
-      // A task's action controls (submit / approve-reject) ride a sub-row spanning the
-      // table, so the list has the SAME mutation UI as the Kanban card (#217).
-      if (isTask(f) && (f.state==="in_progress" || f.state==="in_review"))
-        tr += '<tr class="tsub"><td colspan="6">'+taskExtra(f)+'</td></tr>';
-      return tr;
     };
     const byState = {};
     FEATURES.forEach(f => (byState[f.state] = byState[f.state] || []).push(f));
@@ -277,6 +288,11 @@ function render(){
     });
     $("rows").innerHTML = html || '<tr><td colspan="6"><div class="pl-empty">No features yet — create some via the board tools or API.</div></td></tr>';
   }
+  // Keep an open task drawer in sync with the freshly-rendered FEATURES (bd-rdmh): a
+  // reject-toggle, a mutation's reload, or the 10s auto-reload re-renders the board, so
+  // the drawer re-renders too — its state (in_progress → in_review → done) and the
+  // reject-form toggle survive a re-render, the same way REJECT_OPEN/COLLAPSED do.
+  syncTaskDrawer();
 }
 
 async function load(){
@@ -437,7 +453,12 @@ function renderSetup(e, setup){
 // per-feature progress snapshot every ~3s, mirroring the console's goal-detail-
 // drawer UX in this page's OWN vanilla HTML/JS (an iframe — no console imports).
 const MON_POLL_MS = 3000;
-let MON_FID = null, MON_TIMER = null;
+// MON_FID: the coding feature the monitor is polling (null when closed OR when the
+// shared drawer is showing a task instead). TASK_FID: the task whose detail the shared
+// drawer is showing (null otherwise). The two are mutually exclusive — opening one
+// clears the other — and both fence writes to the shared #drawer-body (see pollMonitor
+// / syncTaskDrawer) so a stale async can't clobber a re-purposed drawer.
+let MON_FID = null, MON_TIMER = null, TASK_FID = null;
 
 function toolLine(t){
   const st = esc(t.status||"");
@@ -558,11 +579,23 @@ function renderMonitor(data){
   enhanceSaying($("drawer-body"));   // upgrade "saying" plain text → rendered markdown (lazy, best-effort)
 }
 async function pollMonitor(){
-  if (!MON_FID) return;
-  try { renderMonitor(await api("/api/plugins/project_board/features/"+encodeURIComponent(MON_FID)+"/progress")); }
-  catch (e) { $("drawer-body").innerHTML = '<div class="pl-callout pl-callout--error">'+esc(""+e)+'</div>'; }
+  // Fence on the fid we START the request for: clearInterval stops FUTURE polls but
+  // cannot cancel a request already in flight, so if the drawer is switched to a task
+  // (or closed) while this awaits, MON_FID no longer matches and we bail WITHOUT
+  // writing — a late success or error must not clobber a re-purposed #drawer-body.
+  const fid = MON_FID;
+  if (!fid) return;
+  try {
+    const data = await api("/api/plugins/project_board/features/"+encodeURIComponent(fid)+"/progress");
+    if (MON_FID !== fid) return;
+    renderMonitor(data);
+  } catch (e) {
+    if (MON_FID !== fid) return;
+    $("drawer-body").innerHTML = '<div class="pl-callout pl-callout--error">'+esc(""+e)+'</div>';
+  }
 }
 function openMonitor(fid){
+  TASK_FID = null;                                               // switching drawer modes → not a task
   MON_FID = fid;
   $("drawer-title").textContent = "Coder monitor — " + fid;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
@@ -572,17 +605,40 @@ function openMonitor(fid){
   if (MON_TIMER) clearInterval(MON_TIMER);
   MON_TIMER = setInterval(pollMonitor, MON_POLL_MS);
 }
-function closeMonitor(){
+// Open a task's detail in the SAME drawer (bd-rdmh): a task has no coder run, so there
+// is NO polling — clear any monitor state first (MON_FID=null fences a poll already in
+// flight from clobbering this body; see pollMonitor), then render the static detail.
+function openTask(fid){
   MON_FID = null;
+  if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
+  TASK_FID = fid;
+  $("drawer-title").textContent = "Task — " + fid;
+  $("drawer").classList.add("open"); $("scrim").classList.add("open");
+  document.body.classList.add("drawer-open");
+  syncTaskDrawer();
+}
+// Render the open task's detail from the live FEATURES into the shared drawer body — a
+// no-op when no task is open, so it's safe to call at the end of every render(). Guarded
+// on TASK_FID so it never touches the drawer while it's showing the coder monitor.
+function syncTaskDrawer(){
+  if (!TASK_FID) return;
+  const f = FEATURES.find(x => x.id === TASK_FID);
+  $("drawer-body").innerHTML = f ? taskDetail(f) : '<div class="pl-empty">Task not found.</div>';
+}
+function closeMonitor(){
+  MON_FID = null; TASK_FID = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
   document.body.classList.remove("drawer-open");
 }
-// Delegate clicks: any [data-mon] element (in_progress card or row) opens the drawer;
-// the task-card action buttons (#217) are delegated the same way, keyed on data-* verb.
+// Delegate clicks: a [data-mon] element (coding in_progress card/row) opens the monitor,
+// a [data-task] element (any task card/row) opens its detail drawer; the task action
+// buttons (#217) are delegated the same way, keyed on data-* verb.
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-mon]");
   if (el) { openMonitor(el.getAttribute("data-mon")); return; }
+  const tel = e.target.closest("[data-task]");
+  if (tel) { openTask(tel.getAttribute("data-task")); return; }
   const act = e.target.closest("[data-deliver],[data-approve],[data-reject],[data-reject-toggle]");
   if (!act) return;
   if (act.hasAttribute("data-deliver")) submitDeliver(act.getAttribute("data-deliver"));
