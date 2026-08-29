@@ -34,8 +34,8 @@
     border:var(--pl-border-width) dashed var(--pl-color-border);border-radius:var(--pl-radius);
     color:var(--pl-color-fg-muted);font-size:11px}
   .showall:hover{color:var(--pl-color-fg);border-color:var(--pl-color-accent)}
-  /* Clickable cards/rows open the right-edge drawer — the coder monitor (#84) for a coding
-     in_progress card, the task detail drawer (bd-rdmh) for any task card — so cue both. */
+  /* Clickable cards/rows open the drawer — the coder monitor (in_progress coding, #84)
+     or a task's detail (any task, bd-rdmh) — so both wear the clickable cue. */
   .card--live,.card--task{cursor:pointer}
   .card--live:hover,.card--task:hover{border-color:var(--pl-color-accent)}
   #list tr[data-mon],#list tr[data-task]{cursor:pointer}
@@ -124,19 +124,14 @@
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}
   .st-start{color:var(--pl-color-fg-muted)}
-  /* ── Task cards (#217) + task detail drawer (bd-rdmh): a task-type feature ships a
-     DELIVERABLE (a doc, a decision, an artifact ref) instead of a coder PR. A document
-     icon + a dashed left border mark its card apart; the card is summary-only and
-     clickable — its spec, acceptance criteria, recorded deliverable and state-appropriate
-     controls (submit / approve-reject) live in the shared #drawer, NOT inline on the card,
-     and it NEVER opens the coder monitor (no coder dispatch). Token-driven, vanilla. */
+  /* ── Task cards (#217): a task-type feature ships a DELIVERABLE (a doc, a decision,
+     an artifact ref) instead of a coder PR. A document icon marks it apart from a
+     coding feature card; its in_progress/in_review cards carry their own submit +
+     approve/reject controls and NEVER open the coder monitor (no coder dispatch).
+     Token-driven, vanilla — same discipline as the rest of the page. */
   .doc-ico{vertical-align:-2px}
   .doc-ico-w{color:var(--pl-color-status-info);margin-right:4px}
   .card--task{border-left-style:dashed}
-  /* Task detail in the drawer: uppercase section labels + pre-wrapped spec/AC blocks. */
-  #drawer .tlbl{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted);margin:var(--pl-space-3) 0 2px}
-  #drawer .tlbl:first-child{margin-top:0}
-  #drawer .tspec{font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;color:var(--pl-color-fg)}
   .deliv{margin-top:6px;padding:6px 8px;background:var(--pl-color-bg);
     border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
     font-size:11.5px;color:var(--pl-color-fg-muted);white-space:pre-wrap;word-break:break-word;
@@ -157,5 +152,13 @@
   .tbtn--primary{background:var(--pl-color-accent);color:var(--pl-color-bg);border-color:var(--pl-color-accent)}
   .tbtn--danger{background:var(--pl-color-status-error);color:var(--pl-color-bg);border-color:var(--pl-color-status-error)}
   .terr{color:var(--pl-color-status-error);font-size:10.5px;margin-top:2px;white-space:pre-wrap;word-break:break-word}
+  /* Task detail drawer (bd-rdmh): a task's spec / acceptance criteria / deliverable +
+     its state-appropriate controls now live in the shared #drawer (not inline on the
+     card). Section labels reuse the drawer's uppercase idiom; the prose blocks wrap. */
+  .tdlbl{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted);
+    margin:var(--pl-space-3) 0 3px}
+  .tdlbl:first-child{margin-top:0}
+  .tdsec{font-size:12px;color:var(--pl-color-fg);white-space:pre-wrap;word-break:break-word}
+  .tdsec--empty{color:var(--pl-color-fg-muted)}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
