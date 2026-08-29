@@ -3407,11 +3407,19 @@ def test_record_delivery_stamps_the_store_actor_when_unassigned(make_board, monk
 def test_record_verification_approved_closes_with_a_verified_reason(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task"})
+    # A DIFFERENT identity delivered this task (`human`) than the store actor closing it
+    # (`agent`), so this is a plain cross-identity verify — the self-verification flag (#316
+    # S2) stays off and the close reason is bare `verified: agent`.
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": "human"},
+    )
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
     f = b.record_verification("bd-t", approved=True)
     # the task Done edge: a `br close` like record_merge's, with the verifier in the reason
     assert br.cmds("close") == [("close", "bd-t", "-r", "verified: agent")]  # actor defaults to "agent"
+    assert ("update", "bd-t", "--add-label", "self-verified") not in br.calls
     assert f["board_state"] == "done"
 
 
@@ -3450,6 +3458,121 @@ def test_record_verification_rejects_a_coding_feature(make_board, monkeypatch):
     with pytest.raises(BoardError, match="record_verification is task-only"):
         b.record_verification("bd-1", approved=False, feedback="nope")
     assert br.cmds("close") == [] and br.cmds("update") == [] and br.cmds("comments") == []
+
+
+# ── self-verification: flag (never refuse) an approval by the deliverer (#316 S2) ──
+
+
+def test_record_verification_flags_self_verified_when_the_verifier_delivered(make_board, monkeypatch):
+    """#316 S2 r1: a task delivered by `Alice`, approved by ` alice `, is done, carries the
+    `self-verified` label, and closes with the verifier text preserved verbatim in the reason
+    (`verified:  alice  (self-verified)`) while the MATCH is decided on normalized identity
+    (casefold + strip) — so surrounding spaces and case never let a self-verify slip through."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": "Alice"},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    f = b.record_verification("bd-t", approved=True, by=" alice ")
+    # label-safe FLAG, added before the close (the cancel_feature tag-then-close precedent)
+    assert ("update", "bd-t", "--add-label", "self-verified") in br.calls
+    # displayed verifier text is preserved verbatim; only the comparison normalized it
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified:  alice  (self-verified)")]
+    assert f["board_state"] == "done"
+
+
+def test_record_verification_not_self_verified_when_a_different_actor_verifies(make_board, monkeypatch):
+    """#316 S2 r2: a task delivered by `alice`, approved by `bob`, is done WITHOUT the
+    `self-verified` label and closes with a bare `verified: bob` — a cross-identity verify
+    is the normal, un-flagged case."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": "alice"},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    f = b.record_verification("bd-t", approved=True, by="bob")
+    assert ("update", "bd-t", "--add-label", "self-verified") not in br.calls
+    assert br.cmds("update") == []  # no label write at all on a plain verify
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified: bob")]
+    assert f["board_state"] == "done"
+
+
+def test_record_verification_compares_against_the_assignee_for_a_legacy_delivery(make_board, monkeypatch):
+    """#316 S2 r3: a task delivered before the `delivered-by:` stamp existed carries no
+    provenance comment — `_project` falls its `delivered_by` back to the assignee (the actor
+    provenance a legacy bead does have), and record_verification compares the verifier against
+    THAT. Verification by the legacy assignee is therefore flagged self-verified."""
+    br = Br()
+    b = make_board(br)
+    # A legacy in_review task: no `delivered-by:` comment → projection uses the assignee.
+    bead = {"id": "bd-t", "status": "in_progress", "labels": ["in-review"], "issue_type": "task", "assignee": "dave"}
+    legacy = b._project(bead)
+    assert legacy["delivered_by"] == "dave"  # the S1 assignee fallback fired
+    monkeypatch.setattr(b, "_require", lambda fid: legacy)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    b.record_verification("bd-t", approved=True, by="Dave")
+    assert ("update", "bd-t", "--add-label", "self-verified") in br.calls
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified: Dave (self-verified)")]
+
+
+def test_record_verification_unattributed_delivery_by_the_actor_is_self_verified(make_board, monkeypatch):
+    """#316 S2 r4: an unattributed delivery — no `delivered-by:` stamp AND no assignee, so
+    `delivered_by` projects empty — has the STORE ACTOR stand in as the deliverer. The actor
+    closing its own unattributed task (the `by` default) is therefore flagged self-verified."""
+    br = Br()
+    b = make_board(br)
+    b.actor = "solo-bot"
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": ""}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    b.record_verification("bd-t", approved=True)  # by defaults to the store actor
+    assert ("update", "bd-t", "--add-label", "self-verified") in br.calls
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified: solo-bot (self-verified)")]
+
+
+def test_record_verification_unattributed_delivery_by_another_is_not_self_verified(make_board, monkeypatch):
+    """#316 S2 r4 boundary: only the store actor stands in for an unattributed delivery — a
+    DIFFERENT verifier of an unstamped, unassigned task is a genuine cross-identity verify and
+    is NOT flagged."""
+    br = Br()
+    b = make_board(br)
+    b.actor = "solo-bot"
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": ""}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "done"})
+    b.record_verification("bd-t", approved=True, by="reviewer")
+    assert ("update", "bd-t", "--add-label", "self-verified") not in br.calls
+    assert br.cmds("close") == [("close", "bd-t", "-r", "verified: reviewer")]
+
+
+def test_record_verification_rejection_never_flags_self_verified(make_board, monkeypatch):
+    """#316 S2 r5: the approved=False path is untouched — even when the rejecter IS the
+    deliverer, a rejection requeues with feedback and writes NEITHER the `self-verified` label
+    NOR any approval close reason."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "delivered_by": "alice"},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    f = b.record_verification("bd-t", approved=False, feedback="missing the Q3 section", by="alice")
+    assert ("comments", "add", "bd-t", "verification failed: missing the Q3 section") in br.calls
+    assert br.cmds("close") == []  # a rejection NEVER closes
+    # the ONLY update is the requeue (open+ready, assignee cleared) — no self-verified label
+    (up,) = br.cmds("update")
+    assert "--add-label" in up and "ready" in up and "in-review" in up
+    assert not any("self-verified" in str(part) for c in br.calls for part in c)
+    assert f["board_state"] == "ready"
 
 
 # ── the Ready gate relaxes files_to_modify for a task (#217) ─────────────────────
