@@ -21,7 +21,14 @@ from fastapi.testclient import TestClient
 import project_board as pb
 from project_board import api, store
 from project_board.loop import BoardLoop
-from project_board.store import annotate_next_action, knob_bool, merge_posture, pr_number
+from project_board.store import (
+    NEXT_ACTION_AWAITING_DELIVERABLE,
+    annotate_next_action,
+    knob_bool,
+    merge_posture,
+    pr_number,
+    task_posture,
+)
 
 PR = "https://github.com/o/r/pull/42"
 
@@ -34,6 +41,24 @@ def _feat(state="in_review", labels=(), *, blocked=False, pr=PR, fid="bd-1"):
         "blocked": blocked,
         "labels": list(labels),
         "pr_url": pr,
+        "priority": 2,
+        "difficulty": "",
+    }
+
+
+def _task(state="in_progress", *, assignee="alice", blocked=False, fid="bd-t"):
+    """A task-type bead (#217): ships a deliverable, no PR. `assignee` is its dispatch
+    target — a human/unassigned one parks it in_progress awaiting an out-of-band
+    delivery (#305)."""
+    return {
+        "id": fid,
+        "title": fid,
+        "board_state": state,
+        "issue_type": "task",
+        "assignee": assignee,
+        "blocked": blocked,
+        "labels": [],
+        "pr_url": "",
         "priority": 2,
         "difficulty": "",
     }
@@ -225,6 +250,84 @@ def test_annotate_defaults_match_the_loop_defaults():
     assert "merge #42" in row["next_action_hint"]
 
 
+# ── task_posture: the parked-task deliverable seam (#305) ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "state, assignee, blocked, driven, want",
+    [
+        ("in_progress", "alice", False, False, NEXT_ACTION_AWAITING_DELIVERABLE),  # parked on a human
+        ("in_progress", "", False, False, NEXT_ACTION_AWAITING_DELIVERABLE),  # parked, unassigned
+        ("in_progress", "claude", False, True, ""),  # ACP agent, live drive → working, not awaiting
+        ("in_progress", "alice", True, False, ""),  # blocked → its own posture, not awaiting
+        ("ready", "alice", False, False, ""),  # not yet claimed
+        ("in_review", "alice", False, False, ""),  # delivered — merge_posture's lane, not this one
+        ("done", "alice", False, False, ""),  # terminal
+    ],
+)
+def test_task_posture_table(state, assignee, blocked, driven, want):
+    p = task_posture(_task(state=state, assignee=assignee, blocked=blocked), is_driven=lambda _fid: driven)
+    assert p["next_action"] == want
+    assert p["awaiting_merge"] is False
+    if want:
+        assert "board_deliver(bd-t, text=…)" in p["next_action_hint"]
+        assert (assignee or "an out-of-band delivery") in p["next_action_hint"]
+    else:
+        assert p["next_action_hint"] == ""
+
+
+@pytest.mark.parametrize("state", ["backlog", "ready", "in_progress", "in_review", "done"])
+def test_task_posture_never_fires_for_a_coding_feature(state):
+    """#305 regression pin: the parked-task posture is task-only. A coding feature
+    (issue_type "feature" or none) never reads as awaiting a deliverable — even an
+    in_progress one with an assignee sitting where a parked task would."""
+    for itype in ("feature", ""):
+        f = {**_feat(state=state), "issue_type": itype, "assignee": "alice"}
+        p = task_posture(f, is_driven=lambda _fid: False)
+        assert p["next_action"] == "" and p["awaiting_merge"] is False and p["next_action_hint"] == ""
+
+
+def test_annotate_stamps_awaiting_deliverable_on_a_parked_task():
+    """r1: an in_progress task with a non-dispatchable assignee carries
+    `awaiting deliverable` + a hint naming board_deliver and the assignee."""
+    (row,) = annotate_next_action([_task(assignee="alice")], {}, is_driven=lambda _fid: False)
+    assert row["next_action"] == "awaiting deliverable" and row["awaiting_merge"] is False
+    assert row["next_action_hint"] == "awaiting alice — record it with board_deliver(bd-t, text=…)"
+
+
+def test_annotate_leaves_a_driven_task_working_not_awaiting():
+    """r2: a task actively driven by a dispatched agent (a live drive) is working — it
+    gets none of the three keys stamped, exactly like a coding feature outside review."""
+    (row,) = annotate_next_action([_task(assignee="claude")], {}, is_driven=lambda _fid: True)
+    assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(row)
+
+
+def test_annotate_leaves_a_coding_feature_untouched_in_every_state():
+    """r3 regression pin, via the full annotate seam: a coding feature carries no
+    next_action outside in_review, whatever its state or assignee — the parked-task
+    branch is gated on issue_type == task and never reaches it."""
+    feats = [
+        {**_feat(state="in_progress", fid="bd-1"), "issue_type": "feature", "assignee": "claude"},
+        {**_feat(state="ready", fid="bd-2"), "issue_type": "feature"},
+        {**_feat(state="backlog", fid="bd-3", pr=""), "issue_type": ""},
+    ]
+    rows = annotate_next_action(feats, {"auto_merge": False, "review_gate": True}, is_driven=lambda _fid: False)
+    assert all(not {"next_action", "awaiting_merge", "next_action_hint"} & set(r) for r in rows)
+
+
+def test_default_is_driven_consults_the_loops_live_drive(monkeypatch):
+    """The default `is_driven` (no arg) is the loop's live-drive registry: the SAME fid
+    reads `awaiting deliverable` with no drive and working with one — no per-row network,
+    the pull-only signal the task asks for."""
+    driven = {"bd-t"}
+    monkeypatch.setattr("project_board.loop.live_drive", lambda fid: object() if fid in driven else None)
+    (working,) = annotate_next_action([_task(fid="bd-t", assignee="claude")], {})
+    assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(working)
+    driven.clear()
+    (parked,) = annotate_next_action([_task(fid="bd-t", assignee="alice")], {})
+    assert parked["next_action"] == "awaiting deliverable"
+
+
 # ── board_list rows ─────────────────────────────────────────────────────────────
 
 
@@ -257,6 +360,18 @@ def test_board_list_rows_carry_next_action_and_the_merge_hint(monkeypatch):
     assert "next_action_hint" not in rows["bd-2"]
     # non-review rows carry none of the three keys (the row shape stays lean)
     assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(rows["bd-3"])
+
+
+def test_board_list_surfaces_awaiting_deliverable_on_a_parked_task(monkeypatch):
+    """r1 through the tool: a parked in_progress task rides the SAME `next_action` /
+    `awaiting_merge` / `next_action_hint` row slots as an in_review card, and a coding
+    card in the same listing keeps its merge posture."""
+    fake = _Store([_task(fid="bd-t", assignee="alice"), _feat(labels=["review-clean"], fid="bd-1")])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    rows = {r["id"]: r for r in json.loads(_list_tool({"auto_merge": False, "review_gate": True}).invoke({}))}
+    assert rows["bd-t"]["next_action"] == "awaiting deliverable" and rows["bd-t"]["awaiting_merge"] is False
+    assert rows["bd-t"]["next_action_hint"] == "awaiting alice — record it with board_deliver(bd-t, text=…)"
+    assert rows["bd-1"]["next_action"] == "awaiting-merge (auto_merge off)"  # the feature is untouched
 
 
 def test_next_action_follows_the_live_auto_merge_knob_without_a_restart(monkeypatch):
@@ -330,6 +445,15 @@ def test_features_payload_carries_next_action_for_the_console(monkeypatch):
     assert "merge #42" in feats["bd-1"]["next_action_hint"]
     # rows in any other state keep their existing shape — no empty keys stamped
     assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(feats["bd-2"])
+
+
+def test_features_payload_surfaces_awaiting_deliverable_for_the_console(monkeypatch):
+    """r1 through the console payload: a parked in_progress task carries
+    `awaiting deliverable` + the board_deliver hint, so the page can chip it."""
+    c = _client(monkeypatch, [_task(fid="bd-t", assignee="alice")], {"auto_merge": False})
+    (f,) = c.get("/api/plugins/project_board/features").json()["features"]
+    assert f["next_action"] == "awaiting deliverable" and f["awaiting_merge"] is False
+    assert "board_deliver(bd-t, text=…)" in f["next_action_hint"] and "awaiting alice" in f["next_action_hint"]
 
 
 def test_features_payload_respects_the_boards_merge_posture(monkeypatch):

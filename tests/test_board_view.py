@@ -266,6 +266,21 @@ def test_task_review_lane_posts_through_a_json_apiPost_helper():
     assert "body: JSON.stringify(body || {})" in BOARD_PAGE
 
 
+def test_parked_task_awaiting_deliverable_chips_on_the_card():
+    """#305 (r4): an in_progress task the loop parked for an out-of-band delivery carries
+    next_action "awaiting deliverable"; the page maps it to an info chip and renders it
+    through the shared nextActionChip → flags(), which BOTH the Kanban card and the list
+    row emit — so the chip lands on a task card, with the board_deliver hint as its
+    tooltip (the server text, esc()'d)."""
+    assert '"awaiting deliverable": ["pl-badge--info", "awaiting deliverable"],' in BOARD_PAGE
+    assert "function nextActionChip(f)" in BOARD_PAGE
+    assert "const hint = f.next_action_hint || f.next_action;" in BOARD_PAGE
+    assert "title=\"'+esc(hint)+'\"" in BOARD_PAGE
+    # flags() carries the chip and is rendered on both the Kanban card and the list row
+    assert "out += nextActionChip(f);" in BOARD_PAGE
+    assert BOARD_PAGE.count("flags(f)") == 3  # definition + Kanban card + list row
+
+
 def test_task_cards_share_lanes_and_ordering_with_coding_features():
     """A task is filtered/sorted by the SAME comparator and column filter as a coding
     feature — no task-only lane, no separate ordering — so it lands in its board state
