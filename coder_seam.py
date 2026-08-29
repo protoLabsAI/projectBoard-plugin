@@ -602,14 +602,20 @@ async def dispatch_coder_tapped(
     progress_begin(fid, gen, tier)
     tapped = _dispatch_tapped if _dispatch_tapped is not None else _import_dispatch_tapped()
     if tapped is None:
-        # Public C1 seam absent → the untapped fallback (the gen still records
-        # start/tier/elapsed). Absence-only: NOT a broad except around the tapped path.
-        try:
-            return await worktree.dispatch_coder(
-                coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
-            )
-        finally:
-            progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
+        # Public C1 seam absent. Do NOT jump to the untapped dispatch — that records a
+        # gen with no tools/thoughts/plan, which IS the monitor being broken (observed
+        # live the day F7 landed: every host on a released protoAgent lost the drawer).
+        # Try the legacy private tap first; only a host where neither is reachable
+        # degrades to untapped. Absence-only: NOT a broad except around a tapped path.
+        return await _dispatch_coder_tapped_legacy(
+            coder,
+            worktree_path,
+            prompt,
+            fid=fid,
+            gen=gen,
+            timeout=timeout,
+            env_passthrough=env_passthrough,
+        )
 
     # Board policy on the scoped copy, applied BEFORE the generic public seam and
     # mirroring worktree.dispatch_coder: the worktree is the workdir, the BOARD owns
@@ -674,6 +680,150 @@ async def dispatch_coder_tapped(
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     finally:
         progress_end(fid, gen)
+
+
+# ── legacy private tap (pre-C1 hosts) ────────────────────────────────────────────
+# The C1 seam (`plugins.coding_agent.dispatch_tapped`) is the preferred path and the
+# only one that reaches no host internals — but it shipped in protoAgent AFTER the
+# releases this plugin supports (`min_protoagent_version: 0.153.2`), so on every
+# released host today it is absent. Degrading straight to the UNTAPPED dispatch there
+# means the coder monitor records a gen with no tools, no thoughts and no plan — i.e.
+# the drawer stops working, which is what happened on a live board the day F7 landed.
+# So the ladder is THREE rungs, not two:
+#
+#   1. `dispatch_tapped`         — public, preferred, zero internals
+#   2. this legacy tap           — the pre-F7 implementation, private internals, WARNS once
+#   3. `worktree.dispatch_coder` — untapped; only when neither is reachable
+#
+# Rung 2 exists to be deleted: once a protoAgent release carrying C1 is the floor in
+# `min_protoagent_version`, drop this function and its warning with it.
+_LEGACY_TAP_WARNED = False
+
+
+async def _dispatch_coder_tapped_legacy(
+    coder,
+    worktree_path: str,
+    prompt: str,
+    *,
+    fid: str | None,
+    gen: int,
+    timeout: float | None = None,
+    env_passthrough: Iterable[str] = (),
+) -> str:
+    """The pre-C1 tap: drive the pooled ``AcpClient`` directly with the progress
+    callbacks wired in. Reaches ``coding_agent`` internals (``_client_for``,
+    ``_make_permission``, ``_drop_client``, ``adapter._spec``) — which is why C1 exists
+    — but it is what keeps the monitor alive on a host that predates the public seam.
+    Same contract as the public path: every dispatch failure surfaces as
+    ``WorktreeError``/``CoderTimeout``, the gen closes on every exit, and the
+    worktree-scoped subprocess is always torn down. A host with neither the seam nor
+    these internals falls through to the untapped dispatch inside this function."""
+    global _LEGACY_TAP_WARNED
+    if not _LEGACY_TAP_WARNED:
+        _LEGACY_TAP_WARNED = True
+        log.warning(
+            "[project_board] this host predates coding_agent.dispatch_tapped (the C1 seam) — "
+            "the coder monitor is running on the legacy private tap. It works; upgrade "
+            "protoAgent to move onto the public seam."
+        )
+    try:
+        import dataclasses as _dc
+
+        from plugins.coding_agent import _client_for, _drop_client, _make_permission
+        from plugins.coding_agent.acp_client import AcpError
+        from plugins.delegates.adapters import ADAPTERS, DelegateError
+
+        adapter = ADAPTERS["acp"]
+        overrides: dict = {"workdir": worktree_path}
+        if any(f.name == "manage_git" for f in _dc.fields(coder)):
+            overrides["manage_git"] = False  # the BOARD owns git for scoped dispatches
+        if any(f.name == "env" for f in _dc.fields(coder)):
+            overrides["env"] = config.sanitized_env(env_passthrough)
+        scoped = _dc.replace(coder, **overrides)
+        spec = adapter._spec(scoped)
+    except Exception:  # noqa: BLE001 — host internals absent/changed → untapped fallback
+        try:
+            return await worktree.dispatch_coder(
+                coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
+            )
+        finally:
+            progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
+
+    # Fresh-both: forget any persisted session first (see worktree.dispatch_coder).
+    try:
+        await adapter.forget_session(scoped)
+    except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the build
+        log.warning("[project_board] forget_session failed for %s", worktree_path, exc_info=True)
+
+    try:
+        client = _client_for(spec)
+    except Exception as exc:  # noqa: BLE001 — adapter-layer parity: dispatch failures are WorktreeError
+        progress_end(fid, gen)
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    try:
+        client._permission = _make_permission(spec)  # the adapter's by-kind policy (ADR 0024)
+    except Exception:  # noqa: BLE001 — tolerate a host that resolves permissions differently
+        pass
+
+    async def _thought_cb(delta):
+        progress_thought(fid, gen, delta)
+
+    async def _answer_cb(delta):
+        progress_answer(fid, gen, delta)
+
+    async def _tool_cb(event):
+        progress_tool(fid, gen, event)
+        # usage_update isn't forwarded as a callback — the client folds it into
+        # last_usage as it goes, so sample it on each tool event to keep totals live.
+        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
+        # Same sampling pattern for the coder's live plan (ACP `plan` updates —
+        # its own todo list). Hosts older than the last_plan parse just yield None.
+        progress_plan(fid, gen, getattr(client, "last_plan", None))
+
+    # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
+    # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
+    # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
+    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    try:
+        coro = client.prompt(
+            prompt,
+            tool_callback=_tool_cb,
+            thought_callback=_thought_cb,
+            text_callback=_answer_cb,
+            timeout=prompt_timeout,
+        )
+        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
+        return reply
+    except asyncio.CancelledError:
+        # Turn stopped (operator/watchdog) — drop the pooled client + SIGKILL the tree
+        # NOW (mirrors AcpAdapter._prompt) so the subprocess can't keep running detached.
+        try:
+            _drop_client(spec)
+            client.kill_now()
+        except Exception:  # noqa: BLE001 — mid-cancellation cleanup is best-effort
+            pass
+        raise
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
+    except (AcpError, DelegateError) as exc:
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 — restore the adapter path's contract: nothing
+        # below the seam propagates raw; every dispatch failure surfaces as WorktreeError
+        # (panel on #89: the client-direct tap had narrowed AcpError-only).
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    finally:
+        # Stash whatever stop-reason / dead-end signal the ACP client reports (#198)
+        # — sampled on EVERY exit so an empty reply still records WHY the coder
+        # stopped. Best-effort getattr: a host without the attribute yields None.
+        progress_stop_reason(
+            fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
+        )
+        progress_end(fid, gen)
+        try:
+            await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess
+        except Exception:  # noqa: BLE001 — never let teardown mask the result/error
+            log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
 async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) -> str:
