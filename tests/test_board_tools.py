@@ -646,8 +646,11 @@ class _TaskEdgeStore:
     def record_delivery(self, fid, text="", ref=""):
         return self._edge("record_delivery", fid, text, ref)
 
-    def record_verification(self, fid, approved=True, feedback=""):
-        return self._edge("record_verification", fid, approved, feedback)
+    def record_verification(self, fid, approved=True, feedback="", by=""):
+        # `by` (#316 S3c) rides at a fixed 4th slot so a call that omits it (the empty
+        # tool default) records "" here — the same shape the store sees before resolving
+        # it to its own actor. The verifier-identity tests below assert this slot.
+        return self._edge("record_verification", fid, approved, feedback, by)
 
 
 def test_board_deliver_records_delivery_and_returns_in_review(monkeypatch):
@@ -690,7 +693,8 @@ def test_board_verify_approved_closes_the_task_done(monkeypatch):
     out = json.loads(_get_tool("board_verify").invoke({"feature_id": "bd-t", "approved": True}))
 
     assert out == {"id": "bd-t", "state": "done"}
-    assert board.calls == [("record_verification", "bd-t", True, "")]
+    # omitting `by` forwards the empty tool default (the store resolves it to its actor).
+    assert board.calls == [("record_verification", "bd-t", True, "", "")]
 
 
 def test_board_verify_rejected_requeues_to_ready_with_feedback(monkeypatch):
@@ -704,8 +708,9 @@ def test_board_verify_rejected_requeues_to_ready_with_feedback(monkeypatch):
     )
 
     assert out == {"id": "bd-t", "state": "ready"}
-    # approved flag threads through, and the wrapping quotes are peeled off the feedback.
-    assert board.calls == [("record_verification", "bd-t", False, "misses the Q3 numbers")]
+    # approved flag threads through, and the wrapping quotes are peeled off the feedback;
+    # `by` rides its empty default here (this rejection path omits it).
+    assert board.calls == [("record_verification", "bd-t", False, "misses the Q3 numbers", "")]
 
 
 def test_board_verify_surfaces_a_task_only_or_wrong_state_error(monkeypatch):
@@ -715,3 +720,67 @@ def test_board_verify_surfaces_a_task_only_or_wrong_state_error(monkeypatch):
     out = _get_tool("board_verify").invoke({"feature_id": "bd-1", "approved": True})
 
     assert out.startswith("Error: ") and "task-only" in out
+
+
+# ── #316 S3c: board_verify forwards the verifier identity `by` to record_verification ──
+#
+# The store's Done edge (bd-hksj) already accepts `by` and writes it into the `verified:
+# <by>` close reason (flagging, never blocking, a self-approval). These pin the TOOL seam:
+# an explicit `by` forwards UNCHANGED, and an omitted `by` forwards the empty tool default
+# so the store — not the tool — resolves it to its actor (it must NOT substitute the HTTP
+# API's `operator` default, which is a deliberately different caller).
+
+
+def test_board_verify_forwards_explicit_by_to_record_verification(monkeypatch):
+    """An explicit verifier identity threads through the tool to the store's Done edge,
+    unchanged — the store writes it into the `verified: <by>` close reason."""
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "done"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(_get_tool("board_verify").invoke({"feature_id": "bd-t", "approved": True, "by": "quinn"}))
+
+    assert out == {"id": "bd-t", "state": "done"}
+    # `by` arrives at the store verbatim (4th slot), not dropped and not rewritten.
+    assert board.calls == [("record_verification", "bd-t", True, "", "quinn")]
+
+
+def test_board_verify_omitting_by_forwards_the_empty_store_actor_default(monkeypatch):
+    """Omitting `by` forwards the empty TOOL default so the STORE resolves it to its own
+    actor (this tool IS the agent). It must NOT substitute the HTTP API's `operator`
+    default — the tool never invents a verifier the caller didn't name."""
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "done"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    json.loads(_get_tool("board_verify").invoke({"feature_id": "bd-t", "approved": True}))
+
+    (call,) = board.calls
+    assert call == ("record_verification", "bd-t", True, "", "")  # empty tool default, not "operator"
+
+
+def test_board_verify_does_not_strip_wrapping_quotes_from_by(monkeypatch):
+    """`by` forwards UNCHANGED — unlike `feedback`, it is NOT de-quoted. This pins the
+    deliberate asymmetry: the store compares identity casefolded but preserves the caller's
+    text, so the tool must hand the value through verbatim."""
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "done"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    _get_tool("board_verify").invoke({"feature_id": "bd-t", "approved": True, "by": '"quinn"'})
+
+    # feedback would be peeled; `by` is not — it reaches the store with its quotes intact.
+    assert board.calls == [("record_verification", "bd-t", True, "", '"quinn"')]
+
+
+def test_board_verify_forwards_by_on_the_rejection_path_too(monkeypatch):
+    """`by` threads through regardless of the verdict — a rejection still carries the
+    verifier identity to the store (which records the feedback comment and requeues)."""
+    board = _TaskEdgeStore(reply={"id": "bd-t", "board_state": "ready"})
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+
+    out = json.loads(
+        _get_tool("board_verify").invoke(
+            {"feature_id": "bd-t", "approved": False, "feedback": "misses the Q3 numbers", "by": "quinn"}
+        )
+    )
+
+    assert out == {"id": "bd-t", "state": "ready"}
+    assert board.calls == [("record_verification", "bd-t", False, "misses the Q3 numbers", "quinn")]

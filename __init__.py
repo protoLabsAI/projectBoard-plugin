@@ -767,19 +767,30 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_verify(feature_id: str, approved: bool = True, feedback: str = "") -> str:
+    def board_verify(feature_id: str, approved: bool = True, feedback: str = "", by: str = "") -> str:
         """Verify a TASK's delivered work (#217) — the task Done edge, record_merge's
         verify sibling. `approved=true` CLOSES the task `done` with an auditable
-        `verified: <actor>` reason (a task has no PR to merge, so a verifier's approval is
+        `verified: <by>` reason (a task has no PR to merge, so a verifier's approval is
         what closes it). `approved=false` records `feedback` as a comment (the next dispatch
         prompt leads with it, the adverse-review shape) and requeues the bead to `ready` for
-        another pass. TASK-ONLY and in_review-ONLY: a coding feature (closed here it would
-        dodge record_merge, the ONE Done edge for code) or a task not in review is refused
-        with an `Error: …`. `feedback` is stripped of any literal wrapping double quotes
-        first (same hygiene as board_create_feature)."""
+        another pass.
+
+        `by` names the verifier written into that `verified: <by>` reason (#316), forwarded
+        UNCHANGED. SELF-APPROVAL is NOT blocked: when the verifier matches the task's
+        deliverer the close is still recorded — just FLAGGED (a `self-verified` label plus a
+        `(self-verified)` note on the reason) so the provenance is auditable; the store
+        records it, it never refuses. The empty tool default is DELIBERATE: because this
+        tool IS the agent, an omitted `by` forwards blank and the STORE resolves it to its
+        own actor — it is NOT the HTTP API's `operator` default (the out-of-band API is a
+        different caller and defaults differently on purpose).
+
+        TASK-ONLY and in_review-ONLY: a coding feature (closed here it would dodge
+        record_merge, the ONE Done edge for code) or a task not in review is refused with an
+        `Error: …`. `feedback` is stripped of any literal wrapping double quotes first (same
+        hygiene as board_create_feature); `by` is not — it forwards verbatim."""
         try:
             feedback = _strip_wrapping_quotes(feedback)
-            f = get_store(**store_kw).record_verification(feature_id, approved, feedback)
+            f = get_store(**store_kw).record_verification(feature_id, approved, feedback, by=by)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"
