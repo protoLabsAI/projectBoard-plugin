@@ -269,6 +269,17 @@ DELIVERED_BY_PREFIX = "delivered-by:"
 # token, not free-text actor values, so beads' validator accepts it, unlike the
 # `delivered-by:` stamp) and a LABEL so the projection/view can surface self-verified work.
 LABEL_SELF_VERIFIED = "self-verified"
+# The task Done edge's verifier record (#316 S3a): `record_verification` closes an
+# approved task with a `verified: <by>` reason (br surfaces it as the `close_reason`
+# field), appending ` (self-verified)` when the verifier was the deliverer — the flag
+# itself rides `LABEL_SELF_VERIFIED`, projected separately. `_project` reads the `<by>`
+# back into `verified_by`, stripping that suffix so the field is the verifier identity
+# alone. ONLY reasons with this prefix are parsed, so the other terminal edges' close
+# reasons (`merged:`/`cancelled:`/`done:`) never leak a verifier; a feature or an
+# undelivered task has no such reason and projects "". Mirrors record_verification's
+# `f"verified: {by}"` format (kept in sync there — this slice is projection-only).
+VERIFIED_REASON_PREFIX = "verified:"
+SELF_VERIFIED_REASON_SUFFIX = " (self-verified)"
 # What the puller admits (#217): coding features AND task-type beads — everything
 # else (epics, milestones) stays structural and is never claimed.
 PULLABLE_ISSUE_TYPES = ("feature", "task")
@@ -2495,6 +2506,19 @@ class BeadsBoard:
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
             elif txt.startswith(DELIVERED_BY_PREFIX):
                 delivered_by = txt[len(DELIVERED_BY_PREFIX) :].strip()
+        # Who verified the task (#316 S3a): the `<by>` from the `verified: <by>` close
+        # reason record_verification writes on approval (br exposes it as `close_reason`).
+        # Strip the ` (self-verified)` suffix — that flag rides the label, projected as
+        # `self_verified` below — so verified_by is the verifier identity alone. "" for
+        # anything without a `verified:` reason: an open feature (no close reason), or a
+        # merge/cancel/manual-done close whose reason names no verifier.
+        close_reason = str(bead.get("close_reason") or "").strip()
+        verified_by = ""
+        if close_reason.startswith(VERIFIED_REASON_PREFIX):
+            who = close_reason[len(VERIFIED_REASON_PREFIX) :]
+            if who.endswith(SELF_VERIFIED_REASON_SUFFIX):
+                who = who[: -len(SELF_VERIFIED_REASON_SUFFIX)]
+            verified_by = who.strip()
         # The bead `notes` field carries files_to_modify (one path per line), the
         # requirement ledger (#113, one `req: {…}` line per item), AND the
         # originating-issue record (#97) as a `source-issue: owner/repo#N` metadata
@@ -2551,6 +2575,11 @@ class BeadsBoard:
             "verified_sha": verified_sha,
             "deliverable": deliverable,
             "delivered_by": delivered_by,
+            # Verification provenance (#316 S3a): who approved the task Done edge
+            # (`verified_by`, from the close reason — "" when unverified) and whether the
+            # deliverer verified their own work (`self_verified`, from the label).
+            "verified_by": verified_by,
+            "self_verified": LABEL_SELF_VERIFIED in labels,
             "source_issue": source_issue,
             "requirements": requirements,
             "project": project,
