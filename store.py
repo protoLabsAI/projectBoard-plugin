@@ -2625,15 +2625,77 @@ def merge_posture(feature: dict, *, auto_merge: bool, review_gate: bool, is_draf
     return out
 
 
-def annotate_next_action(feats: list[dict], cfg: dict) -> list[dict]:
-    """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every
-    ``in_review`` row from the board's config (``auto_merge``, ``review_gate``) —
-    labels + config only, no per-row network. Rows in any other state are left
-    untouched (the payload shape for them is unchanged). Mutates and returns ``feats``.
+# ── parked-task deliverable posture (#305) ───────────────────────────────────────
+# A task-type bead (#217) ships a deliverable, not a coder PR. When its assignee is a
+# human / unassigned (not a dispatchable ACP agent), the loop claims it to `in_progress`
+# and leaves it there to await an OUT-OF-BAND delivery (`record_delivery` via the API /
+# chat) — no drive is spawned, no slot held (loop._dispatch_task → "parked"). That
+# parked card owed the PM nothing that said "this is waiting on a delivery" — the task
+# sibling of the in_review `awaiting-merge` gap (#208). A task the loop IS actively
+# driving (an ACP-agent assignee → a live drive) is WORKING, not awaiting, so the tell
+# is `loop.live_drive(fid)`: the same process-stable registry the cancel verbs read.
+# Pull-only — no host-inbox / ADR 0070 background-result push nudge.
+NEXT_ACTION_AWAITING_DELIVERABLE = "awaiting deliverable"
+
+
+def _live_drive_predicate():
+    """The default ``is_driven`` for ``annotate_next_action``: True when the loop holds a
+    live drive for the fid. Lazily imported (``loop`` imports ``store``, so a top-level
+    import would cycle) and fail-safe — a pull-only listing must never break, so if the
+    loop module can't be reached an unknown drive state reads as parked (awaiting)."""
+    try:
+        from .loop import live_drive
+    except Exception:  # noqa: BLE001 — a listing must not crash on the drive-registry read
+        return lambda _fid: False
+    return lambda fid: live_drive(fid) is not None
+
+
+def task_posture(feature: dict, *, is_driven) -> dict:
+    """The parked-task sibling of ``merge_posture`` (#305). Returns the SAME
+    ``{"next_action", "awaiting_merge", "next_action_hint"}`` shape, all-empty except for
+    an ``in_progress`` task-type bead (#217) with no live drive — a card the loop claimed
+    and left in_progress because its assignee is a human / unassigned (not a dispatchable
+    ACP agent), so nothing moves it but a ``board_deliver``. It reads
+    ``awaiting deliverable`` with a hint naming ``board_deliver(<id>, text=…)`` and the
+    awaited assignee. Empty (no posture) for everything else:
+
+    * a coding feature (``issue_type`` != ``task``) — its next action lives only
+      in_review, via ``merge_posture``;
+    * a task in any state but ``in_progress`` (or a blocked one);
+    * a task the loop is actively driving (``is_driven(fid)`` True — an ACP-agent
+      assignee whose drive is live): it is working, not awaiting.
+
+    ``is_driven`` is a fid→bool predicate (default: the loop's live-drive registry) so
+    the signal is pull-only — no per-row network, no host-inbox / ADR 0070 push."""
+    out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    if feature.get("issue_type") != LABEL_TASK or feature.get("board_state") != "in_progress":
+        return out
+    if feature.get("blocked") or is_driven(feature.get("id", "")):
+        return out
+    fid = feature.get("id", "")
+    assignee = str(feature.get("assignee") or "").strip()
+    out["next_action"] = NEXT_ACTION_AWAITING_DELIVERABLE
+    out["next_action_hint"] = (
+        f"awaiting {assignee or 'an out-of-band delivery'} — record it with board_deliver({fid}, text=…)"
+    )
+    return out
+
+
+def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
+    """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
+    that owes the PM a next action — an ``in_review`` card from the board's config
+    (``auto_merge``, ``review_gate``, via ``merge_posture``) and a parked ``in_progress``
+    task awaiting a deliverable (#305, via ``task_posture``). Labels + config only, no
+    per-row network. Rows in any other state are left untouched (the payload shape for
+    them is unchanged). Mutates and returns ``feats``.
 
     ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
     routers and the tools alike; ``BoardLoop.reload`` writes every changed live knob
     back into it), so a Settings save flips the posture without a restart.
+
+    ``is_driven`` is a fid→bool predicate deciding whether a task is being actively
+    driven (so it is working, NOT awaiting a deliverable); it defaults to the loop's
+    live-drive registry and is injectable for tests.
 
     A row that ``annotate_ci_status`` stamped ``ci_status == "failing"`` is demoted:
     "merge #N" / "auto-merge pending" on a red PR is the wrong hint — it reads
@@ -2641,11 +2703,17 @@ def annotate_next_action(feats: list[dict], cfg: dict) -> list[dict]:
     (a review in progress on a red PR is still a review in progress)."""
     auto_merge = knob_bool(cfg, "auto_merge", False, strict=False)
     review_gate = knob_bool(cfg, "review_gate", False, strict=False)
+    if is_driven is None:
+        is_driven = _live_drive_predicate()
     for f in feats:
         posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate)
         if not posture["next_action"]:
-            continue
-        if f.get("ci_status") == "failing" and posture["next_action"] in (
+            # #305: not an in_review card — the one other card that owes the PM a next
+            # action is a parked task awaiting an out-of-band deliverable.
+            posture = task_posture(f, is_driven=is_driven)
+            if not posture["next_action"]:
+                continue
+        elif f.get("ci_status") == "failing" and posture["next_action"] in (
             NEXT_ACTION_AWAITING_MERGE,
             NEXT_ACTION_AUTO_MERGE_PENDING,
             NEXT_ACTION_DRAFT,
