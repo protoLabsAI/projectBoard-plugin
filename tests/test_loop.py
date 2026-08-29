@@ -2930,6 +2930,356 @@ async def test_reconcile_orphan_requeues_a_dead_a2a_task(monkeypatch):
     assert store.names() == ["requeue"]
 
 
+# ── #311: dispatch a self-assigned task through the host agent (HOST.invoke) ──────
+
+
+def _fake_host(invoke):
+    """A host stand-in exposing just the ``invoke`` seam ``dispatch_self`` reaches."""
+    import types
+
+    return types.SimpleNamespace(invoke=invoke)
+
+
+# ---- coder_seam.dispatch_self / host_invoke_available (the seam itself) ----------
+
+
+def test_host_invoke_available_feature_detects_the_seam():
+    """r2: the seam is present only when the host exposes a CALLABLE ``invoke`` — a host
+    (or a test env) without it degrades to the parked path."""
+    assert coder_seam.host_invoke_available(_fake_host(lambda *a, **k: None)) is True
+    import types
+
+    assert coder_seam.host_invoke_available(types.SimpleNamespace()) is False  # no invoke attr
+    assert coder_seam.host_invoke_available(types.SimpleNamespace(invoke="not-callable")) is False
+    assert coder_seam.host_invoke_available(None) is False  # standalone env → import misses
+
+
+async def test_dispatch_self_passes_tool_fence_when_the_host_supports_it():
+    """The optional ``tool_fence`` parameter is feature-detected via inspect.signature and
+    passed EXPLICITLY as None (unfenced first-party work) when the host's invoke declares
+    it — proven by a sentinel default that only stays put if nothing was passed."""
+    sentinel = object()
+    seen = {}
+
+    async def invoke(prompt, session_id, *, tool_fence=sentinel):
+        seen["args"] = (prompt, session_id)
+        seen["tool_fence"] = tool_fence
+        return "the self deliverable"
+
+    out = await coder_seam.dispatch_self("do the work", "sess-1", _host=_fake_host(invoke))
+    assert out == "the self deliverable"
+    assert seen["args"] == ("do the work", "sess-1")
+    assert seen["tool_fence"] is None  # passed explicitly — NOT the sentinel default
+
+
+async def test_dispatch_self_omits_tool_fence_on_an_older_host():
+    """A host whose ``invoke`` predates ``tool_fence`` is called withOUT it — if
+    dispatch_self wrongly forced the kwarg this would TypeError, so a clean return proves
+    the guard held (backward-compatible with older hosts)."""
+    seen = {}
+
+    async def invoke(prompt, session_id):  # no tool_fence parameter
+        seen["args"] = (prompt, session_id)
+        return "reply"
+
+    out = await coder_seam.dispatch_self("x", "sess-2", _host=_fake_host(invoke))
+    assert out == "reply"
+    assert seen["args"] == ("x", "sess-2")
+
+
+async def test_dispatch_self_supports_a_sync_host_invoke():
+    """``invoke`` may be sync (a plain return, not a coroutine) — a non-awaitable result
+    is handed straight back rather than awaited."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "sync reply"
+
+    assert await coder_seam.dispatch_self("x", "s", _host=_fake_host(invoke)) == "sync reply"
+
+
+async def test_dispatch_self_raises_worktree_error_when_the_host_lacks_invoke():
+    """No ``invoke`` seam ⇒ a WorktreeError (the same shape the loop's coder-failure
+    classifier blocks on) — the caller normally guards with host_invoke_available first."""
+    import types
+
+    with pytest.raises(worktree.WorktreeError):
+        await coder_seam.dispatch_self("x", "s", _host=types.SimpleNamespace())
+
+
+async def test_dispatch_self_normalises_a_host_failure_to_worktree_error():
+    """A raw host exception is normalised to WorktreeError, exactly like dispatch_task's
+    DelegateError path — so the loop classifies+blocks a self-dispatch the same way."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        raise RuntimeError("host agent blew up")
+
+    with pytest.raises(worktree.WorktreeError):
+        await coder_seam.dispatch_self("x", "s", _host=_fake_host(invoke))
+
+
+async def test_dispatch_self_normalises_a_timeout_to_coder_timeout():
+    """A host invoke that overruns ``timeout`` surfaces as CoderTimeout (the coder-path
+    timeout class), bounded by the passed coder_timeout_s."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        await asyncio.sleep(10)
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self("x", "s", timeout=0.01, _host=_fake_host(invoke))
+
+
+# ---- config + the self-assignee / session-id helpers ----------------------------
+
+
+def test_agent_name_config():
+    assert BoardLoop({}).agent_name == ""  # no configured board agent name
+    assert BoardLoop({"agent_name": "roxy"}).agent_name == "roxy"
+    assert BoardLoop({"agent_name": "  roxy  "}).agent_name == "roxy"  # stripped
+
+
+def test_is_self_assignee_matches_aliases_and_the_configured_name():
+    loop = BoardLoop({"agent_name": "Roxy"})
+    assert loop._is_self_assignee("self")
+    assert loop._is_self_assignee("agent")
+    assert loop._is_self_assignee("SELF")  # aliases are case-insensitive
+    assert loop._is_self_assignee("roxy")  # the configured name, case-insensitive
+    assert loop._is_self_assignee("Roxy")
+    assert not loop._is_self_assignee("")  # empty / unassigned
+    assert not loop._is_self_assignee("alice")  # a human
+    assert not loop._is_self_assignee("quinn")  # a sister agent
+    # With no agent_name configured, only the reserved aliases are self.
+    bare = BoardLoop({})
+    assert bare._is_self_assignee("agent")
+    assert not bare._is_self_assignee("roxy")
+
+
+def test_self_session_id_is_stable_per_card():
+    loop = BoardLoop({})
+    assert loop._self_session_id("bd-1") == "project_board:self:bd-1"
+    assert loop._self_session_id("bd-1") == loop._self_session_id("bd-1")  # stable across attempts
+    assert loop._self_session_id("bd-1") != loop._self_session_id("bd-2")  # per-card
+
+
+# ---- the loop's self-dispatch branch --------------------------------------------
+
+
+async def test_self_assigned_task_dispatches_via_host_invoke(monkeypatch):
+    """r1: a task whose assignee is a reserved self alias — resolving to NO sister-agent
+    delegate — is dispatched through HOST.invoke (not parked), with a stable per-card
+    session_id and coder_timeout_s, and its reply recorded as the deliverable →
+    in_review. It counts as a started drive."""
+    store = _TaskStore(
+        [_task("bd-self", assignee="self", spec="Write the RFC", criteria="WHEN done THE SYSTEM SHALL publish")]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_worktree(*a, **k):
+        raise AssertionError("a self-task must NOT create a git worktree")
+
+    monkeypatch.setattr(worktree, "create_worktree", _no_worktree)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+
+    seen = {}
+
+    async def _dispatch_self(prompt, session_id, *, timeout=None):
+        seen["prompt"] = prompt
+        seen["session_id"] = session_id
+        seen["timeout"] = timeout
+        return "The RFC deliverable."
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _dispatch_self)
+
+    loop = BoardLoop({"coder": "proto", "coder_timeout_s": 1800})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # 'self' is no delegate
+
+    assert await loop._spawn_ready() is True  # a self-task IS a drive → counts as started
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)  # let the done-callback run
+
+    assert store.claimed == ["bd-self"]
+    assert seen["session_id"] == "project_board:self:bd-self"  # stable, per-card
+    assert seen["timeout"] == 1800  # coder_timeout_s
+    assert "Write the RFC" in seen["prompt"]  # the spec…
+    assert "WHEN done THE SYSTEM SHALL publish" in seen["prompt"]  # …and the acceptance criteria
+    assert ("record_delivery", "bd-self", "The RFC deliverable.") in store.calls
+    assert loop._drives == set() and loop._inflight_files == {}  # the slot released on completion
+    assert loop._self_dispatch_fid is None  # the recursion gate released too
+
+
+async def test_a_configured_agent_name_self_dispatches(monkeypatch):
+    """r1: the board's configured ``agent_name`` (not just the reserved aliases) routes a
+    task to HOST.invoke when it resolves to no sister-agent delegate."""
+    store = _TaskStore([_task("bd-mine", assignee="Roxy")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+
+    async def _dispatch_self(prompt, session_id, *, timeout=None):
+        return "done by me"
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _dispatch_self)
+    loop = BoardLoop({"coder": "proto", "agent_name": "roxy"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    assert await loop._spawn_ready() is True
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert ("record_delivery", "bd-mine", "done by me") in store.calls
+
+
+async def test_self_assigned_task_parks_when_host_lacks_invoke(monkeypatch, caplog):
+    """r2: on a host without HOST.invoke a self-assigned task PARKS in_progress with the
+    existing park log line — never dispatched, never blocked (honest degrade)."""
+    store = _TaskStore([_task("bd-self", assignee="self")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: False)  # host predates the seam
+
+    async def _no_self(*a, **k):
+        raise AssertionError("no self-dispatch without HOST.invoke")
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _no_self)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        assert await loop._spawn_ready() is False  # parked → nothing started this tick
+    assert store.claimed == ["bd-self"]  # …but it WAS claimed to in_progress
+    assert loop._drives == set()  # holds no concurrency slot
+    assert "bd-self" not in loop._inflight_files
+    assert loop._self_dispatch_fid is None
+    assert store.calls == []  # no delivery, no block — just parked
+    assert any("parked in_progress" in r.getMessage() for r in caplog.records)  # the existing log line
+
+
+async def test_self_dispatch_consumes_a_concurrency_slot(monkeypatch):
+    """r1: a live self-dispatch is a real drive — it counts toward max_concurrent, so a
+    coding feature behind it does NOT also claim the single slot this tick."""
+    store = _TaskStore([_task("bd-self", assignee="self"), _ready("bd-feat", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+    release = asyncio.Event()
+
+    async def _held_self(prompt, session_id, *, timeout=None):
+        await release.wait()
+        return "done"
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _held_self)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    try:
+        assert await loop._spawn_ready() is True
+        assert store.claimed == ["bd-self"]  # the self-task took the ONE slot…
+        assert len(loop._drives) == 1  # …and holds it (bd-feat never reached — cap full)
+        assert loop._self_dispatch_fid == "bd-self"
+    finally:
+        release.set()
+        await asyncio.gather(*list(loop._drives), return_exceptions=True)
+        await asyncio.sleep(0)
+    assert loop._self_dispatch_fid is None  # released on completion
+
+
+async def test_second_self_assigned_task_parks_while_one_is_in_flight(monkeypatch):
+    """r3: only ONE self-dispatch is in flight per board — a second self-assigned task
+    parks (no recursion into the host) while the first runs, then the gate reopens."""
+    c1 = _task("bd-self-1", assignee="self")
+    c2 = _task("bd-self-2", assignee="self")
+    store = _TaskStore([c1, c2])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+    release = asyncio.Event()
+
+    async def _held_self(prompt, session_id, *, timeout=None):
+        await release.wait()
+        return "done"
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _held_self)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    out1 = await loop._dispatch_task(store, c1)
+    out2 = await loop._dispatch_task(store, c2)
+    assert out1 == "host"  # first self-task dispatched via HOST.invoke
+    assert out2 == "parked"  # second parks — a self-dispatch is already in flight
+    assert loop._self_dispatch_fid == "bd-self-1"
+    assert len(loop._drives) == 1  # only the first holds a slot
+    assert "bd-self-2" not in loop._inflight_files  # the parked one holds nothing
+
+    release.set()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert loop._self_dispatch_fid is None  # the gate reopened for the next tick
+
+
+async def test_a_resolved_delegate_wins_over_self_dispatch(monkeypatch):
+    """r4: a self-alias name that ALSO resolves to a sister-agent delegate dispatches over
+    that delegate (acp/a2a), never HOST.invoke — the delegate path is unaffected."""
+    store = _TaskStore([_task("bd-agent", assignee="agent")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)  # available but must NOT be used
+
+    seen = {}
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        seen["delegate"] = delegate
+        return "sister deliverable"
+
+    async def _no_self(*a, **k):
+        raise AssertionError("a resolved sister-agent delegate must win over self-dispatch")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+    monkeypatch.setattr(coder_seam, "dispatch_self", _no_self)
+
+    acp = _sister("acp")
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: acp if expect == "acp" else None)
+
+    assert await loop._spawn_ready() is True
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert seen["delegate"] is acp  # dispatched over the ACP delegate, not the host
+    assert ("record_delivery", "bd-agent", "sister deliverable") in store.calls
+    assert loop._self_dispatch_fid is None  # the self gate never engaged
+
+
+async def test_self_dispatch_failure_is_classified_and_blocks(monkeypatch):
+    """r5: a HOST.invoke failure (surfaced as WorktreeError) is classified like a coder
+    failure and blocks the card with the CLASSIFIED reason — no deliverable recorded,
+    same terminal edge as the acp/a2a task paths, and the recursion gate releases."""
+    store = _TaskStore([_task("bd-self", assignee="self")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+
+    async def _boom(prompt, session_id, *, timeout=None):
+        raise worktree.WorktreeError("coder dispatch failed: host agent refused")
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _boom)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    await loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert "flag_blocked" in store.names()
+    assert "record_delivery" not in store.names()
+    reason = next(c[2] for c in store.calls if c[0] == "flag_blocked")
+    assert reason.startswith("terminal:")  # classify() → TERMINAL, the classified reason
+    assert loop._self_dispatch_fid is None  # the gate released even on failure
+
+
+async def test_reconcile_orphan_requeues_a_dead_self_task(monkeypatch):
+    """r3/durability: a self-assigned task whose HOST.invoke drive died mid-flight IS
+    orphaned — recognized as dispatchable (self alias + host seam) and requeued for a
+    clean re-dispatch, not left parked forever."""
+    store = _TaskStore([_task("bd-self", assignee="self")])
+    store.claimed.append("bd-self")  # already in_progress
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda: True)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("bd-self")
+    assert store.names() == ["requeue"]
+
+
 async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch, caplog):
     """#124: when a lower-priority card claims ahead of a higher one, the single
     per-tick claim_decision line must name the selected fid AND why the higher card
