@@ -639,34 +639,30 @@ async def dispatch_coder_tapped(
     async def _tool_cb(event):
         progress_tool(fid, gen, event)
 
-    def _usage_cb(usage):
-        progress_usage(fid, gen, usage or {})
-
-    def _plan_cb(plan):
-        progress_plan(fid, gen, plan)
-
-    def _stop_cb(reason):
-        # The ACP stop-reason / dead-end signal (#198) — the seam surfaces it via this
-        # callback (called on its own way out) instead of the board reading client fields.
-        progress_stop_reason(fid, gen, reason)
-
     # Old adapter-path semantics preserved: no configured timeout = UNBOUNDED dispatch,
     # else hard-bound with asyncio.wait_for exactly as worktree.dispatch_coder does —
     # on timeout the seam coro is cancelled (its own finally reaps the subprocess) and
     # we raise CoderTimeout. The seam owns the client's own internal timeout bookkeeping.
     try:
+        # C1's ACTUAL signature (plugins/coding_agent, `dispatch_tapped`): three
+        # keyword-only STREAM callbacks — `on_tool` / `on_thought` / `on_text` — plus
+        # `timeout`. It takes no usage/plan/stop-reason callbacks: those are wire
+        # signals the seam snapshots off the client the moment the turn ends and
+        # returns ON the result. F7 called it with the private client's kwarg names
+        # (`tool_callback=…`) against a host where the seam did not exist yet, so the
+        # mismatch could not surface until a release carried it — then EVERY dispatch
+        # died on `dispatch_tapped() got an unexpected keyword argument`. The fake in
+        # the test below now mirrors this signature exactly (no **kwargs) so a rename
+        # on either side fails here instead of on a live board.
         coro = tapped(
             scoped,
             prompt,
             timeout=timeout,
-            tool_callback=_tool_cb,
-            thought_callback=_thought_cb,
-            text_callback=_answer_cb,
-            usage_callback=_usage_cb,
-            plan_callback=_plan_cb,
-            stop_reason_callback=_stop_cb,
+            on_tool=_tool_cb,
+            on_thought=_thought_cb,
+            on_text=_answer_cb,
         )
-        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        result = await (asyncio.wait_for(coro, timeout) if timeout else coro)
     except asyncio.CancelledError:
         # Turn stopped (operator/watchdog): the public seam already dropped the pooled
         # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
@@ -678,6 +674,24 @@ async def dispatch_coder_tapped(
         # WorktreeError (this is error normalisation, NOT a fallback — see the seam-absent
         # branch above for the only path that degrades to an untapped dispatch).
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    else:
+        # Drain the returned TappedResult onto the gen BEFORE it closes, so the drawer
+        # shows the same usage/plan/stop-reason the legacy tap sampled off the client.
+        # Outside the `except` on purpose: a shape complaint below is the board's own
+        # verdict, not a below-seam failure to re-wrap (it would double the prefix).
+        progress_usage(fid, gen, getattr(result, "usage", None) or {})
+        progress_plan(fid, gen, getattr(result, "plan", None))
+        progress_stop_reason(fid, gen, getattr(result, "stop_reason", None) or getattr(result, "dead_end", None))
+        reply = getattr(result, "reply", result)
+        if not isinstance(reply, str):
+            # Refuse loudly rather than hand a non-string up the board's reply path,
+            # where it would end up in a PR body. Accepts BOTH known shapes (a
+            # TappedResult, or a bare reply string from a seam that returns one).
+            raise worktree.WorktreeError(
+                f"coder dispatch failed: dispatch_tapped returned {type(result).__name__}, "
+                "expected a TappedResult (or a reply string)"
+            )
+        return reply
     finally:
         progress_end(fid, gen)
 
