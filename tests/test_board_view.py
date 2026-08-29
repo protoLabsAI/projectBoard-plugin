@@ -232,8 +232,10 @@ def test_verify_error_slot_is_present_on_the_approve_path():
     """Regression for the review finding: the error slot (terr-<id>) is emitted OUTSIDE
     the reject-form branch, so a failed Approve (reject form collapsed) still surfaces
     its error instead of being silently dropped by taskErr's `if (el)` guard. Both
-    action states (in_progress form + in_review) own a slot — two `id="terr-` sites."""
-    assert "return deliv + acts + '<div class=\"terr\" id=\"terr-'+id+'\"></div>';" in BOARD_PAGE
+    action states (in_progress form + in_review) own a slot — two `id="terr-` sites.
+    (bd-rdmh: the deliverable moved out of taskExtra into taskDetail, so the in_review
+    return is `acts + …` — the slot is still emitted outside the reject branch.)"""
+    assert "return acts + '<div class=\"terr\" id=\"terr-'+id+'\"></div>';" in BOARD_PAGE
     assert "function taskErr(fid, e)" in BOARD_PAGE
     assert BOARD_PAGE.count('id="terr-') == 2
 
@@ -538,3 +540,110 @@ def test_marked_cdn_script_is_pinned_with_integrity_and_crossorigin():
     )
     assert "s.integrity = MARKED_SRI;" in BOARD_PAGE
     assert 's.crossOrigin = "anonymous";' in BOARD_PAGE
+
+
+# ── task detail moves into the #drawer (bd-rdmh) ─────────────────────────────────
+#
+# Task detail + controls leave the inline Kanban card / list sub-row and move into the
+# existing #drawer. The card keeps only summary content (title, id, priority, doc glyph,
+# state chips) and becomes clickable; the drawer is card-type aware ("Task — <id>") and
+# shows spec / acceptance criteria / any recorded deliverable + the state-appropriate
+# controls. Monitor polling stays coding-only (a task has no coder run). These are
+# structural assertions on the page source — the suite has no JS runtime (see the module
+# docstring), so a "rendered-HTML" check pins the markup the card/drawer paths emit.
+
+
+def test_r1_task_cards_render_no_inline_form_or_action_controls():
+    """r1: a task card in ANY column renders only summary content — the inline task-form
+    markup (textarea / url input / action buttons) is gone from BOTH projections. The
+    Kanban card no longer appends taskExtra, and the list's task sub-row is removed, so
+    taskExtra is reachable ONLY from taskDetail (the drawer)."""
+    # the old inline card append + the old list sub-row are both gone
+    assert '(isTask(f)?taskExtra(f):"")' not in BOARD_PAGE
+    assert 'class="tsub"' not in BOARD_PAGE
+    assert ".tsub>td" not in BOARD_PAGE  # its dead CSS rule is removed too
+    # taskExtra now has exactly two sites: its definition + the one taskDetail call
+    assert BOARD_PAGE.count("taskExtra(f)") == 2
+    # the Kanban card closes summary-only (title row + meta row, no task extra after it)
+    assert "+ flags(f)+' '+taskFoot(f)+'</div></div>';" in BOARD_PAGE
+
+
+def test_r1_task_cards_and_rows_are_clickable_via_a_data_task_handle():
+    """r1/r2: every task card (Kanban) and row (list) carries a data-task handle so a
+    delegated click opens the drawer — two sites, one per projection — and the task card
+    keeps the same dashed-border + document-icon summary chrome."""
+    assert BOARD_PAGE.count("data-task=\"'+esc(f.id)+'\"") == 2
+    assert "(isTask(f) ? ' data-task=\"'+esc(f.id)+'\"' : \"\")" in BOARD_PAGE
+    # clickable cursor + hover cue extends to task cards/rows, not only the monitor ones
+    assert ".card--live,.card--task{cursor:pointer}" in BOARD_PAGE
+    assert "#list tr[data-mon],#list tr[data-task]{cursor:pointer}" in BOARD_PAGE
+
+
+def test_r2_task_drawer_is_card_type_aware_and_shows_spec_ac_and_deliverable():
+    """r2: clicking a task opens the shared drawer titled "Task — <id>" and renders the
+    task's spec, acceptance criteria, and any recorded deliverable (taskDetail)."""
+    assert "function openTask(fid)" in BOARD_PAGE
+    assert 'openTask(taskEl.getAttribute("data-task"))' in BOARD_PAGE
+    assert '$("drawer-title").textContent = "Task — " + fid;' in BOARD_PAGE
+    assert "function taskDetail(f)" in BOARD_PAGE
+    assert "function renderTask()" in BOARD_PAGE
+    # spec / acceptance criteria / deliverable, each esc()'d, under a labelled section
+    assert '<div class="tlbl">spec</div>' in BOARD_PAGE
+    assert "esc(f.spec)" in BOARD_PAGE
+    assert '<div class="tlbl">acceptance criteria</div>' in BOARD_PAGE
+    assert "esc(f.acceptance_criteria)" in BOARD_PAGE
+    assert '<div class="tlbl">deliverable</div>' in BOARD_PAGE
+    assert "esc(f.deliverable)" in BOARD_PAGE
+    # the drawer reads the already-loaded feature row — no new per-open fetch infra
+    assert "FEATURES.find(x => x.id === TASK_FID)" in BOARD_PAGE
+    # its detail styles are drawer-scoped and token-driven
+    assert "#drawer .tlbl{" in BOARD_PAGE
+    assert "#drawer .tspec{" in BOARD_PAGE
+
+
+def test_r2_deliver_approve_reject_still_post_through_the_unchanged_routes():
+    """r2: the controls moved into the drawer, but the mutation routes are unchanged —
+    deliver posts {text, ref}, approve/reject post the verify verdict."""
+    assert '"/deliver", {text: text, ref: ref}' in BOARD_PAGE
+    assert '"/verify", {approved: true}' in BOARD_PAGE
+    assert '"/verify", {approved: false, feedback: feedback}' in BOARD_PAGE
+    # the reject toggle re-renders the OPEN drawer (not the board), and a successful
+    # deliver/verify reloads then re-renders the drawer so it reflects the new state
+    assert "if (TASK_FID === fid) renderTask();" in BOARD_PAGE
+    assert "if (TASK_FID) renderTask();" in BOARD_PAGE
+
+
+def test_r3_coding_cards_poll_but_task_cards_never_do():
+    """r3: the coding-only monitor condition is refactored so a task can open the drawer
+    WITHOUT starting monitor polling. openMonitor sets up the ~3s interval; openTask
+    clears any live poll and renders statically — it never calls setInterval/pollMonitor.
+    The card/row gates still exclude tasks from the data-mon monitor handle."""
+    assert "const mon = live && !isTask(f);" in BOARD_PAGE  # kanban gate
+    assert 'const mon = f.state==="in_progress" && !isTask(f);' in BOARD_PAGE  # list gate
+    assert 'openMonitor(el.getAttribute("data-mon"))' in BOARD_PAGE
+    assert "MON_TIMER = setInterval(pollMonitor, MON_POLL_MS);" in BOARD_PAGE  # coding polls
+    # openTask is poll-free — no interval, no progress poll inside it
+    body = BOARD_PAGE[BOARD_PAGE.index("function openTask(fid)") :]
+    body = body[: body.index("\n}")]
+    assert "setInterval" not in body
+    assert "pollMonitor" not in body
+    assert "MON_FID = null;" in body  # it also stops any monitor that was live
+    assert "renderTask();" in body
+    # a distinct module-scoped id tracks the open task drawer, separate from MON_FID
+    assert "let TASK_FID = null;" in BOARD_PAGE
+
+
+def test_r4_esc_and_scrim_close_the_drawer_and_role_dialog_is_retained():
+    """r4: the existing drawer dialog + Esc + scrim behavior is preserved. The one close
+    routine (closeMonitor — button, scrim, and Esc all route through it) now also clears
+    the open task drawer, and the drawer keeps role="dialog"."""
+    assert 'e.key === "Escape"' in BOARD_PAGE  # Esc closes
+    assert '$("scrim").addEventListener("click", closeMonitor)' in BOARD_PAGE  # scrim closes
+    assert 'role="dialog"' in BOARD_PAGE  # the drawer stays a dialog
+    # the single close routine clears BOTH the monitor and the task drawer
+    body = BOARD_PAGE[BOARD_PAGE.index("function closeMonitor()") :]
+    body = body[: body.index("\n}")]
+    assert "MON_FID = null;" in body
+    assert "TASK_FID = null;" in body
+    # a link click just navigates — it never opens a drawer (guards the card's ref/PR link)
+    assert 'if (e.target.closest("a[href]")) return;' in BOARD_PAGE
