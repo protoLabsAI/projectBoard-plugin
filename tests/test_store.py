@@ -3369,6 +3369,41 @@ def test_record_delivery_rejects_a_coding_feature(make_board, monkeypatch):
     assert br.cmds("update") == [] and br.cmds("comments") == []  # nothing written on the refusal
 
 
+def test_record_delivery_stamps_delivered_by_the_assignee(make_board, monkeypatch):
+    """#316 r1: an in-progress task assigned to `alice`, on delivery, records BOTH the
+    deliverable AND a `delivered-by: alice` provenance stamp — and the stamp lands
+    BEFORE the in_review move (the actor is captured at delivery time, not after)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task", "assignee": "alice"}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", text="triage report written")
+    assert ("comments", "add", "bd-t", "deliverable: triage report written") in br.calls
+    assert ("comments", "add", "bd-t", "delivered-by: alice") in br.calls
+    # provenance is a comment, never a label (actor values are free text, #101)…
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-t", "--add-label", "in-review")
+    # …and every provenance write precedes the in_review update (stamped "before" the move)
+    update_idx = next(i for i, c in enumerate(br.calls) if c[0] == "update")
+    assert all(i < update_idx for i, c in enumerate(br.calls) if c[0] == "comments")
+
+
+def test_record_delivery_stamps_the_store_actor_when_unassigned(make_board, monkeypatch):
+    """#316 r2: an unassigned task has no assignee to credit, so the delivery stamps
+    the STORE actor as the deliverer instead."""
+    br = Br()
+    b = make_board(br)
+    b.actor = "delivery-bot"
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "board_state": "in_progress", "issue_type": "task", "assignee": ""}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
+    b.record_delivery("bd-t", text="done")
+    assert ("comments", "add", "bd-t", "delivered-by: delivery-bot") in br.calls
+
+
 def test_record_verification_approved_closes_with_a_verified_reason(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
@@ -3639,6 +3674,43 @@ def test_project_deliverable_falls_back_to_a_label(make_board):
 def test_project_deliverable_defaults_empty_for_coding_features(make_board):
     b = make_board(Br())
     assert b._project({"id": "x", "status": "open", "labels": []})["deliverable"] == ""
+
+
+# ── _project: the delivered_by field (#316) ──────────────────────────────────────
+
+
+def test_project_delivered_by_reads_the_latest_comment(make_board):
+    """#316 r3: _project surfaces the NEWEST `delivered-by:` comment, mirroring the
+    latest-deliverable scan — the stamp wins over the bead's assignee."""
+    b = make_board(Br())
+    f = b._project(
+        {
+            "id": "bd-t",
+            "status": "in_progress",
+            "labels": ["in-review"],
+            "issue_type": "task",
+            "assignee": "alice",
+            "comments": [
+                "delivered-by: bob",  # bare-string comment shape (br 0.1.x)
+                {"text": "attempt 1 (tier=smart): ok"},
+                {"text": "delivered-by: carol"},
+            ],
+        }
+    )
+    assert f["delivered_by"] == "carol"  # the LATEST stamp wins, over earlier stamps AND the assignee
+
+
+def test_project_delivered_by_falls_back_to_the_assignee_for_a_legacy_bead(make_board):
+    """#316 r3: a task delivered before the stamp existed carries no `delivered-by:`
+    comment — _project falls back to the bead's assignee (the provenance it does have)."""
+    b = make_board(Br())
+    bead = {"id": "bd-t", "status": "in_progress", "labels": ["in-review"], "issue_type": "task", "assignee": "dave"}
+    assert b._project(bead)["delivered_by"] == "dave"
+
+
+def test_project_delivered_by_defaults_empty_with_no_stamp_or_assignee(make_board):
+    b = make_board(Br())
+    assert b._project({"id": "x", "status": "open", "labels": []})["delivered_by"] == ""
 
 
 # ── `br --json` failures: the reason is on STDOUT, and a missing id is data (#255) ──

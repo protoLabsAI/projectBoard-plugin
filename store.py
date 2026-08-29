@@ -254,6 +254,15 @@ LABEL_TASK = "task"
 # carries comments; a `br list` row projects ""). A `deliverable:<ref>` label is the
 # fallback for beads authored outside record_delivery with a label-safe ref.
 LABEL_DELIVERABLE_PREFIX = "deliverable:"
+# Who delivered the task (#316): `record_delivery` stamps a `delivered-by: <actor>`
+# comment beside the `deliverable:` record — the actor is the task's assignee AT
+# DELIVERY TIME (falling back to the store actor when unassigned), captured then so a
+# later reassignment can't rewrite who actually delivered. A comment, not a label:
+# actor values are free text (spaces, punctuation) that beads' label validator would
+# reject (the #101 lesson, same reason the deliverable text rides a comment). `_project`
+# reads the LATEST one back into `delivered_by`, mirroring the deliverable scan; a task
+# delivered before this stamp existed has none, so it falls back to `assignee`.
+DELIVERED_BY_PREFIX = "delivered-by:"
 # What the puller admits (#217): coding features AND task-type beads — everything
 # else (epics, milestones) stays structural and is never claimed.
 PULLABLE_ISSUE_TYPES = ("feature", "task")
@@ -1627,6 +1636,13 @@ class BeadsBoard:
                 text = f"{text} ({ref})" if text else ref
         if text:
             self.comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
+        # Actor provenance (#316): stamp WHO delivered, beside the deliverable record and
+        # BEFORE the in_review move — the task's assignee at delivery time, falling back to
+        # the store actor when unassigned. Captured now (not read off the bead later) so a
+        # reassignment after delivery can't rewrite the deliverer; _project reads the latest
+        # `delivered-by:` comment back into `delivered_by`.
+        delivered_by = str(f.get("assignee") or "").strip() or self.actor
+        self.comment(fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if external_ref:
             args += ["--external-ref", external_ref]
@@ -2439,11 +2455,20 @@ class BeadsBoard:
             (l[len(LABEL_DELIVERABLE_PREFIX) :].strip() for l in labels if l.startswith(LABEL_DELIVERABLE_PREFIX)),
             "",
         )
+        # Who delivered the task (#316): the LATEST `delivered-by:` comment
+        # (record_delivery's stamp), read in the SAME comment pass as the deliverable.
+        # A task delivered before this stamp existed carries none, so seed the fallback
+        # with the bead's `assignee` — the actor provenance a legacy bead does have.
+        # ("delivered-by:" is not a prefix of "deliverable:" nor vice versa, so the two
+        # scans never cross-match.)
+        delivered_by = bead.get("assignee", "")
         for c in bead.get("comments") or []:
             txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
             txt = txt.strip()
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
+            elif txt.startswith(DELIVERED_BY_PREFIX):
+                delivered_by = txt[len(DELIVERED_BY_PREFIX) :].strip()
         # The bead `notes` field carries files_to_modify (one path per line), the
         # requirement ledger (#113, one `req: {…}` line per item), AND the
         # originating-issue record (#97) as a `source-issue: owner/repo#N` metadata
@@ -2499,6 +2524,7 @@ class BeadsBoard:
             "budgets": budgets_from_labels(labels),
             "verified_sha": verified_sha,
             "deliverable": deliverable,
+            "delivered_by": delivered_by,
             "source_issue": source_issue,
             "requirements": requirements,
             "project": project,
