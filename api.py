@@ -742,15 +742,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.post("/features/{fid}/verify")
     async def _verify(fid: str, body: dict = Body(default={})):
         """The task-type Done edge (#217) — ``record_merge``'s verify sibling. Body:
-        ``{approved?: bool=true, feedback?}``. ``approved=true`` closes the task with
-        a `verified: <actor>` reason; ``approved=false`` records the ``feedback`` as a
+        ``{approved?: bool=true, feedback?, by?}``. ``approved=true`` closes the task
+        with a `verified: <by>` reason; ``approved=false`` records the ``feedback`` as a
         comment (the re-dispatch prompt injects it, the adverse-review shape) and
         requeues the bead to ready. Expects in_review. TASK-ONLY: a coding feature is
-        refused (it closes via ``record_merge``, the ONE Done edge for code)."""
+        refused (it closes via ``record_merge``, the ONE Done edge for code).
+
+        ``by`` names the verifier (#316 S3b). An HTTP/console verification is OUT-OF-BAND
+        by construction, so an omitted ``by`` defaults to ``"operator"`` — NOT the store
+        actor (record_verification's own fallback): defaulting to the actor would falsely
+        flag an agent-delivered task, verified in the console, as self-verified. An
+        explicit ``by`` is forwarded unchanged (S3c owns the agent-tool default seam)."""
         body = body or {}
         approved = bool(body.get("approved", True))
+        by = str(body.get("by") or "operator")
         return await _guard(
-            lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")))
+            lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")), by=by)
         )
 
     @router.delete("/features/{fid}")

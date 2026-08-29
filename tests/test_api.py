@@ -119,9 +119,10 @@ class FakeStore:
         self.calls.append(("record_delivery", (fid,), {"text": text, "ref": ref}))
         return {"id": fid, "issue_type": "task", "board_state": "in_review", "deliverable": text, "external_ref": ref}
 
-    def record_verification(self, fid, approved=True, feedback=""):
+    def record_verification(self, fid, approved=True, feedback="", by=""):
         # approve → done (closed); reject → requeued to ready — the real store's edges (#217).
-        self.calls.append(("record_verification", (fid,), {"approved": approved, "feedback": feedback}))
+        # `by` names the verifier (#316 S3b) — the API route forwards it (operator by default).
+        self.calls.append(("record_verification", (fid,), {"approved": approved, "feedback": feedback, "by": by}))
         return {"id": fid, "issue_type": "task", "board_state": "done" if approved else "ready"}
 
     def escalate(self, fid, reason):
@@ -1059,12 +1060,12 @@ def test_deliver_route_surfaces_an_invalid_state_or_type_as_400(monkeypatch):
 
 def test_verify_route_approve_closes_the_task_to_done(monkeypatch):
     """POST /features/{fid}/verify with {approved: true} forwards approved+feedback and
-    returns the done (closed) projection (#217)."""
+    returns the done (closed) projection (#217). With no `by` it forwards operator (S3b)."""
     store = FakeStore()
     c = _client(monkeypatch, store)
     r = c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True})
     assert r.status_code == 200
-    assert ("record_verification", ("bd-1",), {"approved": True, "feedback": ""}) in store.calls
+    assert ("record_verification", ("bd-1",), {"approved": True, "feedback": "", "by": "operator"}) in store.calls
     assert r.json()["board_state"] == "done"
 
 
@@ -1075,7 +1076,7 @@ def test_verify_route_defaults_approved_true_when_body_omits_it(monkeypatch):
     c = _client(monkeypatch, store)
     r = c.post("/api/plugins/project_board/features/bd-2/verify")
     assert r.status_code == 200
-    assert ("record_verification", ("bd-2",), {"approved": True, "feedback": ""}) in store.calls
+    assert ("record_verification", ("bd-2",), {"approved": True, "feedback": "", "by": "operator"}) in store.calls
     assert r.json()["board_state"] == "done"
 
 
@@ -1092,9 +1093,75 @@ def test_verify_route_reject_requeues_to_ready_with_feedback(monkeypatch):
     assert (
         "record_verification",
         ("bd-1",),
-        {"approved": False, "feedback": "missing the summary table"},
+        {"approved": False, "feedback": "missing the summary table", "by": "operator"},
     ) in store.calls
     assert r.json()["board_state"] == "ready"
+
+
+# ── #316 S3b: the API/console verify is OUT-OF-BAND → attribute to the operator ──────
+# `POST /features/{fid}/verify` forwards `by`; an omitted `by` defaults to "operator"
+# (NOT record_verification's own store-actor fallback), so an agent-delivered task
+# verified in the console is attributed to the operator and is NOT flagged self-verified.
+
+
+def test_verify_route_forwards_an_explicit_by_unchanged(monkeypatch):
+    """r1: a caller-supplied `by` rides through to record_verification verbatim — the
+    route never rewrites an explicit verifier identity."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True, "by": "alice"})
+    assert r.status_code == 200
+    assert ("record_verification", ("bd-1",), {"approved": True, "feedback": "", "by": "alice"}) in store.calls
+
+
+def test_verify_route_defaults_omitted_by_to_operator_not_the_store_actor(monkeypatch):
+    """r2: with no `by` in the body the route forwards `by="operator"` — an HTTP/console
+    verification is out-of-band, so it must NOT fall through to record_verification's own
+    store-actor default (which would let an agent-delivered task read as self-verified)."""
+    store = FakeStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-2/verify", json={"approved": True})
+    assert r.status_code == 200
+    call = next(call for call in store.calls if call[0] == "record_verification")
+    assert call[2]["by"] == "operator"  # not "" (which the store would resolve to its actor)
+
+
+def test_verify_route_omitted_by_of_an_agent_delivered_task_is_operator_not_self_verified(monkeypatch):
+    """r3: the regression. A task DELIVERED by the store's agent actor, then verified
+    over the API with no `by`, must be attributed to the operator and NOT self-verified.
+    If the route defaulted `by` to the store actor (forwarding "" and letting the store's
+    `by or self.actor` fall back to the delivering agent), verifier == deliverer and the
+    close would be flagged self-verified — the flag would lose its meaning for the exact
+    out-of-band console verification this edge exists to serve."""
+
+    class SelfVerifyStore(FakeStore):
+        # The store actor IS the agent that delivered the task, so an omitted `by` that
+        # fell through to the store default would match the deliverer and self-flag.
+        actor = "proto-agent"
+
+        def record_verification(self, fid, approved=True, feedback="", by=""):
+            self.calls.append(("record_verification", (fid,), {"approved": approved, "feedback": feedback, "by": by}))
+            verifier = by or self.actor  # record_verification's own `by or self.actor` fallback
+            deliverer = self.actor  # delivered_by == the agent actor (an agent-delivered task)
+            return {
+                "id": fid,
+                "issue_type": "task",
+                "board_state": "done" if approved else "ready",
+                "verified_by": verifier,
+                "self_verified": verifier.strip().casefold() == deliverer.casefold(),
+            }
+
+    store = SelfVerifyStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["verified_by"] == "operator"  # attributed to the operator, not the delivering agent
+    assert body["self_verified"] is False  # and therefore NOT self-verified
+    # The route forwarded an explicit "operator"; had it forwarded "" the store would have
+    # resolved the delivering agent and this same call would have self-flagged.
+    call = next(call for call in store.calls if call[0] == "record_verification")
+    assert call[2]["by"] == "operator"
 
 
 def test_verify_route_surfaces_an_invalid_state_or_type_as_400(monkeypatch):
@@ -1102,7 +1169,7 @@ def test_verify_route_surfaces_an_invalid_state_or_type_as_400(monkeypatch):
     the BoardError as a JSON 400 via the shared _guard."""
 
     class WrongState(FakeStore):
-        def record_verification(self, fid, approved=True, feedback=""):
+        def record_verification(self, fid, approved=True, feedback="", by=""):
             raise BoardError("record_verification expects in_review, got 'in_progress'")
 
     c = _client(monkeypatch, WrongState())
