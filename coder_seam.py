@@ -677,19 +677,35 @@ async def dispatch_coder_tapped(
 
 
 async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) -> str:
-    """Dispatch a task-type bead's spec to its assignee delegate via ``delegate_to``
-    (#217) and return the reply — the deliverable a task ships instead of a diff.
+    """Dispatch a task-type bead's spec to its assignee sister-agent delegate and
+    return the reply — the deliverable a task ships instead of a diff.
+
+    The assignee is a sister agent of EITHER type: an ``acp`` coder delegate (a real
+    ACP session) or an ``a2a`` sister agent — the SAME transport review dispatch
+    already reaches over ``ADAPTERS["a2a"]``. The adapter is selected by the
+    delegate's own ``type`` (#304); a delegate that carries no type defaults to
+    ``acp`` (the pre-#304 behaviour). Both dispatch over their native transport and
+    the reply is handed straight to ``record_delivery`` by the loop.
 
     Unlike ``dispatch_coder``/``dispatch_coder_tapped`` there is NO worktree scoping:
     a task produces a doc/decision/artifact, not a code change, so the delegate runs
-    in its own context and its reply IS the deliverable (the loop hands it straight to
-    ``record_delivery``). Same teardown discipline (reap the ACP subprocess on every
-    exit) and the same error normalisation as ``dispatch_coder`` — a ``DelegateError``
-    surfaces as ``WorktreeError`` and a timeout as ``CoderTimeout`` — so the loop's
-    coder-failure classifier handles a task-dispatch failure with the identical code."""
+    in its own context and its reply IS the deliverable. Same teardown discipline
+    (reap the delegate on every exit — the ``finally``) and the same error
+    normalisation as ``dispatch_coder`` — a ``DelegateError`` surfaces as
+    ``WorktreeError`` and a timeout as ``CoderTimeout`` — so the loop's coder-failure
+    classifier blocks a task-dispatch failure of either type with the identical code.
+
+    Fire-and-forget only (#304): the reply is awaited inline, bounded by ``timeout``
+    (``coder_timeout_s``, 30 minutes by default). There is no correlation-id /
+    long-running task state or ingress route — leaving a task unassigned and using
+    ``POST /features/{id}/deliver`` remains the separate long-running workaround."""
     from plugins.delegates.adapters import ADAPTERS, DelegateError
 
-    adapter = ADAPTERS["acp"]
+    # Select the adapter by the delegate's own type (acp | a2a). ``or ADAPTERS["acp"]``
+    # short-circuits when the type resolves an adapter, so a typeless double (or an
+    # unknown type) degrades to the acp path without ever touching a missing "acp" slot.
+    kind = str(getattr(delegate, "type", "") or "acp")
+    adapter = ADAPTERS.get(kind) or ADAPTERS["acp"]
     try:
         coro = adapter.dispatch(delegate, prompt, timeout=timeout)
         return await (asyncio.wait_for(coro, timeout) if timeout else coro)
