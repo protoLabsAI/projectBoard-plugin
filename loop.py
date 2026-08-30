@@ -57,6 +57,7 @@ from .store import (
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
+    LABEL_REVIEWED_HEAD_PREFIX,
     LABEL_TASK,
     _all_items_disposed,
     apply_requirement_dispositions,
@@ -79,6 +80,13 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # ``_verify_merged_state`` truncates the live origin/<base> to the SAME width so the
 # ``stamped == current`` currency check stays exact.
 _MERGED_VERIFIED_SHA_LEN = 12
+
+# The review-verdict head stamp (#328) rides a ``reviewed-head:<sha>`` LABEL under the
+# SAME 50-char beads label cap that forced ``merged-verified:`` short (#135) — so the PR
+# head sha is abbreviated to the same 12-char width, and the reconcile's stale-verdict
+# check truncates the live head to this width before comparing (``stamped == current``
+# stays exact only when both sides use the same abbreviation).
+_REVIEWED_HEAD_SHA_LEN = 12
 
 # After this many consecutive failed reap attempts for the same worktree path, stop
 # logging at WARNING and downgrade to DEBUG to avoid log spam (e.g. 464 lines for
@@ -2572,6 +2580,24 @@ class BoardLoop:
                         continue  # blocked on a red merged-state gate → nothing further this pass
                     if self.ci_poll:
                         await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
+                    # The re-arm half of the review gate (#328): a direct/human push to
+                    # the branch of an in_review PR sitting in `changes-requested` moved
+                    # the head out from under a verdict the gate — which re-runs only on
+                    # `review-pending` — will never revisit. Left alone, the stale
+                    # rejection pins a dead head forever (or, labels cleared by hand, an
+                    # un-reviewed head merges). Re-arm the gate for the new head ONLY on a
+                    # demonstrable reviewed-head↔live-head mismatch; the resume edge below
+                    # then runs the fresh review. Fail-closed cases leave `changes-requested`
+                    # in place, so the merge edge still can't touch an un-reviewed head. The
+                    # board_state re-read guards against the CI reconcile having just
+                    # requeued the feature out of in_review this same pass.
+                    if (
+                        self.review_gate
+                        and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
+                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
+                        and await self._rearm_review_for_new_head(store, f, pr_url, repo)
+                    ):
+                        f = await asyncio.to_thread(store.get_feature, fid) or f
                     # The merge-edge half of the review gate (M5): an in_review PR still
                     # marked review-pending had its gate interrupted (host restart, dead
                     # workflow run) — finish it here so the gate can't silently lapse into
@@ -3754,6 +3780,80 @@ class BoardLoop:
             # feature whose PR already opened. CI + the merge webhook are the gate.
             log.warning("[project_board] review dispatch for %s failed: %s", fid, exc)
 
+    # ── stale-review re-arm on an external head push (#328) ───────────────────
+    async def _rearm_review_for_new_head(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """Re-arm the review gate when a direct/human push moved the PR head out from
+        under an active ``changes-requested`` verdict (#328).
+
+        The gate normally re-runs only on ``review-pending``, so a push to a board PR
+        sitting in ``changes-requested`` leaves the rejection pinned to a dead head —
+        blocking the card forever, or (labels cleared by hand) merging an un-reviewed
+        head. This compares the LIVE PR head against the ``reviewed-head:<sha>`` the
+        verdict was stamped for and, ONLY on a demonstrable mismatch, invalidates the
+        stale disposition by swapping ``changes-requested`` → ``review-pending`` so the
+        established gate runs one fresh normal review for the new head.
+
+        Recorded SHA identity, never a timestamp or the label's presence: an UNCHANGED
+        rejected head stays rejected (return False, no re-arm). FAIL CLOSED — leave the
+        blocking ``changes-requested`` in place so the card cannot auto-merge — whenever
+        identity is unreadable, absent, or ambiguous: not a ``changes-requested`` card,
+        no live head (a gh hiccup), no stamp, an empty stamp, or MORE THAN ONE stamp.
+        Never touches the review-fix / review-run budgets (the re-armed gate spends them
+        exactly as any review does) and never erases the findings history (it lives in
+        the bead comments the gate wrote). Returns True only when it re-armed — the
+        caller refreshes its snapshot so the review-pending resume edge picks the gate
+        up this same pass; the in-flight guard in ``_review_gate`` keeps concurrent
+        reconcile ticks from starting a second review for the new head."""
+        fid = feature["id"]
+        labels = feature.get("labels") or []
+        if LABEL_CHANGES_REQUESTED not in labels:
+            return False  # only a blocking verdict can go stale
+        stamps = [l[len(LABEL_REVIEWED_HEAD_PREFIX) :] for l in labels if l.startswith(LABEL_REVIEWED_HEAD_PREFIX)]
+        if len(stamps) != 1 or not stamps[0]:
+            # Absent or ambiguous verdict identity → fail closed: the rejection stands,
+            # the card can't merge. Cannot re-arm what we can't prove is stale.
+            return False
+        stamped = stamps[0]
+        head = await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head:
+            return False  # unreadable live head → fail closed; the next poll retries
+        short = head[:_REVIEWED_HEAD_SHA_LEN]
+        if short == stamped:
+            return False  # head unchanged since the verdict — exactly-once holds, still rejected
+        await asyncio.to_thread(
+            store.set_review_substate,
+            fid,
+            LABEL_REVIEW_PENDING,
+            note=(
+                f"review re-armed (#328): the PR head moved to {short} (the changes-requested "
+                f"verdict was for {stamped}) — an external push invalidated that verdict; running "
+                "a fresh review for the new head"
+            ),
+        )
+        log.info(
+            "[project_board] %s external push moved head %s→%s under changes-requested — re-armed the review gate: %s",
+            fid,
+            stamped,
+            short,
+            pr_url,
+        )
+        return True
+
+    async def _stamp_reviewed_head(self, store, fid: str, sha: str) -> None:
+        """Best-effort stamp of the PR head the review verdict was rendered against
+        (#328) — the ``reviewed-head:<sha>`` label the reconcile compares against the
+        live head to spot an external push that stales a ``changes-requested`` verdict.
+        ``sha=""`` clears it (a clean verdict pins no head). Fire-and-forget like the
+        merged-verified stamp: a ``br`` hiccup must never fail the gate that landed the
+        verdict — the next poll re-reads, and a MISSING stamp fails the reconcile CLOSED
+        (the rejection stands) rather than re-arming on unproven identity."""
+        try:
+            await asyncio.to_thread(store.record_reviewed_head, fid, sha)
+        except Exception:  # noqa: BLE001 — bookkeeping must never break the gate
+            log.warning(
+                "[project_board] %s reviewed-head stamp (%s) not persisted", fid, sha or "(clear)", exc_info=True
+            )
+
     # ── blocking review gate (plan M5) ────────────────────────────────────────
     async def _review_gate(self, store, fid: str, pr_url: str, repo: str) -> None:
         """Run the adversarial review workflow on the just-opened PR and act on the
@@ -3792,6 +3892,12 @@ class BoardLoop:
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
+        # The head THIS verdict is for (#328) — read BEFORE the panel so a push that lands
+        # DURING the review can never stamp the verdict as current for a head the review
+        # never saw (which would merge an un-reviewed head); if the head moved mid-review,
+        # the stamp stays at the reviewed head and the next reconcile re-arms. "" when gh
+        # can't be read → the verdict lands UNSTAMPED and the reconcile fails closed on it.
+        reviewed_head = await worktree.pr_head_sha(pr_url, cwd=repo)
         output, why = await self._run_review_workflow(fid, pr_url)
         if output is None:
             # Could not review — ``why`` names the actual cause (#180: no runner +
@@ -3852,6 +3958,10 @@ class BoardLoop:
                 LABEL_REVIEW_CLEAN,
                 note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
             )
+            # A clean verdict pins no head: clear the reviewed-head stamp so a later
+            # changes-requested (an external fleet review, a re-block) can't be judged
+            # stale against a dead head — an absent stamp fails the reconcile CLOSED (#328).
+            await self._stamp_reviewed_head(store, fid, "")
             await self._budget_reset(store, fid, "review-fix")
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
             return
@@ -3860,6 +3970,9 @@ class BoardLoop:
         n = await self._budget_get(store, fid, "review-fix")
         if n >= self.review_fix_max:
             await asyncio.to_thread(store.set_review_substate, fid, None, note=rendered)
+            # Blocked for a human, changes-requested dropped: clear the head stamp too so
+            # an operator unblock can't leave a dead-head marker for the reconcile (#328).
+            await self._stamp_reviewed_head(store, fid, "")
             await asyncio.to_thread(
                 store.flag_blocked,
                 fid,
@@ -3880,6 +3993,11 @@ class BoardLoop:
             "unrelated code.\n\n" + rendered
         )
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_CHANGES_REQUESTED, note=rendered)
+        # Pin the verdict to the head it was rendered against (#328) so a later external
+        # push to this branch reads as a demonstrable head move and re-arms the gate — an
+        # unchanged head keeps matching this stamp and stays rejected. Empty (unreadable
+        # head) writes no stamp → the reconcile fails closed on it, never re-arming blind.
+        await self._stamp_reviewed_head(store, fid, reviewed_head[:_REVIEWED_HEAD_SHA_LEN] if reviewed_head else "")
         await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s review gate bounce %d/%d (%d blocking finding(s))",

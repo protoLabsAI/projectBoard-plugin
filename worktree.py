@@ -653,6 +653,16 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def pr_head_sha(pr_url: str, *, cwd: str = ".") -> str:
+    """The PR's current head commit sha (``headRefOid``) — or ``""`` on a ``gh``
+    failure (the next poll just retries; this never raises into the loop). The
+    review-gate reconcile (#328) reads this to tell whether an external/human push
+    moved the head out from under a ``changes-requested`` verdict since the gate last
+    reviewed it — the recorded-SHA identity a stale-verdict re-arm turns on."""
+    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid", cwd=cwd)
+    return out.strip() if rc == 0 else ""
+
+
 async def pr_merge_info(pr_url: str, *, cwd: str = ".") -> dict:
     """ONE ``gh pr view`` read of the merge-relevant PR facts:
     ``{"mergeStateStatus": str, "isDraft": bool | None}``. ``mergeStateStatus`` is

@@ -5023,6 +5023,11 @@ class _GateStore(FakeLoopStore):
         self.review_states.append((label, note))
         return {"id": fid}
 
+    def record_reviewed_head(self, fid, sha):
+        # #328: the head the verdict was rendered against (or "" to clear the stamp).
+        self.calls.append(("record_reviewed_head", fid, sha))
+        return {"id": fid}
+
     def requeue(self, fid):
         self.calls.append(("requeue", fid))
         self.state = "ready"
@@ -5085,6 +5090,20 @@ def _inject_fake_findings(monkeypatch):
     monkeypatch.setitem(_sys.modules, "graph", pkg)
     monkeypatch.setitem(_sys.modules, "graph.review", sub)
     monkeypatch.setitem(_sys.modules, "graph.review.findings", mod)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pr_head_sha(monkeypatch):
+    """#328: the review gate now reads ``worktree.pr_head_sha`` to stamp the head a
+    verdict is for, and the reconcile reads it to spot an external push. Pin it so no
+    review-gate/reconcile test in this module shells a real ``gh`` — the default is ""
+    (unreadable, the fail-closed edge); a test that exercises the re-arm injects its own
+    head. Mirrors the ``_no_real_br_version`` / ``_clean_base_checkout`` guards."""
+
+    async def _blank(pr_url, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _blank)
 
 
 def _gate_loop(monkeypatch, output, cfg=None):
@@ -5274,6 +5293,14 @@ class _RoundTripStore(_GateStore):
             self.labels.append(label)
         return super().set_review_substate(fid, label, note)
 
+    def record_reviewed_head(self, fid, sha):
+        # #328: single replaced `reviewed-head:<sha>` label; "" clears it. Survives a
+        # set_review_substate swap (it isn't one of the three review sub-state labels).
+        self.labels = [l for l in self.labels if not l.startswith("reviewed-head:")]
+        if sha:
+            self.labels.append(f"reviewed-head:{sha}")
+        return super().record_reviewed_head(fid, sha)
+
     def flag_blocked(self, fid, reason):
         self.state = "blocked"
         return super().flag_blocked(fid, reason)
@@ -5417,6 +5444,271 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert "prior_findings" in seen_inputs[1]
     assert "drops data" in seen_inputs[1]["prior_findings"]
+
+
+# ── #328: re-arm the review gate after an external push stales the verdict ────────
+
+
+async def test_review_gate_stamps_the_reviewed_head_on_a_changes_requested_verdict(monkeypatch):
+    """The changes-requested verdict records the SHORT head sha it was rendered against
+    (#328) — the recorded-SHA identity the reconcile re-arm turns on. A 40-char head is
+    abbreviated to 12 (the same beads label cap that forced merged-verified short), and
+    the findings history is preserved on the bead alongside the stamp."""
+    from project_board.loop import _REVIEWED_HEAD_SHA_LEN
+
+    _inject_fake_findings(monkeypatch)
+    full_head = "0123456789abcdef0123456789abcdef01234567"  # a real 40-char sha
+    assert len(full_head) == 40
+    store = _RoundTripStore()
+    store.state = "in_review"
+    loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
+
+    async def _head(pr_url, *, cwd="."):
+        return full_head
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    await loop._review_gate(store, "bd-1", store.pr_url, "/repo")
+    assert store.review_states[-1][0] == "changes-requested"
+    assert f"reviewed-head:{full_head[:_REVIEWED_HEAD_SHA_LEN]}" in store.labels
+    assert "drops data" in store.review_states[-1][1]  # findings history not erased
+
+
+async def test_rearm_review_promotes_pending_when_an_external_push_moved_the_head(monkeypatch):
+    """r1: a `changes-requested` verdict stamped for H1, but the live PR head is now H2
+    (a direct/human push) → swap to `review-pending` so the established gate re-reviews
+    the new head, recording WHY on the bead."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True})
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"  # the new head after the external push
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._rearm_review_for_new_head(store, feature, store.pr_url, "/repo") is True
+    assert "review-pending" in store.labels and "changes-requested" not in store.labels
+    assert store.review_states[-1][0] == "review-pending"
+    assert "external push" in store.review_states[-1][1]
+
+
+async def test_rearm_review_is_a_noop_on_an_unchanged_head(monkeypatch):
+    """r2: the live head still matches the reviewed head → the rejection stands, no
+    re-arm and no duplicate review (exactly-once per unchanged head)."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True})
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._rearm_review_for_new_head(store, feature, store.pr_url, "/repo") is False
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_rearm_review_fails_closed_on_unreadable_absent_or_ambiguous_identity(monkeypatch):
+    """r3: an unreadable live head, an absent stamp, an ambiguous (double) stamp, or a
+    non-blocking sub-state each leave `changes-requested` untouched — a rejection is
+    never re-armed on unproven identity, so the card can't merge on an un-reviewed head."""
+    loop = BoardLoop({"review_gate": True})
+
+    async def _head_ok(pr_url, *, cwd="."):
+        return "bbb222"
+
+    async def _head_blank(pr_url, *, cwd="."):
+        return ""  # a gh hiccup — the live head can't be read
+
+    # 1) unreadable live head (stamp present, head can't be read)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_blank)
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    assert (
+        await loop._rearm_review_for_new_head(
+            store, {"id": "bd-1", "labels": list(store.labels)}, store.pr_url, "/repo"
+        )
+        is False
+    )
+    assert "changes-requested" in store.labels
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+    # 2) absent stamp — staleness can't be proven even though the head reads fine
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_ok)
+    store = _RoundTripStore()
+    store.labels = ["changes-requested"]
+    assert (
+        await loop._rearm_review_for_new_head(
+            store, {"id": "bd-1", "labels": list(store.labels)}, store.pr_url, "/repo"
+        )
+        is False
+    )
+    assert store.labels == ["changes-requested"]
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+    # 3) ambiguous — two conflicting stamps can't identify the reviewed head
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111", "reviewed-head:ccc333"]
+    assert (
+        await loop._rearm_review_for_new_head(
+            store, {"id": "bd-1", "labels": list(store.labels)}, store.pr_url, "/repo"
+        )
+        is False
+    )
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+    # 4) not a blocking verdict — nothing to re-arm
+    store = _RoundTripStore()
+    store.labels = ["review-clean", "reviewed-head:aaa111"]
+    assert (
+        await loop._rearm_review_for_new_head(
+            store, {"id": "bd-1", "labels": list(store.labels)}, store.pr_url, "/repo"
+        )
+        is False
+    )
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_reconcile_rearms_and_runs_one_fresh_review_for_the_new_head(monkeypatch):
+    """r1 end-to-end (r6 regression): an in_review PR sitting in `changes-requested` for
+    H1 gets an external push to H2 → the reconcile re-arms and the resume edge runs
+    EXACTLY ONE fresh review for H2, which (clean this time) lands review-clean and clears
+    the head stamp. Before #328 the reconcile ran the gate only on `review-pending`, so
+    nothing ever re-reviewed the pushed head."""
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return "clean.\n```json\n[]\n```", None  # the new head passes review
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url]  # exactly one review for the new head
+    assert "review-clean" in store.labels and "changes-requested" not in store.labels
+    assert not any(l.startswith("reviewed-head:") for l in store.labels)  # clean pins no head
+
+
+async def test_reconcile_does_not_rearm_or_review_an_unchanged_rejected_head(monkeypatch):
+    """r2 end-to-end: the live head still matches the reviewed head → the reconcile
+    leaves `changes-requested` in place and starts NO review; the card stays rejected."""
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return "clean.\n```json\n[]\n```", None
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"  # unchanged since the verdict
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert runs == []  # no review re-run for a head already rejected
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]
+
+
+async def test_concurrent_reconcile_ticks_start_one_review_for_the_new_head(monkeypatch):
+    """r5: two reconcile ticks race on the same `changes-requested` card whose head just
+    moved. The in-flight guard lets only ONE gate run the panel for the new head — the
+    overlapping tick starts no second review."""
+    import asyncio as _asyncio
+
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+    started, release = _asyncio.Event(), _asyncio.Event()
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        started.set()
+        await release.wait()  # hold the panel open so the second tick overlaps
+        return "clean.\n```json\n[]\n```", None
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    tick1 = _asyncio.create_task(loop._reconcile_prs())
+    await started.wait()  # the first tick re-armed and its gate is mid-panel
+    assert "bd-1" in loop._review_inflight
+    await loop._reconcile_prs()  # the second tick fires while the first holds the panel
+    assert runs == [store.pr_url]  # … and starts NO second review for the new head
+    release.set()
+    await tick1
+    assert runs == [store.pr_url]
+
+
+async def test_rearm_review_does_not_reset_the_review_fix_budget(monkeypatch):
+    """r4: an external push re-arms the gate but must NOT hand the new head a fresh
+    review-fix budget. A card at its spent budget whose re-armed review still finds a
+    blocker goes straight to blocked (human review), never an unbounded re-bounce."""
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111", "budget:review-fix:1"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False, "review_fix_max": 1})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return f"brief…\n```json\n{_BLOCKER}\n```", None  # the new head STILL has a blocker
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"
+
+    async def _diff(url, *, cwd=".", max_chars=4000):
+        return "diff --git a/a.py b/a.py"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url]
+    assert store.state == "blocked"  # spent budget → blocked, not a fresh bounce
+    assert not any(c[0] == "requeue" for c in store.calls)
 
 
 # ── surfaced unrunnable-gate causes (#180) ───────────────────────────────────────
