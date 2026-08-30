@@ -687,7 +687,7 @@ def test_r1_drawer_fetches_the_single_feature_route_for_the_deliverable():
     assert "const f = await api(FEAT + encodeURIComponent(fid));" in BOARD_PAGE  # …/features/{fid}
     assert "TASK_DETAIL = {fid: fid, feature: f};" in BOARD_PAGE
     # fenced on TASK_FID on BOTH the success and the error path (mirrors pollMonitor)
-    assert BOARD_PAGE.count("if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ) return;") == 2
+    assert BOARD_PAGE.count("if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ[fid]) return;") == 2
     assert "fetchTaskDetail(fid);" in BOARD_PAGE  # kicked from openTask
 
 
@@ -746,13 +746,17 @@ def test_r5_two_fetches_of_the_same_task_are_sequenced_by_ticket():
 
     Each fetch takes a monotonic ticket and writes only while it is still the latest, so
     the LAST-ISSUED fetch wins rather than the last to resolve."""
-    assert "let TASK_DETAIL_SEQ = 0;" in BOARD_PAGE
-    assert "const seq = ++TASK_DETAIL_SEQ;" in BOARD_PAGE
+    assert "const TASK_DETAIL_SEQ = {};" in BOARD_PAGE
+    assert "const seq = TASK_DETAIL_SEQ[fid] = (TASK_DETAIL_SEQ[fid] || 0) + 1;" in BOARD_PAGE
     # the ticket is checked on BOTH the success and the error path, alongside the fid fence
-    assert BOARD_PAGE.count("seq !== TASK_DETAIL_SEQ") == 2
+    assert BOARD_PAGE.count("seq !== TASK_DETAIL_SEQ[fid]") == 2
+    # PER-FID, not one global counter: a delayed action on task A must not invalidate
+    # task B's in-flight fetch after the drawer switched (#315 review) — B would be left
+    # with no deliverable and nothing to re-issue its fetch.
+    assert "++TASK_DETAIL_SEQ;" not in BOARD_PAGE
     # and it is taken BEFORE the await, or every fetch would read the same latest value
     body = BOARD_PAGE[BOARD_PAGE.index("async function fetchTaskDetail(fid){") :]
-    assert body.index("const seq = ++TASK_DETAIL_SEQ;") < body.index("await api(")
+    assert body.index("const seq = TASK_DETAIL_SEQ[fid]") < body.index("await api(")
 
 
 # ── self-verified task deliverables surface in the board view (#316 S4) ───────────

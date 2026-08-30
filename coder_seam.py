@@ -82,6 +82,7 @@ import inspect
 import json
 import logging
 import re
+import concurrent.futures
 import sys
 import threading
 import time
@@ -943,11 +944,25 @@ def _host_slot():
     holder = sys.modules.get(name)
     if holder is None:
         holder = types.ModuleType(name)
-        holder.__doc__ = "Process-stable holder for project_board's host-invoke busy flag — data, not code."
+        holder.__doc__ = "Process-stable holder for project_board's host-invoke slot — data, not code."
         holder.busy = 0
         holder.lock = threading.Lock()
+        # OUR OWN executor, not the loop's shared default, for one reason: a
+        # `concurrent.futures.Future` we submitted ourselves answers the question no
+        # `asyncio.to_thread` can — `cancel()` returns True ONLY if the work had not
+        # started and now never will. That is the proof needed to release the slot on
+        # the cancel path without ever releasing one a live worker still owns.
+        # max_workers=1 also makes two simultaneous host invocations structurally
+        # impossible rather than merely guarded.
+        holder.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="pb-host-invoke")
         holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
     return holder
+
+
+def _host_slot_release() -> None:
+    holder = _host_slot()
+    with holder.lock:
+        holder.busy = max(0, holder.busy - 1)
 
 
 def host_invoke_busy() -> bool:
@@ -992,14 +1007,24 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
     cover — CancelledError unwinds this coroutine and the drive's done-callback frees the
     guard while the worker runs on — and draining there would block shutdown on the very
     runaway call the operator is trying to stop. That case is covered instead by the
-    worker-owned busy flag (``host_invoke_busy``), which the loop consults alongside its
-    own guard."""
+    busy slot (``host_invoke_busy``), which the loop consults alongside its own guard.
+
+    The slot is raised on THIS thread before the work is submitted — not inside the
+    worker — because a cancel landing in the submission window would otherwise find the
+    slot still clear while a worker was already queued to run. It is lowered by the
+    worker when the call returns, or by the cancel path but ONLY when
+    ``Future.cancel()`` proves the work never started and never will. Those are the two
+    exhaustive cases, which is why the work is submitted to a private single-worker
+    executor rather than through ``asyncio.to_thread``: the shared default executor
+    hands back no future that can answer that question."""
     kwargs = {}
     try:
         if "tool_fence" in inspect.signature(invoke).parameters:
             kwargs["tool_fence"] = None
     except (TypeError, ValueError):  # a C/builtin callable with no introspectable signature
         pass
+    holder = _host_slot()
+    work = None  # the submitted synchronous call, so the cancel handler can interrogate it
     try:
         if inspect.iscoroutinefunction(invoke):
             # A coroutine invoke IS cancellable — wait_for cancels it cleanly on timeout.
@@ -1009,22 +1034,16 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
             # The worker thread is uncancellable — never abandon it past the timeout (see the
             # docstring). ``asyncio.wait`` returns pending tasks WITHOUT cancelling them, so on
             # timeout we drain the still-running thread before raising CoderTimeout.
-            holder = _host_slot()
-
-            def _invoke_owning_the_slot():
-                # Acquire AND release inside the worker, one frame: a thread that never
-                # runs leaves the flag untouched, so it cannot leak (the earlier draft
-                # acquired on the event loop and leaked the flag permanently whenever a
-                # cancel landed before the thread started, parking every later self task).
-                with holder.lock:
-                    holder.busy += 1
+            def _invoke_releasing_the_slot():
                 try:
                     return invoke(prompt, session_id, **kwargs)
                 finally:
-                    with holder.lock:
-                        holder.busy = max(0, holder.busy - 1)
+                    _host_slot_release()
 
-            thread = asyncio.ensure_future(asyncio.to_thread(_invoke_owning_the_slot))
+            with holder.lock:  # raised BEFORE submission — a cancel in the submission
+                holder.busy += 1  # window must never find the slot clear
+            work = holder.executor.submit(_invoke_releasing_the_slot)
+            thread = asyncio.ensure_future(asyncio.wrap_future(work))
             if timeout:
                 await asyncio.wait({thread}, timeout=timeout)
                 if not thread.done():
@@ -1036,6 +1055,14 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
                 reply = thread.result()
             else:
                 reply = await thread
+    except asyncio.CancelledError:
+        # Operator stop / shutdown. `cancel()` is True only when the work had not started
+        # and now never will — then its `finally` will never run and the slot is ours to
+        # lower. False means a worker is live and still owns it; releasing here would let
+        # the next self task race a call that is still on the host.
+        if work is not None and work.cancel():
+            _host_slot_release()
+        raise
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
     except (worktree.WorktreeError, worktree.CoderTimeout):

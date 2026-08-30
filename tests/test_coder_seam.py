@@ -2588,3 +2588,55 @@ async def test_a_coroutine_self_dispatch_never_touches_the_host_slot():
 
     assert await coder_seam.dispatch_self(invoke, "p", "pb-self-bd-async") == "async done"
     assert coder_seam.host_invoke_busy() is False
+
+
+async def test_queued_work_holds_the_slot_and_a_cancel_releases_only_its_own():
+    """#315 review: the slot must be raised BEFORE the work is submitted, not inside the
+    worker. Raised inside, a cancel landing in the submission window found the slot clear
+    while a worker was already queued — and the loop would admit a second host invocation.
+
+    Raised before, the mirror hazard appears: a cancel of work that never runs would leak
+    the slot forever and park every later self task. That is why the work goes to a
+    private single-worker executor — `Future.cancel()` returning True is PROOF the call
+    never started and never will, so the cancel path can release exactly that slot and no
+    other. This pins both halves at once: the executor is saturated, so the second
+    dispatch is queued-but-not-started."""
+    import threading
+
+    holder = coder_seam._host_slot()
+    gate = threading.Event()
+    running = threading.Event()
+
+    def first_invoke(prompt, session_id, *, tool_fence=None):
+        running.set()
+        gate.wait(10)
+        return "first"
+
+    def never_runs(prompt, session_id, *, tool_fence=None):
+        raise AssertionError("queued work must never start once cancelled")
+
+    first = asyncio.create_task(coder_seam.dispatch_self(first_invoke, "p", "pb-self-1"))
+    for _ in range(500):
+        if running.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert running.is_set()
+
+    second = asyncio.create_task(coder_seam.dispatch_self(never_runs, "p", "pb-self-2"))
+    for _ in range(500):  # let it reach the submit
+        with holder.lock:
+            if holder.busy == 2:
+                break
+        await asyncio.sleep(0.01)
+    with holder.lock:
+        assert holder.busy == 2, "queued-but-unstarted work must already hold a slot"
+
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    with holder.lock:
+        assert holder.busy == 1, "the cancel released its own slot, not the live worker's"
+
+    gate.set()
+    assert await first == "first"
+    assert coder_seam.host_invoke_busy() is False
