@@ -14,6 +14,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import threading
+
 import pytest
 
 from project_board import coder_seam, worktree
@@ -2517,3 +2519,44 @@ async def test_a_seam_returning_a_non_result_is_refused_not_passed_up(monkeypatc
             _FakeCoder(), "/wt", "x", fid="bd-junk", gen=1, _dispatch_tapped=_junk_seam
         )
     assert coder_seam.progress_snapshot("bd-junk")["gens"][0]["done"] is True  # gen still closed
+
+
+async def test_an_abandoned_sync_invoke_keeps_the_host_slot_until_the_thread_really_ends():
+    """#315 review, major: ``asyncio.to_thread`` CANNOT be cancelled — ``wait_for``
+    abandons the future while the worker thread runs on. Before this fix the loop saw a
+    timed-out self-dispatch, cleared its guard, and let the next self task invoke the
+    host CONCURRENTLY with a call that never stopped.
+
+    So the busy flag must track the THREAD: still raised after CoderTimeout, and only
+    lowered once the blocked ``invoke`` actually returns."""
+    released = threading.Event()
+    entered = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        entered.set()
+        released.wait(10)  # outlives the timeout below
+        return "late reply"
+
+    assert coder_seam.host_invoke_busy() is False
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self("p", "pb-self-bd-slot", timeout=0.05, _host=_host_with(invoke))
+    assert entered.is_set()
+    # The awaiter gave up; the thread did NOT. The host is still busy.
+    assert coder_seam.host_invoke_busy() is True
+    released.set()
+    for _ in range(200):  # let the worker thread run its finally
+        if not coder_seam.host_invoke_busy():
+            break
+        await asyncio.sleep(0.01)
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_the_host_slot_is_clear_after_an_ordinary_self_dispatch():
+    """The slot is not a leak: a normal call raises and lowers it, so the next self task
+    is admitted immediately."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "done"
+
+    assert await coder_seam.dispatch_self("p", "pb-self-bd-ok", _host=_host_with(invoke)) == "done"
+    assert coder_seam.host_invoke_busy() is False

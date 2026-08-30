@@ -3128,6 +3128,65 @@ async def test_a_sister_agent_task_is_not_hijacked_by_self_dispatch(monkeypatch)
     assert loop._self_inflight_fid is None  # self-dispatch never engaged
 
 
+async def test_a_real_delegate_named_agent_still_wins_over_self_dispatch(monkeypatch):
+    """#315 review, removed-behavior: a roster entry literally named `agent` / `self` /
+    the configured agent_name was dispatchable before #311, and must stay so. The
+    reserved aliases only mean "the board itself" when they name NO delegate — otherwise
+    renaming the host agent would silently strand an existing sister agent whose name
+    happened to collide."""
+    store = _TaskStore([_task("bd-collide", assignee="agent", spec="Audit the API")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda *a, **k: True)
+
+    async def _no_self(*a, **k):
+        raise AssertionError("a name that resolves to a real delegate must NOT self-dispatch")
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _no_self)
+
+    seen = {}
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        seen["delegate"] = delegate
+        return "The audit deliverable."
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+
+    a2a = _sister("a2a")
+    loop = BoardLoop({"coder": "proto", "agent_name": "agent"})  # agent_name COLLIDES with the roster name
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: a2a if expect == "a2a" else None)
+
+    assert await loop._spawn_ready() is True
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert seen.get("delegate") is a2a
+    assert ("record_delivery", "bd-collide", "The audit deliverable.") in store.calls
+    assert loop._self_inflight_fid is None
+
+
+async def test_a_self_task_stays_parked_while_an_abandoned_host_invoke_still_runs(monkeypatch):
+    """#315 review, major: the in-flight guard alone is not enough. A timed-out
+    self-dispatch clears `_self_inflight_fid` while its worker thread runs on, so the
+    loop also consults `host_invoke_busy()` — otherwise the next self task invokes the
+    host CONCURRENTLY with the abandoned call."""
+    store = _TaskStore([_self_task("bd-second-self")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "host_invoke_available", lambda *a, **k: True)
+    monkeypatch.setattr(coder_seam, "host_invoke_busy", lambda: True)  # an abandoned call is STILL running
+
+    async def _no_self(*a, **k):
+        raise AssertionError("must not invoke the host while an abandoned call is live")
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _no_self)
+
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    assert await loop._dispatch_task(store, _self_task("bd-second-self")) == "parked"
+    assert loop._self_inflight_fid is None
+    assert not loop._drives
+
+
 async def test_reconcile_orphan_requeues_a_dead_self_task_when_host_can_invoke(monkeypatch):
     """#311: a self task whose HOST.invoke drive died mid-flight IS orphaned on a
     host that can self-dispatch — reconcile requeues it for a clean re-dispatch (this is

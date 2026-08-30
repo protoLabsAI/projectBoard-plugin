@@ -83,6 +83,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 import types
 from collections import OrderedDict, deque
@@ -911,6 +912,54 @@ def _import_host(_host=None):
     return HOST
 
 
+# ── the host-invocation slot (#315 review, major) ─────────────────────────────────
+# `asyncio.to_thread` cannot be cancelled: `wait_for` abandons the FUTURE while the
+# worker thread runs on to completion. So a self-dispatch that times out returns to a
+# loop that promptly clears its `_self_inflight_fid` guard — and the next self task
+# invokes the host CONCURRENTLY with a call that never stopped. The guard has to track
+# the thread, not the coroutine awaiting it.
+#
+# This flag is therefore set before the thread is submitted and cleared INSIDE the
+# thread, in a `finally` around `invoke` itself, so it stays raised for exactly as long
+# as the host is really executing. It lives in a process-stable `sys.modules` slot (the
+# #178 pattern) so a plugin reload mid-invocation cannot forget an in-flight call.
+_HOST_SLOT_PREFIX = "project_board.host_invoke::"
+
+
+def _host_slot():
+    name = _HOST_SLOT_PREFIX + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's host-invoke busy flag — data, not code."
+        holder.busy = 0
+        holder.lock = threading.Lock()
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
+    return holder
+
+
+def host_invoke_busy() -> bool:
+    """True while a ``dispatch_self`` host invocation is STILL EXECUTING — including one
+    whose awaiter already gave up on a timeout or a cancel (the worker thread runs on).
+    The loop consults this alongside its own in-flight guard so a second self task can
+    never invoke the host concurrently with an abandoned-but-live first."""
+    holder = _host_slot()
+    with holder.lock:
+        return holder.busy > 0
+
+
+def _host_slot_acquire() -> None:
+    holder = _host_slot()
+    with holder.lock:
+        holder.busy += 1
+
+
+def _host_slot_release() -> None:
+    holder = _host_slot()
+    with holder.lock:
+        holder.busy = max(0, holder.busy - 1)
+
+
 def host_invoke_available(_host=None) -> bool:
     """Feature-detect the host's first-party ``HOST.invoke`` seam — a callable ``invoke``
     attribute on the host object. ``False`` when the host predates it, so the caller
@@ -966,7 +1015,17 @@ async def dispatch_self(prompt: str, session_id: str, *, timeout: float | None =
             # clock, never a fresh ``timeout``.
             loop = asyncio.get_running_loop()
             deadline = (loop.time() + timeout) if timeout else None
-            sync_call = asyncio.to_thread(invoke, prompt, session_id, **kwargs)
+
+            def _invoke_holding_the_slot():
+                # Released ON THE WORKER THREAD, so an abandoned call (timeout/cancel)
+                # keeps the slot until the host actually returns — see host_invoke_busy.
+                try:
+                    return invoke(prompt, session_id, **kwargs)
+                finally:
+                    _host_slot_release()
+
+            _host_slot_acquire()
+            sync_call = asyncio.to_thread(_invoke_holding_the_slot)
             reply = await (asyncio.wait_for(sync_call, timeout) if timeout else sync_call)
             if inspect.isawaitable(reply):
                 remaining = None if deadline is None else deadline - loop.time()

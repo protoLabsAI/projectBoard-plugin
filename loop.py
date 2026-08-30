@@ -2090,9 +2090,21 @@ class BoardLoop:
         # while one runs) with the existing log line, and the reconcile requeues a
         # host-capable park once the slot frees. A self-assignee never resolves to a
         # sister-agent delegate — self is the board's own identity, not a roster entry.
-        is_self = self._is_self_assignee(assignee)
-        self_dispatch = is_self and coder_seam.host_invoke_available() and self._self_inflight_fid is None
-        delegate = None if is_self else self._resolve_task_delegate(assignee)
+        # A REAL delegate by that name still wins (#315 review, removed-behavior): a
+        # roster entry literally called `self` / `agent` / the configured agent_name was
+        # dispatchable before #311 and must stay so. Resolve FIRST, and treat the
+        # assignee as first-party only when it names no delegate at all — otherwise a
+        # rename of the host agent would silently strand an existing sister agent.
+        delegate = self._resolve_task_delegate(assignee)
+        is_self = delegate is None and self._is_self_assignee(assignee)
+        self_dispatch = (
+            is_self
+            and coder_seam.host_invoke_available()
+            and self._self_inflight_fid is None
+            # An abandoned self-dispatch (timed out / cancelled) leaves its worker thread
+            # running; the board must not invoke the host a second time until it ends.
+            and not coder_seam.host_invoke_busy()
+        )
         claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
         if claimed is None:
             return "race"
