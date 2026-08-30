@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -7615,31 +7617,75 @@ async def test_an_unclassified_block_escalates_rather_than_silently_retrying(mon
     assert store.requeued == [] and "unclassified" in seen[0]
 
 
-async def test_the_operator_is_told_once_per_card_not_once_per_sweep(monkeypatch):
+async def test_the_operator_is_told_once_per_card_not_once_per_sweep(monkeypatch, tmp_path):
     """The sweep runs every few minutes. An alert that repeats forever is an alert that
-    gets filtered, so a card that STAYS blocked is announced once."""
+    gets filtered, so a card that STAYS blocked is announced once.
+
+    The fake mirrors the host's REAL constructor — ``InboxStore(db_path)`` — because the
+    first version of this test faked a no-arg one, which is exactly how a notification
+    that could never construct its store shipped green: every alert fell into the
+    except branch and the operator was never told anything."""
     store = _BlockedStore([_blocked("bd-a", "auth")])
     loop = BoardLoop({"coder": "proto"})
     added = []
     import sys
     import types as _types
 
-    fake = _types.ModuleType("inbox.store")
+    fake = _types.ModuleType("inbox")
 
     class _Inbox:
+        def __init__(self, db_path, *, dedup_window_s=300):
+            self.path = db_path
+
         def add(self, text, *, priority="next", source="", dedup_key=""):
-            added.append((text, priority, dedup_key))
+            added.append((text, priority, dedup_key, self.path))
 
     fake.InboxStore = _Inbox
-    monkeypatch.setitem(sys.modules, "inbox", _types.ModuleType("inbox"))
-    monkeypatch.setitem(sys.modules, "inbox.store", fake)
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
 
     await loop._recover_blocked(store)
     await loop._recover_blocked(store)
     await loop._recover_blocked(store)
     assert len(added) == 1
-    (text, priority, dedup) = added[0]
+    (text, priority, dedup, path) = added[0]
     assert priority == "now" and dedup == "blocked:bd-a" and "bd-a" in text
+    assert path == str(tmp_path / "agent.db")
+
+
+async def test_an_unresolvable_inbox_falls_back_to_the_loud_log_never_a_crash(monkeypatch, caplog):
+    """If the inbox path can't be resolved the alert must still be LOUD, not swallowed
+    and not raised into the sweep — a notification failure must never stop the pass."""
+    store = _BlockedStore([_blocked("bd-a", "auth")])
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: None)
+    with caplog.at_level("WARNING"):
+        await loop._recover_blocked(store)
+    assert any("bd-a" in str(r.getMessage()) for r in caplog.records)
+
+
+def test_the_inbox_path_never_guesses_between_two_name_keyed_stores(monkeypatch, tmp_path):
+    """An agent renamed before the host's #2382 fix can leave TWO name-keyed databases.
+    Nothing on disk says which is current, and filing an alert into the wrong one is
+    worse than not filing it — the operator would see silence either way, but with a
+    guess we would also log success. So it resolves to None and the caller says so."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "oldName.db").touch()
+    (inbox / "newName.db").touch()
+
+    class _Paths:
+        def store(self, name):
+            return inbox
+
+    fake = types.ModuleType("infra.paths")
+    fake.instance_paths = lambda: _Paths()
+    monkeypatch.setitem(sys.modules, "infra.paths", fake)
+    assert loop_mod._inbox_db_path() is None
+
+    # …but the constant name wins outright when it is there
+    (inbox / "agent.db").touch()
+    assert loop_mod._inbox_db_path() == inbox / "agent.db"
 
 
 async def test_a_self_healed_card_that_blocks_again_is_news_again(monkeypatch):
