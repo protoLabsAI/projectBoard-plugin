@@ -20,9 +20,12 @@ guard test below — a silent skip is a fake with extra ceremony.
 #138 MATRIX (see .github/workflows/ci.yml): the tests that assert the version-agnostic
 ``--json`` SHAPE contract carry ``@pytest.mark.br_shape`` and run against BOTH br 0.1.23
 (bare list) and 0.2.16 (envelope). The 0.2.16 leg runs ONLY ``-m br_shape`` — the rest of
-this tier pins 0.1.x-SPECIFIC quirks (``br ready --json`` omitting ``labels``, the 50-char
-label cap, contention reported as JSON on a zero exit) whose whole value is that they're
-version-specific; running them on 0.2.16 would test beads, not the plugin's shape handling.
+this tier pins 0.1.x-SPECIFIC quirks (the 50-char label cap, contention reported as JSON
+on a zero exit) whose whole value is that they're version-specific; running them on 0.2.16
+would test beads, not the plugin's shape handling. The ``br ready --json`` labels contract
+is NOT one of them anymore (#324): ready_queue now re-fetches labels only when the row
+lacks them, so its test is version-AWARE and rides the ``@br_shape`` matrix — the 0.1.23
+leg exercises the label-less path, the newer legs the label-carrying one.
 """
 
 from __future__ import annotations
@@ -273,34 +276,60 @@ def test_json_shape_show_for_raw_features_with_comments(board):
     assert any("waiting on upstream: see #99 — contention" in c.get("text", "") for c in comments)
 
 
-@requires_br  # deliberately NOT @br_shape: a 0.1.x quirk, so it runs only on the 0.1.23 leg
-def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path):
-    """`br ready --json` (ready_queue) on 0.1.23 OMITS the `labels` field — the
-    documented quirk the batched `br show` re-fetch works around (without it
-    every candidate projects as `backlog` and the puller silently never claims).
-    If an upgrade starts carrying labels here, this failing is the signal the
-    workaround is droppable — exactly the class #138 needed surfaced. This asserts a
-    version-SPECIFIC absence, so it is intentionally excluded from the br_shape
-    matrix (the 0.2.16 leg would rightly disagree); it stays on the 0.1.23 pin.
-    With ONE ready bead the batched show also rides 0.1.x's OTHER quirk end-to-end:
-    a single-id `br show --json` is a bare dict, which ready_queue must fold back."""
+@requires_br
+@pytest.mark.br_shape  # version-AWARE now (#324): it adapts to whichever `br ready --json`
+# shape the installed binary returns, so it belongs on the normal cross-version gate — the
+# 0.1.23 leg exercises the label-LESS path, the 0.2.16/0.3.2 legs the label-CARRYING one.
+def test_json_shape_ready_for_ready_queue_omits_labels(board, tmp_path, monkeypatch):
+    """`br ready --json` (ready_queue) SHAPE contract, across br versions (#324).
+    beads-rust ≤0.1.23 OMITS the `labels` field from `br ready --json` rows, so
+    ready_queue re-fetches via a batched `br show` (which carries labels) — else every
+    candidate projects as `backlog` and the puller silently never claims. A newer `br`
+    CARRIES labels on the ready row itself, so that re-fetch is REDUNDANT and must be
+    skipped. This characterizes BOTH shapes without asserting an obsolete universal
+    absence: whichever the real binary returns, the queue must project the candidate as
+    `ready`, AND it must re-fetch iff (and only iff) the row lacked labels.
+
+    Red-reachable both ways: on the label-less leg, dropping the fallback show makes the
+    `board_state == "ready"` assertion FAIL; on a label-carrying leg, dropping the
+    capability guard re-issues the show and the `shows == []` assertion FAILS. With ONE
+    ready bead the label-less path also rides 0.1.x's OTHER quirk — a single-id `br show
+    --json` is a bare dict, which ready_queue must fold back."""
     f = _ready_feature(board, tmp_path)
     rows = board._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True)
     assert isinstance(rows, list) and rows
-    assert "labels" not in rows[0], "br ready --json now carries labels — revisit ready_queue's re-fetch"
+    row_carries_labels = "labels" in rows[0]  # the version-dependent fact — not asserted either way
+
+    # Count the batched `br show` re-fetches ready_queue issues, without disturbing behavior.
+    real_run = board._run
+    shows: list[tuple] = []
+
+    def counting_run(*args, want_json=False, with_has_more=False):
+        if args and args[0] == "show":
+            shows.append(args)
+        return real_run(*args, want_json=want_json, with_has_more=with_has_more)
+
+    monkeypatch.setattr(board, "_run", counting_run)
     queue = board.ready_queue()
+    monkeypatch.setattr(board, "_run", real_run)
+
     assert [q["id"] for q in queue] == [f["id"]]
-    assert queue[0]["board_state"] == "ready"  # the re-fetch restored the labels
+    assert queue[0]["board_state"] == "ready"  # projected as ready on BOTH shapes
+    if row_carries_labels:
+        assert shows == [], "br ready carried labels — the redundant batched show must be skipped (#324)"
+    else:
+        assert shows == [("show", f["id"])], "label-less br ready rows still need exactly one batched show"
 
 
 @requires_br
 @pytest.mark.br_shape
 def test_json_shape_batched_show_for_ready_queue(board, tmp_path):
-    """ready_queue's labels re-fetch is ONE `br show <id…>` for the whole ready set
-    (#257) — so the MULTI-id `br show --json` must return a LIST of dicts carrying
-    `id` + `labels` on BOTH matrix legs (the same batched-show contract
-    list_features rides for dependencies), and the queue must project every
-    candidate as `ready` through it."""
+    """The MULTI-id `br show --json` contract ready_queue's label-less re-fetch rides
+    (#257): it must return a LIST of dicts carrying `id` + `labels` on BOTH matrix legs
+    — the same batched-show shape list_features uses for dependencies, and the shape the
+    label-less (≤0.1.23) `br ready` fallback folds back into `ready`. Whether the
+    installed `br` re-fetches (label-less rows) or projects the ready rows directly
+    (label-carrying rows, #324), the queue must project every candidate as `ready`."""
     f1 = _ready_feature(board, tmp_path, title="Ready one")
     # A second ready feature naming a DIFFERENT file — the same target would trip
     # the #143 overlapping-worktree gate at mark_ready.

@@ -18,8 +18,11 @@ jobs:
     # normalizes both, so the shape contract must hold on BOTH versions — run the real-br
     # integration tier across a version matrix instead of a single pinned binary.
     #   0.1.23 (the version we run locally + pin to): the FULL suite gates here, including
-    #          the tests that pin 0.1.x-SPECIFIC quirks (br ready omitting labels, the
-    #          50-char label cap, contention-as-JSON-on-zero-exit).
+    #          the tests that pin 0.1.x-SPECIFIC quirks (the 50-char label cap,
+    #          contention-as-JSON-on-zero-exit). NB: `br ready --json` omitting labels is
+    #          no longer a 0.1.x-quirk pin (#324) — ready_queue re-fetches labels only when
+    #          the row lacks them, so that contract is version-AWARE and rides `-m br_shape`
+    #          on every leg (label-less path here, label-carrying path on the newer legs).
     #   0.2.16: only `-m br_shape` — the version-agnostic --json SHAPE contract. The
     #          0.1.x-quirk pins would rightly disagree with 0.2.16; running them here would
     #          test beads, not the plugin's shape handling (see tests/test_integration.py).

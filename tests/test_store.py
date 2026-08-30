@@ -1161,6 +1161,64 @@ def test_ready_queue_falls_back_per_id_when_the_batched_show_404s(make_board):
     assert q[0]["board_state"] == "ready"
 
 
+def test_ready_queue_projects_label_carrying_ready_rows_without_a_refetch(make_board):
+    """#324: a newer `br ready --json` carries `labels` on the ready row ITSELF, so
+    the batched `br show` re-fetch the label-less (≤0.1.23) shape needs is REDUNDANT —
+    those rows must project directly, skipping the extra subprocess spawn on the loop's
+    hottest poll. Priority order and the label-derived fields (board_state, diff) come
+    straight off the ready row. Red-reachable: dropping the capability check re-issues
+    the show and this `br.cmds("show") == []` assertion FAILS."""
+    ready = [
+        {"id": "bd-1", "issue_type": "feature", "status": "open", "labels": ["ready", "diff:small"]},
+        {"id": "bd-2", "issue_type": "task", "status": "open", "labels": ["ready"]},
+        {"id": "bd-ep", "issue_type": "epic", "status": "open", "labels": ["ready"]},  # structural → excluded
+    ]
+    br = Br({"ready": ready})
+    b = make_board(br)
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-1", "bd-2"]  # priority order, epic excluded
+    assert all(f["board_state"] == "ready" for f in q)  # projected as ready off the row's labels
+    assert q[0]["difficulty"] == "small"  # and the rest of the label-derived projection
+    assert br.cmds("show") == []  # no redundant re-fetch — the whole point of #324
+
+
+def test_ready_queue_refetches_only_the_label_less_rows_in_a_mixed_shape(make_board):
+    """#324: a mixed ready set — one row carries `labels` (newer br), one omits it
+    (≤0.1.23) — must re-fetch ONLY the label-less row, in a single batched `br show`
+    over exactly that subset (never the label-carrying id), and still project BOTH as
+    `ready` in `br ready`'s priority order. The label-carrying row is projected directly."""
+    ready = [
+        {"id": "bd-new", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+        {"id": "bd-old", "issue_type": "feature", "status": "open"},  # ≤0.1.23 shape: no labels key
+    ]
+    shows = [{"id": "bd-old", "status": "open", "issue_type": "feature", "labels": ["ready"]}]
+    br = Br({"ready": ready, "show": shows})
+    b = make_board(br)
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-new", "bd-old"]  # both ready, priority order preserved
+    assert all(f["board_state"] == "ready" for f in q)
+    assert br.cmds("show") == [("show", "bd-old")]  # only the label-less id re-fetched, once
+
+
+def test_ready_queue_delete_race_in_the_refetch_still_flows_label_carrying_rows(make_board):
+    """#324 + the delete race together: a label-CARRYING ready row must still project
+    even when a sibling label-LESS row vanishes between `br ready` and its re-fetch (the
+    batched show 404s → per-id fallback for the label-less set only). The label-carrying
+    row never rode that show, so a ghost in the fallback can't starve it."""
+
+    def show(args):
+        raise store.BoardNotFound("`br show` failed: ISSUE_NOT_FOUND")
+
+    ready = [
+        {"id": "bd-new", "issue_type": "feature", "status": "open", "labels": ["ready"]},
+        {"id": "bd-gone", "issue_type": "feature", "status": "open"},  # label-less, vanishes → 404
+    ]
+    b = make_board(Br({"ready": ready, "show": show}))
+    q = b.ready_queue()
+    assert [f["id"] for f in q] == ["bd-new"]  # ghost skipped, label-carrying survivor flows
+    assert q[0]["board_state"] == "ready"
+
+
 def test_claim_claims_a_specific_ready_feature(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
