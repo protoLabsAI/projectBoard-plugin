@@ -1853,6 +1853,12 @@ class BoardLoop:
             fid = f["id"]
             try:
                 cls = str(f.get("blocked_class") or "").strip()
+                # The reason rides a COMMENT, and `br list` carries none — a list row
+                # always projects "". Escalating "no reason recorded" tells the operator
+                # nothing and makes them go digging, which is the thing this alert exists
+                # to prevent, so the one card being escalated is re-read through
+                # get_feature (`br show`). Only on the escalation path: rare, once per
+                # card, never a per-row probe across the whole blocked lane.
                 reason = str(f.get("blocked_reason") or "").strip()
                 spent = await self._budget_get(store, fid, "unblock-retry", f)
                 if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:
@@ -1874,6 +1880,12 @@ class BoardLoop:
                     if spent < _UNBLOCK_RETRY_MAX
                     else f"{cls} block, {spent} auto-retr{'y' if spent == 1 else 'ies'} spent"
                 )
+                if not reason:
+                    try:
+                        full = await asyncio.to_thread(store.get_feature, fid)
+                        reason = str((full or {}).get("blocked_reason") or "").strip()
+                    except Exception:  # noqa: BLE001 — the alert matters more than its detail
+                        pass
                 title = str(f.get("title") or "").strip()
                 self._notify_operator(
                     fid,

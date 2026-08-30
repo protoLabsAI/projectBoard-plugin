@@ -4371,3 +4371,21 @@ def test_requeue_preserves_a_task_assignee_so_a_rejected_deliverable_can_redispa
     assert "--assignee" not in up
     assert "--status" in up and "open" in up
     assert "--add-label" in up and "ready" in up
+
+
+def test_a_reblock_for_the_SAME_class_keeps_its_label(make_board, monkeypatch):
+    """`br` applies --remove-label AFTER --add-label, so emitting both for the same value
+    nets to REMOVED. A card re-blocked for the same reason therefore lost its class
+    silently, read as `unclassified` on the next sweep, and was escalated to a human
+    instead of taking the retry it still had. Observed live on bd-eyrs.
+
+    So a prior class label is only removed when it DIFFERS from the one being written."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked-class:transient", "blocked"]})
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-9", "coder timed out after 1800.0s")  # transient AGAIN
+    (up,) = br.cmds("update")
+    assert "blocked-class:transient" in up
+    assert "--remove-label" not in up, "removing the label it is adding nets to removed"
