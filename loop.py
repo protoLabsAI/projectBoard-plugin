@@ -36,6 +36,7 @@ dispatch). Missing any of the three gates ⇒ honest degrade to the single shot 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import json
 import logging
 import os
@@ -743,6 +744,35 @@ _SELF_HEALING_BLOCKS = frozenset({"rate-limit", "transient", "merge-conflict"})
 # Deliberately small: a card that has failed transiently three times is not unlucky, it
 # has a problem a human needs to see.
 _UNBLOCK_RETRY_MAX = 2
+
+
+def _inbox_db_path():
+    """This agent's inbox SQLite file, or None when it can't be resolved.
+
+    Mirrors the host's own resolution (``server.agent_init._agent_store_db("inbox")``),
+    which the plugin must not import — ``server`` is off-limits to plugins, and reaching
+    into it for a notification would be a layering break. ``infra.paths.instance_paths``
+    IS the sanctioned seam (already used by br_fetch and the board store), and the store
+    dir is per-instance, so a fleet member resolves inside its own workspace.
+
+    Two filenames, in the host's order: the constant ``agent.db``, else — for an install
+    predating that constant — the single name-keyed ``*.db`` left in the dir. Two or more
+    is genuinely ambiguous (an agent renamed before the host's fix); picking wrong would
+    file the alert into a database nobody reads, so that returns None and the caller
+    falls back to its loud log line."""
+    try:
+        from infra.paths import instance_paths
+
+        base = Path(instance_paths().store("inbox"))
+    except Exception:  # noqa: BLE001 — host without instance paths / no inbox store
+        return None
+    if not base.is_dir():
+        return None
+    target = base / "agent.db"
+    if target.exists():
+        return target
+    legacy = sorted(p for p in base.glob("*.db") if p.name != "agent.db")
+    return legacy[0] if len(legacy) == 1 else None
 
 
 class BoardLoop:
@@ -1867,15 +1897,19 @@ class BoardLoop:
             return
         self._notified_blocks.add(fid)
         try:
-            from inbox.store import InboxStore  # host module — absent on older hosts
+            from inbox import InboxStore  # host module — absent on older hosts
 
-            InboxStore().add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
+            db = _inbox_db_path()
+            if db is None:
+                raise RuntimeError("no resolvable inbox store for this instance")
+            InboxStore(str(db)).add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
             log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
             log.warning(
                 "[project_board] %s blocked and NOT self-healing (no operator inbox reachable): %s",
                 fid,
                 text[:200],
+                exc_info=True,
             )
 
     async def _sweep_worktrees(self, store, repo: str) -> None:
