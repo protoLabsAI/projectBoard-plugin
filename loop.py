@@ -730,7 +730,19 @@ _BUDGET_KINDS: dict[str, str] = {
     "auto-merge": "_auto_merge_failures",
     "review-fix": "_review_fix_attempts",
     "review-run": "_review_run_failures",
+    "unblock-retry": "_unblock_retries",
 }
+
+# Which classifier categories the blocked sweep will clear on its own. A block self-heals
+# only when the thing that caused it is the kind that passes: a rate limit, a network or
+# timeout blip, a base that moved under the build. `auth` and `terminal` are deliberately
+# absent — no amount of waiting fixes a bad credential or an unrecognised failure, and
+# silently re-running those burns budget while looking like progress.
+_SELF_HEALING_BLOCKS = frozenset({"rate-limit", "transient", "merge-conflict"})
+# How many times one card may be auto-unblocked before the operator is told instead.
+# Deliberately small: a card that has failed transiently three times is not unlucky, it
+# has a problem a human needs to see.
+_UNBLOCK_RETRY_MAX = 2
 
 
 class BoardLoop:
@@ -1122,6 +1134,12 @@ class BoardLoop:
         # instead of re-burning the workflow every poll (ADR 0078 D3: fail closed,
         # escalate; never judge from a partial panel).
         self._review_run_failures: dict[str, int] = {}
+        # How many times the blocked sweep has auto-cleared each card (see
+        # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
+        self._unblock_retries: dict[str, int] = {}
+        # Feature ids already reported to the operator as stuck, so a card that stays
+        # blocked is announced once rather than every sweep (see _notify_operator).
+        self._notified_blocks: set[str] = set()
         # Last parsed findings JSON per fid — fed back as the recipe's
         # prior_findings input so a bounce re-review is a DELTA review
         # (GitHub-native review memory, ADR 0078 D5).
@@ -1759,6 +1777,10 @@ class BoardLoop:
         # project's repo, and a worktree resolved in repo A must be reaped in repo A.
         for repo in self._all_repos():
             await self._sweep_worktrees(store, repo)
+        # (b2) the blocked lane: self-heal what can be, and TELL THE OPERATOR about what
+        # cannot — a blocked card used to leave the queue with only a log line, so
+        # dependents sat `ready` waiting on a blocker that would never arrive.
+        await self._recover_blocked(store)
         # (c) the archive pass (#115): age done/cancelled features out of the live
         # view so the Done column doesn't bury recent work — a label write only. Runs
         # ONCE per sweep (project-independent — the board db is shared), after the
@@ -1771,6 +1793,90 @@ class BoardLoop:
                 )
         except Exception:  # noqa: BLE001
             log.warning("[project_board] sweep archive pass failed", exc_info=True)
+
+    async def _recover_blocked(self, store) -> None:
+        """The blocked lane's self-heal + escalation pass.
+
+        Before this, every block was terminal in practice: the card left the queue, the
+        only record was a WARNING in a log nobody reads, and the board said nothing. A
+        transient coder timeout and a bad credential died in exactly the same silent way,
+        and dependent cards sat `ready` forever waiting on a blocker that would never
+        arrive. That is the failure mode this pass exists to end.
+
+        Two outcomes, never zero:
+
+        * the block classifies as self-healing (`rate-limit` / `transient` /
+          `merge-conflict`) and the card has retries left → clear it, requeue it, spend
+          one `unblock-retry`; the next tick re-dispatches it.
+        * anything else — `auth`, `terminal`, an unclassified block, or a card that has
+          spent its retries → the OPERATOR is told, once, naming the card and the actual
+          reason. It stays blocked; a human decides.
+
+        Best-effort per card, exactly like the rest of the sweep: one card that fails to
+        recover must never stop the pass or the loop."""
+        try:
+            blocked = await asyncio.to_thread(store.list_features, state="blocked")
+        except Exception:  # noqa: BLE001
+            log.warning("[project_board] blocked sweep: could not list blocked features", exc_info=True)
+            return
+        for f in blocked:
+            fid = f["id"]
+            try:
+                cls = str(f.get("blocked_class") or "").strip()
+                reason = str(f.get("blocked_reason") or "").strip()
+                spent = await self._budget_get(store, fid, "unblock-retry", f)
+                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:
+                    await self._budget_set(store, fid, "unblock-retry", spent + 1)
+                    await asyncio.to_thread(store.clear_blocked, fid)
+                    await asyncio.to_thread(store.requeue, fid)
+                    self._notified_blocks.discard(fid)  # a LATER block is news again
+                    log.info(
+                        "[project_board] blocked sweep: %s auto-unblocked (%s, retry %d/%d): %s",
+                        fid,
+                        cls,
+                        spent + 1,
+                        _UNBLOCK_RETRY_MAX,
+                        reason[:120],
+                    )
+                    continue
+                why = (
+                    f"{cls or 'unclassified'} block"
+                    if spent < _UNBLOCK_RETRY_MAX
+                    else f"{cls} block, {spent} auto-retr{'y' if spent == 1 else 'ies'} spent"
+                )
+                title = str(f.get("title") or "").strip()
+                self._notify_operator(
+                    fid,
+                    f"Board card {fid} is blocked and will not clear itself ({why}): "
+                    f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
+
+    def _notify_operator(self, fid: str, text: str) -> None:
+        """Put ONE item in the operator's inbox for a card that has stopped moving.
+
+        Deduped on the feature id so a card that stays blocked across many sweeps is
+        reported once, not every five minutes — the point is to be noticed, and an alert
+        that repeats forever is an alert that gets filtered.
+
+        Feature-detected: the inbox is a host module this plugin must not hard-depend on.
+        A host without it still gets the WARNING below, which is strictly louder than the
+        silence a block used to leave."""
+        if fid in self._notified_blocks:
+            return
+        self._notified_blocks.add(fid)
+        try:
+            from inbox.store import InboxStore  # host module — absent on older hosts
+
+            InboxStore().add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
+            log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
+        except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
+            log.warning(
+                "[project_board] %s blocked and NOT self-healing (no operator inbox reachable): %s",
+                fid,
+                text[:200],
+            )
 
     async def _sweep_worktrees(self, store, repo: str) -> None:
         """Reap orphaned ``feat-<id>`` worktrees under one project's checkout (#90) —

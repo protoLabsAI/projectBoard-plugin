@@ -7522,3 +7522,144 @@ async def test_clean_gate_verdicts_are_unchanged(monkeypatch):
     lp2, released2 = await _preflight_with(monkeypatch, rc=0, dirt="", prior="tsc: not found")
     assert lp2._preflight_state["default"] is True  # clean green still acquits
     assert released2 == ["default"]  # …and releases the hold
+
+
+# ── the blocked lane: self-heal or escalate, never die silently ─────────────────────
+
+
+class _BlockedStore:
+    """A store whose blocked lane a sweep can drive: list_features(state="blocked")
+    returns the given rows, and clear_blocked/requeue/record_budget are recorded."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.cleared: list[str] = []
+        self.requeued: list[str] = []
+        self.budgets: list[tuple] = []
+
+    def list_features(self, state=None, **_kw):
+        return list(self._rows) if state == "blocked" else []
+
+    def clear_blocked(self, fid):
+        self.cleared.append(fid)
+        return {"id": fid}
+
+    def requeue(self, fid):
+        self.requeued.append(fid)
+        return {"id": fid, "board_state": "ready"}
+
+    def record_budget(self, fid, kind, n):
+        self.budgets.append((fid, kind, n))
+
+
+def _blocked(fid, cls, *, reason="boom", title="A card", budget=None):
+    f = {
+        "id": fid,
+        "board_state": "blocked",
+        "blocked": True,
+        "blocked_class": cls,
+        "blocked_reason": reason,
+        "title": title,
+        "labels": [],
+    }
+    if budget is not None:
+        f["labels"] = [f"budget:unblock-retry:{budget}"]
+    return f
+
+
+async def test_a_transient_block_clears_itself_instead_of_dying(monkeypatch):
+    """A coder timeout is not a reason to retire a card. The sweep clears the block,
+    requeues it, and spends one retry — before this, a transient failure and a bad
+    credential died in exactly the same silent way and dependents waited forever."""
+    store = _BlockedStore([_blocked("bd-t", "transient", reason="coder timed out after 1800.0s")])
+    loop = BoardLoop({"coder": "proto"})
+    await loop._recover_blocked(store)
+    assert store.cleared == ["bd-t"] and store.requeued == ["bd-t"]
+    assert ("bd-t", "unblock-retry", 1) in store.budgets
+
+
+async def test_an_auth_block_is_never_auto_retried_and_pages_the_operator(monkeypatch):
+    """No amount of waiting fixes a bad credential, so it must NOT burn retries looking
+    like progress — it goes straight to a human, naming the card and the real reason."""
+    store = _BlockedStore([_blocked("bd-a", "auth", reason="403 forbidden", title="Ship the thing")])
+    loop = BoardLoop({"coder": "proto"})
+    seen = []
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append((fid, text)))
+    await loop._recover_blocked(store)
+    assert store.cleared == [] and store.requeued == []
+    (fid, text) = seen[0]
+    assert fid == "bd-a"
+    assert "bd-a" in text and "403 forbidden" in text and "Ship the thing" in text
+
+
+async def test_a_card_that_keeps_failing_transiently_stops_retrying_and_escalates(monkeypatch):
+    """Three transient failures is not bad luck. Once the retry budget is spent the card
+    stays blocked and the operator is told, rather than the loop re-running it forever."""
+    store = _BlockedStore([_blocked("bd-t", "transient", budget=2)])
+    loop = BoardLoop({"coder": "proto"})
+    seen = []
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    await loop._recover_blocked(store)
+    assert store.requeued == []
+    assert "auto-retries spent" in seen[0]
+
+
+async def test_an_unclassified_block_escalates_rather_than_silently_retrying(monkeypatch):
+    """A block with no class is an unknown failure — the one case where guessing is
+    worst. It escalates."""
+    store = _BlockedStore([_blocked("bd-u", "")])
+    loop = BoardLoop({"coder": "proto"})
+    seen = []
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    await loop._recover_blocked(store)
+    assert store.requeued == [] and "unclassified" in seen[0]
+
+
+async def test_the_operator_is_told_once_per_card_not_once_per_sweep(monkeypatch):
+    """The sweep runs every few minutes. An alert that repeats forever is an alert that
+    gets filtered, so a card that STAYS blocked is announced once."""
+    store = _BlockedStore([_blocked("bd-a", "auth")])
+    loop = BoardLoop({"coder": "proto"})
+    added = []
+    import sys
+    import types as _types
+
+    fake = _types.ModuleType("inbox.store")
+
+    class _Inbox:
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            added.append((text, priority, dedup_key))
+
+    fake.InboxStore = _Inbox
+    monkeypatch.setitem(sys.modules, "inbox", _types.ModuleType("inbox"))
+    monkeypatch.setitem(sys.modules, "inbox.store", fake)
+
+    await loop._recover_blocked(store)
+    await loop._recover_blocked(store)
+    await loop._recover_blocked(store)
+    assert len(added) == 1
+    (text, priority, dedup) = added[0]
+    assert priority == "now" and dedup == "blocked:bd-a" and "bd-a" in text
+
+
+async def test_a_self_healed_card_that_blocks_again_is_news_again(monkeypatch):
+    """The once-per-card memo is cleared when the card actually recovers, so a LATER
+    block on the same card still reaches the operator — otherwise the first transient
+    failure would permanently silence that card."""
+    store = _BlockedStore([_blocked("bd-t", "transient")])
+    loop = BoardLoop({"coder": "proto"})
+    loop._notified_blocks.add("bd-t")
+    await loop._recover_blocked(store)
+    assert "bd-t" not in loop._notified_blocks
+
+
+async def test_a_host_without_an_inbox_still_says_so_loudly(monkeypatch, caplog):
+    """The inbox is feature-detected. A host without it must still leave a WARNING —
+    strictly louder than the silence a block used to leave — never an exception."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "inbox.store", None)  # import raises
+    loop = BoardLoop({"coder": "proto"})
+    with caplog.at_level("WARNING"):
+        loop._notify_operator("bd-x", "Board card bd-x is blocked")
+    assert any("bd-x" in r.message or "bd-x" in str(r.args) for r in caplog.records)

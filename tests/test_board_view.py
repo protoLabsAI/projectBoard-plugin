@@ -11,10 +11,17 @@ from __future__ import annotations
 from project_board.board_view import BOARD_PAGE
 
 
-def test_list_sections_cover_cols_plus_blocked_and_cancelled():
-    """The list groups by COLS order + the blocked flag-state + cancelled (the second
-    terminal edge), so every board state a feature can be in has a home in the list."""
-    assert 'const LIST_SECTIONS = [...COLS, "blocked", "cancelled"];' in BOARD_PAGE
+def test_blocked_is_the_first_list_section_not_buried_below_done():
+    """Blocked cards must be the first thing the list shows. They used to render
+    second-to-last, BELOW done — which is why `list_features` floating blocked rows to
+    the top (#201) had no visible effect: the list groups by state before rendering, so
+    the GROUP order won and the row sort inside it was invisible. An operator scrolling
+    past five sections to find the one card that needs them is the whole complaint."""
+    assert 'const LIST_SECTIONS = ["blocked", ...COLS, "cancelled"];' in BOARD_PAGE
+    # every state a feature can be in still has a home, and cancelled stays last
+    order = BOARD_PAGE.split("const LIST_SECTIONS = ")[1].split(";")[0]
+    assert order.index('"blocked"') < order.index("...COLS")
+    assert order.index("...COLS") < order.index('"cancelled"')
 
 
 def test_list_groups_are_collapsible_and_persist_across_reloads():

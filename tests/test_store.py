@@ -1335,7 +1335,61 @@ def test_flag_blocked_clears_the_assignee(make_board, monkeypatch):
     monkeypatch.setattr(b, "comment", lambda fid, text: None)
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
     b.flag_blocked("bd-9", "boom")
-    assert ("update", "bd-9", "--add-label", "blocked", "--assignee", "") in br.calls
+    (up,) = br.cmds("update")
+    assert "--add-label" in up and "blocked" in up
+    assert "--assignee" in up and "" in up
+
+
+def test_flag_blocked_keeps_a_task_assignee_because_it_is_the_dispatch_target(make_board, monkeypatch):
+    """The #333 carve-out applies to the block edge too: on a task the assignee is the
+    DISPATCH TARGET, not a claim marker, so clearing it means an unblocked task can never
+    be driven again — it parks "awaiting unassigned delivery" forever."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "issue_type": "task", "assignee": "agent"})
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-t", "boom")
+    (up,) = br.cmds("update")
+    assert "--assignee" not in up
+    assert "--add-label" in up and "blocked" in up
+
+
+def test_flag_blocked_stamps_the_failure_class_so_a_transient_block_can_self_heal(make_board, monkeypatch):
+    """Every block used to look identical to the board — a coder timeout and a bad
+    credential both left nothing but a WARNING in the log. The class label is what lets
+    the sweep clear the first and escalate the second, and it is derived from the reason
+    so a call site added later is classified without being told to."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid})
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-9", "coder timed out after 1800.0s")
+    (up,) = br.cmds("update")
+    assert "blocked-class:transient" in up
+    # an unrecognised failure is terminal — a human is the only thing that clears it
+    br2 = Br()
+    b2 = make_board(br2)
+    monkeypatch.setattr(b2, "_require", lambda fid: {"id": fid})
+    monkeypatch.setattr(b2, "comment", lambda fid, text: None)
+    monkeypatch.setattr(b2, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b2.flag_blocked("bd-8", "something nobody has seen before")
+    assert "blocked-class:terminal" in br2.cmds("update")[0]
+
+
+def test_flag_blocked_replaces_a_prior_class_rather_than_accumulating(make_board, monkeypatch):
+    """The `gens:` pattern — one class label, replaced, so a card re-blocked for a new
+    reason does not carry a stale class the sweep would act on."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked-class:rate-limit", "project:x"]})
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-9", "permission denied")
+    (up,) = br.cmds("update")
+    assert "--remove-label" in up and "blocked-class:rate-limit" in up
+    assert "blocked-class:auth" in up
 
 
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
