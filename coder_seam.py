@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import re
@@ -882,6 +883,79 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
             await adapter.teardown(delegate)
         except Exception:  # noqa: BLE001 — never let teardown mask the result/error
             log.warning("[project_board] task delegate teardown failed", exc_info=True)
+
+
+# ── first-party self-dispatch through the host agent (#311) ──────────────────────
+# A task assigned to the board's OWN agent (its configured coder name, or the reserved
+# ``self``/``agent`` aliases) is NOT shelled out to a sister-agent delegate — it is
+# first-party work the host does itself through ``graph.plugins.host.HOST``'s ``invoke``
+# seam. Both the seam AND its optional ``tool_fence`` parameter are feature-detected: a
+# host predating either (an older host, or the standalone test env with no ``graph``
+# package) degrades to the caller's existing parked behaviour, and a host whose
+# ``invoke`` predates ``tool_fence`` is called without it. Self work is intentionally
+# UNFENCED — trusted first-party work — so ``tool_fence`` stays ``None`` where supported.
+
+
+def _import_host(_host=None):
+    """Best-effort handle on the host's ``graph.plugins.host.HOST`` object — the seam the
+    board drives its OWN agent through for a self-assigned task (#311). Returns it, or
+    ``None`` when the host predates the seam (an older host, or the standalone test env
+    with no ``graph`` package). ``_host`` is a test-injection seam (mirrors the import
+    guards elsewhere in this module); production callers never pass it."""
+    if _host is not None:
+        return _host
+    try:
+        from graph.plugins.host import HOST
+    except Exception:  # noqa: BLE001 — host-free test env / a host predating the seam
+        return None
+    return HOST
+
+
+def resolve_self_invoke(_host=None):
+    """Resolve the host's ``invoke`` callable for a self-dispatch, or ``None`` when the
+    host exposes no such seam (an older host, or the host-free test env). Feature-detects
+    BOTH the host object AND a callable ``invoke`` on it — the loop parks the self task
+    when this returns ``None`` (#311, r2), exactly the existing park a human/unassigned
+    task gets. ``_host`` is the same test-injection seam ``_import_host`` documents."""
+    invoke = getattr(_import_host(_host), "invoke", None)
+    return invoke if callable(invoke) else None
+
+
+async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float | None = None) -> str:
+    """Dispatch a self-assigned task through the host's OWN agent via ``invoke`` and
+    return the reply — the first-party sibling of ``dispatch_task``. ``invoke`` is the
+    ``HOST.invoke`` callable the caller already resolved with ``resolve_self_invoke``;
+    this drives it with a stable per-card ``session_id``.
+
+    The optional ``tool_fence`` parameter is feature-detected with ``inspect.signature``
+    rather than ASSUMED on the host's signature (#311): a host whose ``invoke`` accepts it
+    is called with ``tool_fence=None`` (self work is intentionally UNFENCED first-party
+    work); an older ``invoke`` without the parameter is called without it. A synchronous
+    ``invoke`` is offloaded to a worker thread (``asyncio.to_thread``) so it never stalls
+    the event loop; a coroutine ``invoke`` is awaited directly. Bounded by ``timeout``
+    (``coder_timeout_s``) and its failures normalised EXACTLY like ``dispatch_task`` — a
+    timeout to ``CoderTimeout`` and anything else to ``WorktreeError`` — so the loop's
+    coder-failure classifier blocks a self-dispatch failure via the identical code path
+    (#311, r5)."""
+    kwargs = {}
+    try:
+        if "tool_fence" in inspect.signature(invoke).parameters:
+            kwargs["tool_fence"] = None
+    except (TypeError, ValueError):  # a C/builtin callable with no introspectable signature
+        pass
+    try:
+        if inspect.iscoroutinefunction(invoke):
+            coro = invoke(prompt, session_id, **kwargs)
+        else:
+            coro = asyncio.to_thread(invoke, prompt, session_id, **kwargs)
+        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
+    except (worktree.WorktreeError, worktree.CoderTimeout):
+        raise  # already normalised — never double-wrap
+    except Exception as exc:  # noqa: BLE001 — normalise like dispatch_task: everything → WorktreeError
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    return str(reply or "")
 
 
 def resolve_delegate(name: str, expect_type: str):

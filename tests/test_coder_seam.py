@@ -1868,6 +1868,118 @@ async def test_dispatch_task_maps_an_a2a_timeout_to_coder_timeout_and_tears_down
     assert a2a.torn_down == [delegate]  # torn down on the timeout exit
 
 
+# ── #311: first-party self-dispatch through the host's own invoke seam ─────────────
+
+
+def test_resolve_self_invoke_feature_detects_a_callable_invoke():
+    """#311 r2: the self seam is present ONLY when the host exposes a callable ``invoke``.
+    A host without it, or with a non-callable ``invoke``, resolves to None — the loop parks
+    the self task exactly as it parks a human/unassigned one. ``_host`` is the injection
+    seam; production callers let it import ``graph.plugins.host.HOST``."""
+    import types as _types
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "ok"
+
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace(invoke=invoke)) is invoke
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace()) is None  # no invoke attr
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace(invoke="nope")) is None  # not callable
+
+
+def test_resolve_self_invoke_returns_none_when_the_host_package_is_absent():
+    """#311 r2: in the standalone suite there is no ``graph`` package, so ``_import_host``
+    degrades to None and the seam resolves to None — the honest degrade to the existing
+    park (mirrors ``test_import_solve_returns_none_when_the_coder_plugin_is_absent``)."""
+    assert coder_seam.resolve_self_invoke() is None
+
+
+async def test_dispatch_self_passes_tool_fence_none_when_the_seam_supports_it():
+    """#311: ``tool_fence`` is FEATURE-DETECTED via inspect.signature, not assumed. A host
+    whose ``invoke`` accepts it is called with ``tool_fence=None`` — self work is trusted
+    first-party work, so it runs UNFENCED. The prompt + stable session id pass through."""
+    seen = {}
+
+    def invoke(prompt, session_id, *, tool_fence="sentinel"):
+        seen["args"] = (prompt, session_id)
+        seen["tool_fence"] = tool_fence
+        return "deliverable"
+
+    out = await coder_seam.dispatch_self(invoke, "do the task", "board-self-bd-1", timeout=1800)
+    assert out == "deliverable"
+    assert seen["args"] == ("do the task", "board-self-bd-1")
+    assert seen["tool_fence"] is None  # explicitly unfenced — not the default sentinel
+
+
+async def test_dispatch_self_omits_tool_fence_when_the_seam_predates_it():
+    """#311: a host whose ``invoke`` has NO ``tool_fence`` parameter is called without it —
+    no TypeError. That the call returns proves the parameter was not force-passed."""
+    seen = {}
+
+    def invoke(prompt, session_id):
+        seen["args"] = (prompt, session_id)
+        return "ok"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "s") == "ok"
+    assert seen["args"] == ("p", "s")
+
+
+async def test_dispatch_self_awaits_a_coroutine_invoke():
+    """#311: a coroutine ``invoke`` is awaited directly (not offloaded), and tool_fence is
+    still feature-detected and passed as None."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        return f"async:{prompt}:{tool_fence}"
+
+    assert await coder_seam.dispatch_self(invoke, "task", "sid") == "async:task:None"
+
+
+async def test_dispatch_self_offloads_a_synchronous_invoke_to_a_thread():
+    """#311: a synchronous ``invoke`` runs on a worker thread (``asyncio.to_thread``) so it
+    never stalls the event loop — the reply comes back stringified through the seam."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "sync-ok"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "s") == "sync-ok"
+
+
+async def test_dispatch_self_maps_a_timeout_to_coder_timeout():
+    """#311 r5: a self-invoke that exceeds ``timeout`` surfaces as CoderTimeout (mapped from
+    asyncio.TimeoutError), so the loop's classifier blocks the card like any coder timeout."""
+    import asyncio as _asyncio
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        await _asyncio.sleep(10)
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self(invoke, "p", "s", timeout=0.01)
+
+
+async def test_dispatch_self_normalizes_an_error_to_worktree_error():
+    """#311 r5: any other failure from ``invoke`` is normalised to WorktreeError — the SAME
+    shape dispatch_task raises — so the loop's coder-failure classifier blocks it identically."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        raise RuntimeError("the host agent exploded")
+
+    with pytest.raises(worktree.WorktreeError) as ei:
+        await coder_seam.dispatch_self(invoke, "p", "s")
+    assert "the host agent exploded" in str(ei.value)
+
+
+async def test_dispatch_self_does_not_double_wrap_an_already_normalized_error():
+    """#311: a ``CoderTimeout``/``WorktreeError`` raised BY the invoke passes through as-is —
+    never re-wrapped in a second ``coder dispatch failed:`` layer."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        raise worktree.CoderTimeout("host already timed out")
+
+    with pytest.raises(worktree.CoderTimeout) as ei:
+        await coder_seam.dispatch_self(invoke, "p", "s")
+    assert "host already timed out" in str(ei.value)
+    assert "coder dispatch failed" not in str(ei.value)  # not double-wrapped
+
+
 # ── #226 S1: persist a finished gen's snapshot as a `coder-monitor:` bead comment ──
 
 
