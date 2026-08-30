@@ -2061,8 +2061,29 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     def clear_blocked(self, fid: str) -> dict:
-        self._require(fid)
-        self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+        """Clear the ``blocked`` flag so a feature can be re-dispatched.
+
+        When the block was a NON-MODEL failure — a pre-model dispatch/adapter/infra
+        incident, ``blocked-class:dispatch-infra`` (#339) — also RESET the card's
+        escalation posture: drop every ``tier:`` label (and the now-stale block class)
+        so the next GENUINE build starts at its difficulty-selected tier instead of
+        inheriting a tier the model never earned. A host/adapter incident must never
+        leave a `tier:` label that runs the card on a stronger, costlier model for its
+        next real attempt — the ladder is a model-capability record, not an infra one.
+        A model-reachable block (or an unclassified one) leaves the tier posture as-is,
+        exactly as before."""
+        from .failures import PRE_MODEL_DISPATCH_CLASS
+
+        f = self._require(fid)
+        labels = f.get("labels") or []
+        args = ["update", fid, "--remove-label", LABEL_BLOCKED]
+        cls = next((l.split(":", 1)[1] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)), "")
+        if cls == PRE_MODEL_DISPATCH_CLASS:
+            for lbl in labels:
+                if lbl.startswith("tier:"):  # every earned/inflated rung — reset to difficulty-selected
+                    args += ["--remove-label", lbl]
+            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        self._run(*args)
         return self.get_feature(fid)
 
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at
