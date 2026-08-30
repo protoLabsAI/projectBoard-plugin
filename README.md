@@ -267,6 +267,57 @@ quiets once `db_path` is pinned explicitly or the repo no longer carries a
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
 
+## The task lane — deliverables, not PRs
+
+Not every board card ships code. A **task-type bead** (`issue_type: task`, #217) rides
+the SAME rails as a coding feature — `ready → in_progress → in_review → done` — but its
+output is a **deliverable** (a doc, a decision, an artifact ref), not a PR.
+`record_delivery` (`board_deliver`) moves it to `in_review` with no `pr_url`, stamping
+the deliverable text plus a `delivered-by: <actor>` note — the assignee **at delivery
+time**, captured then so a later reassignment can't rewrite who actually delivered it.
+
+Because a task has no PR to merge, its **Done edge is a verifier's approval**, not
+`record_merge`: `board_verify` (the agent tool) / `POST …/features/{id}/verify` (the
+HTTP API) / `record_verification` (the store) close an approved task with an auditable
+`verified: <who>` reason — a deliberate *second* `br close` edge beside the code path's
+one Done edge. A rejection instead records the feedback as a comment (the re-dispatch
+prompt leads with it) and requeues the bead to `ready` for another pass.
+
+### Self-verification is recorded, not refused
+
+On approval the store compares **who verified** (`by`) against **who delivered** (the
+projected `delivered_by`). When they match — the same identity delivered *and* approved
+the work, with no second pair of eyes — the close is **flagged, never blocked**: a
+`self-verified` label plus a `(self-verified)` note appended to the `verified:` reason.
+Refusing a self-verification is deliberately out of scope; the board's posture is to make
+it **visible**, not to gate it. An unattributed delivery (no `delivered-by:` stamp and no
+assignee) has the store actor stand in as the deliverer, so an actor verifying its own
+unattributed task is flagged too. The projection surfaces the outcome as
+`self_verified: true` beside `delivered_by` / `verified_by`, and the **Board** view
+renders a done, self-verified task with a caution badge on the card and a
+`delivered by X, self-verified by Y` provenance line in the drawer.
+
+This is a **provenance flag over the identities the callers supplied**, not an identity
+or authentication guarantee: the match casefolds and trims the two recorded strings and
+does nothing more. It tells a reviewer that a deliverable closed without an independent
+verifier; it does not attest who those actors *really* were, nor authenticate the caller.
+
+### The default verifier splits by caller — on purpose
+
+An omitted `by` resolves differently depending on which door the verification came
+through, and the split is intentional (#316):
+
+- **Agent tool** (`board_verify`, `by` omitted) → the **store actor**. The tool *is* the
+  agent, so a blank `by` forwards straight through and the store stamps its own actor —
+  the agent attributing the close to itself.
+- **HTTP / console API** (`POST …/verify`, `by` omitted) → **`operator`**, NOT the store
+  actor. A console verification is out-of-band by construction; defaulting it to the store
+  actor would falsely flag an **agent-delivered** task, approved by a human in the console,
+  as self-verified. `operator` keeps that human-in-the-console close distinct from the
+  deliverer.
+
+An explicit `by` is forwarded verbatim through every door.
+
 ## Configure it in the console
 
 On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is split
