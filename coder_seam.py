@@ -78,10 +78,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import re
+import concurrent.futures
 import sys
+import threading
 import time
 import types
 from collections import OrderedDict, deque
@@ -882,6 +885,191 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
             await adapter.teardown(delegate)
         except Exception:  # noqa: BLE001 — never let teardown mask the result/error
             log.warning("[project_board] task delegate teardown failed", exc_info=True)
+
+
+# ── first-party self-dispatch through the host agent (#311) ──────────────────────
+# A task assigned to the board's OWN agent (its configured coder name, or the reserved
+# ``self``/``agent`` aliases) is NOT shelled out to a sister-agent delegate — it is
+# first-party work the host does itself through ``graph.plugins.host.HOST``'s ``invoke``
+# seam. Both the seam AND its optional ``tool_fence`` parameter are feature-detected: a
+# host predating either (an older host, or the standalone test env with no ``graph``
+# package) degrades to the caller's existing parked behaviour, and a host whose
+# ``invoke`` predates ``tool_fence`` is called without it. Self work is intentionally
+# UNFENCED — trusted first-party work — so ``tool_fence`` stays ``None`` where supported.
+
+
+def _import_host(_host=None):
+    """Best-effort handle on the host's ``graph.plugins.host.HOST`` object — the seam the
+    board drives its OWN agent through for a self-assigned task (#311). Returns it, or
+    ``None`` when the host predates the seam (an older host, or the standalone test env
+    with no ``graph`` package). ``_host`` is a test-injection seam (mirrors the import
+    guards elsewhere in this module); production callers never pass it."""
+    if _host is not None:
+        return _host
+    try:
+        from graph.plugins.host import HOST
+    except Exception:  # noqa: BLE001 — host-free test env / a host predating the seam
+        return None
+    return HOST
+
+
+def resolve_self_invoke(_host=None):
+    """Resolve the host's ``invoke`` callable for a self-dispatch, or ``None`` when the
+    host exposes no such seam (an older host, or the host-free test env). Feature-detects
+    BOTH the host object AND a callable ``invoke`` on it — the loop parks the self task
+    when this returns ``None`` (#311, r2), exactly the existing park a human/unassigned
+    task gets. ``_host`` is the same test-injection seam ``_import_host`` documents."""
+    invoke = getattr(_import_host(_host), "invoke", None)
+    return invoke if callable(invoke) else None
+
+
+# ── the host-invocation slot ──────────────────────────────────────────────────────
+# The drain below holds the loop's one-in-flight guard across a TIMEOUT. It cannot hold
+# it across an external CANCEL (operator stop / shutdown): CancelledError unwinds this
+# coroutine, the drive's done-callback clears `_self_inflight`, and the worker thread
+# keeps executing on the host — so a later self task could invoke it concurrently. And
+# draining on cancel is not an option: shutdown must not block on a runaway host call.
+#
+# So the cancel case is covered by a flag the WORKER owns. Acquire and release both live
+# inside the thread wrapper, in one frame: if the thread never starts, neither happens,
+# so the flag can never leak and strand every future self task. The gap between
+# submitting the thread and it entering is covered by `_self_inflight`, which the loop
+# sets synchronously before the drive begins. Process-stable slot (#178) so a plugin
+# reload mid-invocation cannot forget a live call.
+_HOST_SLOT_PREFIX = "project_board.host_invoke::"
+
+
+def _host_slot():
+    name = _HOST_SLOT_PREFIX + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's host-invoke slot — data, not code."
+        holder.busy = 0
+        holder.lock = threading.Lock()
+        # OUR OWN executor, not the loop's shared default, for one reason: a
+        # `concurrent.futures.Future` we submitted ourselves answers the question no
+        # `asyncio.to_thread` can — `cancel()` returns True ONLY if the work had not
+        # started and now never will. That is the proof needed to release the slot on
+        # the cancel path without ever releasing one a live worker still owns.
+        # max_workers=1 also makes two simultaneous host invocations structurally
+        # impossible rather than merely guarded.
+        holder.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="pb-host-invoke")
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
+    return holder
+
+
+def _host_slot_release() -> None:
+    holder = _host_slot()
+    with holder.lock:
+        holder.busy = max(0, holder.busy - 1)
+
+
+def host_invoke_busy() -> bool:
+    """True while a synchronous ``dispatch_self`` worker is STILL EXECUTING on the host —
+    including one whose awaiter was cancelled out from under it. The loop consults this
+    alongside ``_self_inflight`` so a cancelled self task cannot be followed by a second
+    invoke while the first is still running."""
+    holder = _host_slot()
+    with holder.lock:
+        return holder.busy > 0
+
+
+async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float | None = None) -> str:
+    """Dispatch a self-assigned task through the host's OWN agent via ``invoke`` and
+    return the reply — the first-party sibling of ``dispatch_task``. ``invoke`` is the
+    ``HOST.invoke`` callable the caller already resolved with ``resolve_self_invoke``;
+    this drives it with a stable per-card ``session_id``.
+
+    The optional ``tool_fence`` parameter is feature-detected with ``inspect.signature``
+    rather than ASSUMED on the host's signature (#311): a host whose ``invoke`` accepts it
+    is called with ``tool_fence=None`` (self work is intentionally UNFENCED first-party
+    work); an older ``invoke`` without the parameter is called without it. A coroutine
+    ``invoke`` is awaited directly (and genuinely cancelled on timeout); a synchronous
+    ``invoke`` is offloaded to a worker thread (``asyncio.to_thread``) so it never stalls
+    the event loop. Bounded by ``timeout`` (``coder_timeout_s``) and its failures normalised
+    EXACTLY like ``dispatch_task`` — a timeout to ``CoderTimeout`` and anything else to
+    ``WorktreeError`` — so the loop's coder-failure classifier blocks a self-dispatch failure
+    via the identical code path (#311, r5).
+
+    A synchronous ``invoke`` runs on a worker thread that CANNOT be cancelled: a plain
+    ``wait_for(to_thread(...))`` cancels only the *await* on timeout, leaving the thread
+    still executing on the host after this call returns and the loop's done-callback clears
+    the one-in-flight guard — a second self task could then invoke the host CONCURRENTLY,
+    defeating that guard (the #311 review finding). So on a synchronous timeout the worker is
+    DRAINED to true completion before the timeout is surfaced: the caller stays parked on this
+    await (guard held, slot held) until the host's own call actually returns, so no concurrent
+    invoke can start. The cost — a runaway synchronous host pins the drive until its thread
+    finishes — is the honest price of an uncancellable call, and strictly safer than two live
+    invokes racing on one host.
+
+    The drain covers a TIMEOUT. An external CANCEL (operator stop / shutdown) it cannot
+    cover — CancelledError unwinds this coroutine and the drive's done-callback frees the
+    guard while the worker runs on — and draining there would block shutdown on the very
+    runaway call the operator is trying to stop. That case is covered instead by the
+    busy slot (``host_invoke_busy``), which the loop consults alongside its own guard.
+
+    The slot is raised on THIS thread before the work is submitted — not inside the
+    worker — because a cancel landing in the submission window would otherwise find the
+    slot still clear while a worker was already queued to run. It is lowered by the
+    worker when the call returns, or by the cancel path but ONLY when
+    ``Future.cancel()`` proves the work never started and never will. Those are the two
+    exhaustive cases, which is why the work is submitted to a private single-worker
+    executor rather than through ``asyncio.to_thread``: the shared default executor
+    hands back no future that can answer that question."""
+    kwargs = {}
+    try:
+        if "tool_fence" in inspect.signature(invoke).parameters:
+            kwargs["tool_fence"] = None
+    except (TypeError, ValueError):  # a C/builtin callable with no introspectable signature
+        pass
+    holder = _host_slot()
+    work = None  # the submitted synchronous call, so the cancel handler can interrogate it
+    try:
+        if inspect.iscoroutinefunction(invoke):
+            # A coroutine invoke IS cancellable — wait_for cancels it cleanly on timeout.
+            coro = invoke(prompt, session_id, **kwargs)
+            reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        else:
+            # The worker thread is uncancellable — never abandon it past the timeout (see the
+            # docstring). ``asyncio.wait`` returns pending tasks WITHOUT cancelling them, so on
+            # timeout we drain the still-running thread before raising CoderTimeout.
+            def _invoke_releasing_the_slot():
+                try:
+                    return invoke(prompt, session_id, **kwargs)
+                finally:
+                    _host_slot_release()
+
+            with holder.lock:  # raised BEFORE submission — a cancel in the submission
+                holder.busy += 1  # window must never find the slot clear
+            work = holder.executor.submit(_invoke_releasing_the_slot)
+            thread = asyncio.ensure_future(asyncio.wrap_future(work))
+            if timeout:
+                await asyncio.wait({thread}, timeout=timeout)
+                if not thread.done():
+                    try:
+                        await thread  # drain the uncancellable worker — never leak it past the guard
+                    except Exception:  # noqa: BLE001 — the drained result/error is moot; the timeout wins
+                        pass
+                    raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
+                reply = thread.result()
+            else:
+                reply = await thread
+    except asyncio.CancelledError:
+        # Operator stop / shutdown. `cancel()` is True only when the work had not started
+        # and now never will — then its `finally` will never run and the slot is ours to
+        # lower. False means a worker is live and still owns it; releasing here would let
+        # the next self task race a call that is still on the host.
+        if work is not None and work.cancel():
+            _host_slot_release()
+        raise
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
+    except (worktree.WorktreeError, worktree.CoderTimeout):
+        raise  # already normalised — never double-wrap
+    except Exception as exc:  # noqa: BLE001 — normalise like dispatch_task: everything → WorktreeError
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
+    return str(reply or "")
 
 
 def resolve_delegate(name: str, expect_type: str):

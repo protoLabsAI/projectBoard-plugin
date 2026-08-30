@@ -9,6 +9,7 @@ needs the (separate, git-URL-installed) `coder` plugin to be present."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1868,6 +1869,144 @@ async def test_dispatch_task_maps_an_a2a_timeout_to_coder_timeout_and_tears_down
     assert a2a.torn_down == [delegate]  # torn down on the timeout exit
 
 
+# ── #311: first-party self-dispatch through the host's own invoke seam ─────────────
+
+
+def test_resolve_self_invoke_feature_detects_a_callable_invoke():
+    """#311 r2: the self seam is present ONLY when the host exposes a callable ``invoke``.
+    A host without it, or with a non-callable ``invoke``, resolves to None — the loop parks
+    the self task exactly as it parks a human/unassigned one. ``_host`` is the injection
+    seam; production callers let it import ``graph.plugins.host.HOST``."""
+    import types as _types
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "ok"
+
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace(invoke=invoke)) is invoke
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace()) is None  # no invoke attr
+    assert coder_seam.resolve_self_invoke(_host=_types.SimpleNamespace(invoke="nope")) is None  # not callable
+
+
+def test_resolve_self_invoke_returns_none_when_the_host_package_is_absent():
+    """#311 r2: in the standalone suite there is no ``graph`` package, so ``_import_host``
+    degrades to None and the seam resolves to None — the honest degrade to the existing
+    park (mirrors ``test_import_solve_returns_none_when_the_coder_plugin_is_absent``)."""
+    assert coder_seam.resolve_self_invoke() is None
+
+
+async def test_dispatch_self_passes_tool_fence_none_when_the_seam_supports_it():
+    """#311: ``tool_fence`` is FEATURE-DETECTED via inspect.signature, not assumed. A host
+    whose ``invoke`` accepts it is called with ``tool_fence=None`` — self work is trusted
+    first-party work, so it runs UNFENCED. The prompt + stable session id pass through."""
+    seen = {}
+
+    def invoke(prompt, session_id, *, tool_fence="sentinel"):
+        seen["args"] = (prompt, session_id)
+        seen["tool_fence"] = tool_fence
+        return "deliverable"
+
+    out = await coder_seam.dispatch_self(invoke, "do the task", "board-self-bd-1", timeout=1800)
+    assert out == "deliverable"
+    assert seen["args"] == ("do the task", "board-self-bd-1")
+    assert seen["tool_fence"] is None  # explicitly unfenced — not the default sentinel
+
+
+async def test_dispatch_self_omits_tool_fence_when_the_seam_predates_it():
+    """#311: a host whose ``invoke`` has NO ``tool_fence`` parameter is called without it —
+    no TypeError. That the call returns proves the parameter was not force-passed."""
+    seen = {}
+
+    def invoke(prompt, session_id):
+        seen["args"] = (prompt, session_id)
+        return "ok"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "s") == "ok"
+    assert seen["args"] == ("p", "s")
+
+
+async def test_dispatch_self_awaits_a_coroutine_invoke():
+    """#311: a coroutine ``invoke`` is awaited directly (not offloaded), and tool_fence is
+    still feature-detected and passed as None."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        return f"async:{prompt}:{tool_fence}"
+
+    assert await coder_seam.dispatch_self(invoke, "task", "sid") == "async:task:None"
+
+
+async def test_dispatch_self_offloads_a_synchronous_invoke_to_a_thread():
+    """#311: a synchronous ``invoke`` runs on a worker thread (``asyncio.to_thread``) so it
+    never stalls the event loop — the reply comes back stringified through the seam."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "sync-ok"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "s") == "sync-ok"
+
+
+async def test_dispatch_self_maps_a_timeout_to_coder_timeout():
+    """#311 r5: a self-invoke that exceeds ``timeout`` surfaces as CoderTimeout (mapped from
+    asyncio.TimeoutError), so the loop's classifier blocks the card like any coder timeout."""
+    import asyncio as _asyncio
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        await _asyncio.sleep(10)
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self(invoke, "p", "s", timeout=0.01)
+
+
+async def test_dispatch_self_drains_a_timed_out_synchronous_worker_before_surfacing():
+    """#311 review finding: a SYNCHRONOUS invoke runs on a worker thread that CANNOT be
+    cancelled. A plain ``wait_for(to_thread(...))`` would surface the timeout while the thread
+    kept running on the host — so after the loop cleared its one-in-flight guard a second self
+    task could invoke the host CONCURRENTLY. dispatch_self instead DRAINS the thread to true
+    completion before raising CoderTimeout: when the timeout surfaces the worker has genuinely
+    finished, so no invoke is left running past the guard. Red-is-reachable: the abandon-on-
+    timeout code leaves ``finished`` unset when CoderTimeout is raised."""
+    import threading
+    import time as _time
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        started.set()
+        _time.sleep(0.2)  # outlives the 0.01s timeout — the thread cannot be cancelled
+        finished.set()
+        return "late"
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self(invoke, "p", "s", timeout=0.01)
+    assert started.is_set()
+    assert finished.is_set()  # drained to completion — NOT abandoned mid-flight past the guard
+
+
+async def test_dispatch_self_normalizes_an_error_to_worktree_error():
+    """#311 r5: any other failure from ``invoke`` is normalised to WorktreeError — the SAME
+    shape dispatch_task raises — so the loop's coder-failure classifier blocks it identically."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        raise RuntimeError("the host agent exploded")
+
+    with pytest.raises(worktree.WorktreeError) as ei:
+        await coder_seam.dispatch_self(invoke, "p", "s")
+    assert "the host agent exploded" in str(ei.value)
+
+
+async def test_dispatch_self_does_not_double_wrap_an_already_normalized_error():
+    """#311: a ``CoderTimeout``/``WorktreeError`` raised BY the invoke passes through as-is —
+    never re-wrapped in a second ``coder dispatch failed:`` layer."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        raise worktree.CoderTimeout("host already timed out")
+
+    with pytest.raises(worktree.CoderTimeout) as ei:
+        await coder_seam.dispatch_self(invoke, "p", "s")
+    assert "host already timed out" in str(ei.value)
+    assert "coder dispatch failed" not in str(ei.value)  # not double-wrapped
+
+
 # ── #226 S1: persist a finished gen's snapshot as a `coder-monitor:` bead comment ──
 
 
@@ -2386,3 +2525,118 @@ async def test_a_seam_returning_a_non_result_is_refused_not_passed_up(monkeypatc
             _FakeCoder(), "/wt", "x", fid="bd-junk", gen=1, _dispatch_tapped=_junk_seam
         )
     assert coder_seam.progress_snapshot("bd-junk")["gens"][0]["done"] is True  # gen still closed
+
+
+async def test_a_cancelled_self_dispatch_keeps_the_host_slot_until_the_worker_returns():
+    """The drain covers a TIMEOUT. It cannot cover an external CANCEL: CancelledError
+    unwinds dispatch_self, the drive's done-callback frees `_self_inflight`, and the
+    uncancellable worker keeps executing on the host — so a later self task could invoke
+    it concurrently. Draining on cancel is not an option either (shutdown must not block
+    on the runaway call the operator is stopping).
+
+    So the worker owns a busy flag: still raised after the await is cancelled, lowered
+    only when the host's call actually returns."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        started.set()
+        release.wait(10)
+        return "late"
+
+    assert coder_seam.host_invoke_busy() is False
+    task = asyncio.create_task(coder_seam.dispatch_self(invoke, "p", "pb-self-bd-cancel"))
+    for _ in range(500):  # let the worker thread actually enter invoke
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    task.cancel()  # operator stop / shutdown
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The awaiter is gone; the worker is NOT. The host must still read as busy.
+    assert coder_seam.host_invoke_busy() is True
+
+    release.set()
+    for _ in range(500):
+        if not coder_seam.host_invoke_busy():
+            break
+        await asyncio.sleep(0.01)
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_the_host_slot_is_clear_after_an_ordinary_self_dispatch():
+    """No leak on the happy path — the next self task is admitted immediately."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "done"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "pb-self-bd-ok") == "done"
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_a_coroutine_self_dispatch_never_touches_the_host_slot():
+    """The slot exists only for the uncancellable THREAD. A coroutine invoke is genuinely
+    cancelled by wait_for, so it needs no flag — and must not leave one raised."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        assert coder_seam.host_invoke_busy() is False
+        return "async done"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "pb-self-bd-async") == "async done"
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_queued_work_holds_the_slot_and_a_cancel_releases_only_its_own():
+    """#315 review: the slot must be raised BEFORE the work is submitted, not inside the
+    worker. Raised inside, a cancel landing in the submission window found the slot clear
+    while a worker was already queued — and the loop would admit a second host invocation.
+
+    Raised before, the mirror hazard appears: a cancel of work that never runs would leak
+    the slot forever and park every later self task. That is why the work goes to a
+    private single-worker executor — `Future.cancel()` returning True is PROOF the call
+    never started and never will, so the cancel path can release exactly that slot and no
+    other. This pins both halves at once: the executor is saturated, so the second
+    dispatch is queued-but-not-started."""
+    import threading
+
+    holder = coder_seam._host_slot()
+    gate = threading.Event()
+    running = threading.Event()
+
+    def first_invoke(prompt, session_id, *, tool_fence=None):
+        running.set()
+        gate.wait(10)
+        return "first"
+
+    def never_runs(prompt, session_id, *, tool_fence=None):
+        raise AssertionError("queued work must never start once cancelled")
+
+    first = asyncio.create_task(coder_seam.dispatch_self(first_invoke, "p", "pb-self-1"))
+    for _ in range(500):
+        if running.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert running.is_set()
+
+    second = asyncio.create_task(coder_seam.dispatch_self(never_runs, "p", "pb-self-2"))
+    for _ in range(500):  # let it reach the submit
+        with holder.lock:
+            if holder.busy == 2:
+                break
+        await asyncio.sleep(0.01)
+    with holder.lock:
+        assert holder.busy == 2, "queued-but-unstarted work must already hold a slot"
+
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    with holder.lock:
+        assert holder.busy == 1, "the cancel released its own slot, not the live worker's"
+
+    gate.set()
+    assert await first == "first"
+    assert coder_seam.host_invoke_busy() is False

@@ -501,7 +501,7 @@ let MON_FID = null, MON_TIMER = null, TASK_FID = null;
 let TASK_DETAIL = null;
 // Monotonic ticket for fetchTaskDetail — see its comment: fences two in-flight
 // fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
-let TASK_DETAIL_SEQ = 0;
+const TASK_DETAIL_SEQ = {};
 
 function toolLine(t){
   const st = esc(t.status||"");
@@ -674,15 +674,17 @@ function openTask(fid){
 // other: open the drawer (fetch A), approve (fetch B), and if A resolves after B it
 // overwrites B's newer post-action detail with pre-action data. So each fetch also takes
 // a monotonic ticket and writes only while it is still the latest — last-issued wins,
-// never last-to-resolve.
+// never last-to-resolve. The ticket is PER-FID: a single global counter let a delayed
+// action on task A bump the sequence and silently invalidate task B's in-flight fetch
+// after the drawer switched, leaving B with no deliverable and no replacement fetch.
 async function fetchTaskDetail(fid){
-  const seq = ++TASK_DETAIL_SEQ;
+  const seq = TASK_DETAIL_SEQ[fid] = (TASK_DETAIL_SEQ[fid] || 0) + 1;
   try {
     const f = await api(FEAT + encodeURIComponent(fid));
-    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ) return;
+    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ[fid]) return;
     TASK_DETAIL = {fid: fid, feature: f};
   } catch (e) {
-    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ) return;
+    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ[fid]) return;
     TASK_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};
   }
   syncTaskDrawer();
