@@ -183,18 +183,20 @@ function taskErr(fid, e){
 async function submitDeliver(fid){
   const text = ($("tdtext-"+fid) || {}).value || "";
   const ref = ($("tdref-"+fid) || {}).value || "";
-  try { await apiPost(FEAT+encodeURIComponent(fid)+"/deliver", {text: text, ref: ref}); await load(); }
+  // …then re-fetch the single-card detail so the drawer picks up the just-recorded
+  // deliverable (the list reload above can't — /features omits comments; see #312).
+  try { await apiPost(FEAT+encodeURIComponent(fid)+"/deliver", {text: text, ref: ref}); await load(); await fetchTaskDetail(fid); }
   catch (e) { taskErr(fid, e); }
 }
 async function approveTask(fid){
-  try { await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true}); await load(); }
+  try { await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true}); await load(); await fetchTaskDetail(fid); }
   catch (e) { taskErr(fid, e); }
 }
 async function rejectTask(fid){
   const feedback = ($("trtext-"+fid) || {}).value || "";
   try {
     await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: false, feedback: feedback});
-    REJECT_OPEN.delete(fid); await load();
+    REJECT_OPEN.delete(fid); await load(); await fetchTaskDetail(fid);
   } catch (e) { taskErr(fid, e); }
 }
 
@@ -459,6 +461,18 @@ const MON_POLL_MS = 3000;
 // clears the other — and both fence writes to the shared #drawer-body (see pollMonitor
 // / syncTaskDrawer) so a stale async can't clobber a re-purposed drawer.
 let MON_FID = null, MON_TIMER = null, TASK_FID = null;
+// The single-card detail behind the OPEN task drawer (#312): the list projection the 10s
+// poll pulls (/features → br list) intentionally OMITS bead comments, so its comment-
+// derived `deliverable` field is always "" — the drawer would render blank for a delivered
+// task. So the drawer fetches the single-feature route (/features/{fid} → get_feature → br
+// show, which carries comments) ON OPEN and after each action, caching the result here so
+// the 10s poll's syncTaskDrawer re-render reuses it (no per-task br show every tick, the
+// monitor's on-open /progress posture). Shape: {fid, feature} on success, {fid, error} on
+// a failed fetch (surfaced in the drawer); null when no task is open / not yet fetched.
+let TASK_DETAIL = null;
+// Monotonic ticket for fetchTaskDetail — see its comment: fences two in-flight
+// fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
+let TASK_DETAIL_SEQ = 0;
 
 function toolLine(t){
   const st = esc(t.status||"");
@@ -612,9 +626,36 @@ function openTask(fid){
   MON_FID = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   TASK_FID = fid;
+  TASK_DETAIL = null;                                            // drop the prior task's fetched detail
   $("drawer-title").textContent = "Task — " + fid;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
   document.body.classList.add("drawer-open");
+  syncTaskDrawer();                                              // paint the list-driven summary at once…
+  fetchTaskDetail(fid);                                          // …then fetch the comment-derived deliverable (on open, like the monitor's /progress fetch)
+}
+// Fetch the single-feature detail (/features/{fid} → get_feature → br show, which carries
+// the comment-derived deliverable the list projection omits) for the open task and re-
+// render the drawer with it (#312). This is the ONLY source of the drawer's deliverable —
+// the 10s /features poll never carries one. Fenced on TASK_FID exactly like pollMonitor:
+// a fetch that resolves AFTER the drawer is closed or switched to another task/the monitor
+// re-checks TASK_FID on BOTH the success and the error path and bails without writing, so
+// a late resolve can't clobber a re-purposed #drawer-body.
+//
+// TASK_FID alone only fences ACROSS tasks. Two fetches for the SAME open task race each
+// other: open the drawer (fetch A), approve (fetch B), and if A resolves after B it
+// overwrites B's newer post-action detail with pre-action data. So each fetch also takes
+// a monotonic ticket and writes only while it is still the latest — last-issued wins,
+// never last-to-resolve.
+async function fetchTaskDetail(fid){
+  const seq = ++TASK_DETAIL_SEQ;
+  try {
+    const f = await api(FEAT + encodeURIComponent(fid));
+    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ) return;
+    TASK_DETAIL = {fid: fid, feature: f};
+  } catch (e) {
+    if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ) return;
+    TASK_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};
+  }
   syncTaskDrawer();
 }
 // Render the open task's detail from the live FEATURES into the shared drawer body — a
@@ -623,10 +664,21 @@ function openTask(fid){
 function syncTaskDrawer(){
   if (!TASK_FID) return;
   const f = FEATURES.find(x => x.id === TASK_FID);
-  $("drawer-body").innerHTML = f ? taskDetail(f) : '<div class="pl-empty">Task not found.</div>';
+  if (!f) { $("drawer-body").innerHTML = '<div class="pl-empty">Task not found.</div>'; return; }
+  // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
+  // action re-render still tracks in_progress → in_review → done; the comment-derived
+  // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it
+  // has landed for THIS task (#312). A failed single-fetch surfaces as an error callout
+  // ABOVE the detail rather than leaving the deliverable silently blank.
+  const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;
+  const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable} : f;
+  const err = d && d.error
+    ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load task detail: " + d.error)+'</div>'
+    : "";
+  $("drawer-body").innerHTML = err + taskDetail(merged);
 }
 function closeMonitor(){
-  MON_FID = null; TASK_FID = null;
+  MON_FID = null; TASK_FID = null; TASK_DETAIL = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
   document.body.classList.remove("drawer-open");
