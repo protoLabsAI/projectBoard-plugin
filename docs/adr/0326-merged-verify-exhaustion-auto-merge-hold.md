@@ -47,13 +47,27 @@ the persisted `budget:merged-verify:<n>` label by hand does nothing, because
    against the *live* cfg cap, raising `merged_verify_max` flips the projection back to
    `auto-merge pending` with no restart, mirroring how the loop re-arms.
 
-3. **A supported, auditable reset.** A new board tool
-   `board_reset_merged_verify_budget(feature_id)` clears **only** the selected feature's
-   `merged-verify` budget label (`store.reset_merged_verify_budget`, which records an
-   audit comment) *and* invalidates the live loop's in-process cache via a
-   process-stable `loop.reset_merged_verify_budget(fid)` (the #178/#211 `sys.modules`
-   registry pattern, reload-stable). A blank or unknown feature id alters nothing
-   (`_require` raises `BoardNotFound`); the reset touches no other budget kind.
+3. **A supported, auditable reset — race-safe against an in-flight reconcile.** A new
+   board tool `board_reset_merged_verify_budget(feature_id)` clears **only** the selected
+   feature's `merged-verify` budget label (`store.reset_merged_verify_budget`, which
+   records an audit comment) *and* invalidates the live loop's in-process budget via a
+   process-stable `loop.reset_merged_verify_budget(fid, store)` (the #178/#211
+   `sys.modules` registry pattern, reload-stable). A blank or unknown feature id alters
+   nothing (`_require` raises `BoardNotFound`); the reset touches no other budget kind.
+
+   The invalidation **pins the live count to 0**, it does not pop the key — the #259
+   `_budget_reset` mid-flow rule: a popped key lets the very next `_budget_get(...,
+   feature)` rehydrate the exhausted count from a poll's stale label snapshot and re-hold
+   the card, so 0 must be authoritative until a real re-verify spends it again. And it is
+   serialized against the sentinel write by a per-loop `_mv_reset_lock`: the reconcile
+   arms the exhaustion sentinel through a compare-and-set (`_arm_merged_verify_exhaustion`,
+   run in a worker thread) that writes `max+1` **only if the live count is still exactly
+   at the cap**, while the reset pins 0 and re-clears the label under the same lock. So a
+   reset landing between the reconcile's at-cap read and its sentinel write cannot be
+   clobbered: either the CAS runs first and the reset then wipes both halves (pinned cache
+   + re-cleared label), or the reset runs first and the CAS reads the pinned 0 and skips.
+   Without this, a reset that reported success could be silently undone by an in-flight
+   reconcile re-persisting the `max+1` sentinel, leaving the card held.
 
 ## Consequences
 

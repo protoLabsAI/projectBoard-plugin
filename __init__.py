@@ -886,12 +886,16 @@ def _board_tools(cfg: dict):
                 return "Error: feature_id is required to reset a merged-verify budget"
             store = get_store(**store_kw)
             f = store.reset_merged_verify_budget(feature_id)
-            # Invalidate the running loop's in-process cache too — the label clear alone
-            # is not enough (the loop's cache wins over the labels, #259). Lazy import
-            # (the loop imports from here, so a top-level import would cycle).
+            # Invalidate the running loop's in-process budget too — the label clear alone
+            # is not enough (the loop's cache wins over the labels, #259). This runs AFTER
+            # the store's durable clear: it pins the live count to 0 and re-clears the
+            # label under the loop's reset lock, so a reconcile that is mid-flight arming
+            # the exhaustion sentinel can't leave the card held (ADR 0326). The store is
+            # handed in for that re-clear. Lazy import (the loop imports from here, so a
+            # top-level import would cycle).
             from .loop import reset_merged_verify_budget as _invalidate_cache
 
-            cache_cleared = _invalidate_cache(feature_id)
+            cache_cleared = _invalidate_cache(feature_id, store)
             return json.dumps(
                 {
                     "id": f["id"],

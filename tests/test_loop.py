@@ -4166,25 +4166,101 @@ async def test_verify_merged_state_red_gate_spends_a_unit(monkeypatch):
 # ── merged-verify budget reset: the live-loop cache invalidation (ADR 0326, #326) ─
 
 
-def test_reset_merged_verify_budget_pops_the_live_loops_cache():
-    """AC6/ADR 0326: the reset verb clears the RUNNING loop's in-process merged-verify
-    cache (clearing the label alone can't — `_budget_get` lets the cache win, #259). It
-    touches only the named fid, is idempotent, and returns False when no loop is live."""
+class _ResetStore:
+    """A store double for the reset path: records the merged-verify label clears the loop
+    re-issues under its reset lock (`clear_budgets`) and the sentinel writes a racing
+    reconcile persists (`record_budget`)."""
+
+    def __init__(self):
+        self.cleared = []  # (fid, kinds-tuple | None)
+        self.budgets = []  # (fid, kind, n)
+
+    def clear_budgets(self, fid, kinds=None):
+        self.cleared.append((fid, tuple(kinds) if kinds is not None else None))
+        return {"id": fid}
+
+    def record_budget(self, fid, kind, n):
+        self.budgets.append((fid, kind, n))
+        return {"id": fid}
+
+
+def test_reset_merged_verify_budget_pins_the_live_loops_count_to_zero():
+    """AC6/ADR 0326: the reset verb resets the RUNNING loop's in-process merged-verify
+    budget (clearing the label alone can't — `_budget_get` lets the cache win, #259). It
+    PINS the count to 0 (not a pop — the #259 mid-flow rule, so a stale label snapshot
+    can't rehydrate the exhausted count), re-clears the label under the reset lock, touches
+    only the named fid, is idempotent, and returns False when no loop is live."""
     slot = loop_mod._loop_slot()
     prior = slot.loop
     slot.loop = None
+    store = _ResetStore()
     try:
-        assert loop_mod.reset_merged_verify_budget("bd-1") is False  # no live loop → nothing to do
+        assert loop_mod.reset_merged_verify_budget("bd-1", store) is False  # no live loop → nothing to do
         loop = BoardLoop({})
         loop._merged_verify_attempts["bd-1"] = 6
         loop._merged_verify_attempts["bd-2"] = 3
         loop_mod._register_loop(loop)
-        assert loop_mod.reset_merged_verify_budget("bd-1") is True
-        assert "bd-1" not in loop._merged_verify_attempts  # only bd-1 dropped
+        assert loop_mod.reset_merged_verify_budget("bd-1", store) is True
+        assert loop._merged_verify_attempts["bd-1"] == 0  # PINNED to 0, not popped
         assert loop._merged_verify_attempts["bd-2"] == 3  # a sibling's budget is untouched
-        assert loop_mod.reset_merged_verify_budget("bd-1") is True  # idempotent on an absent fid
+        assert store.cleared == [("bd-1", ("merged-verify",))]  # only that kind's label re-cleared
+        assert loop_mod.reset_merged_verify_budget("bd-1", store) is True  # idempotent
     finally:
         slot.loop = prior
+
+
+async def test_reset_wins_a_race_with_the_in_flight_exhaustion_sentinel(monkeypatch):
+    """The review finding: a reset that lands AFTER the reconcile read the at-cap count but
+    BEFORE it writes the `max+1` sentinel must not be clobbered. The sentinel write is a
+    compare-and-set under the reset lock; a reset that pins 0 first makes the CAS read 0
+    and skip, so the card is not silently re-held."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("newbase"))
+    built = []
+
+    async def _build(repo, branch, sha, root=".worktrees"):
+        built.append(sha)
+        return ("merged", "/wt")
+
+    monkeypatch.setattr(worktree, "merged_state_worktree", _build)
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(merged_verify_max=1)
+    loop._merged_verify_attempts["bd-1"] = 1  # already AT the cap
+
+    # Simulate the operator reset firing exactly while the reconcile is inside the CAS:
+    # the to_thread arm runs _invalidate first (pin 0 + label clear), then the real CAS.
+    real_arm = loop._arm_merged_verify_exhaustion
+
+    def _arm_after_reset(st, fid):
+        loop._invalidate_merged_verify_budget(fid, st)  # the reset lands first
+        return real_arm(st, fid)
+
+    monkeypatch.setattr(loop, "_arm_merged_verify_exhaustion", _arm_after_reset)
+    feature = {"id": "bd-1", "labels": ["merged-verified:oldsha"]}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert built == []  # AT the cap → the gate never ran
+    assert loop._merged_verify_attempts["bd-1"] == 0  # the reset's pinned 0 stands
+    # No max+1 sentinel persisted — only the reset's label clear ran.
+    assert ("bd-1", "merged-verify", 2) not in store.budgets
+    assert store.cleared == [("bd-1", ("merged-verify",))]
+
+
+async def test_pinned_zero_defeats_a_stale_exhaustion_label_snapshot(monkeypatch):
+    """After a reset, a poll whose feature snapshot still carries the pre-reset
+    `budget:merged-verify:<max+1>` label must NOT re-hold the card: the pinned 0 wins over
+    the stale snapshot in `_budget_get`, so the loop re-verifies and re-stamps."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("freshbase"))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt")))
+    monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(merged_verify_max=1)
+    loop._invalidate_merged_verify_budget("bd-1", store)  # operator reset → pins 0
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green
+    # The poll's snapshot is stale — it still shows the exhaustion sentinel label.
+    feature = {"id": "bd-1", "labels": ["merged-verified:old", "budget:merged-verify:2"]}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert store.verified == [("bd-1", "freshbase")]  # re-verified, not held on the stale label
+    assert loop._merged_verify_attempts["bd-1"] == 1  # a real re-verify spent 0→1
 
 
 def test_start_publishes_the_loop_to_the_process_stable_slot():

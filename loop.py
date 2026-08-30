@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import types
 
@@ -718,20 +719,24 @@ def live_loop():
     return _loop_slot().loop
 
 
-def reset_merged_verify_budget(fid: str) -> bool:
-    """Invalidate the live loop's in-process merged-verify budget cache for ``fid`` so an
+def reset_merged_verify_budget(fid: str, store) -> bool:
+    """Invalidate the live loop's in-process merged-verify budget for ``fid`` so an
     operator's budget reset takes effect on the NEXT reconcile without a host restart
     (ADR 0326, #326). The store already dropped the persisted `budget:merged-verify:<n>`
     label, but ``_budget_get`` lets the loop's cache win over the labels (#259), so a
-    cached exhausted count would keep holding the auto-merge edge — this pops that cache
-    entry. Thread-safe: the reset verb runs in a worker thread and a dict pop is atomic
-    under the GIL (the same cross-thread pattern as ``live_drive``). Returns True when a
-    live loop was found to invalidate (False when the loop never started — nothing to
-    invalidate, the label clear alone suffices for the next process)."""
+    cached exhausted count would keep holding the auto-merge edge. Delegates to the live
+    loop's ``_invalidate_merged_verify_budget`` (PINS the count to 0 under the reset lock
+    and re-clears the label there too) so a reconcile that has ALREADY read the at-cap
+    count can't slip its ``max+1`` exhaustion sentinel in after the reset — the sentinel
+    write is a compare-and-set under the same lock and now reads the pinned 0. Thread-safe
+    across the worker thread the reset verb runs on and the loop's async reconcile (the
+    same cross-thread pattern as ``live_drive``). Returns True when a live loop was found
+    to invalidate (False when the loop never started — nothing in-process to invalidate,
+    the store's label clear alone suffices for the next process)."""
     loop = live_loop()
     if loop is None:
         return False
-    getattr(loop, "_merged_verify_attempts", {}).pop(fid, None)
+    loop._invalidate_merged_verify_budget(fid, store)
     return True
 
 
@@ -1162,6 +1167,13 @@ class BoardLoop:
         # half of the rebase edge, bounded by the same rebase_fix_max budget so a
         # base that moves repeatedly doesn't burn a gate run every poll forever.
         self._merged_verify_attempts: dict[str, int] = {}
+        # ADR 0326: serializes the ONE-TIME merged-verify exhaustion sentinel write
+        # (`_arm_merged_verify_exhaustion`) against the operator budget reset
+        # (`_invalidate_merged_verify_budget`), which run on different threads (the async
+        # reconcile via to_thread vs the reset verb's worker thread). Held across the
+        # cache mutation AND its label persist so the reset's pinned 0 + label clear and
+        # the sentinel's max+1 can never interleave — the reset always wins.
+        self._mv_reset_lock = threading.Lock()
         self._auto_merge_failures: dict[str, int] = {}
         # #211: drives whose operator-cancel cleanup already ran (or is running) — a
         # second cancel verb landing mid-cleanup re-enters _drive's CancelledError
@@ -1267,6 +1279,51 @@ class BoardLoop:
             await asyncio.to_thread(store.clear_budgets, fid, list(kinds) if kinds else None)
         except Exception:  # noqa: BLE001 — bookkeeping must never break the edge
             log.warning("[project_board] %s budget reset (%s) not persisted", fid, ", ".join(names), exc_info=True)
+
+    # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
+    def _arm_merged_verify_exhaustion(self, store, fid: str) -> bool:
+        """Persist the ONE-TIME exhaustion sentinel `budget:merged-verify:<max+1>` — the
+        fact ``store.merge_posture`` reads to hold an ``auto_merge`` card whose merged-
+        state re-verify budget is spent while base keeps moving — but as a COMPARE-AND-SET
+        under the reset lock, NOT a blind write. Arms ONLY if the in-process count is
+        still exactly at the cap; a concurrent operator reset
+        (``_invalidate_merged_verify_budget``) PINS the count to 0 and clears the label
+        under the same lock, so if it already landed we read 0 (≠ cap) and skip — the
+        reset's fresh window stands instead of being silently re-held. If we arm first,
+        the reset that follows wipes both halves (pinned cache + re-cleared label). Runs
+        in a worker thread (via ``asyncio.to_thread``) so the plain lock is never held on
+        the event loop. Best-effort on the label, like ``_budget_set``. Returns True iff
+        it armed."""
+        with self._mv_reset_lock:
+            if self._merged_verify_attempts.get(fid) != self.merged_verify_max:
+                return False  # a reset (pin 0) or a tier climb moved it off the cap — don't re-arm
+            value = self.merged_verify_max + 1
+            self._merged_verify_attempts[fid] = value
+            try:
+                store.record_budget(fid, "merged-verify", value)
+            except Exception:  # noqa: BLE001 — bookkeeping must never break the edge
+                log.warning("[project_board] %s merged-verify exhaustion sentinel (%d) not persisted", fid, value)
+            return True
+
+    def _invalidate_merged_verify_budget(self, fid: str, store) -> None:
+        """Operator reset of the LIVE loop's merged-verify budget (ADR 0326, #326). PINS
+        the in-process count to 0 — NOT a pop: the #259 ``_budget_reset`` mid-flow rule is
+        that a popped key lets the very next ``_budget_get(..., feature)`` rehydrate the
+        exhausted count from a poll's stale label snapshot and re-hold the card, so 0 must
+        be AUTHORITATIVE until a real re-verify spends it again. Re-clears the durable
+        label under the SAME lock the exhaustion sentinel arms under: an in-flight
+        reconcile that already read the at-cap count and won the race to arm the sentinel
+        (cache + label = max+1) is then fully undone — the pin wipes its cache write and
+        this clear wipes the label it persisted, so the board projection can't keep
+        reading a stale hold. Best-effort on the label (the tool's store reset already
+        dropped it); this backstops only the racing re-arm. Runs on the reset verb's
+        worker thread."""
+        with self._mv_reset_lock:
+            self._merged_verify_attempts[fid] = 0
+            try:
+                store.clear_budgets(fid, ["merged-verify"])
+            except Exception:  # noqa: BLE001 — bookkeeping must never break the reset
+                log.warning("[project_board] %s merged-verify label re-clear failed on reset", fid)
 
     def _child_env(self) -> dict[str, str]:
         """The sanitized environment for a subprocess the loop spawns directly (gate
@@ -2620,7 +2677,7 @@ class BoardLoop:
             return False  # the verdict is current — base hasn't moved since it was stamped
         n = await self._budget_get(store, fid, "merged-verify", feature)
         if self.merged_verify_max and n >= self.merged_verify_max:
-            if n == self.merged_verify_max:  # log the exhaustion once, then stay quiet
+            if n == self.merged_verify_max:  # arm the exhaustion sentinel once, then stay quiet
                 # The ONE-TIME sentinel: bump the persisted budget to `max+1`. Beyond
                 # logging once, this is the loop SUPPLYING the exhaustion fact to the
                 # board projection (ADR 0326): `budget:merged-verify:<max+1>` is a value
@@ -2630,9 +2687,13 @@ class BoardLoop:
                 # auto_merge card reads `auto-merge held: merged-verify budget exhausted`
                 # instead of the `auto-merge pending` lie. NOT a gate-run spend (the gate
                 # never ran this pass) — the budget accounting for actual verifications is
-                # untouched below.
-                await self._budget_set(store, fid, "merged-verify", n + 1)
-                if self.auto_merge:
+                # untouched below. The write is a COMPARE-AND-SET under the reset lock
+                # (in a worker thread): an operator budget reset landing between the read
+                # above and this write pins the count to 0 under the same lock, so the CAS
+                # reads 0 (≠ cap) and SKIPS — the reset's fresh window is never silently
+                # re-held (`armed` is False and the next poll re-verifies).
+                armed = await asyncio.to_thread(self._arm_merged_verify_exhaustion, store, fid)
+                if armed and self.auto_merge:
                     # The loop IS the adjudicator here, and a stale stamp is a hard hold
                     # on the merge edge — say so, and say what unsticks it.
                     log.warning(
@@ -2648,7 +2709,7 @@ class BoardLoop:
                 # pre-#135 world where every write failed), the adjudicator sees an
                 # UNVERIFIED merged state — reporting a stale verdict that isn't there
                 # is the same lie #132 was built to prevent.
-                if stamped:
+                if armed and stamped:
                     log.info(
                         "[project_board] %s base moved again but the merged-verify budget (%d) is spent — "
                         "leaving the stale merged-verified stamp for the adjudicator: %s",
@@ -2656,7 +2717,7 @@ class BoardLoop:
                         self.merged_verify_max,
                         pr_url,
                     )
-                else:
+                elif armed:
                     log.info(
                         "[project_board] %s base moved but the merged-verify budget (%d) is spent and no "
                         "merged-verified stamp was ever written — the merged state stays unverified: %s",

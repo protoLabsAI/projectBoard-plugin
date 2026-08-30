@@ -485,17 +485,24 @@ def _reset_tool(cfg=None):
 
 def test_board_reset_merged_verify_budget_tool_clears_label_and_cache(monkeypatch):
     """AC6 end-to-end: the tool clears the persisted label (store) AND invalidates the
-    running loop's in-process cache (loop) for the one feature, returning a structured ok
-    — a reset that takes effect on the next reconcile without a host restart."""
+    running loop's in-process budget (loop) for the one feature, returning a structured ok
+    — a reset that takes effect on the next reconcile without a host restart. The loop half
+    PINS the count to 0 (the #259 rule, ADR 0326) and re-clears the label under its reset
+    lock so an in-flight reconcile can't leave the card held."""
     from project_board import loop as loop_mod
 
     class _FakeStore:
         def __init__(self):
             self.reset = []
+            self.cleared = []
 
         def reset_merged_verify_budget(self, fid, actor=""):
             self.reset.append(fid)
             return {"id": fid, "board_state": "in_review"}
+
+        def clear_budgets(self, fid, kinds=None):
+            self.cleared.append((fid, tuple(kinds) if kinds is not None else None))
+            return {"id": fid}
 
     fake = _FakeStore()
     monkeypatch.setattr(store, "get_store", lambda **_kw: fake)
@@ -509,8 +516,9 @@ def test_board_reset_merged_verify_budget_tool_clears_label_and_cache(monkeypatc
     finally:
         slot.loop = prior
     assert fake.reset == ["bd-1"]  # the persisted label half ran
+    assert fake.cleared == [("bd-1", ("merged-verify",))]  # loop re-cleared the label under its lock
     assert out["id"] == "bd-1" and out["merged_verify_budget_reset"] is True
-    assert out["cache_cleared"] is True and "bd-1" not in loop._merged_verify_attempts
+    assert out["cache_cleared"] is True and loop._merged_verify_attempts["bd-1"] == 0  # pinned to 0
 
 
 def test_board_reset_merged_verify_budget_tool_rejects_a_blank_id(monkeypatch):
