@@ -945,6 +945,85 @@ def test_cancel_feature_with_open_deps_drops_edges_and_reports_them(make_board, 
     assert set(f.get("dropped_deps", [])) == {"bd-1", "bd-2"}
 
 
+def _blocked_then_cancelled():
+    """A stateful ``get_feature``: the blocked source projection on the FIRST read
+    (what cancel inspects for the `blocked` label + a cleared assignee — exactly what
+    flag_blocked leaves), then the terminal cancelled projection with `blocked` cleared
+    on every later read (what the fix produces)."""
+    calls = {"n": 0}
+
+    def _gf(fid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"id": fid, "board_state": "blocked", "assignee": "", "labels": ["blocked"]}
+        return {"id": fid, "board_state": "cancelled", "cancelled": True, "blocked": False}
+
+    return _gf
+
+
+def test_cancel_feature_clears_the_blocked_label_before_close(make_board, monkeypatch):
+    """#325: cancelling a card blocked through the normal board path drops the `blocked`
+    label alongside the `cancelled` tag (one atomic `br update`) — a terminal card can't
+    remain a live blocker, the same invariant record_merge / mark_done enforce. The
+    projection reads terminal `cancelled` with blocked cleared, and the audit reason is
+    preserved."""
+    br = Br()  # `show` → [] : no open blocker EDGES gate this feature
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _blocked_then_cancelled())
+    f = b.cancel_feature("bd-9", "scope cut")
+    # the cancel tag write ALSO drops the blocked label — one atomic write, not two
+    update = next(c for c in br.calls if c[0] == "update")
+    assert update == ("update", "bd-9", "--add-label", "cancelled", "--assignee", "", "--remove-label", "blocked")
+    # …then it closes with the auditable cancel reason (the `cancelled` tag stands)
+    close = next(c for c in br.calls if c[0] == "close")
+    assert close == ("close", "bd-9", "-r", "cancelled: scope cut")
+    # terminal cancelled, and no longer reports blocked (the projection / count / sort)
+    assert f["board_state"] == "cancelled" and f["cancelled"] is True and f["blocked"] is False
+
+
+def test_cancel_feature_unblocked_does_not_touch_the_blocked_label(make_board, monkeypatch):
+    """#325 regression guard: an UNBLOCKED cancel is unchanged — the tag write carries
+    no `--remove-label` (byte-for-byte the prior single-label write), so a card that was
+    never blocked takes no spurious blocked churn."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "cancelled", "cancelled": True})
+    b.cancel_feature("bd-9", "duplicate")
+    update = next(c for c in br.calls if c[0] == "update")
+    assert update == ("update", "bd-9", "--add-label", "cancelled", "--assignee", "")
+    # no `blocked` token in any update — the label is never added, removed, or churned.
+    assert all("blocked" not in c for c in br.calls if c[0] == "update")
+
+
+def test_cancel_feature_rollback_restores_the_blocked_label(make_board, monkeypatch):
+    """#325 + #106: if `br close` fails after the blocked card was tagged `cancelled` and
+    unblocked, the rollback re-adds `blocked` (and removes `cancelled`) so the card lands
+    back in its exact pre-cancel state — blocked, never a half-cancelled, now-unblocked
+    zombie."""
+    br = Br(returns={"close": _raise_on_close})
+    b = make_board(br)
+    # flag_blocked clears the assignee, so a blocked card is unassigned pre-cancel.
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "assignee": "", "labels": ["blocked"]})
+    with pytest.raises(BoardError, match="failed"):
+        b.cancel_feature("bd-9", "scope cut — folded into bd-42")
+    # forward: tag `cancelled` + drop `blocked` in one update…
+    assert ("update", "bd-9", "--add-label", "cancelled", "--assignee", "", "--remove-label", "blocked") in br.calls
+    # …then close blew up, so the compensating write undoes the tag AND re-adds `blocked`
+    # (no assignee token — a blocked card was already unassigned, nothing to restore).
+    assert ("update", "bd-9", "--remove-label", "cancelled", "--add-label", "blocked") in br.calls
+
+
+def test_cancelled_card_projects_unblocked_even_if_the_label_lingered(make_board):
+    """The projection is the enforcement point: a closed+cancelled bead reads terminal
+    `cancelled` (status wins), and once the fix strips the `blocked` label the projected
+    `blocked` flag is False — so a cancelled card drops out of the blocked count/sort.
+    (A lingering label would still project blocked=True — the exact bug #325 fixes at the
+    write side.)"""
+    b = make_board(Br())
+    proj = b._project({"id": "bd-9", "status": "closed", "labels": ["cancelled"]})
+    assert proj["board_state"] == "cancelled" and proj["blocked"] is False
+
+
 def test_remove_dependency_issues_dep_remove_command(make_board):
     """remove_dependency is the inverse of add_dependency: it calls `br dep remove
     <fid> <depends_on> --type blocks` to tear down the gate."""
