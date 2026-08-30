@@ -91,7 +91,7 @@ def _stub_worktree(monkeypatch, *, created=None, removed=None, promoted=None):
     removed = removed if removed is not None else []
     promoted = promoted if promoted is not None else []
 
-    async def _create(repo, base, cid, root):
+    async def _create(repo, base, cid, root, **_kw):
         created.append(cid)
         return (f"/wt/feat-{cid}", f"feat/{cid}")
 
@@ -162,7 +162,7 @@ async def test_dispatch_falls_back_to_a_diagnostic_string_when_the_winner_has_no
     PR body."""
     _, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1118,7 +1118,7 @@ async def test_generate_fusion_writes_parsed_files_into_a_fresh_worktree(monkeyp
 
     # `_stub_worktree`'s fake `create_worktree` always returns "/wt/feat-<cid>" — redirect
     # it to a real tmp_path so the write actually lands somewhere we can inspect.
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1138,7 +1138,7 @@ async def test_generate_fusion_rejects_a_path_traversal_attempt(monkeypatch, tmp
             "### ../../etc/passwd\n```\npwned\n```\n\n### /etc/shadow\n```\npwned2\n```\n\n### legit.py\n```\nfine\n```"
         )
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1176,7 +1176,7 @@ async def test_generate_fusion_restricts_writes_to_declared_files_to_modify(monk
     async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
         return "### declared.py\n```\nfine\n```\n\n### undeclared.py\n```\nsneaky\n```"
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1211,7 +1211,7 @@ async def test_generate_fusion_shrink_guard_refuses_a_suspiciously_smaller_rewri
     async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
         return "### big.py\n```\nx\n```"  # a few chars back for a 1000-char original
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         (d / "big.py").write_text("x = 1\n" * 200)  # 1200 chars, well over the min-original floor
@@ -1246,7 +1246,7 @@ async def test_generate_fusion_shrink_guard_allows_a_legitimately_smaller_edit(m
     async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
         return "### small.py\n```\nx = 1\n```"
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         (d / "small.py").write_text("x = 1\ny = 2\n")  # tiny original, under the min-original floor
@@ -1278,7 +1278,7 @@ async def test_generate_fusion_empty_reply_writes_nothing_and_does_not_crash(mon
     async def _fake_openai_dispatch(delegate, prompt, *, timeout=None):
         return "I looked at the task but have no changes."
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1313,7 +1313,7 @@ async def test_dispatch_reaches_fusion_when_cheaper_rungs_fail(monkeypatch, tmp_
     fusion-produced candidate promotes exactly like an ACP one."""
     created, removed, promoted = _stub_worktree(monkeypatch)
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1401,7 +1401,7 @@ async def test_test_rung_always_reaps_even_on_a_pass(monkeypatch, tmp_path):
     not, or a 'just checking fusion works' call would silently ship a feature.)"""
     removed = []
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1452,7 +1452,7 @@ async def test_test_rung_always_reaps_even_on_a_pass(monkeypatch, tmp_path):
 async def test_test_rung_reaps_on_a_fail_too(monkeypatch, tmp_path):
     removed = []
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1505,7 +1505,7 @@ async def test_test_rung_reaps_on_a_fail_too(monkeypatch, tmp_path):
 async def test_test_rung_reaps_even_if_solve_raises(monkeypatch, tmp_path):
     removed = []
 
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -1549,7 +1549,7 @@ async def test_test_rung_reaps_even_if_solve_raises(monkeypatch, tmp_path):
 
 
 async def test_test_rung_forwards_fusion_and_files_to_modify(monkeypatch, tmp_path):
-    async def _create_in_tmp(repo, base, cid, root):
+    async def _create_in_tmp(repo, base, cid, root, **_kw):
         d = tmp_path / cid
         d.mkdir(parents=True, exist_ok=True)
         return (str(d), f"feat/{cid}")
@@ -2640,3 +2640,29 @@ async def test_queued_work_holds_the_slot_and_a_cancel_releases_only_its_own():
     gate.set()
     assert await first == "first"
     assert coder_seam.host_invoke_busy() is False
+
+
+# ── a fix round is a patch, not a fresh generation ──────────────────────────────────
+
+
+def test_solve_is_skipped_once_a_feature_has_an_open_pr():
+    """`solve()` generates K candidate implementations, each in a FRESH worktree off
+    base, and picks a winner — right for greenfield work, exactly wrong for "address
+    these review findings on the branch you already pushed". No candidate can see that
+    branch, so the coder must re-derive the whole change before it can touch the finding.
+
+    Observed live on a +661/-7 card: three 30-minute rounds at the top tier, ZERO
+    commits, because a rebuild does not fit in the dispatch timeout. And worse than slow
+    — a regenerated implementation is a DIFFERENT one, so the verdict that requested the
+    change no longer describes the code it lands on."""
+    fix_round = dict(FEATURE_WITH_AC, pr_url="https://github.com/o/r/pull/332")
+    assert should_use_solve(fix_round, test_cmd="pytest -q", _solve_mod=object()) is False
+    # …and the greenfield case is untouched
+    assert should_use_solve(FEATURE_WITH_AC, test_cmd="pytest -q", _solve_mod=object()) is True
+
+
+def test_an_empty_pr_url_is_still_a_fresh_build():
+    """Only a REAL pr_url means a fix round — a blank/whitespace field is a card that has
+    never opened one, and must keep the ladder."""
+    for blank in ("", "   ", None):
+        assert should_use_solve(dict(FEATURE_WITH_AC, pr_url=blank), test_cmd="pytest -q", _solve_mod=object())

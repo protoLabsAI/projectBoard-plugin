@@ -311,6 +311,43 @@ async def test_create_worktree_falls_back_to_local_base_without_a_remote(monkeyp
     assert add[-1] == "main"  # fell back to the local branch
 
 
+async def test_resume_starts_a_fix_round_from_the_pr_head_not_from_base(monkeypatch):
+    """A fix round must open the coder on the branch it is being asked to correct.
+
+    Without this the coder gets a clean tree off base while the review prompt tells it to
+    "fix every finding in the existing branch" — the prompt and the filesystem disagree,
+    so it has to re-implement the whole change before it can touch a one-line finding. On
+    a large card that never fits the dispatch timeout: three 30-minute rounds, zero
+    commits, observed live on PR #332."""
+    git = FakeGit({"rev-parse": (0, "abc123", "")})  # both origin/main and the branch resolve
+    _install(monkeypatch, git, FakeGh())
+    _path, branch = await worktree.create_worktree("/repo", "main", "bd-1", root=".worktrees", resume=True)
+    add = next(a for a in git.calls if a[:2] == ("worktree", "add"))
+    assert add[-1] == f"origin/{branch}"  # the PR head, NOT origin/main
+    assert ("fetch", "origin", branch) in git.calls  # and it was fetched first
+
+
+async def test_resume_falls_back_to_base_when_the_branch_is_gone(monkeypatch):
+    """A card whose remote branch was deleted (a squash-merge cleanup, a manual tidy)
+    must still BUILD rather than fail its dispatch — resume is an optimisation, never a
+    precondition."""
+    git = FakeGit({"rev-parse": (1, "", "")})  # nothing resolves
+    _install(monkeypatch, git, FakeGh())
+    _path, _branch = await worktree.create_worktree("/repo", "main", "bd-2", root=".worktrees", resume=True)
+    add = next(a for a in git.calls if a[:2] == ("worktree", "add"))
+    assert add[-1] == "main"
+
+
+async def test_a_fresh_build_never_resumes(monkeypatch):
+    """The default is unchanged: a card with no PR starts off base, one throwaway tree."""
+    git = FakeGit({"rev-parse": (0, "abc123", "")})
+    _install(monkeypatch, git, FakeGh())
+    _path, branch = await worktree.create_worktree("/repo", "main", "bd-3", root=".worktrees")
+    add = next(a for a in git.calls if a[:2] == ("worktree", "add"))
+    assert add[-1] == "origin/main"
+    assert ("fetch", "origin", branch) not in git.calls
+
+
 # ── #225: prune stale worktrees so create_worktree survives a corrupt admin dir ──
 
 

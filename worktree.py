@@ -181,12 +181,23 @@ async def prune_stale_worktrees(repo: str) -> str:
     return out
 
 
-async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "") -> tuple[str, str]:
+async def create_worktree(
+    repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "", *, resume: bool = False
+) -> tuple[str, str]:
     """``git worktree add <root>/feat-<id>[-<slug>] -b feat/<id>[-<slug>] <base>``.
 
     Returns (absolute worktree path, branch). The branch is fresh off ``base`` so
     the blast radius is one throwaway tree. Cleans a stale worktree/branch of the
     same name first (idempotent re-run after a crashed feature).
+
+    ``resume`` (a FIX ROUND on a card that already has an open PR) starts from
+    ``origin/<branch>`` instead — the PR head — when that ref resolves. Without it the
+    coder is handed a clean tree off base while the prompt tells it to "fix every finding
+    in the existing branch": the prompt and the filesystem disagree, and the coder must
+    re-implement the whole change before it can address a one-line finding. On a large
+    card that does not fit in the dispatch timeout at all (three 30-minute rounds, zero
+    commits, observed live). A missing remote branch falls back to ``base`` — a card
+    whose branch was deleted still builds rather than failing the dispatch.
 
     Preventively runs ``git worktree prune`` before the add (#225): stale
     ``.git/worktrees/*`` entries left behind outside the loop — branches merged and
@@ -213,6 +224,21 @@ async def create_worktree(repo: str, base: str, fid: str, root: str = ".worktree
     # PR base stays the plain `<base>` in open_pr — worktree-base and PR-base are decoupled.
     await _git(repo, "fetch", "origin", base)
     start = f"origin/{base}"
+    if resume:
+        # Best-effort: fetch the feature branch and start from it when it exists, so the
+        # coder opens its own prior work instead of a clean base.
+        await _git(repo, "fetch", "origin", branch)
+        rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
+        if rc == 0:
+            start = f"origin/{branch}"
+            log.info("[project_board] %s resuming existing branch %s for a fix round", fid, branch)
+        else:
+            log.info(
+                "[project_board] %s asked to resume %s but no remote branch exists — building off %s",
+                fid,
+                branch,
+                base,
+            )
     rc_chk, _o, _e = await _git(repo, "rev-parse", "--verify", "--quiet", start)
     if rc_chk != 0:
         start = base

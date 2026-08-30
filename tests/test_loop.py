@@ -572,7 +572,7 @@ async def _drive_with(
     store.promotes = []  # (src_wt, src_branch, fid) the Max-Mode winner was promoted with
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         store.creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
@@ -842,7 +842,7 @@ async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatc
     store = _EscalatingStore(tiers=["smart"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -895,7 +895,7 @@ async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
     store = _EscalatingStore(tiers=["smart"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -2084,7 +2084,7 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     ticks = iter([0.0, 1800.0])
     monkeypatch.setattr(coder_seam, "_monotonic", lambda: next(ticks, 1800.0))
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -2167,7 +2167,7 @@ async def test_drive_tier_climb_grants_a_fresh_window_despite_stale_budget_label
 
     monkeypatch.setattr(BoardLoop, "_verify_goal", _verify)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -2222,7 +2222,7 @@ async def test_drive_ledger_gate_exhaustion_escalates_into_the_same_worktree(mon
 
     creates = []
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
@@ -2283,7 +2283,7 @@ async def test_drive_non_keep_worktree_failure_rebuilds_and_drops_stale_feedback
 
     creates = []
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         creates.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
@@ -2354,7 +2354,7 @@ async def test_drive_keep_worktree_exhaustion_clears_feedback_when_no_worktree(m
 
     # create_worktree hands back NO worktree path — the keep-wt reuse can never fire, so
     # the ledger exhaustion escalates with wt unset (the "cannot be kept" branch).
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return (None, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -5492,7 +5492,7 @@ async def test_drive_builds_in_the_features_project_repo(monkeypatch):
     store = FakeLoopStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         captured["repo"], captured["base"] = repo, base
         return (f"/wt/feat-{fid}", f"feat/{fid}")
 
@@ -6259,7 +6259,7 @@ async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
@@ -6712,7 +6712,7 @@ async def _cancel_drive_with(monkeypatch, *, cancel_at, open_review_raises=False
     store.branch_lookups = []
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -7021,7 +7021,7 @@ async def test_request_drive_cancel_stops_a_running_coder_and_ends_the_drive_cle
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     started = asyncio.Event()
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -7065,7 +7065,7 @@ async def test_shutdown_cancel_still_propagates(monkeypatch):
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     started = asyncio.Event()
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -7328,7 +7328,7 @@ async def test_drive_reaches_the_store_off_the_event_loop_thread(monkeypatch):
     store = _ThreadProbeStore([dict(FEATURE, board_state="in_progress")])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -7382,7 +7382,7 @@ def _ladder_drive_env(monkeypatch, dispatch, tiers):
     store = _EscalatingStore(tiers=tiers)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
-    async def _create(repo, base, fid, root, title=""):
+    async def _create(repo, base, fid, root, title="", **_kw):
         return ("/wt/feat-" + fid, "feat/" + fid)
 
     async def _remove(repo, wt, branch=""):
