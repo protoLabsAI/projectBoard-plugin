@@ -2008,21 +2008,23 @@ class BeadsBoard:
         # NOT for a task (#217/#333): there the assignee is the DISPATCH TARGET, not a
         # claim marker, so clearing it means an unblocked task can never be driven again
         # — it parks "awaiting unassigned delivery" forever. Same carve-out requeue owes.
+        from .failures import classify
+
         args = ["update", fid, "--add-label", LABEL_BLOCKED]
         if f.get("issue_type") != LABEL_TASK:
             args += ["--assignee", ""]
-        for prior in f.get("labels") or []:  # replace, never accumulate (the `gens:` pattern)
-            if prior.startswith(LABEL_BLOCKED_CLASS_PREFIX):
-                args += ["--remove-label", prior]
-        # Derive the class from the REASON when the caller didn't name one: every block
-        # site already writes the underlying error text, and `failures.classify` is the
-        # same function the dispatch path uses to decide retryability. Deriving here
-        # rather than threading a category through a dozen call sites keeps the classes
-        # consistent and means a site added later is classified without being told to.
-        from .failures import classify
-
         cls = str(category or "").strip() or classify(reason).category
         cls = cls.lower().replace("_", "-")
+        want = f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}" if cls else ""
+        for prior in f.get("labels") or []:  # replace, never accumulate (the `gens:` pattern)
+            # ONLY a prior class that differs. `br` applies --remove-label AFTER
+            # --add-label, so emitting both for the SAME value nets to removed: a card
+            # re-blocked for the same reason silently lost its class, read as
+            # `unclassified` on the next sweep, and was escalated to a human instead of
+            # taking the retry it had left. Verified against br 0.2.16.
+            if prior.startswith(LABEL_BLOCKED_CLASS_PREFIX) and prior != want:
+                args += ["--remove-label", prior]
+
         if cls:
             args += ["--add-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
         self._run(*args)

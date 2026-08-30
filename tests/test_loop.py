@@ -7709,3 +7709,33 @@ async def test_a_host_without_an_inbox_still_says_so_loudly(monkeypatch, caplog)
     with caplog.at_level("WARNING"):
         loop._notify_operator("bd-x", "Board card bd-x is blocked")
     assert any("bd-x" in r.message or "bd-x" in str(r.args) for r in caplog.records)
+
+
+async def test_escalation_re_reads_the_reason_because_br_list_carries_no_comments(monkeypatch):
+    """The block reason rides a COMMENT, and `br list` carries none — so the sweep's list
+    row always projects "". Escalating "no reason recorded" tells the operator nothing
+    and sends them digging, which is exactly what the alert exists to prevent. The one
+    card being escalated is re-read through get_feature."""
+    store = _BlockedStore([_blocked("bd-a", "auth", reason="")])
+    store.get_feature = lambda fid: {"id": fid, "blocked_reason": "auth: 403 forbidden on push"}
+    loop = BoardLoop({"coder": "proto"})
+    seen = []
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    await loop._recover_blocked(store)
+    assert "403 forbidden on push" in seen[0]
+
+
+async def test_a_failed_reason_re_read_still_escalates(monkeypatch):
+    """The alert matters more than its detail: if the re-read fails the operator is still
+    told, with whatever is known."""
+    store = _BlockedStore([_blocked("bd-a", "auth", reason="")])
+
+    def _boom(fid):
+        raise RuntimeError("br exploded")
+
+    store.get_feature = _boom
+    loop = BoardLoop({"coder": "proto"})
+    seen = []
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    await loop._recover_blocked(store)
+    assert seen and "bd-a" in seen[0]
