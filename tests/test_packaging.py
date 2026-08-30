@@ -344,3 +344,55 @@ def test_manifest_min_host_version_covers_tabbed_plugin_config():
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     version = tuple(int(x) for x in str(m["min_protoagent_version"]).split("."))
     assert version >= (0, 153, 2)
+
+
+# ── #316 docs: the task lane's self-verification provenance ──────────────────────
+
+
+def test_readme_documents_the_task_lane_self_verification_posture():
+    """The README must describe the landed #316 field/badge accurately: the task
+    Done edge, that self-verification is RECORDED and flagged (never blocked), the
+    user-visible provenance posture WITHOUT overclaiming identity/auth, and the
+    deliberate API-`operator` vs tool/store-actor default split."""
+    flat = " ".join((ROOT / "README.md").read_text().split())
+
+    # The task lane + its Done edge (a task ships a deliverable, verified not merged).
+    assert "The task lane" in flat and "deliverables, not PRs" in flat
+    assert "Done edge is a verifier's approval" in flat
+    assert "verified: <who>" in flat
+
+    # r1: self-verification is allowed and flagged/recorded, NOT blocked.
+    assert "flagged, never blocked" in flat
+    assert "a `self-verified` label" in flat
+    assert "`self_verified: true`" in flat  # the projected field the badge reads
+    assert "caution badge" in flat  # the user-visible board surface (S4)
+
+    # r2: provenance posture, NO new identity/authentication guarantee claim.
+    assert "not an identity or authentication guarantee" in flat
+    assert "does not attest who those actors *really* were" in flat
+
+    # r4: the intentional API(operator) vs tool(store-actor) default distinction.
+    assert "store actor" in flat  # the agent-tool (board_verify) default
+    assert "NOT the store actor" in flat  # the API default is `operator`, deliberately not the actor
+    assert "A console verification is out-of-band by construction" in flat  # why they differ
+    assert "An explicit `by` is forwarded verbatim" in flat
+
+
+def test_loop_retro_skill_calls_out_self_verified_closures():
+    """The loop-retro skill must teach the retro to surface self-verified task
+    closures — deliverables that closed with no independent verifier — for the human
+    report, sourced from `board_list` (board_retro's digest doesn't carry the flag),
+    and kept OUT of the coder KG (a governance signal, not a failure class)."""
+    text = (ROOT / "skills" / "loop-retro" / "SKILL.md").read_text()
+    fm = yaml.safe_load(text.split("---", 2)[1])
+    assert fm["name"] == "loop-retro"
+    # The projection tool is the honest source for the per-task self_verified flag.
+    assert "board_list" in fm["tools"]
+
+    flat = " ".join(text.split())
+    # It names the landed field + what a self-verified closure MEANS.
+    assert "self_verified: true" in flat
+    assert "no independent verifier" in flat
+    assert "no second pair of eyes" in flat
+    # It goes in the human REPORT, never the coder-facing knowledge graph.
+    assert "never the KG" in flat
