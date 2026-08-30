@@ -357,6 +357,15 @@ LABEL_VERIFIED_PREFIX = "verified:"
 # else ⇒ the verdict is stale (unverified, not broken — staleness alone never
 # blocks; only a gate FAILURE on the merged state does).
 LABEL_MERGED_VERIFIED_PREFIX = "merged-verified:"
+# In-review REVIEW-verdict currency (#328) — `reviewed-head:<sha>`, replaced (never
+# accumulated) each time the review gate lands a verdict for an `in_review` PR. The sha
+# is the PR HEAD commit the verdict was rendered against, SHORT-abbreviated for the same
+# 50-char label cap that forced `merged-verified:` short (#135). It lets the merge-poll
+# reconciler tell a `changes-requested` verdict whose head an external/human push moved
+# out from under (stale — re-arm the gate for the new head) from one still pinned to the
+# reviewed head (current — the rejection stands). Recorded SHA identity, not a timestamp
+# or the label's mere presence, so an UNCHANGED rejected head remains rejected.
+LABEL_REVIEWED_HEAD_PREFIX = "reviewed-head:"
 # The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
 # metadata line in the bead `notes` field, beside the files_to_modify path lines.
 # NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
@@ -2143,6 +2152,26 @@ class BeadsBoard:
         for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_MERGED_VERIFIED_PREFIX)]:
             args += ["--remove-label", stale]
         args += ["--add-label", f"{LABEL_MERGED_VERIFIED_PREFIX}{sha}"]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    # ── review-verdict head stamp (#328) ──────────────────────────────────────
+    def record_reviewed_head(self, fid: str, sha: str) -> dict:
+        """Stamp the PR head sha the active review verdict was rendered against (#328)
+        — a single, replaced `reviewed-head:<sha>` label (the `merged-verified:`
+        pattern). The merge-poll reconciler compares it against the live PR head to tell
+        a stale `changes-requested` verdict (an external/human push moved the head out
+        from under it) from a still-current one, and re-arms the review gate ONLY on a
+        demonstrable mismatch. Passing ``sha=""`` CLEARS the stamp (a clean verdict pins
+        no head; a missing stamp fails the reconcile CLOSED, so the rejection stands).
+        Fire-and-forget like record_merged_verified: a `br` hiccup here must never fail
+        the gate that landed the verdict — the next poll simply re-reads."""
+        f = self._require(fid)
+        args = ["update", fid]
+        for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_REVIEWED_HEAD_PREFIX)]:
+            args += ["--remove-label", stale]
+        if sha:
+            args += ["--add-label", f"{LABEL_REVIEWED_HEAD_PREFIX}{sha}"]
         self._run(*args)
         return self.get_feature(fid)
 
