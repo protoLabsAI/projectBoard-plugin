@@ -674,6 +674,29 @@ def test_cancel_route_calls_cancel_feature_with_reason(monkeypatch):
     assert ("cancel_feature", ("bd-8", ""), {}) in store.calls
 
 
+def test_cancel_route_surfaces_the_unblocked_cancelled_projection(monkeypatch):
+    """#325: a card blocked through the board path, then cancelled, comes back terminal
+    `cancelled` with `blocked` cleared — the store drops the label at the terminal edge and
+    the route surfaces that projection verbatim, so a cancelled card no longer contributes
+    to the blocked projection/count. The audit reason still rides through to the store."""
+    _stub_reap(monkeypatch)
+
+    class BlockedCancelStore(FakeStore):
+        def cancel_feature(self, fid, reason=""):
+            self.calls.append(("cancel_feature", (fid, reason), {}))
+            # the real store's terminal-edge cleanup: `cancelled` tag + `blocked` cleared.
+            return {"id": fid, "board_state": "cancelled", "cancelled": True, "blocked": False}
+
+    store = BlockedCancelStore()
+    c = _client(monkeypatch, store)
+    r = c.post("/api/plugins/project_board/features/bd-7/cancel", json={"reason": "scope cut"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["board_state"] == "cancelled" and body["cancelled"] is True
+    assert body["blocked"] is False  # no longer a live blocker in the projection/count
+    assert ("cancel_feature", ("bd-7", "scope cut"), {}) in store.calls
+
+
 def test_done_route_calls_mark_done_with_reason(monkeypatch):
     """POST /features/{fid}/done — the manual Done edge (#228). Carries the optional
     reason through as a keyword (mark_done's signature) and works with no body too."""

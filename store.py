@@ -1878,15 +1878,31 @@ class BeadsBoard:
         revived id could be re-claimed. Idempotent-ish: re-cancelling a cancelled feature
         just re-closes it.
 
+        TERMINAL-STATE CLEANUP (#325): a cancel is a terminal edge, so the card can't stay
+        a live blocker — the `blocked` label is dropped alongside the `cancelled` tag (the
+        same terminal-state invariant record_merge / mark_done enforce). board_state already
+        reads a closed+cancelled bead as `cancelled`, but the projected `blocked` flag rides
+        the LABEL, so a cancelled card that kept it would still count as blocked and float to
+        the top of the sort. The `cancelled` tag + audit reason are preserved; only the stale
+        flag drops.
+
         ATOMIC-OR-CLEAN (#106): the tag/unassign write lands BEFORE `br close`, so a failing
         close (a reason `br` can't parse, contention outlasting the retries, …) would strand
         the feature as a claimable zombie — still OPEN, still `ready`-labelled, now also
-        `cancelled` and unassigned. On any close failure we undo the tag + restore the prior
-        assignee, then re-raise: the feature lands back in its exact pre-cancel state and the
-        caller sees the error, never a silent half-cancel."""
+        `cancelled` and unassigned. On any close failure we undo the tag (re-adding `blocked`
+        if we cleared it) + restore the prior assignee, then re-raise: the feature lands back
+        in its exact pre-cancel state and the caller sees the error, never a silent
+        half-cancel."""
         f = self._require(fid)
         prior_assignee = f.get("assignee", "")
-        self._run("update", fid, "--add-label", LABEL_CANCELLED, "--assignee", "")
+        # Fold the blocked-label drop (#325) into the same atomic tag write so a cancelled
+        # card never stays a live blocker; only add the flag when the card actually carries
+        # it, so an unblocked cancel is byte-for-byte its prior single-label write.
+        was_blocked = LABEL_BLOCKED in (f.get("labels") or [])
+        tag = ["update", fid, "--add-label", LABEL_CANCELLED, "--assignee", ""]
+        if was_blocked:
+            tag += ["--remove-label", LABEL_BLOCKED]
+        self._run(*tag)
         # Drop open incoming `blocks` edges before closing (#145): `br close` refuses
         # when blockers are unresolved, but a cancel is a scope-cut — prerequisites
         # being unfinished is irrelevant. Log each dropped edge for the audit trail.
@@ -1906,6 +1922,10 @@ class BeadsBoard:
             self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
         except BoardError:
             undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
+            # Re-add the blocked label we dropped, so a blocked card rolls back to blocked —
+            # not a half-cancelled, now-silently-unblocked zombie.
+            if was_blocked:
+                undo += ["--add-label", LABEL_BLOCKED]
             # Only rewrite the assignee if there was one — a bead that was already
             # unassigned needs no restore (and `--assignee ""` would be a redundant write).
             if prior_assignee:
