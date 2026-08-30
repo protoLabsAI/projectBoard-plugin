@@ -864,6 +864,50 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_reset_merged_verify_budget(feature_id: str) -> str:
+        """Reset ONE feature's merged-state re-verify budget (ADR 0326, #326) — the
+        supported way to un-stick an in_review card whose `next_action` reads `auto-merge
+        held: merged-verify budget exhausted`.
+
+        When a sibling merge keeps moving base under an in_review PR, the loop re-runs the
+        gate against the merged state and stamps `merged-verified:<sha>`; that re-verify
+        is bounded by `merged_verify_max` (#131). Once the budget is spent the loop stops
+        re-verifying, the stamp goes stale, and with `auto_merge` on the PR can never
+        auto-merge. This clears BOTH halves of that budget so the next reconcile verifies
+        again with no host restart: the persisted `budget:merged-verify:<n>` label (an
+        auditable comment is recorded on the bead) AND the running loop's in-process
+        budget cache. Only the `merged-verify` kind is touched — every other budget is
+        left alone. A blank or unknown `feature_id` alters nothing and returns an error
+        (the reset can never silently touch a phantom bead). Raising `merged_verify_max`
+        in Settings ▸ Project Board is the alternative remedy; this is the per-card one."""
+        try:
+            feature_id = _strip_wrapping_quotes(feature_id).strip()
+            if not feature_id:
+                return "Error: feature_id is required to reset a merged-verify budget"
+            store = get_store(**store_kw)
+            f = store.reset_merged_verify_budget(feature_id)
+            # Invalidate the running loop's in-process budget too — the label clear alone
+            # is not enough (the loop's cache wins over the labels, #259). This runs AFTER
+            # the store's durable clear: it pins the live count to 0 and re-clears the
+            # label under the loop's reset lock, so a reconcile that is mid-flight arming
+            # the exhaustion sentinel can't leave the card held (ADR 0326). The store is
+            # handed in for that re-clear. Lazy import (the loop imports from here, so a
+            # top-level import would cycle).
+            from .loop import reset_merged_verify_budget as _invalidate_cache
+
+            cache_cleared = _invalidate_cache(feature_id, store)
+            return json.dumps(
+                {
+                    "id": f["id"],
+                    "state": f["board_state"],
+                    "merged_verify_budget_reset": True,
+                    "cache_cleared": cache_cleared,
+                }
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_list(
         state: str = "",
         include_archived: bool = False,
@@ -995,6 +1039,7 @@ def _board_tools(cfg: dict):
         board_requeue_feature,
         board_block_feature,
         board_unblock_feature,
+        board_reset_merged_verify_budget,
         board_list,
         board_retro,
     ]

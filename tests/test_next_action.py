@@ -23,6 +23,7 @@ from project_board import api, store
 from project_board.loop import BoardLoop
 from project_board.store import (
     NEXT_ACTION_AWAITING_DELIVERABLE,
+    NEXT_ACTION_MERGED_VERIFY_EXHAUSTED,
     annotate_next_action,
     knob_bool,
     merge_posture,
@@ -116,6 +117,70 @@ def test_merge_posture_names_a_known_draft_behind_the_review_states():
     assert p["next_action"] == "review in progress"
     # board-side blockers are unchanged by a draft (the loop reads isDraft from GitHub itself)
     assert merge_posture(f, auto_merge=True, review_gate=True, is_draft=True)["blockers"] == []
+
+
+# ── merged-verify exhaustion hold (ADR 0326, #326) ───────────────────────────────
+
+_BUDGET6 = "budget:merged-verify:6"  # the one-time exhaustion sentinel for max=5 (max+1)
+
+
+def test_merge_posture_flags_merged_verify_exhaustion_under_auto_merge():
+    """r1: an auto_merge card whose merged-verify budget has passed the cap (the loop's
+    one-time exhaustion sentinel) reads the distinct held action + a remediation hint, in
+    place of `auto-merge pending`."""
+    p = merge_posture(_feat(labels=["review-clean", _BUDGET6]), auto_merge=True, review_gate=True, merged_verify_max=5)
+    assert p["next_action"] == NEXT_ACTION_MERGED_VERIFY_EXHAUSTED and p["awaiting_merge"] is False
+    hint = p["next_action_hint"]
+    assert "board_reset_merged_verify_budget bd-1" in hint
+    assert "raise merged_verify_max" in hint and "base stops moving" in hint
+
+
+def test_merge_posture_budget_at_cap_is_still_auto_merge_pending():
+    """The trigger is the sentinel (`> max`), not `>= max`: a card AT exactly the cap just
+    re-verified and can still auto-merge (its stamp is current) — only the one-time
+    sentinel (`max+1`, written once base moves at the cap) means the edge is stuck."""
+    p = merge_posture(
+        _feat(labels=["review-clean", "budget:merged-verify:5"]), auto_merge=True, review_gate=True, merged_verify_max=5
+    )
+    assert p["next_action"] == "auto-merge pending" and p["next_action_hint"] == ""
+
+
+def test_merge_posture_exhaustion_is_auto_merge_only():
+    """auto_merge off means a human merges — the merged-verify budget only holds the
+    LOOP's edge, so an exhausted budget with auto_merge off still reads awaiting-merge."""
+    p = merge_posture(_feat(labels=["review-clean", _BUDGET6]), auto_merge=False, review_gate=True, merged_verify_max=5)
+    assert p["next_action"] == "awaiting-merge (auto_merge off)" and p["awaiting_merge"] is True
+
+
+def test_merge_posture_unlimited_or_unset_cap_never_exhausts():
+    """merged_verify_max 0 = unlimited (the loop never writes a sentinel), and the param
+    defaults to 0 so an un-threaded caller (the loop's `_auto_merge_blockers`) is
+    unaffected — a large budget with no/zero cap stays `auto-merge pending`."""
+    big = _feat(labels=["review-clean", "budget:merged-verify:9"])
+    assert (
+        merge_posture(big, auto_merge=True, review_gate=True, merged_verify_max=0)["next_action"]
+        == "auto-merge pending"
+    )
+    assert merge_posture(big, auto_merge=True, review_gate=True)["next_action"] == "auto-merge pending"
+
+
+@pytest.mark.parametrize(
+    "labels, blocked, is_draft, want",
+    [
+        (["review-clean", _BUDGET6, "merge-hold"], False, None, "merge-hold (operator veto)"),
+        (["review-pending", _BUDGET6], False, None, "review in progress"),
+        (["changes-requested", _BUDGET6], False, None, "changes requested"),
+        (["review-clean", _BUDGET6], True, None, "blocked"),
+        (["review-clean", _BUDGET6], False, True, "draft (run `gh pr ready`)"),
+    ],
+)
+def test_merge_posture_precedence_wins_over_exhaustion(labels, blocked, is_draft, want):
+    """r3: blocked, operator-veto, the review sub-states, and draft all still take
+    precedence — the exhaustion hold lives inside the auto_merge branch, behind them."""
+    p = merge_posture(
+        _feat(labels=labels, blocked=blocked), auto_merge=True, review_gate=True, merged_verify_max=5, is_draft=is_draft
+    )
+    assert p["next_action"] == want
 
 
 @pytest.mark.parametrize("state", ["backlog", "ready", "in_progress", "done", "cancelled"])
@@ -250,6 +315,63 @@ def test_annotate_defaults_match_the_loop_defaults():
     assert "merge #42" in row["next_action_hint"]
 
 
+# ── annotate: merged-verify exhaustion from the live cap (ADR 0326, #326) ─────────
+
+
+def test_annotate_stamps_merged_verify_exhaustion_from_the_cfg_cap():
+    """r1 through the annotate seam: the hold is read from the LIVE `merged_verify_max`
+    in cfg (default 5). A card past the cap reads the held action + reset hint; one AT
+    the cap stays `auto-merge pending`."""
+    rows = annotate_next_action(
+        [
+            _feat(labels=["review-clean", _BUDGET6], fid="bd-held"),
+            _feat(labels=["review-clean", "budget:merged-verify:5"], fid="bd-at-cap"),
+        ],
+        {"auto_merge": True, "review_gate": True},  # merged_verify_max defaults to 5
+    )
+    by = {r["id"]: r for r in rows}
+    assert by["bd-held"]["next_action"] == NEXT_ACTION_MERGED_VERIFY_EXHAUSTED
+    assert by["bd-held"]["awaiting_merge"] is False
+    assert "board_reset_merged_verify_budget bd-held" in by["bd-held"]["next_action_hint"]
+    assert by["bd-at-cap"]["next_action"] == "auto-merge pending"
+
+
+def test_annotate_exhaustion_tracks_the_live_cap_and_the_sentinel():
+    """AC4: budget at the configured cap is NOT held; the one-time sentinel (cap+1) IS.
+    And raising the cap (or resetting the budget) flips a held card back to `auto-merge
+    pending` with no other change — the same re-arm the loop does off the live cap."""
+    held = _feat(labels=["review-clean", "budget:merged-verify:4"])
+    base = {"auto_merge": True, "review_gate": True}
+    (row,) = annotate_next_action([dict(held)], {**base, "merged_verify_max": 3})
+    assert row["next_action"] == NEXT_ACTION_MERGED_VERIFY_EXHAUSTED  # 4 > 3 → held
+    (row,) = annotate_next_action([dict(held)], {**base, "merged_verify_max": 4})
+    assert row["next_action"] == "auto-merge pending"  # 4 == 4 → not past the cap
+    (row,) = annotate_next_action([dict(held)], {**base, "merged_verify_max": 10})
+    assert row["next_action"] == "auto-merge pending"  # cap raised → re-armed
+    (row,) = annotate_next_action([dict(held)], {**base, "merged_verify_max": 0})
+    assert row["next_action"] == "auto-merge pending"  # 0 = unlimited → never held
+
+
+def test_annotate_demotes_the_exhaustion_hold_to_ci_failing_on_a_red_pr():
+    """r3: a red PR still reads `ci failing` — the exhaustion hold is demoted exactly like
+    `auto-merge pending`, so a coder-fix signal is never buried behind it."""
+    (row,) = annotate_next_action(
+        [{**_feat(labels=["review-clean", _BUDGET6]), "ci_status": "failing"}],
+        {"auto_merge": True, "review_gate": True},
+    )
+    assert row["next_action"] == "ci failing" and row["awaiting_merge"] is False
+
+
+def test_annotate_tolerates_a_non_int_merged_verify_max():
+    """A hand-edited, unparseable cap reads as 0 (no exhaustion) rather than crashing the
+    listing — the same fail-open discipline as the bool knobs."""
+    (row,) = annotate_next_action(
+        [_feat(labels=["review-clean", _BUDGET6])],
+        {"auto_merge": True, "review_gate": True, "merged_verify_max": "banana"},
+    )
+    assert row["next_action"] == "auto-merge pending"
+
+
 # ── task_posture: the parked-task deliverable seam (#305) ────────────────────────
 
 
@@ -374,6 +496,16 @@ def test_board_list_surfaces_awaiting_deliverable_on_a_parked_task(monkeypatch):
     assert rows["bd-1"]["next_action"] == "awaiting-merge (auto_merge off)"  # the feature is untouched
 
 
+def test_board_list_surfaces_merged_verify_exhaustion(monkeypatch):
+    """r2 through the tool: a held card carries the exhaustion next_action + the reset
+    hint, so an operator sees it on the board rather than only in the loop log."""
+    fake = _Store([_feat(labels=["review-clean", _BUDGET6], fid="bd-1")])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    (row,) = json.loads(_list_tool({"auto_merge": True, "review_gate": True}).invoke({}))
+    assert row["next_action"] == NEXT_ACTION_MERGED_VERIFY_EXHAUSTED and row["awaiting_merge"] is False
+    assert "board_reset_merged_verify_budget bd-1" in row["next_action_hint"]
+
+
 def test_next_action_follows_the_live_auto_merge_knob_without_a_restart(monkeypatch):
     """The blocker on #214: `auto_merge` is a LIVE knob (BoardLoop.reload), but
     annotate_next_action reads the register-time cfg dict. The loop, the routers and
@@ -462,6 +594,15 @@ def test_features_payload_respects_the_boards_merge_posture(monkeypatch):
     assert f["next_action"] == "auto-merge pending" and f["awaiting_merge"] is False
 
 
+def test_features_payload_surfaces_merged_verify_exhaustion(monkeypatch):
+    """r2 through the console payload: the held card carries the exhaustion next_action +
+    reset hint so the page can chip it — no restart, no per-row network."""
+    c = _client(monkeypatch, [_feat(labels=["review-clean", _BUDGET6])], {"auto_merge": True, "review_gate": True})
+    (f,) = c.get("/api/plugins/project_board/features").json()["features"]
+    assert f["next_action"] == NEXT_ACTION_MERGED_VERIFY_EXHAUSTED
+    assert "board_reset_merged_verify_budget bd-1" in f["next_action_hint"]
+
+
 # ── the console chip ────────────────────────────────────────────────────────────
 
 
@@ -480,3 +621,14 @@ def test_board_page_chips_the_in_review_sub_state():
     assert 'f.next_action === "blocked") return "";' in BOARD_PAGE
     # wired into flags(), which both the Kanban card and the list row render
     assert "out += nextActionChip(f);" in BOARD_PAGE
+
+
+def test_board_page_chips_the_merged_verify_exhaustion_hold():
+    """r2: the ADR 0326 hold has its own warning chip; the reset/remediation hint rides
+    the tooltip (the server's `next_action_hint`), so the operator never reads the log."""
+    from project_board.board_view import BOARD_PAGE
+
+    assert (
+        '"auto-merge held: merged-verify budget exhausted": ["pl-badge--warning", "merge held (verify budget)"],'
+        in BOARD_PAGE
+    )

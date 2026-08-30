@@ -424,6 +424,135 @@ def test_project_exposes_budgets_from_labels(make_board):
     assert b._project({"id": "bd-2", "status": "open", "labels": []})["budgets"] == {}
 
 
+# ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
+
+
+def _reset_comments(br):
+    """The `comments add` calls the reset recorded (fid, text pairs)."""
+    return [(a[2], a[3]) for a in br.calls if a[:2] == ("comments", "add")]
+
+
+def test_reset_merged_verify_budget_clears_only_that_kind_and_audits(make_board, monkeypatch):
+    """AC6: the reset drops ONLY the merged-verify budget label — another kind's budget
+    is untouched — and records an auditable comment naming who and the prior value."""
+    br = Br()
+    b = make_board(br)
+    labels = ["budget:merged-verify:6", "budget:ci-fix:2", "ready"]
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": list(labels)})
+    monkeypatch.setattr(
+        b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "labels": ["budget:ci-fix:2", "ready"]}
+    )
+    b.reset_merged_verify_budget("bd-1", actor="alice")
+    # only the merged-verify budget label is removed; ci-fix is left alone
+    assert ("update", "bd-1", "--remove-label", "budget:merged-verify:6") in br.calls
+    assert not any("budget:ci-fix:2" in a for a in br.cmds("update"))
+    comments = _reset_comments(br)
+    assert len(comments) == 1
+    fid, text = comments[0]
+    assert fid == "bd-1" and "reset by alice" in text and "was 6" in text and "#326" in text
+
+
+def test_reset_merged_verify_budget_audits_an_already_clear_budget(make_board, monkeypatch):
+    """The reset is a supported operator action even when nothing was set: it records the
+    request (audit trail) with `was unset` and the default actor, and burns no `br update`
+    (clear_budgets no-ops without a matching label)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["ready"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "labels": ["ready"]})
+    b.reset_merged_verify_budget("bd-1")
+    assert not br.cmds("update")  # nothing to drop → no write burned
+    comments = _reset_comments(br)
+    assert len(comments) == 1
+    fid, text = comments[0]
+    assert fid == "bd-1" and "was unset" in text and "reset by agent" in text  # actor = store default
+
+
+def test_reset_merged_verify_budget_unknown_id_alters_nothing(make_board, monkeypatch):
+    """AC7: an unknown feature id raises and NOTHING is altered — no label removed, no
+    audit comment for a phantom bead. (`_require` raises via get_feature → None.)"""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: None)
+    with pytest.raises(BoardError):
+        b.reset_merged_verify_budget("bd-nope")
+    assert not br.cmds("update") and not _reset_comments(br)
+
+
+def _reset_tool(cfg=None):
+    return {t.name: t for t in pb._board_tools(cfg or {})}["board_reset_merged_verify_budget"]
+
+
+def test_board_reset_merged_verify_budget_tool_clears_label_and_cache(monkeypatch):
+    """AC6 end-to-end: the tool clears the persisted label (store) AND invalidates the
+    running loop's in-process budget (loop) for the one feature, returning a structured ok
+    — a reset that takes effect on the next reconcile without a host restart. The loop half
+    PINS the count to 0 (the #259 rule, ADR 0326) and re-clears the label under its reset
+    lock so an in-flight reconcile can't leave the card held."""
+    from project_board import loop as loop_mod
+
+    class _FakeStore:
+        def __init__(self):
+            self.reset = []
+            self.cleared = []
+
+        def reset_merged_verify_budget(self, fid, actor=""):
+            self.reset.append(fid)
+            return {"id": fid, "board_state": "in_review"}
+
+        def clear_budgets(self, fid, kinds=None):
+            self.cleared.append((fid, tuple(kinds) if kinds is not None else None))
+            return {"id": fid}
+
+    fake = _FakeStore()
+    monkeypatch.setattr(store, "get_store", lambda **_kw: fake)
+    loop = loop_mod.BoardLoop({})
+    loop._merged_verify_attempts["bd-1"] = 6
+    slot = loop_mod._loop_slot()
+    prior = slot.loop
+    slot.loop = loop
+    try:
+        out = json.loads(_reset_tool().invoke({"feature_id": "bd-1"}))
+    finally:
+        slot.loop = prior
+    assert fake.reset == ["bd-1"]  # the persisted label half ran
+    assert fake.cleared == [("bd-1", ("merged-verify",))]  # loop re-cleared the label under its lock
+    assert out["id"] == "bd-1" and out["merged_verify_budget_reset"] is True
+    assert out["cache_cleared"] is True and loop._merged_verify_attempts["bd-1"] == 0  # pinned to 0
+
+
+def test_board_reset_merged_verify_budget_tool_rejects_a_blank_id(monkeypatch):
+    """AC7: a blank feature_id alters nothing and returns an error — the store is never
+    even reached (no phantom write)."""
+    reached = []
+    monkeypatch.setattr(store, "get_store", lambda **_kw: reached.append(1) or object())
+    out = _reset_tool().invoke({"feature_id": "   "})
+    assert out.startswith("Error:") and reached == []
+
+
+def test_board_reset_merged_verify_budget_tool_reports_an_unknown_id(monkeypatch):
+    """AC7: an unknown id surfaces the store's BoardError as a tool Error and — because the
+    store raises first — the loop cache is never touched."""
+    from project_board import loop as loop_mod
+
+    class _MissingStore:
+        def reset_merged_verify_budget(self, fid, actor=""):
+            raise BoardError(f"unknown feature {fid!r}")
+
+    monkeypatch.setattr(store, "get_store", lambda **_kw: _MissingStore())
+    loop = loop_mod.BoardLoop({})
+    loop._merged_verify_attempts["bd-x"] = 6
+    slot = loop_mod._loop_slot()
+    prior = slot.loop
+    slot.loop = loop
+    try:
+        out = _reset_tool().invoke({"feature_id": "bd-x"})
+    finally:
+        slot.loop = prior
+    assert out.startswith("Error:")
+    assert loop._merged_verify_attempts.get("bd-x") == 6  # cache untouched — store raised first
+
+
 # ── verified-candidate salvage record (#91) ─────────────────────────────────────
 
 
