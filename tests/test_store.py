@@ -589,6 +589,162 @@ def test_project_exposes_verified_sha(make_board):
     assert b._project({"id": "y", "status": "open", "labels": []})["verified_sha"] == ""
 
 
+# ── #338: single-label replacement is safe against br's arg ordering ─────────────
+#
+# `br` applies --remove-label AFTER --add-label within one update, so the pre-#338
+# hand-written "remove every same-prefix label, then add the desired one" loop
+# SELF-CANCELS when the value is unchanged: it emits both --remove-label X and
+# --add-label X, and X is dropped. `replace_prefixed_label_args` removes ONLY
+# same-prefix labels that DIFFER, so an unchanged re-stamp keeps exactly one copy.
+# Every unchanged-value assertion below is red against the previous implementation.
+
+
+def _update_call(br):
+    """The single `br update` call an edge issued (fid + label flags), or None."""
+    return next((a for a in br.calls if a and a[0] == "update"), None)
+
+
+def test_replace_prefixed_label_args_leaves_unchanged_value_untouched():
+    # same value → no self-cancelling remove; just the idempotent add (the #338 fix)
+    assert store.replace_prefixed_label_args(["gens:9", "ready"], "gens:", "gens:9") == ["--add-label", "gens:9"]
+
+
+def test_replace_prefixed_label_args_removes_only_differing_same_prefix_labels():
+    # a changed value drops the stale label and lands the new one; other prefixes stay
+    assert store.replace_prefixed_label_args(["gens:5", "ready", "diff:small"], "gens:", "gens:9") == [
+        "--remove-label",
+        "gens:5",
+        "--add-label",
+        "gens:9",
+    ]
+
+
+def test_replace_prefixed_label_args_fresh_label_just_adds():
+    assert store.replace_prefixed_label_args([], "verified:", "verified:abc") == ["--add-label", "verified:abc"]
+    assert store.replace_prefixed_label_args(None, "diff:", "diff:small") == ["--add-label", "diff:small"]
+
+
+def test_record_gens_spent_unchanged_total_keeps_one_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    # adding 0 gens re-stamps the SAME gens:9 — the pre-#338 loop dropped it (remove+add)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "gens_spent": 9, "labels": ["gens:9", "ready"]})
+    b.record_gens_spent("bd-1", 0)
+    assert _update_call(br) == ("update", "bd-1", "--add-label", "gens:9")
+
+
+def test_record_verified_candidate_unchanged_sha_keeps_one_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["verified:abc123", "ready"]})
+    b.record_verified_candidate("bd-1", branch="feat/bd-1", sha="abc123", worktree="/wt/feat-bd-1")
+    assert _update_call(br) == ("update", "bd-1", "--add-label", "verified:abc123")
+
+
+def test_record_merged_verified_unchanged_sha_preserves_its_record(make_board, monkeypatch):
+    """#338 headline: a quiet-base re-verify re-stamps the SAME merged-verified:<sha>.
+    The pre-#338 loop emitted --remove-label AND --add-label for it (br drops the label
+    → the record the auto-merge edge reads is gone). Now exactly one copy survives."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["merged-verified:base9", "ready"]})
+    b.record_merged_verified("bd-1", "base9")
+    assert _update_call(br) == ("update", "bd-1", "--add-label", "merged-verified:base9")
+
+
+def test_record_merged_verified_replaces_a_changed_sha(make_board, monkeypatch):
+    # value-changing transition (#338 r2): the stale sha is removed, the new one added
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["merged-verified:old", "ready"]})
+    b.record_merged_verified("bd-1", "new1")
+    assert _update_call(br) == (
+        "update",
+        "bd-1",
+        "--remove-label",
+        "merged-verified:old",
+        "--add-label",
+        "merged-verified:new1",
+    )
+
+
+def test_update_feature_unchanged_diff_keeps_one_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["diff:small", "ready"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["diff:small", "ready"]})
+    b.update_feature("bd-1", difficulty="small")  # re-stamps the SAME diff:small
+    assert _update_call(br) == ("update", "bd-1", "--add-label", "diff:small")
+
+
+def test_update_feature_replaces_a_changed_diff(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["diff:small", "ready"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["diff:small", "ready"]})
+    b.update_feature("bd-1", difficulty="medium")
+    assert _update_call(br) == ("update", "bd-1", "--remove-label", "diff:small", "--add-label", "diff:medium")
+
+
+def test_record_budget_unchanged_count_keeps_one_label(make_board, monkeypatch):
+    # the fifth site the shared helper closes: a re-stamp of the same budget count must
+    # not self-cancel, and another kind's budget stays untouched
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "labels": ["budget:ci-fix:2", "budget:rebase:1", "ready"]}
+    )
+    b.record_budget("bd-1", "ci-fix", 2)
+    assert _update_call(br) == ("update", "bd-1", "--add-label", "budget:ci-fix:2")
+
+
+def test_set_review_substate_swaps_siblings_never_self_cancels(make_board, monkeypatch):
+    """#338 r4: `set_review_substate` keeps its own (correct) multi-label semantics —
+    it removes only the SIBLING gate labels that differ and adds the desired one, so a
+    re-stamp of the already-present label never emits a self-cancelling remove for it."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["review-clean", "ready"]})
+    # re-stamp the label that is ALREADY present: the two siblings drop, review-clean stays
+    b.set_review_substate("bd-1", "review-clean")
+    call = _update_call(br)
+    assert call == (
+        "update",
+        "bd-1",
+        "--remove-label",
+        "review-pending",
+        "--remove-label",
+        "changes-requested",
+        "--add-label",
+        "review-clean",
+    )
+
+
+def test_set_review_substate_none_clears_all_three(make_board, monkeypatch):
+    # a None label clears every gate sub-state and adds nothing (the requeue reset)
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["review-pending"]})
+    b.set_review_substate("bd-1", None)
+    assert _update_call(br) == (
+        "update",
+        "bd-1",
+        "--remove-label",
+        "review-pending",
+        "--remove-label",
+        "changes-requested",
+        "--remove-label",
+        "review-clean",
+    )
+
+
 # ── _project: the bead → feature view mapping ───────────────────────────────────
 
 
