@@ -1087,6 +1087,73 @@ async def test_drive_dispatch_failure_after_model_work_still_escalates(monkeypat
     assert not any(c[0] == "flag_blocked" for c in store.calls)
 
 
+async def test_drive_pre_model_failure_on_a_keep_worktree_redispatch_still_blocks(monkeypatch):
+    """The review finding: model-reached evidence must be scoped to the CURRENT dispatch.
+    A first dispatch reaches the model and leaves an active sibling gen in the feature's
+    ring buffer; a goal-verify gap keeps the worktree and re-dispatches (gen 1, NO
+    progress_new_run — the stale sibling survives for the drawer). That re-dispatch dies
+    BELOW the seam before a first token. The unscoped model-reached scan saw the PRIOR
+    dispatch's activity and climbed the ladder; with run-scoping it correctly reads "no
+    model work this dispatch" and blocks for infra triage — no tier climb (#339)."""
+    coder_seam._progress.clear()
+    store = _EscalatingStore(tiers=["reasoning", "opus"])  # a real ladder is available…
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    removes = []
+
+    async def _remove(repo, wt, branch=""):
+        removes.append(wt)
+
+    async def _reap(repo, root, fid):
+        return None
+
+    # Goal-verify gaps once (dispatch 1) → keep-worktree re-dispatch; the re-dispatch
+    # never reaches the gate (it dies below the seam first), so this fires exactly once.
+    async def _verify(feature, wt, base, coder_reply=""):
+        return "missing tests for the new behavior"
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        if len(dispatches) == 1:
+            # Dispatch 1 reached the model: record activity on gen 1 AND an active
+            # sibling gen 2 (a solve/max-mode fan-out the earlier dispatch left behind).
+            coder_seam.progress_begin("bd-1", 2, "fast")
+            coder_seam.progress_tool("bd-1", 2, {"phase": "start", "id": "s1", "name": "edit_file"})
+            coder_seam.progress_tool("bd-1", 1, {"phase": "start", "id": "s2", "name": "edit_file"})
+            return "implementation is in the worktree"
+        # Dispatch 2 (keep-worktree re-run of gen 1) dies below the seam before a token.
+        raise worktree.WorktreeError(
+            "coder dispatch failed: dispatch_tapped() got an unexpected keyword argument 'tool_callback'"
+        )
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_verify": True, "goal_fix_max": 2})
+    assert loop.escalation_on  # …and yet the ladder is NEVER consulted
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    monkeypatch.setattr(loop, "_verify_goal", _verify)
+    await loop._drive(FEATURE)
+
+    # No climb: the stale sibling gen did NOT masquerade as this dispatch's model work.
+    assert store.escalated == []
+    assert len(dispatches) == 2  # initial build + the one keep-worktree re-dispatch
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    fid, reason, category = blocked[0][1], blocked[0][2], blocked[0][3]
+    assert fid == "bd-1" and category == "dispatch-infra"
+    assert "dispatch_tapped" in reason  # the original infra evidence is preserved
+    assert removes == ["/wt/feat-bd-1"]  # the worktree is reaped
+
+
 async def test_drive_empty_result_retry_recovers_and_resets_the_count(monkeypatch):
     """One empty occurrence then a real diff: the same-tier retry ships normally and
     the empty-result count resets (a later empty attempt starts a fresh window)."""

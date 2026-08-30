@@ -4739,30 +4739,16 @@ class BoardLoop:
     def _dispatch_reached_model(fid: str) -> bool:
         """Did the coder dispatch that just failed REACH the model — i.e. produce any
         first-token evidence (a tool call, a thought, streamed answer text, or token
-        usage) — mined from the live-monitor ring buffer? A dispatch that failed with
-        NONE of these never got past the seam/adapter, so the model could not have
-        influenced the result and a stronger model cannot clear it (it must block for
-        infra triage, not climb the tier ladder — #339).
+        usage)? A dispatch that failed with NONE of these never got past the seam /
+        adapter, so the model could not have influenced the result and a stronger model
+        cannot clear it (it must block for infra triage, not climb the tier ladder).
 
-        Fail SAFE: an unreadable or empty snapshot returns ``False`` so an ambiguous
-        dispatch failure blocks for triage rather than burning the escalation ladder.
-        This is the OPPOSITE bias from ``_empty_result_signals`` on purpose — that one
-        guards against a wasteful same-tier retry, so it errs toward "had activity";
-        this one gates model-capability escalation, so it errs toward "no model work"."""
-        try:
-            gens = coder_seam.progress_snapshot(fid).get("gens") or []
-        except Exception:  # noqa: BLE001 — a monitor read must never break the drive
-            return False
-        for g in gens:
-            if (
-                g.get("recent_tools")
-                or g.get("current_tool")
-                or (g.get("thought_tail") or "").strip()
-                or (g.get("answer_tail") or "").strip()
-                or g.get("usage")
-            ):
-                return True
-        return False
+        Delegates to ``coder_seam.dispatch_reached_model``, which scopes the check to
+        the CURRENT dispatch's run epoch so a stale gen an earlier dispatch left in the
+        feature's ring buffer can't misclassify a later pre-model failure as model-
+        reachable (the review finding on the first cut). Fail-safe toward "no model
+        work" so an ambiguous dispatch failure blocks rather than climbs (#339)."""
+        return coder_seam.dispatch_reached_model(fid)
 
     def _timeout_escalation_context(self, fid: str) -> str:
         """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).

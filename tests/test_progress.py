@@ -109,6 +109,60 @@ def test_progress_new_run_clears_prior_gens():
     assert coder_seam.progress_snapshot("f") == {"gens": []}
 
 
+# ── dispatch_reached_model: first-token evidence, scoped to the CURRENT dispatch (#339) ──
+
+
+def test_dispatch_reached_model_false_on_an_empty_or_unknown_buffer():
+    """No run in the buffer ⇒ fail SAFE to "model not reached" so an ambiguous dispatch
+    failure blocks for infra triage rather than climbing the escalation ladder."""
+    coder_seam._progress.clear()
+    assert coder_seam.dispatch_reached_model("nope") is False
+
+
+def test_dispatch_reached_model_true_when_the_current_run_streamed():
+    """Any first-token evidence on a current-run gen — a tool, thought, answer, or token
+    usage — is model-reachable; a solve/max-mode run tags all its gens with one epoch."""
+    coder_seam._progress.clear()
+    coder_seam.progress_new_run("f")
+    coder_seam.progress_begin("f", 1, "smart")
+    coder_seam.progress_begin("f", 2, "smart")  # a sibling candidate, same run
+    coder_seam.progress_tool("f", 2, {"phase": "start", "id": "t1", "name": "edit_file"})
+    assert coder_seam.dispatch_reached_model("f") is True
+
+
+def test_dispatch_reached_model_ignores_a_prior_dispatchs_activity():
+    """The review finding: a pre-model failure on a LATER dispatch that re-runs gen 1
+    (a keep-worktree fix round — no progress_new_run) must read as "model not reached"
+    even though an EARLIER dispatch left active sibling gens in the same feature buffer.
+    The unscoped scan returned True here and climbed the tier ladder instead of blocking."""
+    coder_seam._progress.clear()
+    # Earlier dispatch: a solve/max-mode fan-out that reached the model on gens 1 & 2.
+    coder_seam.progress_new_run("f")
+    coder_seam.progress_begin("f", 1, "smart")
+    coder_seam.progress_begin("f", 2, "smart")
+    coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t1", "name": "edit_file"})
+    coder_seam.progress_thought("f", 2, "thinking about the fix")
+    assert coder_seam.dispatch_reached_model("f") is True  # that dispatch did reach
+    # Later dispatch: re-run gen 1 (keep-worktree) with NO progress_new_run — the stale
+    # gens 1 & 2 survive for the drawer. The seam throws before a first token, so the
+    # fresh gen 1 has no activity of its own.
+    coder_seam.progress_begin("f", 1, "reasoning")
+    assert coder_seam.dispatch_reached_model("f") is False  # scoped to the current run
+
+
+def test_dispatch_reached_model_true_when_the_re_dispatch_itself_streams():
+    """The genuine model-reachable case on a re-dispatch is preserved: if the re-run of
+    gen 1 DOES stream a token before failing, it is model-reachable and stays on the
+    ladder — the scoping only masks the PRIOR dispatch's activity, not this one's."""
+    coder_seam._progress.clear()
+    coder_seam.progress_new_run("f")
+    coder_seam.progress_begin("f", 1, "smart")
+    coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t1", "name": "edit_file"})
+    coder_seam.progress_begin("f", 1, "reasoning")  # keep-worktree re-run, new epoch
+    coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t2", "name": "edit_file"})
+    assert coder_seam.dispatch_reached_model("f") is True
+
+
 def test_registry_evicts_the_oldest_features_beyond_the_cap():
     """A long-lived loop can't leak memory — the registry keeps only the most
     recent _MAX_FEATURES features, LRU-evicting the oldest."""

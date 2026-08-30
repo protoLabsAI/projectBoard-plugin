@@ -2064,14 +2064,18 @@ class BeadsBoard:
         """Clear the ``blocked`` flag so a feature can be re-dispatched.
 
         When the block was a NON-MODEL failure — a pre-model dispatch/adapter/infra
-        incident, ``blocked-class:dispatch-infra`` (#339) — also RESET the card's
-        escalation posture: drop every ``tier:`` label (and the now-stale block class)
-        so the next GENUINE build starts at its difficulty-selected tier instead of
-        inheriting a tier the model never earned. A host/adapter incident must never
-        leave a `tier:` label that runs the card on a stronger, costlier model for its
-        next real attempt — the ladder is a model-capability record, not an infra one.
-        A model-reachable block (or an unclassified one) leaves the tier posture as-is,
-        exactly as before."""
+        incident, ``blocked-class:dispatch-infra`` (#339) — also drop the now-stale
+        block class so a requeue starts clean. The card's escalation posture is left
+        UNTOUCHED, and deliberately so: the loop never climbs a tier on a pre-model
+        failure (``store.escalate`` is not called on that path), so every ``tier:``
+        label present at a dispatch-infra block was earned BEFORE the incident by real
+        model-capability work. Removing them would silently restart a card that had
+        legitimately escalated on its lower difficulty-selected model and repeat the
+        work that already failed there — the exact regression the first cut introduced.
+        A card that never escalated carries no ``tier:`` label, so it still starts at
+        its difficulty-selected tier on the next build; the ladder stays a
+        model-capability record, and the infra incident adds nothing to it. A
+        model-reachable block (or an unclassified one) is untouched, exactly as before."""
         from .failures import PRE_MODEL_DISPATCH_CLASS
 
         f = self._require(fid)
@@ -2079,9 +2083,8 @@ class BeadsBoard:
         args = ["update", fid, "--remove-label", LABEL_BLOCKED]
         cls = next((l.split(":", 1)[1] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)), "")
         if cls == PRE_MODEL_DISPATCH_CLASS:
-            for lbl in labels:
-                if lbl.startswith("tier:"):  # every earned/inflated rung — reset to difficulty-selected
-                    args += ["--remove-label", lbl]
+            # Drop only the stale infra class — NOT the tier labels, which predate the
+            # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
         self._run(*args)
         return self.get_feature(fid)

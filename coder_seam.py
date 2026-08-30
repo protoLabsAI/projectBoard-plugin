@@ -173,6 +173,7 @@ class _GenBuffer:
     __slots__ = (
         "gen",
         "tier",
+        "run",
         "started",
         "ended",
         "current_tool",
@@ -189,6 +190,10 @@ class _GenBuffer:
     def __init__(self, gen: int, tier: str = ""):
         self.gen = int(gen)
         self.tier = tier or ""
+        # Dispatch epoch this gen belongs to (assigned by progress_begin). Scopes the
+        # first-token check in dispatch_reached_model to the CURRENT dispatch so a
+        # stale gen an earlier dispatch left in the buffer can't answer for it (#339).
+        self.run = 0
         self.started = _monotonic()
         self.ended: float | None = None
         self.current_tool: dict | None = None
@@ -399,10 +404,26 @@ def progress_new_run(fid: str | None) -> None:
 
 def progress_begin(fid: str | None, gen: int, tier: str = "") -> None:
     """Register (or reset) a generation's buffer. No-op when ``fid`` is falsy — the
-    operator-only test-rung path passes None (it's a diagnostic, not a live run)."""
+    operator-only test-rung path passes None (it's a diagnostic, not a live run).
+
+    Each gen is tagged with a ``run`` epoch so ``dispatch_reached_model`` can scope its
+    first-token check to the CURRENT dispatch and ignore stale gens an earlier dispatch
+    left in the ring buffer (#339). RE-registering an existing gen number is a fresh
+    dispatch attempt reusing that gen — the keep-worktree fix round re-runs gen 1 with
+    NO ``progress_new_run``, so its stale solve/max-mode siblings survive — and opens a
+    NEW epoch; a brand-new gen number is another candidate of the SAME run (solve /
+    max-mode fan out gens 1..N in one dispatch) and stays on the current epoch. A fresh
+    build calls ``progress_new_run`` first, clearing the feature, so its gens start at
+    epoch 0 and the whole run is the current one."""
     gens = _gens_for(fid, create=True)
     if gens is not None:
-        gens[int(gen)] = _GenBuffer(gen, tier)
+        g = int(gen)
+        runs = [getattr(b, "run", 0) for b in gens.values()]
+        # Re-run of an existing gen → new attempt (bump); new gen → current run.
+        epoch = ((max(runs) if runs else -1) + 1) if g in gens else (max(runs) if runs else 0)
+        buf = _GenBuffer(g, tier)
+        buf.run = epoch
+        gens[g] = buf
 
 
 def _buf(fid: str | None, gen: int) -> "_GenBuffer | None":
@@ -553,6 +574,44 @@ def progress_snapshot(fid: str) -> dict:
     if not gens:
         return {"gens": []}
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
+
+
+def dispatch_reached_model(fid: str) -> bool:
+    """Did the CURRENT coder dispatch reach the model — produce any first-token
+    evidence (a tool call, a thought, streamed answer text, or token usage) — mined
+    from the live-monitor ring buffer?
+
+    Scoped to the LATEST run epoch (``progress_begin``) so a stale gen an EARLIER
+    dispatch left in this feature's buffer can NOT answer for the current one: a
+    pre-model failure on a keep-worktree re-dispatch (which re-runs gen 1 without a
+    ``progress_new_run``, leaving the prior solve/max-mode gens visible for the drawer)
+    must read as "model not reached" even though those older gens still show activity.
+    The unscoped scan misclassified exactly this as model-reachable and climbed the tier
+    ladder instead of blocking for infra triage (#339).
+
+    Fail SAFE: an unreadable or empty buffer returns ``False`` so an ambiguous dispatch
+    failure blocks for triage rather than burning the escalation ladder — the OPPOSITE
+    bias from the empty-result miner, which errs toward "had activity" to avoid a
+    wasteful same-tier retry. This one gates model-capability escalation."""
+    try:
+        gens = _progress.get(fid)
+        if not gens:
+            return False
+        current = max(getattr(b, "run", 0) for b in gens.values())
+        for b in gens.values():
+            if getattr(b, "run", 0) != current:
+                continue  # a stale earlier-dispatch gen — not evidence for THIS dispatch
+            if (
+                b.recent_tools
+                or b.current_tool
+                or (b.thought_tail or "").strip()
+                or (b.answer_tail or "").strip()
+                or b.usage
+            ):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — a monitor read must never break the drive
+        return False
 
 
 def _import_dispatch_tapped():
