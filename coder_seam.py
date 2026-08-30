@@ -83,6 +83,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 import types
 from collections import OrderedDict, deque
@@ -921,6 +922,44 @@ def resolve_self_invoke(_host=None):
     return invoke if callable(invoke) else None
 
 
+# ── the host-invocation slot ──────────────────────────────────────────────────────
+# The drain below holds the loop's one-in-flight guard across a TIMEOUT. It cannot hold
+# it across an external CANCEL (operator stop / shutdown): CancelledError unwinds this
+# coroutine, the drive's done-callback clears `_self_inflight`, and the worker thread
+# keeps executing on the host — so a later self task could invoke it concurrently. And
+# draining on cancel is not an option: shutdown must not block on a runaway host call.
+#
+# So the cancel case is covered by a flag the WORKER owns. Acquire and release both live
+# inside the thread wrapper, in one frame: if the thread never starts, neither happens,
+# so the flag can never leak and strand every future self task. The gap between
+# submitting the thread and it entering is covered by `_self_inflight`, which the loop
+# sets synchronously before the drive begins. Process-stable slot (#178) so a plugin
+# reload mid-invocation cannot forget a live call.
+_HOST_SLOT_PREFIX = "project_board.host_invoke::"
+
+
+def _host_slot():
+    name = _HOST_SLOT_PREFIX + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's host-invoke busy flag — data, not code."
+        holder.busy = 0
+        holder.lock = threading.Lock()
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
+    return holder
+
+
+def host_invoke_busy() -> bool:
+    """True while a synchronous ``dispatch_self`` worker is STILL EXECUTING on the host —
+    including one whose awaiter was cancelled out from under it. The loop consults this
+    alongside ``_self_inflight`` so a cancelled self task cannot be followed by a second
+    invoke while the first is still running."""
+    holder = _host_slot()
+    with holder.lock:
+        return holder.busy > 0
+
+
 async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float | None = None) -> str:
     """Dispatch a self-assigned task through the host's OWN agent via ``invoke`` and
     return the reply — the first-party sibling of ``dispatch_task``. ``invoke`` is the
@@ -947,7 +986,14 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
     await (guard held, slot held) until the host's own call actually returns, so no concurrent
     invoke can start. The cost — a runaway synchronous host pins the drive until its thread
     finishes — is the honest price of an uncancellable call, and strictly safer than two live
-    invokes racing on one host."""
+    invokes racing on one host.
+
+    The drain covers a TIMEOUT. An external CANCEL (operator stop / shutdown) it cannot
+    cover — CancelledError unwinds this coroutine and the drive's done-callback frees the
+    guard while the worker runs on — and draining there would block shutdown on the very
+    runaway call the operator is trying to stop. That case is covered instead by the
+    worker-owned busy flag (``host_invoke_busy``), which the loop consults alongside its
+    own guard."""
     kwargs = {}
     try:
         if "tool_fence" in inspect.signature(invoke).parameters:
@@ -963,7 +1009,22 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
             # The worker thread is uncancellable — never abandon it past the timeout (see the
             # docstring). ``asyncio.wait`` returns pending tasks WITHOUT cancelling them, so on
             # timeout we drain the still-running thread before raising CoderTimeout.
-            thread = asyncio.ensure_future(asyncio.to_thread(invoke, prompt, session_id, **kwargs))
+            holder = _host_slot()
+
+            def _invoke_owning_the_slot():
+                # Acquire AND release inside the worker, one frame: a thread that never
+                # runs leaves the flag untouched, so it cannot leak (the earlier draft
+                # acquired on the event loop and leaked the flag permanently whenever a
+                # cancel landed before the thread started, parking every later self task).
+                with holder.lock:
+                    holder.busy += 1
+                try:
+                    return invoke(prompt, session_id, **kwargs)
+                finally:
+                    with holder.lock:
+                        holder.busy = max(0, holder.busy - 1)
+
+            thread = asyncio.ensure_future(asyncio.to_thread(_invoke_owning_the_slot))
             if timeout:
                 await asyncio.wait({thread}, timeout=timeout)
                 if not thread.done():

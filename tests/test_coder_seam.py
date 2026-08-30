@@ -9,6 +9,7 @@ needs the (separate, git-URL-installed) `coder` plugin to be present."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2524,3 +2525,66 @@ async def test_a_seam_returning_a_non_result_is_refused_not_passed_up(monkeypatc
             _FakeCoder(), "/wt", "x", fid="bd-junk", gen=1, _dispatch_tapped=_junk_seam
         )
     assert coder_seam.progress_snapshot("bd-junk")["gens"][0]["done"] is True  # gen still closed
+
+
+async def test_a_cancelled_self_dispatch_keeps_the_host_slot_until_the_worker_returns():
+    """The drain covers a TIMEOUT. It cannot cover an external CANCEL: CancelledError
+    unwinds dispatch_self, the drive's done-callback frees `_self_inflight`, and the
+    uncancellable worker keeps executing on the host — so a later self task could invoke
+    it concurrently. Draining on cancel is not an option either (shutdown must not block
+    on the runaway call the operator is stopping).
+
+    So the worker owns a busy flag: still raised after the await is cancelled, lowered
+    only when the host's call actually returns."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        started.set()
+        release.wait(10)
+        return "late"
+
+    assert coder_seam.host_invoke_busy() is False
+    task = asyncio.create_task(coder_seam.dispatch_self(invoke, "p", "pb-self-bd-cancel"))
+    for _ in range(500):  # let the worker thread actually enter invoke
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    task.cancel()  # operator stop / shutdown
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The awaiter is gone; the worker is NOT. The host must still read as busy.
+    assert coder_seam.host_invoke_busy() is True
+
+    release.set()
+    for _ in range(500):
+        if not coder_seam.host_invoke_busy():
+            break
+        await asyncio.sleep(0.01)
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_the_host_slot_is_clear_after_an_ordinary_self_dispatch():
+    """No leak on the happy path — the next self task is admitted immediately."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return "done"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "pb-self-bd-ok") == "done"
+    assert coder_seam.host_invoke_busy() is False
+
+
+async def test_a_coroutine_self_dispatch_never_touches_the_host_slot():
+    """The slot exists only for the uncancellable THREAD. A coroutine invoke is genuinely
+    cancelled by wait_for, so it needs no flag — and must not leave one raised."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        assert coder_seam.host_invoke_busy() is False
+        return "async done"
+
+    assert await coder_seam.dispatch_self(invoke, "p", "pb-self-bd-async") == "async done"
+    assert coder_seam.host_invoke_busy() is False

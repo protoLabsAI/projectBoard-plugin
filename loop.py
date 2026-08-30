@@ -2140,7 +2140,11 @@ class BoardLoop:
         # existing log line. r3: a self-dispatch already in flight → park the second
         # rather than recurse. Both claim to in_progress and hold no slot, exactly like a
         # human/unassigned park.
-        if invoke is None or self._self_inflight:
+        # r3b: `_self_inflight` is cleared by the drive's done-callback, which fires as soon
+        # as the drive is CANCELLED — while an uncancellable worker thread may still be
+        # executing on the host. `host_invoke_busy()` is owned by that thread, so it stays
+        # true until the call really returns and the second task parks instead of racing it.
+        if invoke is None or self._self_inflight or coder_seam.host_invoke_busy():
             claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
             if claimed is None:
                 return "race"

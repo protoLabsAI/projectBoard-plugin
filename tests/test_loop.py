@@ -3079,6 +3079,27 @@ async def test_a_second_self_task_parks_while_one_self_dispatch_is_in_flight(mon
     assert ("record_delivery", "bd-self-2", "done") not in store.calls  # the parked one was NOT delivered
 
 
+async def test_a_self_task_parks_while_a_cancelled_dispatchs_worker_still_runs(monkeypatch):
+    """`_self_inflight` is cleared by the drive's done-callback, which fires as soon as the
+    drive is CANCELLED — while the uncancellable worker may still be on the host. The
+    admission gate therefore also consults `host_invoke_busy()`, so the next self task
+    parks instead of racing a call that never stopped."""
+    store = _TaskStore([_task("bd-after-cancel", assignee="self")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda *a, **k: lambda *_a, **_k: "x")
+    monkeypatch.setattr(coder_seam, "host_invoke_busy", lambda: True)  # abandoned worker STILL running
+
+    async def _no_self(*a, **k):
+        raise AssertionError("must not invoke the host while an abandoned worker is live")
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _no_self)
+
+    loop = BoardLoop({"coder": "proto"})
+    assert loop._self_inflight is False  # the guard is already free — only the flag holds it
+    assert await loop._dispatch_task(store, _task("bd-after-cancel", assignee="self")) == "parked"
+    assert not loop._drives
+
+
 async def test_self_task_dispatch_failure_is_classified_and_blocks(monkeypatch):
     """#311 r5: a self-dispatch failure (surfaced as WorktreeError by coder_seam) is
     classified like a coder failure and blocks the card with the CLASSIFIED reason — no
