@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import re
@@ -882,6 +883,105 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
             await adapter.teardown(delegate)
         except Exception:  # noqa: BLE001 — never let teardown mask the result/error
             log.warning("[project_board] task delegate teardown failed", exc_info=True)
+
+
+# ── first-party self-dispatch through the host agent (#311) ──────────────────────
+# A task assigned to the board's OWN agent (its configured name, or the reserved
+# ``self``/``agent`` aliases) is NOT shelled out to a sister-agent delegate — it is
+# first-party work the host does itself through ``graph.plugins.host.HOST``'s ``invoke``
+# seam. Both the seam AND its optional ``tool_fence`` parameter are feature-detected: a
+# host predating either (an older host, or the standalone test env with no ``graph``
+# package) degrades to the caller's existing parked behaviour, and a host whose
+# ``invoke`` predates ``tool_fence`` is called without it. Self work is intentionally
+# UNFENCED — trusted first-party work — so ``tool_fence`` stays ``None`` where supported.
+
+
+def _import_host(_host=None):
+    """Best-effort handle on the host's ``graph.plugins.host.HOST`` object — the seam the
+    board drives its OWN agent through for a self-assigned task (#311). Returns it, or
+    ``None`` when the host predates the seam (an older host, or the standalone test env
+    with no ``graph`` package). ``_host`` is a test-injection seam (mirrors the import
+    guards elsewhere in this module); production callers never pass it."""
+    if _host is not None:
+        return _host
+    try:
+        from graph.plugins.host import HOST
+    except Exception:  # noqa: BLE001 — host-free test env / a host predating the seam
+        return None
+    return HOST
+
+
+def host_invoke_available(_host=None) -> bool:
+    """Feature-detect the host's first-party ``HOST.invoke`` seam — a callable ``invoke``
+    attribute on the host object. ``False`` when the host predates it, so the caller
+    preserves the existing parked behaviour (#311, honest degrade) instead of dispatching
+    self-work into a seam that isn't there."""
+    return callable(getattr(_import_host(_host), "invoke", None))
+
+
+async def dispatch_self(prompt: str, session_id: str, *, timeout: float | None = None, _host=None) -> str:
+    """Dispatch a SELF-assigned task through the board's OWN host agent
+    (``graph.plugins.host.HOST.invoke``) and return the reply — the first-party sibling of
+    ``dispatch_task``. Where a task delegate is a sister agent reached over acp/a2a, this
+    is the board driving its own host agent: no worktree, no delegate transport, the reply
+    IS the deliverable ``record_delivery`` records.
+
+    ``session_id`` is stable per task card so a re-dispatch resumes the same host session.
+    The optional ``tool_fence`` parameter is feature-detected with ``inspect.signature`` —
+    an older ``invoke`` that predates it is called WITHOUT it, and self work is
+    intentionally unfenced (``tool_fence=None``) first-party work.
+
+    ``invoke`` may be a coroutine function OR a plain sync callable, and a sync ``invoke``
+    may itself RETURN an awaitable. The WHOLE call — the synchronous phase (run on a worker
+    thread so a blocking implementation can't monopolise the event loop) AND awaiting any
+    awaitable it returns — is bounded by ONE ``timeout`` deadline: the awaitable phase
+    inherits the REMAINING time off a shared monotonic deadline, never a second full
+    ``timeout``, so a sync-invoke-that-returns-an-awaitable can't run for ~2× the
+    configured timeout.
+
+    Errors are normalised exactly like ``dispatch_task`` so the loop's coder-failure
+    classifier blocks a self-dispatch failure with the identical code: a timeout →
+    ``CoderTimeout``, anything else → ``WorktreeError``. ``CancelledError`` (operator
+    cancel / shutdown) propagates untouched — it owns its own edge."""
+    invoke = getattr(_import_host(_host), "invoke", None)
+    if not callable(invoke):
+        # Caller feature-detects with ``host_invoke_available`` before dispatching, so this
+        # is belt-and-braces: a host that lost the seam between the check and here surfaces
+        # as a normal dispatch failure rather than an AttributeError up the loop.
+        raise worktree.WorktreeError("coder dispatch failed: host exposes no invoke seam")
+    kwargs: dict = {}
+    try:
+        if "tool_fence" in inspect.signature(invoke).parameters:
+            kwargs["tool_fence"] = None  # supported → pass it explicitly-unfenced
+    except (TypeError, ValueError):
+        pass  # a builtin/C callable with no introspectable signature — call it bare
+    try:
+        if inspect.iscoroutinefunction(invoke):
+            coro = invoke(prompt, session_id, **kwargs)
+            reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        else:
+            # Sync ``invoke``: the synchronous phase runs on a worker thread (a blocking
+            # implementation must not monopolise the event loop). A returned awaitable is
+            # then awaited within the SAME deadline — the remaining time off one monotonic
+            # clock, never a fresh ``timeout``.
+            loop = asyncio.get_running_loop()
+            deadline = (loop.time() + timeout) if timeout else None
+            sync_call = asyncio.to_thread(invoke, prompt, session_id, **kwargs)
+            reply = await (asyncio.wait_for(sync_call, timeout) if timeout else sync_call)
+            if inspect.isawaitable(reply):
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    raise asyncio.TimeoutError
+                reply = await (asyncio.wait_for(reply, remaining) if remaining is not None else reply)
+        return reply if isinstance(reply, str) else ("" if reply is None else str(reply))
+    except asyncio.CancelledError:
+        raise  # operator cancel / shutdown owns the edge — never normalised to a block
+    except asyncio.TimeoutError:
+        raise worktree.CoderTimeout(f"self dispatch timed out after {timeout}s")
+    except (worktree.CoderTimeout, worktree.WorktreeError):
+        raise  # already normalised (e.g. the seam-missing guard above) — don't re-wrap
+    except Exception as exc:  # noqa: BLE001 — mirror dispatch_task: nothing below propagates raw
+        raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
 
 
 def resolve_delegate(name: str, expect_type: str):

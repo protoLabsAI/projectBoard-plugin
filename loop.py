@@ -90,6 +90,11 @@ _REAP_WARN_CAP = 5
 # are invisible to both `_ready_projects` and a fresh `_preflight_state`).
 PREFLIGHT_BLOCK_PREFIX = "gate preflight failed"
 
+# #311: the reserved assignee aliases that name the board's OWN agent (as does its
+# configured ``agent_name``) — a task on one of these is first-party work the host runs
+# itself through HOST.invoke, not shelled out to a sister-agent delegate.
+_SELF_ALIASES = frozenset({"self", "agent"})
+
 # `flag_blocked` records its reason as a `blocked: <reason>` bead comment (the same
 # format retro.py mines); the LAST such comment is the card's CURRENT block reason.
 _BLOCKED_COMMENT_RE = re.compile(r"^\s*blocked:\s*(.*)", re.I | re.S)
@@ -757,6 +762,12 @@ class BoardLoop:
         # the operator sees (setup_check), never a phantom delegate name that exists on
         # one machine and blocks every feature with "delegate not configured" elsewhere.
         self.coder_name = str(self.cfg.get("coder") or "").strip()
+        # #311: the board's OWN agent identity. A task assigned to this name — or to the
+        # reserved `self`/`agent` aliases — is first-party work the host runs itself through
+        # HOST.invoke, not shelled out to a sister-agent delegate. Configured explicitly, or
+        # read from the host's `AGENT_NAME` env (the identity the host authenticates this
+        # agent under — see config.py). Blank ⇒ only the aliases name self.
+        self.agent_name = str(self.cfg.get("agent_name") or os.environ.get("AGENT_NAME") or "").strip()
         self.reviewer_name = self.cfg.get("reviewer", "quinn")
         # Review dispatch is OPT-IN (default off). The fleet's PR-review pipeline
         # already reviews PRs the moment they're opened, so the loop doesn't need to
@@ -1063,6 +1074,11 @@ class BoardLoop:
         # files_to_modify of each in-flight feature, for the hot-file overlap guard
         # (don't run two parallel coders that edit the same file → sure conflict).
         self._inflight_files: dict[str, set[tuple[str, str]]] = {}  # fid -> {(project, path)} (#197)
+        # #311: the fid of the single in-flight SELF-dispatch (a task the board runs through
+        # its own HOST.invoke), or None. Only one self-dispatch runs at a time — a second
+        # self-assigned task stays parked while this is set, so a self task can never recurse
+        # the board into itself. Released by the drive's done-callback.
+        self._self_inflight_fid: str | None = None
         self._last_poll = 0.0  # monotonic ts of the last merge poll
         self._last_sweep = 0.0  # monotonic ts of the last health sweep
         # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
@@ -1576,18 +1592,24 @@ class BoardLoop:
         puller re-claims it). Shared by boot recovery and the health sweep."""
         store = self._store()
         feature = await asyncio.to_thread(store.get_feature, fid) or {}
-        # #217/#304: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
-        # salvage below never apply. A task parked on a human/unassigned assignee is
-        # NOT orphaned — it is intentionally in_progress awaiting async delivery
-        # (API/chat), the same "leave it, an out-of-band edge resolves it" posture an
-        # in_review PR gets — so leave it be. A task on a SISTER-AGENT assignee (ACP
-        # coder OR A2A agent) whose drive died mid-flight IS orphaned: requeue it for a
-        # clean re-dispatch.
+        # #217/#304/#311: a task bead has no PR/worktree, so the PR-adopt /
+        # verified-candidate salvage below never apply. A task parked on a
+        # human/unassigned assignee is NOT orphaned — it is intentionally in_progress
+        # awaiting async delivery (API/chat), the same "leave it, an out-of-band edge
+        # resolves it" posture an in_review PR gets — so leave it be. Only a task that had
+        # (or could have had) a LIVE drive is orphaned when that drive dies mid-flight:
+        #   • a SISTER-AGENT assignee (ACP coder OR A2A agent) — always dispatchable, or
+        #   • a SELF assignee ONLY on a host that exposes HOST.invoke (#311).
+        # A self assignee on a host WITHOUT HOST.invoke is parked exactly like a human —
+        # requeueing it would cycle it ready↔in_progress forever, so it must be left be.
         if feature.get("issue_type") == LABEL_TASK:
             assignee = str(feature.get("assignee") or "").strip()
-            if self._resolve_task_delegate(assignee) is not None:
+            had_live_drive = self._resolve_task_delegate(assignee) is not None or (
+                self._is_self_assignee(assignee) and coder_seam.host_invoke_available()
+            )
+            if had_live_drive:
                 await asyncio.to_thread(store.requeue, fid)
-                log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
+                log.info("[project_board] %s task reset to ready (agent drive died — re-dispatch)", fid)
             return
         pr_url = await worktree.pr_url_for_branch(
             worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
@@ -1965,12 +1987,13 @@ class BoardLoop:
             # decision, an artifact ref), not a diff, so it takes NO git worktree and
             # skips the hot-file guard below (with no worktree there is no file to
             # collide on). A sister-agent assignee — an ACP coder OR an A2A agent
-            # (#304) — is driven via its native adapter (a real drive → counts toward
-            # max_concurrent); a human/unassigned task is parked in_progress to await
-            # async delivery (API/chat) and does NOT hold a slot.
+            # (#304) — is driven via its native adapter; a SELF assignee (this board's
+            # own agent, #311) is driven through HOST.invoke — both are real drives that
+            # count toward max_concurrent; a human/unassigned task is parked in_progress
+            # to await async delivery (API/chat) and does NOT hold a slot.
             if candidate.get("issue_type") == LABEL_TASK:
                 outcome = await self._dispatch_task(store, candidate)
-                if outcome in ("acp", "a2a"):
+                if outcome in ("acp", "a2a", "self"):
                     selected.append(cid)
                     spawned = True
                 elif outcome == "parked":
@@ -2028,6 +2051,8 @@ class BoardLoop:
             self._inflight_files.pop(fid, None)
             _unregister_drive(fid, task)
             self._cancel_done.discard(fid)  # a later drive of the same card gets its own cancel edge
+            if self._self_inflight_fid == fid:
+                self._self_inflight_fid = None  # #311: free the self-dispatch slot for the next self task
             # #258: drop any write-back futures a failed dispatch left un-awaited —
             # the executor still runs them (fire-and-forget); only the parking is freed.
             self._bg_records.pop(fid, None)
@@ -2042,9 +2067,15 @@ class BoardLoop:
           that type (ACP coder or A2A agent, #304) → claimed and a ``_drive_task`` was
           spawned (into ``self._drives``, so it counts toward ``max_concurrent`` exactly
           like a coding drive). The caller treats both alike: a drive was started.
-        - ``"parked"`` — a human/unassigned task, or a name that resolves to NEITHER
-          type → claimed to ``in_progress`` and left there to await async delivery
-          (API/chat). No drive, no slot held.
+        - ``"self"`` — the assignee names this board's OWN agent (its ``agent_name`` or a
+          reserved ``self``/``agent`` alias, #311) AND the host exposes ``HOST.invoke`` AND
+          no self-dispatch is already in flight → claimed and a ``_drive_self_task`` was
+          spawned (also a real drive → counts toward ``max_concurrent``).
+        - ``"parked"`` — a human/unassigned task, a name that resolves to NEITHER
+          sister-agent type, or a self-assignee the host can't run right now (no
+          ``HOST.invoke``, or a self-dispatch already in flight) → claimed to
+          ``in_progress`` and left to await async delivery (API/chat) or a later
+          re-dispatch. No drive, no slot held.
         - ``"race"`` — the atomic claim was lost (someone else took it); still ready.
 
         The assignee is read from the CANDIDATE (the pre-claim projection) and passed
@@ -2052,15 +2083,38 @@ class BoardLoop:
         target, not the coder identity a coding claim stamps."""
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
-        delegate = self._resolve_task_delegate(assignee)
+        # #311: a self-assignee is first-party work the host runs itself — dispatched only
+        # when the host exposes ``HOST.invoke`` AND no self-dispatch is already in flight
+        # (one at a time, so the board can never recurse into itself). Otherwise it flows
+        # into the park branch below (a host predating the seam, or a second self task
+        # while one runs) with the existing log line, and the reconcile requeues a
+        # host-capable park once the slot frees. A self-assignee never resolves to a
+        # sister-agent delegate — self is the board's own identity, not a roster entry.
+        is_self = self._is_self_assignee(assignee)
+        self_dispatch = is_self and coder_seam.host_invoke_available() and self._self_inflight_fid is None
+        delegate = None if is_self else self._resolve_task_delegate(assignee)
         claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
         if claimed is None:
             return "race"
+        if self_dispatch:
+            # First-party self-dispatch through HOST.invoke. No worktree, so it owns no
+            # files (empty set: present so the done-callback's pop and the sweep's
+            # live-drive check see it, colliding with nothing in the hot-file guard). The
+            # single-in-flight guard is set here and released by the drive's done-callback.
+            self._self_inflight_fid = cid
+            self._inflight_files[cid] = set()
+            task = asyncio.create_task(self._drive_self_task(claimed), name=f"pb-self-{cid}")
+            self._drives.add(task)
+            _register_drive(cid, task)  # reachable by the cancel verbs (#211)
+            task.add_done_callback(self._make_drive_done_cb(cid))
+            return "self"
         if delegate is None:
-            # Human assignee, none, or a name that resolves to NEITHER an ACP coder nor
-            # an A2A sister agent: nothing to dispatch. The task is now in_progress; its
-            # deliverable arrives out-of-band (record_delivery via the API/chat). The
-            # loop moves on and this parked card holds no slot.
+            # Human assignee, none, a self-assignee the host can't run right now (no
+            # HOST.invoke, or a self-dispatch already in flight), or a name that resolves
+            # to NEITHER an ACP coder nor an A2A sister agent: nothing to dispatch. The
+            # task is now in_progress; its deliverable arrives out-of-band (record_delivery
+            # via the API/chat) or a later tick re-dispatches it. The loop moves on and
+            # this parked card holds no slot.
             log.info(
                 "[project_board] %s task parked in_progress — awaiting %s delivery (assignee=%s)",
                 cid,
@@ -2623,6 +2677,41 @@ class BoardLoop:
             return
         await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
         log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
+
+    async def _drive_self_task(self, feature: dict) -> None:
+        """Drive a task assigned to the board's OWN agent (#311) — the first-party sibling
+        of ``_drive_task``. No sister-agent delegate and no worktree: the board runs its
+        own host agent through ``coder_seam.dispatch_self``
+        (``graph.plugins.host.HOST.invoke``) with a STABLE per-card session id (so a
+        re-dispatch resumes the same host session), then records the reply as the
+        deliverable (``record_delivery`` → in_review, where board_verify closes it — the
+        same lifecycle the sister-agent path uses). The dispatch is bounded by
+        ``coder_timeout`` and a failure/timeout is classified and blocks the card for
+        triage exactly like ``_drive_task`` — a task has no model ladder to climb, so the
+        capability-escalation edge collapses to the terminal block. The single-in-flight
+        guard (``self._self_inflight_fid``) is released by the drive's done-callback."""
+        store = self._store()
+        fid = feature["id"]
+        prompt = self._build_task_prompt(feature)
+        session_id = f"pb-self-{fid}"  # stable per card → a re-dispatch resumes this session
+        try:
+            reply = await coder_seam.dispatch_self(prompt, session_id, timeout=self.coder_timeout or None)
+        except asyncio.CancelledError:
+            raise  # operator cancel / shutdown owns the edge — never a block
+        except (worktree.WorktreeError, worktree.CoderTimeout) as exc:
+            if self._shutting_down:
+                log.info("[project_board] %s self-task dispatch aborted by shutdown — no block", fid)
+                return
+            policy = classify(str(exc))
+            log.warning("[project_board] %s self-task blocked (%s): %s", fid, policy.category, exc)
+            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
+            log.exception("[project_board] %s self-task dispatch unexpected failure", fid)
+            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
+            return
+        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
+        log.info("[project_board] %s self-task delivered (%d chars) → in_review", fid, len(reply or ""))
 
     def _build_task_prompt(self, feature: dict) -> str:
         """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
@@ -3596,6 +3685,17 @@ class BoardLoop:
         if not assignee:
             return None
         return self._resolve_delegate(assignee, "acp") or self._resolve_delegate(assignee, "a2a")
+
+    def _is_self_assignee(self, assignee: str) -> bool:
+        """True when ``assignee`` names this board's OWN agent (#311): the reserved
+        ``self``/``agent`` aliases, or a case-insensitive match on the configured
+        ``agent_name``. Such a task is first-party work the host runs itself through
+        HOST.invoke, not shelled out to a sister-agent delegate. Empty ⇒ not self (an
+        unassigned task parks)."""
+        name = (assignee or "").strip().lower()
+        if not name:
+            return False
+        return name in _SELF_ALIASES or (bool(self.agent_name) and name == self.agent_name.lower())
 
     async def _run_fixups(self, wt: str, feature: dict | None = None) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.

@@ -9,6 +9,7 @@ needs the (separate, git-URL-installed) `coder` plugin to be present."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1866,6 +1867,136 @@ async def test_dispatch_task_maps_an_a2a_timeout_to_coder_timeout_and_tears_down
         raised = True
     assert raised
     assert a2a.torn_down == [delegate]  # torn down on the timeout exit
+
+
+# ── #311: first-party self-dispatch through the host's HOST.invoke seam ───────────
+
+
+def _host_with(invoke):
+    """A ``graph.plugins.host.HOST`` stand-in exposing just the ``invoke`` seam
+    dispatch_self drives — injected via the ``_host`` test seam so no ``graph`` package
+    is needed."""
+    import types as _types
+
+    return _types.SimpleNamespace(invoke=invoke)
+
+
+def test_host_invoke_available_is_false_without_a_host():
+    """The standalone test env has no ``graph.plugins.host`` — the seam feature-detects
+    as absent, so the loop keeps its parked behaviour (honest degrade)."""
+    assert coder_seam.host_invoke_available() is False  # real import path: no graph package
+
+
+def test_host_invoke_available_detects_a_callable_invoke():
+    """True only for a host object carrying a CALLABLE ``invoke`` attribute."""
+    import types as _types
+
+    assert coder_seam.host_invoke_available(_host=_host_with(lambda *a, **k: "x")) is True
+    assert coder_seam.host_invoke_available(_host=_types.SimpleNamespace()) is False  # no invoke attr
+    assert coder_seam.host_invoke_available(_host=_types.SimpleNamespace(invoke="nope")) is False  # not callable
+
+
+async def test_dispatch_self_calls_a_sync_invoke_with_an_explicitly_unfenced_tool_fence():
+    """A sync ``invoke`` that accepts ``tool_fence`` is called with it explicitly None —
+    self work is intentionally unfenced first-party work — and its reply is returned."""
+    seen = {}
+
+    def invoke(prompt, session_id, *, tool_fence="sentinel"):
+        seen["args"] = (prompt, session_id)
+        seen["tool_fence"] = tool_fence
+        return "sync reply"
+
+    out = await coder_seam.dispatch_self("do it", "pb-self-bd-1", timeout=5, _host=_host_with(invoke))
+
+    assert out == "sync reply"
+    assert seen["args"] == ("do it", "pb-self-bd-1")
+    assert seen["tool_fence"] is None  # supported → passed, and unfenced
+
+
+async def test_dispatch_self_awaits_a_coroutine_invoke():
+    """An async ``invoke`` is awaited directly (not run through the sync worker-thread
+    branch) and its reply returned."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        return f"async:{prompt}"
+
+    out = await coder_seam.dispatch_self("hello", "pb-self-bd-2", timeout=5, _host=_host_with(invoke))
+    assert out == "async:hello"
+
+
+async def test_dispatch_self_omits_tool_fence_for_a_legacy_invoke():
+    """A host whose ``invoke`` predates ``tool_fence`` is called WITHOUT it (feature-detected
+    via inspect.signature) — passing it would TypeError."""
+    seen = {}
+
+    def invoke(prompt, session_id):  # no tool_fence parameter
+        seen["called"] = (prompt, session_id)
+        return "legacy reply"
+
+    out = await coder_seam.dispatch_self("p", "pb-self-bd-3", _host=_host_with(invoke))
+    assert out == "legacy reply"
+    assert seen["called"] == ("p", "pb-self-bd-3")
+
+
+async def test_dispatch_self_awaits_an_awaitable_returned_by_a_sync_invoke():
+    """A sync ``invoke`` that RETURNS an awaitable has that awaitable awaited too — the
+    whole call resolves to the awaitable's result."""
+
+    async def _inner():
+        return "deferred reply"
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return _inner()  # a coroutine, created but not awaited here
+
+    out = await coder_seam.dispatch_self("p", "pb-self-bd-4", timeout=5, _host=_host_with(invoke))
+    assert out == "deferred reply"
+
+
+async def test_dispatch_self_maps_a_timeout_to_coder_timeout():
+    """An ``invoke`` that outruns ``timeout`` surfaces as CoderTimeout — the loop's
+    classifier blocks it exactly like a coder timeout."""
+
+    async def invoke(prompt, session_id, *, tool_fence=None):
+        await asyncio.sleep(10)
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self("p", "pb-self-bd-5", timeout=0.01, _host=_host_with(invoke))
+
+
+async def test_dispatch_self_bounds_a_sync_invoke_returning_a_slow_awaitable_by_one_deadline():
+    """The awaitable phase of a sync ``invoke`` is bounded by the SAME deadline as the
+    synchronous phase — a slow returned awaitable still trips CoderTimeout rather than
+    running for a second full ``timeout``."""
+
+    async def _slow():
+        await asyncio.sleep(10)
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        return _slow()
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self("p", "pb-self-bd-6", timeout=0.05, _host=_host_with(invoke))
+
+
+async def test_dispatch_self_normalises_an_error_to_worktree_error():
+    """Any non-timeout failure below the seam surfaces as WorktreeError (mirrors
+    dispatch_task) so the loop blocks the card with a classified reason."""
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        raise ValueError("host exploded")
+
+    with pytest.raises(worktree.WorktreeError) as exc:
+        await coder_seam.dispatch_self("p", "pb-self-bd-7", timeout=5, _host=_host_with(invoke))
+    assert "host exploded" in str(exc.value)
+
+
+async def test_dispatch_self_raises_when_the_host_has_no_invoke_seam():
+    """Belt-and-braces: a host object with no ``invoke`` surfaces as a normal dispatch
+    failure (WorktreeError), never an AttributeError up the loop."""
+    import types as _types
+
+    with pytest.raises(worktree.WorktreeError):
+        await coder_seam.dispatch_self("p", "pb-self-bd-8", _host=_types.SimpleNamespace())
 
 
 # ── #226 S1: persist a finished gen's snapshot as a `coder-monitor:` bead comment ──
