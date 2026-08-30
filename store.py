@@ -2356,33 +2356,57 @@ class BeadsBoard:
         # must see EVERY ready feature (the exhaustiveness invariant) — a cap here would
         # drop ready work past row 20 from the scan and the relaxed-gate cross-reference.
         ready = self._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True) or []
-        # `br ready --json` omits the labels field (beads-rust ≤0.1.23), so projecting
-        # its rows directly makes board_state() see no `ready` label → "backlog", and
-        # the puller's `board_state != "ready"` guard self-rejects every candidate (the
-        # loop ticks forever but silently never claims). Re-fetch via `br show` — which
-        # carries labels — so board_state/blocked/diff/dag_blocked project correctly.
-        # ONE batched show for the whole ready set (#257; the same batching as
-        # list_features): this queue is polled every loop tick, so a per-bead
-        # get_feature was R+1 subprocess spawns. `br ready` is priority-ordered;
-        # iterating its ids (not the show's row order) preserves that.
-        ids = [b["id"] for b in ready if b.get("issue_type") in PULLABLE_ISSUE_TYPES and b.get("id")]
-        out: list[dict] = []
-        if ids:
+        # Supported feature/task filter + priority order in one pass: keep `br ready`'s
+        # own (priority-ordered) sequence, admitting only PULLABLE_ISSUE_TYPES with an id
+        # (structural epic/milestone beads are never claimed). Iterate these ids — never
+        # the show's row order below — so `br ready`'s priority order survives the batch.
+        candidates = [b for b in ready if b.get("issue_type") in PULLABLE_ISSUE_TYPES and b.get("id")]
+        ids = [b["id"] for b in candidates]
+        rows_by_id = {b["id"]: b for b in candidates}
+        # A ready row is directly projectable ONLY when it already carries the `labels`
+        # field board_state() keys the `ready` state off. beads-rust ≤0.1.23 OMITS labels
+        # from `br ready --json` rows, so projecting those directly makes board_state()
+        # see no `ready` label → "backlog", and the puller's `board_state != "ready"`
+        # guard self-rejects every candidate (the loop ticks forever but silently never
+        # claims). Those rows need the `br show` re-fetch — which carries labels — so
+        # board_state/blocked/diff/dag_blocked project correctly. A newer `br` (#324)
+        # carries labels on the ready row ITSELF, so the re-fetch is redundant there:
+        # project those rows straight from `br ready`. Re-fetch ONLY the label-less
+        # (incomplete) rows, and still in ONE batched show (#257; the same batching as
+        # list_features) — never the R+1 subprocess spawns a per-bead get_feature was.
+        stale = [i for i in ids if "labels" not in rows_by_id[i]]
+        projected: dict[str, dict] = {}
+        if stale:
             try:
-                batch = self._run("show", *ids, want_json=True) or []
+                batch = self._run("show", *stale, want_json=True) or []
             except BoardNotFound:
                 batch = None
             if batch is None:
                 # A candidate vanished between `br ready` and the show (the delete race
-                # get_feature folded to None per-row). Never starve the whole queue over
-                # one ghost: fall back to per-id fetches for this tick, which skip
-                # exactly the missing bead(s) and keep the rest flowing.
-                out = [f for f in (self.get_feature(i) for i in ids) if f is not None]
+                # get_feature folds to None per-row). Never starve the whole queue over
+                # one ghost: fall back to per-id fetches for the label-less set, which
+                # skip exactly the missing bead(s) and keep the rest flowing. Rows that
+                # already carry labels are unaffected — they never take this show.
+                for i in stale:
+                    f = self.get_feature(i)
+                    if f is not None:
+                        projected[i] = f
             else:
                 if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
                     batch = [batch]
                 show_by_id = {r["id"]: r for r in batch if isinstance(r, dict) and r.get("id")}
-                out = [self._project(show_by_id[i]) for i in ids if i in show_by_id]
+                for i in stale:
+                    if i in show_by_id:
+                        projected[i] = self._project(show_by_id[i])
+        # Assemble in `br ready`'s priority order: a label-carrying row projects directly
+        # (no redundant show), a label-less row from the re-fetch above (skipped when the
+        # delete race dropped it).
+        out: list[dict] = []
+        for i in ids:
+            if i in projected:
+                out.append(projected[i])
+            elif "labels" in rows_by_id[i]:
+                out.append(self._project(rows_by_id[i]))
         if not relaxed:
             return out
         have = {f["id"] for f in out}
