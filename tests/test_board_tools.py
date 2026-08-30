@@ -452,6 +452,7 @@ _MINIMAL_ARGS = {
     "board_requeue_feature": {"feature_id": "bd-1"},
     "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
     "board_unblock_feature": {"feature_id": "bd-1"},
+    "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
     "board_list": {},
     "board_retro": {},
 }

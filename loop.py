@@ -677,6 +677,64 @@ def request_drive_cancel(fid: str) -> bool:
     return True
 
 
+# ── live-loop registry (ADR 0326, #326) ──────────────────────────────────────
+# The merged-verify budget reset verb (the board_reset_merged_verify_budget tool)
+# must clear the RUNNING loop's in-process budget cache, not just the persisted label:
+# ``_budget_get`` lets that cache win over the bead's labels (#259), so a cached
+# exhausted count would keep holding the auto-merge edge even after the label is gone.
+# The verb holds no handle on the loop, so — like ``_drive_slot`` — the live loop
+# publishes itself into a process-stable ``sys.modules`` data slot (survives a plugin
+# reload, which re-imports this module while the loop surface keeps running). One loop
+# per process; last writer wins. Distinct from setup_check's `project_board.live_loop::`
+# snapshot slot — that one holds the running loop's CONFIG snapshot, this one the live
+# loop OBJECT; a shared name would cross the two holders' attributes.
+_LOOP_SLOT_PREFIX = "project_board.loop_instance::"
+
+
+def _loop_slot():
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+    name = _LOOP_SLOT_PREFIX + pkg
+    holder = sys.modules.get(name)
+    if holder is None:
+        holder = types.ModuleType(name)
+        holder.__doc__ = "Process-stable holder for project_board's running loop (#326) — data, not code."
+        holder.loop = None
+        holder = sys.modules.setdefault(name, holder)  # atomic install — see store._br_lock
+    return holder
+
+
+def _register_loop(loop) -> None:
+    _loop_slot().loop = loop
+
+
+def _unregister_loop(loop) -> None:
+    slot = _loop_slot()
+    if slot.loop is loop:
+        slot.loop = None
+
+
+def live_loop():
+    """The running BoardLoop for this process, or None (loop never started)."""
+    return _loop_slot().loop
+
+
+def reset_merged_verify_budget(fid: str) -> bool:
+    """Invalidate the live loop's in-process merged-verify budget cache for ``fid`` so an
+    operator's budget reset takes effect on the NEXT reconcile without a host restart
+    (ADR 0326, #326). The store already dropped the persisted `budget:merged-verify:<n>`
+    label, but ``_budget_get`` lets the loop's cache win over the labels (#259), so a
+    cached exhausted count would keep holding the auto-merge edge — this pops that cache
+    entry. Thread-safe: the reset verb runs in a worker thread and a dict pop is atomic
+    under the GIL (the same cross-thread pattern as ``live_drive``). Returns True when a
+    live loop was found to invalidate (False when the loop never started — nothing to
+    invalidate, the label clear alone suffices for the next process)."""
+    loop = live_loop()
+    if loop is None:
+        return False
+    getattr(loop, "_merged_verify_attempts", {}).pop(fid, None)
+    return True
+
+
 def cancel_pr_comment(fid: str) -> str:
     return f"cancelled by operator — see card {fid}"
 
@@ -1383,6 +1441,10 @@ class BoardLoop:
 
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
+        # Publish this loop into the process-stable registry BEFORE the enabled gate so
+        # the merged-verify budget reset verb can reach its in-process cache (ADR 0326).
+        # A disabled loop registers too (harmless — its budget cache stays empty).
+        _register_loop(self)
         if not self.enabled:
             log.info("[project_board] loop disabled (project_board.loop_enabled=false) — board API still serves")
             return None
@@ -1544,6 +1606,7 @@ class BoardLoop:
     async def stop(self):
         self._shutting_down = True
         self._stop.set()
+        _unregister_loop(self)  # drop the process-stable handle (ADR 0326)
         if self._task:
             setup_check.publish_loop_snapshot(None)  # no running loop → nothing to be stale against
         if self._task:
@@ -2558,6 +2621,16 @@ class BoardLoop:
         n = await self._budget_get(store, fid, "merged-verify", feature)
         if self.merged_verify_max and n >= self.merged_verify_max:
             if n == self.merged_verify_max:  # log the exhaustion once, then stay quiet
+                # The ONE-TIME sentinel: bump the persisted budget to `max+1`. Beyond
+                # logging once, this is the loop SUPPLYING the exhaustion fact to the
+                # board projection (ADR 0326): `budget:merged-verify:<max+1>` is a value
+                # a gate-run spend can never reach (the `n >= max` guard returns before
+                # the gate runs), so `budget > merged_verify_max` uniquely means "base
+                # moved while exhausted" — store.merge_posture reads it back and an
+                # auto_merge card reads `auto-merge held: merged-verify budget exhausted`
+                # instead of the `auto-merge pending` lie. NOT a gate-run spend (the gate
+                # never ran this pass) — the budget accounting for actual verifications is
+                # untouched below.
                 await self._budget_set(store, fid, "merged-verify", n + 1)
                 if self.auto_merge:
                     # The loop IS the adjudicator here, and a stale stamp is a hard hold

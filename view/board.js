@@ -75,6 +75,11 @@ const NEXT_ACTION_CHIP = {
   "merge-hold (operator veto)": ["", "merge-hold"],
   "draft (run `gh pr ready`)": ["pl-badge--warning", "draft"],
   "ci failing": ["pl-badge--error", "ci failing"],
+  // ADR 0326: the auto-merge edge is stuck because the merged-verify re-verify budget
+  // is spent while base keeps moving — a warning chip whose tooltip (the server hint)
+  // names the reset / raise-cap / wait remedies, so the operator sees it on the card
+  // instead of only in the loop log.
+  "auto-merge held: merged-verify budget exhausted": ["pl-badge--warning", "merge held (verify budget)"],
   "awaiting deliverable": ["pl-badge--info", "awaiting deliverable"],
 };
 function nextActionChip(f){

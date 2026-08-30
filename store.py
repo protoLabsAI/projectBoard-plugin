@@ -2141,6 +2141,31 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    def reset_merged_verify_budget(self, fid: str, *, actor: str = "") -> dict:
+        """Operator reset of a feature's merged-state re-verify budget (ADR 0326, #326).
+
+        Drops ONLY the persisted `budget:merged-verify:<n>` label (including the
+        exhaustion sentinel) and records an audit comment, so an in_review card whose
+        auto-merge edge is held by an exhausted merged-verify budget can re-verify the
+        merged state on the next reconcile. Other budget kinds are untouched — this is
+        the label half of the reset; the loop's in-process cache is invalidated
+        separately (``loop.reset_merged_verify_budget``), because ``_budget_get`` lets
+        that cache win over the labels (#259). Requires the feature to exist: an unknown
+        id raises ``BoardError`` from ``_require`` (`unknown feature`) and NOTHING is
+        altered (the reset can never silently touch a phantom bead). ``actor`` names who
+        requested it for the audit trail, defaulting to the store actor."""
+        f = self._require(fid)  # unknown id → BoardNotFound; nothing cleared
+        had = budgets_from_labels(f.get("labels")).get("merged-verify")
+        self.clear_budgets(fid, ["merged-verify"])
+        who = str(actor or self.actor or "operator").strip() or "operator"
+        was = "unset" if had is None else str(had)
+        self.comment(
+            fid,
+            f"merged-verify budget reset by {who} (was {was}) — the auto-merge edge can re-verify the "
+            "merged state on the next reconcile (ADR 0326, #326)",
+        )
+        return self.get_feature(fid)
+
     # ── requirement ledger write-back (#113) ──────────────────────────────────
     def set_requirements(self, fid: str, items) -> dict:
         """Write the requirement ledger back to the bead — the loop calls this after
@@ -2640,6 +2665,18 @@ class BeadsBoard:
 # and the merge edge all decode the review sub-state labels the same way.
 NEXT_ACTION_AWAITING_MERGE = "awaiting-merge (auto_merge off)"
 NEXT_ACTION_AUTO_MERGE_PENDING = "auto-merge pending"
+# Merged-verify exhaustion (ADR 0326, #326): an auto_merge card whose merged-state
+# re-verify budget (#131) is spent while base keeps moving. The loop deliberately
+# stops re-verifying once `merged_verify_max` is reached (the bounded-retry safety),
+# so the `merged-verified:<sha>` stamp never refreshes and the auto-merge edge holds
+# on a stale stamp FOREVER — but the only tell used to be a one-time WARNING in the
+# loop log. The loop persists the fact as a one-time budget SENTINEL
+# (`budget:merged-verify:<max+1>`, written by `_verify_merged_state` the first time
+# base moves at the cap); this projection validates it against the LIVE cap so a card
+# whose auto-merge is stuck reads a distinct, human-readable action instead of the
+# `auto-merge pending` lie. Raising `merged_verify_max` (or resetting the budget) flips
+# it back to `auto-merge pending` with no restart, mirroring how the loop re-arms.
+NEXT_ACTION_MERGED_VERIFY_EXHAUSTED = "auto-merge held: merged-verify budget exhausted"
 NEXT_ACTION_REVIEW_IN_PROGRESS = "review in progress"
 NEXT_ACTION_CHANGES_REQUESTED = "changes requested"
 NEXT_ACTION_AWAITING_VERDICT = "awaiting review verdict (no review-clean)"
@@ -2683,11 +2720,24 @@ def knob_bool(cfg: dict, key: str, default: bool, *, strict: bool = True) -> boo
     return bool(raw)
 
 
-def merge_posture(feature: dict, *, auto_merge: bool, review_gate: bool, is_draft: bool | None = None) -> dict:
+def merge_posture(
+    feature: dict,
+    *,
+    auto_merge: bool,
+    review_gate: bool,
+    is_draft: bool | None = None,
+    merged_verify_max: int = 0,
+) -> dict:
     """Decode an in_review feature's review/merge sub-state from its labels + the
     board's merge posture — pure, no GitHub read. ``is_draft`` (or a ``pr_draft``
     key on the row, when a join stamped one) says the PR is a GitHub draft — a fact
-    this function never fetches itself.
+    this function never fetches itself. ``merged_verify_max`` is the board's live
+    merged-state re-verify cap (#131); when it's positive and the feature's persisted
+    ``merged-verify`` budget has passed it (the loop's one-time exhaustion sentinel,
+    ADR 0326), an ``auto_merge`` card reads ``auto-merge held: merged-verify budget
+    exhausted`` instead of ``auto-merge pending`` — the auto-merge edge is stuck on a
+    stale ``merged-verified`` stamp the loop has stopped refreshing. Default 0 leaves
+    the projection exactly as before (no exhaustion state).
 
     Returns ``{"blockers", "next_action", "awaiting_merge", "next_action_hint"}``:
 
@@ -2739,7 +2789,23 @@ def merge_posture(feature: dict, *, auto_merge: bool, review_gate: bool, is_draf
     elif (is_draft if is_draft is not None else feature.get("pr_draft")) is True:
         out["next_action"] = NEXT_ACTION_DRAFT
     elif auto_merge:
-        out["next_action"] = NEXT_ACTION_AUTO_MERGE_PENDING
+        # ADR 0326: the merged-state re-verify budget is spent while base keeps moving,
+        # so the loop has stopped refreshing the `merged-verified:<sha>` stamp and the
+        # auto-merge edge can never clear its "stamp is stale" blocker. `budget >
+        # merged_verify_max` is precisely the loop's one-time exhaustion sentinel
+        # (`budget:merged-verify:<max+1>`) — a gate-run spend can only reach the cap, so
+        # anything past it is the sentinel. Compared against the LIVE cap, so raising
+        # `merged_verify_max` (or an operator budget reset) drops back to
+        # `auto-merge pending` with no restart.
+        if merged_verify_max and budgets_from_labels(feature.get("labels")).get("merged-verify", 0) > merged_verify_max:
+            out["next_action"] = NEXT_ACTION_MERGED_VERIFY_EXHAUSTED
+            out["next_action_hint"] = (
+                f"merged-verify budget ({merged_verify_max}) is exhausted and base keeps moving — the loop will "
+                f"NOT auto-merge until you reset it (board_reset_merged_verify_budget {feature.get('id', '')}), "
+                "raise merged_verify_max in Settings ▸ Project Board, or the base stops moving"
+            )
+        else:
+            out["next_action"] = NEXT_ACTION_AUTO_MERGE_PENDING
     else:
         n = pr_number(feature.get("pr_url", ""))
         out["next_action"] = NEXT_ACTION_AWAITING_MERGE
@@ -2822,16 +2888,29 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
     driven (so it is working, NOT awaiting a deliverable); it defaults to the loop's
     live-drive registry and is injectable for tests.
 
+    An ``auto_merge`` in_review card whose merged-state re-verify budget (#131) is spent
+    while base keeps moving reads ``auto-merge held: merged-verify budget exhausted``
+    (ADR 0326) — the loop's auto-merge edge is stuck on a stale ``merged-verified`` stamp
+    it has stopped refreshing, with a hint naming the reset / raise-cap / wait remedies.
+    Read from the live ``merged_verify_max`` cap in ``cfg`` (0/unlimited never exhausts).
+
     A row that ``annotate_ci_status`` stamped ``ci_status == "failing"`` is demoted:
-    "merge #N" / "auto-merge pending" on a red PR is the wrong hint — it reads
-    ``ci failing``, ``awaiting_merge`` False, no hint. The review sub-states stand
-    (a review in progress on a red PR is still a review in progress)."""
+    "merge #N" / "auto-merge pending" / the exhaustion hold on a red PR is the wrong hint
+    — it reads ``ci failing``, ``awaiting_merge`` False, no hint. The review sub-states
+    stand (a review in progress on a red PR is still a review in progress)."""
     auto_merge = knob_bool(cfg, "auto_merge", False, strict=False)
     review_gate = knob_bool(cfg, "review_gate", False, strict=False)
+    # The board's LIVE merged-state re-verify cap (ADR 0326): read defensively — a
+    # listing must never crash on a hand-edited value, so a non-int reads as 0 (no
+    # exhaustion state), the same fail-open discipline as the bool knobs above.
+    try:
+        merged_verify_max = max(0, int(cfg.get("merged_verify_max", 5)))
+    except (TypeError, ValueError):
+        merged_verify_max = 0
     if is_driven is None:
         is_driven = _live_drive_predicate()
     for f in feats:
-        posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate)
+        posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate, merged_verify_max=merged_verify_max)
         if not posture["next_action"]:
             # #305: not an in_review card — the one other card that owes the PM a next
             # action is a parked task awaiting an out-of-band deliverable.
@@ -2841,6 +2920,7 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         elif f.get("ci_status") == "failing" and posture["next_action"] in (
             NEXT_ACTION_AWAITING_MERGE,
             NEXT_ACTION_AUTO_MERGE_PENDING,
+            NEXT_ACTION_MERGED_VERIFY_EXHAUSTED,
             NEXT_ACTION_DRAFT,
         ):
             posture = {"next_action": NEXT_ACTION_CI_FAILING, "awaiting_merge": False, "next_action_hint": ""}
