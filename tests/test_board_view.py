@@ -753,3 +753,69 @@ def test_r5_two_fetches_of_the_same_task_are_sequenced_by_ticket():
     # and it is taken BEFORE the await, or every fetch would read the same latest value
     body = BOARD_PAGE[BOARD_PAGE.index("async function fetchTaskDetail(fid){") :]
     assert body.index("const seq = ++TASK_DETAIL_SEQ;") < body.index("await api(")
+
+
+# ── self-verified task deliverables surface in the board view (#316 S4) ───────────
+#
+# S3a projects `self_verified` / `delivered_by` / `verified_by` onto every feature: a done
+# task whose deliverer approved their OWN Done edge (no independent reviewer) carries
+# `self_verified: true`. S4 surfaces that in the view — an existing caution badge on the
+# card (no new visual language), gated to DONE TASKS only, plus a drawer provenance line
+# naming the deliverer + the self-verifying actor. These are structural assertions on the
+# page source (the suite has no JS runtime — see the module docstring), so a
+# "rendered-HTML"-style check pins the markup the card/badge/drawer paths emit.
+
+
+def test_r1_r2_r3_self_verified_badge_gates_on_task_done_and_the_projection_flag():
+    """r1/r2/r3: the self-verified badge renders ONLY for a task in the done state whose
+    projected `self_verified` is true. The single gate — task-ness AND done AND the flag —
+    is what excludes a coding feature (not a task), a non-done task (wrong state), and an
+    independently-verified task (`self_verified: false`); each falls through to "" ."""
+    assert 'function isSelfVerified(f){ return isTask(f) && f.state === "done" && !!f.self_verified; }' in BOARD_PAGE
+    assert "function selfVerifiedBadge(f)" in BOARD_PAGE
+    assert (
+        'return isSelfVerified(f) ? \'<span class="pl-badge pl-badge--warning">self-verified</span>\' : "";'
+        in BOARD_PAGE
+    )
+
+
+def test_r1_self_verified_badge_reuses_an_existing_badge_class_no_new_visual_language():
+    """r1: the badge reuses an existing pl-badge variant — the same caution class flags()
+    already emits for 'waiting on deps' — rather than inventing new visual language."""
+    assert '<span class="pl-badge pl-badge--warning">self-verified</span>' in BOARD_PAGE
+    # the caution variant is one this page already uses, so no new CSS is introduced
+    assert "out += '<span class=\"pl-badge pl-badge--warning\">waiting on deps</span>';" in BOARD_PAGE
+
+
+def test_r1_r3_self_verified_badge_rides_flags_onto_both_card_projections():
+    """r1/r3: the badge is emitted through flags(), the shared render path BOTH the Kanban
+    card and the list row already call — so a done self-verified task card carries it in
+    either projection, and a non-task/non-done card carries nothing (the gate returns "")."""
+    assert "out += selfVerifiedBadge(f);" in BOARD_PAGE
+    # flags() stays the shared path: its definition + the Kanban card + the list row
+    assert BOARD_PAGE.count("flags(f)") == 3
+
+
+def test_r1_r4_self_verified_drawer_provenance_names_deliverer_and_verifier_escaped():
+    """r1/r4: the drawer adds a provenance line for a self-verified done task naming the
+    deliverer (`delivered_by`) and the self-verifying actor (`verified_by`, falling back to
+    the deliverer), BOTH esc()'d — server-authored free-text actor fields, never raw HTML —
+    and it carries the same badge (no new visual language)."""
+    assert "function selfVerifiedProvenance(f)" in BOARD_PAGE
+    assert 'const deliverer = esc(f.delivered_by || "—");' in BOARD_PAGE
+    assert 'const verifier = esc(f.verified_by || f.delivered_by || "—");' in BOARD_PAGE
+    assert "' delivered by '+deliverer+', self-verified by '+verifier+'</div>';" in BOARD_PAGE
+    # the provenance line is spliced into the task drawer body (taskDetail), before the controls
+    assert "h += selfVerifiedProvenance(f);" in BOARD_PAGE
+    assert "return h + taskExtra(f);" in BOARD_PAGE  # the controls still close the drawer body
+
+
+def test_r2_r3_self_verified_provenance_shares_the_badge_gate():
+    """r2/r3: the drawer provenance uses the SAME isSelfVerified gate as the card badge, so
+    a non-done task, a coding feature, and an independently-verified task get no provenance
+    line — the gate is not duplicated with a drifting condition."""
+    body = BOARD_PAGE[BOARD_PAGE.index("function selfVerifiedProvenance(f)") :]
+    body = body[: body.index("\n}")]
+    assert 'if (!isSelfVerified(f)) return "";' in body
+    # both the badge and the provenance route through the one gate
+    assert BOARD_PAGE.count("isSelfVerified(f)") >= 3  # definition + badge + provenance

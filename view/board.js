@@ -89,6 +89,7 @@ function flags(f){
   if (f.dag_blocked) out += '<span class="pl-badge pl-badge--warning">waiting on deps</span>';
   out += nextActionChip(f);
   if (f.difficulty) out += '<span class="pl-badge">'+esc(f.difficulty)+'</span>';
+  out += selfVerifiedBadge(f);
   return out;
 }
 // Render-side half of the external-ref gate (the store's normalize_external_ref is the
@@ -125,6 +126,33 @@ function docIco(f){ return isTask(f) ? '<span class="doc-ico-w">'+DOC_ICON+'</sp
 function taskRef(f){ return f.pr_url ? '<a class="pr" href="'+esc(safeHref(f.pr_url))+'" target="_blank" rel="noopener noreferrer">ref ↗</a>' : ""; }
 // A card's footer link: a task shows its external ref, a coding feature its PR.
 function taskFoot(f){ return isTask(f) ? taskRef(f) : pr(f); }
+
+// ── Self-verified task deliverables (#316 S4) ────────────────────────────────────
+// S3a (#316) projects `self_verified` / `delivered_by` / `verified_by` onto every feature.
+// A DONE TASK whose deliverer approved their own Done edge — the same identity delivered
+// AND verified it, with no independent reviewer — carries `self_verified: true`. Surface
+// that with the EXISTING caution badge flags() already uses for "waiting on deps" (no new
+// visual language), gated to done tasks ONLY: a coding feature (not a task), a non-done
+// task (wrong state), and an independently-verified task (`self_verified: false`) all fall
+// through to "". The drawer adds a provenance line naming the deliverer + the self-
+// verifying actor, every actor field esc()'d (server-authored free text — the same #101
+// reason `delivered_by` rides a comment, not a label).
+function isSelfVerified(f){ return isTask(f) && f.state === "done" && !!f.self_verified; }
+function selfVerifiedBadge(f){
+  return isSelfVerified(f) ? '<span class="pl-badge pl-badge--warning">self-verified</span>' : "";
+}
+// The drawer's self-verification provenance: the badge + a line naming the deliverer
+// (`delivered_by`) and the self-verifying actor (`verified_by`, which on a self-verified
+// edge IS the deliverer, so fall back to `delivered_by`, then to the em-dash the drawer
+// uses elsewhere for an absent field). Both actor fields esc()'d — never raw HTML.
+function selfVerifiedProvenance(f){
+  if (!isSelfVerified(f)) return "";
+  const deliverer = esc(f.delivered_by || "—");
+  const verifier = esc(f.verified_by || f.delivered_by || "—");
+  return '<div class="tdlbl">verification</div>'
+    + '<div class="tdsec">'+selfVerifiedBadge(f)
+    + ' delivered by '+deliverer+', self-verified by '+verifier+'</div>';
+}
 
 // Which in_review task cards have their reject-feedback form expanded — module-scoped
 // so the 10s auto-reload re-render keeps it open (same pattern as COLLAPSED/DONE_ALL).
@@ -173,6 +201,7 @@ function taskDetail(f){
   let h = '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
+  h += selfVerifiedProvenance(f);
   return h + taskExtra(f);
 }
 // Surface a task-action failure in the card's always-present error slot.
