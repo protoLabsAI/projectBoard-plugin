@@ -405,6 +405,27 @@ def budgets_from_labels(labels) -> dict[str, int]:
     return out
 
 
+def replace_prefixed_label_args(labels, prefix: str, desired: str) -> list[str]:
+    """`br update` args that REPLACE the single ``<prefix>…`` label with ``desired`` —
+    the one correct spelling of the single-label-replaced pattern (`diff:`, `gens:`,
+    `verified:`, `merged-verified:`), factored so a fifth site can't diverge (#338).
+
+    `br` applies ``--remove-label`` AFTER ``--add-label`` within one update, so emitting
+    BOTH for the SAME value nets to *removed*: a re-stamp of an UNCHANGED value silently
+    dropped the label (a quiet-base re-verify lost its own persisted `merged-verified:`
+    sha). So remove ONLY same-prefix labels that DIFFER from ``desired``, then add
+    ``desired`` — an unchanged re-stamp emits just the idempotent ``--add-label`` with no
+    self-cancelling remove, leaving exactly one copy; a changed value drops the stale
+    label and lands the new one. Mirrors the ``set_review_substate`` / blocked-class
+    remove-only-what-differs pattern. Verified against br 0.2.16."""
+    args: list[str] = []
+    for existing in labels or []:
+        if str(existing).startswith(prefix) and existing != desired:
+            args += ["--remove-label", existing]
+    args += ["--add-label", desired]
+    return args
+
+
 def _decompose_ac(text) -> list[dict]:
     """Split acceptance-criteria prose into requirement items (#113): each markdown
     bullet becomes one `{id, text, status: "open"}` item (a non-bullet line continues
@@ -1362,9 +1383,7 @@ class BeadsBoard:
             # malformed `diff:` that would corrupt the escalation ladder's tier selection.
             diff = difficulty.strip().lower()
             if diff:
-                for stale in [l for l in f.get("labels") or [] if l.startswith("diff:")]:
-                    args += ["--remove-label", stale]
-                args += ["--add-label", f"diff:{diff}"]
+                args += replace_prefixed_label_args(f.get("labels"), "diff:", f"diff:{diff}")
         if foundation:
             # Complete the create-repair contract: a foundation flag dropped by a failed
             # create can be restored here (QA panel on #88, round 4 — same undeliverable-
@@ -2091,11 +2110,8 @@ class BeadsBoard:
         build the way a missing PR would — callers should treat it as fire-and-forget."""
         f = self._require(fid)
         total = int(f.get("gens_spent", 0)) + max(0, int(n))
-        stale = [l for l in f.get("labels") or [] if l.startswith(LABEL_GENS_PREFIX)]
         args = ["update", fid]
-        for label in stale:
-            args += ["--remove-label", label]
-        args += ["--add-label", f"{LABEL_GENS_PREFIX}{total}"]
+        args += replace_prefixed_label_args(f.get("labels"), LABEL_GENS_PREFIX, f"{LABEL_GENS_PREFIX}{total}")
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2109,9 +2125,7 @@ class BeadsBoard:
         here must never fail a build whose tests already passed."""
         f = self._require(fid)
         args = ["update", fid]
-        for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_VERIFIED_PREFIX)]:
-            args += ["--remove-label", stale]
-        args += ["--add-label", f"{LABEL_VERIFIED_PREFIX}{sha}"]
+        args += replace_prefixed_label_args(f.get("labels"), LABEL_VERIFIED_PREFIX, f"{LABEL_VERIFIED_PREFIX}{sha}")
         self._run(*args)
         self.comment(fid, f"verified candidate: branch={branch} sha={sha} worktree={worktree}")
         return self.get_feature(fid)
@@ -2140,9 +2154,9 @@ class BeadsBoard:
         next poll just re-verifies)."""
         f = self._require(fid)
         args = ["update", fid]
-        for stale in [l for l in f.get("labels") or [] if l.startswith(LABEL_MERGED_VERIFIED_PREFIX)]:
-            args += ["--remove-label", stale]
-        args += ["--add-label", f"{LABEL_MERGED_VERIFIED_PREFIX}{sha}"]
+        args += replace_prefixed_label_args(
+            f.get("labels"), LABEL_MERGED_VERIFIED_PREFIX, f"{LABEL_MERGED_VERIFIED_PREFIX}{sha}"
+        )
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2158,9 +2172,7 @@ class BeadsBoard:
         f = self._require(fid)
         prefix = f"{LABEL_BUDGET_PREFIX}{kind}:"
         args = ["update", fid]
-        for stale in [l for l in f.get("labels") or [] if l.startswith(prefix)]:
-            args += ["--remove-label", stale]
-        args += ["--add-label", f"{prefix}{max(0, int(n))}"]
+        args += replace_prefixed_label_args(f.get("labels"), prefix, f"{prefix}{max(0, int(n))}")
         self._run(*args)
         return self.get_feature(fid)
 
