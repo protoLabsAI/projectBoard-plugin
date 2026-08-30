@@ -1710,21 +1710,22 @@ class BeadsBoard:
         """Put a feature back to `ready` for re-dispatch (keeps its open PR via
         external_ref). The puller re-claims it and the loop re-dispatches — at the
         higher tier if it was just escalated; open_pr pushes to the existing PR."""
-        self._require(fid)
+        f = self._require(fid)
         # Clear the assignee too — without it `br update --claim` on the re-pull
         # fails ("already assigned to <actor>") and the feature can't be re-dispatched.
-        self._run(
-            "update",
-            fid,
-            "--status",
-            "open",
-            "--assignee",
-            "",
-            "--add-label",
-            LABEL_READY,
-            "--remove-label",
-            LABEL_IN_REVIEW,
-        )
+        #
+        # EXCEPT for a task (#217), where the assignee is not a claim marker but the
+        # DISPATCH TARGET: the sister agent, or `agent`/`self` for first-party work. Clear
+        # it and the requeued task is unassigned, so the next claim parks it "awaiting
+        # unassigned delivery" and nothing ever drives it again. That made every REJECTED
+        # task deliverable a dead card — `record_verification(approved=False)` requeues
+        # through here — and it is how a live self-assigned audit task stranded itself the
+        # first time an operator rejected its deliverable.
+        args = ["update", fid, "--status", "open"]
+        if f.get("issue_type") != LABEL_TASK:
+            args += ["--assignee", ""]
+        args += ["--add-label", LABEL_READY, "--remove-label", LABEL_IN_REVIEW]
+        self._run(*args)
         return self.get_feature(fid)
 
     def block_from_review(self, fid: str, reason: str) -> dict:

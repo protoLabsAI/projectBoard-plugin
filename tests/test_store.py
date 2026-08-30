@@ -3567,13 +3567,29 @@ def test_record_verification_rejected_comments_feedback_and_requeues(make_board,
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
     f = b.record_verification("bd-t", approved=False, feedback="the report misses the Q3 numbers")
     assert ("comments", "add", "bd-t", "verification failed: the report misses the Q3 numbers") in br.calls
-    # requeued through the standard edge: back to open+ready, assignee cleared, in-review dropped
+    # requeued through the standard edge: back to open+ready, in-review dropped — but the
+    # assignee is KEPT, because on a task it is the dispatch target, not a claim marker.
+    # Clearing it here made every rejected deliverable a dead card: the requeued task came
+    # back unassigned and the next claim parked it "awaiting unassigned delivery" forever.
     (up,) = br.cmds("update")
     assert "--status" in up and "open" in up
-    assert "--assignee" in up  # cleared (paired with "") so the re-pull's `--claim` won't reject
+    assert "--assignee" not in up  # the sister agent / `agent` must survive the rejection
     assert "--add-label" in up and "ready" in up and "in-review" in up
     assert br.cmds("close") == []  # a rejection NEVER closes
     assert f["board_state"] == "ready"
+
+
+def test_requeue_still_clears_the_assignee_on_a_coding_feature(make_board, monkeypatch):
+    """The task carve-out must not leak to coding features: there the assignee IS a claim
+    marker, and leaving it set makes the re-pull's `br update --claim` fail with "already
+    assigned to <actor>" so the feature can never be re-dispatched."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "feature"})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready"})
+    b.requeue("bd-1")
+    (up,) = br.cmds("update")
+    assert "--assignee" in up and "" in up
 
 
 def test_record_verification_rejects_a_non_in_review_state(make_board, monkeypatch):
@@ -4281,3 +4297,23 @@ def test_slot_install_is_atomic_under_a_first_call_race(monkeypatch):
             _sys.modules[slot] = saved
         else:
             _sys.modules.pop(slot, None)
+
+
+def test_requeue_preserves_a_task_assignee_so_a_rejected_deliverable_can_redispatch(make_board, monkeypatch):
+    """A task's assignee is its DISPATCH TARGET (a sister agent, or `agent`/`self` for
+    first-party work), not a claim marker. requeue cleared it unconditionally, so a
+    rejected deliverable came back unassigned and the next claim parked it "awaiting
+    unassigned delivery" with nothing left to drive it — the card was dead and only a
+    log line said so. Observed live on a self-assigned audit task the first time an
+    operator rejected its deliverable."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "board_state": "in_review", "issue_type": "task", "assignee": "agent"}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "ready", "assignee": "agent"})
+    b.requeue("bd-task")
+    (up,) = br.cmds("update")
+    assert "--assignee" not in up
+    assert "--status" in up and "open" in up
+    assert "--add-label" in up and "ready" in up
