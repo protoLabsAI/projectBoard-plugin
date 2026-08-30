@@ -930,13 +930,24 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
     The optional ``tool_fence`` parameter is feature-detected with ``inspect.signature``
     rather than ASSUMED on the host's signature (#311): a host whose ``invoke`` accepts it
     is called with ``tool_fence=None`` (self work is intentionally UNFENCED first-party
-    work); an older ``invoke`` without the parameter is called without it. A synchronous
+    work); an older ``invoke`` without the parameter is called without it. A coroutine
+    ``invoke`` is awaited directly (and genuinely cancelled on timeout); a synchronous
     ``invoke`` is offloaded to a worker thread (``asyncio.to_thread``) so it never stalls
-    the event loop; a coroutine ``invoke`` is awaited directly. Bounded by ``timeout``
-    (``coder_timeout_s``) and its failures normalised EXACTLY like ``dispatch_task`` — a
-    timeout to ``CoderTimeout`` and anything else to ``WorktreeError`` — so the loop's
-    coder-failure classifier blocks a self-dispatch failure via the identical code path
-    (#311, r5)."""
+    the event loop. Bounded by ``timeout`` (``coder_timeout_s``) and its failures normalised
+    EXACTLY like ``dispatch_task`` — a timeout to ``CoderTimeout`` and anything else to
+    ``WorktreeError`` — so the loop's coder-failure classifier blocks a self-dispatch failure
+    via the identical code path (#311, r5).
+
+    A synchronous ``invoke`` runs on a worker thread that CANNOT be cancelled: a plain
+    ``wait_for(to_thread(...))`` cancels only the *await* on timeout, leaving the thread
+    still executing on the host after this call returns and the loop's done-callback clears
+    the one-in-flight guard — a second self task could then invoke the host CONCURRENTLY,
+    defeating that guard (the #311 review finding). So on a synchronous timeout the worker is
+    DRAINED to true completion before the timeout is surfaced: the caller stays parked on this
+    await (guard held, slot held) until the host's own call actually returns, so no concurrent
+    invoke can start. The cost — a runaway synchronous host pins the drive until its thread
+    finishes — is the honest price of an uncancellable call, and strictly safer than two live
+    invokes racing on one host."""
     kwargs = {}
     try:
         if "tool_fence" in inspect.signature(invoke).parameters:
@@ -945,10 +956,25 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
         pass
     try:
         if inspect.iscoroutinefunction(invoke):
+            # A coroutine invoke IS cancellable — wait_for cancels it cleanly on timeout.
             coro = invoke(prompt, session_id, **kwargs)
+            reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         else:
-            coro = asyncio.to_thread(invoke, prompt, session_id, **kwargs)
-        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+            # The worker thread is uncancellable — never abandon it past the timeout (see the
+            # docstring). ``asyncio.wait`` returns pending tasks WITHOUT cancelling them, so on
+            # timeout we drain the still-running thread before raising CoderTimeout.
+            thread = asyncio.ensure_future(asyncio.to_thread(invoke, prompt, session_id, **kwargs))
+            if timeout:
+                await asyncio.wait({thread}, timeout=timeout)
+                if not thread.done():
+                    try:
+                        await thread  # drain the uncancellable worker — never leak it past the guard
+                    except Exception:  # noqa: BLE001 — the drained result/error is moot; the timeout wins
+                        pass
+                    raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
+                reply = thread.result()
+            else:
+                reply = await thread
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"host self-invoke timed out after {timeout}s")
     except (worktree.WorktreeError, worktree.CoderTimeout):

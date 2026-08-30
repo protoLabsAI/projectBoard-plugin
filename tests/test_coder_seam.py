@@ -1955,6 +1955,32 @@ async def test_dispatch_self_maps_a_timeout_to_coder_timeout():
         await coder_seam.dispatch_self(invoke, "p", "s", timeout=0.01)
 
 
+async def test_dispatch_self_drains_a_timed_out_synchronous_worker_before_surfacing():
+    """#311 review finding: a SYNCHRONOUS invoke runs on a worker thread that CANNOT be
+    cancelled. A plain ``wait_for(to_thread(...))`` would surface the timeout while the thread
+    kept running on the host — so after the loop cleared its one-in-flight guard a second self
+    task could invoke the host CONCURRENTLY. dispatch_self instead DRAINS the thread to true
+    completion before raising CoderTimeout: when the timeout surfaces the worker has genuinely
+    finished, so no invoke is left running past the guard. Red-is-reachable: the abandon-on-
+    timeout code leaves ``finished`` unset when CoderTimeout is raised."""
+    import threading
+    import time as _time
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        started.set()
+        _time.sleep(0.2)  # outlives the 0.01s timeout — the thread cannot be cancelled
+        finished.set()
+        return "late"
+
+    with pytest.raises(worktree.CoderTimeout):
+        await coder_seam.dispatch_self(invoke, "p", "s", timeout=0.01)
+    assert started.is_set()
+    assert finished.is_set()  # drained to completion — NOT abandoned mid-flight past the guard
+
+
 async def test_dispatch_self_normalizes_an_error_to_worktree_error():
     """#311 r5: any other failure from ``invoke`` is normalised to WorktreeError — the SAME
     shape dispatch_task raises — so the loop's coder-failure classifier blocks it identically."""

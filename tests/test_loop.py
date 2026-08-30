@@ -3106,6 +3106,52 @@ async def test_self_task_dispatch_failure_is_classified_and_blocks(monkeypatch):
     assert loop._self_inflight is False  # guard released on the failure exit — the next self task can run
 
 
+async def test_a_timed_out_sync_self_invoke_holds_the_guard_until_its_thread_settles(monkeypatch):
+    """#311 review finding: a SYNCHRONOUS HOST.invoke that outlives ``coder_timeout_s`` runs on
+    an uncancellable worker thread. The self-drive must NOT be marked done — which would clear
+    the one-in-flight guard and let a second self task invoke the host CONCURRENTLY — until that
+    thread genuinely settles. Driving the REAL ``coder_seam.dispatch_self`` (the code under
+    test): with the tiny timeout long since fired, the guard is STILL held and the drive is
+    STILL live while the thread runs; only once the thread finishes does the drive complete and
+    the guard clear — and the card blocks on the timeout, never delivers. Red-is-reachable: the
+    abandon-on-timeout code returns from the drive at the timeout and clears the guard while the
+    thread is still executing."""
+    import threading
+
+    store = _TaskStore([_task("bd-self", assignee="self")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def invoke(prompt, session_id, *, tool_fence=None):
+        started.set()
+        release.wait()  # the thread cannot be cancelled — it outlives the timeout
+        return "late deliverable"
+
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda: invoke)
+    # NB: coder_seam.dispatch_self is NOT stubbed here — its real drain is what we exercise.
+
+    loop = BoardLoop({"coder": "proto", "coder_timeout_s": 0.05})
+    try:
+        assert await loop._spawn_ready() is True  # the self task dispatched → a real drive
+        for _ in range(200):  # let the worker thread actually start
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set()
+        await asyncio.sleep(0.15)  # well past coder_timeout_s — the timeout has fired
+        assert loop._self_inflight is True  # guard STILL held: the drive is not done while the thread runs
+        assert len(loop._drives) == 1  # …and it still holds its slot
+    finally:
+        release.set()  # let the thread finish so the drain completes
+        await asyncio.gather(*list(loop._drives), return_exceptions=True)
+        await asyncio.sleep(0)  # let the done-callback run
+    assert loop._self_inflight is False  # cleared only once the drained thread settled
+    assert "flag_blocked" in store.names()  # blocked on the timeout…
+    assert "record_delivery" not in store.names()  # …never delivered
+
+
 async def test_spawn_ready_does_not_divert_an_acp_assignee_to_self_dispatch(monkeypatch):
     """#311 r4 (regression pin): even with a coder name configured, a task whose assignee
     names a SISTER ACP agent (not the board's own name, not an alias) still takes the
