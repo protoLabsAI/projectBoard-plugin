@@ -198,6 +198,13 @@ def _warn_blocking_on_event_loop(op: str) -> None:
 LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
+# WHY a feature is blocked, as the failure classifier's category (failures.classify):
+# `blocked-class:transient` / `-rate-limit` / `-merge-conflict` / `-auth` / `-terminal`.
+# A single REPLACED label (the `gens:` pattern) so the projection can tell a block that
+# will clear itself from one that needs a human — WITHOUT a `br show` per card to read
+# the `blocked:` comment. Underscores in a category are hyphenated: beads' label
+# validator takes alphanumerics and hyphens (the #101 lesson).
+LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -263,6 +270,10 @@ LABEL_DELIVERABLE_PREFIX = "deliverable:"
 # reads the LATEST one back into `delivered_by`, mirroring the deliverable scan; a task
 # delivered before this stamp existed has none, so it falls back to `assignee`.
 DELIVERED_BY_PREFIX = "delivered-by:"
+# Where flag_blocked's human-readable reason rides — free text can't ride a label
+# (beads' validator, the #101 lesson), so it is a comment and `_project` reads the
+# LATEST one back into `blocked_reason`.
+BLOCKED_REASON_PREFIX = "blocked:"
 # Self-verification (#316 S2): when the verifier who approves a task is the same identity
 # that delivered it, `record_verification` FLAGS the close with this label rather than
 # refusing it — refusal is deliberately out of scope for this slice. Label-safe (a fixed
@@ -1981,14 +1992,40 @@ class BeadsBoard:
         return archived
 
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
-    def flag_blocked(self, fid: str, reason: str) -> dict:
-        self._require(fid)
+    def flag_blocked(self, fid: str, reason: str, category: str = "") -> dict:
+        """Flag a feature blocked, recording WHY in two places: the human-readable
+        ``blocked: <reason>`` comment, and — when the caller classified it — a single
+        replaced ``blocked-class:<category>`` label the projection can read without a
+        per-card ``br show``. That class is what lets the sweep auto-clear a block that
+        is merely transient instead of leaving every failure to die identically."""
+        f = self._require(fid)
         # Clear the assignee with the block: `br update --claim` rejects an already-
         # assigned bead, so a later reset-to-ready would be SILENTLY un-claimable (the
         # loop ticks forever, never claims, logs nothing). A blocked feature is terminal
         # until requeued, so dropping the assignee here is safe — and lets a requeue
         # (`--status open --add-label ready`) be re-claimed without a manual unassign.
-        self._run("update", fid, "--add-label", LABEL_BLOCKED, "--assignee", "")
+        #
+        # NOT for a task (#217/#333): there the assignee is the DISPATCH TARGET, not a
+        # claim marker, so clearing it means an unblocked task can never be driven again
+        # — it parks "awaiting unassigned delivery" forever. Same carve-out requeue owes.
+        args = ["update", fid, "--add-label", LABEL_BLOCKED]
+        if f.get("issue_type") != LABEL_TASK:
+            args += ["--assignee", ""]
+        for prior in f.get("labels") or []:  # replace, never accumulate (the `gens:` pattern)
+            if prior.startswith(LABEL_BLOCKED_CLASS_PREFIX):
+                args += ["--remove-label", prior]
+        # Derive the class from the REASON when the caller didn't name one: every block
+        # site already writes the underlying error text, and `failures.classify` is the
+        # same function the dispatch path uses to decide retryability. Deriving here
+        # rather than threading a category through a dozen call sites keeps the classes
+        # consistent and means a site added later is classified without being told to.
+        from .failures import classify
+
+        cls = str(category or "").strip() or classify(reason).category
+        cls = cls.lower().replace("_", "-")
+        if cls:
+            args += ["--add-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        self._run(*args)
         if reason:
             self.comment(fid, f"blocked: {reason}")
         return self.get_feature(fid)
@@ -2529,6 +2566,14 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
+        # WHY this card is blocked (the sweep's self-heal input): the classifier category
+        # off the single `blocked-class:` label, "" when the block predates it or the
+        # caller never classified. Hyphenated on the label, hyphenated here — callers
+        # compare against `failures.Policy.category` with the same normalisation.
+        blocked_class = next(
+            (l[len(LABEL_BLOCKED_CLASS_PREFIX) :] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)),
+            "",
+        )
         # A task-type bead's deliverable (#217): the LATEST `deliverable:` comment
         # (record_delivery's record — only `br show` carries comments, so a `br list`
         # row projects "") wins over a `deliverable:<ref>` label (the fallback for
@@ -2544,11 +2589,17 @@ class BeadsBoard:
         # ("delivered-by:" is not a prefix of "deliverable:" nor vice versa, so the two
         # scans never cross-match.)
         delivered_by = bead.get("assignee", "")
+        blocked_reason = ""
         for c in bead.get("comments") or []:
             txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
             txt = txt.strip()
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
+            elif txt.startswith(BLOCKED_REASON_PREFIX):
+                # The LATEST `blocked: <reason>` comment — what the operator is told when
+                # a block is escalated, so the notification names the actual failure
+                # instead of "this card is blocked, go look".
+                blocked_reason = txt[len(BLOCKED_REASON_PREFIX) :].strip()
             elif txt.startswith(DELIVERED_BY_PREFIX):
                 delivered_by = txt[len(DELIVERED_BY_PREFIX) :].strip()
         # Who verified the task (#316 S3a): the `<by>` from the `verified: <by>` close
@@ -2619,6 +2670,8 @@ class BeadsBoard:
             "budgets": budgets_from_labels(labels),
             "verified_sha": verified_sha,
             "deliverable": deliverable,
+            "blocked_class": blocked_class,
+            "blocked_reason": blocked_reason,
             "delivered_by": delivered_by,
             # Verification provenance (#316 S3a): who approved the task Done edge
             # (`verified_by`, from the close reason — "" when unverified) and whether the

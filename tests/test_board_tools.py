@@ -267,7 +267,11 @@ def test_board_block_feature_flags_blocked_and_comments_reason(make_board, monke
 
     assert out == {"id": "bd-1", "state": "blocked"}
     (update,) = br.cmds("update")
-    assert update == ("update", "bd-1", "--add-label", "blocked", "--assignee", "")
+    assert "--add-label" in update and "blocked" in update
+    assert "--assignee" in update and "" in update  # a coding feature is unassigned with the block
+    # the failure class rides alongside so the sweep can tell a self-healing block from
+    # one that needs a human — "waiting on bd-0" matches nothing, so it is terminal.
+    assert "blocked-class:terminal" in update
     # the reason rides through as an auditable comment on the bead.
     (comment,) = br.cmds("comments")
     assert comment == ("comments", "add", "bd-1", "blocked: waiting on bd-0")

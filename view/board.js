@@ -232,9 +232,13 @@ async function rejectTask(fid){
 // State → DS dot variant (for the list view chip).
 const DOT_VARIANT = {ready:"pl-dot--success", in_review:"pl-dot--info", blocked:"pl-dot--error"};
 
-// List view sections: the Kanban columns + the `blocked` flag-state + `cancelled`
-// (the second terminal edge, #47), rendered as collapsible groups in COLS order (#26).
-const LIST_SECTIONS = [...COLS, "blocked", "cancelled"];
+// List view sections, rendered as collapsible groups in this order. `blocked` comes
+// FIRST, before every Kanban column: a blocked card is the board's loudest "needs
+// attention" signal and the one thing an operator must not scroll to find. It used to
+// sit second-to-last, BELOW done — so `list_features` floating blocked rows to the top
+// (#201) had no visible effect here, because the list groups by state before it renders
+// and the group order won. `cancelled` stays last: it is terminal and uninteresting.
+const LIST_SECTIONS = ["blocked", ...COLS, "cancelled"];
 // States the user has collapsed — module-scoped so the 10s auto-reload re-render
 // doesn't re-expand what they closed.
 const COLLAPSED = new Set();
