@@ -206,7 +206,7 @@ class _FakeBudget:
 async def test_dispatch_records_per_gen_progress_including_the_verify_outcome(monkeypatch):
     coder_seam._progress.clear()
 
-    async def _create(repo, base, cid, root):
+    async def _create(repo, base, cid, root, **_kw):
         return (f"/wt/feat-{cid}", f"feat/{cid}")
 
     async def _dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):

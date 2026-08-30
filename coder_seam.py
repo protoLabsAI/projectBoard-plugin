@@ -1276,6 +1276,19 @@ def should_use_solve(feature: dict, *, test_cmd: str, _solve_mod=None) -> bool:
     mod = _solve_mod if _solve_mod is not None else _import_solve()
     if mod is None:
         return False
+    # A card with an OPEN PR is on a FIX ROUND, and the ladder is the wrong tool for one.
+    # `solve()` generates K candidate implementations, each in a fresh worktree off base,
+    # and picks a winner — the right shape for greenfield work and exactly wrong for
+    # "address these review findings on the branch you already pushed". The candidates
+    # cannot see that branch, so the coder must re-derive the whole change before it can
+    # touch the finding: observed on a +661/-7 card that burned three 30-minute rounds at
+    # the top tier and produced ZERO commits, because a rebuild does not fit in the
+    # dispatch timeout. Worse than slow — a regenerated implementation is a DIFFERENT
+    # one, so the verdict that requested the change no longer describes the code.
+    #
+    # A fix round therefore takes the single-dispatch path, which resumes the PR branch.
+    if str(feature.get("pr_url") or "").strip():
+        return False
     if not str(feature.get("acceptance_criteria") or "").strip():
         return False
     if not str(test_cmd or "").strip():

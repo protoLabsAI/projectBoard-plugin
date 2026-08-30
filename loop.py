@@ -3089,7 +3089,12 @@ class BoardLoop:
                         self._inflight[fid] = (repo, wt, branch)
                     else:
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
-                        wt, branch = await worktree.create_worktree(repo, base, fid, self.root, title=raw_title)
+                        # A card with an open PR is on a FIX ROUND: resume its branch so
+                        # the coder sees the change it is being asked to correct (#332 —
+                        # three 30-minute rounds off a clean base, zero commits).
+                        wt, branch = await worktree.create_worktree(
+                            repo, base, fid, self.root, title=raw_title, resume=bool(feature.get("pr_url"))
+                        )
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
