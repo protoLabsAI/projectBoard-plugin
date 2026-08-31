@@ -601,6 +601,18 @@ and a mock cannot be relabeled REAL while mutating a real PR: either would fail 
 loudly rather than leave the contract green. `merge_pr` stays REAL because branch protection
 *refuses* `gh pr merge` on the pinned PR, so it runs for real without consuming it.
 
+EXEMPT is also **not an escape *from* the ratchet** — it is a second ratchet.
+`MAX_EXEMPT_WORKTREE` may only *fall* (each write flips to REAL the day a disposable sandbox
+repo is provisioned), never rise, so a fourth EXEMPT can't be minted to make debt disappear.
+And the exemption is backed by an **executable escape hatch**:
+`tests/test_worktree_pr_lifecycle_sandbox.py` drives all three writes — create, promote-draft,
+close — against a *throwaway* sandbox repo through the real `gh`, dormant (skipped) only until
+the operator sets `PB_SANDBOX_REPO` (and `PB_REQUIRE_SANDBOX=1` to enforce it); it refuses to
+run against the checkout's own repo, so no CI job ever mutates a production PR. That test's
+presence and its coverage of each EXEMPT seam are themselves asserted by
+`test_external_seams.py` — so the recorded gap is one env var from closing, not a promise on
+paper, and a regression that stops a seam issuing its `gh pr` write fails the contract today.
+
 ## Layout
 
 | File | What |

@@ -36,6 +36,17 @@ PR-lifecycle writes, and each must provably shell a fixture-destroying `gh pr` w
 permanently-open read fixture, so it needs a disposable sandbox repo to cover for real.
 Symmetrically, no REAL seam may shell one of those writes. So a read cannot hide under
 EXEMPT to dodge the ratchet, and a mock cannot pose as REAL while mutating real PR state.
+
+And EXEMPT is not an escape FROM the ratchet either — it is a second, equally strict ratchet,
+answering the exact review that flagged the UNCOVERED → EXEMPT move: dropping a seam from the
+UNCOVERED count must not make its debt vanish. So `MAX_EXEMPT_WORKTREE` may only FALL (each
+write flips to REAL the day a disposable sandbox repo is provisioned), never rise — a fourth
+EXEMPT cannot be minted to dodge the uncovered-seam ratchet. And the exemption is backed by an
+EXECUTABLE escape hatch: tests/test_worktree_pr_lifecycle_sandbox.py drives all three writes —
+create, promote-draft, close — against a THROWAWAY sandbox repo through the real `gh`, dormant
+(skipped) only until the operator sets PB_SANDBOX_REPO (with PB_REQUIRE_SANDBOX to enforce it).
+So the gap the exemption records is one env var from closing, not a promise on paper, and a
+regression that stops a seam issuing its `gh pr` write fails this contract now, not silently.
 """
 
 from __future__ import annotations
@@ -65,6 +76,14 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # FEEDBACK CHANNEL — a regression here surfaces as a blocked card / operator signal rather than red
 # CI — not an absence of runtime execution. They are NOT mocked into a false REAL, and NO CI job
 # creates/closes/promotes a PR in a production repository.
+#
+# EXEMPT does not remove these three from accountability — that was the review finding on the
+# UNCOVERED → EXEMPT move. Two things keep them honest: (1) MAX_EXEMPT_WORKTREE is a SECOND ratchet
+# that may only fall (each flips to REAL when a disposable sandbox is provisioned), so debt cannot be
+# dissolved by relabelling; and (2) their exemption is backed by an EXECUTABLE escape hatch —
+# tests/test_worktree_pr_lifecycle_sandbox.py drives all three against a THROWAWAY sandbox repo for
+# real, dormant only until the operator sets PB_SANDBOX_REPO. The escape hatch's presence + coverage
+# of each seam is itself asserted below, so the exemption is one env var from closing, not paper.
 WORKTREE_SEAMS: dict[str, str] = {
     "_find_marked_comment": "REAL",
     "_promote_adopted_draft": (
@@ -166,6 +185,13 @@ STORE_SEAMS: dict[str, str] = {
 MAX_UNCOVERED_WORKTREE = 0
 MAX_UNCOVERED_STORE = 21
 
+# The EXEMPT ratchet. An EXEMPT drops a seam from MAX_UNCOVERED_WORKTREE, so EXEMPT must itself be
+# bounded or the label would let real debt vanish (the review finding on the UNCOVERED → EXEMPT
+# move). Exactly the three PR-lifecycle writes are EXEMPT today; this floor may only FALL as each
+# flips to REAL when a disposable sandbox repo is provisioned — never rise. A fourth EXEMPT fails
+# this file just as loudly as a new UNCOVERED one would.
+MAX_EXEMPT_WORKTREE = 3
+
 
 def _external_seams(path: str, callees: set[str], skip_prefix: tuple[str, ...] = ()) -> set[str]:
     """Every function in ``path`` that reaches an external system, by AST — not by name
@@ -257,6 +283,23 @@ def test_uncovered_seams_never_increase():
     assert s <= MAX_UNCOVERED_STORE, f"store.py uncovered external seams rose to {s} (ratchet: {MAX_UNCOVERED_STORE})"
 
 
+def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
+    """The direct answer to the review finding: reclassifying a seam UNCOVERED → EXEMPT drops it
+    from ``MAX_UNCOVERED_WORKTREE``, so without a second bound the label would be a blank cheque
+    that makes real debt vanish and lets a regression in opening/closing/promoting a PR pass green.
+
+    EXEMPT is therefore itself ratcheted. The count may FALL — each PR-lifecycle write flips to REAL
+    the day a disposable sandbox repo is provisioned — but NEVER rise: a fourth EXEMPT cannot be
+    minted to escape the uncovered-seam ratchet, and fails this file exactly as a new UNCOVERED seam
+    would."""
+    e = sum(1 for v in WORKTREE_SEAMS.values() if v.startswith("EXEMPT: "))
+    assert e <= MAX_EXEMPT_WORKTREE, (
+        f"worktree.py EXEMPT external seams rose to {e} (ratchet: {MAX_EXEMPT_WORKTREE}). EXEMPT is "
+        f"tracked debt, not a way out of the ratchet: it may only fall (a write flips to REAL when a "
+        f"disposable sandbox repo is provisioned), never rise. Give the new seam REAL coverage."
+    )
+
+
 def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
     """The final worktree coverage contract after #361 S1/S2/S3: 23 REAL, 3 EXEMPT, 0 UNCOVERED.
 
@@ -282,6 +325,7 @@ def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"
     )
     assert MAX_UNCOVERED_WORKTREE == 0
+    assert MAX_EXEMPT_WORKTREE == 3
 
     # Each exemption must record WHY it cannot be REAL (a disposable sandbox repo for real PR state)
     # AND that the gap is feedback latency, not missing production execution — so the exemption stays
@@ -318,6 +362,36 @@ def test_exempt_worktree_seams_really_perform_a_pr_lifecycle_write():
             f"(create/close/ready). An EXEMPT that removes a seam from the ratchet must be a real "
             f"PR-lifecycle mutation needing a disposable sandbox repo — not a read hiding behind the "
             f"label. Give it REAL coverage or reclassify it honestly."
+        )
+
+
+def test_exempt_pr_writes_are_backed_by_an_executable_sandbox_lifecycle_test():
+    """The review's remedy, made concrete and enforced. An EXEMPT PR-lifecycle write is honest only
+    if the disposable-sandbox lifecycle test that WOULD cover it for real actually EXISTS and drives
+    it — otherwise the exemption is a paper promise, and a regression in opening / closing / promoting
+    a PR leaves the coverage contract green (the reviewer's exact worry).
+
+    ``tests/test_worktree_pr_lifecycle_sandbox.py`` is that escape hatch: it shells the real `gh`
+    against a THROWAWAY sandbox repo to create, promote and close real PRs through the three seams,
+    dormant (skipped) only until the operator sets ``PB_SANDBOX_REPO`` (and enforces it with
+    ``PB_REQUIRE_SANDBOX``) — the provisioning decision the exemption records. This test asserts the
+    escape hatch is present, gates on those env vars, and exercises EACH EXEMPT seam BY NAME, so
+    deleting or hollowing it fails the contract rather than silently re-opening the gap. Iterating
+    over the live EXEMPT set (not a hard-coded list) keeps the two in lockstep automatically."""
+    exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
+    assert exempt, "expected at least one EXEMPT worktree seam whose escape hatch to verify"
+    src = (_ROOT / "tests" / "test_worktree_pr_lifecycle_sandbox.py").read_text()
+    assert "PB_SANDBOX_REPO" in src and "PB_REQUIRE_SANDBOX" in src, (
+        "the disposable-sandbox lifecycle tier must gate on PB_SANDBOX_REPO (provision) and "
+        "PB_REQUIRE_SANDBOX (enforce) so it stays dormant until the operator provisions the sandbox — "
+        "an EXEMPT must never quietly become a tier that mutates a live repo on every run"
+    )
+    for name in exempt:
+        assert f"worktree.{name}(" in src, (
+            f"{name} is EXEMPT but the disposable-sandbox lifecycle test does not exercise "
+            f"worktree.{name}(). An exemption must be backed by the executable escape hatch that "
+            f"covers it for real, not by its classification comment alone — add the seam to "
+            f"tests/test_worktree_pr_lifecycle_sandbox.py or reclassify it honestly."
         )
 
 
