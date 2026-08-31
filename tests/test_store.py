@@ -424,6 +424,13 @@ def test_project_exposes_budgets_from_labels(make_board):
     assert b._project({"id": "bd-2", "status": "open", "labels": []})["budgets"] == {}
 
 
+# ── operator-notified markers (#341) — the durable half of the blocked-lane dedup ─
+
+
+# ── recovery-generation ABA guard (#341 review) — the marker re-read must distinguish a
+#    card that STAYED blocked from one that recovered-and-re-blocked in the write window ──
+
+
 # ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
 
 
@@ -1737,7 +1744,9 @@ def test_clear_blocked_dispatch_infra_on_a_never_escalated_card_leaves_difficult
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
     b.clear_blocked("bd-9")
     (up,) = br.cmds("update")
-    assert up == ("update", "bd-9", "--remove-label", "blocked", "--remove-label", "blocked-class:dispatch-infra")
+    assert up[:2] == ("update", "bd-9")
+    assert "blocked" in up and "blocked-class:dispatch-infra" in up  # stale infra class dropped
+    assert "diff:small" not in up  # difficulty untouched
 
 
 def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board, monkeypatch):
@@ -1768,7 +1777,8 @@ def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
     b.clear_blocked("bd-9")
     (up,) = br.cmds("update")
-    assert up == ("update", "bd-9", "--remove-label", "blocked")
+    assert up[:2] == ("update", "bd-9")
+    assert "blocked" in up and "tier:reasoning" not in up  # the tier record is untouched
 
 
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────

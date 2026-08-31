@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import hashlib
 import json
 import logging
 import os
@@ -821,6 +822,11 @@ _SELF_HEALING_BLOCKS = frozenset({"rate-limit", "transient", "merge-conflict"})
 # Deliberately small: a card that has failed transiently three times is not unlucky, it
 # has a problem a human needs to see.
 _UNBLOCK_RETRY_MAX = 2
+# How long one blocked-card alert suppresses an identical repeat. Long, because a blocked
+# card can sit for hours and the inbox's 300s default would re-alert on every restart —
+# the exact noise #341 opened with. The KEY carries the incident, so a genuinely new
+# failure is never suppressed by this window.
+_ALERT_DEDUP_S = 7 * 24 * 3600
 
 
 def _inbox_db_path():
@@ -1252,7 +1258,11 @@ class BoardLoop:
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}
         # Feature ids already reported to the operator as stuck, so a card that stays
-        # blocked is announced once rather than every sweep (see _notify_operator).
+        # blocked is announced once rather than every sweep (see _notify_operator). This
+        # set is a per-process CACHE only: the DURABLE dedup is the bead's
+        # `notified:blocked` marker (#341), which a restart reads back so it does not
+        # re-alert a block the operator was already told about — this set is rebuilt empty
+        # on every restart and must never be the sole record.
         self._notified_blocks: set[str] = set()
         # Last parsed findings JSON per fid — fed back as the recipe's
         # prior_findings input so a bounce re-review is a DELTA review
@@ -1999,7 +2009,6 @@ class BoardLoop:
                     await self._budget_set(store, fid, "unblock-retry", spent + 1)
                     await asyncio.to_thread(store.clear_blocked, fid)
                     await asyncio.to_thread(store.requeue, fid)
-                    self._notified_blocks.discard(fid)  # a LATER block is news again
                     log.info(
                         "[project_board] blocked sweep: %s auto-unblocked (%s, retry %d/%d): %s",
                         fid,
@@ -2025,30 +2034,59 @@ class BoardLoop:
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    # The recovery CYCLE is part of the incident's identity (#346 r7): a
+                    # card that auto-healed, rebuilt and failed the SAME way again is a new
+                    # failed cycle and IS news — the self-heal did not work. Keying on
+                    # class+reason alone suppressed exactly that for the whole window.
+                    # `spent` is the unblock-retry budget the self-heal already tracks, so
+                    # this costs no new state: it increments on every auto-unblock and is
+                    # therefore different on each side of a recovery.
+                    incident=f"{cls}|{reason}|{spent}",
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
 
-    def _notify_operator(self, fid: str, text: str) -> None:
+    def _notify_operator(self, fid: str, text: str, *, incident: str = "") -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
 
-        Deduped on the feature id so a card that stays blocked across many sweeps is
-        reported once, not every five minutes — the point is to be noticed, and an alert
-        that repeats forever is an alert that gets filtered.
+        Dedup is the whole difficulty here, and it is deliberately NOT solved with state
+        on our side. Earlier cuts tried a per-process memo, then a durable
+        ``notified:blocked`` label, then a rollback when a recovery raced the write, then
+        a recovery-generation counter to make the rollback safe — and review found a
+        narrower race in each. Every one of them was trying to answer "is this the same
+        incident?" by tracking OUR OWN writes across a distributed edge, which is the hard
+        version of the question.
+
+        The easy version: let the KEY answer it. ``dedup_key`` carries the incident's
+        identity — the card, its failure class and reason, and the recovery cycle it is on
+        — so the same block dedups by construction, a genuinely different block is a
+        different key and alerts, and no bead label, memo, generation or rollback exists
+        to go stale.
+
+        The recovery cycle belongs in that identity: a card that auto-healed, rebuilt and
+        failed the SAME way again is a NEW failed cycle and is news, because the self-heal
+        did not work. Keying on class+reason alone silently suppressed that for the whole
+        window — the behaviour this docstring's first draft argued was correct, and was
+        not.
+
+        The window is long (`_ALERT_DEDUP_S`) because a blocked card can sit for hours and
+        the default 300s would re-alert on every restart — the failure #341 opened with.
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
         silence a block used to leave."""
-        if fid in self._notified_blocks:
-            return
-        self._notified_blocks.add(fid)
+        key = f"blocked:{fid}"
+        if incident.strip():
+            key += ":" + hashlib.sha1(incident.encode("utf-8", "replace")).hexdigest()[:12]
         try:
             from inbox import InboxStore  # host module — absent on older hosts
 
             db = _inbox_db_path()
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
-            InboxStore(str(db)).add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
+            InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S).add(
+                text, priority="now", source="project_board", dedup_key=key
+            )
             log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
             log.warning(

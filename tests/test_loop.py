@@ -8486,19 +8486,31 @@ async def test_clean_gate_verdicts_are_unchanged(monkeypatch):
 
 class _BlockedStore:
     """A store whose blocked lane a sweep can drive: list_features(state="blocked")
-    returns the given rows, and clear_blocked/requeue/record_budget are recorded."""
+    returns the given rows, and clear_blocked/requeue/record_budget/record_notified are
+    recorded. The `notified:<kind>` marker (#341) is written onto the ROW's labels so a
+    fresh loop over the SAME rows reads it back — the durable half a restart depends on;
+    clear_blocked strips it, mirroring the real store's genuine-recovery edge."""
 
     def __init__(self, rows):
         self._rows = rows
         self.cleared: list[str] = []
         self.requeued: list[str] = []
         self.budgets: list[tuple] = []
+        self.notified: list[tuple] = []  # (fid, kind) — record_notified writes (#341)
+
+    def _row(self, fid):
+        return next((r for r in self._rows if r.get("id") == fid), None)
 
     def list_features(self, state=None, **_kw):
         return list(self._rows) if state == "blocked" else []
 
     def clear_blocked(self, fid):
         self.cleared.append(fid)
+        r = self._row(fid)
+        if r is not None:  # a genuine unblock drops the block flag AND supersedes the marker (#341)
+            r["blocked"] = False
+            r["board_state"] = "ready"
+            r["labels"] = [l for l in (r.get("labels") or []) if not str(l).startswith("notified:") and l != "blocked"]
         return {"id": fid}
 
     def requeue(self, fid):
@@ -8507,6 +8519,18 @@ class _BlockedStore:
 
     def record_budget(self, fid, kind, n):
         self.budgets.append((fid, kind, n))
+
+    def record_notified(self, fid, kind="blocked"):
+        r = self._row(fid)
+        # Mirror the real store's LIVE-condition guard (#341 review): a `blocked` marker is
+        # stamped only while the card is STILL blocked, so a concurrent unblock that landed
+        # between the alert and this delayed write is never overwritten by a stale re-add.
+        if kind == "blocked" and (r is None or not r.get("blocked")):
+            return {"id": fid}
+        self.notified.append((fid, kind))
+        if r is not None and f"notified:{kind}" not in (r.get("labels") or []):
+            r.setdefault("labels", []).append(f"notified:{kind}")
+        return {"id": fid}
 
 
 def _blocked(fid, cls, *, reason="boom", title="A card", budget=None):
@@ -8541,7 +8565,7 @@ async def test_an_auth_block_is_never_auto_retried_and_pages_the_operator(monkey
     store = _BlockedStore([_blocked("bd-a", "auth", reason="403 forbidden", title="Ship the thing")])
     loop = BoardLoop({"coder": "proto"})
     seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append((fid, text)))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, **_kw: seen.append((fid, text)))
     await loop._recover_blocked(store)
     assert store.cleared == [] and store.requeued == []
     (fid, text) = seen[0]
@@ -8555,7 +8579,7 @@ async def test_a_card_that_keeps_failing_transiently_stops_retrying_and_escalate
     store = _BlockedStore([_blocked("bd-t", "transient", budget=2)])
     loop = BoardLoop({"coder": "proto"})
     seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, **_kw: seen.append(text))
     await loop._recover_blocked(store)
     assert store.requeued == []
     assert "auto-retries spent" in seen[0]
@@ -8567,45 +8591,9 @@ async def test_an_unclassified_block_escalates_rather_than_silently_retrying(mon
     store = _BlockedStore([_blocked("bd-u", "")])
     loop = BoardLoop({"coder": "proto"})
     seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, **_kw: seen.append(text))
     await loop._recover_blocked(store)
     assert store.requeued == [] and "unclassified" in seen[0]
-
-
-async def test_the_operator_is_told_once_per_card_not_once_per_sweep(monkeypatch, tmp_path):
-    """The sweep runs every few minutes. An alert that repeats forever is an alert that
-    gets filtered, so a card that STAYS blocked is announced once.
-
-    The fake mirrors the host's REAL constructor — ``InboxStore(db_path)`` — because the
-    first version of this test faked a no-arg one, which is exactly how a notification
-    that could never construct its store shipped green: every alert fell into the
-    except branch and the operator was never told anything."""
-    store = _BlockedStore([_blocked("bd-a", "auth")])
-    loop = BoardLoop({"coder": "proto"})
-    added = []
-    import sys
-    import types as _types
-
-    fake = _types.ModuleType("inbox")
-
-    class _Inbox:
-        def __init__(self, db_path, *, dedup_window_s=300):
-            self.path = db_path
-
-        def add(self, text, *, priority="next", source="", dedup_key=""):
-            added.append((text, priority, dedup_key, self.path))
-
-    fake.InboxStore = _Inbox
-    monkeypatch.setitem(sys.modules, "inbox", fake)
-    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
-
-    await loop._recover_blocked(store)
-    await loop._recover_blocked(store)
-    await loop._recover_blocked(store)
-    assert len(added) == 1
-    (text, priority, dedup, path) = added[0]
-    assert priority == "now" and dedup == "blocked:bd-a" and "bd-a" in text
-    assert path == str(tmp_path / "agent.db")
 
 
 async def test_an_unresolvable_inbox_falls_back_to_the_loud_log_never_a_crash(monkeypatch, caplog):
@@ -8643,17 +8631,6 @@ def test_the_inbox_path_never_guesses_between_two_name_keyed_stores(monkeypatch,
     assert loop_mod._inbox_db_path() == inbox / "agent.db"
 
 
-async def test_a_self_healed_card_that_blocks_again_is_news_again(monkeypatch):
-    """The once-per-card memo is cleared when the card actually recovers, so a LATER
-    block on the same card still reaches the operator — otherwise the first transient
-    failure would permanently silence that card."""
-    store = _BlockedStore([_blocked("bd-t", "transient")])
-    loop = BoardLoop({"coder": "proto"})
-    loop._notified_blocks.add("bd-t")
-    await loop._recover_blocked(store)
-    assert "bd-t" not in loop._notified_blocks
-
-
 async def test_a_host_without_an_inbox_still_says_so_loudly(monkeypatch, caplog):
     """The inbox is feature-detected. A host without it must still leave a WARNING —
     strictly louder than the silence a block used to leave — never an exception."""
@@ -8675,7 +8652,7 @@ async def test_escalation_re_reads_the_reason_because_br_list_carries_no_comment
     store.get_feature = lambda fid: {"id": fid, "blocked_reason": "auth: 403 forbidden on push"}
     loop = BoardLoop({"coder": "proto"})
     seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, **_kw: seen.append(text))
     await loop._recover_blocked(store)
     assert "403 forbidden on push" in seen[0]
 
@@ -8691,6 +8668,140 @@ async def test_a_failed_reason_re_read_still_escalates(monkeypatch):
     store.get_feature = _boom
     loop = BoardLoop({"coder": "proto"})
     seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, **_kw: seen.append(text))
     await loop._recover_blocked(store)
     assert seen and "bd-a" in seen[0]
+
+
+# ── the operator-notified marker is DURABLE, not process scratch (#341) ──────────────
+
+
+def _use_fake_inbox(monkeypatch, tmp_path):
+    """Install the host `inbox.InboxStore` seam over a temp db and return the list every
+    `add()` appends to (text, priority, dedup_key). Mirrors the REAL constructor —
+    InboxStore(db_path) — like test_the_operator_is_told_once_per_card_not_once_per_sweep."""
+    added: list[tuple] = []
+
+    fake = types.ModuleType("inbox")
+
+    class _Inbox:
+        def __init__(self, db_path, *, dedup_window_s=300):
+            self.path = db_path
+
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            added.append((text, priority, dedup_key))
+
+    fake.InboxStore = _Inbox
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
+    return added
+
+
+# ── alert dedup lives in the KEY, not in state we have to keep correct ──────────────
+
+
+def _spy_inbox(monkeypatch, tmp_path, added):
+    import sys
+    import types as _types
+
+    fake = _types.ModuleType("inbox")
+
+    class _Inbox:
+        def __init__(self, db_path, *, dedup_window_s=300):
+            self.window = dedup_window_s
+
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            added.append({"key": dedup_key, "priority": priority, "text": text, "window": self.window})
+
+    fake.InboxStore = _Inbox
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
+
+
+async def test_the_same_incident_dedups_by_key_across_sweeps_and_restarts(monkeypatch, tmp_path):
+    """A stayed-blocked card is ONE alert. Nothing on our side remembers that — the key
+    carries the incident, so repeated sweeps (and a fresh process, which is what a restart
+    is) produce an identical key and the inbox dedups it. Earlier cuts kept a memo, then a
+    bead label, then a rollback, then a generation counter, and review found a race in
+    each; none of that exists now, so none of it can go stale."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    store = _BlockedStore([_blocked("bd-a", "auth", reason="403 forbidden")])
+
+    await BoardLoop({"coder": "proto"})._recover_blocked(store)
+    await BoardLoop({"coder": "proto"})._recover_blocked(store)  # a "restart": brand-new loop
+    assert len({a["key"] for a in added}) == 1, "the same incident must produce the same key"
+    assert added[0]["priority"] == "now"
+    # and the window outlives a blocked card's real lifetime, so a restart cannot re-alert
+    assert added[0]["window"] >= 24 * 3600
+
+
+async def test_a_different_failure_on_the_same_card_is_a_new_incident(monkeypatch, tmp_path):
+    """The point of keying on the incident: a card that recovers and blocks again for a
+    DIFFERENT reason is news, and must alert even though the card id is unchanged."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    loop = BoardLoop({"coder": "proto"})
+    await loop._recover_blocked(_BlockedStore([_blocked("bd-a", "auth", reason="403 forbidden")]))
+    await loop._recover_blocked(_BlockedStore([_blocked("bd-a", "terminal", reason="worktree add failed")]))
+    assert len({a["key"] for a in added}) == 2, "a different failure must not be deduped away"
+
+
+async def test_the_key_is_stable_for_one_incident_and_carries_the_card(monkeypatch, tmp_path):
+    """The key must be derived, not random: same class + reason ⇒ same key, and it names
+    the card so an operator reading the inbox can tell which one it is."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    row = _blocked("bd-xyz", "auth", reason="403 forbidden")
+    for _ in range(3):
+        await BoardLoop({"coder": "proto"})._recover_blocked(_BlockedStore([row]))
+    assert len({a["key"] for a in added}) == 1
+    assert added[0]["key"].startswith("blocked:bd-xyz:")
+
+
+async def test_no_notification_state_is_written_to_the_bead(monkeypatch, tmp_path):
+    """The bead is not where alert bookkeeping belongs. An escalation writes NOTHING to
+    the card — no marker, no generation — so there is no state to strand, roll back, or
+    reconcile, and a blocked card's labels mean exactly what they say."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    store = _BlockedStore([_blocked("bd-a", "auth", reason="403 forbidden")])
+    store.updates = []
+    store.record_notified = lambda *a, **k: store.updates.append(a)  # must never be called
+    await BoardLoop({"coder": "proto"})._recover_blocked(store)
+    assert added, "the operator was still told"
+    assert store.updates == []
+
+
+async def test_a_failed_recovery_cycle_alerts_again_even_for_an_identical_failure(monkeypatch, tmp_path):
+    """#346 r7: keying the incident on class+reason alone was wrong. A card that auto-healed,
+    rebuilt, and failed in exactly the same way is a NEW failed recovery cycle — the
+    self-heal did not work, which is precisely what an operator needs to hear — and it was
+    being suppressed for the whole seven-day window.
+
+    The unblock-retry budget already counts those cycles, so it joins the key and costs no
+    new state."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    same = dict(cls="transient", reason="coder timed out after 1800.0s")
+    # cycle 2 exhausted its retries → alert. A FRESH loop each time so the budget is read
+    # from the bead rather than the per-process cache, which is also what a restart does.
+    await BoardLoop({"coder": "proto"})._recover_blocked(
+        _BlockedStore([_blocked("bd-a", same["cls"], reason=same["reason"], budget=2)])
+    )
+    # …recovered, rebuilt, failed IDENTICALLY — a new cycle, so the budget advanced
+    await BoardLoop({"coder": "proto"})._recover_blocked(
+        _BlockedStore([_blocked("bd-a", same["cls"], reason=same["reason"], budget=3)])
+    )
+    assert len({a["key"] for a in added}) == 2, "a new failed recovery cycle must reach the operator"
+
+
+async def test_repeated_sweeps_within_one_cycle_still_dedup(monkeypatch, tmp_path):
+    """The other half stays true: while the card sits blocked on the SAME cycle, every
+    sweep produces the same key and the operator is told once."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    row = _blocked("bd-a", "auth", reason="403 forbidden", budget=2)
+    for _ in range(4):
+        await BoardLoop({"coder": "proto"})._recover_blocked(_BlockedStore([row]))
+    assert len({a["key"] for a in added}) == 1

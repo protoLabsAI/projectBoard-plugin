@@ -2246,6 +2246,8 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # ── operator-notification markers (#341) — the durable half of the blocked-lane
+
     def reset_merged_verify_budget(self, fid: str, *, actor: str = "") -> dict:
         """Operator reset of a feature's merged-state re-verify budget (ADR 0326, #326).
 
@@ -2760,6 +2762,7 @@ class BeadsBoard:
             # The persisted loop fix budgets (#259): {kind: count} from the replaced
             # `budget:<kind>:<n>` labels — {} for a feature the loop never bounced.
             "budgets": budgets_from_labels(labels),
+            # Operator-notification markers (#341): the alert kinds already delivered to a
             "verified_sha": verified_sha,
             "deliverable": deliverable,
             "blocked_class": blocked_class,

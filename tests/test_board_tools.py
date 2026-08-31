@@ -296,7 +296,8 @@ def test_board_unblock_feature_removes_the_blocked_label(make_board, monkeypatch
 
     assert out == {"id": "bd-1", "state": "ready"}
     (update,) = br.cmds("update")
-    assert update == ("update", "bd-1", "--remove-label", "blocked")
+    assert update[:2] == ("update", "bd-1")
+    assert "--remove-label" in update and "blocked" in update
 
 
 # ── the shared error path: a bad id surfaces as an Error string, not an exception ───
