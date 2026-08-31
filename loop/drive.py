@@ -828,6 +828,11 @@ class DriveMixin:
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
         tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
+        # Which sibling of the current rung to use. Seeded from a per-process counter so
+        # consecutive cards do not all open on the same provider — spread is the ordinary
+        # case; the failover below is the exceptional one.
+        sib = _next_rung_cursor()
+        tried_here = 0  # siblings already exhausted at THIS rung (reset on a climb)
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
@@ -839,7 +844,14 @@ class DriveMixin:
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons)
-                coder_name = coders.get(tier, self.coder_name) if self.escalation_on else self.coder_name
+                # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
+                # the same capability tier (#362); `sib` advances only on a quota failure
+                # (below) or round-robin across dispatches, never on a capability failure —
+                # that is what climbing a rung is for.
+                siblings = coders.get(tier) if self.escalation_on else None
+                if not siblings:
+                    siblings = [self.coder_name]
+                coder_name = siblings[sib % len(siblings)]
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
                     await asyncio.to_thread(
@@ -1256,6 +1268,7 @@ class DriveMixin:
                                     )
                                     tier = nxt
                                     retries = 0
+                                    tried_here = 0  # a NEW rung has its own providers (#362)
                                     # Fresh per-tier budgets on the climb — mirrors the
                                     # shared capability-escalation path below.
                                     await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
@@ -1301,6 +1314,28 @@ class DriveMixin:
                     )
                     # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
                     #    off the latest base also clears a merge conflict).
+                    # 0.5 QUOTA failure with an untried sibling at this rung → switch
+                    #     provider IMMEDIATELY (#362). Sleeping 60s to re-dispatch the same
+                    #     exhausted provider, five times, then blocking the card, is what
+                    #     this replaces — a rate limit says nothing about the model's
+                    #     ability, only about its quota, so it must not spend the retry
+                    #     budget or the capability ladder. Only when every sibling is
+                    #     exhausted does the ordinary backoff below apply.
+                    if should_rotate_provider(policy.category, siblings, tried_here):
+                        tried_here += 1
+                        sib += 1
+                        log.info(
+                            "[project_board] %s %s on %s — switching to %s at the same rung "
+                            "(sibling %d/%d, no backoff, no tier climb): %s",
+                            fid,
+                            policy.category,
+                            coder_name,
+                            siblings[sib % len(siblings)],
+                            tried_here + 1,
+                            len(siblings),
+                            str(exc)[:120],
+                        )
+                        continue
                     if policy.retryable and not capability and retries < policy.max_attempts - 1:
                         retries += 1
                         log.info(
@@ -1367,6 +1402,7 @@ class DriveMixin:
                                 self._ci_prior_diff.pop(fid, None)
                             tier = nxt
                             retries = 0
+                            tried_here = 0  # a NEW rung has its own providers (#362)
                             # Fresh goal-fix / local-gate / ledger budgets at the new tier —
                             # otherwise a tier that exhausted its retries hands the next
                             # (stronger) tier a spent budget, so it blocks on its first gap

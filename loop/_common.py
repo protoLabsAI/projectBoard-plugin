@@ -36,6 +36,7 @@ dispatch). Missing any of the three gates ⇒ honest degrade to the single shot 
 from __future__ import annotations
 
 import asyncio
+import itertools
 from pathlib import Path
 import hashlib
 import json
@@ -614,6 +615,59 @@ LIVE_BOOL_KNOBS = ("auto_merge", "br_autofetch")
 # in Settings) then clears and the paused loop resumes WITHOUT a restart. The `coders`
 # ladder map and `repo` stay restart knobs; `setup_status` reports them as
 # `loop_cfg_stale` when a reload changes them under a running loop.
+_RUNG_CURSOR = itertools.count()
+
+
+def _next_rung_cursor() -> int:
+    """A per-process counter so consecutive cards do not all open on the same provider.
+
+    Deliberately NOT persisted: spread is a statistical property across many dispatches,
+    not a guarantee about any one card, and a restart re-seeding at zero costs nothing."""
+    return next(_RUNG_CURSOR)
+
+
+def should_rotate_provider(category: str, siblings: list[str], tried: int) -> bool:
+    """Should this failure move to the NEXT provider at the same rung, rather than
+    sleeping to retry the same one (#362)?
+
+    Only for a QUOTA failure, and only while an untried sibling remains. A rate limit
+    says nothing about the model's ability — only that this provider is spent — so it
+    must not consume the transient-retry budget (60s × 5, all on the exhausted provider)
+    nor the capability ladder. Every other class keeps the existing behaviour exactly:
+    transient infra backs off, capability climbs a rung, terminal blocks.
+
+    Kept pure and separate from the drive loop so the POLICY is testable on its own —
+    the decision is the whole feature, and it was previously buried in a 565-line
+    function where the only way to exercise it was to drive an entire card."""
+    return category == "rate_limit" and len(siblings) > 1 and tried < len(siblings) - 1
+
+
+def rung_delegates(value) -> list[str]:
+    """One ladder rung → its interchangeable delegate names, in declaration order.
+
+    A rung is a CAPABILITY tier. The delegates WITHIN a rung are interchangeable
+    PROVIDERS of that capability — that distinction is the whole point (#362):
+
+    * climbing a rung means "a stronger model may succeed where a weaker one failed";
+    * rotating within a rung means "this model is fine, its QUOTA is not".
+
+    A rate limit is not a capability signal, and before this it consumed the capability
+    ladder's budget as though it were — the same category error #339 fixed for infra
+    dispatch failures. 644 rate-limit lines in one agent's log, each one sleeping 60s and
+    re-dispatching the SAME exhausted provider up to five times before blocking the card,
+    while five other declared, working ACP coders sat idle.
+
+    ``"sonnet"`` → ``["sonnet"]``, so a string rung behaves EXACTLY as before and every
+    existing config is untouched. Blanks and duplicates are dropped, order preserved."""
+    raw = value if isinstance(value, (list, tuple)) else [value]
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 LIVE_STR_KNOBS = ("coder",)
 _CONFIG_SECTION = "project_board"
 
@@ -884,6 +938,9 @@ _loop = sys.modules[__package__]
 # before the split. Underscore names are listed explicitly so ``import *`` picks
 # them up.
 __all__ = [
+    "rung_delegates",
+    "should_rotate_provider",
+    "_next_rung_cursor",
     "asyncio",
     "Path",
     "hashlib",
