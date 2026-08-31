@@ -4100,7 +4100,10 @@ class BoardLoop:
         nothing (r3); and — the TOCTOU guard — a live head that MOVED between the check read
         and the promotion write (a PR push landing mid-reconcile) is not trusted either, so
         a PASS proven for the old head can never mark a newly pushed, unreviewed head clean
-        (r3). NEVER races the internal gate (r4/r5): it skips a ``review-pending``
+        (r3). That guard is BOTH a pre-write early-out AND a post-write confirmation: a push
+        that races the review-clean write itself is detected right after it lands and the
+        write is UNDONE (reverted to the prior blocking / absent substate) before the merge
+        edge can act on it. NEVER races the internal gate (r4/r5): it skips a ``review-pending``
         card (the gate owns that live verdict) and a ``review-clean`` card (already promoted
         → idempotent no-op), and — the same liveness guard the stranded-fix recovery (#340)
         uses — any card with a live drive, a claimed worktree, or an in-flight gate. Returns
@@ -4148,12 +4151,11 @@ class BoardLoop:
         # against a TOCTOU race (#323): ``head`` was read at the top of this method, and a
         # PR push in the interval up to these local writes could move the live head — which
         # would let a PASS proven for the OLD head mark a NEW, unreviewed head review-clean
-        # for the downstream merge gate to act on. Re-read the LIVE head immediately before
-        # the write and require it STILL equals the head the PASS was proven for (the same
-        # read-the-live-head-then-act discipline #328's re-arm uses). On ANY move — or an
-        # unreadable re-read — fail closed and leave the card unpromoted; a stale verdict
-        # never lands. The next poll re-reads fresh, and once #328 re-arms the gate for the
-        # new head a normal review runs, so the moved head is not silently trusted.
+        # for the downstream merge gate to act on. A single pre-write re-read is NOT enough on
+        # its own: a push can still land between that check and the asynchronous write LANDING,
+        # so the guard is BOTH a pre-write early-out AND a post-write confirmation. First the
+        # cheap early-out: re-read the LIVE head and, if it already moved (or is unreadable),
+        # skip the write entirely — the same read-the-live-head-then-act discipline #328 uses.
         head_now = await worktree.pr_head_sha(pr_url, cwd=repo)
         if not head_now or head_now != head:
             log.info(
@@ -4174,9 +4176,42 @@ class BoardLoop:
             + " has been repaired to review-clean; the ordinary merge gates decide the rest"
         )
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_CLEAN, note=note)
-        # A clean verdict pins no head — clear any reviewed-head stamp so a later
-        # changes-requested can't be judged stale against a dead head, exactly as the internal
-        # clean path does (#328), and reset the fix budget the adopted PASS makes moot.
+        # TOCTOU CLOSE (#323): re-read the live head AFTER the review-clean verdict has landed.
+        # A push that raced in between the pre-write confirmation above and this write actually
+        # landing would have moved the head, making the review-clean we just wrote a verdict for
+        # a now-dead, unreviewed head — which this SAME reconcile pass's merge edge (running
+        # strictly after this method returns) would otherwise act on. On any move — or an
+        # unreadable re-read — UNDO the write, restoring the card to EXACTLY its prior blocking /
+        # absent substate (its reviewed-head stamp and review-fix budget are still intact — they
+        # are only cleared once the head is confirmed to have held, below), and fail closed. The
+        # clean verdict is therefore committed only when the head held across the entire
+        # read→write→confirm span; the next poll re-reads fresh, and once #328 re-arms the moved
+        # head a normal review runs, so the moved head is never silently trusted.
+        head_after = await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head_after or head_after != head:
+            await asyncio.to_thread(
+                store.set_review_substate,
+                fid,
+                LABEL_CHANGES_REQUESTED if stale_rejection else None,
+                note=(
+                    f"trusted-QA reconcile aborted (#323): the PR head moved "
+                    f"({head[:12]}→{(head_after or 'unreadable')[:12]}) as the review-clean verdict landed — "
+                    "reverted to the prior review state so the now-stale QA PASS can't merge an unreviewed head"
+                ),
+            )
+            log.info(
+                "[project_board] %s PR head moved (%s→%s) as the trusted-PASS clean verdict landed — "
+                "reverted to the prior review state (fail closed): %s",
+                fid,
+                head[:12],
+                (head_after or "unreadable")[:12],
+                pr_url,
+            )
+            return False
+        # The head held across the entire read→write→confirm span — commit the adopted verdict.
+        # A clean verdict pins no head, so clear any reviewed-head stamp (a later
+        # changes-requested then can't be judged stale against a dead head, exactly as the
+        # internal clean path does, #328) and reset the fix budget the adopted PASS makes moot.
         await self._stamp_reviewed_head(store, fid, "")
         await self._budget_reset(store, fid, "review-fix")
         log.info(
