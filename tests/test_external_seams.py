@@ -40,36 +40,40 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # ── the registry ────────────────────────────────────────────────────────────────────
 # worktree.py — shells `gh` and `git`. The 11 LOCAL-git seams (no network, no credential)
-# are now exercised against a real git repo in tests/test_worktree_git.py — a temporary bare
-# origin plus a clone, so `origin/<base>` and PR-branch resume resolve exactly as in
-# production (#361, slice 1). The `gh`-backed seams remain UNCOVERED: there is still no GitHub
-# sandbox tier, which is precisely how #354 shipped — that debt is a later slice.
+# are exercised against a real git repo in tests/test_worktree_git.py — a temporary bare origin
+# plus a clone, so `origin/<base>` and PR-branch resume resolve exactly as in production (#361,
+# slice 1). The 12 read-dominant `gh`/GitHub seams are now exercised against a PINNED,
+# permanently-open PR in tests/test_worktree_gh.py (#361, slice 2): CI sets PB_REQUIRE_GH=1 so an
+# absent/unusable credential FAILS instead of skipping — the same posture that made the real-`br`
+# tier catch #353/#356, applied to the read seams a mocked `_gh` was blind to (how #354 shipped).
+# Only the WRITE-lifecycle seams remain UNCOVERED (open_pr / close_pr / _promote_adopted_draft):
+# they mutate real PRs (create/close/ready), so they are not run against the pinned fixture here.
 WORKTREE_SEAMS: dict[str, str] = {
-    "_find_marked_comment": "UNCOVERED",
+    "_find_marked_comment": "REAL",
     "_promote_adopted_draft": "UNCOVERED",
     "base_checkout_dirt": "REAL",
     "close_pr": "UNCOVERED",
     "commit_worktree": "REAL",
     "create_worktree": "REAL",
     "delete_remote_branch": "REAL",
-    "merge_pr": "UNCOVERED",
+    "merge_pr": "REAL",
     "merged_state_worktree": "REAL",
     "open_pr": "UNCOVERED",
     "origin_head_sha": "REAL",
-    "post_or_update_pr_comment": "UNCOVERED",
-    "post_review_status": "UNCOVERED",
-    "pr_ci_status": "UNCOVERED",
-    "pr_diff": "UNCOVERED",
-    "pr_head_sha": "UNCOVERED",
-    "pr_merge_info": "UNCOVERED",
-    "pr_state": "UNCOVERED",
-    "pr_url_for_branch": "UNCOVERED",
+    "post_or_update_pr_comment": "REAL",
+    "post_review_status": "REAL",
+    "pr_ci_status": "REAL",
+    "pr_diff": "REAL",
+    "pr_head_sha": "REAL",
+    "pr_merge_info": "REAL",
+    "pr_state": "REAL",
+    "pr_url_for_branch": "REAL",
     "promote_worktree": "REAL",
     "prune_stale_worktrees": "REAL",
-    "read_review_status": "UNCOVERED",
+    "read_review_status": "REAL",
     "rebase_onto_base": "REAL",
     "remove_worktree": "REAL",
-    "repo_slug": "UNCOVERED",
+    "repo_slug": "REAL",
     "stage_all": "REAL",
 }
 
@@ -124,8 +128,10 @@ STORE_SEAMS: dict[str, str] = {
 }
 
 # The ratchet. These are the counts at the moment the contract was introduced; a change
-# that raises either number fails this file. Lower them as coverage lands.
-MAX_UNCOVERED_WORKTREE = 15
+# that raises either number fails this file. Lower them as coverage lands. worktree.py fell
+# 15 → 3 when the 12 read-dominant `gh` seams landed real coverage (#361, slice 2); the 3 that
+# remain are the write-lifecycle seams (open_pr / close_pr / _promote_adopted_draft).
+MAX_UNCOVERED_WORKTREE = 3
 MAX_UNCOVERED_STORE = 21
 
 
@@ -202,3 +208,33 @@ def test_the_real_tier_actually_runs_against_a_real_binary():
     integ = (_ROOT / "tests" / "test_integration.py").read_text()
     assert "PB_REQUIRE_BR" in integ
     assert re.search(r"requires_br\s*=\s*pytest\.mark\.skipif", integ)
+
+
+def test_the_real_gh_tier_actually_runs_against_real_github():
+    """The `gh`/GitHub REAL entries (#361, slice 2) carry the same guard as the `br` tier: the
+    real-GitHub seam tests must be gated by a `requires_gh` skipif AND CI must set PB_REQUIRE_GH=1
+    so an absent/unusable credential FAILS rather than silently skipping — the failure mode that
+    let #354 (a PAT that cannot POST /check-runs) ship green. Without both, the 12 REAL `gh`
+    classifications above would be as inert as the mock they replaced.
+
+    The read seams must also run on EVERY CI path, not just same-repo PRs: the two writes gate on
+    `requires_gh_write` / PB_GH_ALLOW_WRITES (set only where GITHUB_TOKEN is write-capable) so the
+    read seams still run on fork PRs and pushes. Without that split the whole job had to be gated
+    off wherever a write was impossible — which is how the tier was BYPASSED for fork PRs and
+    unpinned pushes, leaving these REAL classifications uncovered on those paths."""
+    tier = (_ROOT / "tests" / "test_worktree_gh.py").read_text()
+    assert "PB_REQUIRE_GH" in tier
+    assert re.search(r"requires_gh\s*=\s*pytest\.mark\.skipif", tier)
+    # Reads run everywhere; only the writes gate on a write-capable token. This split is what lets
+    # the CI job run unconditionally instead of being bypassed where writes are impossible.
+    assert re.search(r"requires_gh_write\s*=\s*pytest\.mark\.skipif", tier), (
+        "the two write seams must gate on a separate `requires_gh_write` skipif so the read seams "
+        "still run on fork PRs / pushes (a read-only token) rather than bypassing the whole tier"
+    )
+    assert "PB_GH_ALLOW_WRITES" in tier
+    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert "PB_REQUIRE_GH" in ci, "CI must set PB_REQUIRE_GH=1 on the real-GitHub job (r2)"
+    assert "PB_GH_ALLOW_WRITES" in ci, (
+        "CI must gate the write seams behind PB_GH_ALLOW_WRITES so the read seams run on every path "
+        "(fork PRs / pushes) instead of the whole real-GitHub job being bypassed there"
+    )
