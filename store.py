@@ -2297,24 +2297,39 @@ class BeadsBoard:
         truth (#341 r5).
 
         GUARDED by the LIVE condition (#341 review): a `blocked` marker is stamped only
-        while the card is STILL blocked, read fresh here. The alert and this write are
-        separated by an ``await`` in the caller, so a genuine unblock (``clear_blocked``)
-        can land in between — dropping the `blocked` flag AND the prior `notified:` marker
-        it supersedes. Re-adding the marker onto an already-recovered card would resurrect
-        a dedup the recovery edge deliberately dropped and mute the alert for a LATER
-        distinct block. So a card that is no longer blocked is left UNTOUCHED and returned
-        as-is: recording 'the operator was told about a block' is meaningless once the
-        block is gone, and the recovery edge stays authoritative. (Not an error — a
-        recovered card is a normal outcome, so this returns rather than raises; the write
-        only fails, and only then raises, when `br` itself refuses.)"""
-        f = self._require(fid)
+        while the card is STILL blocked. A pre-read guard ALONE cannot enforce that — the
+        guard read and the add are two independent `br` calls, so a genuine unblock
+        (``clear_blocked``, which drops the `blocked` flag AND every `notified:` marker it
+        supersedes) can land in the GAP between them and strand the just-added `blocked`
+        marker on a now-recovered card, muting the alert for that card's LATER distinct
+        block. That gap is the TOCTOU the pre-read check left open. So the guard is
+        enforced by a RE-READ *after* the write: the add is treated as provisional, the
+        live state is re-checked, and a `blocked` marker is ROLLED BACK when the card is no
+        longer blocked. The recovery edge stays authoritative and a stale marker never
+        outlives the recovery that raced it. The rollback remove is itself safe under a
+        concurrent RE-block: a re-block re-adds `blocked`, so the re-read observes it and
+        KEEPS the marker — only a card seen not-blocked after the write is rolled back.
+        (Recording 'the operator was told about a block' is meaningless once the block is
+        gone, so a recovered card is a normal outcome that returns rather than raises; the
+        write only fails, and only then raises, when `br` itself refuses.)"""
         kind = str(kind or "").strip() or "blocked"
+        label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
+        f = self._require(fid)
         if kind == "blocked" and LABEL_BLOCKED not in (f.get("labels") or []):
             return f
-        label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
-        if label not in (f.get("labels") or []):
-            self._run("update", fid, "--add-label", label)
-        return self.get_feature(fid)
+        if label in (f.get("labels") or []):
+            return self.get_feature(fid)  # already marked — idempotent, no self-cancelling re-add
+        self._run("update", fid, "--add-label", label)
+        # Re-read the LIVE state AFTER the add (see the docstring's TOCTOU note): a genuine
+        # unblock that raced the add leaves the marker stranded on a recovered card, so roll
+        # it back off any card no longer blocked. Only the marker THIS call added is undone,
+        # and only when the card is not blocked, so a concurrent re-block keeps its marker.
+        after = self.get_feature(fid)
+        after_labels = after.get("labels") or []
+        if kind == "blocked" and label in after_labels and LABEL_BLOCKED not in after_labels:
+            self._run("update", fid, "--remove-label", label)
+            return self.get_feature(fid)
+        return after
 
     def clear_notified(self, fid: str, kind=None) -> dict:
         """Drop the persisted `notified:<kind>` marker(s) — the genuine-recovery half of

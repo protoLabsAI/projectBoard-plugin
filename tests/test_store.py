@@ -430,16 +430,18 @@ def test_project_exposes_budgets_from_labels(make_board):
 def test_record_notified_adds_the_marker_label(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["notified:blocked"]})
+    # the post-write re-read shows the card STILL blocked → the marker is kept, not rolled back
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth"]})
     b.record_notified("bd-1", "blocked")
     assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
+    assert not any(c[:2] == ("update", "bd-1") and "--remove-label" in c for c in br.calls)  # marker kept
 
 
 def test_record_notified_defaults_the_kind_to_blocked(make_board, monkeypatch):
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
     b.record_notified("bd-1", "")
     assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
@@ -467,6 +469,31 @@ def test_record_notified_skips_a_card_that_already_unblocked(make_board, monkeyp
     out = b.record_notified("bd-1", "blocked")
     assert not br.cmds("update")  # no stale marker re-added onto the recovered card
     assert "notified:blocked" not in (out.get("labels") or [])
+
+
+def test_record_notified_rolls_back_a_marker_stranded_by_a_concurrent_unblock(make_board, monkeypatch):
+    """The TOCTOU the pre-read guard alone left open (#341 review): the guard read still
+    sees `blocked`, but a genuine unblock lands in the GAP before the add — so the add
+    strands `notified:blocked` on a now-recovered card, which would mute the alert for its
+    LATER distinct block. record_notified re-reads AFTER the add and rolls the marker back
+    off the recovered card, so the recovery edge stays authoritative."""
+    br = Br()
+    b = make_board(br)
+    # guard read: the unblock hasn't landed yet, so the card still looks blocked
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
+    # the post-write re-read, then the post-rollback read: the unblock won the race, leaving
+    # only the marker THIS call just added — which must not survive on the recovered card
+    reads = iter(
+        [
+            {"id": "bd-1", "labels": ["notified:blocked"]},  # recovered (no `blocked`) + stray marker
+            {"id": "bd-1", "labels": ["ready"]},  # after rollback: clean
+        ]
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: next(reads))
+    out = b.record_notified("bd-1", "blocked")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls  # the add landed…
+    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls  # …then was rolled back
+    assert "notified:blocked" not in (out.get("labels") or [])  # recovered card left clean
 
 
 def test_clear_notified_drops_the_marker(make_board, monkeypatch):
