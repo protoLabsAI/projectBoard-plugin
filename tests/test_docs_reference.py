@@ -136,3 +136,39 @@ def test_every_config_key_the_code_reads_is_documented():
         f"docs/configuration.md: {missing}. Add them with a default and whether the change "
         f"is live, reload or restart — a stranger configures this board from that table."
     )
+
+
+def test_the_readme_never_documents_a_nonexistent_server_subcommand():
+    """The Install section told a first-time reader to run, as step 2 of 2:
+
+        python -m server plugin enable project_board
+
+    There is no `enable` subcommand. A stranger following the README hit
+    `error: argument cmd: invalid choice: 'enable'` on the second line of setup — the
+    worst place to be wrong, and invisible to every test because nothing executes the
+    README.
+
+    This pins the `python -m server plugin <cmd>` invocations the README claims against
+    the subcommands that actually exist. It is a coarse guard (it does not run the host)
+    but it catches the failure that occurred: a plausible verb that was never implemented.
+    """
+    readme = (_ROOT / "README.md").read_text()
+    claimed = set(re.findall(r"python -m server plugin ([a-z][a-z-]*)", readme))
+    # The real subcommand list, from `python -m server plugin --help` on protoAgent 0.155.x.
+    real = {
+        "new",
+        "new-bundle",
+        "install",
+        "list",
+        "uninstall",
+        "update-bundle",
+        "uninstall-bundle",
+        "sync",
+        "install-deps",
+    }
+    invented = sorted(claimed - real)
+    assert not invented, (
+        f"README documents `python -m server plugin {invented}` — not a real subcommand. "
+        f"Valid: {sorted(real)}. A setup step that cannot be executed is worse than a "
+        f"missing one: the reader assumes they made the mistake."
+    )
