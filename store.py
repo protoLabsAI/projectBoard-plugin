@@ -205,6 +205,17 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
+# The operator-notified marker (#341) — a plain presence label the blocked sweep writes
+# once it has told the operator that a card has stopped moving (loop._notify_operator).
+# The loop's in-process `_notified_blocks` set deduped that alert within one run, but died
+# with the process: a restart rebuilt it EMPTY and re-alerted every still-blocked card the
+# moment the inbox's 300s dedup window aged out. This label is the DURABLE half — present
+# ⇒ the operator was already told about the CURRENT block, so a freshly constructed loop
+# reads it back off the bead and stays quiet, and it is visible in card history/projection
+# as an audit record. Cleared on the genuine recovery edge (`clear_blocked`) so a LATER,
+# distinct block re-arms exactly one new notification rather than staying silent behind a
+# stale marker. Presence-only (no value): the `operator-notified:` comment carries detail.
+LABEL_BLOCKED_NOTIFIED = "blocked-notified"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -2086,7 +2097,36 @@ class BeadsBoard:
             # Drop only the stale infra class — NOT the tier labels, which predate the
             # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        # The genuine recovery edge (#341): whatever the operator was told about THIS
+        # block is now moot, so drop the durable notified marker. A LATER, distinct block
+        # then re-arms one new operator notification instead of being silenced forever by
+        # a stale marker. Only when present, so a routine unblock never burns an extra
+        # `--remove-label` for a card that was auto-healed before it ever escalated.
+        if LABEL_BLOCKED_NOTIFIED in labels:
+            args += ["--remove-label", LABEL_BLOCKED_NOTIFIED]
         self._run(*args)
+        return self.get_feature(fid)
+
+    def record_blocked_notified(self, fid: str, note: str = "") -> dict:
+        """Persist that the operator was TOLD about this card's current block (#341).
+
+        Writes the durable ``blocked-notified`` presence label plus a human-readable
+        ``operator-notified: <note>`` audit comment, so the fact survives a process
+        restart (the loop's in-memory ``_notified_blocks`` set does not) and reads back
+        from the projection/history. Idempotent on the label — re-stamping an already-
+        present label is a no-op ``--add-label`` — so a repeated sweep leaves exactly one.
+
+        UNLIKE the best-effort budget writes, this RAISES on a `br` label failure. The
+        loop's ``_notify_operator`` records the marker only AFTER the inbox accepted the
+        alert, and needs to know if the durable half did NOT land: a swallowed failure
+        would leave a bead silently claiming the operator was notified when its marker was
+        never written. On a raise the caller logs actionable evidence and lets a restart
+        re-alert (the safe direction) rather than pretend a record exists (r5)."""
+        f = self._require(fid)
+        if LABEL_BLOCKED_NOTIFIED not in (f.get("labels") or []):
+            self._run("update", fid, "--add-label", LABEL_BLOCKED_NOTIFIED)
+        note = str(note or "").strip()
+        self.comment(fid, f"operator-notified: {note}" if note else "operator-notified")
         return self.get_feature(fid)
 
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at
@@ -2747,6 +2787,10 @@ class BeadsBoard:
             "pr_url": bead.get("external_ref", ""),
             "assignee": bead.get("assignee", ""),
             "blocked": LABEL_BLOCKED in labels,
+            # The durable operator-notified marker (#341): True once the blocked sweep has
+            # told the operator about this card's current block, so a restart reads the
+            # fact back instead of re-alerting. Cleared on the recovery edge (clear_blocked).
+            "blocked_notified": LABEL_BLOCKED_NOTIFIED in labels,
             "cancelled": LABEL_CANCELLED in labels,
             # archived is VISIBILITY, not a state: the feature stays done/cancelled;
             # the label only drops it from the default list_features projection (#115).

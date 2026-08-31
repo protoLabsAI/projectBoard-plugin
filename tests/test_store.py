@@ -1771,6 +1771,77 @@ def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
     assert up == ("update", "bd-9", "--remove-label", "blocked")
 
 
+# ── operator-notified marker persistence (#341) ─────────────────────────────────
+
+
+def test_record_blocked_notified_stamps_the_marker_and_an_audit_comment(make_board, monkeypatch):
+    """The operator-notified fact is durable operational history: `record_blocked_notified`
+    adds the `blocked-notified` presence label (survives a restart) AND an
+    `operator-notified:` audit comment (reads back from history)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.record_blocked_notified("bd-9", "Board card bd-9 is blocked (auth block): 403 forbidden")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-9", "--add-label", "blocked-notified")
+    # the human-readable half rides a comment, carrying the alert text for the audit trail
+    assert any(c[0] == "comments" and c[1] == "add" and "operator-notified" in c[3] for c in br.calls)
+
+
+def test_record_blocked_notified_is_idempotent_on_the_label(make_board, monkeypatch):
+    """A marker already present is never re-added — a repeated call (or a sweep that
+    raced) leaves exactly one label, not a duplicate."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-notified"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.record_blocked_notified("bd-9", "again")
+    assert br.cmds("update") == []  # no second --add-label for an already-marked card
+
+
+def test_record_blocked_notified_raises_so_a_failed_write_is_never_swallowed(make_board, monkeypatch):
+    """Fail-safe (r5): unlike the best-effort budget writes, a `br` failure here PROPAGATES
+    so the loop learns the durable marker did NOT land — a swallowed failure would leave a
+    bead silently claiming the operator was told when nothing was written."""
+
+    def _boom(*_a, **_k):
+        raise BoardError("br update failed")
+
+    b = make_board(_boom)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
+    with pytest.raises(BoardError):
+        b.record_blocked_notified("bd-9", "x")
+
+
+def test_clear_blocked_drops_the_operator_notified_marker(make_board, monkeypatch):
+    """The genuine recovery edge clears the durable marker so a LATER distinct block can
+    notify again (r3) — the block flag AND the notified marker are dropped together, while
+    an unrelated class label is left alone."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth", "blocked-notified"]},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "blocked" in up and "blocked-notified" in up  # both dropped on recovery
+    assert "blocked-class:auth" not in up  # only the dispatch-infra class is ever dropped
+
+
+def test_the_projection_exposes_the_operator_notified_marker(make_board):
+    """The marker reads back off the feature projection (r2), so an operator/console can
+    tell a blocked card that has been escalated from one that has not."""
+    b = make_board(Br())
+    on = b._project({"id": "bd-1", "status": "open", "labels": ["blocked", "blocked-notified"]})
+    off = b._project({"id": "bd-2", "status": "open", "labels": ["blocked"]})
+    assert on["blocked_notified"] is True
+    assert off["blocked_notified"] is False
+
+
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
 
 

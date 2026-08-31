@@ -53,6 +53,7 @@ from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import (
     BoardError,
+    LABEL_BLOCKED_NOTIFIED,
     LABEL_CHANGES_REQUESTED,
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
@@ -1999,7 +2000,11 @@ class BoardLoop:
                     await self._budget_set(store, fid, "unblock-retry", spent + 1)
                     await asyncio.to_thread(store.clear_blocked, fid)
                     await asyncio.to_thread(store.requeue, fid)
-                    self._notified_blocks.discard(fid)  # a LATER block is news again
+                    # A LATER block is news again — clear BOTH halves of the dedup: the
+                    # in-process memo here, and (via clear_blocked, #341) the durable
+                    # `blocked-notified` marker on the bead, so the next distinct block
+                    # re-arms one new operator notification instead of staying silent.
+                    self._notified_blocks.discard(fid)
                     log.info(
                         "[project_board] blocked sweep: %s auto-unblocked (%s, retry %d/%d): %s",
                         fid,
@@ -2021,27 +2026,58 @@ class BoardLoop:
                     except Exception:  # noqa: BLE001 — the alert matters more than its detail
                         pass
                 title = str(f.get("title") or "").strip()
-                self._notify_operator(
+                await self._notify_operator(
+                    store,
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    labels=f.get("labels"),
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
 
-    def _notify_operator(self, fid: str, text: str) -> None:
-        """Put ONE item in the operator's inbox for a card that has stopped moving.
+    async def _notify_operator(self, store, fid: str, text: str, labels=None) -> None:
+        """Put ONE item in the operator's inbox for a card that has stopped moving, and
+        persist that we did so on the bead (#341).
 
-        Deduped on the feature id so a card that stays blocked across many sweeps is
-        reported once, not every five minutes — the point is to be noticed, and an alert
-        that repeats forever is an alert that gets filtered.
+        Deduped THREE ways, strongest first:
+
+        * the DURABLE ``blocked-notified`` marker on the bead — the whole point of #341.
+          Being told about a blocking card is operational history, not process scratch, so
+          the fact rides the bead and survives a restart. Before this the only dedup was
+          the process-local ``_notified_blocks`` set (rebuilt EMPTY on restart) and the
+          inbox's own 300s window, so a plugin/host restart re-alerted every still-blocked
+          card the moment that window aged out.
+        * this process's ``_notified_blocks`` set — the fast in-run guard, reseeded from
+          the marker so a sweep that already saw the bead needn't re-read it.
+        * the inbox's ``dedup_key`` — the secondary guard, never the sole persistence.
+
+        Fail-safe on persistence (r5): the marker is recorded ONLY after the inbox
+        actually accepted the item, so a delivery that FAILED never leaves a bead claiming
+        the operator was told. A marker write that ITSELF fails is logged with actionable
+        evidence and left UNWRITTEN — a restart re-alerts (the safe direction) rather than
+        a bead silently pretending a durable record exists.
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
         silence a block used to leave."""
         if fid in self._notified_blocks:
             return
-        self._notified_blocks.add(fid)
+        # Durable dedup across restarts: derive the marker from the caller's in-hand
+        # projection labels when given (the sweep already has them — no extra `br show`),
+        # else read the bead. A read hiccup derives "no marker" and re-alerts: fail loud,
+        # never swallow a block because a projection read blinked.
+        if labels is None:
+            try:
+                full = await asyncio.to_thread(store.get_feature, fid)
+                labels = (full or {}).get("labels")
+            except Exception:  # noqa: BLE001 — a marker read must never break the alert
+                labels = None
+        if LABEL_BLOCKED_NOTIFIED in (labels or []):
+            # A prior process already told the operator about THIS block and persisted it;
+            # reseed the process cache so later sweeps skip the re-read, and stay quiet.
+            self._notified_blocks.add(fid)
+            return
         try:
             from inbox import InboxStore  # host module — absent on older hosts
 
@@ -2049,12 +2085,31 @@ class BoardLoop:
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
             InboxStore(str(db)).add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
-            log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
+            # NOTHING was delivered, so DON'T persist a marker claiming otherwise (r5).
+            # Memo it in-process so the WARNING isn't re-emitted every sweep of this run; a
+            # restart (empty cache, no marker) re-tries the inbox rather than swallow it.
+            self._notified_blocks.add(fid)
             log.warning(
                 "[project_board] %s blocked and NOT self-healing (no operator inbox reachable): %s",
                 fid,
                 text[:200],
+                exc_info=True,
+            )
+            return
+        # Delivered. Record the process memo AND the durable, auditable marker so a restart
+        # doesn't re-alert. A marker-write failure must not claim success (r5): log
+        # actionable evidence and leave it unwritten — a restart re-alerts, the safe way.
+        self._notified_blocks.add(fid)
+        try:
+            await asyncio.to_thread(store.record_blocked_notified, fid, text)
+            log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
+        except Exception:  # noqa: BLE001 — the operator WAS told; only the durable record failed
+            log.warning(
+                "[project_board] %s operator notified but blocked-notified marker NOT persisted "
+                "(a restart may re-alert): %s",
+                fid,
+                text[:160],
                 exc_info=True,
             )
 
