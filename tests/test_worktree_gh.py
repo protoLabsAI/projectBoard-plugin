@@ -224,21 +224,28 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
     ``read_review_status`` reads it back off the head-scoped combined-status endpoint. This is the
     exact capability #354 proved a mock cannot validate.
 
-    EXACTLY ONE post per run (r4): GitHub records every status POST as a NEW immutable entry — a
-    re-post is not an in-place update; only the combined-status ROLLUP reports the latest per
-    context — and the permanently-open fixture's head is stable, so posting twice to "prove
-    idempotency" would accrue two records every run toward GitHub's 1000-per-(sha, context) cap.
-    The idempotency that matters here is that the write is CONSTRAINED to one STABLE disposable
-    ``(context, sha)``: it never sprawls new contexts, and the rollup the review gate reads is
-    latest-per-context — so a single post + readback IS the whole capability proof, and repeated
-    CI runs converge on one live signal rather than accumulating distinct ones.
+    WRITES TO A PER-RUN SHA (review r5). GitHub records every status POST as a NEW immutable
+    entry and caps a ``(sha, context)`` pair at 1,000. The first cut wrote once per run to the
+    permanently-open fixture's STABLE head and argued that one post per run "converges on one
+    signal" — but the entries still accrue, so a stable head is a slow time bomb that fails
+    confusingly, years later, on a test nobody has touched. Writing to the commit UNDER TEST
+    removes the accumulation entirely rather than rationing it: that sha is different on every
+    run by construction, so the cap can never be approached.
 
     Head-safe (r5/#328): the readback is scoped by the commit in its URL, so the verdict recorded
     for the fixture head is NEVER attributed to a DIFFERENT head — a wrong (but well-formed) sha
     reads back ``None`` even though the same context IS present on the true head. An EMPTY head
     posts nothing (no verdict against a head the gate never examined) and reads back ``None`` —
     without shelling gh."""
-    slug, head, cwd = gh_fixture.slug, gh_fixture.head_sha, gh_fixture.repo_dir
+    # Write to the PER-RUN sha, never the pinned fixture head (#361 S2 review): GitHub
+    # records every status POST as a NEW immutable entry and caps a (sha, context) pair at
+    # 1,000, so even one write per CI run walks a stable head toward that cap and fails —
+    # confusingly, and years from now. The commit under test differs every run, so this
+    # write cannot accumulate. The READ-only tests still pin the stable fixture head.
+    slug, cwd = gh_fixture.slug, gh_fixture.repo_dir
+    head = gh_fixture.probe_sha
+    if not head:
+        pytest.skip("no probe sha (not in CI and `git rev-parse HEAD` failed)")
 
     ok = await worktree.post_review_status(
         slug,

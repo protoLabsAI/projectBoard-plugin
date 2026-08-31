@@ -159,6 +159,12 @@ class GhFixture(NamedTuple):
     head_sha: str
     head_branch: str
     repo_dir: str
+    # A DIFFERENT sha every run, for the one test that WRITES. GitHub caps statuses at
+    # 1,000 per (sha, context) and records every POST as a new immutable entry — even one
+    # write per CI run walks a pinned head toward that cap and fails, confusingly, years
+    # later. The commit under test is naturally distinct on every run, so writing there
+    # can never accumulate. Falls back to the checkout's HEAD when run outside CI.
+    probe_sha: str
 
 
 def gh_credentialed() -> bool:
@@ -237,4 +243,11 @@ def gh_fixture() -> GhFixture:
         f"unexpected fixture head sha shape: {head_sha!r}"
     )
     assert isinstance(head_branch, str) and head_branch, f"unexpected fixture head branch: {head_branch!r}"
-    return GhFixture(GH_FIXTURE_PR_URL, slug, number, head_sha, head_branch, repo_dir)
+    # The write target: the commit CI is running on (GITHUB_SHA), else this checkout's
+    # HEAD. Distinct per run BY CONSTRUCTION, which is what keeps the status write from
+    # accumulating on one sha — see GhFixture.probe_sha.
+    probe_sha = (os.environ.get("GITHUB_SHA") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", probe_sha):
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, timeout=30)
+        probe_sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    return GhFixture(GH_FIXTURE_PR_URL, slug, number, head_sha, head_branch, repo_dir, probe_sha)
