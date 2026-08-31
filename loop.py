@@ -3181,7 +3181,13 @@ class BoardLoop:
                         # dies below the seam reads as "no model work THIS dispatch" and
                         # blocks for infra triage instead of climbing the tier ladder.
                         result = await coder_seam.dispatch_coder_tapped(
-                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None,
+                            coder,
+                            wt,
+                            prompt,
+                            fid=fid,
+                            gen=1,
+                            tier=tier,
+                            timeout=self.coder_timeout or None,
                             new_dispatch=True,
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
