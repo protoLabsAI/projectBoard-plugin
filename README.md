@@ -563,6 +563,35 @@ aborts nor forgets it, and flipping it back on never starts a second one.
 Both references are covered by `tests/test_docs_reference.py`, which fails if a route or
 tool is added, renamed or removed without the doc changing — so they are worth trusting.
 
+## External-seam coverage — REAL, EXEMPT, or honest debt
+
+A function whose whole job is to make an external system do something is close to untested
+when it is validated only against a mock of that system — that shape shipped three GREEN-
+but-inert fixes in one night (#353, #354, #356). `tests/test_external_seams.py` makes that
+gap impossible to add silently: every seam that shells `gh`/`git`/`br` is CLASSIFIED, by
+AST rather than by name, as **REAL** (exercised against the real binary/API in the
+integration tier), **EXEMPT: `<reason>`** (real coverage genuinely not warranted, reason
+stated), or **UNCOVERED** (honest debt) — and the UNCOVERED count is a ratchet that may
+fall, never rise.
+
+`worktree.py` reached its final contract over #361: **23 REAL / 3 EXEMPT / 0 UNCOVERED**
+(`MAX_UNCOVERED_WORKTREE = 0`). The 11 local-git seams run against a real bare-origin +
+clone (slice 1); the 12 read-dominant `gh` seams run against a pinned, permanently-open PR
+with `PB_REQUIRE_GH=1` so an absent credential FAILS rather than skips (slice 2).
+
+The remaining three are the **PR-lifecycle writes** — `open_pr`, `close_pr`,
+`_promote_adopted_draft` — classified **EXEMPT** (slice 3). Each mutates real PR lifecycle
+state (create a PR, close a PR, promote an adopted draft to ready), so a REAL tier could
+only run by creating and tearing down real PRs against a **disposable sandbox repository**,
+and the operator's decision is not to provision that sandbox now. This is a deliberately
+recorded gap, **not mock confidence** and **not an untested path**: these three run
+repeatedly in normal board operation — every delivery opens a PR, closes stale ones and
+promotes adopted drafts — so they ARE exercised in production. The residual weakness is the
+**feedback channel**: a regression surfaces as a blocked card / operator signal rather than
+red CI. They are never mocked into a false REAL, and no CI job creates, closes or promotes a
+PR in a production repository. If the sandbox is ever provisioned, these flip to REAL and the
+exemption disappears.
+
 ## Layout
 
 | File | What |

@@ -46,19 +46,41 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # permanently-open PR in tests/test_worktree_gh.py (#361, slice 2): CI sets PB_REQUIRE_GH=1 so an
 # absent/unusable credential FAILS instead of skipping — the same posture that made the real-`br`
 # tier catch #353/#356, applied to the read seams a mocked `_gh` was blind to (how #354 shipped).
-# Only the WRITE-lifecycle seams remain UNCOVERED (open_pr / close_pr / _promote_adopted_draft):
-# they mutate real PRs (create/close/ready), so they are not run against the pinned fixture here.
+#
+# The 3 WRITE-lifecycle seams (open_pr / close_pr / _promote_adopted_draft) are classified EXEMPT
+# (#361, slice 3), NOT UNCOVERED. Each mutates real PR lifecycle state — create a PR, close a PR,
+# promote an adopted draft to ready — so a REAL tier could only run by creating and tearing down
+# real PRs against a DISPOSABLE SANDBOX repository, and the operator's decision is not to provision
+# that sandbox now. This is an honest gap, deliberately recorded, not mock confidence: these paths
+# run REPEATEDLY in normal board operation (every delivery opens a PR, closes stale ones, promotes
+# adopted drafts), so they ARE exercised in production. The residual weakness is therefore the
+# FEEDBACK CHANNEL — a regression here surfaces as a blocked card / operator signal rather than red
+# CI — not an absence of runtime execution. They are NOT mocked into a false REAL, and NO CI job
+# creates/closes/promotes a PR in a production repository.
 WORKTREE_SEAMS: dict[str, str] = {
     "_find_marked_comment": "REAL",
-    "_promote_adopted_draft": "UNCOVERED",
+    "_promote_adopted_draft": (
+        "EXEMPT: promotes a real adopted draft PR to ready — REAL coverage would need a disposable "
+        "sandbox repo to hold that PR lifecycle state (operator chose not to provision one now). "
+        "Run on every adopted-draft delivery in production; residual risk is delayed feedback via a "
+        "blocked card / operator signal, not absent execution."
+    ),
     "base_checkout_dirt": "REAL",
-    "close_pr": "UNCOVERED",
+    "close_pr": (
+        "EXEMPT: closes a real PR — REAL coverage would need a disposable sandbox repo to open and "
+        "tear down that PR (operator chose not to provision one now). Run routinely in production; "
+        "residual risk is delayed feedback via a blocked card / operator signal, not absent execution."
+    ),
     "commit_worktree": "REAL",
     "create_worktree": "REAL",
     "delete_remote_branch": "REAL",
     "merge_pr": "REAL",
     "merged_state_worktree": "REAL",
-    "open_pr": "UNCOVERED",
+    "open_pr": (
+        "EXEMPT: creates a real PR — REAL coverage would need a disposable sandbox repo to hold the "
+        "created PR (operator chose not to provision one now). Run on every delivery in production; "
+        "residual risk is delayed feedback via a blocked card / operator signal, not absent execution."
+    ),
     "origin_head_sha": "REAL",
     "post_or_update_pr_comment": "REAL",
     "post_review_status": "REAL",
@@ -129,9 +151,11 @@ STORE_SEAMS: dict[str, str] = {
 
 # The ratchet. These are the counts at the moment the contract was introduced; a change
 # that raises either number fails this file. Lower them as coverage lands. worktree.py fell
-# 15 → 3 when the 12 read-dominant `gh` seams landed real coverage (#361, slice 2); the 3 that
-# remain are the write-lifecycle seams (open_pr / close_pr / _promote_adopted_draft).
-MAX_UNCOVERED_WORKTREE = 3
+# 15 → 3 when the 12 read-dominant `gh` seams landed real coverage (#361, slice 2), then 3 → 0
+# when the last 3 write-lifecycle seams were classified EXEMPT (#361, slice 3): every worktree
+# seam is now REAL or an honestly-recorded EXEMPT, so the worktree UNCOVERED floor is 0 and a
+# newly-added UNCOVERED worktree seam fails this file outright.
+MAX_UNCOVERED_WORKTREE = 0
 MAX_UNCOVERED_STORE = 21
 
 
@@ -192,6 +216,47 @@ def test_uncovered_seams_never_increase():
         "solely against a mock of that effect — the shape that shipped #353, #354 and #356."
     )
     assert s <= MAX_UNCOVERED_STORE, f"store.py uncovered external seams rose to {s} (ratchet: {MAX_UNCOVERED_STORE})"
+
+
+def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
+    """The final worktree coverage contract after #361 S1/S2/S3: 23 REAL, 3 EXEMPT, 0 UNCOVERED.
+
+    Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
+    WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
+    closes or promotes a real PR, so making it REAL would require a disposable sandbox repository the
+    operator has chosen not to provision now. That is a recorded gap, not mock confidence — these
+    paths run on every delivery in production, so the residual risk is delayed feedback (a blocked
+    card / operator signal) rather than red CI, NOT an absence of execution. No mocked test is
+    relabeled REAL and no CI job creates/closes/promotes a PR in a production repo."""
+    real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
+    exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
+    uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
+
+    assert exempt == ["_promote_adopted_draft", "close_pr", "open_pr"], (
+        "the ONLY worktree seams that may be EXEMPT are the three PR-lifecycle writes "
+        "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
+        f"Got EXEMPT={exempt}"
+    )
+    assert len(real) == 23, f"expected 23 REAL worktree seams, got {len(real)}: {real}"
+    assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
+    assert uncovered == [], (
+        f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"
+    )
+    assert MAX_UNCOVERED_WORKTREE == 0
+
+    # Each exemption must record WHY it cannot be REAL (a disposable sandbox repo for real PR state)
+    # AND that the gap is feedback latency, not missing production execution — so the exemption stays
+    # honest and can never be read as "this path is untested/unused".
+    for name in exempt:
+        reason = WORKTREE_SEAMS[name]
+        assert "sandbox" in reason.lower(), (
+            f"{name}: an EXEMPT PR-lifecycle write must state it needs a disposable sandbox "
+            f"repository (it creates/changes real PR state); got {reason!r}"
+        )
+        assert "production" in reason.lower(), (
+            f"{name}: the exemption must record that this path runs in production (the gap is "
+            f"delayed feedback, not absent execution); got {reason!r}"
+        )
 
 
 def test_registry_values_are_wellformed():
