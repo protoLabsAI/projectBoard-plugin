@@ -8851,33 +8851,67 @@ async def test_a_notified_marker_write_failure_fails_safe(monkeypatch, tmp_path,
     assert len(added) == 2
 
 
-async def test_the_notified_memo_follows_the_bead_and_re_arms_when_the_marker_is_gone(monkeypatch):
+async def test_the_notified_memo_follows_the_bead_and_re_arms_when_the_marker_is_gone(monkeypatch, tmp_path):
     """#346 review r3: `record_notified` writes its marker provisionally and rolls it back
     if the card recovered meanwhile. The process-local memo did not follow that rollback,
     so the NEXT distinct block on the same card was suppressed — no alert AND no durable
-    write — until a restart. That is the exact silence #341 exists to prevent.
+    write — until a restart. That is precisely the silence #341 exists to prevent.
 
-    The bead is the source of truth; the memo is a cache of it. An absent marker re-arms."""
-    store = _BlockedStore([_blocked("bd-a", "auth")])  # labels carry NO notified: marker
+    The bead is the source of truth; the memo is a cache of it. An absent marker re-arms.
+
+    NB: this must NOT stub `_notify_operator` — the dedup lives INSIDE it, so stubbing it
+    makes the test pass against the unfixed code. Spy on the inbox instead."""
+    store = _BlockedStore([_blocked("bd-a", "auth")])  # bead carries NO notified: marker
     loop = BoardLoop({"coder": "proto"})
     loop._notified_blocks.add("bd-a")  # a stale memo from a rolled-back provisional write
-    seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+
+    added = []
+    import sys
+    import types as _types
+
+    fake = _types.ModuleType("inbox")
+
+    class _Inbox:
+        def __init__(self, db_path, *, dedup_window_s=300):
+            pass
+
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            added.append(dedup_key)
+
+    fake.InboxStore = _Inbox
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
+
     await loop._recover_blocked(store)
-    assert seen, "a block whose durable marker is gone must alert again"
-    assert "bd-a" in seen[0]
+    assert added == ["blocked:bd-a"], "a block whose durable marker is gone must alert again"
 
 
-async def test_a_durable_marker_still_suppresses_a_repeat_alert(monkeypatch):
-    """The other direction is unchanged: a card whose bead DOES carry the marker was
-    already reported — including across a restart that rebuilt the memo empty — so it
-    stays quiet."""
+async def test_a_durable_marker_still_suppresses_a_repeat_alert(monkeypatch, tmp_path):
+    """The other direction is unchanged: a bead that DOES carry the marker was already
+    reported — including across a restart that rebuilt the memo empty — so it stays quiet
+    and seeds the memo for this process."""
     row = _blocked("bd-a", "auth")
     row["labels"] = ["notified:blocked"]
     store = _BlockedStore([row])
     loop = BoardLoop({"coder": "proto"})
-    seen = []
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text: seen.append(text))
+
+    added = []
+    import sys
+    import types as _types
+
+    fake = _types.ModuleType("inbox")
+
+    class _Inbox:
+        def __init__(self, db_path, *, dedup_window_s=300):
+            pass
+
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            added.append(dedup_key)
+
+    fake.InboxStore = _Inbox
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
+
     await loop._recover_blocked(store)
-    assert not seen
-    assert "bd-a" in loop._notified_blocks  # memo seeded from the bead for this process
+    assert added == []
+    assert "bd-a" in loop._notified_blocks  # seeded from the bead for this process
