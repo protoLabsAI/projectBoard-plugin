@@ -5342,6 +5342,20 @@ def _no_real_post_review_check(monkeypatch):
     monkeypatch.setattr(worktree, "post_review_check", _noop)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_read_review_check(monkeypatch):
+    """#323: the reconcile now reads back the head-pinned ``QA panel`` verdict via
+    ``worktree.read_review_check`` to ingest a trusted current-head QA PASS. Pin it to the
+    fail-closed default (None = no provable verdict) so no reconcile test in this module
+    shells a real ``gh api``; a #323 test that exercises the promotion installs its own
+    stub. Mirrors the ``_no_real_pr_head_sha`` / ``_no_real_post_review_check`` guards."""
+
+    async def _none(*a, **k):
+        return None
+
+    monkeypatch.setattr(worktree, "read_review_check", _none)
+
+
 def _record_review_checks(monkeypatch):
     """Install a recorder over ``worktree.post_review_check`` and return the list it
     appends each call's kwargs (+ positional slug/head) to — the seam the #347 gate tests
@@ -6310,6 +6324,293 @@ async def test_reinject_review_feedback_never_clobbers_a_live_in_memory_copy(mon
     await loop._reconcile_prs()
     assert store.state == "ready"  # still recovered
     assert loop._ci_feedback["bd-1"] == "LIVE in-memory feedback"  # the live copy is untouched
+
+
+# ── #323: reconcile a trusted current-head QA PASS into local review state ────────
+
+
+_QA_PR = "https://github.com/o/r/pull/9"
+
+
+def _qa_loop(monkeypatch, *, head, verdict, cfg=None):
+    """A review_gate loop whose live PR head is ``head`` and whose head-pinned QA read
+    (``worktree.read_review_check``) returns ``verdict`` (a dict or None) for that exact
+    head — the two worktree reads #323's inbound reconcile turns on."""
+    loop = BoardLoop({"review_gate": True, "merge_poll": False, **(cfg or {})})
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(head))
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        return verdict if head_sha == head else None
+
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    return loop
+
+
+async def test_trusted_qa_pass_repairs_changes_requested_to_clean(monkeypatch):
+    """r1: a promoted, current-head QA PASS repairs a stale ``changes-requested`` to
+    ``review-clean`` and clears the reviewed-head stamp (a clean verdict pins no head). It
+    ADOPTS the external verdict — no internal review is invented."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
+    assert "review-clean" in store.labels and "changes-requested" not in store.labels
+    assert not any(l.startswith("reviewed-head:") for l in store.labels)  # clean pins no head
+    assert store.review_states[-1][0] == "review-clean"
+
+
+async def test_trusted_qa_pass_repairs_absent_review_state_to_clean(monkeypatch):
+    """r1: an in_review card with NO review substate (pre-upgrade / operator unblock / inert
+    gate — merge_posture's "no review-clean verdict") is likewise repaired to review-clean
+    on a trusted current-head PASS."""
+    store = _RoundTripStore()
+    store.labels = []
+    loop = _qa_loop(monkeypatch, head="h1", verdict={"conclusion": "success", "head_sha": "h1", "passed": True})
+    assert await loop._reconcile_trusted_qa_pass(store, {"id": "bd-1", "labels": []}, _QA_PR, "/repo") is True
+    assert "review-clean" in store.labels
+
+
+async def test_trusted_qa_fail_never_promotes(monkeypatch):
+    """r2: a trusted, current-head FAIL is authoritative the OTHER way — it never promotes
+    or clears the blocking ``changes-requested`` state."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = _qa_loop(
+        monkeypatch, head="aaa111", verdict={"conclusion": "failure", "head_sha": "aaa111", "passed": False}
+    )
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]  # untouched
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_trusted_qa_none_fails_closed(monkeypatch):
+    """r3: an unreadable / absent / malformed / ambiguous / another-head marker — all of
+    which ``read_review_check`` collapses to None — leaves the card unpromoted. A PASS for
+    another head cannot alter review state (this is also the stale-head case: the live head
+    moved, so there is no ``QA panel`` verdict for the current head)."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = _qa_loop(monkeypatch, head="bbb222", verdict=None)  # no readable verdict for the live head
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_trusted_qa_fails_closed_on_an_unreadable_live_head(monkeypatch):
+    """r3: the live PR head can't be read (a gh hiccup) → fail closed; a verdict is never
+    adopted without knowing which commit is current, and the check is not even consulted."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(""))  # unreadable
+    consulted = []
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        consulted.append(head_sha)
+        return {"conclusion": "success", "head_sha": head_sha, "passed": True}
+
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    feature = {"id": "bd-1", "labels": ["changes-requested"]}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert consulted == []  # short-circuited before reading the check
+
+
+async def test_trusted_qa_pass_does_not_overwrite_an_in_flight_gate(monkeypatch):
+    """r4: while the internal review gate is in flight (or a drive/worktree is live), the
+    reconcile must NOT adopt an external PASS — the running gate owns the verdict it is about
+    to land. Even a valid current-head PASS is skipped, under EACH liveness signal."""
+    verdict = {"conclusion": "success", "head_sha": "aaa111", "passed": True}
+    # (a) the gate is mid-transition (its own set-changes-requested not yet requeued)
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict=verdict)
+    loop._review_inflight.add("bd-1")
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels
+    # (b) a live drive owns the worktree
+    loop._review_inflight.discard("bd-1")
+    loop._inflight_files["bd-1"] = {("default", "a.py")}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_trusted_qa_reconcile_is_idempotent_on_a_pending_or_clean_card(monkeypatch):
+    """r4/r5: a ``review-pending`` card (the internal gate's LIVE verdict) is never touched,
+    and a ``review-clean`` card is a no-op — repeated polls converge, they don't churn or
+    overwrite the internal gate's own verdicts."""
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    for existing in (["review-pending"], ["review-clean"]):
+        store = _RoundTripStore()
+        store.labels = list(existing)
+        feature = {"id": "bd-1", "labels": list(existing)}
+        assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+        assert store.labels == existing  # unchanged
+        assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_trusted_qa_reconcile_is_a_noop_when_the_gate_is_off(monkeypatch):
+    """r5: with review_gate off there is no review substate to repair — the inbound reconcile
+    is inert (it never manufactures a review-clean the board never gated for)."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested"]
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    loop.review_gate = False
+    feature = {"id": "bd-1", "labels": ["changes-requested"]}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels
+
+
+async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_reviews(monkeypatch):
+    """r1/r5 end-to-end: a full reconcile of an in_review PR stuck in ``changes-requested``
+    for the SAME (unchanged) head — so #328 does not re-arm and #340 would otherwise requeue
+    the "stranded" round — instead adopts a trusted, promoted current-head QA PASS: it repairs
+    to ``review-clean``, clears the stamp, requeues nothing, and never re-runs the internal
+    review gate."""
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return "clean.\n```json\n[]\n```", None
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"  # unchanged since the verdict → NOT a #328 head move
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        assert head_sha == "aaa111"  # the loop asks about the LIVE head
+        return {"conclusion": "success", "head_sha": head_sha, "passed": True}
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert "review-clean" in store.labels and "changes-requested" not in store.labels
+    assert not any(l.startswith("reviewed-head:") for l in store.labels)
+    assert runs == []  # adopted the external PASS — the internal gate never re-ran
+    assert not any(c[0] == "requeue" for c in store.calls)  # #340 did not requeue it either
+
+
+async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_trust_path(monkeypatch):
+    """r5/ordering: a ``changes-requested`` card whose head actually MOVED takes #328's
+    fresh-internal-review path, NOT the #323 trust path — even when a promoted PASS exists for
+    the new head. #328 flips it to ``review-pending`` first, which #323 then skips, so the
+    internal gate (finding a blocker here) is what lands the verdict."""
+    _inject_fake_findings(monkeypatch)
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return f"brief…\n```json\n{_BLOCKER}\n```", None  # the internal gate rejects the new head
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"  # an external push moved the head off the reviewed one
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        return {"conclusion": "success", "head_sha": head_sha, "passed": True}  # a PASS is available…
+
+    async def _diff(url, *, cwd=".", max_chars=4000):
+        return "diff --git a/a.py b/a.py"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url]  # #328 re-armed → exactly one fresh internal review for the new head
+    assert "review-clean" not in store.labels  # …but the QA trust path did NOT promote it
+    assert "changes-requested" in store.labels  # the internal gate's own verdict stands
+
+
+def _automerge_reconcile_env(monkeypatch, *, head, verdict, mss="CLEAN"):
+    """Stub the worktree reads a full reconcile+auto-merge pass makes for #323: the PR is
+    OPEN, its live head is ``head``, its head-pinned QA read returns ``verdict``, and GitHub
+    reports ``mss`` (CLEAN → mergeable, not a draft). Records each ``merge_pr`` call."""
+    merges = []
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _pr_head(url, *, cwd="."):
+        return head
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        return verdict if head_sha == head else None
+
+    async def _info(url, *, cwd="."):
+        return {"mergeStateStatus": mss, "isDraft": False}
+
+    async def _merge(url, *, method="squash", cwd="."):
+        merges.append((url, method))
+        return (True, "")
+
+    async def _delete(repo, branch):
+        return True
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _pr_head)
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "pr_merge_info", _info)
+    monkeypatch.setattr(worktree, "merge_pr", _merge)
+    monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
+    return merges
+
+
+async def test_reconcile_promotes_then_auto_merges_a_trusted_current_head_pass(monkeypatch):
+    """r1/r3 end-to-end: an in_review PR with an ABSENT review verdict (auto-merge held on
+    "no review-clean verdict") gets a trusted, promoted current-head QA PASS → the reconcile
+    repairs it to ``review-clean`` and the ORDINARY auto-merge gate then lands the PR."""
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = []  # absent verdict → #328/#340 never fire; auto-merge is held pre-promotion
+    loop = BoardLoop({"review_gate": True, "auto_merge": True, "merge_poll": False})
+    merges = _automerge_reconcile_env(
+        monkeypatch, head="h1", verdict={"conclusion": "success", "head_sha": "h1", "passed": True}
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert "review-clean" in store.labels  # r1: repaired
+    assert merges == [(store.pr_url, "squash")]  # r3: the ordinary merge gate then landed it
+
+
+async def test_reconcile_fail_closed_leaves_auto_merge_held(monkeypatch):
+    """r3 end-to-end: with no provable current-head verdict (``read_review_check`` → None),
+    the absent review substate is NOT repaired — auto-merge stays held on "no review-clean
+    verdict" and the PR is never merged."""
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = []
+    loop = BoardLoop({"review_gate": True, "auto_merge": True, "merge_poll": False})
+    merges = _automerge_reconcile_env(monkeypatch, head="h1", verdict=None)  # no promotion evidence
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert "review-clean" not in store.labels  # unpromoted
+    assert merges == []  # auto-merge held — the fail-closed card never merged
 
 
 # ── surfaced unrunnable-gate causes (#180) ───────────────────────────────────────

@@ -2642,6 +2642,24 @@ class BoardLoop:
                         and await self._rearm_review_for_new_head(store, f, pr_url, repo)
                     ):
                         f = await asyncio.to_thread(store.get_feature, fid) or f
+                    # The INBOUND half of the review gate (#323): a trusted, promoted QA
+                    # PASS for the PR's CURRENT head repairs a stale changes-requested or an
+                    # absent local review verdict to review-clean, so the ordinary merge
+                    # gates can proceed — the counterpart to #347's head-pinned publish.
+                    # Runs AFTER #328 (a genuine head move takes the fresh-internal-review
+                    # path, never this trust path — #328 flipped it to review-pending, which
+                    # this edge then skips) and BEFORE #340 (a proven current-head PASS
+                    # supersedes resuming an internal fix round; on a promotion the refreshed
+                    # snapshot drops changes-requested so #340 short-circuits this pass). Fails
+                    # closed on anything unproven, so the un-promoted card still can't merge.
+                    # The board_state re-read guards against #328 / the CI reconcile having
+                    # just moved the card out of in_review this same pass.
+                    if (
+                        self.review_gate
+                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
+                        and await self._reconcile_trusted_qa_pass(store, f, pr_url, repo)
+                    ):
+                        f = await asyncio.to_thread(store.get_feature, fid) or f
                     # The RECOVERY half of the review gate (#340): a shutdown/restart can
                     # abort a fix round mid-transition and leave the card in_review +
                     # changes-requested with the review gate's requeue never landed — no
@@ -4060,6 +4078,90 @@ class BoardLoop:
             log.warning(
                 "[project_board] %s reviewed-head stamp (%s) not persisted", fid, sha or "(clear)", exc_info=True
             )
+
+    # ── inbound trusted-QA reconcile on the current head (#323) ───────────────
+    async def _reconcile_trusted_qa_pass(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """Ingest a trusted, promoted QA PASS for the PR's CURRENT head and repair a stale
+        ``changes-requested`` or ABSENT local review verdict to ``review-clean`` (#323) —
+        the inbound counterpart of #347's head-pinned publish.
+
+        #347 makes the board's own gate verdict a reliable, head-pinned ``QA panel`` check
+        run. This reads that SAME check back (``worktree.read_review_check`` — the identity
+        plumbing, not a second parsed signal): when a PROMOTED PASS whose recorded immutable
+        head equals the LIVE PR head exists, the local review substate is repaired to
+        ``review-clean`` so the ordinary merged-state / CI / auto-merge gates decide the
+        rest. It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a
+        blocking state to clean (never manufactures a blocking one).
+
+        Fails CLOSED, leaving the card exactly as it was (no promotion, so the merge edge
+        still can't touch it), on everything that is not a provable current-head PASS: a
+        FAIL never promotes or clears a blocking state (r2); a PASS for another head,
+        unreadable / malformed / ambiguous marker data, or no promotion evidence changes
+        nothing (r3). NEVER races the internal gate (r4/r5): it skips a ``review-pending``
+        card (the gate owns that live verdict) and a ``review-clean`` card (already promoted
+        → idempotent no-op), and — the same liveness guard the stranded-fix recovery (#340)
+        uses — any card with a live drive, a claimed worktree, or an in-flight gate. Returns
+        True only when it repaired the substate; the caller then refreshes its snapshot so
+        the downstream #340 / merge edges read the cleaned labels this same pass."""
+        fid = feature["id"]
+        if not self.review_gate:
+            return False  # no gate ⇒ no review substate to repair
+        labels = set(feature.get("labels") or [])
+        # review-pending → the internal gate owns the live verdict (r4/r5); review-clean →
+        # already promoted, a repeated poll is a no-op (idempotent). Only a stale rejection
+        # (changes-requested) or an ABSENT verdict (pre-upgrade card, operator unblock, inert
+        # gate — merge_posture's "no review-clean verdict") is repairable.
+        if LABEL_REVIEW_PENDING in labels or LABEL_REVIEW_CLEAN in labels:
+            return False
+        stale_rejection = LABEL_CHANGES_REQUESTED in labels
+        # A live fix round / in-flight gate is about to land its OWN verdict — adopting an
+        # external PASS under it would overwrite that in-flight result (r4). The three signals
+        # span the whole window a fix round is alive in this process (mirrors #340).
+        if live_drive(fid) is not None or fid in self._inflight_files or fid in self._review_inflight:
+            return False
+        head = await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head:
+            return False  # unreadable live head → fail closed; the next poll retries
+        _number, repo_slug = _parse_pr_url(pr_url)
+        if not repo_slug:
+            return False  # no repo identity → fail closed
+        verdict = await worktree.read_review_check(repo_slug, head, cwd=repo)
+        if verdict is None:
+            # Unreadable / absent / malformed / ambiguous / another-head marker → fail closed,
+            # leaving the card unpromoted (r3).
+            return False
+        if not verdict.get("passed"):
+            # A trusted, current-head FAIL is authoritative the OTHER way: it must never
+            # promote or clear a blocking state (r2). Leave changes-requested / absence as is.
+            log.info(
+                "[project_board] %s trusted QA verdict for current head %s is %s — not promoting (fail closed): %s",
+                fid,
+                head[:12],
+                verdict.get("conclusion"),
+                pr_url,
+            )
+            return False
+        # A trusted, PROMOTED, current-head PASS. Adopt it as the local clean verdict — the
+        # same substate a clean internal gate would have set, so the merge edge can proceed.
+        note = (
+            f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('conclusion')}) is promoted for "
+            f"the current PR head {head[:12]} — "
+            + ("the stale changes-requested verdict" if stale_rejection else "no local review verdict was recorded")
+            + " has been repaired to review-clean; the ordinary merge gates decide the rest"
+        )
+        await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_CLEAN, note=note)
+        # A clean verdict pins no head — clear any reviewed-head stamp so a later
+        # changes-requested can't be judged stale against a dead head, exactly as the internal
+        # clean path does (#328), and reset the fix budget the adopted PASS makes moot.
+        await self._stamp_reviewed_head(store, fid, "")
+        await self._budget_reset(store, fid, "review-fix")
+        log.info(
+            "[project_board] %s reconciled a trusted current-head QA PASS (%s) → review-clean: %s",
+            fid,
+            head[:12],
+            pr_url,
+        )
+        return True
 
     async def _publish_gate_check(
         self, fid: str, pr_url: str, repo: str, head_sha: str, *, conclusion: str, title: str, summary: str

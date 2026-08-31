@@ -1413,3 +1413,130 @@ async def test_post_review_check_lookup_error_falls_back_to_create(monkeypatch):
         await worktree.post_review_check(_SLUG, _HEAD, conclusion="success", title="t", summary="s", cwd="/repo")
         is True
     )
+
+
+# ── #323: read back the head-pinned QA verdict (read_review_check) ────────────────
+
+
+def _checks_gh(runs):
+    """A `_gh` stub for read_review_check: answers the GET …/commits/<sha>/check-runs
+    lookup (jq'd to `.check_runs`, so gh emits just the array) with `runs`."""
+    import json as _json
+
+    async def _gh(*args, cwd, timeout=60):
+        assert args[0] == "api" and "/commits/" in args[1] and "/check-runs" in args[1]
+        return (0, _json.dumps(runs), "")
+
+    return _gh
+
+
+def _qa_run(name="QA panel", head=_HEAD, status="completed", conclusion="success", rid=7):
+    return {"name": name, "head_sha": head, "status": status, "conclusion": conclusion, "id": rid}
+
+
+async def test_read_review_check_returns_a_current_head_pass(monkeypatch):
+    """r1: exactly one completed `QA panel` run pinned to the queried head with a success
+    conclusion is a TRUSTED, PROMOTED, current-head PASS."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="success")]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") == {
+        "conclusion": "success",
+        "head_sha": _HEAD,
+        "passed": True,
+    }
+
+
+async def test_read_review_check_reports_a_current_head_fail_as_not_passed(monkeypatch):
+    """r2: a completed current-head FAIL is a real, trusted verdict (not None) — but
+    `passed` is False, so a caller never promotes off it. action_required (an active fix
+    round's non-success) is likewise not a pass."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="failure")]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") == {
+        "conclusion": "failure",
+        "head_sha": _HEAD,
+        "passed": False,
+    }
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="action_required")]))
+    v = await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo")
+    assert v["passed"] is False and v["conclusion"] == "action_required"
+
+
+async def test_read_review_check_none_when_absent(monkeypatch):
+    """r3: no `QA panel` run on the head (only unrelated checks, or none at all) → None —
+    there is no promotion evidence to ingest."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(name="build"), _qa_run(name="lint")]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_check_none_for_a_pass_pinned_to_another_head(monkeypatch):
+    """r3 (stale head): a `QA panel` PASS whose OWN recorded immutable head is a DIFFERENT
+    commit is not a verdict for the current head — fail closed (the currency invariant of
+    #328, full-sha exact)."""
+    other = "ffffffffffffffffffffffffffffffffffffffff"
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(head=other, conclusion="success")]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_check_none_when_ambiguous(monkeypatch):
+    """r3: MORE THAN ONE `QA panel` run on the same head is ambiguous — the caller can't tell
+    which is authoritative, so fail closed (mirrors #347 keeping a single record)."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(rid=1), _qa_run(rid=2)]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_check_none_when_still_running(monkeypatch):
+    """A `QA panel` run still in flight (not `completed`) is not yet a PROMOTED verdict → None:
+    the caller waits rather than adopting a half-formed result."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(status="in_progress", conclusion=None)]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_check_none_when_completed_without_a_conclusion(monkeypatch):
+    """Malformed: a completed run carrying no conclusion is not a readable verdict → None."""
+    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(status="completed", conclusion=None)]))
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_check_none_on_empty_slug_or_head_without_shelling_gh(monkeypatch):
+    """r3: an empty slug or head means the caller can't say which repo/commit to read — None,
+    and not even a gh call fires (short-circuit)."""
+    called = []
+
+    async def _spy(*a, cwd, timeout=60):
+        called.append(a)
+        return (0, "[]", "")
+
+    monkeypatch.setattr(worktree, "_gh", _spy)
+    assert await worktree.read_review_check("", _HEAD, cwd="/repo") is None
+    assert await worktree.read_review_check(_SLUG, "", cwd="/repo") is None
+    assert called == []
+
+
+async def test_read_review_check_none_on_unreadable_or_malformed(monkeypatch):
+    """Every unreadable case fails closed to None: a gh non-zero, a raised WorktreeError, and
+    non-JSON / non-list (a dict, not the jq'd array) output."""
+
+    async def _rc1(*a, cwd, timeout=60):
+        return (1, "", "not found")
+
+    monkeypatch.setattr(worktree, "_gh", _rc1)
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _raise(*a, cwd, timeout=60):
+        raise worktree.WorktreeError("gh timed out")
+
+    monkeypatch.setattr(worktree, "_gh", _raise)
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _garbage(*a, cwd, timeout=60):
+        return (0, "not json", "")
+
+    monkeypatch.setattr(worktree, "_gh", _garbage)
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _obj(*a, cwd, timeout=60):
+        return (0, '{"check_runs": []}', "")  # a dict, not the jq'd array
+
+    monkeypatch.setattr(worktree, "_gh", _obj)
+    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
