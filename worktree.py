@@ -226,10 +226,19 @@ async def create_worktree(
     start = f"origin/{base}"
     if resume:
         # Best-effort: fetch the feature branch and start from it when it exists, so the
-        # coder opens its own prior work instead of a clean base.
-        await _git(repo, "fetch", "origin", branch)
+        # coder opens its own prior work instead of a clean base. The FETCH's exit code —
+        # not just whether ``origin/<branch>`` resolves — decides. A branch deleted on the
+        # remote (a squash-merge auto-delete, a manual tidy) leaves a STALE
+        # ``origin/<branch>`` remote-tracking ref that a single-ref ``git fetch origin
+        # <branch>`` reports "couldn't find remote ref" for yet never prunes; a bare
+        # ``rev-parse`` then still resolves the dead sha, and starting from it rebuilds the
+        # fix round off a stale ref — #337's rebuild loop, one clone behind the delete
+        # (proven against real git, not just the mock the fix originally shipped with).
+        # Requiring the fetch to have SUCCEEDED makes a gone branch fall back to ``base``:
+        # resume is an optimisation, never a precondition.
+        rc_fetch, _fo, _fe = await _git(repo, "fetch", "origin", branch)
         rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
-        if rc == 0:
+        if rc_fetch == 0 and rc == 0:
             start = f"origin/{branch}"
             log.info("[project_board] %s resuming existing branch %s for a fix round", fid, branch)
         else:
