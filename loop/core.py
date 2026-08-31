@@ -97,6 +97,16 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # review, so the loop can't pile up PRs faster than they merge (flooding CI /
         # reviewers). 0 = unlimited. LIVE (see max_concurrent).
         self.max_pending_reviews = _knob_int(self.cfg, "max_pending_reviews", 5, floor=0)
+        # Ready-queue skip livelock bound (#356): how many CONSECUTIVE ready-queue scans a
+        # single card may be passed over for the SAME unresolved skip reason (a lost
+        # claim/assignment race, most importantly) before the loop flags it blocked with the
+        # evidence — so an indefinitely-unclaimable "ready" card enters the existing
+        # blocked-sweep/operator-escalation path instead of retrying forever invisibly. Must
+        # be > 1 so a single/transient claim race never blocks prematurely (r5); 0 disables
+        # the bound entirely (pre-#356 behavior). Structurally self-resolving skips (a
+        # hot-file wait on an in-flight build, an already-blocked/other-state card, a
+        # preflight hold) are NOT counted toward it — see `_bound_ready_skips`.
+        self.ready_skip_max = max(0, int(self.cfg.get("ready_skip_max", 12)))
         # Dependency gate: "merge" (default) — a dependent waits for every blocker to
         # merge (done); "review" — a NON-foundation blocker releases its dependents at
         # in_review (more parallelism, at the risk of building on un-merged code).
@@ -349,6 +359,15 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # files_to_modify of each in-flight feature, for the hot-file overlap guard
         # (don't run two parallel coders that edit the same file → sure conflict).
         self._inflight_files: dict[str, set[tuple[str, str]]] = {}  # fid -> {(project, path)} (#197)
+        # Ready-queue skip livelock counters (#356): fid → (reason, consecutive_count). A card
+        # passed over for the SAME unresolved reason on back-to-back scans accumulates here;
+        # past `ready_skip_max` it is flagged blocked (→ the blocked sweep / operator alert)
+        # so a ready-but-unclaimable card can't retry forever. Per-run in-memory (a restart
+        # re-counts from zero — fine: a genuine livelock immediately re-accumulates, and a
+        # transient race that cleared shouldn't carry a stale count). Reset the moment a card
+        # makes progress (claimed, parked, its reason/state changes, it leaves the queue) — so
+        # a one-off claim race never blocks (r5). See `_bound_ready_skips`.
+        self._skip_streaks: dict[str, tuple[str, int]] = {}
         # #311: at most ONE self-dispatch (a task the board runs through HOST.invoke as
         # its own agent) in flight per board — a second self-assigned task parks rather
         # than invoking the host recursively. Set before the self-drive is spawned and

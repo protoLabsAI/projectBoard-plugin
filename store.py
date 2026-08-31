@@ -1647,6 +1647,55 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
+    def claim_task(self, fid: str, assignee: str = "") -> dict | None:
+        """Claim a ready TASK bead → `in_progress` while PRESERVING its assignee (#356) —
+        the task sibling of ``claim``.
+
+        A task's ``assignee`` is its DISPATCH TARGET (a sister agent, or ``self``/``agent``
+        for first-party work), NOT the actor identity a coding claim stamps. So it cannot
+        ride ``br update --claim``, which reassigns the bead to the board actor AND refuses
+        an already-assigned bead: every ready task assigned to any target OTHER than the
+        actor was rejected by ``--claim`` and retried forever as a ``claim-race`` — the
+        exact livelock #356 fixes. #333/#334 already established that a task's assignee must
+        survive requeue/blocked transitions; this closes the last edge (the claim itself)
+        that still reassigned it.
+
+        Transition (NO ``--claim``): flip status ready→in_progress and drop the ``ready``
+        label in ONE update so it projects as in_progress, leaving the existing assignee
+        untouched; a non-empty ``assignee`` is re-stamped idempotently so the caller can pin
+        the resolved dispatch target (the bead normally already carries it). Returns the
+        claimed feature, or None if it is no longer claimable.
+
+        Race safety without the ``--claim`` CAS (the target assignee makes that primitive
+        unavailable): the pre-read state guard refuses a stale/non-ready card (no stale ready
+        card is claimed), and the post-write re-read CONFIRMS the transition landed as
+        in_progress — a genuinely concurrent state change that moved the card first leaves it
+        in some other state, so we return None and the caller retries/classifies rather than
+        double-driving a card another claimer owns. A coding feature keeps ``claim``'s atomic
+        ``--claim`` actor-assignment untouched (r2)."""
+        f = self.get_feature(fid)
+        if f is None or f["board_state"] != "ready":
+            return None
+        # NOT --claim: preserve the dispatch target. `in_progress` is the same status token
+        # `br list --status in_progress` filters on and the projection reads back — beads
+        # accepts it as a `--status` value (verified via the list projection). The assignee
+        # is re-stamped ONLY when passed and non-empty — never cleared, so an unassigned
+        # (human/parked) task stays unassigned exactly as before.
+        args = ["update", fid, "--status", "in_progress", "--remove-label", LABEL_READY]
+        if str(assignee or "").strip():
+            args += ["--assignee", assignee.strip()]
+        try:
+            self._run(*args)
+        except BoardError as exc:
+            log.info("[project_board] %s task not claimable (state changed under the claim?): %s", fid, exc)
+            return None
+        got = self.get_feature(fid)
+        if got is None or got["board_state"] != "in_progress":
+            # A concurrent change overtook the transition (moved it out of in_progress) — lost
+            # the race. Surface None so the caller retries rather than driving a stale card.
+            return None
+        return got
+
     # ── In Progress → In Review ───────────────────────────────────────────────
     def open_review(self, fid: str, *, pr_url: str = "") -> dict:
         """In Progress → In Review. ``pr_url`` is still REQUIRED for a coding feature

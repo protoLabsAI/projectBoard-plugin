@@ -94,6 +94,20 @@ def _ready_feature(board, tmp_path, title="Ready feature"):
     return board.mark_ready(f["id"])
 
 
+def _ready_task(board, *, assignee, title="Ready task"):
+    """A task-type bead (#217) that passes the REAL Ready gate — spec + AC, NO files (a
+    task ships a deliverable, not repo edits) — pre-assigned to a dispatch target so the
+    claim path sees a bead already assigned to someone other than the actor."""
+    f = board.create_feature(
+        title,
+        spec="do the task",
+        acceptance_criteria="- WHEN done THE SYSTEM SHALL deliver",
+        issue_type="task",
+        assignee=assignee,
+    )
+    return board.mark_ready(f["id"])
+
+
 # ── label constraints (#135): every label the plugin emits, at realistic values ──
 
 
@@ -241,6 +255,33 @@ def test_mixed_type_projection_includes_tasks_excludes_structural_beads(board):
     assert epic["id"] not in projected  # …structural beads are OUT
     assert milestone["id"] not in projected
     assert projected[task["id"]]["issue_type"] == "task"  # and the task projects as a task
+
+
+@requires_br
+def test_task_claim_preserves_assignee_where_br_claim_refuses(board):
+    """#356 (r8): a ready TASK pre-assigned to a non-actor dispatch target is REFUSED by the
+    atomic ``br update --claim`` — it reassigns to the actor and rejects an already-assigned
+    bead, the forever-``claim-race`` livelock this fix ends — while the new ``claim_task``
+    edge reaches ``in_progress`` WITHOUT changing the assignee. Proven on real ``br``: the
+    fake ``_run`` tier has no ``--claim`` CAS, so this class is exactly what it is blind to.
+    Red-reachable: routing the task through the actor-assigning ``claim`` makes the
+    assignee-preservation assertion FAIL (it lands ``test``, not ``agent-bot``)."""
+    # 1) reproduce the refusal — the actor-reassigning --claim cannot claim a target-assigned task
+    probe = _ready_task(board, assignee="agent-bot", title="Probe")
+    with pytest.raises(BoardError):
+        board._run("update", probe["id"], "--claim")  # already assigned to agent-bot → real br refuses
+    assert board.get_feature(probe["id"])["assignee"] == "agent-bot"  # untouched by the refusal
+    assert board.get_feature(probe["id"])["board_state"] == "ready"  # still ready (the livelock: retried forever)
+
+    # 2) the new edge reaches in_progress and PRESERVES the dispatch target
+    task = _ready_task(board, assignee="agent-bot", title="Real")
+    claimed = board.claim_task(task["id"], assignee="agent-bot")
+    assert claimed is not None
+    assert claimed["board_state"] == "in_progress"  # transitioned off ready…
+    assert claimed["assignee"] == "agent-bot"  # …WITHOUT reassigning to the actor
+    assert LABEL_READY not in (claimed["labels"] or [])  # the ready label was dropped
+    # (a coding feature's atomic --claim actor-assignment is exercised on real `br` by
+    #  test_json_shape_ready_for_claim_next_ready / _find_by_external_ref, unchanged by r2.)
 
 
 @requires_br

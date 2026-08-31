@@ -2870,6 +2870,19 @@ class _TaskStore:
             return None
         return dict(f, board_state="in_progress", assignee=assignee or f.get("assignee", ""))
 
+    def claim_task(self, fid, assignee=""):
+        # #356: the task claim edge — PRESERVES the dispatch target (assignee) instead of
+        # reassigning to the actor. The loop's task/self dispatch now routes here, never
+        # through `claim` (which the real store implements with the actor-reassigning,
+        # already-assigned-refusing `--claim`).
+        if fid in self.claimed:
+            return None
+        self.claimed.append(fid)
+        f = next((x for x in self._features if x["id"] == fid), None)
+        if f is None:
+            return None
+        return dict(f, board_state="in_progress", assignee=assignee or f.get("assignee", ""))
+
     def list_features(self, state=None):
         return []
 
@@ -3564,6 +3577,194 @@ async def test_spawn_ready_logs_a_claim_race_skip(monkeypatch, caplog):
     assert payload["selected"] == ["bd-lo"]
     skip = {s["fid"]: s for s in payload["skipped"]}
     assert skip["bd-hi"]["reason"] == "claim-race"
+
+
+# ── #356: task claim preserves the dispatch target; ready-queue skip livelock bound ──
+
+
+class _LivelockTaskStore(_TaskStore):
+    """A task the puller can never claim: ``claim_task`` loses the race every scan, so the
+    card stays ``ready`` and is skipped ``claim-race`` on back-to-back ``_spawn_ready``
+    calls — the livelock #356 bounds. ``refuse`` names the perpetually-unclaimable ids;
+    clearing it lets the card be claimed (the transient-race-then-progress path)."""
+
+    def __init__(self, features, refuse=()):
+        super().__init__(features)
+        self._refuse = set(refuse)
+
+    def claim_task(self, fid, assignee=""):
+        if fid in self._refuse:
+            return None  # perpetual claim race — never added to `claimed`, stays ready
+        return super().claim_task(fid, assignee=assignee)
+
+
+async def test_task_claim_preserves_dispatch_target_via_claim_task(monkeypatch):
+    """r1: a task assigned to a sister agent is claimed through ``claim_task`` (NOT the
+    coding ``claim``), so its assignee/dispatch target is PRESERVED — never reassigned to
+    the actor — and the dispatch then follows the existing delegate path."""
+    seen = []
+
+    class _Spy(_TaskStore):
+        def claim(self, fid, assignee=""):
+            raise AssertionError("a task must NOT take the coding --claim edge (#356)")
+
+        def claim_task(self, fid, assignee=""):
+            seen.append((fid, assignee))
+            return super().claim_task(fid, assignee=assignee)
+
+    store = _Spy([_task("bd-task", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        return "delivered"
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object() if name == "agent-bot" else None)
+
+    outcome = await loop._dispatch_task(store, _task("bd-task", assignee="agent-bot"))
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert outcome in ("acp", "a2a")  # a real drive started
+    assert seen == [("bd-task", "agent-bot")]  # claim_task got the dispatch target, preserved
+
+
+async def test_coding_feature_still_claims_via_atomic_claim_not_claim_task(monkeypatch):
+    """r2: an ordinary coding feature keeps its existing atomic ``--claim`` behavior —
+    ``store.claim`` with the ACTOR as assignee — and NEVER takes the #356 task-claim edge
+    (``claim_task``, which preserves a dispatch target)."""
+    calls = []
+
+    class _Spy(_ClaimStore):
+        def claim(self, fid, assignee=""):
+            calls.append(("claim", fid, assignee))
+            return super().claim(fid, assignee=assignee)
+
+        def claim_task(self, fid, assignee=""):
+            raise AssertionError("a coding feature must NOT use the task-claim edge (#356)")
+
+    store = _Spy([_ready("bd-feat", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert await loop._spawn_ready() is True
+    finally:
+        await finish()
+    assert calls == [("claim", "bd-feat", "proto")]  # actor-assignment via --claim, never claim_task
+
+
+async def test_task_claim_race_returns_race_and_starts_no_drive(monkeypatch):
+    """r3: when ``claim_task`` loses a genuinely concurrent race, ``_dispatch_task`` returns
+    ``"race"`` — no drive is spawned, no files are held, and the card stays ready for a
+    later tick (retried, not double-driven)."""
+
+    class _Racing(_TaskStore):
+        def claim_task(self, fid, assignee=""):
+            return None  # lost the race / no longer claimable
+
+    store = _Racing([_task("bd-task", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    outcome = await loop._dispatch_task(store, _task("bd-task", assignee="agent-bot"))
+    assert outcome == "race"
+    assert loop._drives == set() and loop._inflight_files == {}  # nothing started
+
+
+async def test_ready_queue_claim_race_livelock_eventually_blocks(monkeypatch):
+    """r4/r6: a card that stays ready but is skipped for the SAME ``claim-race`` reason on
+    back-to-back scans is livelocked, not merely contended — past ``ready_skip_max`` it is
+    flagged blocked with actionable evidence, so the existing blocked sweep / operator
+    escalation makes the formerly-invisible ready-but-unclaimable card visible."""
+    store = _LivelockTaskStore([_task("bd-stuck", assignee="agent-bot")], refuse={"bd-stuck"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "ready_skip_max": 3})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    for _ in range(2):  # below the threshold: a growing streak, no block yet
+        await loop._spawn_ready()
+    assert "flag_blocked" not in store.names()
+    assert loop._skip_streaks["bd-stuck"] == ("claim-race", 2)
+
+    await loop._spawn_ready()  # the 3rd identical skip hits the bound
+    assert "flag_blocked" in store.names()
+    reason = next(c[2] for c in store.calls if c[0] == "flag_blocked")
+    assert "livelock" in reason and "claim-race" in reason  # actionable, names the reason
+    assert "bd-stuck" not in loop._skip_streaks  # budget reset after blocking (fresh if it recovers)
+
+
+async def test_a_single_transient_claim_race_never_blocks(monkeypatch):
+    """r5: a one-off/transient claim race must not block prematurely. A card that
+    claim-races a couple of scans then becomes claimable has its skip streak forgiven on
+    the successful claim — it never reaches the block threshold."""
+    store = _LivelockTaskStore([_task("bd-flaky", assignee="agent-bot")], refuse={"bd-flaky"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        return "delivered"
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+    loop = BoardLoop({"coder": "proto", "ready_skip_max": 3})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    await loop._spawn_ready()
+    await loop._spawn_ready()
+    assert loop._skip_streaks["bd-flaky"] == ("claim-race", 2)  # two transient races
+
+    store._refuse.clear()  # the race clears — the card is claimable now
+    await loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert "bd-flaky" not in loop._skip_streaks  # reset on the successful claim
+    assert "flag_blocked" not in store.names()  # never blocked — it was transient
+
+
+async def test_bound_ready_skips_resets_on_reason_change_and_when_card_leaves_queue(monkeypatch):
+    """r5 (unit): the streak restarts when a card's skip REASON changes (a changed
+    reason/state is progress against the old reason), and is dropped entirely when a card
+    LEAVES the scan (claimed elsewhere, blocked, merged, done, or newly dependency-blocked
+    so it left ``br ready``). Neither path can reach the block threshold spuriously."""
+    store = _TaskStore([])
+    loop = BoardLoop({"ready_skip_max": 3})
+
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "claim-race"}])
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "claim-race"}])
+    assert loop._skip_streaks["bd-x"] == ("claim-race", 2)
+    # the reason changes → the count restarts at 1 (progress against the old reason)
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "preflight-hold"}])
+    assert loop._skip_streaks["bd-x"] == ("preflight-hold", 1)
+    # the card vanishes from the scan → its budget is forgiven
+    await loop._bound_ready_skips(store, [], [], [])
+    assert "bd-x" not in loop._skip_streaks
+    assert "flag_blocked" not in store.names()
+
+
+async def test_bound_ready_skips_never_blocks_a_self_resolving_hot_file_wait(monkeypatch):
+    """r4 (scope): a ``hot-file`` skip is bounded by the in-flight build it collides with
+    (that build terminates and releases the file, then the waiter is claimed), so it is
+    structurally self-resolving — the livelock bound must NEVER block it, even far past the
+    threshold, or a card waiting on a legitimately long build would be killed."""
+    store = _TaskStore([])
+    loop = BoardLoop({"ready_skip_max": 2})
+    for _ in range(6):
+        await loop._bound_ready_skips(store, [], [], [{"fid": "bd-hot", "reason": "hot-file", "overlaps": ["bd-live"]}])
+    assert "flag_blocked" not in store.names()  # never blocked — self-resolving
+    assert loop._skip_streaks["bd-hot"][1] == 6  # counted for reason-change detection, but exempt
+
+
+async def test_ready_skip_bound_disabled_keeps_no_counters(monkeypatch):
+    """``ready_skip_max: 0`` disables the bound (pre-#356 behavior) — a claim-race skip is
+    never counted and never blocks, no matter how many scans."""
+    store = _LivelockTaskStore([_task("bd-stuck", assignee="agent-bot")], refuse={"bd-stuck"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "ready_skip_max": 0})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    for _ in range(5):
+        await loop._spawn_ready()
+    assert loop._skip_streaks == {}  # no counters kept
+    assert "flag_blocked" not in store.names()
 
 
 # ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────

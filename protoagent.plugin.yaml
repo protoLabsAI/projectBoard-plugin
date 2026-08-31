@@ -159,6 +159,15 @@ config:
                             # merge). 0 = unlimited. LIVE (see max_concurrent) — raise
                             # it with max_concurrent or the extra slots idle behind
                             # the review queue.
+  ready_skip_max: 12        # ready-queue livelock bound (#356): consecutive scans a card may
+                            # be passed over for the SAME unresolved skip reason (a lost
+                            # claim/assignment race, above all) before it is flagged blocked
+                            # with the evidence — so a ready-but-unclaimable card enters the
+                            # blocked-sweep/operator-escalation path instead of retrying
+                            # forever invisibly. Must be > 1 (a single/transient claim race
+                            # must never block); 0 disables the bound. Structurally
+                            # self-resolving skips (a hot-file wait on an in-flight build, an
+                            # already-blocked/other-state card, a preflight hold) are exempt.
   dep_gate: merge           # how a blocks-dependency gates its dependents: "merge"
                             # (default, safe) — wait for the blocker to merge (done);
                             # "review" — a NON-foundation blocker releases dependents at
