@@ -424,6 +424,71 @@ def test_project_exposes_budgets_from_labels(make_board):
     assert b._project({"id": "bd-2", "status": "open", "labels": []})["budgets"] == {}
 
 
+# ── operator-notified persistence (#341) ────────────────────────────────────────
+
+
+def _added_comments(br):
+    """The `comments add` calls a write recorded (fid, text pairs)."""
+    return [(a[2], a[3]) for a in br.calls if a[:2] == ("comments", "add")]
+
+
+def test_notified_from_labels_parses_and_ignores_junk():
+    assert store.notified_from_labels(["notified:blocked", "ready", "budget:ci-fix:2"]) == {"blocked"}
+    # an empty kind (`notified:`) or a bare `notified` with no colon carries no fact → ignored
+    assert store.notified_from_labels(["notified:", "notified"]) == set()
+    assert store.notified_from_labels(None) == set()
+
+
+def test_project_exposes_notified_markers_from_labels(make_board):
+    b = make_board(Br())
+    f = b._project({"id": "bd-1", "status": "open", "labels": ["blocked", "notified:blocked"]})
+    assert f["notified"] == ["blocked"]  # readable from the projection (#341 r2)
+    assert b._project({"id": "bd-2", "status": "open", "labels": ["blocked"]})["notified"] == []
+
+
+def test_record_notified_adds_a_marker_and_audits(make_board, monkeypatch):
+    """The FIRST notification stamps a presence-based `notified:blocked` label AND records
+    the alert text on an audit comment — the durable, readable record a later process reads
+    back instead of re-alerting (#341 r2)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["notified:blocked"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth"]})
+    b.record_notified("bd-1", "blocked", "Board card bd-1 is blocked: 403 forbidden")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
+    comments = _added_comments(br)  # the alert text rides history (the comment), not the label
+    assert len(comments) == 1 and comments[0][0] == "bd-1"
+    assert "operator notified (blocked)" in comments[0][1] and "403 forbidden" in comments[0][1]
+
+
+def test_record_notified_is_idempotent_when_already_marked(make_board, monkeypatch):
+    """Repeated writes for the SAME still-open incident are idempotent: an already-present
+    marker returns unchanged — no duplicate label op, no second audit comment (#341 r4)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
+    b.record_notified("bd-1", "blocked", "again")
+    assert not br.cmds("update")  # marker already present → no label op burned
+    assert not _added_comments(br)  # …and no duplicate comment
+
+
+def test_clear_notified_drops_the_marker_or_noops(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
+    b.clear_notified("bd-1")
+    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls
+
+
+def test_clear_notified_noops_without_a_marker(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "ready"]})
+    b.clear_notified("bd-1")
+    assert not br.cmds("update")  # nothing to drop → no br write burned
+
+
 # ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
 
 
@@ -1769,6 +1834,22 @@ def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
     b.clear_blocked("bd-9")
     (up,) = br.cmds("update")
     assert up == ("update", "bd-9", "--remove-label", "blocked")
+
+
+def test_clear_blocked_drops_the_operator_notified_marker(make_board, monkeypatch):
+    """r3 (#341): a genuine recovery clears the `notified:blocked` marker alongside the
+    block, so a LATER, distinct block on the same card is eligible for a fresh alert — the
+    earned tier is left untouched (a model-reachable block, not a tier reset)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "tier:opus"]}
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "blocked" in up and "notified:blocked" in up  # both dropped on recovery
+    assert "tier:opus" not in up  # the earned rung is preserved
 
 
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────

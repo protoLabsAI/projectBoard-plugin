@@ -205,6 +205,18 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
+# Operator-notified marker (#341) — `notified:<feature>`, currently only
+# `notified:blocked`. Being told about a blocking card is durable operational
+# history, not process scratch: the loop's `_notify_operator` used to dedup alerts
+# ONLY in a process-local set (`_notified_blocks`), so a plugin/host restart forgot
+# the operator had already been told and re-alerted the moment the inbox's 300s
+# dedup window lapsed. Persisting the fact on the bead (a single, presence-based
+# label + an audit comment, the `verified:` pattern) makes it survive restarts and
+# readable in the feature projection/history. Feature-scoped and cleared ONLY on a
+# genuine recovery edge (`clear_blocked`), so a later, distinct block can alert again
+# while a card that merely STAYS blocked is never re-announced.
+LABEL_NOTIFIED_PREFIX = "notified:"
+BLOCKED_NOTIFY_KIND = "blocked"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -411,6 +423,21 @@ def budgets_from_labels(labels) -> dict[str, int]:
         kind, _, num = str(label)[len(LABEL_BUDGET_PREFIX) :].rpartition(":")
         if kind and num.isdigit():
             out[kind] = int(num)
+    return out
+
+
+def notified_from_labels(labels) -> set[str]:
+    """The features the operator has been notified about (#341) from a bead's
+    labels — the kind of each `notified:<kind>` marker (see ``LABEL_NOTIFIED_PREFIX``),
+    currently just `blocked`. Shared by the projection and the loop's restart guard so
+    both decode the marker the same way; an empty/malformed marker is ignored (never
+    invent a notification that didn't happen)."""
+    out: set[str] = set()
+    for label in labels or []:
+        if str(label).startswith(LABEL_NOTIFIED_PREFIX):
+            kind = str(label)[len(LABEL_NOTIFIED_PREFIX) :].strip()
+            if kind:
+                out.add(kind)
     return out
 
 
@@ -2086,6 +2113,11 @@ class BeadsBoard:
             # Drop only the stale infra class — NOT the tier labels, which predate the
             # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        # A genuine recovery clears the operator-notified marker (#341) so a LATER,
+        # distinct block on this card is news again. Only when present, so the routine
+        # unblock writes no extra label op (and the exact-args tests still hold).
+        for marker in [l for l in labels if l.startswith(LABEL_NOTIFIED_PREFIX)]:
+            args += ["--remove-label", marker]
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2238,6 +2270,43 @@ class BeadsBoard:
         f = self._require(fid)
         prefixes = [LABEL_BUDGET_PREFIX] if kinds is None else [f"{LABEL_BUDGET_PREFIX}{k}:" for k in kinds]
         stale = [l for l in f.get("labels") or [] if any(l.startswith(p) for p in prefixes)]
+        if not stale:
+            return f
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    # ── operator-notified persistence (#341) ──────────────────────────────────
+    def record_notified(self, fid: str, kind: str = BLOCKED_NOTIFY_KIND, detail: str = "") -> dict:
+        """Persist that the operator was told about a `kind` incident on this card — a
+        single, presence-based `notified:<kind>` label (the `verified:` pattern) plus an
+        audit comment carrying the alert text. The durable half of the loop's once-per-
+        incident dedup (#341): a freshly constructed loop derives "already told" back from
+        this label instead of re-alerting after a restart cleared its in-memory memo. The
+        loop only writes it once the alert was ACTUALLY delivered, so the marker never
+        claims a notification that never left — and idempotent here too: an already-present
+        marker returns unchanged, no duplicate label op and no second comment. Cleared on a
+        genuine recovery (``clear_blocked``) so a later, distinct block can alert again.
+        Fire-and-forget at the call site, like ``record_budget``: a `br` hiccup here must
+        never fail the sweep (the in-process memo still carries it for this process)."""
+        f = self._require(fid)
+        label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
+        if label in (f.get("labels") or []):
+            return f
+        self._run("update", fid, "--add-label", label)
+        self.comment(fid, f"operator notified ({kind}): {detail}".rstrip()[:500])
+        return self.get_feature(fid)
+
+    def clear_notified(self, fid: str, kind: str | None = None) -> dict:
+        """Drop the operator-notified marker (#341) — the named `notified:<kind>` label,
+        or EVERY `notified:` label when ``kind`` is None (the recovery edge, where the
+        card leaves the blocked state entirely). No-op without a matching label, so the
+        routine unblock never burns an extra `br` write."""
+        f = self._require(fid)
+        prefix = LABEL_NOTIFIED_PREFIX if kind is None else f"{LABEL_NOTIFIED_PREFIX}{kind}"
+        stale = [l for l in f.get("labels") or [] if l == prefix or (kind is None and l.startswith(prefix))]
         if not stale:
             return f
         args = ["update", fid]
@@ -2760,6 +2829,11 @@ class BeadsBoard:
             # The persisted loop fix budgets (#259): {kind: count} from the replaced
             # `budget:<kind>:<n>` labels — {} for a feature the loop never bounced.
             "budgets": budgets_from_labels(labels),
+            # Operator-notified markers (#341): the kinds the operator has already been
+            # told about (`notified:<kind>` labels) — [] for a card no alert has fired
+            # on. `blocked` here is the durable "restart won't re-alert" record the
+            # loop's `_notify_operator` reads and writes.
+            "notified": sorted(notified_from_labels(labels)),
             "verified_sha": verified_sha,
             "deliverable": deliverable,
             "blocked_class": blocked_class,

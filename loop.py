@@ -66,6 +66,7 @@ from .store import (
     get_store,
     knob_bool,
     merge_posture,
+    notified_from_labels,
     reconfigure_cached_store,
 )
 
@@ -852,6 +853,21 @@ def _inbox_db_path():
     return legacy[0] if len(legacy) == 1 else None
 
 
+def _feature_already_notified(feature: dict | None) -> bool:
+    """Did a prior process already tell the operator about THIS block (#341)? Reads the
+    durable `notified:blocked` marker off the feature projection — the projected
+    ``notified`` list when present, else decoded straight from the bead's ``labels`` (so a
+    raw projection missing the derived field still resolves). Absent/malformed → False:
+    never suppress a real alert on a card no marker was actually written for."""
+    if not feature:
+        return False
+    projected = feature.get("notified")
+    if isinstance(projected, (list, tuple, set)):
+        if "blocked" in projected:
+            return True
+    return "blocked" in notified_from_labels(feature.get("labels"))
+
+
 class BoardLoop:
     def __init__(self, cfg: dict, *, gap_reporter: setup_check.GapReporter | None = None):
         self.cfg = cfg or {}
@@ -1252,7 +1268,11 @@ class BoardLoop:
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}
         # Feature ids already reported to the operator as stuck, so a card that stays
-        # blocked is announced once rather than every sweep (see _notify_operator).
+        # blocked is announced once rather than every sweep (see _notify_operator). This
+        # is only the in-PROCESS half of the dedup: the DURABLE half is the bead's
+        # `notified:blocked` marker (#341), which `_notify_operator` reads on the next
+        # sweep so a restart doesn't rebuild an empty set and re-alert. Seeded from that
+        # marker on the first sweep that sees a still-notified block.
         self._notified_blocks: set[str] = set()
         # Last parsed findings JSON per fid — fed back as the recipe's
         # prior_findings input so a bounce re-review is a DELTA review
@@ -2022,26 +2042,49 @@ class BoardLoop:
                         pass
                 title = str(f.get("title") or "").strip()
                 self._notify_operator(
+                    store,
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    feature=f,
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
 
-    def _notify_operator(self, fid: str, text: str) -> None:
+    def _notify_operator(self, store, fid: str, text: str, feature: dict | None = None) -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
 
-        Deduped on the feature id so a card that stays blocked across many sweeps is
-        reported once, not every five minutes — the point is to be noticed, and an alert
-        that repeats forever is an alert that gets filtered.
+        Deduped so a card that stays blocked across many sweeps is reported once, not every
+        five minutes — the point is to be noticed, and an alert that repeats forever is an
+        alert that gets filtered. That dedup is now DURABLE (#341): the process-local
+        ``_notified_blocks`` set alone forgot on restart, so a plugin/host restart re-alerted
+        the moment the inbox's 300s dedup window lapsed. The fact the operator was told is
+        persisted on the bead (``store.record_notified`` → a `notified:blocked` label + audit
+        comment) and derived back on the next sweep, so a restart no longer re-notifies. The
+        bead marker is the primary persistence; the inbox dedup is a secondary guard.
+
+        Order matters for failing safe (#341 r5): the marker is written ONLY after the alert
+        was ACTUALLY delivered, so a refused/absent inbox never leaves a bead claiming a
+        notification that never left — and if the marker write itself fails, that is logged
+        with actionable evidence and left unpersisted (a later restart may re-alert once,
+        never the reverse: it never records a delivery that didn't happen).
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
         silence a block used to leave."""
         if fid in self._notified_blocks:
             return
+        # Durable restart guard: a `notified:blocked` marker on the bead means a PRIOR
+        # process already told the operator about this still-unresolved block. Seed the
+        # in-process memo from it and skip — the marker is cleared only when the card
+        # genuinely recovers (`clear_blocked`), so a later distinct block still alerts.
+        if store is not None and _feature_already_notified(feature):
+            self._notified_blocks.add(fid)
+            return
+        # Mark in-process FIRST so a delivery failure doesn't re-alert every sweep (the
+        # loud WARNING below already fired); a restart, with no bead marker, retries it.
         self._notified_blocks.add(fid)
+        delivered = False
         try:
             from inbox import InboxStore  # host module — absent on older hosts
 
@@ -2049,6 +2092,7 @@ class BoardLoop:
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
             InboxStore(str(db)).add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
+            delivered = True
             log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
             log.warning(
@@ -2057,6 +2101,20 @@ class BoardLoop:
                 text[:200],
                 exc_info=True,
             )
+        if delivered and store is not None:
+            # Persist the audit record ONLY on a real delivery. Best-effort like every
+            # other bead write: a `br` hiccup must never break the sweep, but it must NOT
+            # be swallowed silently — log actionable evidence and leave the marker absent
+            # rather than claim a notification was durably recorded when it was not (r5).
+            try:
+                store.record_notified(fid, "blocked", text)
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "[project_board] %s operator-notified marker NOT persisted (restart may re-alert): %s",
+                    fid,
+                    text[:160],
+                    exc_info=True,
+                )
 
     async def _sweep_worktrees(self, store, repo: str) -> None:
         """Reap orphaned ``feat-<id>`` worktrees under one project's checkout (#90) —
