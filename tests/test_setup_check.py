@@ -1297,21 +1297,141 @@ def test_review_status_probe_runs_once_per_process(tmp_path):
     assert calls == [1]  # cached across evaluations
 
 
-def test_default_status_probe_distinguishes_pat_from_app_only():
-    """r6: the DEFAULT probe (`gh api user`) reads a user/PAT token as capable (rc 0), a GitHub
-    App-only token (the 403 signature) as incapable, and any other failure as capable (no false
-    alarm — the gh/auth checks own those)."""
-    ok, detail = setup_check._default_status_probe(_fake_run("octocat", returncode=0))
-    assert ok is True and detail == ""
+def _multi_run(*, user=None, repo=None, headers=None):
+    """An argv-aware fake ``run`` for the two/three-step status probe (#354/bd-doo0): routes
+    ``gh api user --jq`` (credential-shape), ``gh api repos/{owner}/{repo} --jq .permissions.push``
+    (per-repo capability), and ``gh api user --include`` (the scope-header fallback) to their own
+    responses. Each of ``user`` / ``repo`` / ``headers`` is ``(stdout, rc[, stderr])`` or ``None``
+    (→ rc 1, empty). Records ``(argv, kw)`` on ``.calls``."""
+
+    def _resp(spec):
+        if spec is None:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        stdout, rc = spec[0], spec[1]
+        stderr = spec[2] if len(spec) > 2 else ""
+        return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
+
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        if "--include" in argv:
+            return _resp(headers)
+        if any(str(a).startswith("repos/") for a in argv):
+            return _resp(repo)
+        return _resp(user)
+
+    run.calls = calls
+    return run
+
+
+def test_default_status_probe_user_read_discriminates_app_vs_user():
+    """r6: the FIRST read (`gh api user`) still discriminates credential SHAPE — a GitHub App
+    installation token (either 403 signature) is proven incapable; any OTHER `gh api user` failure
+    (offline / unauthenticated) fails open (the gh/auth checks own those); a raised probe fails
+    open. A user/PAT rc-0 is necessary but NOT sufficient — it defers to the per-repo read."""
     ok, detail = setup_check._default_status_probe(
-        _fake_run("HTTP 403: You must authenticate via a GitHub App", returncode=1)
+        _multi_run(user=("HTTP 403: You must authenticate via a GitHub App", 1))
     )
     assert ok is False and "installation token" in detail
-    # an unrelated failure (offline / unauthenticated) never manufactures the status warning
-    ok, _ = setup_check._default_status_probe(_fake_run("could not connect", returncode=1))
+    # the symmetric App-installation signature, arriving via stderr
+    ok, detail = setup_check._default_status_probe(_multi_run(user=("", 1, "not accessible by integration")))
+    assert ok is False and "installation token" in detail
+    # an unrelated `gh api user` failure never manufactures the status warning
+    ok, _ = setup_check._default_status_probe(_multi_run(user=("could not connect", 1)))
     assert ok is True
     ok, _ = setup_check._default_status_probe(_fake_run(raise_exc=TimeoutError("slow")))
     assert ok is True
+
+
+def test_default_status_probe_per_repo_push_decides_a_user_pat():
+    """r1/r2: a user/PAT-shaped credential (rc 0 on `gh api user`) is decided by the PER-REPOSITORY
+    `.permissions.push` read on the checkout's own repo — `push` true ⇒ capable, `push` false ⇒
+    the former-`gh api user` false-positive is now caught with an actionable, repo-specific
+    warning (a token valid elsewhere but not on THIS repo)."""
+    ok, detail = setup_check._default_status_probe(_multi_run(user=("octocat", 0), repo=("true", 0)))
+    assert ok is True and detail == ""
+
+    ok, detail = setup_check._default_status_probe(_multi_run(user=("octocat", 0), repo=("false", 0)))
+    assert ok is False
+    assert "no write access to this repository" in detail
+
+
+def test_default_status_probe_targets_the_checkout_repo():
+    """r1: the per-repo read uses gh's templated `repos/{owner}/{repo}` path (gh fills the slug
+    from the checkout's remote) run in the supplied `cwd`, so it assesses the SAME repository the
+    reviewed status publishes to — not the process cwd."""
+    run = _multi_run(user=("octocat", 0), repo=("true", 0))
+    setup_check._default_status_probe(run, cwd="/some/repo")
+    repo_calls = [(argv, kw) for argv, kw in run.calls if any(str(a).startswith("repos/") for a in argv)]
+    assert repo_calls, "the per-repo capability read never fired"
+    argv, kw = repo_calls[0]
+    assert "repos/{owner}/{repo}" in argv and ".permissions.push" in argv
+    assert kw.get("cwd") == "/some/repo"
+
+
+def test_default_status_probe_ambiguous_per_repo_falls_back_to_scope_headers():
+    """r3: when the per-repo `.permissions.push` read is AMBIGUOUS (rc 0 but no `.permissions`, or
+    unreadable), the probe consults the `X-OAuth-Scopes` response header as a SECONDARY fallback —
+    a scope list carrying `repo`/`public_repo` is capable, a non-empty list without them is a
+    proven-incapable classic PAT, and an EMPTY header (a fine-grained token) proves nothing → fail
+    open."""
+    # ambiguous per-repo (empty `.permissions.push`) + a header carrying `repo` → capable
+    ok, _ = setup_check._default_status_probe(
+        _multi_run(user=("octocat", 0), repo=("", 0), headers=("HTTP/2 200\r\nX-OAuth-Scopes: repo, gist\r\n", 0))
+    )
+    assert ok is True
+    # ambiguous per-repo + a non-empty scope list WITHOUT a status-write scope → proven incapable
+    ok, detail = setup_check._default_status_probe(
+        _multi_run(user=("octocat", 0), repo=("", 0), headers=("X-OAuth-Scopes: gist, read:org\r\n", 0))
+    )
+    assert ok is False and "OAuth scopes" in detail
+    # ambiguous per-repo + an EMPTY scope header (fine-grained token) → prove nothing → fail open
+    ok, _ = setup_check._default_status_probe(
+        _multi_run(user=("octocat", 0), repo=("", 0), headers=("X-OAuth-Scopes: \r\n", 0))
+    )
+    assert ok is True
+
+
+def test_default_status_probe_fails_open_when_capability_is_unreadable():
+    """r3: neither the per-repo read NOR the scope fallback is readable (offline / SSO wall / no
+    scope header at all) — capability cannot be proven either way, so the probe fails open to
+    `(True, "")` rather than a startup false alarm."""
+    # user ok, repo read fails (offline), scope header present but no X-OAuth-Scopes line
+    ok, _ = setup_check._default_status_probe(
+        _multi_run(user=("octocat", 0), repo=None, headers=("HTTP/2 200\r\ncontent-type: application/json\r\n", 0))
+    )
+    assert ok is True
+    # user ok, repo read fails, scope fallback also fails → still fail open
+    ok, _ = setup_check._default_status_probe(_multi_run(user=("octocat", 0), repo=None, headers=None))
+    assert ok is True
+    # a per-repo read that surfaces the App-only signature (rc 0 user, App 403 on the repo) warns
+    ok, detail = setup_check._default_status_probe(
+        _multi_run(user=("octocat", 0), repo=("", 1, "You must authenticate as a GitHub App"))
+    )
+    assert ok is False and "installation token" in detail
+
+
+def test_default_status_probe_never_mutates_anything():
+    """r4: every read the probe issues is a bounded, read-only GET — no `--method POST/PATCH`, no
+    write path — so proving capability can never create a live status or mutate a resource."""
+    run = _multi_run(user=("octocat", 0), repo=("false", 0))
+    setup_check._default_status_probe(run)
+    for argv, _kw in run.calls:
+        assert "--method" not in argv and "statuses" not in " ".join(str(a) for a in argv)
+
+
+def test_setup_status_probes_the_board_repo_as_cwd(tmp_path):
+    """r1: setup_status runs the default probe in the BOARD's own checkout (cfg['repo']) so the
+    per-repo capability read assesses the repository the reviewed status will be published to."""
+    seen = {}
+
+    def _probe(run, cwd):
+        seen["cwd"] = cwd
+        return (True, "")
+
+    _probe_status(tmp_path, probe=_probe)
+    assert seen["cwd"] == str(tmp_path)
 
 
 def test_reporter_forwards_the_review_status_warning_and_clears_it():

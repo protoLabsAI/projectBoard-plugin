@@ -5655,31 +5655,10 @@ def _no_real_pr_head_sha(monkeypatch):
     monkeypatch.setattr(worktree, "pr_head_sha", _blank)
 
 
-@pytest.fixture(autouse=True)
-def _no_real_post_review_check(monkeypatch):
-    """#347: the review gate now publishes its verdict as a head-pinned ``QA panel`` check
-    run via ``worktree.post_review_check``. Pin it to a no-op so no gate test in this
-    module shells a real ``gh api`` (a test that asserts posting installs its own recorder,
-    which overrides this). Mirrors the ``_no_real_pr_head_sha`` guard above."""
-
-    async def _noop(*a, **k):
-        return True
-
-    monkeypatch.setattr(worktree, "post_review_check", _noop)
-
-
-@pytest.fixture(autouse=True)
-def _no_real_read_review_check(monkeypatch):
-    """#323: the reconcile now reads back the head-pinned ``QA panel`` verdict via
-    ``worktree.read_review_check`` to ingest a trusted current-head QA PASS. Pin it to the
-    fail-closed default (None = no provable verdict) so no reconcile test in this module
-    shells a real ``gh api``; a #323 test that exercises the promotion installs its own
-    stub. Mirrors the ``_no_real_pr_head_sha`` / ``_no_real_post_review_check`` guards."""
-
-    async def _none(*a, **k):
-        return None
-
-    monkeypatch.setattr(worktree, "read_review_check", _none)
+# The #347 App-only check-run guards (`_no_real_post_review_check` / `_no_real_read_review_check`)
+# are gone: bd-doo0 deleted `worktree.post_review_check` / `read_review_check` (the path 403s under
+# the board's user/PAT credential). The #354 status seam below is the only publication seam left to
+# pin, so a stale check-run guard would only fail at `monkeypatch.setattr` on a missing attribute.
 
 
 @pytest.fixture(autouse=True)
@@ -5687,8 +5666,8 @@ def _no_real_review_status_seam(monkeypatch):
     """#354: the gate now publishes via ``worktree.post_review_status`` + a findings PR comment
     (``post_or_update_pr_comment``) and the reconcile reads back ``worktree.read_review_status``.
     Pin all three to fail-closed / no-op defaults so no gate/reconcile test shells a real
-    ``gh api`` — a test that asserts the new seam installs its own recorder. Mirrors the
-    ``_no_real_post_review_check`` / ``_no_real_read_review_check`` guards above."""
+    ``gh api`` — a test that asserts the new seam installs its own recorder. This is the only
+    verdict-publication seam left to pin (bd-doo0 removed the App-only check-run guards)."""
 
     async def _ok(*a, **k):
         return True

@@ -3085,6 +3085,12 @@ def merge_posture(
 # is `loop.live_drive(fid)`: the same process-stable registry the cancel verbs read.
 # Pull-only — no host-inbox / ADR 0070 background-result push nudge.
 NEXT_ACTION_AWAITING_DELIVERABLE = "awaiting deliverable"
+# A DELIVERED task (in_review, no PR) awaiting its task-lane Done edge — record_verification
+# (board_verify), NOT a coder-PR merge or a review-gate verdict. ADR 0078 makes task
+# verification a SEPARATE Done edge from the coding review gate, so a task sitting in in_review
+# reads this instead of merge_posture's coding wording (`awaiting review verdict (no
+# review-clean)`) — the real transition that advances the card is a verifier's approval.
+NEXT_ACTION_AWAITING_VERIFICATION = "awaiting verification"
 
 
 def _live_drive_predicate():
@@ -3100,28 +3106,54 @@ def _live_drive_predicate():
 
 
 def task_posture(feature: dict, *, is_driven) -> dict:
-    """The parked-task sibling of ``merge_posture`` (#305). Returns the SAME
-    ``{"next_action", "awaiting_merge", "next_action_hint"}`` shape, all-empty except for
-    an ``in_progress`` task-type bead (#217) with no live drive — a card the loop claimed
-    and left in_progress because its assignee is a human / unassigned (not a dispatchable
-    ACP agent), so nothing moves it but a ``board_deliver``. It reads
-    ``awaiting deliverable`` with a hint naming ``board_deliver(<id>, text=…)`` and the
-    awaited assignee. Empty (no posture) for everything else:
+    """The task-lane sibling of ``merge_posture`` (#305, #217). Returns the SAME
+    ``{"next_action", "awaiting_merge", "next_action_hint"}`` shape for the two states a
+    task-type bead owes the PM a next action in, all-empty otherwise:
 
-    * a coding feature (``issue_type`` != ``task``) — its next action lives only
-      in_review, via ``merge_posture``;
-    * a task in any state but ``in_progress`` (or a blocked one);
-    * a task the loop is actively driving (``is_driven(fid)`` True — an ACP-agent
-      assignee whose drive is live): it is working, not awaiting.
+    * ``in_review`` — a DELIVERED task awaiting its task-lane Done edge, ``record_verification``
+      (``board_verify``). A task has no PR to merge and no review-gate verdict to await — ADR
+      0078 makes task verification a SEPARATE Done edge from the coding review gate — so it reads
+      ``awaiting verification`` (the real transition that advances it), NOT ``merge_posture``'s
+      coding wording ``awaiting review verdict (no review-clean)``. A ``blocked`` in_review task
+      keeps its own ``blocked`` posture (as ``merge_posture`` projects for a blocked coding card).
+    * ``in_progress`` with no live drive — a card the loop claimed and left in_progress because
+      its assignee is a human / unassigned (not a dispatchable ACP agent), so nothing moves it
+      but a ``board_deliver``. It reads ``awaiting deliverable`` with a hint naming
+      ``board_deliver(<id>, text=…)`` and the awaited assignee.
+
+    Empty (no posture) for everything else:
+
+    * a coding feature (``issue_type`` != ``task``) — its next action lives in ``merge_posture``
+      / ``review_fix_posture``;
+    * a task in any other state (``backlog`` / ``ready`` / ``done``);
+    * a blocked in_progress task (its own blocked posture, not awaiting);
+    * a task the loop is actively driving (``is_driven(fid)`` True — an ACP-agent assignee whose
+      drive is live): it is working, not awaiting.
 
     ``is_driven`` is a fid→bool predicate (default: the loop's live-drive registry) so
     the signal is pull-only — no per-row network, no host-inbox / ADR 0070 push."""
     out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
-    if feature.get("issue_type") != LABEL_TASK or feature.get("board_state") != "in_progress":
+    if feature.get("issue_type") != LABEL_TASK:
         return out
-    if feature.get("blocked") or is_driven(feature.get("id", "")):
-        return out
+    state = feature.get("board_state")
     fid = feature.get("id", "")
+    if state == "in_review":
+        # A delivered task awaiting record_verification — its Done edge. A blocked one keeps the
+        # `blocked` projection merge_posture would have given it (blocked wins); otherwise it is
+        # `awaiting verification`, never the coding review-gate wording.
+        if feature.get("blocked"):
+            out["next_action"] = NEXT_ACTION_BLOCKED
+            return out
+        out["next_action"] = NEXT_ACTION_AWAITING_VERIFICATION
+        out["next_action_hint"] = (
+            f"verify the delivered work and close it with board_verify({fid}) "
+            f"(or board_verify({fid}, approved=false, feedback=…) to requeue it)"
+        )
+        return out
+    if state != "in_progress":
+        return out
+    if feature.get("blocked") or is_driven(fid):
+        return out
     assignee = str(feature.get("assignee") or "").strip()
     out["next_action"] = NEXT_ACTION_AWAITING_DELIVERABLE
     out["next_action_hint"] = (
@@ -3159,11 +3191,14 @@ def review_fix_posture(feature: dict) -> dict:
 
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
-    that owes the PM a next action — an ``in_review`` card from the board's config
-    (``auto_merge``, ``review_gate``, via ``merge_posture``) and a parked ``in_progress``
-    task awaiting a deliverable (#305, via ``task_posture``). Labels + config only, no
-    per-row network. Rows in any other state are left untouched (the payload shape for
-    them is unchanged). Mutates and returns ``feats``.
+    that owes the PM a next action — a coding ``in_review`` card from the board's config
+    (``auto_merge``, ``review_gate``, via ``merge_posture``) and a task-type bead via
+    ``task_posture``: ``awaiting verification`` for a delivered ``in_review`` task (its
+    record_verification Done edge, ADR 0078) and ``awaiting deliverable`` for a parked
+    ``in_progress`` one (#305). A task is routed to ``task_posture`` first, so the coding
+    review-gate wording never lands on it. Labels + config only, no per-row network. Rows in
+    any other state are left untouched (the payload shape for them is unchanged). Mutates and
+    returns ``feats``.
 
     ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
     routers and the tools alike; ``BoardLoop.reload`` writes every changed live knob
@@ -3195,15 +3230,23 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
     if is_driven is None:
         is_driven = _live_drive_predicate()
     for f in feats:
+        # A task-type bead (#217) never merges a PR: its in_review Done edge is
+        # record_verification and its parked in_progress state awaits a deliverable — both owned
+        # by task_posture. Route it there FIRST so merge_posture's coding wording (`awaiting
+        # review verdict (no review-clean)`) never lands on a task, while coding features keep
+        # merge_posture's precedence unchanged (ADR 0078: task verification is a SEPARATE edge).
+        if f.get("issue_type") == LABEL_TASK:
+            posture = task_posture(f, is_driven=is_driven)
+            if posture["next_action"]:
+                f["next_action"] = posture["next_action"]
+                f["awaiting_merge"] = posture["awaiting_merge"]
+                f["next_action_hint"] = posture["next_action_hint"]
+            continue
         posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate, merged_verify_max=merged_verify_max)
         if not posture["next_action"]:
-            # #305: not an in_review card — the one other card that owes the PM a next
-            # action is a parked task awaiting an out-of-band deliverable.
-            posture = task_posture(f, is_driven=is_driven)
-            if not posture["next_action"]:
-                # #347: …or a coding card in an active review-fix round (bounced +
-                # requeued, changes-requested riding the requeue) — re-driving a fix.
-                posture = review_fix_posture(f)
+            # #347: a coding card in an active review-fix round (bounced + requeued,
+            # changes-requested riding the requeue) — re-driving a fix.
+            posture = review_fix_posture(f)
             if not posture["next_action"]:
                 continue
         elif f.get("ci_status") == "failing" and posture["next_action"] in (

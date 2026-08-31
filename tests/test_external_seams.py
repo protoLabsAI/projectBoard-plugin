@@ -42,7 +42,6 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # worktree.py — shells `gh` and `git`. NOTHING here is covered against the real API
 # today: there is no GitHub sandbox tier at all, which is precisely how #354 shipped.
 WORKTREE_SEAMS: dict[str, str] = {
-    "_existing_review_check_id": "UNCOVERED",
     "_find_marked_comment": "UNCOVERED",
     "_promote_adopted_draft": "UNCOVERED",
     "base_checkout_dirt": "UNCOVERED",
@@ -55,7 +54,6 @@ WORKTREE_SEAMS: dict[str, str] = {
     "open_pr": "UNCOVERED",
     "origin_head_sha": "UNCOVERED",
     "post_or_update_pr_comment": "UNCOVERED",
-    "post_review_check": "UNCOVERED",
     "post_review_status": "UNCOVERED",
     "pr_ci_status": "UNCOVERED",
     "pr_diff": "UNCOVERED",
@@ -65,7 +63,6 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_url_for_branch": "UNCOVERED",
     "promote_worktree": "UNCOVERED",
     "prune_stale_worktrees": "UNCOVERED",
-    "read_review_check": "UNCOVERED",
     "read_review_status": "UNCOVERED",
     "rebase_onto_base": "UNCOVERED",
     "remove_worktree": "UNCOVERED",
@@ -125,7 +122,7 @@ STORE_SEAMS: dict[str, str] = {
 
 # The ratchet. These are the counts at the moment the contract was introduced; a change
 # that raises either number fails this file. Lower them as coverage lands.
-MAX_UNCOVERED_WORKTREE = 29
+MAX_UNCOVERED_WORKTREE = 26
 MAX_UNCOVERED_STORE = 21
 
 
