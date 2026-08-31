@@ -260,6 +260,47 @@ def test_json_shape_ready_for_claim_next_ready(board, tmp_path):
     assert [i["id"] for i in claimed["requirements"]] == ["r1"]
 
 
+@requires_br
+def test_task_claim_preserves_a_non_actor_assignee_where_claim_would_refuse(board):
+    """#356 r8: the livelock and its fix, against REAL `br`. A task's assignee is its
+    DISPATCH TARGET, not a claim marker — but the puller claimed every candidate with
+    `br update --claim`, which REJECTS an already-assigned bead. So every ready task
+    assigned to any target other than the board actor was refused and retried forever as
+    a lost claim race. The fake `_run` tier is blind to this — only real `br` decides the
+    refusal.
+
+    Prove both halves: (1) raw `--claim` on a task assigned to a non-actor target is
+    refused (BoardError) and leaves the bead untouched (still ready, still assigned to the
+    target); (2) `claim_task` reaches `in_progress` WITHOUT changing the assignee."""
+    task = board.create_feature(
+        "Sister-agent task",
+        spec="s",
+        acceptance_criteria="- WHEN done THE SYSTEM SHALL deliver",
+        issue_type="task",
+        assignee="quinn",  # a non-actor dispatch target (the board actor is "test")
+    )
+    fid = task["id"]
+    board.mark_ready(fid)
+    assert board.get_feature(fid)["assignee"] == "quinn"  # the target rode create → ready
+
+    # (1) the refusal the loop hit every tick: `br --claim` rejects the already-assigned bead.
+    with pytest.raises(BoardError):
+        board._run("update", fid, "--claim", "--remove-label", LABEL_READY)
+    still = board.get_feature(fid)
+    assert still["board_state"] == "ready" and still["assignee"] == "quinn"  # untouched by the failed claim
+
+    # (2) claim_task transitions to in_progress with the dispatch target PRESERVED.
+    claimed = board.claim_task(fid, assignee="quinn")
+    assert claimed is not None
+    assert claimed["board_state"] == "in_progress"
+    assert claimed["assignee"] == "quinn"  # preserved — NOT reassigned to the actor
+    # …and it is no longer ready (the ready label was dropped), so it will not re-livelock.
+    assert LABEL_READY not in (claimed.get("labels") or [])
+
+    # state-race safety: a second claim finds it already in_progress → None (no duplicate).
+    assert board.claim_task(fid, assignee="quinn") is None
+
+
 @requires_br  # NOT @br_shape: asserts the 0.1.x `comments`-field STRUCTURE, so 0.1.23-pinned
 def test_json_shape_show_for_raw_features_with_comments(board):
     """`br show --json` re-fetch in raw_features_with_comments: the RAW bead must

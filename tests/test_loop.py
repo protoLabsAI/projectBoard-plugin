@@ -2849,19 +2849,23 @@ async def test_drive_done_releases_its_files(monkeypatch):
 
 
 class _TaskStore:
-    """A ready queue + the store verbs the task dispatch path uses (claim, get_feature,
-    record_delivery, flag_blocked, requeue). Records calls so a test can prove which
-    edge a task took."""
+    """A ready queue + the store verbs the task dispatch path uses (claim/claim_task,
+    get_feature, record_delivery, flag_blocked, requeue). Records calls so a test can
+    prove which edge a task took."""
 
     def __init__(self, features):
         self._features = [dict(f) for f in features]
         self.claimed = []
+        self.claim_task_calls = []  # (#356) (fid, assignee) the task path claimed with
         self.calls = []  # (verb, fid, extra…)
 
     def ready_queue(self, relaxed=False):
         return [f for f in self._features if f["id"] not in self.claimed]
 
     def claim(self, fid, assignee=""):
+        # The CODING-feature primitive (atomic `--claim`, actor-assignment) — still used
+        # by the feature path (a coding card in a _TaskStore); the task path uses
+        # claim_task below so the dispatch-target assignee survives (#356).
         if fid in self.claimed:
             return None
         self.claimed.append(fid)
@@ -2869,6 +2873,18 @@ class _TaskStore:
         if f is None:
             return None
         return dict(f, board_state="in_progress", assignee=assignee or f.get("assignee", ""))
+
+    def claim_task(self, fid, assignee=""):
+        # #356: the TASK primitive — PRESERVES the dispatch target rather than reassigning
+        # to the actor. State-race safe: a second claim (already in_progress) returns None.
+        if fid in self.claimed:
+            return None
+        self.claimed.append(fid)
+        self.claim_task_calls.append((fid, assignee))
+        f = next((x for x in self._features if x["id"] == fid), None)
+        if f is None:
+            return None
+        return dict(f, board_state="in_progress", assignee=(assignee or f.get("assignee", "")))
 
     def list_features(self, state=None):
         return []
@@ -2880,7 +2896,7 @@ class _TaskStore:
         self.calls.append(("record_delivery", fid, text))
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, category=""):
         self.calls.append(("flag_blocked", fid, reason))
         return {"id": fid}
 
@@ -3564,6 +3580,238 @@ async def test_spawn_ready_logs_a_claim_race_skip(monkeypatch, caplog):
     assert payload["selected"] == ["bd-lo"]
     skip = {s["fid"]: s for s in payload["skipped"]}
     assert skip["bd-hi"]["reason"] == "claim-race"
+
+
+# ── #356: task-claim target preservation + ready-queue livelock bound ─────────────
+
+
+class _BlockRecorder:
+    """Records flag_blocked calls — the minimal store `_bound_ready_skips` touches."""
+
+    def __init__(self):
+        self.blocked = []  # (fid, reason, category)
+
+    def flag_blocked(self, fid, reason, category=""):
+        self.blocked.append((fid, reason, category))
+        return {"id": fid}
+
+
+async def test_task_claim_preserves_the_dispatch_target(monkeypatch):
+    """#356 r1: a ready task assigned to a sister agent transitions to in_progress via
+    claim_task with its assignee/dispatch target PRESERVED — never the coding-feature
+    `claim` (which would reassign to the actor and refuse the already-assigned bead).
+    Its dispatch then follows the existing target-resolution path."""
+    store = _TaskStore([_task("bd-a2a", assignee="quinn")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_worktree(*a, **k):
+        raise AssertionError("a task must NOT create a git worktree")
+
+    monkeypatch.setattr(worktree, "create_worktree", _no_worktree)
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        return "the deliverable"
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+
+    a2a = _sister("a2a")
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(
+        loop, "_resolve_delegate", lambda name, expect: a2a if (name == "quinn" and expect == "a2a") else None
+    )
+
+    assert await loop._spawn_ready() is True
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    # the transition went through claim_task with the target PRESERVED (not the actor)…
+    assert store.claim_task_calls == [("bd-a2a", "quinn")]
+    # …and the reply was recorded, i.e. the dispatch followed the resolved target path.
+    assert ("record_delivery", "bd-a2a", "the deliverable") in store.calls
+
+
+async def test_coding_feature_still_uses_the_atomic_claim_primitive(monkeypatch):
+    """#356 r2: an ordinary coding feature is unaffected — it still claims through the
+    atomic `claim` (`br --claim`, actor-assignment), NEVER the task-only claim_task."""
+    store = _TaskStore([_ready("bd-feat", ["a.py"])])  # no issue_type → a coding feature
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert await loop._spawn_ready() is True
+        assert store.claimed == ["bd-feat"]  # it WAS claimed…
+        assert store.claim_task_calls == []  # …via the atomic `claim`, not claim_task (r2)
+    finally:
+        await finish()
+
+
+async def test_task_claim_race_starts_no_drive_and_is_retried(monkeypatch):
+    """#356 r3: when claim_task loses the race (the ready card changed state under us),
+    no drive starts and the outcome is a retriable claim-race skip — no duplicate drive
+    start, no stale ready card claimed."""
+
+    class _RaceTaskStore(_TaskStore):
+        def claim_task(self, fid, assignee=""):
+            return None  # the atomic transition lost the race / the card is no longer ready
+
+    store = _RaceTaskStore([_task("bd-task", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_dispatch(*a, **k):
+        raise AssertionError("a lost claim race must NOT dispatch")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _no_dispatch)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    assert await loop._spawn_ready() is False  # nothing started…
+    assert loop._drives == set()  # …no drive
+    assert loop._ready_skips["bd-task"] == ("claim-race", 1)  # recorded as a retriable claim-race
+
+
+class _AlwaysRaceStore(_ClaimStore):
+    """A ready card whose atomic claim ALWAYS loses the race — it stays ready and is
+    re-skipped as claim-race every tick, the #356 livelock shape. flag_blocked marks the
+    card blocked (as real `br` does), so a blocked card is not endlessly re-blocked."""
+
+    def __init__(self, features):
+        super().__init__(features)
+        self.blocked = []  # (fid, reason, category)
+
+    def claim(self, fid, assignee=""):
+        return None  # never wins the race
+
+    def flag_blocked(self, fid, reason, category=""):
+        self.blocked.append((fid, reason, category))
+        for f in self._features:
+            if f["id"] == fid:
+                f["blocked"] = True  # the card now carries the blocked flag (still ready-labelled)
+        return {"id": fid}
+
+
+async def test_ready_queue_claim_race_livelock_blocks_after_threshold(monkeypatch):
+    """#356 r4/r6: a ready card whose claim loses the race EVERY tick is not retried
+    forever — after `ready_skip_max` consecutive `claim-race` skips it is flagged blocked
+    with an actionable livelock reason and a non-self-healing class, so the existing
+    blocked sweep / operator escalation surfaces the formerly-invisible
+    ready-but-unclaimable state. It is blocked exactly once."""
+    store = _AlwaysRaceStore([_ready("bd-stuck", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "ready_skip_max": 3})
+
+    for _ in range(2):  # two transient races — must NOT block yet
+        assert await loop._spawn_ready() is False
+        assert store.blocked == []
+    assert await loop._spawn_ready() is False  # the 3rd consecutive claim-race trips the bound
+    assert await loop._spawn_ready() is False  # …and further ticks do not re-block the now-blocked card
+    assert await loop._spawn_ready() is False
+
+    assert len(store.blocked) == 1
+    fid, reason, category = store.blocked[0]
+    assert fid == "bd-stuck"
+    assert "livelock" in reason.lower() and "claim-race" in reason  # actionable livelock/claim reason
+    assert category == "terminal"  # not a self-healing class → the sweep escalates to the operator
+
+
+async def test_ready_queue_transient_claim_race_resets_on_success(monkeypatch):
+    """#356 r5: a single/transient claim race must NOT block. A subsequent successful
+    claim resets the skip counter, so the streak never reaches the threshold — even a
+    threshold of 2, which the un-reset streak would have tripped on the second tick."""
+
+    class _FlakyStore(_ClaimStore):
+        def __init__(self, features):
+            super().__init__(features)
+            self.blocked = []
+            self.attempt = 0
+
+        def claim(self, fid, assignee=""):
+            self.attempt += 1
+            if self.attempt == 1:
+                return None  # a one-off race on the first tick
+            return super().claim(fid, assignee=assignee)
+
+        def flag_blocked(self, fid, reason, category=""):
+            self.blocked.append((fid, reason))
+            return {"id": fid}
+
+    store = _FlakyStore([_ready("bd-flaky", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "ready_skip_max": 2})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert await loop._spawn_ready() is False  # tick 1: raced (streak = 1)
+        assert await loop._spawn_ready() is True  # tick 2: claimed → drive; streak reset
+    finally:
+        await finish()
+    assert store.blocked == []  # a transient race never blocked
+    assert loop._ready_skips == {}  # the counter cleared on the successful claim
+
+
+async def test_bound_ready_skips_counts_and_blocks_by_fid_and_reason(monkeypatch):
+    """#356 r4: the counter is keyed by (fid, reason) and only the SAME reason repeated
+    to the threshold blocks — driven directly against `_bound_ready_skips`."""
+    store = _BlockRecorder()
+    loop = BoardLoop({"ready_skip_max": 3})
+    skip = [{"fid": "bd-x", "reason": "claim-race"}]
+    await loop._bound_ready_skips(store, [], [], skip)
+    await loop._bound_ready_skips(store, [], [], skip)
+    assert loop._ready_skips["bd-x"] == ("claim-race", 2)
+    assert store.blocked == []  # below threshold — not yet
+    await loop._bound_ready_skips(store, [], [], skip)  # the 3rd consecutive identical skip
+    assert [b[0] for b in store.blocked] == ["bd-x"]
+    assert store.blocked[0][2] == "terminal"
+    assert "bd-x" not in loop._ready_skips  # counter dropped once blocked
+
+
+async def test_bound_ready_skips_resets_on_reason_change_and_when_card_leaves(monkeypatch):
+    """#356 r5: a CHANGED skip reason opens a fresh window, and a card that stops being
+    skipped (claimed elsewhere, dependency-blocked, or closed) drops its counter — so a
+    streak of DIFFERENT reasons, or an interrupted streak, never blocks prematurely."""
+    store = _BlockRecorder()
+    loop = BoardLoop({"ready_skip_max": 2})
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-y", "reason": "claim-race"}])
+    # the reason changes → the window resets (count back to 1 for the new reason)…
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-y", "reason": "preflight-hold"}])
+    assert loop._ready_skips["bd-y"] == ("preflight-hold", 1)
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-y", "reason": "claim-race"}])
+    assert loop._ready_skips["bd-y"] == ("claim-race", 1)
+    assert store.blocked == []  # alternating reasons never reached the threshold
+
+    # a card that leaves the ready queue (no skip this tick) drops its counter → progress
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-z", "reason": "claim-race"}])
+    assert loop._ready_skips["bd-z"] == ("claim-race", 1)
+    await loop._bound_ready_skips(store, [], [], [])  # bd-z became dependency-blocked / claimed elsewhere
+    assert "bd-z" not in loop._ready_skips
+    # a successful claim (selected) also resets it
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-z", "reason": "claim-race"}])
+    await loop._bound_ready_skips(store, ["bd-z"], [], [])
+    assert "bd-z" not in loop._ready_skips
+    assert store.blocked == []
+
+
+async def test_bound_ready_skips_never_blocks_a_resolving_hot_file_wait(monkeypatch):
+    """#356: a hot-file skip is RESOLVING (an in-flight build is progressing and, bounded
+    by coder_timeout, will free the file) — transient by construction, not a livelock. It
+    is counted (so a later reason change resets cleanly) but never trips the block, even
+    far past the threshold."""
+    store = _BlockRecorder()
+    loop = BoardLoop({"ready_skip_max": 2})
+    for _ in range(6):
+        await loop._bound_ready_skips(store, [], [], [{"fid": "bd-hot", "reason": "hot-file"}])
+    assert store.blocked == []
+    assert loop._ready_skips["bd-hot"][0] == "hot-file"  # still tracked, never blocked
+
+
+def test_ready_skip_max_floors_so_a_single_race_is_never_terminal():
+    """#356 r5: the threshold floors at 2 — a misconfigured `ready_skip_max` of 0/1 can
+    never make a single/transient claim race terminal. The default is a sane bound."""
+    assert BoardLoop({})._ready_skip_max() >= 2  # a real default bound
+    assert BoardLoop({"ready_skip_max": 1})._ready_skip_max() == 2  # floored
+    assert BoardLoop({"ready_skip_max": 0})._ready_skip_max() == 2
+    assert BoardLoop({"ready_skip_max": 7})._ready_skip_max() == 7  # honored above the floor
+    assert (
+        BoardLoop({"ready_skip_max": "oops"})._ready_skip_max() == BoardLoop({})._ready_skip_max()
+    )  # malformed → default
 
 
 # ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────

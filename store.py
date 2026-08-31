@@ -1647,6 +1647,42 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
+    def claim_task(self, fid: str, assignee: str = "") -> dict | None:
+        """Transition a ready TASK bead → `in_progress` while PRESERVING its existing
+        assignee/dispatch target (#356) — the task sibling of ``claim``.
+
+        A task's ``assignee`` is its DISPATCH TARGET (a sister agent, or the
+        ``self``/``agent`` aliases / the board's own name for first-party work —
+        #333/#334), NOT the claim marker ``--claim`` stamps. So the generic ``claim``
+        above cannot be used for a task: ``br update --claim`` reassigns the bead to the
+        board actor AND refuses a bead that already carries an assignee — so every ready
+        task assigned to any target OTHER than the actor was rejected and retried forever
+        as a lost claim race (the #356 livelock). This transitions the status directly,
+        leaving the dispatch target intact so the caller's target-resolution path (ACP /
+        A2A / self / park) drives it unchanged.
+
+        State-race safe like ``claim``: re-reads the bead and only transitions FROM
+        ``ready``, returning None if it is no longer claimable (already claimed, moved
+        state, or vanished) so the caller classifies it as a race and retries — no stale
+        ready card is claimed. Does NOT use ``--claim`` (that stays the coding-feature
+        primitive, unchanged — its actor-assignment + atomicity are r2).
+
+        The dispatch target is the caller's resolved ``assignee``, else whatever the bead
+        already carries, else the store actor. beads sets an assignee ALONGSIDE
+        in_progress (that is what ``--claim`` does atomically), so the transition always
+        stamps a concrete owner — the non-actor target is preserved exactly (r1), and a
+        truly-unassigned task falls back to the actor: the SAME owned in_progress the old
+        ``--claim`` park produced for it, minus the non-actor refusal."""
+        f = self.get_feature(fid)
+        if f is None or f["board_state"] != "ready":
+            return None
+        target = str(assignee or "").strip() or str(f.get("assignee") or "").strip() or self.actor
+        # Drop the `ready` label so it projects as in_progress; move status WITHOUT
+        # `--claim` so the resolved dispatch target survives the transition instead of
+        # being rewritten to the actor (and the already-assigned bead not being refused).
+        self._run("update", fid, "--status", "in_progress", "--remove-label", LABEL_READY, "--assignee", target)
+        return self.get_feature(fid)
+
     # ── In Progress → In Review ───────────────────────────────────────────────
     def open_review(self, fid: str, *, pr_url: str = "") -> dict:
         """In Progress → In Review. ``pr_url`` is still REQUIRED for a coding feature
