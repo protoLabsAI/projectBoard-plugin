@@ -47,7 +47,11 @@ board to a PR — or fork it as a starting point.
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
 - **Escalation (opt-in)** — with a `coders` map of >1 distinct delegate, a capability
-  failure climbs a model tier (`fast→smart→reasoning`) and blocks at the top.
+  failure climbs to a stronger model. A rung may also hold SEVERAL interchangeable
+  providers (`smart: [codex, sonnet]`, #362): the board round-robins across them, and on
+  a rate limit it switches to the sibling immediately instead of backing off on the
+  exhausted one. Climbing a rung means "a stronger model may succeed"; rotating within one
+  means "this model is fine, its quota is not" — the two never mix.
 - **coder.solve() board seam (ADR 0064 P2/P3)** — on a fresh build, when the
   [`coder`](https://github.com/protoLabsAI/protoAgent/tree/main/plugins/coder) plugin
   is enabled AND the feature has acceptance criteria AND `coder_solve_test_cmd` (or
@@ -547,12 +551,23 @@ aborts nor forgets it, and flipping it back on never starts a second one.
 **and on every redirect hop**, and refuses a hop that leaves `*.githubusercontent.com`
 — reporting the allowlist's message instead of a socket error.
 
+## Reference
+
+| Doc | What |
+|---|---|
+| [`docs/api.md`](docs/api.md) | every HTTP route — the operator (bearer) and public (HMAC) surfaces |
+| [`docs/tools.md`](docs/tools.md) | every agent tool, with the lifecycle-changing ones flagged |
+| [`docs/adr/`](docs/adr/) | the decision records for subsystem behaviour |
+
+Both references are covered by `tests/test_docs_reference.py`, which fails if a route or
+tool is added, renamed or removed without the doc changing — so they are worth trusting.
+
 ## Layout
 
 | File | What |
 |---|---|
 | `store.py` | the `br`/beads wrapper — board projection + the Ready/Done invariants |
-| `loop.py` | the puller: `ready → worktree → coder → PR → in_review` (+ opt-in escalation) |
+| `loop/` | the puller, split by execution edge (#268): `core.py` (lifecycle + config), `drive.py` (`ready → worktree → coder → PR`), `reconcile.py` (rebase/CI/verify/merge), `preflight.py`, `prompt.py` |
 | `worktree.py` | per-feature worktree lifecycle, scoped coder dispatch, `open_pr` |
 | `coder_seam.py` | the ADR 0064 P2 seam — dispatches a build through `coder.solve()` when available, else honest-degrades |
 | `api.py` | the HTTP API + the `/webhook/pr` Done edge (HMAC-verified) |
