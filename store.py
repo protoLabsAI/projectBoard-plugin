@@ -2117,9 +2117,23 @@ class BeadsBoard:
         # marker (#341): drop every `notified:` label so a LATER distinct block on this
         # card can alert the operator again instead of being suppressed forever by a
         # marker the first block left behind. Folded into this one `br update` so the
-        # unblock stays a single write; only removed when actually present.
+        # unblock stays a single write.
+        #
+        # The canonical `blocked` marker is removed UNCONDITIONALLY, not from `labels`
+        # (#341 review). Removing only what the snapshot saw left a real race: a
+        # `mark_notified` add landing AFTER this method's read is invisible to it, so the
+        # marker survived the recovery, and a re-block arriving before mark_notified's
+        # own re-read then made that stale marker look live — silently muting the alert
+        # for the NEW incident. Reading the label list can never be authoritative about a
+        # write that has not happened yet; removing regardless is, and `br` treats
+        # removing an absent label as a no-op (verified against br 0.2.16), so the only
+        # cost is an argument on a write this edge was making anyway.
+        args += ["--remove-label", f"{LABEL_NOTIFIED_PREFIX}blocked"]
         args += [
-            a for label in labels if str(label).startswith(LABEL_NOTIFIED_PREFIX) for a in ("--remove-label", label)
+            a
+            for label in labels
+            if str(label).startswith(LABEL_NOTIFIED_PREFIX) and label != f"{LABEL_NOTIFIED_PREFIX}blocked"
+            for a in ("--remove-label", label)
         ]
         self._run(*args)
         return self.get_feature(fid)

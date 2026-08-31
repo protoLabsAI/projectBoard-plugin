@@ -1856,7 +1856,10 @@ def test_clear_blocked_dispatch_infra_on_a_never_escalated_card_leaves_difficult
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
     b.clear_blocked("bd-9")
     (up,) = br.cmds("update")
-    assert up == ("update", "bd-9", "--remove-label", "blocked", "--remove-label", "blocked-class:dispatch-infra")
+    assert up[:2] == ("update", "bd-9")
+    assert "blocked" in up and "blocked-class:dispatch-infra" in up  # stale infra class dropped
+    assert "diff:small" not in up  # difficulty untouched
+    assert "notified:blocked" in up  # unconditional marker removal (#341 review)
 
 
 def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board, monkeypatch):
@@ -1887,7 +1890,12 @@ def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
     b.clear_blocked("bd-9")
     (up,) = br.cmds("update")
-    assert up == ("update", "bd-9", "--remove-label", "blocked")
+    assert up[:2] == ("update", "bd-9")
+    assert "blocked" in up and "tier:reasoning" not in up  # the tier record is untouched
+    # …plus the unconditional operator-notified removal (#341 review): it is emitted even
+    # when the snapshot shows no marker, because a mark_notified add racing THIS read is
+    # invisible here and would otherwise survive the recovery and mute the NEXT incident.
+    assert "notified:blocked" in up
 
 
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
@@ -4887,3 +4895,40 @@ def test_a_reblock_for_the_SAME_class_keeps_its_label(make_board, monkeypatch):
     (up,) = br.cmds("update")
     assert "blocked-class:transient" in up
     assert "--remove-label" not in up, "removing the label it is adding nets to removed"
+
+
+def test_clear_blocked_removes_the_notified_marker_it_cannot_see(make_board, monkeypatch):
+    """#341 review, the race: `mark_notified` writes its marker provisionally and re-reads
+    to roll it back if the card recovered meanwhile. If a `clear_blocked` that STARTED
+    before that write only removed markers its own snapshot saw, the new marker survived
+    the recovery — and a re-block arriving before the re-read then made that stale marker
+    look live, silently muting the alert for the NEW incident.
+
+    A read can never be authoritative about a write that has not happened yet, so the
+    canonical marker is removed regardless of the snapshot. `br` treats removing an absent
+    label as a no-op, so the only cost is one argument on a write already being made."""
+    br = Br()
+    b = make_board(br)
+    # the snapshot shows NO notified marker — exactly the racing-write case
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "notified:blocked" in up
+
+
+def test_clear_blocked_still_drops_other_notified_kinds_it_can_see(make_board, monkeypatch):
+    """The unconditional removal covers the canonical `blocked` kind; any OTHER
+    `notified:<kind>` present in the snapshot is still dropped, and not duplicated."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "notified:stalled"]},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "notified:stalled" in up
+    assert up.count("notified:blocked") == 1  # unconditional + snapshot must not double up
