@@ -2021,7 +2021,17 @@ class BoardLoop:
                 # saw (the pre-fix behaviour, caught only by the inbox's 300s window). The
                 # marker is dropped only on a genuine unblock (`clear_blocked`, above and
                 # via the operator verb), so a LATER distinct block is news again.
-                if fid not in self._notified_blocks and "blocked" in notified_from_labels(f.get("labels")):
+                marked = "blocked" in notified_from_labels(f.get("labels"))
+                # The BEAD is the source of truth; `_notified_blocks` is only a per-process
+                # cache of it. Whenever the durable marker is absent, drop the memo — a
+                # genuine unblock, an operator clear, or a provisional write that
+                # `record_notified` rolled back after losing a clear-and-reblock race. The
+                # memo used to outlive the rolled-back marker, so the NEXT distinct block on
+                # that card was suppressed — no alert AND no persistence — until a restart,
+                # which is the failure #341 exists to prevent (review r3).
+                if not marked:
+                    self._notified_blocks.discard(fid)
+                if fid not in self._notified_blocks and marked:
                     self._notified_blocks.add(fid)
                     continue
                 already = fid in self._notified_blocks
