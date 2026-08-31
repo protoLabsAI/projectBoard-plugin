@@ -28,6 +28,14 @@ This file does not create that coverage. It makes its ABSENCE impossible to add 
 `REAL` means the function is exercised against the real binary/API in the integration
 tier. `EXEMPT: <reason>` is for a seam where real coverage genuinely is not warranted —
 state why. `UNCOVERED` is honest debt.
+
+EXEMPT is not grantable by say-so: because it drops a seam from the ratchet, an exemption
+is VERIFIED against the source. The only worktree seams that may be EXEMPT are the three
+PR-lifecycle writes, and each must provably shell a fixture-destroying `gh pr` write
+(`create` / `close` / `ready`) — a mutation that creates a new PR or consumes the pinned
+permanently-open read fixture, so it needs a disposable sandbox repo to cover for real.
+Symmetrically, no REAL seam may shell one of those writes. So a read cannot hide under
+EXEMPT to dodge the ratchet, and a mock cannot pose as REAL while mutating real PR state.
 """
 
 from __future__ import annotations
@@ -178,6 +186,37 @@ def _external_seams(path: str, callees: set[str], skip_prefix: tuple[str, ...] =
     return found
 
 
+# The fixture-destroying `gh pr` write subcommands — the ones that either CREATE a brand-new PR
+# or CONSUME / flip the pinned, permanently-open PR the real-`gh` read tier (#361, slice 2) runs
+# against. They cannot be exercised against that shared read fixture the way `merge_pr` can: branch
+# protection REFUSES `gh pr merge` on the pinned PR, so merge_pr runs for real and leaves the fixture
+# intact (that is exactly why merge_pr stays REAL and `merge` is deliberately NOT in this set). These
+# three are the only writes that would need a DISPOSABLE SANDBOX repo to cover for real — which is
+# why they, and only they, are EXEMPT.
+_FIXTURE_DESTROYING_PR_WRITES = {"create", "close", "ready"}
+
+
+def _gh_pr_subcommands(func_name: str) -> set[str]:
+    """Every ``gh pr <sub>`` subcommand ``worktree.<func_name>`` shells with LITERAL leading args,
+    by AST. This ties an EXEMPT classification to what the code ACTUALLY does rather than to an
+    author's comment: a seam cannot be dropped from the ratchet as EXEMPT unless its source really
+    issues a PR-lifecycle write, and a seam kept REAL cannot quietly start issuing one."""
+    tree = ast.parse((_ROOT / "worktree.py").read_text())
+    subs: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != func_name:
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            if (getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)) != "_gh":
+                continue
+            literals = [a.value for a in sub.args if isinstance(a, ast.Constant)]
+            if len(literals) >= 2 and literals[0] == "pr":
+                subs.add(literals[1])
+    return subs
+
+
 def _classify(registry: dict[str, str], found: set[str], module: str) -> None:
     missing = sorted(found - set(registry))
     assert not missing, (
@@ -256,6 +295,49 @@ def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
         assert "production" in reason.lower(), (
             f"{name}: the exemption must record that this path runs in production (the gap is "
             f"delayed feedback, not absent execution); got {reason!r}"
+        )
+
+
+def test_exempt_worktree_seams_really_perform_a_pr_lifecycle_write():
+    """The exemption is verified against the SOURCE, not taken on the author's word.
+
+    An EXEMPT classification drops a seam from the uncovered-seam ratchet, so it must not be
+    grantable by assertion alone — that is precisely the reviewer's worry (a regression in a
+    merely-asserted-exempt seam leaves the contract green). Here every EXEMPT worktree seam must
+    provably shell a fixture-destroying `gh pr` write (create / close / ready): a mutation that
+    creates a new PR or consumes the pinned permanently-open PR the real-`gh` read tier runs
+    against, so it genuinely needs a disposable sandbox repo to cover for real. A plain read seam
+    therefore CANNOT be mislabeled EXEMPT to dodge the ratchet — its source issues no such write
+    and this test fails."""
+    exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
+    assert exempt, "expected at least one EXEMPT worktree seam to verify"
+    for name in exempt:
+        writes = _gh_pr_subcommands(name) & _FIXTURE_DESTROYING_PR_WRITES
+        assert writes, (
+            f"{name} is classified EXEMPT but its source shells no fixture-destroying `gh pr` write "
+            f"(create/close/ready). An EXEMPT that removes a seam from the ratchet must be a real "
+            f"PR-lifecycle mutation needing a disposable sandbox repo — not a read hiding behind the "
+            f"label. Give it REAL coverage or reclassify it honestly."
+        )
+
+
+def test_no_real_worktree_seam_creates_closes_or_promotes_a_pr():
+    """The other half of the invariant, and the direct answer to the ratchet-goes-green risk: no
+    seam classified REAL may shell a fixture-destroying `gh pr` write. If a REAL seam ever starts
+    to create / close / ready a PR, one of two things is true — it now needs the sandbox (→ EXEMPT),
+    or a mock is being passed off as REAL against real PR-lifecycle state (acceptance r4) — and both
+    must fail LOUDLY here rather than leave the coverage contract green. `merge_pr` stays REAL
+    precisely because branch protection REFUSES `gh pr merge` on the pinned fixture, so it runs for
+    real without consuming it; `merge` is intentionally excluded from the fixture-destroying set."""
+    for name, value in WORKTREE_SEAMS.items():
+        if value != "REAL":
+            continue
+        writes = _gh_pr_subcommands(name) & _FIXTURE_DESTROYING_PR_WRITES
+        assert not writes, (
+            f"{name} is classified REAL but its source shells a fixture-destroying `gh pr` write "
+            f"{sorted(writes)}, which cannot be covered against the shared real-`gh` read fixture. "
+            f"Either it now needs a disposable sandbox repo (reclassify EXEMPT) or a mock is posing "
+            f"as REAL — neither may leave this contract green."
         )
 
 

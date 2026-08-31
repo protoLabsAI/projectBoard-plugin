@@ -592,6 +592,15 @@ red CI. They are never mocked into a false REAL, and no CI job creates, closes o
 PR in a production repository. If the sandbox is ever provisioned, these flip to REAL and the
 exemption disappears.
 
+Because an EXEMPT drops a seam from the ratchet, the exemption is **not taken on faith** —
+it is verified against the source. `test_external_seams.py` asserts by AST that each of the
+three EXEMPT seams really shells a *fixture-destroying* `gh pr` write (`create` / `close` /
+`ready`) — the mutations that would consume the pinned read fixture — and, symmetrically,
+that **no** REAL seam shells one. So a read cannot hide under EXEMPT to escape the ratchet,
+and a mock cannot be relabeled REAL while mutating a real PR: either would fail the suite
+loudly rather than leave the contract green. `merge_pr` stays REAL because branch protection
+*refuses* `gh pr merge` on the pinned PR, so it runs for real without consuming it.
+
 ## Layout
 
 | File | What |
