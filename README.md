@@ -13,6 +13,9 @@ backlog → ready → in_progress → in_review → done
                       └── blocked  (a flag, not a lane)
 ```
 
+`in_review` is a small machine of its own, and `blocked` carries a class, a retry budget
+and an escalation path — [`docs/lifecycle.md`](docs/lifecycle.md) has both.
+
 ## See it running — a working board-driven agent
 
 Want a complete, working example of an agent built around this plugin?
@@ -79,7 +82,11 @@ board to a PR — or fork it as a starting point.
   optional (defaults to `project_board.coder`).
 - **Planning layer** — two reasoning subagents (`decompose` + `antagonist`) driven by
   the `decompose-project` skill: idea → outline → MADR ADRs → epics › milestones ›
-  features, hardened by an adversary, with a per-epic human gate.
+  features, hardened by an adversary, with a per-epic human gate. Two more skills bracket
+  it: **`onboard-project`** runs FIRST against a repo this board has not worked before —
+  it scans for the preconditions a coding loop needs and auto-fixes the safe ones — and
+  **`loop-retro`** runs after, mining the board's own attempt history into durable
+  grounding so the next runs stop repeating known failures.
 - **Console view** — a Kanban + list projection over the `/features` API (ADR 0026).
 
 It **composes** the upstream `delegates` plugin (ADR 0024/0025) for the ACP/A2A
@@ -273,8 +280,14 @@ quiets once `db_path` is pinned explicitly or the repo no longer carries a
   `store.merge_posture`; a Settings save to `auto_merge` flips it with no restart),
   no network. `board_list(with_ci=true)` demotes a red row to `ci failing` — never
   "merge #N" on a red PR.
+- **Onboard a repo:** the `onboard-project` skill, BEFORE decomposing or dispatching
+  anything at a repo this board has not worked before. It checks the preconditions a
+  coding-agent loop needs (a runnable gate, conventions, a reachable base branch), fixes
+  the safe deterministic ones, and reports what a human still has to decide.
 - **Plan a project:** the `decompose-project` skill ("decompose <idea>") runs the
   adversarial pipeline and populates the board.
+- **Learn from the loop:** the `loop-retro` skill turns `board_retro`'s failure classes
+  into written grounding, so a recurring failure becomes a rule instead of a habit.
 - **HTTP API:** operator reads and mutations live under the bearer-gated
   `/api/plugins/project_board/*` prefix. The public prefix exposes only the board
   iframe plus `/webhook/pr`, `/features/{id}/ci`, and `/features/{id}/review` for
@@ -573,10 +586,19 @@ aborts nor forgets it, and flipping it back on never starts a second one.
 | [`docs/api.md`](docs/api.md) | every HTTP route — the operator (bearer) and public (HMAC) surfaces |
 | [`docs/tools.md`](docs/tools.md) | every agent tool, with the lifecycle-changing ones flagged |
 | [`docs/configuration.md`](docs/configuration.md) | every config key, its default, and whether the change is live / reload / restart |
-| [`docs/adr/`](docs/adr/) | the decision records for subsystem behaviour |
+| [`docs/lifecycle.md`](docs/lifecycle.md) | the lanes, the `in_review` sub-state machine, head-pinned verdicts, and blocked-card self-heal |
+| [`docs/adr/`](docs/adr/) | the decision records for **this plugin's** subsystem behaviour |
 
-Both references are covered by `tests/test_docs_reference.py`, which fails if a route or
-tool is added, renamed or removed without the doc changing — so they are worth trusting.
+`tests/test_docs_reference.py` covers all four: it fails if a route, an agent tool or a
+config key is added, renamed or removed without its reference changing, and it recomputes
+the YAML-only count `docs/configuration.md` states in prose. That is a COVERAGE guarantee —
+that the lists are honest and complete. What each entry *means* is still a human's job.
+
+**ADRs cited here that are not in `docs/adr/` are the HOST's**, and live in
+[protoAgent's `docs/adr/`](https://github.com/protoLabsAI/protoAgent/tree/main/docs/adr) —
+ADR 0008 (sandboxing), 0024/0025 (ACP coding agents + the delegate registry), 0026
+(plugin-contributed console surfaces) and 0064 (execution-grounded `coder.solve()`). This
+plugin's own decisions are the ones in `docs/adr/`; it does not restate the host's.
 
 ## External-seam coverage — REAL, EXEMPT, or honest debt
 
@@ -641,7 +663,7 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `br_fetch.py` | `br` fetched on first run: the pinned beads-rust release + sha256 table, the off-loop once-per-process fetch, `BR_BIN` > fetched > PATH resolution |
 | `board_view.py` | the Kanban/list console view |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
-| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `loop-retro` distill skill |
+| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project` and `loop-retro` skills |
 | `__init__.py` | `register()` — wires it all |
 
 Ships **disabled**; nothing runs until you enable it, declare a coder delegate and name

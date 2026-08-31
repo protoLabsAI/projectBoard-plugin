@@ -601,7 +601,8 @@ def _issue_closed_by_board_sibling(store, feature: dict) -> bool:
 # but is handled as one validated unit below rather than as independent scalar knobs.
 # Everything else in cfg is read once and needs a restart. Keep this list in
 # step with the manifest's ``settings:`` block (those are the console fields) and
-# the README's "Concurrency" section.
+# the "Concurrency" section of docs/configuration.md. The manifest half is enforced
+# by tests/test_docs_reference.py; the doc half is enforced by its config-key coverage.
 LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge", "coder", "br_autofetch")
 LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0}
 # Knobs that are booleans (coerced by _knob_bool) or strings (stripped); everything

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **18 of 56 keys are in this state, including `coders` and `projects`** —
+never renders it. **21 of 65 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -57,8 +57,19 @@ One board, several repos. Each entry carries its own repo, gate and ladder, so r
 | Key | Default | Applies |
 |---|---|---|
 | `projects` | `—` | reload **· YAML only** |
+| `project` | `—` | **restart** |
+| `default_project` | `—` | reload **· YAML only** |
 | `repo_conventions` | `""` | reload **· YAML only** |
 | `gate_files` | `—` | reload **· YAML only** |
+
+`project` picks ONE entry out of the host's projects registry and layers it under the
+board's own settings — it is a restart knob because the entry supplies `repo` and
+`base_branch`, which the loop reads once at start. Naming an entry that the registry does
+not have is a hard error, not a fallback.
+
+`default_project` names the entry a card lands in when `board_create_feature` is called
+without a `project`. Leave it unset with exactly one project configured and that one is
+used; leave it unset with several and the caller must name one.
 
 ## The gate — the coder's fast slice of CI
 
@@ -114,6 +125,7 @@ The gates between a green build and main.
 | `merged_verify_max` | `5` | reload |
 | `ci_fix_max` | `2` | reload |
 | `review_fix_max` | `2` | reload |
+| `auto_merge` | `False` | live |
 
 ## Housekeeping
 
@@ -125,6 +137,35 @@ The gates between a green build and main.
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
 
+## Concurrency
+
+How much the loop runs at once. All three are **live** — the running loop picks them up on
+its next tick, so you can throttle a board that is running hot without a restart.
+
+| Key | Default | Applies |
+|---|---|---|
+| `max_concurrent` | `1` | live |
+| `max_pending_reviews` | `5` | live |
+| `max_concurrent_sessions` | `0` | live |
+
+`max_concurrent` is the number of cards in flight at once (floor 1) — one per project is
+the usual setting for a multi-repo board. `max_pending_reviews` caps how many cards may sit
+in review before the loop stops claiming new ones (0 = no cap), which is what stops a
+review backlog from starving the queue.
+
+`max_concurrent_sessions` caps ACP sessions, and it is the one to reach for first when the
+board overwhelms a local gateway. It is **0 = uncapped** by default, and the ceiling is not
+`max_concurrent`: each dispatched card opens up to `coder_solve_k` candidate sessions, so
+peak concurrency is `max_concurrent × coder_solve_k`. The loop says so at boot:
+
+```
+coder_solve_k=3: peak concurrent ACP sessions = max_concurrent × coder_solve_k = 6 × 3 = 18
+(set max_concurrent_sessions to cap this)
+```
+
+Set it to `1` to serialise candidates within a card while still building several cards
+in parallel.
+
 ## Everything else
 
 | Key | Default | Applies |
@@ -134,6 +175,7 @@ The gates between a green build and main.
 | `coder_solve_budget` | `6` | reload |
 | `coder_solve_tree_depth` | `2` | reload |
 | `dep_gate` | `"merge"` | reload |
+| `env_passthrough` | `—` | **restart** **· YAML only** |
 | `goal_fix_max` | `2` | reload |
 | `goal_verify` | `False` | reload |
 | `health_sweep_interval_s` | `300` | reload |
@@ -143,7 +185,22 @@ The gates between a green build and main.
 | `rebase_fix_max` | `1` | reload |
 | `review_run_max` | `3` | reload |
 | `review_workflow` | `"code-review"` | reload |
+| `webhook_secret` | `—` | reload |
 | `worktrees_root` | `".worktrees"` | reload |
+
+Two of those carry security weight and are easy to skim past:
+
+**`webhook_secret`** — the shared HMAC-SHA256 secret for the PUBLIC ingress routes
+(`/webhook/pr` and the CI/review callbacks; GitHub supplies the signature, other callers
+sign their exact JSON bytes). It falls back to `PROJECT_BOARD_WEBHOOK_SECRET` in the
+environment. **Blank fails CLOSED** — those routes mutate board state, so they are refused
+rather than opened just because the host happens to be reachable only on loopback.
+
+**`env_passthrough`** — the whitelist of environment variables that gate, format and coder
+child processes are allowed to see (#86). The board strips the host's identity/credential
+block from every child environment; this is the escape hatch for a deployment that
+genuinely needs one of them (a private index token, say). The whitelist WINS, so anything
+named here is passed through — keep it as short as the build actually requires.
 
 ## The two that are easy to get wrong
 
