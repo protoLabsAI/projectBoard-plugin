@@ -2034,7 +2034,14 @@ class BoardLoop:
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
-                    incident=f"{cls}|{reason}",
+                    # The recovery CYCLE is part of the incident's identity (#346 r7): a
+                    # card that auto-healed, rebuilt and failed the SAME way again is a new
+                    # failed cycle and IS news — the self-heal did not work. Keying on
+                    # class+reason alone suppressed exactly that for the whole window.
+                    # `spent` is the unblock-retry budget the self-heal already tracks, so
+                    # this costs no new state: it increments on every auto-unblock and is
+                    # therefore different on each side of a recovery.
+                    incident=f"{cls}|{reason}|{spent}",
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
@@ -2051,11 +2058,16 @@ class BoardLoop:
         version of the question.
 
         The easy version: let the KEY answer it. ``dedup_key`` carries the incident's
-        identity — the card plus its failure class and reason — so the same block dedups
-        by construction, a genuinely different block is a different key and alerts, and no
-        bead label, memo, generation or rollback exists to go stale. A recovery followed
-        by a re-block for a DIFFERENT reason alerts because the key changed; a re-block for
-        the SAME reason is the same incident and the operator has already been told.
+        identity — the card, its failure class and reason, and the recovery cycle it is on
+        — so the same block dedups by construction, a genuinely different block is a
+        different key and alerts, and no bead label, memo, generation or rollback exists
+        to go stale.
+
+        The recovery cycle belongs in that identity: a card that auto-healed, rebuilt and
+        failed the SAME way again is a NEW failed cycle and is news, because the self-heal
+        did not work. Keying on class+reason alone silently suppressed that for the whole
+        window — the behaviour this docstring's first draft argued was correct, and was
+        not.
 
         The window is long (`_ALERT_DEDUP_S`) because a blocked card can sit for hours and
         the default 300s would re-alert on every restart — the failure #341 opened with.

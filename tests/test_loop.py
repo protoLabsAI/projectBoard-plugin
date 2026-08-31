@@ -8771,3 +8771,37 @@ async def test_no_notification_state_is_written_to_the_bead(monkeypatch, tmp_pat
     await BoardLoop({"coder": "proto"})._recover_blocked(store)
     assert added, "the operator was still told"
     assert store.updates == []
+
+
+async def test_a_failed_recovery_cycle_alerts_again_even_for_an_identical_failure(monkeypatch, tmp_path):
+    """#346 r7: keying the incident on class+reason alone was wrong. A card that auto-healed,
+    rebuilt, and failed in exactly the same way is a NEW failed recovery cycle — the
+    self-heal did not work, which is precisely what an operator needs to hear — and it was
+    being suppressed for the whole seven-day window.
+
+    The unblock-retry budget already counts those cycles, so it joins the key and costs no
+    new state."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    same = dict(cls="transient", reason="coder timed out after 1800.0s")
+    # cycle 2 exhausted its retries → alert. A FRESH loop each time so the budget is read
+    # from the bead rather than the per-process cache, which is also what a restart does.
+    await BoardLoop({"coder": "proto"})._recover_blocked(
+        _BlockedStore([_blocked("bd-a", same["cls"], reason=same["reason"], budget=2)])
+    )
+    # …recovered, rebuilt, failed IDENTICALLY — a new cycle, so the budget advanced
+    await BoardLoop({"coder": "proto"})._recover_blocked(
+        _BlockedStore([_blocked("bd-a", same["cls"], reason=same["reason"], budget=3)])
+    )
+    assert len({a["key"] for a in added}) == 2, "a new failed recovery cycle must reach the operator"
+
+
+async def test_repeated_sweeps_within_one_cycle_still_dedup(monkeypatch, tmp_path):
+    """The other half stays true: while the card sits blocked on the SAME cycle, every
+    sweep produces the same key and the operator is told once."""
+    added = []
+    _spy_inbox(monkeypatch, tmp_path, added)
+    row = _blocked("bd-a", "auth", reason="403 forbidden", budget=2)
+    for _ in range(4):
+        await BoardLoop({"coder": "proto"})._recover_blocked(_BlockedStore([row]))
+    assert len({a["key"] for a in added}) == 1
