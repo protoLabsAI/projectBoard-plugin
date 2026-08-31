@@ -697,11 +697,21 @@ async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     return (await pr_merge_info(pr_url, cwd=cwd))["mergeStateStatus"]
 
 
-async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tuple[bool, str]:
+async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".", expected_head: str = "") -> tuple[bool, str]:
     """Merge an open PR via ``gh pr merge`` (the auto-merge edge). ``method`` is
     ``squash`` / ``merge`` / ``rebase``. Returns ``(ok, detail)`` — never raises into
     the loop; a refusal (branch protection, a required review, a race with a
     concurrent merge) is the caller's to log and retry or give up on.
+
+    ``expected_head`` (a commit sha) pins the merge to that head via
+    ``gh pr merge --match-head-commit`` (GitHub's ``expectedHeadOid``): if a push
+    landed after the caller read/verified the head, GitHub REJECTS the merge atomically
+    rather than merging the newer, unreviewed commit. This is the race-free other half
+    of the review gate's last-moment head-pin check (#323/#347) — the caller's own
+    read-then-compare closes the gate on a stale pin, but only ``--match-head-commit``
+    makes the merge itself refuse a head that moved in the window between that read and
+    this call. Empty = no constraint (the historical behavior, for the unpinned /
+    grandfathered / gate-off paths that have no verified head to pin to).
 
     Deliberately NOT ``--delete-branch``: gh deletes the LOCAL branch too, and
     ``feat/<fid>`` is checked out in the feature's worktree, so the merge landed and
@@ -709,7 +719,10 @@ async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tu
     (2026-08-20, bd-p9q/bd-wrl). The remote branch goes via ``delete_remote_branch``
     once the board has read MERGED; the worktree is reaped there too."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(str(method).lower(), "--squash")
-    rc, out, err = await _gh("pr", "merge", pr_url, flag, cwd=cwd, timeout=120)
+    args = ["pr", "merge", pr_url, flag]
+    if expected_head:
+        args += ["--match-head-commit", expected_head]
+    rc, out, err = await _gh(*args, cwd=cwd, timeout=120)
     detail = (err or out or "").strip()
     return rc == 0, detail
 
@@ -1062,6 +1075,65 @@ async def post_review_check(
         )
         return False
     return True
+
+
+async def read_review_check(
+    repo_slug: str,
+    head_sha: str,
+    *,
+    name: str = REVIEW_CHECK_NAME,
+    cwd: str = ".",
+) -> dict | None:
+    """Read back the head-pinned ``QA panel`` check run — the INBOUND counterpart of
+    ``post_review_check`` (#323 ← #347). Returns the TRUSTED, PROMOTED QA verdict recorded
+    for ``head_sha`` as ``{"conclusion": str, "head_sha": str, "passed": bool}``, or
+    ``None`` when no such verdict can be PROVEN for that exact head.
+
+    Reuses the SAME identity plumbing #347 publishes through — the ``name`` check keyed to
+    a commit via ``/repos/{slug}/commits/{sha}/check-runs`` (``_existing_review_check_id``'s
+    endpoint) — instead of parsing a second, independent signal. A verdict is returned ONLY
+    when there is EXACTLY ONE ``name`` check run whose OWN recorded immutable ``head_sha``
+    equals ``head_sha`` (the currency invariant of #328, full-sha exact — no label
+    abbreviation here) AND whose ``status`` is ``completed`` (a promoted verdict, not an
+    in-flight run) AND which carries a ``conclusion``. ``passed`` is
+    ``conclusion == "success"`` — GitHub's green CI rollup and an unpinned review comment
+    are NOT this signal; only the named check pinned to the commit is.
+
+    Fails CLOSED to ``None`` — so a caller can never act on a signal it could not read
+    cleanly — on an empty slug/head, a ``gh`` error, malformed/non-list JSON, NO matching
+    run (absent, or a PASS pinned to another head), MORE THAN ONE (ambiguous), a run still
+    running, or a completed run with no conclusion. Never raises into the loop."""
+    if not repo_slug or not head_sha:
+        return None
+    try:
+        rc, out, _err = await _gh(
+            "api", f"/repos/{repo_slug}/commits/{head_sha}/check-runs", "--jq", ".check_runs", cwd=cwd
+        )
+    except WorktreeError:
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        runs = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(runs, list):
+        return None
+    # Match on the check NAME and on the run's OWN recorded head — the commit endpoint is
+    # already head-scoped, but requiring the run's immutable ``head_sha`` to equal the sha
+    # asked for makes "recorded head == current head" explicit and rejects a stray run
+    # pinned elsewhere. More than one match is ambiguous → fail closed (the caller can't
+    # tell which is authoritative), exactly as #347's publisher keeps a single record.
+    matched = [r for r in runs if isinstance(r, dict) and r.get("name") == name and r.get("head_sha") == head_sha]
+    if len(matched) != 1:
+        return None  # absent, another-head-only, or ambiguous → fail closed
+    run = matched[0]
+    if run.get("status") != "completed":
+        return None  # an in-flight run is not yet a promoted verdict → fail closed
+    conclusion = run.get("conclusion")
+    if not isinstance(conclusion, str) or not conclusion:
+        return None  # completed but no conclusion recorded → malformed → fail closed
+    return {"conclusion": conclusion, "head_sha": head_sha, "passed": conclusion == "success"}
 
 
 async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:

@@ -4778,3 +4778,68 @@ def test_a_reblock_for_the_SAME_class_keeps_its_label(make_board, monkeypatch):
     (up,) = br.cmds("update")
     assert "blocked-class:transient" in up
     assert "--remove-label" not in up, "removing the label it is adding nets to removed"
+
+
+# ── #323: a clean verdict pins the head it examined ─────────────────────────────────
+
+
+def test_a_clean_verdict_pins_the_head_it_reviewed(make_board, monkeypatch):
+    """A clean verdict is a claim about the code it READ. It carries that code's identity,
+    so the merge gate can tell whether the claim still applies."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.set_review_substate("bd-1", store.LABEL_REVIEW_CLEAN, head_sha="abc123def456")
+    (up,) = br.cmds("update")
+    assert "review-clean-sha:abc123def456" in up
+
+
+def test_a_non_clean_substate_drops_any_stale_pin(make_board, monkeypatch):
+    """`review-pending` and `changes-requested` are not verdicts about a head. A pin left
+    behind them would let a later clean-looking state inherit a sha it never earned."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["review-clean-sha:old111"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.set_review_substate("bd-1", store.LABEL_REVIEW_PENDING)
+    (up,) = br.cmds("update")
+    assert "--remove-label" in up and "review-clean-sha:old111" in up
+    assert not any(str(a).startswith("review-clean-sha:") and a != "review-clean-sha:old111" for a in up)
+
+
+def test_re_pinning_the_same_head_keeps_the_label(make_board, monkeypatch):
+    """The #338 trap: `br` applies --remove-label after --add-label, so a re-stamp of an
+    UNCHANGED value would delete the pin it is writing. Goes through the shared helper."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["review-clean-sha:abc123"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.set_review_substate("bd-1", store.LABEL_REVIEW_CLEAN, head_sha="abc123")
+    (up,) = br.cmds("update")
+    assert "review-clean-sha:abc123" in up
+    assert up.count("--remove-label") == 2  # the two sibling substates only, not the pin
+
+
+def test_the_merge_gate_refuses_a_verdict_pinned_to_a_dead_head():
+    """The race this closes, stated as the invariant that replaces it: a PASS proven for
+    one head must not open the merge edge for another. A push landing at ANY point after
+    the review leaves the pin naming a head that no longer exists — no window to lose."""
+    f = {
+        "id": "bd-1",
+        "board_state": "in_review",
+        "labels": ["in-review", "review-clean", "review-clean-sha:aaa111aaa111"],
+    }
+    stale = store.merge_posture(f, auto_merge=True, review_gate=True, head_sha="bbb222bbb222")["blockers"]
+    assert any("review-clean verdict is for aaa111aaa111" in b for b in stale)
+    # …and the same verdict on the head it was actually made for is fine
+    assert store.merge_posture(f, auto_merge=True, review_gate=True, head_sha="aaa111aaa111")["blockers"] == []
+
+
+def test_an_unpinned_clean_verdict_is_grandfathered_not_stranded():
+    """Deliberate: a verdict written before this shipped carries no pin. Blocking those
+    would strand every in-flight card on rollout — a fleet-wide stall, a worse and far more
+    likely outcome than the race being closed. An unpinned verdict is exactly as trusted as
+    it was yesterday; the exposure drains as cards cycle."""
+    f = {"id": "bd-1", "board_state": "in_review", "labels": ["in-review", "review-clean"]}
+    assert store.merge_posture(f, auto_merge=True, review_gate=True, head_sha="anything")["blockers"] == []
