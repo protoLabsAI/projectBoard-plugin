@@ -2045,10 +2045,15 @@ class BoardLoop:
                 # Persist the durable marker AFTER the alert (the loud log is the alert of
                 # last resort, so reaching here always notified the operator). Only on the
                 # FIRST notify this process (`already` was false); a stayed-blocked card is
-                # one alert. Fail SAFE (#341 r5): a lost marker write is logged with
-                # actionable evidence and NOT treated as recorded — the missing label lets
-                # a later sweep/restart re-alert (inbox dedup is the secondary guard),
-                # never a false 'already notified' the loop would trust as durable truth.
+                # one alert. This write is separated from the alert above by the `await`, so
+                # a concurrent genuine unblock can land in between; `record_notified` guards
+                # on the card STILL being blocked (store.py) so it never resurrects the
+                # marker on an already-recovered card — a card that unblocked here is left
+                # clean and a LATER distinct block is news again. Fail SAFE (#341 r5): a
+                # lost marker write is logged with actionable evidence and NOT treated as
+                # recorded — the missing label lets a later sweep/restart re-alert (inbox
+                # dedup is the secondary guard), never a false 'already notified' the loop
+                # would trust as durable truth.
                 if not already:
                     try:
                         await asyncio.to_thread(store.record_notified, fid, "blocked")

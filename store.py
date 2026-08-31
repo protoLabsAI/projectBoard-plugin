@@ -2294,9 +2294,23 @@ class BeadsBoard:
         cancelling re-add). RAISES on a `br` failure, unlike the fire-and-forget budget
         writes: the loop MUST be able to tell a persisted marker from a lost one, so it can
         fail safe and never record a false 'already notified' it would then read as durable
-        truth (#341 r5)."""
+        truth (#341 r5).
+
+        GUARDED by the LIVE condition (#341 review): a `blocked` marker is stamped only
+        while the card is STILL blocked, read fresh here. The alert and this write are
+        separated by an ``await`` in the caller, so a genuine unblock (``clear_blocked``)
+        can land in between — dropping the `blocked` flag AND the prior `notified:` marker
+        it supersedes. Re-adding the marker onto an already-recovered card would resurrect
+        a dedup the recovery edge deliberately dropped and mute the alert for a LATER
+        distinct block. So a card that is no longer blocked is left UNTOUCHED and returned
+        as-is: recording 'the operator was told about a block' is meaningless once the
+        block is gone, and the recovery edge stays authoritative. (Not an error — a
+        recovered card is a normal outcome, so this returns rather than raises; the write
+        only fails, and only then raises, when `br` itself refuses.)"""
         f = self._require(fid)
         kind = str(kind or "").strip() or "blocked"
+        if kind == "blocked" and LABEL_BLOCKED not in (f.get("labels") or []):
+            return f
         label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
         if label not in (f.get("labels") or []):
             self._run("update", fid, "--add-label", label)

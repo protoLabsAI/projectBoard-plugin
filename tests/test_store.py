@@ -454,6 +454,21 @@ def test_record_notified_is_idempotent_when_already_present(make_board, monkeypa
     assert not br.cmds("update")  # marker already there → no self-cancelling re-add
 
 
+def test_record_notified_skips_a_card_that_already_unblocked(make_board, monkeypatch):
+    """The review race: the alert and this delayed write straddle an `await`, so a genuine
+    unblock (`clear_blocked`) can strip the `blocked` flag and the prior marker in between.
+    Re-stamping `notified:blocked` onto an already-recovered card would mute a LATER
+    distinct block, so the guard leaves a not-blocked card untouched — no write burned."""
+    br = Br()
+    b = make_board(br)
+    # fresh read shows the card has RECOVERED (no `blocked` label) — the unblock won the race
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["ready"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["ready"]})
+    out = b.record_notified("bd-1", "blocked")
+    assert not br.cmds("update")  # no stale marker re-added onto the recovered card
+    assert "notified:blocked" not in (out.get("labels") or [])
+
+
 def test_clear_notified_drops_the_marker(make_board, monkeypatch):
     br = Br()
     b = make_board(br)

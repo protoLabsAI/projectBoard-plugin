@@ -8507,8 +8507,10 @@ class _BlockedStore:
     def clear_blocked(self, fid):
         self.cleared.append(fid)
         r = self._row(fid)
-        if r is not None:  # a genuine unblock supersedes the notified marker (#341)
-            r["labels"] = [l for l in (r.get("labels") or []) if not str(l).startswith("notified:")]
+        if r is not None:  # a genuine unblock drops the block flag AND supersedes the marker (#341)
+            r["blocked"] = False
+            r["board_state"] = "ready"
+            r["labels"] = [l for l in (r.get("labels") or []) if not str(l).startswith("notified:") and l != "blocked"]
         return {"id": fid}
 
     def requeue(self, fid):
@@ -8519,8 +8521,13 @@ class _BlockedStore:
         self.budgets.append((fid, kind, n))
 
     def record_notified(self, fid, kind="blocked"):
-        self.notified.append((fid, kind))
         r = self._row(fid)
+        # Mirror the real store's LIVE-condition guard (#341 review): a `blocked` marker is
+        # stamped only while the card is STILL blocked, so a concurrent unblock that landed
+        # between the alert and this delayed write is never overwritten by a stale re-add.
+        if kind == "blocked" and (r is None or not r.get("blocked")):
+            return {"id": fid}
+        self.notified.append((fid, kind))
         if r is not None and f"notified:{kind}" not in (r.get("labels") or []):
             r.setdefault("labels", []).append(f"notified:{kind}")
         return {"id": fid}
@@ -8783,14 +8790,41 @@ async def test_a_recovered_then_reblocked_card_is_news_again(monkeypatch, tmp_pa
     added = _use_fake_inbox(monkeypatch, tmp_path)
     await BoardLoop({"coder": "proto"})._recover_blocked(store)
     assert len(added) == 1 and "notified:blocked" in row["labels"]
-    # genuine recovery supersedes the marker (the real clear_blocked edge strips it)
+    # genuine recovery supersedes the marker (the real clear_blocked edge drops the block
+    # flag AND strips the marker)
     store.clear_blocked("bd-a")
-    assert "notified:blocked" not in row["labels"]
-    # a new distinct block, seen by a restarted loop → news again
+    assert "notified:blocked" not in row["labels"] and row["blocked"] is False
+    # a LATER distinct block re-raises the flag; a restarted loop → news again
+    row["blocked"] = True
+    row["board_state"] = "blocked"
     loop2 = BoardLoop({"coder": "proto"})
     await loop2._recover_blocked(store)
     assert len(added) == 2
     assert store.notified == [("bd-a", "blocked"), ("bd-a", "blocked")]
+
+
+async def test_a_concurrent_unblock_is_not_overwritten_by_the_delayed_marker(monkeypatch, tmp_path):
+    """The race the review caught: the marker write is separated from the alert by an
+    `await`, so a genuine unblock can land BETWEEN them. The delayed `record_notified`
+    must NOT resurrect `notified:blocked` on a now-recovered card — that stale marker
+    would mute the alert for a LATER distinct block. The store's live-condition guard
+    keeps the recovery authoritative: no marker, no stray notify write."""
+    row = _blocked("bd-a", "auth")
+    store = _BlockedStore([row])
+    added = _use_fake_inbox(monkeypatch, tmp_path)
+    loop = BoardLoop({"coder": "proto"})
+    real_notify = loop._notify_operator
+
+    def _notify_then_a_concurrent_unblock_lands(fid, text):
+        real_notify(fid, text)  # the operator IS told about the block
+        store.clear_blocked(fid)  # …but a genuine recovery lands before the marker write
+
+    monkeypatch.setattr(loop, "_notify_operator", _notify_then_a_concurrent_unblock_lands)
+    await loop._recover_blocked(store)
+    assert len(added) == 1  # the alert reached the operator
+    assert store.notified == []  # …but nothing was persisted onto the recovered card
+    assert "notified:blocked" not in (row.get("labels") or [])  # no stale marker re-added
+    assert row["blocked"] is False  # the unblock stands
 
 
 async def test_a_notified_marker_write_failure_fails_safe(monkeypatch, tmp_path, caplog):
