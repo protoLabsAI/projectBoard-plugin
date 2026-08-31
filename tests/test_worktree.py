@@ -1289,3 +1289,127 @@ async def test_base_checkout_dirt_skips_the_branch_check_without_a_base(monkeypa
     monkeypatch.setattr(worktree, "_git", git)
     assert await worktree.base_checkout_dirt("/repo", "") == ""
     assert git.ran("rev-parse") == []
+
+
+# ── #347: the head-pinned review-gate check run (post_review_check) ───────────────
+
+
+class _CheckGh:
+    """A `_gh` stub for post_review_check: records every `gh` call and answers the
+    ``GET …/commits/<sha>/check-runs`` lookup from `existing` (a list of {name,id}),
+    then the CREATE/UPDATE. `create_rc` drives the POST/PATCH return code."""
+
+    def __init__(self, existing=None, create_rc=0, create_err=""):
+        self.calls = []  # each call's full args tuple
+        self.existing = existing or []
+        self.create_rc = create_rc
+        self.create_err = create_err
+
+    async def __call__(self, *args, cwd, timeout=60):
+        self.calls.append(args)
+        # the idempotency lookup — GET /repos/<slug>/commits/<sha>/check-runs with
+        # `--jq .check_runs`, so gh emits just the array (emulated here).
+        if args and args[0] == "api" and "/check-runs" in args[1] and "/commits/" in args[1]:
+            import json as _json
+
+            return (0, _json.dumps(self.existing), "")
+        # the POST/PATCH that lands the verdict
+        return (self.create_rc, "", self.create_err)
+
+    def api_writes(self):
+        """The CREATE/PATCH calls (the ones that mutate a check run)."""
+        return [c for c in self.calls if c and c[0] == "api" and "/commits/" not in c[1]]
+
+    @staticmethod
+    def field(call, key):
+        """The `-f key=value` value from a recorded gh-api call (or None)."""
+        for i, a in enumerate(call):
+            if a == "-f" and i + 1 < len(call) and call[i + 1].startswith(f"{key}="):
+                return call[i + 1].split("=", 1)[1]
+        return None
+
+
+_SLUG = "o/r"
+_HEAD = "0123456789abcdef0123456789abcdef01234567"  # a full 40-char sha
+
+
+async def test_post_review_check_creates_a_head_pinned_check_when_none_exists(monkeypatch):
+    """r1/r2/r4: a clean verdict CREATEs a `QA panel` check keyed to the exact reviewed
+    head, with a success conclusion — no existing run to update."""
+    gh = _CheckGh(existing=[])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_review_check(
+        _SLUG, _HEAD, conclusion="success", title="Review gate: clean", summary="no blocking findings", cwd="/repo"
+    )
+    assert ok is True
+    (write,) = gh.api_writes()
+    assert "--method" in write and write[write.index("--method") + 1] == "POST"
+    assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/check-runs"
+    assert _CheckGh.field(write, "head_sha") == _HEAD  # the FULL immutable head, not truncated
+    assert _CheckGh.field(write, "name") == "QA panel"
+    assert _CheckGh.field(write, "conclusion") == "success"
+    assert _CheckGh.field(write, "status") == "completed"
+
+
+async def test_post_review_check_updates_an_existing_run_idempotently(monkeypatch):
+    """r5: a `QA panel` run ALREADY on this head is PATCHed by id — never a second POST,
+    so a reconcile/retry of the same verdict leaves ONE status record, not duplicates."""
+    gh = _CheckGh(existing=[{"name": "other", "id": 11}, {"name": "QA panel", "id": 42}])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_review_check(
+        _SLUG, _HEAD, conclusion="action_required", title="changes requested", summary="findings", cwd="/repo"
+    )
+    assert ok is True
+    (write,) = gh.api_writes()
+    assert write[write.index("--method") + 1] == "PATCH"
+    assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/check-runs/42"  # the existing id
+    # a PATCH targets the run by id — head_sha is immutable, so it must NOT be re-sent
+    assert _CheckGh.field(write, "head_sha") is None
+    assert _CheckGh.field(write, "conclusion") == "action_required"
+
+
+async def test_post_review_check_never_posts_without_a_head_or_slug(monkeypatch):
+    """r2: an unknown reviewed head (or repo) means the gate can't prove which commit it
+    reviewed — so NO check is posted (never a verdict against a guessed/moved head), and
+    not even the lookup fires."""
+    gh = _CheckGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.post_review_check(_SLUG, "", conclusion="success", title="t", summary="s") is False
+    assert await worktree.post_review_check("", _HEAD, conclusion="success", title="t", summary="s") is False
+    assert gh.calls == []  # short-circuited before any gh call
+
+
+async def test_post_review_check_returns_false_on_a_gh_failure(monkeypatch):
+    """Best-effort: a failed POST (no `checks:write`, a network blip) returns False and
+    never raises into the loop — the verdict still rides the bead comment."""
+    gh = _CheckGh(existing=[], create_rc=1, create_err="HTTP 403: Resource not accessible")
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_review_check(_SLUG, _HEAD, conclusion="failure", title="t", summary="s", cwd="/repo")
+    assert ok is False
+
+
+async def test_post_review_check_coerces_an_unknown_conclusion_to_neutral(monkeypatch):
+    """A caller typo in the conclusion can't make gh reject the POST and drop the verdict:
+    an unknown value degrades to `neutral` (a landed, if uncolored, status)."""
+    gh = _CheckGh(existing=[])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    await worktree.post_review_check(_SLUG, _HEAD, conclusion="explode", title="t", summary="s", cwd="/repo")
+    (write,) = gh.api_writes()
+    assert _CheckGh.field(write, "conclusion") == "neutral"
+
+
+async def test_post_review_check_lookup_error_falls_back_to_create(monkeypatch):
+    """A check-runs lookup that can't be read (gh non-zero / bad JSON) is treated as "no
+    existing run" → CREATE, never a crash: the verdict still lands (a possible duplicate is
+    the safe failure, an unposted verdict is not)."""
+
+    async def _gh(*args, cwd, timeout=60):
+        if args and args[0] == "api" and "/commits/" in args[1]:
+            return (1, "boom", "not found")  # the lookup fails
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    assert (
+        await worktree.post_review_check(_SLUG, _HEAD, conclusion="success", title="t", summary="s", cwd="/repo")
+        is True
+    )

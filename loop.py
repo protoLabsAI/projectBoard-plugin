@@ -4061,6 +4061,44 @@ class BoardLoop:
                 "[project_board] %s reviewed-head stamp (%s) not persisted", fid, sha or "(clear)", exc_info=True
             )
 
+    async def _publish_gate_check(
+        self, fid: str, pr_url: str, repo: str, head_sha: str, *, conclusion: str, title: str, summary: str
+    ) -> None:
+        """Publish the in-loop review-gate verdict as the head-pinned ``QA panel`` GitHub
+        check run (#347) — the merge-relevant fact made visible where the PR is reviewed.
+        Pinned to ``head_sha``, the IMMUTABLE head the gate actually reviewed (#328,
+        ``reviewed_head`` read BEFORE the panel): an unknown head (gh couldn't read it, so
+        ``head_sha`` is empty) posts NOTHING, so a verdict never lands against a head the
+        gate did not see. Best-effort — the bead comment stays the durable audit record —
+        but keyed + idempotent (``worktree.post_review_check`` updates the single record in
+        place) so a reconcile/retry reconciles one status instead of stacking duplicates.
+
+        Runs on EVERY verdict — clean, changes-requested, and the exhausted block — so the
+        historic inconsistency (the ``QA panel`` check appearing only when the review
+        workflow happened to post it as a side effect) is replaced by the loop reliably
+        publishing/updating that same check off the verdict it actually computed."""
+        if not head_sha:
+            log.info(
+                "[project_board] %s review verdict not published as a check — reviewed head unknown (#328 fail-closed)",
+                fid,
+            )
+            return
+        _number, repo_slug = _parse_pr_url(pr_url)
+        if not repo_slug:
+            log.info("[project_board] %s review verdict not published as a check — no repo slug from %s", fid, pr_url)
+            return
+        try:
+            ok = await worktree.post_review_check(
+                repo_slug, head_sha, conclusion=conclusion, title=title, summary=summary, cwd=repo
+            )
+        except Exception as exc:  # noqa: BLE001 — a check post must never break the landed verdict
+            log.warning("[project_board] %s review check post raised (verdict still on the bead): %s", fid, exc)
+            return
+        if not ok:
+            log.warning(
+                "[project_board] %s review check not posted (gh failed / no head) — verdict rides the bead comment", fid
+            )
+
     # ── blocking review gate (plan M5) ────────────────────────────────────────
     async def _review_gate(self, store, fid: str, pr_url: str, repo: str) -> None:
         """Run the adversarial review workflow on the just-opened PR and act on the
@@ -4170,6 +4208,21 @@ class BoardLoop:
             # stale against a dead head — an absent stamp fails the reconcile CLOSED (#328).
             await self._stamp_reviewed_head(store, fid, "")
             await self._budget_reset(store, fid, "review-fix")
+            # r4: the clean verdict is a passing gate ON THE HEAD IT REVIEWED (#347). The
+            # stamp is cleared (a clean verdict pins no head for the reconcile), but the
+            # check must land against the exact reviewed head — the full sha, not "".
+            await self._publish_gate_check(
+                fid,
+                pr_url,
+                repo,
+                reviewed_head,
+                conclusion="success",
+                title="Review gate: clean",
+                summary=(
+                    f"The in-loop review gate found no blocking findings "
+                    f"({len(findings)} finding(s), none blocker/major).\n\n{pr_url}"
+                ),
+            )
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
             return
 
@@ -4188,6 +4241,18 @@ class BoardLoop:
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             await self._budget_reset(store, fid, "review-fix")
+            # r3: a blocking verdict is a non-success gate carrying the surviving findings
+            # (#347). The exhausted round is terminal (a human owns it now), so `failure`,
+            # with the findings + the PR link as the durable actionable reference.
+            await self._publish_gate_check(
+                fid,
+                pr_url,
+                repo,
+                reviewed_head,
+                conclusion="failure",
+                title="Review gate: changes required",
+                summary=f"{rendered}\n\nThese findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
+            )
             log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
             return
         await self._budget_set(store, fid, "review-fix", n + 1)
@@ -4205,6 +4270,18 @@ class BoardLoop:
         # unchanged head keeps matching this stamp and stays rejected. Empty (unreadable
         # head) writes no stamp → the reconcile fails closed on it, never re-arming blind.
         await self._stamp_reviewed_head(store, fid, reviewed_head[:_REVIEWED_HEAD_SHA_LEN] if reviewed_head else "")
+        # r3: publish the blocking verdict against the reviewed head as a non-success check
+        # (#347) — `action_required` (vs the exhausted `failure`): a fix round is active,
+        # the coder is re-driving. The full reviewed head, not the truncated stamp.
+        await self._publish_gate_check(
+            fid,
+            pr_url,
+            repo,
+            reviewed_head,
+            conclusion="action_required",
+            title="Review gate: changes requested",
+            summary=f"{rendered}\n\nThe coder is re-driving a fix for these findings.\n\n{pr_url}",
+        )
         await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s review gate bounce %d/%d (%d blocking finding(s))",

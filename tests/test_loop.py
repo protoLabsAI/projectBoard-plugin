@@ -5329,6 +5329,42 @@ def _no_real_pr_head_sha(monkeypatch):
     monkeypatch.setattr(worktree, "pr_head_sha", _blank)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_post_review_check(monkeypatch):
+    """#347: the review gate now publishes its verdict as a head-pinned ``QA panel`` check
+    run via ``worktree.post_review_check``. Pin it to a no-op so no gate test in this
+    module shells a real ``gh api`` (a test that asserts posting installs its own recorder,
+    which overrides this). Mirrors the ``_no_real_pr_head_sha`` guard above."""
+
+    async def _noop(*a, **k):
+        return True
+
+    monkeypatch.setattr(worktree, "post_review_check", _noop)
+
+
+def _record_review_checks(monkeypatch):
+    """Install a recorder over ``worktree.post_review_check`` and return the list it
+    appends each call's kwargs (+ positional slug/head) to — the seam the #347 gate tests
+    assert against without a real ``gh``."""
+    posts: list[dict] = []
+
+    async def _rec(repo_slug, head_sha, *, conclusion, title, summary, name="QA panel", cwd="."):
+        posts.append(
+            {
+                "repo_slug": repo_slug,
+                "head_sha": head_sha,
+                "conclusion": conclusion,
+                "title": title,
+                "summary": summary,
+                "name": name,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(worktree, "post_review_check", _rec)
+    return posts
+
+
 def _gate_loop(monkeypatch, output, cfg=None):
     """A review_gate loop whose review-workflow run returns ``output`` (None = the
     run could not happen, with the no-runner-no-reviewer reason) and whose PR-diff
@@ -5667,6 +5703,103 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert "prior_findings" in seen_inputs[1]
     assert "drops data" in seen_inputs[1]["prior_findings"]
+
+
+# ── #347: publish the in-loop gate verdict as a head-pinned `QA panel` check run ──
+
+
+_FULL_HEAD = "0123456789abcdef0123456789abcdef01234567"  # a real 40-char sha
+
+
+def _head_returning(sha):
+    async def _head(pr_url, *, cwd="."):
+        return sha
+
+    return _head
+
+
+async def test_gate_publishes_a_success_check_on_the_reviewed_head_when_clean(monkeypatch):
+    """r1/r4: a CLEAN verdict publishes a `QA panel` check with a success conclusion,
+    pinned to the EXACT reviewed head (the full sha — even though the reconcile stamp is
+    cleared for a clean verdict, the check must land on the head the gate examined)."""
+    _inject_fake_findings(monkeypatch)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
+    posts = _record_review_checks(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, "clean.\n```json\n[]\n```")
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert store.review_states[-1][0] == "review-clean"
+    assert len(posts) == 1
+    (post,) = posts
+    assert post["conclusion"] == "success"
+    assert post["head_sha"] == _FULL_HEAD  # full immutable head, not the 12-char stamp
+    assert post["repo_slug"] == "o/r" and post["name"] == "QA panel"
+
+
+async def test_gate_publishes_a_nonsuccess_check_with_findings_when_blocking(monkeypatch):
+    """r1/r3: a BLOCKING verdict publishes a NON-success check whose summary carries the
+    surviving blocking findings + a durable PR reference, pinned to the reviewed head."""
+    _inject_fake_findings(monkeypatch)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
+    posts = _record_review_checks(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert ("requeue", "bd-1") in store.calls  # the fix round is active
+    assert len(posts) == 1
+    (post,) = posts
+    assert post["conclusion"] != "success"  # a blocking result is a non-success gate
+    assert post["head_sha"] == _FULL_HEAD
+    assert "drops data" in post["summary"]  # the surviving blocking finding
+    assert "github.com/o/r/pull/9" in post["summary"]  # a durable reference to it
+
+
+async def test_gate_publishes_a_failure_check_when_the_fix_budget_is_exhausted(monkeypatch):
+    """r3: the terminal (budget-exhausted) block also publishes a non-success check with
+    the persisting findings — a human owns it, and the PR shows why."""
+    _inject_fake_findings(monkeypatch)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
+    posts = _record_review_checks(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, _BLOCKER, cfg={"review_fix_max": 1})
+    loop._review_fix_attempts["bd-1"] = 1  # budget already spent → blocks this round
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert any(c[0] == "flag_blocked" for c in store.calls)
+    assert len(posts) == 1
+    (post,) = posts
+    assert post["conclusion"] == "failure"
+    assert post["head_sha"] == _FULL_HEAD
+    assert "drops data" in post["summary"] and "needs human review" in post["summary"]
+
+
+async def test_gate_posts_no_check_when_the_reviewed_head_is_unknown(monkeypatch):
+    """r2/r6: the historic inconsistency reproduced — when the immutable head can't be
+    read (the autouse `_no_real_pr_head_sha` returns ""), the gate posts NO check rather
+    than stamping a verdict against a head it cannot prove it reviewed. The verdict still
+    lands on the bead (the audit record), so the gate itself is unaffected."""
+    _inject_fake_findings(monkeypatch)
+    # pr_head_sha stays the autouse blank ("") — the unreadable-head path.
+    posts = _record_review_checks(monkeypatch)
+    store = _GateStore()
+    loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert store.review_states[-1][0] == "changes-requested"  # the verdict still lands on the bead
+    assert posts == []  # …but NO check against a head the gate can't prove it saw
+
+
+async def test_gate_check_is_reconciled_not_duplicated_across_the_seam(monkeypatch):
+    """r5 at the loop seam: two identical clean verdicts on the same head each call the
+    idempotent poster (which updates the single record) — the loop never opens a second,
+    parallel posting path, so posting is driven only through `worktree.post_review_check`."""
+    _inject_fake_findings(monkeypatch)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
+    posts = _record_review_checks(monkeypatch)
+    for _ in range(2):
+        store = _GateStore()
+        loop = _gate_loop(monkeypatch, "clean.\n```json\n[]\n```")
+        await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
+    assert [p["head_sha"] for p in posts] == [_FULL_HEAD, _FULL_HEAD]
+    assert all(p["conclusion"] == "success" and p["name"] == "QA panel" for p in posts)
 
 
 # ── #328: re-arm the review gate after an external push stales the verdict ────────
