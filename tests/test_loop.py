@@ -445,6 +445,84 @@ def test_build_prompt_omits_repo_conventions_when_empty():
     assert "## Repo conventions" not in BoardLoop({"repo_conventions": "   \n  "})._build_prompt(FEATURE)
 
 
+# ── standing scope-preservation block (#349 / bd-x01i) ───────────────────────────
+#
+# Removed-behavior is a recurring review-fix category (~21% of findings, one fix-round
+# each). `_build_prompt` carries a UNIVERSAL, unconditional scope block: scope is
+# additive by default, unrequested removal of guards/fallbacks/aliases/defaults is out,
+# and a genuine removal stays legal only when named + explained in the final summary.
+
+# The stable phrases that make up the block's contract — asserted verbatim so the block
+# can't be gutted (turned into a blank line) while the heading survives.
+_SCOPE_MARKERS = (
+    "scope is ADDITIVE",  # additive-by-default framing (r2)
+    "delete, narrow, or bypass",  # the three forbidden moves (r2)
+    "guards, fallbacks, aliases, or defaults",  # the specific behaviors not to drop (r2)
+    "still allowed",  # a necessary removal stays legal (r3)
+    "name the removed behavior and the reason",  # …only if named… (r3)
+    "`## Summary`",  # …in the final summary, where review can judge it (r3)
+)
+
+
+def _assert_scope_block(prompt: str):
+    assert "## Scope" in prompt  # its own heading, distinct from Task / Rules
+    for marker in _SCOPE_MARKERS:
+        assert marker in prompt, marker
+
+
+def test_build_prompt_always_carries_the_scope_preservation_block():
+    """AC r1/r2/r3 (#349): every coding dispatch carries the standing preservation
+    block — scope is additive, unrequested removal of guards/fallbacks/aliases/defaults
+    is forbidden, and a genuine removal stays legal only when named with its reason in
+    the final `## Summary`."""
+    _assert_scope_block(BoardLoop({})._build_prompt(FEATURE))
+    # a bare feature (no files, no design, no acceptance criteria, no requirements) too
+    _assert_scope_block(BoardLoop({})._build_prompt({"id": "x", "title": "T", "spec": "s"}))
+
+
+def test_scope_preservation_block_cannot_disappear_on_any_path():
+    """AC r1/r5: the block is UNCONDITIONAL — present regardless of files_to_modify,
+    repo gate files, repo conventions, distilled lessons, the requirement ledger, or the
+    fix/retry path. Prove it survives with every optional lever toggled on, and again on
+    the previous-attempt-rejected retry path."""
+    loop = BoardLoop({"gate_files": ["CHANGELOG.md"], "repo_conventions": _CONVENTIONS})
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    # ordinary dispatch, every optional block populated
+    _assert_scope_block(loop._build_prompt(feature, lessons="- always update the golden map"))
+    # fix/retry path: a prior attempt was rejected → the block still rides along
+    loop._ci_feedback["bd-1"] = "REQUESTED CHANGES: drops the null guard"
+    loop._ci_prior_diff["bd-1"] = "diff --git a/x b/x\n+ bad"
+    retry = loop._build_prompt(feature, lessons="- heed me")
+    assert "REJECTED" in retry  # sanity: this really is the retry path
+    _assert_scope_block(retry)
+
+
+def test_scope_block_is_separated_from_and_does_not_disturb_existing_blocks():
+    """AC r4: the new block is additive — the task, files, gate files, conventions,
+    lessons, acceptance criteria and requirement ledger all remain under their own
+    headings, correctly separated and in order."""
+    loop = BoardLoop({"gate_files": ["CHANGELOG.md"], "repo_conventions": _CONVENTIONS})
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    prompt = loop._build_prompt(feature, lessons="- always update the golden map")
+    for heading in (
+        "## Task",
+        "## Files to create / modify",
+        "## Repo standing gate files",
+        "## Repo conventions",
+        "## Acceptance criteria",
+        "## Requirements ledger",
+        "## Rules",
+    ):
+        assert heading in prompt, heading
+    # the scope block sits between the design/context blocks and the acceptance criteria,
+    # and does not swallow the ledger that follows
+    assert prompt.index("## Scope") < prompt.index("## Acceptance criteria")
+    assert prompt.index("## Acceptance criteria") < prompt.index("## Requirements ledger")
+    # the card's own content and the neighbouring blocks are untouched by the addition
+    assert "do the thing" in prompt and "- a.py" in prompt
+    assert _CONVENTIONS in prompt and "always update the golden map" in prompt
+
+
 def test_is_test_path_classification():
     """The deterministic gate's path classifier — what counts as a test vs code."""
     from project_board.loop import _is_code_path, _is_test_path

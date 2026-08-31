@@ -5254,6 +5254,27 @@ class BoardLoop:
         )
         design = feature.get("design", "")
         design_block = f"\n## Design / context\n{design}\n" if design.strip() else ""
+        # Standing scope-preservation block (#349 / bd-x01i): removed-behavior is a
+        # recurring review-fix category (~21% of findings, ~one fix-round each). A
+        # card's scope is ADDITIVE by default — a coder that deletes/narrows/bypasses
+        # existing behavior it merely judged redundant burns a full round. This is
+        # UNIVERSAL scope framing, not a policy ban: emitted UNCONDITIONALLY on every
+        # coding dispatch (ordinary, retry, any task type, any config) — no `if`, so it
+        # cannot silently disappear on a path. Removal stays legal when the card asks
+        # for it OR the coder names the removed behavior + its reason in the final
+        # summary, so review can judge it deliberately. Kept concise on purpose (AC r6):
+        # if the measured category rate does not fall, this block is REMOVED, not grown
+        # into a conditional policy system.
+        preserve_scope_block = (
+            "\n## Scope — this change is additive; preserve existing behavior\n"
+            "A card's scope is ADDITIVE unless the card explicitly says otherwise. Do "
+            "NOT delete, narrow, or bypass existing behavior outside the stated change "
+            "— including apparently redundant guards, fallbacks, aliases, or defaults. "
+            "Leave them in place even if they look unnecessary.\n"
+            "If the change GENUINELY requires removing behavior, that is still allowed "
+            "— but name the removed behavior and the reason for it in your final "
+            "`## Summary`, so review can judge the removal deliberately.\n"
+        )
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
         # CI; lead with the failure so the coder FIXES it this pass (it can't run the
         # checks itself — edit-only). Also widen scope: the fix may touch tests/files
@@ -5325,6 +5346,7 @@ class BoardLoop:
             f"{gate_files_block}"
             f"{repo_conventions_block}"
             f"{design_block}\n"
+            f"{preserve_scope_block}"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
             f"## Rules\n"
