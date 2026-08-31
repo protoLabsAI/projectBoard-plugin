@@ -215,9 +215,26 @@ def test_the_real_gh_tier_actually_runs_against_real_github():
     real-GitHub seam tests must be gated by a `requires_gh` skipif AND CI must set PB_REQUIRE_GH=1
     so an absent/unusable credential FAILS rather than silently skipping — the failure mode that
     let #354 (a PAT that cannot POST /check-runs) ship green. Without both, the 12 REAL `gh`
-    classifications above would be as inert as the mock they replaced."""
+    classifications above would be as inert as the mock they replaced.
+
+    The read seams must also run on EVERY CI path, not just same-repo PRs: the two writes gate on
+    `requires_gh_write` / PB_GH_ALLOW_WRITES (set only where GITHUB_TOKEN is write-capable) so the
+    read seams still run on fork PRs and pushes. Without that split the whole job had to be gated
+    off wherever a write was impossible — which is how the tier was BYPASSED for fork PRs and
+    unpinned pushes, leaving these REAL classifications uncovered on those paths."""
     tier = (_ROOT / "tests" / "test_worktree_gh.py").read_text()
     assert "PB_REQUIRE_GH" in tier
     assert re.search(r"requires_gh\s*=\s*pytest\.mark\.skipif", tier)
+    # Reads run everywhere; only the writes gate on a write-capable token. This split is what lets
+    # the CI job run unconditionally instead of being bypassed where writes are impossible.
+    assert re.search(r"requires_gh_write\s*=\s*pytest\.mark\.skipif", tier), (
+        "the two write seams must gate on a separate `requires_gh_write` skipif so the read seams "
+        "still run on fork PRs / pushes (a read-only token) rather than bypassing the whole tier"
+    )
+    assert "PB_GH_ALLOW_WRITES" in tier
     ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert "PB_REQUIRE_GH" in ci, "CI must set PB_REQUIRE_GH=1 on the real-GitHub job (r2)"
+    assert "PB_GH_ALLOW_WRITES" in ci, (
+        "CI must gate the write seams behind PB_GH_ALLOW_WRITES so the read seams run on every path "
+        "(fork PRs / pushes) instead of the whole real-GitHub job being bypassed there"
+    )

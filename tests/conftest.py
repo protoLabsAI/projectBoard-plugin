@@ -127,17 +127,24 @@ def make_board(monkeypatch):
 # No credential is embedded here: the token rides the ambient `gh` auth (GH_TOKEN /
 # `gh auth login`); a PR URL is a PUBLIC identifier, never a secret. Required environment,
 # documented and credential-free:
-#   PB_GH_FIXTURE_PR — full URL of the OPEN fixture PR in the checkout's repo, e.g.
-#                      https://github.com/protoLabsAI/projectBoard-plugin/pull/<n>. CI resolves
-#                      it (see .github/workflows/ci.yml) to the maintained `PB_GH_FIXTURE_PR`
-#                      repo variable when a maintainer wires a dedicated, pinned,
-#                      permanently-open fixture PR, and otherwise to the PR under test — itself
-#                      a real open PR while its own checks run. The reads target this PR; the two
-#                      writes use DISPOSABLE contexts distinct from the production review signals,
-#                      so the tier never disturbs a real review gate on it.
-#   PB_REQUIRE_GH=1  — (CI only) turn an absent/unusable prerequisite into a FAILURE.
-#   GH_TOKEN         — (CI only) the gh credential; a repo-scoped token that can create a
-#                      commit status + a PR comment on the fixture PR (mirrors the board's PAT).
+#   PB_GH_FIXTURE_PR   — full URL of the OPEN fixture PR in the checkout's repo, e.g.
+#                        https://github.com/protoLabsAI/projectBoard-plugin/pull/<n>. CI resolves
+#                        it (see .github/workflows/ci.yml) to the maintained `PB_GH_FIXTURE_PR`
+#                        repo variable when a maintainer wires a dedicated, pinned,
+#                        permanently-open fixture PR, and otherwise to the PR under test — itself
+#                        a real open PR while its own checks run. The reads target this PR; the two
+#                        writes use DISPOSABLE contexts distinct from the production review signals,
+#                        so the tier never disturbs a real review gate on it.
+#   PB_GH_ALLOW_WRITES — set (any non-empty value) to run the two idempotent write seams
+#                        (post_review_status / read_review_status round-trip and
+#                        post_or_update_pr_comment). They need a WRITE-capable token, so CI sets
+#                        this only on the write-capable paths (same-repo PR / push / dispatch) and
+#                        leaves it empty on fork PRs, whose GITHUB_TOKEN is read-only. Unset → the
+#                        read seams still run; the write seams skip (tests/test_worktree_gh.py's
+#                        @requires_gh_write). Not a credential — a public capability toggle.
+#   PB_REQUIRE_GH=1    — (CI only) turn an absent/unusable read prerequisite into a FAILURE.
+#   GH_TOKEN           — (CI only) the gh credential; a repo-scoped token that can create a
+#                        commit status + a PR comment on the fixture PR (mirrors the board's PAT).
 
 GH_FIXTURE_PR_URL = (os.environ.get("PB_GH_FIXTURE_PR") or "").strip()
 _GH_PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")

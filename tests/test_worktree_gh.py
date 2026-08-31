@@ -12,11 +12,20 @@ permission and the provider behaves as assumed.
 Posture mirrors the real-`br` tier (``test_integration.py``): local runs SKIP when GitHub
 credentials are unavailable (``@requires_gh``); CI sets ``PB_REQUIRE_GH=1`` so an absent or
 unusable credential — or an unresolvable fixture PR — FAILS via the guard test below rather
-than silently skipping the whole tier. The fixture PR + credential are resolved once by the
-``gh_fixture`` fixture (tests/conftest.py); the PR URL rides ``PB_GH_FIXTURE_PR``, which CI
-sets (see .github/workflows/ci.yml) to the maintained ``PB_GH_FIXTURE_PR`` repo variable when
-a maintainer pins a dedicated, permanently-open fixture PR, and otherwise to the PR under test
-(itself a real open PR while its checks run). A PR URL is a public identifier, never a secret.
+than silently skipping the whole tier. The CI job carries NO ``if:`` bypass: the READ seams run
+on every event (fork PRs included) because a readable token + a resolvable OPEN PR is all they
+need. The fixture PR + credential are resolved once by the ``gh_fixture`` fixture
+(tests/conftest.py); the PR URL rides ``PB_GH_FIXTURE_PR``, which CI sets (see
+.github/workflows/ci.yml) to the maintained ``PB_GH_FIXTURE_PR`` repo variable when a maintainer
+pins a dedicated, permanently-open fixture PR, and otherwise to the PR under test (itself a real
+open PR while its checks run). A PR URL is a public identifier, never a secret.
+
+The two WRITES additionally need a write-capable token, so they gate on ``@requires_gh_write``
+(``PB_GH_ALLOW_WRITES``): CI sets it on the write-capable paths (same-repo PR / push / dispatch)
+and leaves it empty on fork PRs, whose GITHUB_TOKEN is forced read-only. On a fork PR the write
+seams therefore SKIP with a documented reason — a structural credential limit, not the #354
+silent skip — while every read seam still runs; the writes are covered by every same-repo PR and
+every push, the paths the loop actually opens PRs from.
 
 The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for_branch``,
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
@@ -25,8 +34,8 @@ Reads use the pinned fixture. The only writes are (1) ONE idempotent commit stat
 STABLE disposable ``(context, sha)`` and (2) ONE idempotent marked PR comment updated in place
 — both bounded so a reconcile/retry never stacks duplicates (r4). ``merge_pr`` is exercised
 with a DELIBERATELY wrong ``expected_head`` so GitHub refuses it atomically: the seam runs for
-real, its ``--match-head-commit`` head-pin is proven, and the permanently-open fixture is never
-merged (r5).
+real (on every path, under a token that cannot merge), its ``--match-head-commit`` head-pin is
+proven, and the permanently-open fixture is never merged (r5).
 """
 
 from __future__ import annotations
@@ -54,6 +63,27 @@ requires_gh = pytest.mark.skipif(
     not _TIER_READY,
     reason=_TIER_REASON or "real `gh` / real-GitHub tier prerequisites present (CI sets PB_REQUIRE_GH=1 to enforce)",
 )
+
+# The READ seams run on EVERY CI path (fork PRs included) — a readable token + a resolvable OPEN PR
+# is all they need. The two idempotent WRITES additionally need a WRITE-capable token, which
+# GITHUB_TOKEN is on same-repo PRs / pushes / dispatch but is FORCED read-only on fork PRs. So the
+# write seams gate on PB_GH_ALLOW_WRITES, which CI sets only on the write-capable paths (see
+# .github/workflows/ci.yml). On a fork PR the write seams SKIP with a documented reason — a
+# structural credential limit, not the #354 silent skip — while the read seams still run under
+# PB_REQUIRE_GH; they are covered by every same-repo PR + every push, the paths the loop opens PRs
+# from. Locally set PB_GH_ALLOW_WRITES=1 (with a write-capable `gh` login) to exercise the writes.
+_WRITES_ALLOWED = bool(os.environ.get("PB_GH_ALLOW_WRITES"))
+if not _TIER_READY:
+    _WRITE_REASON = _TIER_REASON
+elif not _WRITES_ALLOWED:
+    _WRITE_REASON = (
+        "PB_GH_ALLOW_WRITES is not set — the two idempotent writes need a write-capable token "
+        "(present on same-repo PRs / pushes / dispatch, but the fork-PR GITHUB_TOKEN is read-only); "
+        "the read seams above still run and are enforced by PB_REQUIRE_GH"
+    )
+else:
+    _WRITE_REASON = ""
+requires_gh_write = pytest.mark.skipif(not (_TIER_READY and _WRITES_ALLOWED), reason=_WRITE_REASON or "writes enabled")
 
 
 def _different_sha(sha: str) -> str:
@@ -177,7 +207,7 @@ async def test_pr_ci_status_reports_a_known_rollup(gh_fixture):
 # ── post_review_status + read_review_status (the commit-status write + its readback) ────
 
 
-@requires_gh
+@requires_gh_write
 async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixture):
     """The #354 PAT-compatible verdict path, end-to-end against real GitHub: ``post_review_status``
     creates a COMMIT STATUS pinned to the fixture head (``POST /repos/{slug}/statuses/{sha}``) —
@@ -228,7 +258,7 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
     assert await worktree.read_review_status(slug, "", context=TEST_STATUS_CONTEXT, cwd=cwd) is None
 
 
-@requires_gh
+@requires_gh_write
 async def test_review_status_read_fails_closed_on_a_head_it_never_examined(gh_fixture):
     """r5, the head-identity invariant against real GitHub: ``read_review_status`` is scoped by the
     commit in its URL, so a verdict recorded for the fixture head must NEVER be attributed to a
@@ -264,7 +294,7 @@ async def test_find_marked_comment_absent_marker_returns_empty(gh_fixture):
     assert (found_id, found_body) == ("", "")
 
 
-@requires_gh
+@requires_gh_write
 async def test_post_or_update_pr_comment_is_idempotent_and_marked(gh_fixture):
     """``post_or_update_pr_comment`` posts — or idempotently UPDATES in place — a single
     board-authored PR comment identified by a hidden marker (#354). Against real GitHub the

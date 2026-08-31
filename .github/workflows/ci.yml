@@ -93,28 +93,38 @@ jobs:
     # The real-GitHub integration tier (#361 slice 2, tests/test_worktree_gh.py): the ACTUAL
     # `gh`/GitHub against a real OPEN PR. It exercises the 12 read-dominant worktree GitHub seams a
     # mocked `_gh` cannot validate — the blindness that shipped #354 (a PAT that cannot POST
-    # /check-runs, green through every mock). It needs a credential that can create the ONE
-    # idempotent commit status (statuses: write) + ONE idempotent marked comment
-    # (pull-requests/issues: write) on that PR, and the PR's URL.
+    # /check-runs, green through every mock, publishing to nothing for a day). A mock proves the
+    # call SHAPE; only the real API proves the configured credential holds the permission.
     #
-    # The fixture PR is resolved by PB_GH_FIXTURE_PR (below): it PREFERS the maintained
-    # `PB_GH_FIXTURE_PR` repo variable — a dedicated, pinned, permanently-open fixture PR when a
-    # maintainer wires one — and otherwise FALLS BACK to the PR under test, which is itself a real
-    # open PR while its own checks run. Either way the tier reads a real open PR and does its two
-    # idempotent writes on it under DISPOSABLE contexts (distinct from the production review-gate
-    # status/comment, so it never disturbs a real review signal); `merge_pr` is exercised with a
-    # deliberately wrong `expected_head` so GitHub refuses it atomically and the PR is never merged.
+    # This job ALWAYS runs (NO `if:` bypass) with PB_REQUIRE_GH=1, mirroring the real-`br` tier's
+    # "an absent prerequisite FAILS, never silently skips" contract. That is deliberate. An earlier
+    # revision gated the whole job behind a same-repo-PR `if:`, so it was BYPASSED for fork PRs and
+    # for pushes without a pinned fixture — leaving the newly-REAL seams with NO real-GitHub coverage
+    # on those paths while the ratchet (tests/test_external_seams.py) still counted them covered.
+    # Now the tier cannot be silently bypassed on any path:
     #
-    # Runs where that credential AND a resolvable fixture PR both exist: same-repo PRs (the loop
-    # opens its PRs from same-repo branches; the fixture defaults to the PR itself), and
-    # pushes/dispatch ONLY when the repo variable pins a dedicated PR. NOT fork PRs, whose
-    # GITHUB_TOKEN is read-only and whose secrets are withheld — the credential-absent case the
-    # tier skips, not a silent skip; the enforced same-repo legs cover every PR the loop actually
-    # opens. `contents` stays READ so the token cannot merge — belt-and-suspenders with the
-    # wrong-`expected_head` refusal in the merge_pr test.
-    if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-      || (github.event_name != 'pull_request' && vars.PB_GH_FIXTURE_PR != '')
+    #   READS (9 of the 12 seams) run on EVERY event — fork PRs included — because they need only a
+    #   readable token (the ambient GITHUB_TOKEN is present on every run, read-only on fork PRs) and
+    #   a resolvable OPEN PR. Under PB_REQUIRE_GH=1 an absent credential or an unresolvable fixture
+    #   FAILS the guard test rather than skipping the tier (an unpinned push FAILS, it does not skip).
+    #
+    #   WRITES (post_review_status + read_review_status round-trip and post_or_update_pr_comment —
+    #   two idempotent observability writes) need a WRITE-capable token. GITHUB_TOKEN gets the
+    #   `permissions:` below on same-repo PRs, pushes and dispatch, but is FORCED read-only on fork
+    #   PRs. So PB_GH_ALLOW_WRITES is set ONLY on the write-capable paths; on a fork PR the write
+    #   seams skip with a documented reason — a structural credential limit, NOT a silent skip of the
+    #   tier — and are covered by every same-repo PR + every push instead (the paths the loop opens
+    #   PRs from and merges through). Both writes are idempotent on a DISPOSABLE (context, marker)
+    #   distinct from the production review-gate signals, so the fixture is never disturbed;
+    #   `merge_pr` is exercised with a deliberately wrong `expected_head` so GitHub refuses it
+    #   atomically and the permanently-open fixture is never merged (and `contents` stays READ so the
+    #   token cannot merge at all — belt-and-suspenders).
+    #
+    # PB_GH_FIXTURE_PR resolves to the maintained `PB_GH_FIXTURE_PR` repo variable — a dedicated,
+    # pinned, permanently-open fixture PR a maintainer wires once (the intended stable config, and
+    # the ONLY fixture available on push/dispatch) — and otherwise to the PR under test, itself a
+    # real open PR while its own checks run. Pin the repo variable to give fork PRs and pushes a
+    # stable same-repo fixture to read; a PR URL is a PUBLIC identifier, never a secret.
     runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
     name: test (real gh)
     permissions:
@@ -137,14 +147,17 @@ jobs:
         run: gh --version
 
       - name: Test (real-GitHub tier)
-        # PB_REQUIRE_GH=1 turns an absent/unusable credential — or an unresolvable fixture PR —
-        # into a FAILURE (the guard test in tests/test_worktree_gh.py) instead of a silent skip of
-        # the whole tier: a silent skip is exactly how #354 shipped green. GH_TOKEN is the ambient
-        # `gh` credential (no token is embedded in the suite). PB_GH_FIXTURE_PR is the maintained
-        # repo variable when a maintainer sets it (a dedicated pinned permanently-open fixture PR),
-        # else the PR under test's own URL — both are PUBLIC PR identifiers, never credentials (r6).
+        # PB_REQUIRE_GH=1 turns an absent/unusable credential — or an unresolvable fixture PR — into
+        # a FAILURE (the guard test in tests/test_worktree_gh.py) instead of a silent skip of the
+        # whole tier: a silent skip is exactly how #354 shipped green. GH_TOKEN is the ambient `gh`
+        # credential (no token is embedded in the suite). PB_GH_ALLOW_WRITES enables the two
+        # idempotent writes ONLY where GITHUB_TOKEN is write-capable (not a PR event, or a same-repo
+        # PR); on a fork PR it is empty, so the write seams skip while the read seams still run under
+        # PB_REQUIRE_GH. PB_GH_FIXTURE_PR is the maintained repo variable when set, else the PR under
+        # test's URL — both are PUBLIC PR identifiers, never credentials (r6).
         env:
           PB_REQUIRE_GH: "1"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PB_GH_FIXTURE_PR: ${{ vars.PB_GH_FIXTURE_PR || github.event.pull_request.html_url }}
+          PB_GH_ALLOW_WRITES: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         run: pytest -q tests/test_worktree_gh.py
