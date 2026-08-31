@@ -2782,12 +2782,16 @@ class BoardLoop:
         self._draft_noted.discard(fid)
         # LAST gate before the merge (#323): a clean verdict is only a verdict about the
         # code it READ, so it is written pinned to that head and must still match the live
-        # one. This is not a check-then-act guard and does not need to be — a push landing
-        # after this read leaves the pin stale on every later pass too, so it can only ever
-        # close the gate, never open it. The first cuts tried to make the WRITE race-free
-        # (re-read before, re-read after, undo); review rejected both, correctly, because a
-        # push can land after any check. Carrying the identity makes the race irrelevant
-        # instead of trying to win it.
+        # one. Two layers guard the merge. (1) The stale-pin check below is a belt: a push
+        # landing before it leaves the pin stale on every later pass too, so the check can
+        # only ever close the gate, never open it — the pin's WRITE never needed to win a
+        # race (earlier cuts that re-read-and-undid the write were correctly rejected). (2)
+        # But a push can still land in the tiny window AFTER this check and BEFORE the merge
+        # call; the check alone can't cover that, so the verified head is carried into
+        # `merge_pr` as `expected_head` and GitHub refuses the merge atomically
+        # (`--match-head-commit`) if the head moved. Belt and suspenders — the merge itself,
+        # not just the board state, is constrained to the reviewed head.
+        merge_head = ""  # the verified reviewed head to pin the merge to (empty = grandfathered/no gate)
         if self.review_gate:
             pinned = next(
                 (
@@ -2810,7 +2814,13 @@ class BoardLoop:
                     )
                     await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
                     return False
-        ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo)
+                # The read above matched, but a push can still land in the window before the
+                # merge call — so carry the verified head into the merge and let GitHub refuse
+                # atomically (``--match-head-commit``) if the head moved. This closes the
+                # residual TOCTOU: without it, a commit pushed after this comparison would be
+                # the head ``gh pr merge`` lands, merging code the gate never reviewed.
+                merge_head = live
+        ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo, expected_head=merge_head)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
             # later step failed, or a concurrent merge (webhook, human) beat us. The

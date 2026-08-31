@@ -5564,6 +5564,12 @@ class _RoundTripStore(_GateStore):
         self.labels = [l for l in self.labels if l not in self._SUBSTATES]
         if label:
             self.labels.append(label)
+        # Mirror the real store's head pin (#323): a review-clean verdict stamps
+        # `review-clean-sha:<head>`; any other substate drops a stale pin. This is what
+        # the auto-merge edge reads to head-pin the merge.
+        self.labels = [l for l in self.labels if not str(l).startswith("review-clean-sha:")]
+        if label == "review-clean" and head_sha:
+            self.labels.append(f"review-clean-sha:{head_sha}")
         return super().set_review_substate(fid, label, note)
 
     def record_reviewed_head(self, fid, sha):
@@ -6563,8 +6569,8 @@ def _automerge_reconcile_env(monkeypatch, *, head, verdict, mss="CLEAN"):
     async def _info(url, *, cwd="."):
         return {"mergeStateStatus": mss, "isDraft": False}
 
-    async def _merge(url, *, method="squash", cwd="."):
-        merges.append((url, method))
+    async def _merge(url, *, method="squash", cwd=".", expected_head=""):
+        merges.append((url, method, expected_head))
         return (True, "")
 
     async def _delete(repo, branch):
@@ -6594,7 +6600,9 @@ async def test_reconcile_promotes_then_auto_merges_a_trusted_current_head_pass(m
 
     await loop._reconcile_prs()
     assert "review-clean" in store.labels  # r1: repaired
-    assert merges == [(store.pr_url, "squash")]  # r3: the ordinary merge gate then landed it
+    # r3: the ordinary merge gate then landed it — and PINNED to the reviewed head so a
+    # push racing the merge can't sneak an unreviewed commit past the gate (--match-head-commit).
+    assert merges == [(store.pr_url, "squash", "h1")]
 
 
 async def test_reconcile_fail_closed_leaves_auto_merge_held(monkeypatch):
@@ -7736,8 +7744,8 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
         # the combined read the merge edge uses (#207): status + isDraft in one gh call
         return {"mergeStateStatus": mss, "isDraft": draft}
 
-    async def _merge(pr_url, *, method="squash", cwd="."):
-        calls["merge"].append((pr_url, method, cwd))
+    async def _merge(pr_url, *, method="squash", cwd=".", expected_head=""):
+        calls["merge"].append((pr_url, method, cwd, expected_head))
         return (merge_ok, "" if merge_ok else "Pull request is not mergeable: required status check pending")
 
     async def _state(pr_url, *, cwd="."):
@@ -7761,7 +7769,57 @@ async def test_auto_merge_merges_when_every_gate_is_green_and_current(monkeypatc
     loop = BoardLoop({"auto_merge": True, "review_gate": True})
     store = _MergeStore(_reviewed())
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
-    assert calls["merge"] == [("https://github.com/o/r/pull/1", "squash", "/repo")]
+    # No `review-clean-sha:` pin on this card → the grandfathered path merges unconstrained.
+    assert calls["merge"] == [("https://github.com/o/r/pull/1", "squash", "/repo", "")]
+
+
+async def test_auto_merge_pins_the_merge_to_the_reviewed_head(monkeypatch):
+    """#323 residual TOCTOU: when the review-clean verdict is pinned to a head and it still
+    matches the live head, the merge itself is constrained to that head
+    (``--match-head-commit``) so a push landing in the window between the head read and the
+    merge call cannot make ``gh pr merge`` land an unreviewed commit."""
+    head = "abcdef123456" + "0" * 28
+    calls = _merge_env(monkeypatch, head=head)
+
+    async def _live(pr_url, *, cwd="."):
+        return head  # the live head still matches the pin at check time
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _live)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(
+        _reviewed(labels=["in-review", "review-clean", f"review-clean-sha:{head}", "merged-verified:abcdef123456"])
+    )
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert calls["merge"] == [("https://github.com/o/r/pull/1", "squash", "/repo", head)]  # pinned to the reviewed head
+
+
+async def test_auto_merge_holds_when_pinned_head_moved_before_the_merge(monkeypatch):
+    """#323/#328: a review-clean verdict pinned to one head but a live head that MOVED
+    re-arms review and never reaches the merge call — the belt to ``--match-head-commit``'s
+    suspenders."""
+    live_head = "beforethepush" + "0" * 27
+    calls = _merge_env(monkeypatch, head=live_head)
+
+    async def _live(pr_url, *, cwd="."):
+        return live_head  # the head moved off the pinned/reviewed one before the merge
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _live)
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(
+        _reviewed(
+            labels=[
+                "in-review",
+                "review-clean",
+                "review-clean-sha:" + "reviewedhead" + "0" * 28,  # pinned to a DIFFERENT head than live
+                "merged-verified:abcdef123456",
+            ]
+        )
+    )
+    reset = []
+    store.set_review_substate = lambda fid, label, note="", head_sha="": reset.append((label, head_sha))
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is False
+    assert calls["merge"] == []  # never reached the merge — re-armed instead
+    assert reset == [("review-pending", "")]
 
 
 async def test_auto_merge_is_off_by_default_and_never_called(monkeypatch):

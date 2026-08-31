@@ -697,11 +697,21 @@ async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     return (await pr_merge_info(pr_url, cwd=cwd))["mergeStateStatus"]
 
 
-async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tuple[bool, str]:
+async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".", expected_head: str = "") -> tuple[bool, str]:
     """Merge an open PR via ``gh pr merge`` (the auto-merge edge). ``method`` is
     ``squash`` / ``merge`` / ``rebase``. Returns ``(ok, detail)`` — never raises into
     the loop; a refusal (branch protection, a required review, a race with a
     concurrent merge) is the caller's to log and retry or give up on.
+
+    ``expected_head`` (a commit sha) pins the merge to that head via
+    ``gh pr merge --match-head-commit`` (GitHub's ``expectedHeadOid``): if a push
+    landed after the caller read/verified the head, GitHub REJECTS the merge atomically
+    rather than merging the newer, unreviewed commit. This is the race-free other half
+    of the review gate's last-moment head-pin check (#323/#347) — the caller's own
+    read-then-compare closes the gate on a stale pin, but only ``--match-head-commit``
+    makes the merge itself refuse a head that moved in the window between that read and
+    this call. Empty = no constraint (the historical behavior, for the unpinned /
+    grandfathered / gate-off paths that have no verified head to pin to).
 
     Deliberately NOT ``--delete-branch``: gh deletes the LOCAL branch too, and
     ``feat/<fid>`` is checked out in the feature's worktree, so the merge landed and
@@ -709,7 +719,10 @@ async def merge_pr(pr_url: str, *, method: str = "squash", cwd: str = ".") -> tu
     (2026-08-20, bd-p9q/bd-wrl). The remote branch goes via ``delete_remote_branch``
     once the board has read MERGED; the worktree is reaped there too."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(str(method).lower(), "--squash")
-    rc, out, err = await _gh("pr", "merge", pr_url, flag, cwd=cwd, timeout=120)
+    args = ["pr", "merge", pr_url, flag]
+    if expected_head:
+        args += ["--match-head-commit", expected_head]
+    rc, out, err = await _gh(*args, cwd=cwd, timeout=120)
     detail = (err or out or "").strip()
     return rc == 0, detail
 

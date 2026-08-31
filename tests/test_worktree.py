@@ -197,6 +197,41 @@ async def test_pr_merge_info_reads_status_and_draft_in_one_call(monkeypatch):
     assert await worktree.pr_merge_info("https://x/pr/1") == {"mergeStateStatus": "", "isDraft": None}
 
 
+async def test_merge_pr_maps_method_and_omits_head_pin_by_default(monkeypatch):
+    """The historical contract: ``method`` maps to the right ``gh pr merge`` flag and — with
+    no ``expected_head`` — NO ``--match-head-commit`` constraint is passed (the unpinned /
+    grandfathered / gate-off paths)."""
+    calls = []
+
+    async def _gh(*args, cwd, timeout=60):
+        calls.append(args)
+        return (0, "✓ Merged", "")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    for method, flag in (("squash", "--squash"), ("merge", "--merge"), ("rebase", "--rebase"), ("weird", "--squash")):
+        calls.clear()
+        ok, detail = await worktree.merge_pr("https://x/pr/1", method=method, cwd="/repo")
+        assert ok and detail == "✓ Merged"
+        assert calls == [("pr", "merge", "https://x/pr/1", flag)]
+        assert not any("--match-head-commit" in a for a in calls[0])
+
+
+async def test_merge_pr_pins_the_head_when_expected_head_given(monkeypatch):
+    """#323: a non-empty ``expected_head`` pins the merge to that sha via
+    ``gh pr merge --match-head-commit`` so GitHub refuses to land a head that moved after the
+    caller verified it (``expectedHeadOid``). A gh non-zero exit is reported as ``(False, detail)``."""
+    calls = []
+
+    async def _gh(*args, cwd, timeout=60):
+        calls.append(args)
+        return (1, "", "Pull request is not mergeable: head has changed")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    ok, detail = await worktree.merge_pr("https://x/pr/1", method="squash", cwd="/repo", expected_head="deadbeef")
+    assert ok is False and "head has changed" in detail
+    assert calls == [("pr", "merge", "https://x/pr/1", "--squash", "--match-head-commit", "deadbeef")]
+
+
 async def test_open_pr_blocks_on_a_push_failure(monkeypatch):
     git = FakeGit({"status": (0, "", ""), "rev-list": (0, "1", ""), "push": (1, "", "remote rejected")})
     _install(monkeypatch, git, FakeGh())
