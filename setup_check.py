@@ -422,8 +422,18 @@ def stale_loop_keys(cfg: dict, snapshot: dict | None) -> list[str]:
     return [k for k in LOOP_RESTART_KEYS if want.get(k) != snapshot.get(k)]
 
 
-def _normalize_coders(raw) -> dict[str, str]:
-    return {str(k): str(v or "").strip() for k, v in raw.items()} if isinstance(raw, dict) else {}
+def _rung_names(value) -> list[str]:
+    """One rung → its delegate names. A rung may hold SEVERAL interchangeable providers
+    (#362), so a list is flattened and a bare string stays a one-element rung. Kept local
+    to setup_check so the preflight never imports the loop package."""
+    raw = value if isinstance(value, (list, tuple)) else [value]
+    return [n for n in (str(x or "").strip() for x in raw) if n]
+
+
+def _normalize_coders(raw) -> dict[str, list[str]]:
+    """Tier → its delegate names. Values are LISTS since #362; a string rung normalises
+    to one element, so a pre-#362 config reads identically."""
+    return {str(k): _rung_names(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
 
 
 def uncovered_tiers(coders: dict) -> list[str]:
@@ -441,9 +451,13 @@ def coder_names(cfg: dict) -> list[str]:
     out: list[str] = []
 
     def _add(v) -> None:
-        name = str(v or "").strip()
-        if name and name not in out:
-            out.append(name)
+        # A rung may name several interchangeable providers (#362) — validate EVERY one,
+        # so a typo'd sibling fails the preflight's coder gap check rather than at
+        # dispatch. Shipping the loop half without this gated a live board: the ladder
+        # stringified to "['codex', 'sonnet']" and read as one missing delegate.
+        for name in _rung_names(v):
+            if name not in out:
+                out.append(name)
 
     _add(cfg.get("coder"))
     tiers = cfg.get("coders")

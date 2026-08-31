@@ -1446,3 +1446,26 @@ def test_reporter_forwards_the_review_status_warning_and_clears_it():
     host.calls.clear()
     rep.report({**base, "review_status_hint": ""})  # capability restored
     assert (setup_check.REVIEW_STATUS_KEY, None) in host.calls
+
+
+def test_the_preflight_validates_every_sibling_of_a_list_rung():
+    """#362's loop half shipped without this and GATED A LIVE BOARD: `coders.smart`
+    became `[codex, sonnet]`, the preflight stringified the list to
+    `"['codex', 'sonnet']"`, reported it as one missing delegate, and `loop_blockers`
+    went to `['coder']`.
+
+    Every sibling must be validated individually — that is the point of the gap check:
+    a typo'd provider fails at STARTUP, not on the card that happens to rotate onto it."""
+    names = setup_check.coder_names({"coders": {"smart": ["codex", "sonnet"], "reasoning": "opus"}})
+    assert names == ["codex", "sonnet", "opus"]
+    # a string rung is unchanged — every pre-#362 config reads identically
+    assert setup_check.coder_names({"coders": {"smart": "sonnet"}}) == ["sonnet"]
+    # blanks never become phantom names, and duplicates across rungs collapse
+    assert setup_check.coder_names({"coders": {"smart": ["a", "", "b"], "opus": "a"}}) == ["a", "b"]
+
+
+def test_a_list_rung_is_not_reported_as_an_uncovered_tier():
+    """The other half of the same bug: `uncovered_tiers` must see a populated list rung
+    as COVERED, or the board reports a ladder gap and pauses on a perfectly valid config."""
+    assert setup_check.uncovered_tiers({"smart": ["codex", "sonnet"], "reasoning": "opus", "opus": "opus"}) == []
+    assert "smart" in setup_check.uncovered_tiers({"smart": [], "reasoning": "opus", "opus": "opus"})
