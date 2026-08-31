@@ -116,7 +116,22 @@ is missing one says so instead of booting green.
 
 ```bash
 python -m server plugin install https://github.com/protoLabsAI/projectBoard-plugin --ref main
-python -m server plugin enable project_board          # the trust decision; then restart
+```
+
+`install` deliberately does **not** enable — installing is fetching code, enabling is
+trusting it, and they are separate decisions. Enable it either way:
+
+```bash
+# In the console: Settings → Plugins → Project Board → enable. Enabling is fully LIVE —
+# tools, subagents and the plugin's router (which serves the board view) hot-mount on the
+# same reload, so the board works immediately with no restart.
+
+# Or from the API, if you are scripting a setup:
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"enabled": true}' \
+     http://127.0.0.1:7870/api/plugins/project_board/enabled
+
+# Or by hand: add `project_board` to `plugins.enabled` in the YAML below, then restart.
 ```
 
 Then in `config/langgraph-config.yaml`:
