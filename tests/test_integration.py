@@ -555,3 +555,25 @@ def test_create_enrichment_failure_leaves_repairable_bead(board, monkeypatch):
     assert got["acceptance_criteria"] == "" and got["difficulty"] == ""  # …the enrich half didn't
     repaired = board.update_feature(f["id"], acceptance_criteria="- must do x", difficulty="small")
     assert repaired["acceptance_criteria"] == "- must do x" and repaired["difficulty"] == "small"
+
+
+@requires_br
+def test_review_clean_sha_label_fits_the_beads_label_cap(board):
+    """The #135 shape, one more time. `review-clean-sha:` is a 17-character prefix, so a
+    FULL 40-char sha makes 57 — seven over beads' 50-char cap — and `br` refuses the whole
+    update. That is not a degraded pin: the write FAILS and the card blocks. It shipped
+    that way and blocked a live card within the hour, because the unit tests all use a
+    fake `br` that has no validator.
+
+    So pin the realistic value through the REAL one, exactly as `verified:` and
+    `merged-verified:` already do."""
+    f = board.create_feature("Pinned verdict", spec="s")
+    got = board.set_review_substate(f["id"], store_mod.LABEL_REVIEW_CLEAN, head_sha=FULL_SHA)
+    pin = next(l for l in (got["labels"] or []) if l.startswith(store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX))
+    assert len(pin) <= BEADS_LABEL_CAP
+    assert pin == f"{store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX}{FULL_SHA[: store_mod.SHORT_SHA_LEN]}"
+    # …and the merge gate matches that short pin against a FULL live head
+    row = {"id": f["id"], "board_state": "in_review", "labels": ["in-review", "review-clean", pin]}
+    assert store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha=FULL_SHA)["blockers"] == []
+    moved = store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha="b" * 40)["blockers"]
+    assert any("review-clean verdict is for" in b for b in moved)
