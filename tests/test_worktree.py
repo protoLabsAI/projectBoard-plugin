@@ -1575,3 +1575,312 @@ async def test_read_review_check_none_on_unreadable_or_malformed(monkeypatch):
 
     monkeypatch.setattr(worktree, "_gh", _obj)
     assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
+
+
+# ── #354: PAT-compatible commit-status publication (post_review_status) ────────────
+
+
+class _StatusGh:
+    """A `_gh` stub for post_review_status: records every call; the POST /statuses/<sha> is
+    driven by `rc`/`err` so a permission refusal can be simulated."""
+
+    def __init__(self, rc=0, err=""):
+        self.calls = []
+        self.rc = rc
+        self.err = err
+
+    async def __call__(self, *args, cwd, timeout=60):
+        self.calls.append(args)
+        return (self.rc, "", self.err)
+
+    def writes(self):
+        return [c for c in self.calls if c and c[0] == "api" and "--method" in c]
+
+    @staticmethod
+    def field(call, key):
+        for i, a in enumerate(call):
+            if a == "-f" and i + 1 < len(call) and call[i + 1].startswith(f"{key}="):
+                return call[i + 1].split("=", 1)[1]
+        return None
+
+
+async def test_post_review_status_creates_a_pat_compatible_status_on_the_head(monkeypatch):
+    """r1: a clean verdict publishes a `QA panel` COMMIT STATUS via the PAT-compatible
+    `POST /repos/<slug>/statuses/<sha>` — keyed to the exact immutable head, success state, a
+    concise description, and the PR link as the stable target url."""
+    gh = _StatusGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_review_status(
+        _SLUG,
+        _HEAD,
+        state="success",
+        description="Review gate clean — 0 findings",
+        target_url="https://github.com/o/r/pull/9",
+        cwd="/repo",
+    )
+    assert ok is True
+    (write,) = gh.writes()
+    assert write[write.index("--method") + 1] == "POST"
+    assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/statuses/{_HEAD}"  # the FULL immutable head
+    assert _StatusGh.field(write, "state") == "success"
+    assert _StatusGh.field(write, "context") == "QA panel"
+    assert _StatusGh.field(write, "description") == "Review gate clean — 0 findings"
+    assert _StatusGh.field(write, "target_url") == "https://github.com/o/r/pull/9"
+
+
+async def test_post_review_status_never_posts_without_a_head_or_slug(monkeypatch):
+    """r2: an unknown reviewed head (or repo) means the gate can't prove which commit it
+    reviewed — NO status is posted, and not even a gh call fires."""
+    gh = _StatusGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.post_review_status(_SLUG, "", state="success", description="d") is False
+    assert await worktree.post_review_status("", _HEAD, state="success", description="d") is False
+    assert gh.calls == []
+
+
+async def test_post_review_status_coerces_an_unknown_state_to_error(monkeypatch):
+    """A caller typo in the state can't make gh reject the POST and drop the verdict: an
+    unknown value degrades to `error` (a landed, if uncolored, non-success signal)."""
+    gh = _StatusGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    await worktree.post_review_status(_SLUG, _HEAD, state="explode", description="d", cwd="/repo")
+    (write,) = gh.writes()
+    assert _StatusGh.field(write, "state") == "error"
+
+
+async def test_post_review_status_truncates_the_description_to_githubs_cap(monkeypatch):
+    """GitHub caps a status description at 140 chars — a long verdict line is truncated so the
+    whole post never fails (the full findings ride the PR comment, not the status)."""
+    gh = _StatusGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    await worktree.post_review_status(_SLUG, _HEAD, state="failure", description="x" * 500, cwd="/repo")
+    (write,) = gh.writes()
+    assert len(_StatusGh.field(write, "description")) == 140
+
+
+async def test_post_review_status_returns_false_on_a_permission_refusal(monkeypatch):
+    """Best-effort: a status POST refused (no `statuses:write`, a network blip) returns False
+    and never raises — the verdict still rides the bead comment."""
+    gh = _StatusGh(rc=1, err="HTTP 403: Resource not accessible by personal access token")
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.post_review_status(_SLUG, _HEAD, state="failure", description="d", cwd="/repo") is False
+
+
+async def test_check_runs_403_is_inert_but_the_status_endpoint_publishes(monkeypatch):
+    """r3: the former check-runs path 403s under a user/PAT token ("You must authenticate via a
+    GitHub App") — structurally inert — while the PAT-compatible commit-status endpoint lands the
+    verdict. Both paths are exercised against the SAME fake seam to prove the migration works."""
+    endpoints = []
+
+    async def _gh(*args, cwd, timeout=60):
+        joined = " ".join(args)
+        if "/check-runs" in joined and "--method" not in args:
+            return (0, "[]", "")  # the idempotency lookup → no existing run
+        if "/check-runs" in joined:
+            endpoints.append("check-runs")
+            return (1, "", "HTTP 403: You must authenticate via a GitHub App to create check runs")
+        if "/statuses/" in joined:
+            endpoints.append("statuses")
+            return (0, "", "")
+        return (0, "", "")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+    # the App-only check-run path is inert under a PAT
+    assert (
+        await worktree.post_review_check(_SLUG, _HEAD, conclusion="success", title="t", summary="s", cwd="/repo")
+        is False
+    )
+    # …but the PAT-compatible commit status lands
+    assert await worktree.post_review_status(_SLUG, _HEAD, state="success", description="d", cwd="/repo") is True
+    assert endpoints == ["check-runs", "statuses"]
+
+
+# ── #354: read back the head-pinned QA commit status (read_review_status) ──────────
+
+
+def _status_gh(statuses):
+    """A `_gh` stub for read_review_status: answers the combined status read
+    (GET …/commits/<sha>/status, jq'd to `.statuses`) with `statuses`."""
+    import json as _json
+
+    async def _gh(*args, cwd, timeout=60):
+        assert args[0] == "api" and "/commits/" in args[1] and args[1].endswith("/status")
+        return (0, _json.dumps(statuses), "")
+
+    return _gh
+
+
+def _qa_status(context="QA panel", state="success"):
+    return {"context": context, "state": state, "id": 3, "target_url": "https://github.com/o/r/pull/9"}
+
+
+async def test_read_review_status_returns_a_current_head_pass(monkeypatch):
+    """r5: exactly one `QA panel` status of state `success` for the head-scoped commit is a
+    trusted, current-head PASS."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="success")]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") == {
+        "state": "success",
+        "head_sha": _HEAD,
+        "passed": True,
+    }
+
+
+async def test_read_review_status_reports_a_current_head_failure_as_not_passed(monkeypatch):
+    """r5: a `QA panel` non-success state is a real, trusted verdict (not None) — but `passed`
+    is False, so a caller never promotes off it."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="failure")]))
+    v = await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo")
+    assert v == {"state": "failure", "head_sha": _HEAD, "passed": False}
+
+
+async def test_read_review_status_none_when_absent_or_ambiguous(monkeypatch):
+    """r5: no `QA panel` status (only unrelated contexts / none) → None; and, defensively,
+    MORE THAN ONE `QA panel` status → None (ambiguous never promotes)."""
+    monkeypatch.setattr(
+        worktree, "_gh", _status_gh([_qa_status(context="ci"), {"context": "lint", "state": "success"}])
+    )
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+    monkeypatch.setattr(worktree, "_gh", _status_gh([]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(), _qa_status()]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_status_none_when_malformed(monkeypatch):
+    """A `QA panel` status carrying no readable state is not a verdict → None."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "QA panel"}]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "QA panel", "state": ""}]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+
+async def test_read_review_status_none_on_empty_slug_or_head_without_shelling_gh(monkeypatch):
+    """r5: an empty slug or head means the caller can't say which repo/commit to read — None,
+    and not even a gh call fires."""
+    called = []
+
+    async def _spy(*a, cwd, timeout=60):
+        called.append(a)
+        return (0, "[]", "")
+
+    monkeypatch.setattr(worktree, "_gh", _spy)
+    assert await worktree.read_review_status("", _HEAD, cwd="/repo") is None
+    assert await worktree.read_review_status(_SLUG, "", cwd="/repo") is None
+    assert called == []
+
+
+async def test_read_review_status_none_on_unreadable_or_malformed_json(monkeypatch):
+    """Every unreadable case fails closed to None: a gh non-zero, a raised WorktreeError, and
+    non-JSON / non-list output."""
+
+    async def _rc1(*a, cwd, timeout=60):
+        return (1, "", "not found")
+
+    monkeypatch.setattr(worktree, "_gh", _rc1)
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _raise(*a, cwd, timeout=60):
+        raise worktree.WorktreeError("gh timed out")
+
+    monkeypatch.setattr(worktree, "_gh", _raise)
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _garbage(*a, cwd, timeout=60):
+        return (0, "not json", "")
+
+    monkeypatch.setattr(worktree, "_gh", _garbage)
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+    async def _obj(*a, cwd, timeout=60):
+        return (0, '{"statuses": []}', "")  # a dict, not the jq'd array
+
+    monkeypatch.setattr(worktree, "_gh", _obj)
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+
+# ── #354: the idempotent findings PR comment (post_or_update_pr_comment) ───────────
+
+
+class _CommentGh:
+    """A `_gh` stub for post_or_update_pr_comment: answers the `--paginate` comment LIST with
+    `existing` (a list of {id, body}) and drives the create/update via `rc`."""
+
+    def __init__(self, existing=None, rc=0):
+        self.calls = []
+        self.existing = existing or []
+        self.rc = rc
+
+    async def __call__(self, *args, cwd, timeout=60):
+        self.calls.append(args)
+        if "--paginate" in args:
+            import json as _json
+
+            return (0, _json.dumps(self.existing), "")
+        return (self.rc, "", "boom" if self.rc else "")
+
+    def writes(self):
+        return [c for c in self.calls if "--method" in c]
+
+    @staticmethod
+    def body(call):
+        for i, a in enumerate(call):
+            if a == "-f" and i + 1 < len(call) and call[i + 1].startswith("body="):
+                return call[i + 1].split("=", 1)[1]
+        return None
+
+
+_PR = "https://github.com/o/r/pull/9"
+_MARKER = worktree.REVIEW_COMMENT_MARKER
+
+
+async def test_post_or_update_pr_comment_creates_a_marked_comment_when_none_exists(monkeypatch):
+    """r2: the first blocking verdict POSTs one board-authored comment (marked) to the PR's
+    issue-comments endpoint, carrying the findings body."""
+    gh = _CommentGh(existing=[])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_or_update_pr_comment(_PR, "## Findings\n- a.py:3 drops data", cwd="/repo")
+    assert ok is True
+    (write,) = gh.writes()
+    assert write[write.index("--method") + 1] == "POST"
+    assert write[write.index("--method") + 2] == "/repos/o/r/issues/9/comments"
+    body = _CommentGh.body(write)
+    assert body.startswith(_MARKER) and "drops data" in body
+
+
+async def test_post_or_update_pr_comment_updates_the_existing_marked_comment(monkeypatch):
+    """r4: a re-post UPDATES the one marked comment (by id) instead of stacking a duplicate —
+    the PR never fills with repeated findings comments across reconcile ticks."""
+    gh = _CommentGh(existing=[{"id": 55, "body": f"{_MARKER}\nold findings"}, {"id": 7, "body": "a human note"}])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_or_update_pr_comment(_PR, "new findings", cwd="/repo")
+    assert ok is True
+    (write,) = gh.writes()
+    assert write[write.index("--method") + 1] == "PATCH"
+    assert write[write.index("--method") + 2] == "/repos/o/r/issues/comments/55"
+    assert "new findings" in _CommentGh.body(write)
+
+
+async def test_post_or_update_pr_comment_is_a_noop_when_the_body_is_unchanged(monkeypatch):
+    """r4: an identical re-render (the same findings on the same head across ticks) makes NO
+    write at all — no needless PATCH churn, no misleading repeated record."""
+    gh = _CommentGh(existing=[{"id": 55, "body": f"{_MARKER}\nsame findings"}])
+    monkeypatch.setattr(worktree, "_gh", gh)
+    ok = await worktree.post_or_update_pr_comment(_PR, "same findings", cwd="/repo")
+    assert ok is True
+    assert gh.writes() == []  # found it, byte-identical → no PATCH
+
+
+async def test_post_or_update_pr_comment_false_on_an_unparseable_url(monkeypatch):
+    """No PR number / repo slug → nothing is posted."""
+    gh = _CommentGh()
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.post_or_update_pr_comment("not-a-pr-url", "findings", cwd="/repo") is False
+    assert gh.calls == []
+
+
+async def test_post_or_update_pr_comment_false_on_a_gh_failure(monkeypatch):
+    """Best-effort: a failed create/update returns False and never raises (findings ride the
+    bead)."""
+    gh = _CommentGh(existing=[], rc=1)
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.post_or_update_pr_comment(_PR, "findings", cwd="/repo") is False

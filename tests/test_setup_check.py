@@ -542,10 +542,11 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("loop", None),
         ("db", None),
         ("db_legacy", None),
+        ("review_status", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
-    assert len(host.calls) == 7
+    assert len(host.calls) == 8
     # br installed → ONE clear for br, coder still standing → silent
     assert rep.report(_status(coder=False)) == {"br": None}
     assert host.calls[-1] == ("br", None)
@@ -673,8 +674,8 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
     with caplog.at_level(logging.INFO, logger=LOGGER):
         pb.register(reg)
     msgs = dict(reg.gaps)
-    # every key on the first evaluation (br + loop + db + db_legacy as clears), in render order
-    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db", "db_legacy"]
+    # every key on the first evaluation (br + loop + db + db_legacy + review_status as clears), in render order
+    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db", "db_legacy", "review_status"]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT
     assert "gh auth login" in msgs["gh"]
@@ -785,7 +786,7 @@ async def test_loop_pauses_on_missing_br_then_resumes_when_it_appears(monkeypatc
         assert len(paused) == 1 and paused[0].levelno == logging.WARNING
         assert "br:" in paused[0].message and "cargo install beads_rust" in paused[0].message
         assert not any("crash recovery failed" in r.message or "loop tick failed" in r.message for r in caplog.records)
-        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 7  # first eval: all keys
+        assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == 8  # first eval: all keys
 
         probe.br = True  # operator installs beads → the next re-check passes
         await _settle()
@@ -1026,9 +1027,9 @@ def test_status_route_resyncs_the_host_gap_through_the_shared_reporter(monkeypat
     _pin_probes(monkeypatch, which=_which_only("br"), delegates=_delegates("proto"))
     c = _client(monkeypatch, {"repo": str(tmp_path), "coder": "proto"}, gap_reporter=rep)
     assert c.get("/api/plugins/project_board/status").json()["setup"]["gh"]["ok"] is False
-    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 7  # first eval: all keys
+    assert ("gh", setup_check.GH_HINT) in host.calls and len(host.calls) == 8  # first eval: all keys
     c.get("/api/plugins/project_board/status")
-    assert len(host.calls) == 7  # steady state: no re-send per poll
+    assert len(host.calls) == 8  # steady state: no re-send per poll
     monkeypatch.setattr(setup_check.shutil, "which", _which_all)  # gh installed
     assert c.get("/api/plugins/project_board/status").json()["setup"]["ready"] is True
     assert host.calls[-1] == ("gh", None)
@@ -1215,3 +1216,113 @@ def test_register_persist_store_factory_rides_the_resolved_db(monkeypatch, tmp_p
     captured["fn"]()
     assert seen["db"] == "/inst/project_board/.beads/beads.db"
     assert seen["repo"] == str(tmp_path)
+
+
+# ── #354: review-status publication capability probe ──────────────────────────────
+
+
+def _probe_cfg(tmp_path, **over):
+    cfg = {"coder": "proto", "repo": str(tmp_path), "review_gate": True}
+    cfg.update(over)
+    return cfg
+
+
+def _probe_status(tmp_path, *, probe, which=_which_all, gate=True, run=None):
+    return setup_status(
+        _probe_cfg(tmp_path, review_gate=gate),
+        which=which,
+        delegates=_delegates("proto"),
+        run=run or _fake_run("br 0.1.23"),
+        status_probe=probe,
+    )
+
+
+def test_review_status_quiet_when_the_gate_is_off(tmp_path):
+    """r6: with the review gate OFF there is nothing to publish — the advisory is quiet and the
+    probe is never even consulted."""
+    consulted = []
+
+    def _probe(run, cwd):
+        consulted.append(1)
+        return (False, "would warn if asked")
+
+    s = _probe_status(tmp_path, probe=_probe, gate=False)
+    assert s["review_status_ok"] is True and s["review_status_hint"] == ""
+    assert consulted == []  # gate off → never probed
+
+
+def test_review_status_warns_on_an_incapable_credential(tmp_path):
+    """r6: gate on + gh present + a proven-incapable credential → a DISTINCT actionable warning
+    (not a failing check, not a pause) naming the fix; `ready` is unaffected."""
+    s = _probe_status(tmp_path, probe=lambda run, cwd: (False, "App-only token detail"))
+    assert s["review_status_ok"] is False
+    assert "App-only token detail" in s["review_status_hint"]
+    assert "statuses:write" in s["review_status_hint"] and "QA panel" in s["review_status_hint"]
+    assert s["ready"] is True  # advisory only — it never fails the preflight or pauses the loop
+
+
+def test_review_status_quiet_when_capable(tmp_path):
+    """r6: a status-capable credential → the advisory is quiet."""
+    s = _probe_status(tmp_path, probe=lambda run, cwd: (True, ""))
+    assert s["review_status_ok"] is True and s["review_status_hint"] == ""
+
+
+def test_review_status_quiet_when_gh_missing_no_double_warn(tmp_path):
+    """r6/r7: gate on but gh MISSING — the `gh` check already owns that failure, so the status
+    advisory stays quiet (no double-warn) and the probe is not consulted."""
+    consulted = []
+
+    def _probe(run, cwd):
+        consulted.append(1)
+        return (False, "unused")
+
+    s = _probe_status(tmp_path, probe=_probe, which=_which_only("br"))
+    assert s["gh"]["ok"] is False  # the gh check reports it
+    assert s["review_status_ok"] is True and s["review_status_hint"] == ""
+    assert consulted == []
+
+
+def test_review_status_probe_runs_once_per_process(tmp_path):
+    """r6: the capability probe is a BOUNDED startup cost — sampled once and cached, so the
+    per-tick / per-page-load re-check never re-shells gh (it does not silently degrade on every
+    card)."""
+    calls = []
+
+    def _probe(run, cwd):
+        calls.append(1)
+        return (True, "")
+
+    _probe_status(tmp_path, probe=_probe)
+    _probe_status(tmp_path, probe=_probe)
+    assert calls == [1]  # cached across evaluations
+
+
+def test_default_status_probe_distinguishes_pat_from_app_only():
+    """r6: the DEFAULT probe (`gh api user`) reads a user/PAT token as capable (rc 0), a GitHub
+    App-only token (the 403 signature) as incapable, and any other failure as capable (no false
+    alarm — the gh/auth checks own those)."""
+    ok, detail = setup_check._default_status_probe(_fake_run("octocat", returncode=0))
+    assert ok is True and detail == ""
+    ok, detail = setup_check._default_status_probe(
+        _fake_run("HTTP 403: You must authenticate via a GitHub App", returncode=1)
+    )
+    assert ok is False and "installation token" in detail
+    # an unrelated failure (offline / unauthenticated) never manufactures the status warning
+    ok, _ = setup_check._default_status_probe(_fake_run("could not connect", returncode=1))
+    assert ok is True
+    ok, _ = setup_check._default_status_probe(_fake_run(raise_exc=TimeoutError("slow")))
+    assert ok is True
+
+
+def test_reporter_forwards_the_review_status_warning_and_clears_it():
+    """r6: the capability warning reaches the operator through the same gap seam as the other
+    checks — sent once when it appears, cleared (None) once the credential becomes capable."""
+    host = _HostWithSeam()
+    rep = GapReporter(host)
+    base = _status()  # every SETUP_KEY ok
+    warned = {**base, "review_status_hint": "cannot publish QA panel status — fix the token"}
+    rep.report(warned)
+    assert (setup_check.REVIEW_STATUS_KEY, "cannot publish QA panel status — fix the token") in host.calls
+    host.calls.clear()
+    rep.report({**base, "review_status_hint": ""})  # capability restored
+    assert (setup_check.REVIEW_STATUS_KEY, None) in host.calls

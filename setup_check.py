@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,7 +79,13 @@ LOOP_BLOCKING_KEYS: tuple[str, ...] = ("br", "coder", "repo")
 LOOP_STALE_KEY = "loop"
 DB_OVERRIDE_KEY = "db"
 LEGACY_STORE_KEY = "db_legacy"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY, LEGACY_STORE_KEY)
+# The #354 review-status publication-capability advisory: with the review gate on, whether the
+# board's `gh` credential can publish the gate's `QA panel` verdict as a commit status. An
+# ADVISORY (reported through the seam, never a failing check, never a pause) — the gate still
+# records its verdict on the bead; this only warns the operator when the PR-visible status can't
+# be written. A single startup probe, so the board never silently degrades on every card (r6).
+REVIEW_STATUS_KEY = "review_status"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -160,6 +167,92 @@ def legacy_store_repos(cfg: dict, isdir=None) -> list[str]:
         if path and path not in out and isdir(os.path.join(path, ".beads")):
             out.append(path)
     return out
+
+
+# ── #354: review-status publication capability probe ─────────────────────────────────
+_REVIEW_STATUS_PROBE_TIMEOUT_S = 5.0
+# The credential-capability probe result, sampled ONCE per process (like _BR_VERSION_CACHE):
+# a token's status-write capability doesn't change mid-run, so the per-tick / per-page-load
+# re-check never re-shells gh — this is what keeps the probe a bounded startup cost, not a
+# per-card degrade (r6).
+_REVIEW_STATUS_CACHE: dict[str, tuple[bool, str]] = {}
+# The App-only credential signature (the #347/#354 fault line): the board's user/PAT token
+# can't act as a GitHub App. `POST /check-runs` needs an App token and 403s under a PAT ("You
+# must authenticate via a GitHub App"); symmetrically, an App INSTALLATION token reached for
+# status publication reports "not accessible by integration". Either string names an App-only
+# credential — the case this probe distinguishes from a status-capable PAT.
+_APP_ONLY_RE = re.compile(r"authenticate (?:via|as) a GitHub App|not accessible by integration", re.I)
+
+
+def review_status_hint(detail: str) -> str:
+    """Operator copy for the #354 review-status capability advisory — the board can't publish
+    the review gate's ``QA panel`` verdict as a PAT-compatible commit status. ``""`` when the
+    credential is capable (the advisory's quiet state)."""
+    if not detail:
+        return ""
+    return (
+        "the board can't publish review-gate verdicts as a `QA panel` commit status — "
+        + detail
+        + ". The gate still runs and records its verdict on the bead, but the PR won't show the "
+        "status; give the board's gh token `repo` (or `statuses:write`) scope and re-run "
+        "`gh auth login`"
+    )
+
+
+def _default_status_probe(run, cwd: str = ".") -> tuple[bool, str]:
+    """The default #354 capability detection: can the board's ``gh`` credential publish commit
+    statuses? A bounded, read-only ``gh api user`` — a user/PAT token (what commit-status
+    publication needs) returns the authed login (rc 0); a GitHub App INSTALLATION token 403s
+    ("must authenticate as a GitHub App" / "not accessible by integration"). That tells a
+    status-capable PAT from the App-only credential model #347 assumed. Returns ``(ok, detail)``:
+    ``(True, "")`` when capable OR when capability can't be proven either way (never a false
+    alarm), ``(False, detail)`` only on a positively App-only credential. Never raises."""
+    try:
+        proc = run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True,
+            text=True,
+            timeout=_REVIEW_STATUS_PROBE_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — a probe that can't run never manufactures a warning
+        return True, ""
+    if getattr(proc, "returncode", 1) == 0:
+        return True, ""  # a user/PAT token → commit-status publication works
+    text = str(getattr(proc, "stderr", "") or "") + str(getattr(proc, "stdout", "") or "")
+    if _APP_ONLY_RE.search(text):
+        return False, (
+            "the board's gh credential is a GitHub App installation token — it can't create the "
+            "commit status the review gate publishes (that needs a user/PAT token)"
+        )
+    # Any other failure (offline, unauthenticated) is the `gh` check's / per-run logs' story —
+    # don't raise a second, possibly-spurious status warning on top of it.
+    return True, ""
+
+
+def _cached_status_probe(probe, run, cwd: str) -> tuple[bool, str]:
+    """Run ``probe`` once per process and cache it (see ``_REVIEW_STATUS_CACHE``). A probe that
+    raises degrades to capable — a broken probe must never manufacture a warning."""
+    key = "review_status"
+    if key not in _REVIEW_STATUS_CACHE:
+        try:
+            _REVIEW_STATUS_CACHE[key] = probe(run, cwd)
+        except Exception:  # noqa: BLE001 — a broken probe never false-alarms
+            _REVIEW_STATUS_CACHE[key] = (True, "")
+    return _REVIEW_STATUS_CACHE[key]
+
+
+def _review_status_capability(cfg: dict, *, gh_ok: bool, run, probe, cwd: str = ".") -> tuple[bool, str]:
+    """The #354 review-status publication-capability check → ``(ok, hint)``. Quiet (``ok`` True,
+    ``hint`` "") when the review gate is OFF (nothing to publish), when ``gh`` is missing (the
+    ``gh`` check already owns that — no double-warn), or when the credential is status-capable.
+    ``ok`` False + an actionable hint ONLY on a proven-incapable credential — a distinct startup
+    warning, computed ONCE (cached), so the board never silently degrades on every card (r6)."""
+    if not bool(cfg.get("review_gate", False)):
+        return True, ""
+    if not gh_ok:
+        return True, ""
+    ok, detail = _cached_status_probe(probe or _default_status_probe, run, cwd)
+    return (True, "") if ok else (False, review_status_hint(detail))
 
 
 _BR_VERSION_TIMEOUT_S = 3.0
@@ -328,9 +421,13 @@ def _repo_check(cfg: dict, isdir) -> dict:
     return {"ok": True, "path": default_repo, "hint": ""}
 
 
-def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None, loop_snapshot=None) -> dict:
-    """The board's setup preflight as a plain dict — pure, never raises, never shells
-    out to ``br`` for a board op (one cached ``--version`` at most).
+def setup_status(
+    cfg: dict, *, which=None, delegates=None, run=None, isdir=None, loop_snapshot=None, status_probe=None
+) -> dict:
+    """The board's setup preflight as a plain dict — pure, never raises, never shells out to
+    ``br`` for a board op (one cached ``--version`` at most). With the review gate on it ALSO
+    runs at most one cached ``gh`` capability probe (#354, ``status_probe``) — the bounded
+    startup cost that replaces #347's silent per-card check-run 403.
 
     Shape::
 
@@ -348,6 +445,8 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
           "db_override_hint": str,     # operator copy, "" when the advisory is quiet
           "legacy_store_repos": [p…],  # repos still carrying a pre-D3 `.beads/` workspace (D3 #260)
           "legacy_store_hint": str,    # migration copy, "" when the advisory is quiet
+          "review_status_ok": bool,    # the review gate can publish its QA-panel commit status (#354)
+          "review_status_hint": str,   # capability-warning copy, "" when capable / gate off
           "ready": bool,               # every check ok
         }
 
@@ -480,6 +579,14 @@ def setup_status(cfg: dict, *, which=None, delegates=None, run=None, isdir=None,
     legacy = legacy_store_repos(cfg, isdir=isdir)
     status["legacy_store_repos"] = legacy
     status["legacy_store_hint"] = legacy_store_hint(legacy)
+    # The #354 review-status capability advisory: with the review gate on, can the board's gh
+    # credential publish the gate's `QA panel` commit status? A single cached probe — quiet when
+    # the gate is off, gh is missing (the gh check owns that), or the credential is capable;
+    # an actionable warning only on a proven-incapable (App-only / no-scope) credential. Never
+    # a failing check or a pause — the verdict still rides the bead.
+    rs_ok, rs_hint = _review_status_capability(cfg, gh_ok=gh["ok"], run=run, probe=status_probe)
+    status["review_status_ok"] = rs_ok
+    status["review_status_hint"] = rs_hint
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -581,6 +688,8 @@ class GapReporter:
                 msg = str((status or {}).get("db_override_hint") or "") or None
             elif key == LEGACY_STORE_KEY:
                 msg = str((status or {}).get("legacy_store_hint") or "") or None
+            elif key == REVIEW_STATUS_KEY:
+                msg = str((status or {}).get("review_status_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")

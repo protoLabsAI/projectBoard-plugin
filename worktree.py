@@ -1136,6 +1136,212 @@ async def read_review_check(
     return {"conclusion": conclusion, "head_sha": head_sha, "passed": conclusion == "success"}
 
 
+# ── #354: PAT-compatible commit-status publication of the review-gate verdict ─────────
+# #347 published the verdict as a GitHub CHECK RUN, but ``POST /check-runs`` requires a
+# GitHub App INSTALLATION token: under the board's user/PAT ``gh`` credential it ALWAYS
+# 403s ("You must authenticate via a GitHub App"), so that path is structurally inert here
+# — no token scope can make it succeed. A COMMIT STATUS (``POST /repos/{repo}/statuses/{sha}``)
+# is the PAT-compatible signal: a user/PAT token with ``repo`` scope can create it, it is
+# pinned to an immutable commit exactly like a check run, and it surfaces on the PR as the
+# same merge-relevant rollup. The context keeps the historical ``QA panel`` name so the PR
+# shows ONE coherent QA signal (the same context the review workflow has posted as a side
+# effect), and ``read_review_status`` reconciles that single record rather than a parallel one.
+REVIEW_STATUS_CONTEXT = "QA panel"
+
+# GitHub commit-status ``state`` values (the merge-relevant ones the gate uses). An unknown
+# value is coerced to ``error`` so a caller typo can never make gh reject the POST and drop
+# the verdict entirely (the check-run publisher's ``neutral`` coercion, one layer down).
+_STATUS_STATES = frozenset({"success", "failure", "error", "pending"})
+# GitHub caps a commit status ``description`` at 140 chars; truncate so a long verdict line
+# never makes the whole post fail. The full findings ride the PR comment, not the status.
+_STATUS_DESCRIPTION_MAX = 140
+
+# The one board-authored PR comment carrying the blocking verdict's full findings (#354) is
+# tagged with this hidden marker, so a re-post UPDATES it in place instead of stacking a new
+# comment every reconcile tick (idempotency, r4). One marked comment per PR.
+REVIEW_COMMENT_MARKER = "<!-- project-board:review-gate -->"
+
+_PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+
+
+def _parse_pr(pr_url: str) -> tuple[str, str]:
+    """``(repo_slug, number)`` from a GitHub PR url, or ``("", "")``. worktree.py's own
+    parser — ``loop._parse_pr_url`` lives one layer up (the loop imports worktree, not the
+    reverse), so the PR-comment/status helpers here can't borrow it."""
+    m = _PR_URL_RE.search(pr_url or "")
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
+async def post_review_status(
+    repo_slug: str,
+    head_sha: str,
+    *,
+    state: str,
+    description: str,
+    target_url: str = "",
+    context: str = REVIEW_STATUS_CONTEXT,
+    cwd: str = ".",
+) -> bool:
+    """Publish the in-loop review gate's verdict as a PAT-compatible COMMIT STATUS pinned to
+    ``head_sha`` (#354) — ``POST /repos/{slug}/statuses/{sha}``. Unlike #347's check run
+    (which needs a GitHub App token and 403s under the board's user/PAT credential), a commit
+    status is creatable by any token carrying ``repo``/``statuses:write`` scope, so this is
+    the endpoint that actually lands the verdict where the PR is reviewed. Returns True on a
+    landed POST, False otherwise; NEVER raises into the loop (the bead comment stays the
+    durable audit record).
+
+    Head-safe (#328): an empty ``repo_slug`` or ``head_sha`` means the head the gate reviewed
+    is unknown, so NOTHING is posted — a verdict must never land against a head the gate did
+    not examine. That missing-head skip is the CALLER's to log (distinct from a permission/API
+    refusal, #354 r7); this returns False without shelling gh. ``state`` is one of
+    ``_STATUS_STATES`` (an unknown value degrades to ``error``); ``description`` is truncated
+    to GitHub's 140-char cap; a ``target_url`` (the stable PR link) is attached when given.
+
+    Idempotent by construction (r4): a commit status is keyed by ``(context, sha)`` — re-posting
+    the same context on the same commit SUPERSEDES the prior state in the PR's combined rollup,
+    so a reconcile/retry of the same verdict reconciles the single ``QA panel`` signal rather
+    than stacking duplicate records."""
+    if not repo_slug or not head_sha:
+        return False
+    if state not in _STATUS_STATES:
+        state = "error"
+    description = (description or "")[:_STATUS_DESCRIPTION_MAX]
+    fields = ["-f", f"state={state}", "-f", f"context={context}", "-f", f"description={description}"]
+    if target_url:
+        fields += ["-f", f"target_url={target_url}"]
+    args = ["api", "--method", "POST", f"/repos/{repo_slug}/statuses/{head_sha}", *fields]
+    try:
+        rc, _out, err = await _gh(*args, cwd=cwd)
+    except WorktreeError as exc:
+        log.warning("[project_board] review status post timed out for %s@%s: %s", repo_slug, head_sha[:12], exc)
+        return False
+    if rc != 0:
+        # A publication PERMISSION/API refusal (no `statuses:write`, an App-only token, a
+        # network blip) — logged here, distinct from the caller's missing-head skip (#354 r7).
+        log.warning(
+            "[project_board] review status post failed (%s@%s): %s",
+            repo_slug,
+            head_sha[:12],
+            (err or "").strip()[:200],
+        )
+        return False
+    return True
+
+
+async def read_review_status(
+    repo_slug: str,
+    head_sha: str,
+    *,
+    context: str = REVIEW_STATUS_CONTEXT,
+    cwd: str = ".",
+) -> dict | None:
+    """Read back the head-pinned ``QA panel`` COMMIT STATUS (#354, the PAT-compatible successor
+    to #347's ``read_review_check``) — the inbound identity plumbing #323's trusted-verdict
+    reconcile turns on. Returns the promoted verdict recorded for ``head_sha`` as
+    ``{"state": str, "head_sha": str, "passed": bool}``, or ``None`` when no trusted verdict can
+    be PROVEN for that exact head.
+
+    Reads the COMBINED status of the commit (``GET /repos/{slug}/commits/{sha}/status``, jq'd to
+    ``.statuses``): GitHub collapses that to ONE latest status per context, so a ``QA panel``
+    match is unambiguous by construction — there is never a stale earlier ``QA panel`` state
+    racing the current one. The endpoint is head-scoped by the URL, so a status it returns IS
+    for ``head_sha`` (the currency invariant of #328). ``passed`` is ``state == "success"`` — a
+    green CI rollup and an unpinned review comment are NOT this signal; only the named status is.
+
+    Fails CLOSED to ``None`` — so a caller can never act on a signal it could not read cleanly,
+    and never promotes from ambiguous/untrusted status data (#354 r5) — on an empty slug/head, a
+    ``gh`` error, malformed/non-list JSON, NO ``QA panel`` status, or (the defensive case the
+    combined endpoint should preclude) MORE THAN ONE match. A completed NON-success state returns
+    ``passed=False`` — a real, trusted verdict a caller must not promote off, DISTINCT from an
+    unreadable ``None``. Never raises into the loop."""
+    if not repo_slug or not head_sha:
+        return None
+    try:
+        rc, out, _err = await _gh("api", f"/repos/{repo_slug}/commits/{head_sha}/status", "--jq", ".statuses", cwd=cwd)
+    except WorktreeError:
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        statuses = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(statuses, list):
+        return None
+    matched = [s for s in statuses if isinstance(s, dict) and s.get("context") == context]
+    if len(matched) != 1:
+        return None  # absent, or (defensively) ambiguous → fail closed
+    state = matched[0].get("state")
+    if not isinstance(state, str) or not state:
+        return None  # malformed → fail closed
+    return {"state": state, "head_sha": head_sha, "passed": state == "success"}
+
+
+async def _find_marked_comment(repo_slug: str, number: str, marker: str, *, cwd: str) -> tuple[str, str]:
+    """The ``(id, body)`` of the board's marked PR comment (the one whose body contains
+    ``marker``), or ``("", "")`` when none exists or the list can't be read — the caller then
+    CREATEs. Best-effort; never raises. ``--paginate`` so a long comment thread doesn't hide
+    the marked comment past the first page and cause a duplicate post."""
+    try:
+        rc, out, _err = await _gh("api", "--paginate", f"/repos/{repo_slug}/issues/{number}/comments", cwd=cwd)
+    except WorktreeError:
+        return "", ""
+    if rc != 0 or not out.strip():
+        return "", ""
+    try:
+        comments = json.loads(out)
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(comments, list):
+        return "", ""
+    for c in comments:
+        if isinstance(c, dict) and marker in str(c.get("body") or ""):
+            return str(c.get("id") or ""), str(c.get("body") or "")
+    return "", ""
+
+
+async def post_or_update_pr_comment(
+    pr_url: str, body: str, *, marker: str = REVIEW_COMMENT_MARKER, cwd: str = "."
+) -> bool:
+    """Post — or idempotently UPDATE — a single board-authored PR comment identified by a hidden
+    HTML ``marker`` (#354). The blocking review-gate verdict's full actionable findings go here
+    so a human sees the rationale GitHub-side, while the bead comment stays the board's audit
+    record. Returns True on a landed create/update (or an idempotent no-op), False otherwise;
+    never raises into the loop.
+
+    Idempotent per PR (r4): the existing marked comment is found and PATCHed in place, so a
+    reconcile tick that re-renders the SAME findings does not spam a duplicate — and if the
+    rendered body is byte-identical to what is already there, it is a no-op (no needless PATCH
+    churn, no "misleading repeated record"). The marker is prepended to the posted body so the
+    found/desired comparison is apples-to-apples. An unparseable url (no PR number / repo slug)
+    posts nothing → False."""
+    repo_slug, number = _parse_pr(pr_url)
+    if not repo_slug or not number:
+        return False
+    full = body if body.startswith(marker) else f"{marker}\n{body}"
+    existing_id, existing_body = await _find_marked_comment(repo_slug, number, marker, cwd=cwd)
+    if existing_id and existing_body == full:
+        return True  # already exactly this comment — idempotent no-op, no PATCH
+    if existing_id:
+        args = ["api", "--method", "PATCH", f"/repos/{repo_slug}/issues/comments/{existing_id}", "-f", f"body={full}"]
+    else:
+        args = ["api", "--method", "POST", f"/repos/{repo_slug}/issues/{number}/comments", "-f", f"body={full}"]
+    try:
+        rc, _out, err = await _gh(*args, cwd=cwd)
+    except WorktreeError as exc:
+        log.warning("[project_board] review PR comment post timed out for %s#%s: %s", repo_slug, number, exc)
+        return False
+    if rc != 0:
+        log.warning(
+            "[project_board] review PR comment post failed (%s#%s): %s",
+            repo_slug,
+            number,
+            (err or "").strip()[:200],
+        )
+        return False
+    return True
+
+
 async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
     """The URL of the PR whose head is ``branch``, or ``""`` if there is none — used
     by crash recovery to tell a feature that already opened a PR (and just needs
