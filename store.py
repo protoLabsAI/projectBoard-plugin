@@ -366,6 +366,10 @@ LABEL_MERGED_VERIFIED_PREFIX = "merged-verified:"
 # lose a race to. (Distinct from the reviewed-head stamp, which a clean verdict
 # deliberately clears so a LATER changes-requested can't be judged stale — #328.)
 LABEL_REVIEW_CLEAN_SHA_PREFIX = "review-clean-sha:"
+# How much of a sha a `<prefix>:<sha>` label may carry. beads caps a label at 50 chars
+# and refuses the whole `br update` past it, so a long prefix must shorten its sha.
+# 12 is git's own abbreviation length and what `merged-verified:` already uses.
+SHORT_SHA_LEN = 12
 # In-review REVIEW-verdict currency (#328) — `reviewed-head:<sha>`, replaced (never
 # accumulated) each time the review gate lands a verdict for an `in_review` PR. The sha
 # is the PR HEAD commit the verdict was rendered against, SHORT-abbreviated for the same
@@ -1731,8 +1735,16 @@ class BeadsBoard:
         # a stale pin left behind them would let a later clean-looking state inherit a sha
         # it never earned.
         if label == LABEL_REVIEW_CLEAN and head_sha:
+            # SHORT sha, because beads caps a label at 50 characters. `review-clean-sha:`
+            # is a 17-character prefix, so a full 40-char sha makes 57 and `br` REFUSES the
+            # whole update — which is not a degraded pin, it is a failed write that blocks
+            # the card. (`verified:` + a full sha is 49, one under the cap; that test warns
+            # "a single character added to the prefix is the next #135" — this was it.)
+            # `merged-verified:` already solved this the same way, with a 12-char sha.
             args += replace_prefixed_label_args(
-                f.get("labels"), LABEL_REVIEW_CLEAN_SHA_PREFIX, f"{LABEL_REVIEW_CLEAN_SHA_PREFIX}{head_sha}"
+                f.get("labels"),
+                LABEL_REVIEW_CLEAN_SHA_PREFIX,
+                f"{LABEL_REVIEW_CLEAN_SHA_PREFIX}{str(head_sha)[:SHORT_SHA_LEN]}",
             )
         else:
             # Not a head-pinning verdict: drop any stale pin, add nothing.
@@ -2953,8 +2965,10 @@ def merge_posture(
             # was yesterday: no new risk, no regression. Every verdict written from now on
             # pins, so the exposure drains as cards cycle rather than in one migration.
             pass
-        elif pinned != head_sha:
-            blockers.append(f"review-clean verdict is for {pinned[:12]}, head is {head_sha[:12]}")
+        elif pinned != str(head_sha)[:SHORT_SHA_LEN]:
+            # The pin is stored SHORT (label cap), so compare like for like — a caller
+            # passing a full head sha must still match its own pin.
+            blockers.append(f"review-clean verdict is for {pinned}, head is {str(head_sha)[:SHORT_SHA_LEN]}")
 
     out = {"blockers": blockers, "next_action": "", "awaiting_merge": False, "next_action_hint": ""}
     if state != "in_review":

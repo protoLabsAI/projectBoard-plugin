@@ -671,13 +671,15 @@ class ReconcileMixin:
             )
             if pinned:  # unpinned verdicts are grandfathered — see merge_posture
                 live = await worktree.pr_head_sha(pr_url, cwd=repo)
-                if not live or live != pinned:
+                # The pin is stored SHORT (beads' 50-char label cap), so compare the live
+                # head's matching prefix — not the full sha, which could never equal it.
+                if not live or str(live)[: store_mod.SHORT_SHA_LEN] != pinned:
                     log.info(
                         "[project_board] %s not merging: the review-clean verdict is for %s but the head is %s "
                         "— the push that moved it is unreviewed; re-arming review: %s",
                         fid,
-                        pinned[:12],
-                        (live or "unreadable")[:12],
+                        pinned,
+                        (live or "unreadable")[: store_mod.SHORT_SHA_LEN],
                         pr_url,
                     )
                     await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)

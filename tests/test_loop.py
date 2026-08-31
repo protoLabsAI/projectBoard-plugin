@@ -7864,8 +7864,18 @@ async def test_auto_merge_pins_the_merge_to_the_reviewed_head(monkeypatch):
 
     monkeypatch.setattr(worktree, "pr_head_sha", _live)
     loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    # The pin is stored SHORT — beads caps a label at 50 chars and `review-clean-sha:` is a
+    # 17-char prefix, so a full sha would make 57 and `br` refuses the whole update. The
+    # gate therefore matches the live head's 12-char prefix against it.
     store = _MergeStore(
-        _reviewed(labels=["in-review", "review-clean", f"review-clean-sha:{head}", "merged-verified:abcdef123456"])
+        _reviewed(
+            labels=[
+                "in-review",
+                "review-clean",
+                f"review-clean-sha:{head[:12]}",
+                "merged-verified:abcdef123456",
+            ]
+        )
     )
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
     assert calls["merge"] == [("https://github.com/o/r/pull/1", "squash", "/repo", head)]  # pinned to the reviewed head
