@@ -8915,3 +8915,38 @@ async def test_a_durable_marker_still_suppresses_a_repeat_alert(monkeypatch, tmp
     await loop._recover_blocked(store)
     assert added == []
     assert "bd-a" in loop._notified_blocks  # seeded from the bead for this process
+
+
+async def test_a_rolled_back_marker_re_arms_the_next_sweep_end_to_end(monkeypatch, tmp_path):
+    """The finding's FULL cycle, driven through the real dedup path rather than a pre-seeded
+    memo: on sweep 1 `record_notified` loses a clear-and-reblock race and ROLLS BACK its
+    provisional marker, so the bead ends with NO `notified:blocked` label while the card is
+    blocked again — leaving a stale `_notified_blocks` entry behind. Sweep 2 in the SAME
+    process must reconcile that memo to the bead and treat the still-blocked card as news
+    again: one fresh operator alert AND the durable marker finally persisted. Before the fix
+    the stale memo suppressed BOTH the alert and the re-persist until a restart — the exact
+    silence #341 exists to prevent, reached from inside its own fix (#346 review r3)."""
+    row = _blocked("bd-a", "auth")
+    store = _BlockedStore([row])
+    added = _use_fake_inbox(monkeypatch, tmp_path)
+    real_record = store.record_notified
+    calls = {"n": 0}
+
+    def _record_rolls_back_the_first_time(fid, kind="blocked"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # a recovery raced the provisional add: the marker was rolled back and a re-block
+            # left the card blocked — the durable label is absent, nothing persisted.
+            return {"id": fid}
+        return real_record(fid, kind)
+
+    store.record_notified = _record_rolls_back_the_first_time
+    loop = BoardLoop({"coder": "proto"})
+    await loop._recover_blocked(store)
+    assert len(added) == 1 and store.notified == []  # alerted, but the raced write persisted nothing
+    assert "notified:blocked" not in (row.get("labels") or [])
+    # sweep 2: the bead has no marker, so the stale memo is reconciled away and the
+    # still-blocked incident is news again — one new alert AND the marker now sticks.
+    await loop._recover_blocked(store)
+    assert len(added) == 2  # re-alerted in-process, no restart needed
+    assert store.notified == [("bd-a", "blocked")] and "notified:blocked" in row["labels"]
