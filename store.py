@@ -340,6 +340,17 @@ LABEL_GENS_PREFIX = "gens:"
 # labels on first consult, and the merge / tier-climb edges clear label and cache
 # together (`clear_budgets`).
 LABEL_BUDGET_PREFIX = "budget:"
+# Operator-notification markers (#341) — `notified:<kind>`, ONE label per feature-scoped
+# alert already delivered to a human. The blocked lane's escalation (`loop._notify_operator`)
+# used to dedup alerts ONLY through the loop's per-process `_notified_blocks` set, which a
+# restart rebuilds EMPTY — so a plugin/host restart forgot that the operator was already
+# told and re-alerted the same block, caught only by the inbox's 300-second dedup window.
+# The fact "the operator was told about THIS block" is durable operational history, so it
+# rides the bead: a freshly constructed loop reads the marker back and does not re-alert.
+# Cleared only on a GENUINE recovery edge (`clear_blocked` drops it), so a later DISTINCT
+# block on the same card can alert again — the marker is scoped to the alert kind, not a
+# blanket "ever notified" flag.
+LABEL_NOTIFIED_PREFIX = "notified:"
 # Crash-salvage record (#91) — `verified:<sha>`, replaced (never accumulated) each time
 # coder.solve()'s verify boundary promotes a test-PASSING candidate. Written on the bead
 # (not loop memory) so it survives a crash between verify and open_pr; recovery's no-PR
@@ -411,6 +422,22 @@ def budgets_from_labels(labels) -> dict[str, int]:
         kind, _, num = str(label)[len(LABEL_BUDGET_PREFIX) :].rpartition(":")
         if kind and num.isdigit():
             out[kind] = int(num)
+    return out
+
+
+def notified_from_labels(labels) -> set[str]:
+    """The operator-notification kinds already delivered for a bead (#341) — one entry
+    per `notified:<kind>` label (see ``LABEL_NOTIFIED_PREFIX``). Shared by the projection
+    and the loop's blocked-lane dedup so both decode the marker the same way. An empty
+    kind (`notified:` alone) is ignored — never record a marker that names no alert."""
+    out: set[str] = set()
+    for label in labels or []:
+        s = str(label)
+        if not s.startswith(LABEL_NOTIFIED_PREFIX):
+            continue
+        kind = s[len(LABEL_NOTIFIED_PREFIX) :].strip()
+        if kind:
+            out.add(kind)
     return out
 
 
@@ -2086,6 +2113,14 @@ class BeadsBoard:
             # Drop only the stale infra class — NOT the tier labels, which predate the
             # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        # A genuine unblock is THE recovery edge that supersedes the operator-notified
+        # marker (#341): drop every `notified:` label so a LATER distinct block on this
+        # card can alert the operator again instead of being suppressed forever by a
+        # marker the first block left behind. Folded into this one `br update` so the
+        # unblock stays a single write; only removed when actually present.
+        args += [
+            a for label in labels if str(label).startswith(LABEL_NOTIFIED_PREFIX) for a in ("--remove-label", label)
+        ]
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2238,6 +2273,48 @@ class BeadsBoard:
         f = self._require(fid)
         prefixes = [LABEL_BUDGET_PREFIX] if kinds is None else [f"{LABEL_BUDGET_PREFIX}{k}:" for k in kinds]
         stale = [l for l in f.get("labels") or [] if any(l.startswith(p) for p in prefixes)]
+        if not stale:
+            return f
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    # ── operator-notification markers (#341) — the durable half of the blocked-lane
+    #    alert dedup: bead labels are truth, the loop's `_notified_blocks` set is a
+    #    per-process cache a restart rebuilds empty. ───────────────────────────────
+    def record_notified(self, fid: str, kind: str = "blocked") -> dict:
+        """Persist that the operator was ALREADY told about a `<kind>` condition on this
+        feature, as the single `notified:<kind>` label (#341). This is the durable half
+        of the blocked-card alert dedup: the loop's `_notified_blocks` set is a per-process
+        cache a restart rebuilds empty, so without this marker a restart re-alerted a block
+        the operator was told about a process ago (only the inbox's 300-second window ever
+        caught it). Idempotent — a marker already present is left untouched (no self-
+        cancelling re-add). RAISES on a `br` failure, unlike the fire-and-forget budget
+        writes: the loop MUST be able to tell a persisted marker from a lost one, so it can
+        fail safe and never record a false 'already notified' it would then read as durable
+        truth (#341 r5)."""
+        f = self._require(fid)
+        kind = str(kind or "").strip() or "blocked"
+        label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
+        if label not in (f.get("labels") or []):
+            self._run("update", fid, "--add-label", label)
+        return self.get_feature(fid)
+
+    def clear_notified(self, fid: str, kind=None) -> dict:
+        """Drop the persisted `notified:<kind>` marker(s) — the genuine-recovery half of
+        the #341 dedup, so a LATER distinct block can alert the operator again. ``kind``
+        None drops EVERY `notified:` label; a named kind drops only that one. No-op without
+        a matching label, so a recovery edge never burns a `br` write for a card that was
+        never notified. (`clear_blocked` already folds the same removal into its own
+        update; this is the standalone verb for any other recovery edge and for symmetry
+        with ``record_notified``.)"""
+        f = self._require(fid)
+        if kind is None:
+            stale = [l for l in f.get("labels") or [] if str(l).startswith(LABEL_NOTIFIED_PREFIX)]
+        else:
+            stale = [l for l in f.get("labels") or [] if l == f"{LABEL_NOTIFIED_PREFIX}{str(kind).strip()}"]
         if not stale:
             return f
         args = ["update", fid]
@@ -2760,6 +2837,11 @@ class BeadsBoard:
             # The persisted loop fix budgets (#259): {kind: count} from the replaced
             # `budget:<kind>:<n>` labels — {} for a feature the loop never bounced.
             "budgets": budgets_from_labels(labels),
+            # Operator-notification markers (#341): the alert kinds already delivered to a
+            # human, from the `notified:<kind>` labels (e.g. `["blocked"]`) — [] for a
+            # card the operator was never paged about. Durable audit that survives a
+            # restart AND the readable record that a notification occurred (#341 r2).
+            "notified": sorted(notified_from_labels(labels)),
             "verified_sha": verified_sha,
             "deliverable": deliverable,
             "blocked_class": blocked_class,

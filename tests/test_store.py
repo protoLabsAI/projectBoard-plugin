@@ -424,6 +424,83 @@ def test_project_exposes_budgets_from_labels(make_board):
     assert b._project({"id": "bd-2", "status": "open", "labels": []})["budgets"] == {}
 
 
+# ── operator-notified markers (#341) — the durable half of the blocked-lane dedup ─
+
+
+def test_record_notified_adds_the_marker_label(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["notified:blocked"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth"]})
+    b.record_notified("bd-1", "blocked")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
+
+
+def test_record_notified_defaults_the_kind_to_blocked(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
+    b.record_notified("bd-1", "")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
+
+
+def test_record_notified_is_idempotent_when_already_present(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["notified:blocked"]})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
+    b.record_notified("bd-1", "blocked")
+    assert not br.cmds("update")  # marker already there → no self-cancelling re-add
+
+
+def test_clear_notified_drops_the_marker(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
+    b.clear_notified("bd-1")
+    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls
+
+
+def test_clear_notified_noops_without_a_marker(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "ready"]})
+    b.clear_notified("bd-1")
+    assert not br.cmds("update")  # nothing to drop → no br write burned
+
+
+def test_clear_blocked_supersedes_the_notified_marker(make_board, monkeypatch):
+    """A genuine unblock is THE recovery edge: it drops the `notified:blocked` marker in
+    the SAME update as the block flag, so a LATER distinct block can alert again (#341)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "tier:opus"]},
+    )
+    b.clear_blocked("bd-1")
+    (up,) = br.cmds("update")
+    assert "--remove-label" in up and "blocked" in up and "notified:blocked" in up
+    assert "tier:opus" not in up  # an earned rung is untouched
+
+
+def test_notified_from_labels_parses_and_ignores_junk():
+    assert store.notified_from_labels(["notified:blocked", "ready", "budget:ci-fix:2"]) == {"blocked"}
+    assert store.notified_from_labels(["notified:", "blocked"]) == set()  # empty kind / non-marker → ignored
+    assert store.notified_from_labels(None) == set()
+
+
+def test_project_exposes_notified_markers(make_board):
+    b = make_board(Br())
+    f = b._project({"id": "bd-1", "status": "open", "labels": ["notified:blocked", "gens:3"]})
+    assert f["notified"] == ["blocked"]
+    assert b._project({"id": "bd-2", "status": "open", "labels": []})["notified"] == []
+
+
 # ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
 
 

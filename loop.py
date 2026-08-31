@@ -66,6 +66,7 @@ from .store import (
     get_store,
     knob_bool,
     merge_posture,
+    notified_from_labels,
     reconfigure_cached_store,
 )
 
@@ -1252,7 +1253,11 @@ class BoardLoop:
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}
         # Feature ids already reported to the operator as stuck, so a card that stays
-        # blocked is announced once rather than every sweep (see _notify_operator).
+        # blocked is announced once rather than every sweep (see _notify_operator). This
+        # set is a per-process CACHE only: the DURABLE dedup is the bead's
+        # `notified:blocked` marker (#341), which a restart reads back so it does not
+        # re-alert a block the operator was already told about — this set is rebuilt empty
+        # on every restart and must never be the sole record.
         self._notified_blocks: set[str] = set()
         # Last parsed findings JSON per fid — fed back as the recipe's
         # prior_findings input so a bounce re-review is a DELTA review
@@ -2009,6 +2014,17 @@ class BoardLoop:
                         reason[:120],
                     )
                     continue
+                # #341: the operator was told about THIS block in a PRIOR process — the
+                # bead carries the durable `notified:blocked` marker, which survived the
+                # restart that rebuilt `_notified_blocks` empty. Seed the per-process memo
+                # and skip, so a restart does not re-alert a block the operator already
+                # saw (the pre-fix behaviour, caught only by the inbox's 300s window). The
+                # marker is dropped only on a genuine unblock (`clear_blocked`, above and
+                # via the operator verb), so a LATER distinct block is news again.
+                if fid not in self._notified_blocks and "blocked" in notified_from_labels(f.get("labels")):
+                    self._notified_blocks.add(fid)
+                    continue
+                already = fid in self._notified_blocks
                 why = (
                     f"{cls or 'unclassified'} block"
                     if spent < _UNBLOCK_RETRY_MAX
@@ -2026,6 +2042,23 @@ class BoardLoop:
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
                 )
+                # Persist the durable marker AFTER the alert (the loud log is the alert of
+                # last resort, so reaching here always notified the operator). Only on the
+                # FIRST notify this process (`already` was false); a stayed-blocked card is
+                # one alert. Fail SAFE (#341 r5): a lost marker write is logged with
+                # actionable evidence and NOT treated as recorded — the missing label lets
+                # a later sweep/restart re-alert (inbox dedup is the secondary guard),
+                # never a false 'already notified' the loop would trust as durable truth.
+                if not already:
+                    try:
+                        await asyncio.to_thread(store.record_notified, fid, "blocked")
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "[project_board] %s operator-notified marker NOT persisted — a restart "
+                            "may re-alert this block (inbox dedup is the only remaining guard)",
+                            fid,
+                            exc_info=True,
+                        )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
 
@@ -2034,7 +2067,10 @@ class BoardLoop:
 
         Deduped on the feature id so a card that stays blocked across many sweeps is
         reported once, not every five minutes — the point is to be noticed, and an alert
-        that repeats forever is an alert that gets filtered.
+        that repeats forever is an alert that gets filtered. This process-local memo is
+        the FAST guard; its durable half — the fact survives a restart — is the bead's
+        `notified:blocked` marker the caller (`_recover_blocked`) persists after this
+        returns (#341), so the inbox's own 300s dedup window is only a secondary guard.
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
