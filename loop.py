@@ -4097,7 +4097,10 @@ class BoardLoop:
         still can't touch it), on everything that is not a provable current-head PASS: a
         FAIL never promotes or clears a blocking state (r2); a PASS for another head,
         unreadable / malformed / ambiguous marker data, or no promotion evidence changes
-        nothing (r3). NEVER races the internal gate (r4/r5): it skips a ``review-pending``
+        nothing (r3); and — the TOCTOU guard — a live head that MOVED between the check read
+        and the promotion write (a PR push landing mid-reconcile) is not trusted either, so
+        a PASS proven for the old head can never mark a newly pushed, unreviewed head clean
+        (r3). NEVER races the internal gate (r4/r5): it skips a ``review-pending``
         card (the gate owns that live verdict) and a ``review-clean`` card (already promoted
         → idempotent no-op), and — the same liveness guard the stranded-fix recovery (#340)
         uses — any card with a live drive, a claimed worktree, or an in-flight gate. Returns
@@ -4141,8 +4144,29 @@ class BoardLoop:
                 pr_url,
             )
             return False
-        # A trusted, PROMOTED, current-head PASS. Adopt it as the local clean verdict — the
-        # same substate a clean internal gate would have set, so the merge edge can proceed.
+        # A trusted, PROMOTED, current-head PASS. Before committing it, GUARD the write
+        # against a TOCTOU race (#323): ``head`` was read at the top of this method, and a
+        # PR push in the interval up to these local writes could move the live head — which
+        # would let a PASS proven for the OLD head mark a NEW, unreviewed head review-clean
+        # for the downstream merge gate to act on. Re-read the LIVE head immediately before
+        # the write and require it STILL equals the head the PASS was proven for (the same
+        # read-the-live-head-then-act discipline #328's re-arm uses). On ANY move — or an
+        # unreadable re-read — fail closed and leave the card unpromoted; a stale verdict
+        # never lands. The next poll re-reads fresh, and once #328 re-arms the gate for the
+        # new head a normal review runs, so the moved head is not silently trusted.
+        head_now = await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head_now or head_now != head:
+            log.info(
+                "[project_board] %s PR head moved (%s→%s) between the trusted-PASS read and promotion — "
+                "not adopting the now-stale verdict (fail closed): %s",
+                fid,
+                head[:12],
+                (head_now or "unreadable")[:12],
+                pr_url,
+            )
+            return False
+        # Adopt it as the local clean verdict — the same substate a clean internal gate would
+        # have set, so the merge edge can proceed.
         note = (
             f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('conclusion')}) is promoted for "
             f"the current PR head {head[:12]} — "

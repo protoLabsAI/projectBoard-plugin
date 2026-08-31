@@ -6465,6 +6465,61 @@ async def test_trusted_qa_reconcile_is_a_noop_when_the_gate_is_off(monkeypatch):
     assert "review-clean" not in store.labels
 
 
+async def test_trusted_qa_pass_fails_closed_when_head_moves_before_the_promotion_write(monkeypatch):
+    """r3/r4 (TOCTOU): the QA check is proven for the head read at the top of the reconcile,
+    but a PR push moves the LIVE head between that read and the promotion write. The pre-write
+    head re-read must catch the move and fail closed — a PASS for the old head can never mark
+    the newly pushed, unreviewed head review-clean, so the downstream merge gate never acts on
+    a now-stale verdict. The card is left exactly as it was."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+
+    # pr_head_sha is read twice: first to prove the check (→ "aaa111"), then again right before
+    # the write (→ "bbb222", the just-pushed head). read_review_check has a promoted PASS ONLY
+    # for the original head, exactly as GitHub would report it.
+    heads = iter(["aaa111", "bbb222"])
+
+    async def _head(pr_url, *, cwd="."):
+        return next(heads, "bbb222")
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        if head_sha == "aaa111":
+            return {"conclusion": "success", "head_sha": head_sha, "passed": True}
+        return None  # no promoted verdict for the pushed head
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels  # the moved head is NOT marked clean
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]  # left exactly as-is
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
+async def test_trusted_qa_pass_fails_closed_when_head_becomes_unreadable_before_promotion(monkeypatch):
+    """r3 (TOCTOU): if the pre-write head re-read is itself unreadable (a gh hiccup landing in
+    the window), the promotion still fails closed — a verdict is never adopted without proving
+    the live head is unchanged at the moment of the write."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    heads = iter(["aaa111", ""])  # readable for the check, unreadable for the pre-write confirm
+
+    async def _head(pr_url, *, cwd="."):
+        return next(heads, "")
+
+    async def _read(repo_slug, head_sha, *, cwd="."):
+        return {"conclusion": "success", "head_sha": head_sha, "passed": True} if head_sha == "aaa111" else None
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "read_review_check", _read)
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert store.labels == ["changes-requested", "reviewed-head:aaa111"]  # unpromoted
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+
+
 async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_reviews(monkeypatch):
     """r1/r5 end-to-end: a full reconcile of an in_review PR stuck in ``changes-requested``
     for the SAME (unchanged) head — so #328 does not re-arm and #340 would otherwise requeue
