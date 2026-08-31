@@ -62,8 +62,8 @@ class FakeLoopStore:
         self.calls.append(("open_review", fid, pr_url))
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason):
-        self.calls.append(("flag_blocked", fid, reason))
+    def flag_blocked(self, fid, reason, category=""):
+        self.calls.append(("flag_blocked", fid, reason, category))
         return {"id": fid}
 
     def record_attempt(self, fid, *, tier, outcome):
@@ -930,6 +930,228 @@ async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
     assert len(dispatches) == 2
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
     assert len(blocked) == 1 and "empty coder reply" not in blocked[0][2]
+
+
+# ── pre-model dispatch failure: block for triage, NEVER climb the ladder (#339) ──
+
+
+async def test_drive_pre_model_dispatch_failure_blocks_without_a_tier_climb(monkeypatch):
+    """The C1 seam-style bug: a dispatch that dies BELOW the seam (a `dispatch_tapped`
+    kwarg mismatch, normalised to `coder dispatch failed: …`) with NO model activity is
+    a pre-model infra failure. It must block DIRECTLY for triage — no smart→reasoning→
+    opus climb, no `tier:` label, ONE dispatch — under the `dispatch-infra` class, with
+    the original infra evidence preserved on the block reason."""
+    store = _EscalatingStore(tiers=["reasoning", "opus"])  # a real 2-rung ladder is available…
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    removes = []
+
+    async def _remove(repo, wt, branch=""):
+        removes.append(wt)
+
+    async def _reap(repo, root, fid):
+        return None
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        # The gen buffer exists (dispatch_coder_tapped ran progress_begin) but the model
+        # never produced a token — the seam threw first. Simulate the seam's normalised
+        # WorktreeError with the C1 kwarg-mismatch evidence.
+        raise worktree.WorktreeError(
+            "coder dispatch failed: dispatch_tapped() got an unexpected keyword argument 'tool_callback'"
+        )
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        raise AssertionError("no PR on a pre-model dispatch failure")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    assert loop.escalation_on  # …and yet it is NEVER consulted
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    # No climb: the ladder was available but escalate() was never called, and only ONE
+    # dispatch ran (no re-dispatch at a stronger tier).
+    assert store.escalated == []
+    assert len(dispatches) == 1
+    # Blocked for infra triage under the dispatch-infra class, evidence intact.
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    fid, reason, category = blocked[0][1], blocked[0][2], blocked[0][3]
+    assert fid == "bd-1" and category == "dispatch-infra"
+    assert "dispatch_tapped" in reason and "unexpected keyword" in reason
+    assert loop._inflight == {} and removes == ["/wt/feat-bd-1"]  # worktree reaped
+
+
+async def test_drive_pre_model_timeout_before_first_token_blocks_not_escalates(monkeypatch):
+    """A CoderTimeout with NO model activity is a pre-first-token infra timeout (a
+    wedged adapter/session), not a model running out of time — a stronger model can't
+    clear it, so it blocks for triage rather than climbing the ladder (#339)."""
+    store = _EscalatingStore(tiers=["reasoning"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        # No progress_thought/progress_tool — the model never produced a first token.
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        raise AssertionError("no PR on a pre-first-token timeout")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    assert store.escalated == []  # a pre-first-token timeout never climbs
+    assert len(dispatches) == 1
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+
+
+async def test_drive_dispatch_failure_after_model_work_still_escalates(monkeypatch):
+    """The genuine model-capability case is PRESERVED: a dispatch failure that lands
+    AFTER the model reached first token (tools/thoughts recorded) is model-reachable —
+    it still climbs the tier ladder exactly as before, NOT a pre-model infra block."""
+    store = _EscalatingStore(tiers=["smart"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _remove(repo, wt, branch=""):
+        return None
+
+    async def _reap(repo, root, fid):
+        return None
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        # The model DID reach first token — a real tool ran — then the dispatch failed
+        # below the seam. Lifecycle evidence ⇒ model-reachable ⇒ escalate, not block.
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {"path": "a.py"}})
+        if len(dispatches) == 1:
+            # A non-transient seam error that landed AFTER the model streamed — the
+            # message even matches the pre-model signature, but the lifecycle evidence
+            # (a real tool ran) makes it model-reachable, so it escalates regardless.
+            raise worktree.WorktreeError("coder dispatch failed: seam raised after the model stream began")
+        return "the escalated coder's reply"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/1"
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "proto-fast", "smart": "proto-smart"}})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    await loop._drive(FEATURE)
+
+    # It climbed (fast→smart), re-dispatched, and shipped — no dispatch-infra block.
+    assert [e[0] for e in store.escalated] == ["bd-1"]
+    assert len(dispatches) == 2
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+    assert not any(c[0] == "flag_blocked" for c in store.calls)
+
+
+async def test_drive_pre_model_failure_on_a_keep_worktree_redispatch_still_blocks(monkeypatch):
+    """The review finding: model-reached evidence must be scoped to the CURRENT dispatch.
+    A first dispatch reaches the model and leaves an active sibling gen in the feature's
+    ring buffer; a goal-verify gap keeps the worktree and re-dispatches (gen 1, NO
+    progress_new_run — the stale sibling survives for the drawer). That re-dispatch dies
+    BELOW the seam before a first token. The unscoped model-reached scan saw the PRIOR
+    dispatch's activity and climbed the ladder; with run-scoping it correctly reads "no
+    model work this dispatch" and blocks for infra triage — no tier climb (#339)."""
+    coder_seam._progress.clear()
+    store = _EscalatingStore(tiers=["reasoning", "opus"])  # a real ladder is available…
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    removes = []
+
+    async def _remove(repo, wt, branch=""):
+        removes.append(wt)
+
+    async def _reap(repo, root, fid):
+        return None
+
+    # Goal-verify gaps once (dispatch 1) → keep-worktree re-dispatch; the re-dispatch
+    # never reaches the gate (it dies below the seam first), so this fires exactly once.
+    async def _verify(feature, wt, base, coder_reply=""):
+        return "missing tests for the new behavior"
+
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        if len(dispatches) == 1:
+            # Dispatch 1 reached the model: record activity on gen 1 AND an active
+            # sibling gen 2 (a solve/max-mode fan-out the earlier dispatch left behind).
+            coder_seam.progress_begin("bd-1", 2, "fast")
+            coder_seam.progress_tool("bd-1", 2, {"phase": "start", "id": "s1", "name": "edit_file"})
+            coder_seam.progress_tool("bd-1", 1, {"phase": "start", "id": "s2", "name": "edit_file"})
+            return "implementation is in the worktree"
+        # Dispatch 2 (keep-worktree re-run of gen 1) dies below the seam before a token.
+        raise worktree.WorktreeError(
+            "coder dispatch failed: dispatch_tapped() got an unexpected keyword argument 'tool_callback'"
+        )
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_verify": True, "goal_fix_max": 2})
+    assert loop.escalation_on  # …and yet the ladder is NEVER consulted
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    monkeypatch.setattr(loop, "_verify_goal", _verify)
+    await loop._drive(FEATURE)
+
+    # No climb: the stale sibling gen did NOT masquerade as this dispatch's model work.
+    assert store.escalated == []
+    assert len(dispatches) == 2  # initial build + the one keep-worktree re-dispatch
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    fid, reason, category = blocked[0][1], blocked[0][2], blocked[0][3]
+    assert fid == "bd-1" and category == "dispatch-infra"
+    assert "dispatch_tapped" in reason  # the original infra evidence is preserved
+    assert removes == ["/wt/feat-bd-1"]  # the worktree is reaped
 
 
 async def test_drive_empty_result_retry_recovers_and_resets_the_count(monkeypatch):
@@ -7919,9 +8141,12 @@ async def test_drive_rate_limited_dispatch_retries_same_tier_and_never_escalates
     assert loop._inflight == {}
 
 
-async def test_drive_terminal_dispatch_failure_still_escalates(monkeypatch):
-    """The guard is narrow: a dispatch failure the classifier calls TERMINAL is still
-    the capability failure it always was — one attempt per tier, climb, block at the top."""
+async def test_drive_terminal_dispatch_failure_blocks_for_triage_never_escalates(monkeypatch):
+    """#339 narrows #280 further: a terminal dispatch failure that never reached the
+    model (an adapter/session refusal, no tool/thought/answer/token recorded) is a
+    HOST-infrastructure incident, not a model-capability ceiling — a stronger model
+    can't clear it. It must block DIRECTLY for triage: ONE dispatch, the ladder never
+    consulted, no `tier:` label, under the `dispatch-infra` class the operator sees."""
     dispatches = []
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
@@ -7931,9 +8156,12 @@ async def test_drive_terminal_dispatch_failure_still_escalates(monkeypatch):
     loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
     await loop._drive(FEATURE)
 
-    assert len(dispatches) == 2  # smart, then the one climb to reasoning
-    assert [e[0] for e in store.escalated] == ["bd-1", "bd-1"]  # climb, then the top
-    assert "flag_blocked" in store.names()
+    assert len(dispatches) == 1  # no re-dispatch at a stronger tier
+    assert store.escalated == []  # the ladder was never consulted — no bogus tier: label
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+    assert "adapter rejected the session" in blocked[0][2]  # infra evidence preserved
+    assert loop._inflight == {}
 
 
 # ── a dirty checkout yields NO preflight verdict, in EITHER direction (#300) ──────

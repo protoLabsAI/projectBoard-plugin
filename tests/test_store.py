@@ -1677,6 +1677,100 @@ def test_flag_blocked_replaces_a_prior_class_rather_than_accumulating(make_board
     assert "blocked-class:auth" in up
 
 
+# ── pre-model dispatch/infra block + tier reset on unblock (#339) ────────────────
+
+
+def test_flag_blocked_stamps_the_explicit_dispatch_infra_class(make_board, monkeypatch):
+    """A pre-model dispatch failure blocks under the caller's explicit `dispatch-infra`
+    class — NOT the message-derived class — so the sweep notifies the operator (it is
+    not a self-healing class) with the original infra evidence."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid})
+    comments = []
+    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append(text))
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
+    b.flag_blocked("bd-9", "coder dispatch failed: dispatch_tapped() unexpected keyword", category="dispatch-infra")
+    (up,) = br.cmds("update")
+    assert "blocked-class:dispatch-infra" in up
+    assert comments and "dispatch_tapped" in comments[0]  # the infra evidence rides the comment
+
+
+def test_clear_blocked_preserves_earned_tiers_after_a_dispatch_infra_block(make_board, monkeypatch):
+    """Unblocking a card blocked for a pre-model dispatch/infra failure drops the block
+    flag and the stale infra class, but KEEPS every `tier:` label. The loop never climbs
+    a tier on a pre-model failure (``escalate`` is never called on that path), so every
+    rung present was earned BEFORE the incident by real model-capability work. Removing
+    them would silently restart a legitimately-escalated card on its weaker difficulty-
+    selected model and repeat work that already failed there (#339)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {
+            "id": fid,
+            "labels": ["blocked", "blocked-class:dispatch-infra", "tier:reasoning", "tier:opus", "diff:small"],
+        },
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "blocked" in up  # the block flag is dropped as always
+    assert "blocked-class:dispatch-infra" in up  # the stale infra class cleared too
+    # the earned rungs are PRESERVED — a pre-model incident never inflated them
+    assert "tier:reasoning" not in up and "tier:opus" not in up
+    assert "diff:small" not in up  # the difficulty label is untouched
+
+
+def test_clear_blocked_dispatch_infra_on_a_never_escalated_card_leaves_difficulty_tier(make_board, monkeypatch):
+    """A card whose FIRST dispatch failed pre-model carries no `tier:` label at all —
+    the incident added none — so unblocking drops only the block flag + stale infra
+    class, and the next real build starts at its difficulty-selected tier untouched."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:dispatch-infra", "diff:small"]},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-9", "--remove-label", "blocked", "--remove-label", "blocked-class:dispatch-infra")
+
+
+def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board, monkeypatch):
+    """A model-reachable block (a real capability escalation) keeps its `tier:` labels
+    on unblock — the ladder record is genuine, so the next build resumes at that tier.
+    Only a pre-model infra block resets the posture."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:terminal", "tier:opus"]},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert "blocked" in up
+    assert "tier:opus" not in up  # untouched — no tier reset for a model-reachable block
+    assert "blocked-class:terminal" not in up  # the class label is left as-is too
+
+
+def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
+    """No block-class label at all (an older card, a hand block) → the legacy behaviour:
+    remove only the `blocked` label, touch nothing else."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "tier:reasoning"]})
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
+    b.clear_blocked("bd-9")
+    (up,) = br.cmds("update")
+    assert up == ("update", "bd-9", "--remove-label", "blocked")
+
+
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
 
 

@@ -61,3 +61,61 @@ def classify(error: str) -> Policy:
         if re.search(pattern, text):
             return policy
     return TERMINAL
+
+
+# ── pre-model dispatch / infrastructure failures (#339) ──────────────────────────
+# The `blocked-class:` a pre-model dispatch/infra failure carries. It is deliberately
+# NOT one of `classify()`'s categories: it can't be decided from the message alone
+# (it needs the loop's dispatch-lifecycle evidence too), and it drives two behaviours
+# the message-classes don't — the operator is NOTIFIED rather than auto-healed (it is
+# absent from the loop's self-healing set), and an operator unblock RESETS the card's
+# escalation tier so a host/adapter incident never leaves a `tier:` label the next
+# genuine build inherits.
+PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
+
+# Dispatch-seam / pre-first-token infrastructure signatures — a failure raised BELOW
+# the model call: the C1 tapped-seam contract (a kwarg mismatch, a non-TappedResult
+# reply), a missing / unresolved / unknown delegate, an adapter or session refusing
+# the call, or a timeout before the model produced a first token. `coder_seam`
+# normalises every below-seam throw to a `coder dispatch failed: …` WorktreeError, so
+# that prefix alone catches the common case; the rest are belt-and-braces for the
+# other pre-model shapes named in ADR 0064's dispatch contract.
+_PRE_MODEL_DISPATCH = re.compile(
+    r"coder dispatch failed"
+    r"|unexpected keyword argument"
+    r"|dispatch_tapped"
+    r"|\bdelegate\b"
+    r"|\badapter\b"
+    r"|not callable|object is not|takes no|positional argument"
+    r"|session (?:refused|rejected|unavailable|not available|limit)"
+    r"|timed out|timeout",
+    re.IGNORECASE,
+)
+
+
+def is_pre_model_dispatch_failure(error: str, *, model_reached: bool) -> bool:
+    """Did a coding failure occur BEFORE the model could influence the result?
+
+    The escalation ladder is a model-CAPABILITY policy, not a generic exception
+    retry (ADR 0064): only a model-reachable, execution-grounded failure justifies a
+    stronger coding tier. A failure in the dispatch seam / adapter, a missing
+    delegate, or a timeout before the first token is a HOST-infrastructure incident —
+    a stronger model cannot clear it, and escalating on one burned the whole ladder
+    in seconds and stamped a bogus ``tier:`` label onto the card that misrouted its
+    next real build (bd-cwpv). Such a failure must block DIRECTLY for triage.
+
+    ``model_reached`` is the loop's dispatch-lifecycle evidence: any tool call,
+    thought, streamed answer, or token usage recorded for the attempt. If the model
+    reached first token the failure is model-reachable no matter the message — this
+    returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
+    signature is pre-model → ``True`` (block, no tier climb).
+
+    Message-gated on purpose: a build-gate failure (goal-verify, requirements
+    unresolved, ``solve()`` exhausted) proves the model produced diffs, so it never
+    matches here even if the monitor lost its lifecycle evidence — only a genuine
+    seam / adapter / delegate / timeout signature qualifies. The loop's own fail-safe
+    (an unreadable monitor snapshot ⇒ ``model_reached=False``) then routes an
+    ambiguous dispatch failure to a block rather than an expensive climb."""
+    if model_reached:
+        return False
+    return bool(_PRE_MODEL_DISPATCH.search(error or ""))

@@ -2061,8 +2061,32 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     def clear_blocked(self, fid: str) -> dict:
-        self._require(fid)
-        self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+        """Clear the ``blocked`` flag so a feature can be re-dispatched.
+
+        When the block was a NON-MODEL failure — a pre-model dispatch/adapter/infra
+        incident, ``blocked-class:dispatch-infra`` (#339) — also drop the now-stale
+        block class so a requeue starts clean. The card's escalation posture is left
+        UNTOUCHED, and deliberately so: the loop never climbs a tier on a pre-model
+        failure (``store.escalate`` is not called on that path), so every ``tier:``
+        label present at a dispatch-infra block was earned BEFORE the incident by real
+        model-capability work. Removing them would silently restart a card that had
+        legitimately escalated on its lower difficulty-selected model and repeat the
+        work that already failed there — the exact regression the first cut introduced.
+        A card that never escalated carries no ``tier:`` label, so it still starts at
+        its difficulty-selected tier on the next build; the ladder stays a
+        model-capability record, and the infra incident adds nothing to it. A
+        model-reachable block (or an unclassified one) is untouched, exactly as before."""
+        from .failures import PRE_MODEL_DISPATCH_CLASS
+
+        f = self._require(fid)
+        labels = f.get("labels") or []
+        args = ["update", fid, "--remove-label", LABEL_BLOCKED]
+        cls = next((l.split(":", 1)[1] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)), "")
+        if cls == PRE_MODEL_DISPATCH_CLASS:
+            # Drop only the stale infra class — NOT the tier labels, which predate the
+            # incident and record genuine model-capability escalation (#339).
+            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        self._run(*args)
         return self.get_feature(fid)
 
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at

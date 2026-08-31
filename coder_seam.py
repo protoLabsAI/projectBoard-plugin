@@ -173,6 +173,7 @@ class _GenBuffer:
     __slots__ = (
         "gen",
         "tier",
+        "run",
         "started",
         "ended",
         "current_tool",
@@ -189,6 +190,10 @@ class _GenBuffer:
     def __init__(self, gen: int, tier: str = ""):
         self.gen = int(gen)
         self.tier = tier or ""
+        # Dispatch epoch this gen belongs to (assigned by progress_begin). Scopes the
+        # first-token check in dispatch_reached_model to the CURRENT dispatch so a
+        # stale gen an earlier dispatch left in the buffer can't answer for it (#339).
+        self.run = 0
         self.started = _monotonic()
         self.ended: float | None = None
         self.current_tool: dict | None = None
@@ -397,12 +402,42 @@ def progress_new_run(fid: str | None) -> None:
         _progress.pop(fid, None)
 
 
-def progress_begin(fid: str | None, gen: int, tier: str = "") -> None:
+def progress_begin(fid: str | None, gen: int, tier: str = "", *, new_dispatch: bool = False) -> None:
     """Register (or reset) a generation's buffer. No-op when ``fid`` is falsy — the
-    operator-only test-rung path passes None (it's a diagnostic, not a live run)."""
+    operator-only test-rung path passes None (it's a diagnostic, not a live run).
+
+    Each gen is tagged with a ``run`` epoch so ``dispatch_reached_model`` can scope its
+    first-token check to the CURRENT dispatch and ignore stale gens an earlier dispatch
+    left in the ring buffer (#339). A DISPATCH opens exactly ONE epoch, and the CALLER —
+    not this per-gen call — marks where that boundary is, so every candidate a fan-out
+    registers lands on the SAME epoch:
+
+      • ``new_dispatch=True`` opens a FRESH epoch (max existing run + 1) WITHOUT clearing
+        the buffer — the keep-worktree fix round, which re-runs the build in place with
+        NO ``progress_new_run`` so its prior solve/max-mode gens survive for the drawer.
+        Only the FIRST gen of that dispatch carries the flag; any sibling it fans out to
+        joins the epoch it just opened.
+      • ``new_dispatch=False`` (the default) JOINS the current epoch — the sibling
+        candidates a solve/max-mode fan-out registers (gens 1..N of ONE dispatch) and
+        every later ladder rung of the same ``solve()``. A fresh build calls
+        ``progress_new_run`` first, clearing the buffer, so its first gen starts at epoch
+        0 and the whole run shares it — no matter how many rungs finish along the way.
+
+    Inferring the boundary per-gen (bump on any re-registration) was the first cut's bug:
+    a re-dispatch that fanned out to retained gen numbers bumped EACH sibling to its own
+    epoch, so an earlier sibling's model activity was scoped out and a later pre-model
+    failure misread as infra. The explicit flag keeps one dispatch on one epoch."""
     gens = _gens_for(fid, create=True)
     if gens is not None:
-        gens[int(gen)] = _GenBuffer(gen, tier)
+        g = int(gen)
+        runs = [getattr(b, "run", 0) for b in gens.values()]
+        maxrun = max(runs) if runs else -1
+        # A new dispatch that did NOT clear the buffer opens the next epoch; everything
+        # else joins the current one (epoch 0 on a freshly cleared / empty buffer).
+        epoch = (maxrun + 1) if new_dispatch else max(maxrun, 0)
+        buf = _GenBuffer(g, tier)
+        buf.run = epoch
+        gens[g] = buf
 
 
 def _buf(fid: str | None, gen: int) -> "_GenBuffer | None":
@@ -555,6 +590,44 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
+def dispatch_reached_model(fid: str) -> bool:
+    """Did the CURRENT coder dispatch reach the model — produce any first-token
+    evidence (a tool call, a thought, streamed answer text, or token usage) — mined
+    from the live-monitor ring buffer?
+
+    Scoped to the LATEST run epoch (``progress_begin``) so a stale gen an EARLIER
+    dispatch left in this feature's buffer can NOT answer for the current one: a
+    pre-model failure on a keep-worktree re-dispatch (which re-runs gen 1 without a
+    ``progress_new_run``, leaving the prior solve/max-mode gens visible for the drawer)
+    must read as "model not reached" even though those older gens still show activity.
+    The unscoped scan misclassified exactly this as model-reachable and climbed the tier
+    ladder instead of blocking for infra triage (#339).
+
+    Fail SAFE: an unreadable or empty buffer returns ``False`` so an ambiguous dispatch
+    failure blocks for triage rather than burning the escalation ladder — the OPPOSITE
+    bias from the empty-result miner, which errs toward "had activity" to avoid a
+    wasteful same-tier retry. This one gates model-capability escalation."""
+    try:
+        gens = _progress.get(fid)
+        if not gens:
+            return False
+        current = max(getattr(b, "run", 0) for b in gens.values())
+        for b in gens.values():
+            if getattr(b, "run", 0) != current:
+                continue  # a stale earlier-dispatch gen — not evidence for THIS dispatch
+            if (
+                b.recent_tools
+                or b.current_tool
+                or (b.thought_tail or "").strip()
+                or (b.answer_tail or "").strip()
+                or b.usage
+            ):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — a monitor read must never break the drive
+        return False
+
+
 def _import_dispatch_tapped():
     """Best-effort handle on coding_agent's PUBLIC tapped-dispatch seam (C1): the host
     function that drives the pooled ACP client WITH progress callbacks wired in and
@@ -580,6 +653,7 @@ async def dispatch_coder_tapped(
     tier: str = "",
     timeout: float | None = None,
     env_passthrough: Iterable[str] = (),
+    new_dispatch: bool = False,
     _dispatch_tapped=None,
 ) -> str:
     """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
@@ -599,10 +673,16 @@ async def dispatch_coder_tapped(
     to a ``WorktreeError``/``CoderTimeout`` and propagates, never silently swallowed
     into an untapped retry. A monitoring concern must NEVER break a build.
 
+    ``new_dispatch`` opens a fresh model-reached epoch for this gen WITHOUT clearing the
+    buffer (``progress_begin``): the keep-worktree fix round sets it so a stale gen an
+    earlier dispatch left behind can't answer the ``dispatch_reached_model`` check for
+    THIS one (#339). A from-scratch build clears the buffer via ``progress_new_run``
+    first, so it leaves the flag off and starts at epoch 0.
+
     ``_dispatch_tapped`` is a test-injection seam (mirrors ``_solve``/
     ``_fusion_dispatch``); production callers never pass it — the real best-effort
     import happens in ``_import_dispatch_tapped``."""
-    progress_begin(fid, gen, tier)
+    progress_begin(fid, gen, tier, new_dispatch=new_dispatch)
     tapped = _dispatch_tapped if _dispatch_tapped is not None else _import_dispatch_tapped()
     if tapped is None:
         # Public C1 seam absent. Do NOT jump to the untapped dispatch — that records a

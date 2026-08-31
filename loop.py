@@ -48,7 +48,7 @@ import time
 import types
 
 from . import br_fetch, coder_seam, config, health, setup_check, worktree
-from .failures import classify
+from .failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
 from .store import (
@@ -3175,8 +3175,20 @@ class BoardLoop:
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
                         # keeps the prior history rather than blanking on a keep-worktree fix).
+                        # new_dispatch opens a fresh model-reached epoch WITHOUT clearing the
+                        # buffer, so the prior dispatch's still-visible gens can't answer the
+                        # pre-model check for this re-dispatch (#339 review): a re-run that
+                        # dies below the seam reads as "no model work THIS dispatch" and
+                        # blocks for infra triage instead of climbing the tier ladder.
                         result = await coder_seam.dispatch_coder_tapped(
-                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                            coder,
+                            wt,
+                            prompt,
+                            fid=fid,
+                            gen=1,
+                            tier=tier,
+                            timeout=self.coder_timeout or None,
+                            new_dispatch=True,
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
                         files_to_modify = feature.get("files_to_modify") or []
@@ -3577,6 +3589,21 @@ class BoardLoop:
                         or str(exc).startswith("goal verification failed")
                         or str(exc).startswith("requirements unresolved")
                     )
+                    # A capability failure that happened BEFORE the model could influence
+                    # the result (a seam/adapter refusal, a missing delegate, a
+                    # non-TappedResult reply, or a timeout before the first token) is NOT a
+                    # model-capability ceiling — a stronger model can't clear it. The ladder
+                    # used to escalate on it anyway, burning smart→reasoning→opus in seconds
+                    # with no model work and leaving a `tier:opus` label that misrouted the
+                    # card's next real build (bd-cwpv). Decide it from the classifier's seam
+                    # signature AND the dispatch-lifecycle evidence (did any tool/thought/
+                    # answer/token reach the ring buffer): a recognised seam failure with no
+                    # model activity is pre-model. Fail-safe — an unreadable snapshot reads
+                    # as "model not reached", so an ambiguous dispatch failure blocks for
+                    # triage rather than climbing an expensive ladder (#339).
+                    pre_model = capability and is_pre_model_dispatch_failure(
+                        str(exc), model_reached=self._dispatch_reached_model(fid)
+                    )
                     # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
                     #    off the latest base also clears a merge conflict).
                     if policy.retryable and not capability and retries < policy.max_attempts - 1:
@@ -3592,6 +3619,26 @@ class BoardLoop:
                         )
                         await asyncio.sleep(policy.base_delay_s)
                         continue
+                    # 1.5 Pre-model dispatch/infra failure → block DIRECTLY for triage, no
+                    #     tier climb. This is not an escalation: `store.escalate` is never
+                    #     called, so no `tier:`/`attempt:` label is added and no ladder
+                    #     budget is spent. It blocks under the `dispatch-infra` class the
+                    #     blocked sweep never auto-heals, so the operator is notified with the
+                    #     original infra evidence — and an operator unblock resets the tier
+                    #     posture (store.clear_blocked) so the next genuine build starts at
+                    #     its difficulty-selected tier (#339).
+                    if pre_model:
+                        reason = f"pre-model dispatch failure — infra triage, no tier climb: {exc}"
+                        log.warning(
+                            "[project_board] %s blocked (pre-model dispatch — no model work, tier untouched): %s",
+                            fid,
+                            exc,
+                        )
+                        await asyncio.to_thread(store.flag_blocked, fid, reason, category=PRE_MODEL_DISPATCH_CLASS)
+                        if wt:
+                            await worktree.remove_worktree(repo, wt, branch or "")
+                        self._inflight.pop(fid, None)
+                        return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
@@ -4699,6 +4746,21 @@ class BoardLoop:
         had_tools = any(g.get("recent_tools") or g.get("current_tool") for g in gens)
         stop = next((str(g["stop_reason"]) for g in reversed(gens) if g.get("stop_reason")), "")
         return had_tools, stop
+
+    @staticmethod
+    def _dispatch_reached_model(fid: str) -> bool:
+        """Did the coder dispatch that just failed REACH the model — i.e. produce any
+        first-token evidence (a tool call, a thought, streamed answer text, or token
+        usage)? A dispatch that failed with NONE of these never got past the seam /
+        adapter, so the model could not have influenced the result and a stronger model
+        cannot clear it (it must block for infra triage, not climb the tier ladder).
+
+        Delegates to ``coder_seam.dispatch_reached_model``, which scopes the check to
+        the CURRENT dispatch's run epoch so a stale gen an earlier dispatch left in the
+        feature's ring buffer can't misclassify a later pre-model failure as model-
+        reachable (the review finding on the first cut). Fail-safe toward "no model
+        work" so an ambiguous dispatch failure blocks rather than climbs (#339)."""
+        return coder_seam.dispatch_reached_model(fid)
 
     def _timeout_escalation_context(self, fid: str) -> str:
         """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).
