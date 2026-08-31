@@ -83,7 +83,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # distinct delegates. With a single ACP coder there's no ladder — one
         # dispatch, then Blocked on failure — so difficulty/tier stay irrelevant
         # and we never write redundant tier/attempt labels.
-        self.coders = {str(k): str(v) for k, v in (self.cfg.get("coders") or {}).items()}
+        # A rung may name ONE delegate ("sonnet") or SEVERAL interchangeable ones
+        # (["codex", "sonnet"]) — see rung_delegates. Normalised to a list here so every
+        # consumer sees one shape; a bare string stays a one-element rung, so existing
+        # configs behave exactly as before.
+        self.coders = {str(k): rung_delegates(v) for k, v in (self.cfg.get("coders") or {}).items()}
         self.escalation_on = escalation_enabled(self.cfg)
         # Concurrency: drive up to `max_concurrent` features at once, each in its own
         # worktree. 1 (the default) = serial — the safe default for token + merge-
@@ -609,13 +613,13 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             return str(pc.get("repo_conventions") or "")
         return self.repo_conventions
 
-    def _coders_for(self, feature: dict) -> dict[str, str]:
+    def _coders_for(self, feature: dict) -> dict[str, list[str]]:
         """The tier→delegate `coders` map for this feature's project (#90), else the
         instance default — so escalation on a multi-repo board climbs the ladder the
         FEATURE's project declares, not the board's."""
         raw = self._project_cfg(feature).get("coders")
         if isinstance(raw, dict) and raw:
-            return {str(k): str(v) for k, v in raw.items()}
+            return {str(k): rung_delegates(v) for k, v in raw.items()}
         return self.coders
 
     def _coder_solve_test_cmd_for(self, feature: dict) -> str:

@@ -197,7 +197,9 @@ def test_reload_flips_auto_merge_and_rejects_garbage():
 def test_reload_only_touches_live_knobs():
     loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30, "coders": {"smart": "a"}})
     assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coders": {"smart": "b"}}) == {}
-    assert loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"smart": "a"}
+    assert (
+        loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"smart": ["a"]}
+    )  # a string rung normalises to a one-element list (#362)
 
 
 def test_reload_applies_coder_live_and_keeps_cfg_in_step():
@@ -7133,7 +7135,7 @@ _MULTI_CFG = {
     "repo": "/instance/repo",
     "base_branch": "main",
     "local_gate_cmd": "instance-gate",
-    "coders": {"fast": "instance-coder"},
+    "coders": {"fast": ["instance-coder"]},
     "default_project": "board-plugin",
     "projects": {
         "board-plugin": {
@@ -7158,10 +7160,10 @@ def test_feature_resolves_repo_gate_and_coders_from_its_project():
     assert lp._repo_for(feat) == "/repos/board-plugin"  # project repo, NOT the stamped instance one
     assert lp._base_branch_for(feat) == "develop"
     assert lp._local_gate_cmd_for(feat) == "ruff check ."
-    assert lp._coders_for(feat) == {"fast": "bp-fast", "smart": "bp-smart"}
+    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "smart": ["bp-smart"]}
     # …and the instance defaults are genuinely DIFFERENT — proving we didn't read them.
     assert lp.local_gate_cmd == "instance-gate"
-    assert lp.coders == {"fast": "instance-coder"}
+    assert lp.coders == {"fast": ["instance-coder"]}
     assert lp._store_kw["repo"] == "/instance/repo"
 
 
@@ -7171,7 +7173,7 @@ def test_unlabeled_feature_resolves_to_the_default_project():
     feat = {"id": "bd-x"}  # no `project`
     assert lp._project_cfg(feat)["name"] == "board-plugin"
     assert lp._repo_for(feat) == "/repos/board-plugin"
-    assert lp._coders_for(feat) == {"fast": "bp-fast", "smart": "bp-smart"}
+    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "smart": ["bp-smart"]}
 
 
 def test_back_compat_no_projects_map_is_a_single_implicit_project():
@@ -7182,7 +7184,7 @@ def test_back_compat_no_projects_map_is_a_single_implicit_project():
     feat = {"id": "bd-1"}  # unlabeled
     assert lp._repo_for(feat) == "/solo"
     assert lp._local_gate_cmd_for(feat) == "make gate"
-    assert lp._coders_for(feat) == {"fast": "solo"}
+    assert lp._coders_for(feat) == {"fast": ["solo"]}
 
 
 def test_build_prompt_uses_the_features_project_gate_files_and_conventions():
@@ -9639,3 +9641,58 @@ async def test_repeated_sweeps_within_one_cycle_still_dedup(monkeypatch, tmp_pat
     for _ in range(4):
         await BoardLoop({"coder": "proto"})._recover_blocked(_BlockedStore([row]))
     assert len({a["key"] for a in added}) == 1
+
+
+# ── #362: several interchangeable providers per rung ────────────────────────────────
+
+
+def test_a_string_rung_is_unchanged_and_a_list_rung_opts_in():
+    """Backwards compatibility is the whole safety story here: every existing config
+    declares string rungs and must behave EXACTLY as before. Only a list opts in."""
+    assert loop_mod.rung_delegates("sonnet") == ["sonnet"]
+    assert loop_mod.rung_delegates(["codex", "sonnet"]) == ["codex", "sonnet"]
+    # blanks and duplicates are dropped; declaration order is preserved
+    assert loop_mod.rung_delegates(["codex", "", "codex", "sonnet"]) == ["codex", "sonnet"]
+    assert loop_mod.rung_delegates("") == []
+
+
+def test_a_quota_failure_rotates_provider_and_nothing_else_does():
+    """The policy this feature IS, tested directly rather than by driving a whole card.
+
+    A rate limit says nothing about the model's ability — only that this provider's quota
+    is spent. Before #362 it consumed the transient-retry budget: sleep 60s, re-dispatch
+    the SAME exhausted provider, five times, then block the card, while other declared
+    coders sat idle. 644 rate-limit lines in one agent's log.
+
+    Every other class must keep its existing behaviour exactly — that separation is what
+    makes this safe, and it is the same category error #339 fixed for infra failures."""
+    pair = ["codex", "sonnet"]
+    # a quota failure with an untried sibling → rotate
+    assert loop_mod.should_rotate_provider("rate_limit", pair, 0) is True
+    # …but only while one remains: the last sibling falls through to the ordinary ladder
+    assert loop_mod.should_rotate_provider("rate_limit", pair, 1) is False
+    # a single-provider rung is unchanged — no sibling to rotate to
+    assert loop_mod.should_rotate_provider("rate_limit", ["sonnet"], 0) is False
+    # and NOTHING else rotates: capability climbs a rung, infra backs off, terminal blocks
+    for other in ("transient", "merge_conflict", "auth", "terminal", "dispatch-infra"):
+        assert loop_mod.should_rotate_provider(other, pair, 0) is False, other
+
+
+async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeypatch):
+    """The distinction that makes this safe: rotating siblings means 'this model is fine,
+    its quota is not'. Climbing a rung means 'a stronger model may succeed'. A capability
+    failure must still CLIMB — collapsing the two would let a hard problem bounce between
+    equally-capable providers instead of ever reaching a stronger one."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.NoChangesError("coder produced no commits")
+
+    loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
+    loop.coders = {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}
+    monkeypatch.setattr(store, "current_tier", lambda fid: "smart", raising=False)
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _dispatch)
+    await loop._drive({"id": "bd-2", "title": "t", "spec": "s"})
+    assert "opus" in seen, f"a capability failure must reach the stronger rung, got {seen}"
