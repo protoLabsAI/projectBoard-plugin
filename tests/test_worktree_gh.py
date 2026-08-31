@@ -1,20 +1,22 @@
 """Real-`gh` / real-GitHub integration tier for the 12 read-dominant ``worktree.py``
 GitHub seams (#361, slice 2).
 
-Every seam here shells the ACTUAL ``gh`` against a PINNED, permanently-open PR in this
-repository — no ``_gh`` stub, no mocked API. Unlike ``test_worktree.py`` (which fakes
-``_gh``/``_git`` to pin the error-path branching) this tier validates what real GitHub
-actually returns for the plugin's payloads: the class a mock is structurally blind to and
-that shipped #354 (a PAT that cannot ``POST /check-runs``, green through every mock,
-publishing to nothing for a day). A mock proves the call SHAPE; only the real API proves
-the configured credential holds the permission and the provider behaves as assumed.
+Every seam here shells the ACTUAL ``gh`` against a real OPEN PR in this repository — no
+``_gh`` stub, no mocked API. Unlike ``test_worktree.py`` (which fakes ``_gh``/``_git`` to pin
+the error-path branching) this tier validates what real GitHub actually returns for the
+plugin's payloads: the class a mock is structurally blind to and that shipped #354 (a PAT
+that cannot ``POST /check-runs``, green through every mock, publishing to nothing for a day).
+A mock proves the call SHAPE; only the real API proves the configured credential holds the
+permission and the provider behaves as assumed.
 
 Posture mirrors the real-`br` tier (``test_integration.py``): local runs SKIP when GitHub
 credentials are unavailable (``@requires_gh``); CI sets ``PB_REQUIRE_GH=1`` so an absent or
-unusable credential — or an unconfigured fixture PR — FAILS via the guard test below rather
+unusable credential — or an unresolvable fixture PR — FAILS via the guard test below rather
 than silently skipping the whole tier. The fixture PR + credential are resolved once by the
-``gh_fixture`` fixture (tests/conftest.py); the pinned PR URL rides ``PB_GH_FIXTURE_PR`` and
-never embeds a secret (a PR URL is a public identifier).
+``gh_fixture`` fixture (tests/conftest.py); the PR URL rides ``PB_GH_FIXTURE_PR``, which CI
+sets (see .github/workflows/ci.yml) to the maintained ``PB_GH_FIXTURE_PR`` repo variable when
+a maintainer pins a dedicated, permanently-open fixture PR, and otherwise to the PR under test
+(itself a real open PR while its checks run). A PR URL is a public identifier, never a secret.
 
 The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for_branch``,
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
@@ -64,7 +66,7 @@ def test_gh_tier_cannot_silently_skip_in_ci():
     """The skip guard (mirrors ``test_integration_tier_cannot_silently_skip_in_ci``, #136):
     deliberately NOT under ``@requires_gh``. When CI declares GitHub must be present
     (``PB_REQUIRE_GH=1``, set on the real-GitHub job), an absent/unusable credential or an
-    unconfigured fixture PR FAILS here instead of silently skipping the whole tier — the way
+    unresolvable fixture PR FAILS here instead of silently skipping the whole tier — the way
     #354 (a PAT that cannot ``POST /check-runs``) shipped green through every mock. Without the
     env var (a local checkout with no gh auth) this is an always-green no-op, and the
     ``@requires_gh`` skips still apply to the real seam tests below."""
@@ -72,8 +74,9 @@ def test_gh_tier_cannot_silently_skip_in_ci():
         ready, reason = gh_tier_ready()
         assert ready, (
             f"PB_REQUIRE_GH is set but the real-GitHub tier is not runnable: {reason}. The tier "
-            f"would have silently skipped; fix the CI credential/fixture wiring (GH_TOKEN + the "
-            f"PB_GH_FIXTURE_PR repo variable) before trusting this run."
+            f"would have silently skipped; fix the CI credential/fixture wiring (GH_TOKEN + "
+            f"PB_GH_FIXTURE_PR — the maintained repo variable, or the PR under test) before "
+            f"trusting this run."
         )
 
 

@@ -117,20 +117,24 @@ def make_board(monkeypatch):
 
 # ── Real-GitHub integration tier (#361 slice 2) ──────────────────────────────────────
 # Mirrors the real-`br` tier (tests/test_integration.py): tests/test_worktree_gh.py shells
-# the ACTUAL `gh`/GitHub against a PINNED, permanently-open PR to exercise the 12 read-
-# dominant worktree GitHub seams a mocked `_gh` cannot validate — the exact blindness that
-# shipped #354 (a PAT that cannot POST /check-runs, green through every mock, publishing to
-# nothing for a day). Locally the tier SKIPS when GitHub credentials are unavailable; CI sets
-# PB_REQUIRE_GH=1 so an absent/unusable credential (or an unconfigured fixture) FAILS the
-# guard test rather than silently skipping — a silent skip is a fake with extra ceremony.
+# the ACTUAL `gh`/GitHub against a real OPEN PR to exercise the 12 read-dominant worktree
+# GitHub seams a mocked `_gh` cannot validate — the exact blindness that shipped #354 (a PAT
+# that cannot POST /check-runs, green through every mock, publishing to nothing for a day).
+# Locally the tier SKIPS when GitHub credentials are unavailable; CI sets PB_REQUIRE_GH=1 so
+# an absent/unusable credential (or an unresolvable fixture PR) FAILS the guard test rather
+# than silently skipping — a silent skip is a fake with extra ceremony.
 #
 # No credential is embedded here: the token rides the ambient `gh` auth (GH_TOKEN /
 # `gh auth login`); a PR URL is a PUBLIC identifier, never a secret. Required environment,
 # documented and credential-free:
-#   PB_GH_FIXTURE_PR — full URL of the pinned, permanently-open fixture PR in the checkout's
-#                      repo, e.g. https://github.com/protoLabsAI/projectBoard-plugin/pull/<n>.
-#                      CI wires the maintained value via the `PB_GH_FIXTURE_PR` repo variable
-#                      so the number lives in one place, never hard-coded into the suite.
+#   PB_GH_FIXTURE_PR — full URL of the OPEN fixture PR in the checkout's repo, e.g.
+#                      https://github.com/protoLabsAI/projectBoard-plugin/pull/<n>. CI resolves
+#                      it (see .github/workflows/ci.yml) to the maintained `PB_GH_FIXTURE_PR`
+#                      repo variable when a maintainer wires a dedicated, pinned,
+#                      permanently-open fixture PR, and otherwise to the PR under test — itself
+#                      a real open PR while its own checks run. The reads target this PR; the two
+#                      writes use DISPOSABLE contexts distinct from the production review signals,
+#                      so the tier never disturbs a real review gate on it.
 #   PB_REQUIRE_GH=1  — (CI only) turn an absent/unusable prerequisite into a FAILURE.
 #   GH_TOKEN         — (CI only) the gh credential; a repo-scoped token that can create a
 #                      commit status + a PR comment on the fixture PR (mirrors the board's PAT).
@@ -208,8 +212,8 @@ def gh_fixture() -> GhFixture:
         if os.environ.get("PB_REQUIRE_GH"):
             pytest.fail(
                 f"PB_REQUIRE_GH is set but the real-GitHub tier cannot run: {reason}. Fix the CI "
-                f"credential/fixture wiring (GH_TOKEN + the PB_GH_FIXTURE_PR repo variable) — a silent "
-                f"skip here is exactly how #354 shipped green."
+                f"credential/fixture wiring (GH_TOKEN + PB_GH_FIXTURE_PR — the maintained repo "
+                f"variable, or the PR under test) — a silent skip here is exactly how #354 shipped green."
             )
         pytest.skip(reason)
     m = _GH_PR_URL_RE.search(GH_FIXTURE_PR_URL)
