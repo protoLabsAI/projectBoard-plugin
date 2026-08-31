@@ -23,6 +23,7 @@ from project_board import api, store
 from project_board.loop import BoardLoop
 from project_board.store import (
     NEXT_ACTION_AWAITING_DELIVERABLE,
+    NEXT_ACTION_AWAITING_VERIFICATION,
     NEXT_ACTION_FIXING_REVIEW,
     NEXT_ACTION_MERGED_VERIFY_EXHAUSTED,
     annotate_next_action,
@@ -451,8 +452,8 @@ def test_annotate_tolerates_a_non_int_merged_verify_max():
         ("in_progress", "claude", False, True, ""),  # ACP agent, live drive → working, not awaiting
         ("in_progress", "alice", True, False, ""),  # blocked → its own posture, not awaiting
         ("ready", "alice", False, False, ""),  # not yet claimed
-        ("in_review", "alice", False, False, ""),  # delivered — merge_posture's lane, not this one
         ("done", "alice", False, False, ""),  # terminal
+        # (a delivered in_review task is `awaiting verification`, its own lane — see below)
     ],
 )
 def test_task_posture_table(state, assignee, blocked, driven, want):
@@ -464,6 +465,53 @@ def test_task_posture_table(state, assignee, blocked, driven, want):
         assert (assignee or "an out-of-band delivery") in p["next_action_hint"]
     else:
         assert p["next_action_hint"] == ""
+
+
+# ── task_posture: the delivered-task verification seam (#217, ADR 0078) ──────────
+
+
+def test_task_posture_in_review_task_awaits_verification_not_a_review_verdict():
+    """r7: a DELIVERED task (in_review, no PR) awaiting its record_verification Done edge reads
+    `awaiting verification` with a board_verify hint — NEVER merge_posture's coding wording
+    `awaiting review verdict (no review-clean)` (ADR 0078: task verification is a SEPARATE edge)."""
+    p = task_posture(_task(state="in_review", assignee="alice"), is_driven=lambda _fid: False)
+    assert p["next_action"] == NEXT_ACTION_AWAITING_VERIFICATION == "awaiting verification"
+    assert p["awaiting_merge"] is False
+    assert "board_verify(bd-t)" in p["next_action_hint"]
+    # the coding review-gate phrasing must not leak onto a task
+    assert "review verdict" not in p["next_action_hint"] and "review-clean" not in p["next_action_hint"]
+
+
+def test_task_posture_blocked_in_review_task_keeps_the_blocked_posture():
+    """A blocked in_review task keeps its own `blocked` projection (blocked wins, as
+    merge_posture projects for a blocked coding card) rather than `awaiting verification`."""
+    p = task_posture(_task(state="in_review", assignee="alice", blocked=True), is_driven=lambda _fid: False)
+    assert p["next_action"] == "blocked" and p["next_action_hint"] == ""
+
+
+def test_annotate_stamps_awaiting_verification_on_a_delivered_task():
+    """r7 through the full annotate seam: an in_review task rides the SAME row slots as a coding
+    in_review card but reads `awaiting verification`, even with the review gate ON — the task is
+    routed to task_posture first so merge_posture's coding verdict wording never lands on it."""
+    (row,) = annotate_next_action(
+        [_task(state="in_review", assignee="alice")],
+        {"auto_merge": False, "review_gate": True},
+        is_driven=lambda _fid: False,
+    )
+    assert row["next_action"] == "awaiting verification" and row["awaiting_merge"] is False
+    assert "board_verify(bd-t)" in row["next_action_hint"]
+
+
+def test_annotate_coding_in_review_retains_review_verdict_wording_and_precedence():
+    """r7: the fix is task-scoped — a CODING feature in_review with the gate on and no clean
+    verdict still reads merge_posture's `awaiting review verdict (no review-clean)`, unchanged,
+    proving the task reroute never touches the coding lane's precedence."""
+    (row,) = annotate_next_action(
+        [{**_feat(state="in_review", labels=[]), "issue_type": "feature"}],
+        {"auto_merge": False, "review_gate": True},
+        is_driven=lambda _fid: False,
+    )
+    assert row["next_action"] == "awaiting review verdict (no review-clean)"
 
 
 @pytest.mark.parametrize("state", ["backlog", "ready", "in_progress", "in_review", "done"])

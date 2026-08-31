@@ -1326,255 +1326,12 @@ async def test_base_checkout_dirt_skips_the_branch_check_without_a_base(monkeypa
     assert git.ran("rev-parse") == []
 
 
-# ── #347: the head-pinned review-gate check run (post_review_check) ───────────────
-
-
-class _CheckGh:
-    """A `_gh` stub for post_review_check: records every `gh` call and answers the
-    ``GET …/commits/<sha>/check-runs`` lookup from `existing` (a list of {name,id}),
-    then the CREATE/UPDATE. `create_rc` drives the POST/PATCH return code."""
-
-    def __init__(self, existing=None, create_rc=0, create_err=""):
-        self.calls = []  # each call's full args tuple
-        self.existing = existing or []
-        self.create_rc = create_rc
-        self.create_err = create_err
-
-    async def __call__(self, *args, cwd, timeout=60):
-        self.calls.append(args)
-        # the idempotency lookup — GET /repos/<slug>/commits/<sha>/check-runs with
-        # `--jq .check_runs`, so gh emits just the array (emulated here).
-        if args and args[0] == "api" and "/check-runs" in args[1] and "/commits/" in args[1]:
-            import json as _json
-
-            return (0, _json.dumps(self.existing), "")
-        # the POST/PATCH that lands the verdict
-        return (self.create_rc, "", self.create_err)
-
-    def api_writes(self):
-        """The CREATE/PATCH calls (the ones that mutate a check run)."""
-        return [c for c in self.calls if c and c[0] == "api" and "/commits/" not in c[1]]
-
-    @staticmethod
-    def field(call, key):
-        """The `-f key=value` value from a recorded gh-api call (or None)."""
-        for i, a in enumerate(call):
-            if a == "-f" and i + 1 < len(call) and call[i + 1].startswith(f"{key}="):
-                return call[i + 1].split("=", 1)[1]
-        return None
-
-
+# `_SLUG` / `_HEAD` — a repo slug + a full 40-char head sha, shared by the #354 commit-status
+# tests below. (The #347 App-only check-run publisher/reader they were first introduced with —
+# post_review_check / read_review_check / _existing_review_check_id — is removed in bd-doo0,
+# along with its mock-only coverage: that path 403s under the board's user/PAT gh credential.)
 _SLUG = "o/r"
 _HEAD = "0123456789abcdef0123456789abcdef01234567"  # a full 40-char sha
-
-
-async def test_post_review_check_creates_a_head_pinned_check_when_none_exists(monkeypatch):
-    """r1/r2/r4: a clean verdict CREATEs a `QA panel` check keyed to the exact reviewed
-    head, with a success conclusion — no existing run to update."""
-    gh = _CheckGh(existing=[])
-    monkeypatch.setattr(worktree, "_gh", gh)
-    ok = await worktree.post_review_check(
-        _SLUG, _HEAD, conclusion="success", title="Review gate: clean", summary="no blocking findings", cwd="/repo"
-    )
-    assert ok is True
-    (write,) = gh.api_writes()
-    assert "--method" in write and write[write.index("--method") + 1] == "POST"
-    assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/check-runs"
-    assert _CheckGh.field(write, "head_sha") == _HEAD  # the FULL immutable head, not truncated
-    assert _CheckGh.field(write, "name") == "QA panel"
-    assert _CheckGh.field(write, "conclusion") == "success"
-    assert _CheckGh.field(write, "status") == "completed"
-
-
-async def test_post_review_check_updates_an_existing_run_idempotently(monkeypatch):
-    """r5: a `QA panel` run ALREADY on this head is PATCHed by id — never a second POST,
-    so a reconcile/retry of the same verdict leaves ONE status record, not duplicates."""
-    gh = _CheckGh(existing=[{"name": "other", "id": 11}, {"name": "QA panel", "id": 42}])
-    monkeypatch.setattr(worktree, "_gh", gh)
-    ok = await worktree.post_review_check(
-        _SLUG, _HEAD, conclusion="action_required", title="changes requested", summary="findings", cwd="/repo"
-    )
-    assert ok is True
-    (write,) = gh.api_writes()
-    assert write[write.index("--method") + 1] == "PATCH"
-    assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/check-runs/42"  # the existing id
-    # a PATCH targets the run by id — head_sha is immutable, so it must NOT be re-sent
-    assert _CheckGh.field(write, "head_sha") is None
-    assert _CheckGh.field(write, "conclusion") == "action_required"
-
-
-async def test_post_review_check_never_posts_without_a_head_or_slug(monkeypatch):
-    """r2: an unknown reviewed head (or repo) means the gate can't prove which commit it
-    reviewed — so NO check is posted (never a verdict against a guessed/moved head), and
-    not even the lookup fires."""
-    gh = _CheckGh()
-    monkeypatch.setattr(worktree, "_gh", gh)
-    assert await worktree.post_review_check(_SLUG, "", conclusion="success", title="t", summary="s") is False
-    assert await worktree.post_review_check("", _HEAD, conclusion="success", title="t", summary="s") is False
-    assert gh.calls == []  # short-circuited before any gh call
-
-
-async def test_post_review_check_returns_false_on_a_gh_failure(monkeypatch):
-    """Best-effort: a failed POST (no `checks:write`, a network blip) returns False and
-    never raises into the loop — the verdict still rides the bead comment."""
-    gh = _CheckGh(existing=[], create_rc=1, create_err="HTTP 403: Resource not accessible")
-    monkeypatch.setattr(worktree, "_gh", gh)
-    ok = await worktree.post_review_check(_SLUG, _HEAD, conclusion="failure", title="t", summary="s", cwd="/repo")
-    assert ok is False
-
-
-async def test_post_review_check_coerces_an_unknown_conclusion_to_neutral(monkeypatch):
-    """A caller typo in the conclusion can't make gh reject the POST and drop the verdict:
-    an unknown value degrades to `neutral` (a landed, if uncolored, status)."""
-    gh = _CheckGh(existing=[])
-    monkeypatch.setattr(worktree, "_gh", gh)
-    await worktree.post_review_check(_SLUG, _HEAD, conclusion="explode", title="t", summary="s", cwd="/repo")
-    (write,) = gh.api_writes()
-    assert _CheckGh.field(write, "conclusion") == "neutral"
-
-
-async def test_post_review_check_lookup_error_falls_back_to_create(monkeypatch):
-    """A check-runs lookup that can't be read (gh non-zero / bad JSON) is treated as "no
-    existing run" → CREATE, never a crash: the verdict still lands (a possible duplicate is
-    the safe failure, an unposted verdict is not)."""
-
-    async def _gh(*args, cwd, timeout=60):
-        if args and args[0] == "api" and "/commits/" in args[1]:
-            return (1, "boom", "not found")  # the lookup fails
-        return (0, "", "")
-
-    monkeypatch.setattr(worktree, "_gh", _gh)
-    assert (
-        await worktree.post_review_check(_SLUG, _HEAD, conclusion="success", title="t", summary="s", cwd="/repo")
-        is True
-    )
-
-
-# ── #323: read back the head-pinned QA verdict (read_review_check) ────────────────
-
-
-def _checks_gh(runs):
-    """A `_gh` stub for read_review_check: answers the GET …/commits/<sha>/check-runs
-    lookup (jq'd to `.check_runs`, so gh emits just the array) with `runs`."""
-    import json as _json
-
-    async def _gh(*args, cwd, timeout=60):
-        assert args[0] == "api" and "/commits/" in args[1] and "/check-runs" in args[1]
-        return (0, _json.dumps(runs), "")
-
-    return _gh
-
-
-def _qa_run(name="QA panel", head=_HEAD, status="completed", conclusion="success", rid=7):
-    return {"name": name, "head_sha": head, "status": status, "conclusion": conclusion, "id": rid}
-
-
-async def test_read_review_check_returns_a_current_head_pass(monkeypatch):
-    """r1: exactly one completed `QA panel` run pinned to the queried head with a success
-    conclusion is a TRUSTED, PROMOTED, current-head PASS."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="success")]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") == {
-        "conclusion": "success",
-        "head_sha": _HEAD,
-        "passed": True,
-    }
-
-
-async def test_read_review_check_reports_a_current_head_fail_as_not_passed(monkeypatch):
-    """r2: a completed current-head FAIL is a real, trusted verdict (not None) — but
-    `passed` is False, so a caller never promotes off it. action_required (an active fix
-    round's non-success) is likewise not a pass."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="failure")]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") == {
-        "conclusion": "failure",
-        "head_sha": _HEAD,
-        "passed": False,
-    }
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(conclusion="action_required")]))
-    v = await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo")
-    assert v["passed"] is False and v["conclusion"] == "action_required"
-
-
-async def test_read_review_check_none_when_absent(monkeypatch):
-    """r3: no `QA panel` run on the head (only unrelated checks, or none at all) → None —
-    there is no promotion evidence to ingest."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(name="build"), _qa_run(name="lint")]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-
-async def test_read_review_check_none_for_a_pass_pinned_to_another_head(monkeypatch):
-    """r3 (stale head): a `QA panel` PASS whose OWN recorded immutable head is a DIFFERENT
-    commit is not a verdict for the current head — fail closed (the currency invariant of
-    #328, full-sha exact)."""
-    other = "ffffffffffffffffffffffffffffffffffffffff"
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(head=other, conclusion="success")]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-
-async def test_read_review_check_none_when_ambiguous(monkeypatch):
-    """r3: MORE THAN ONE `QA panel` run on the same head is ambiguous — the caller can't tell
-    which is authoritative, so fail closed (mirrors #347 keeping a single record)."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(rid=1), _qa_run(rid=2)]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-
-async def test_read_review_check_none_when_still_running(monkeypatch):
-    """A `QA panel` run still in flight (not `completed`) is not yet a PROMOTED verdict → None:
-    the caller waits rather than adopting a half-formed result."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(status="in_progress", conclusion=None)]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-
-async def test_read_review_check_none_when_completed_without_a_conclusion(monkeypatch):
-    """Malformed: a completed run carrying no conclusion is not a readable verdict → None."""
-    monkeypatch.setattr(worktree, "_gh", _checks_gh([_qa_run(status="completed", conclusion=None)]))
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-
-async def test_read_review_check_none_on_empty_slug_or_head_without_shelling_gh(monkeypatch):
-    """r3: an empty slug or head means the caller can't say which repo/commit to read — None,
-    and not even a gh call fires (short-circuit)."""
-    called = []
-
-    async def _spy(*a, cwd, timeout=60):
-        called.append(a)
-        return (0, "[]", "")
-
-    monkeypatch.setattr(worktree, "_gh", _spy)
-    assert await worktree.read_review_check("", _HEAD, cwd="/repo") is None
-    assert await worktree.read_review_check(_SLUG, "", cwd="/repo") is None
-    assert called == []
-
-
-async def test_read_review_check_none_on_unreadable_or_malformed(monkeypatch):
-    """Every unreadable case fails closed to None: a gh non-zero, a raised WorktreeError, and
-    non-JSON / non-list (a dict, not the jq'd array) output."""
-
-    async def _rc1(*a, cwd, timeout=60):
-        return (1, "", "not found")
-
-    monkeypatch.setattr(worktree, "_gh", _rc1)
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-    async def _raise(*a, cwd, timeout=60):
-        raise worktree.WorktreeError("gh timed out")
-
-    monkeypatch.setattr(worktree, "_gh", _raise)
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-    async def _garbage(*a, cwd, timeout=60):
-        return (0, "not json", "")
-
-    monkeypatch.setattr(worktree, "_gh", _garbage)
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
-
-    async def _obj(*a, cwd, timeout=60):
-        return (0, '{"check_runs": []}', "")  # a dict, not the jq'd array
-
-    monkeypatch.setattr(worktree, "_gh", _obj)
-    assert await worktree.read_review_check(_SLUG, _HEAD, cwd="/repo") is None
 
 
 # ── #354: PAT-compatible commit-status publication (post_review_status) ────────────
@@ -1666,33 +1423,27 @@ async def test_post_review_status_returns_false_on_a_permission_refusal(monkeypa
     assert await worktree.post_review_status(_SLUG, _HEAD, state="failure", description="d", cwd="/repo") is False
 
 
-async def test_check_runs_403_is_inert_but_the_status_endpoint_publishes(monkeypatch):
-    """r3: the former check-runs path 403s under a user/PAT token ("You must authenticate via a
-    GitHub App") — structurally inert — while the PAT-compatible commit-status endpoint lands the
-    verdict. Both paths are exercised against the SAME fake seam to prove the migration works."""
+async def test_no_check_run_endpoint_survives_and_the_status_endpoint_publishes(monkeypatch):
+    """r5: the App-only check-run publisher is GONE — there is no ``post_review_check`` seam left
+    to reach ``/check-runs`` (which 403s under the board's user/PAT credential), and the only
+    verdict-publication endpoint the module hits is the PAT-compatible ``/statuses/<sha>``, which
+    lands. Guards against reintroducing a structurally-unavailable publisher."""
+    assert not hasattr(worktree, "post_review_check")  # the dead App-only publisher is removed
+    assert not hasattr(worktree, "read_review_check")  # …and its reader
+    assert not hasattr(worktree, "_existing_review_check_id")
+
     endpoints = []
 
     async def _gh(*args, cwd, timeout=60):
         joined = " ".join(args)
-        if "/check-runs" in joined and "--method" not in args:
-            return (0, "[]", "")  # the idempotency lookup → no existing run
-        if "/check-runs" in joined:
-            endpoints.append("check-runs")
-            return (1, "", "HTTP 403: You must authenticate via a GitHub App to create check runs")
+        assert "/check-runs" not in joined  # nothing in worktree.py may touch the App-only path
         if "/statuses/" in joined:
             endpoints.append("statuses")
-            return (0, "", "")
         return (0, "", "")
 
     monkeypatch.setattr(worktree, "_gh", _gh)
-    # the App-only check-run path is inert under a PAT
-    assert (
-        await worktree.post_review_check(_SLUG, _HEAD, conclusion="success", title="t", summary="s", cwd="/repo")
-        is False
-    )
-    # …but the PAT-compatible commit status lands
     assert await worktree.post_review_status(_SLUG, _HEAD, state="success", description="d", cwd="/repo") is True
-    assert endpoints == ["check-runs", "statuses"]
+    assert endpoints == ["statuses"]
 
 
 # ── #354: read back the head-pinned QA commit status (read_review_status) ──────────

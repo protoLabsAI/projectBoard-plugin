@@ -182,6 +182,35 @@ _REVIEW_STATUS_CACHE: dict[str, tuple[bool, str]] = {}
 # status publication reports "not accessible by integration". Either string names an App-only
 # credential — the case this probe distinguishes from a status-capable PAT.
 _APP_ONLY_RE = re.compile(r"authenticate (?:via|as) a GitHub App|not accessible by integration", re.I)
+# gh fills these templated placeholders from the checkout's OWN remote, so the per-repo
+# capability read targets the SAME repository the reviewed status will be published to — not a
+# repo the operator merely named, and not a repo a PAT happens to be valid on elsewhere.
+# `repos/{owner}/{repo}` is gh's documented equivalent of `repos/{slug}` scoped to the cwd.
+_REPO_CAPABILITY_PATH = "repos/{owner}/{repo}"
+# Classic-PAT OAuth scopes that carry commit-status write (`repo` → private+public,
+# `public_repo` → public only). Read from the `X-OAuth-Scopes` response header ONLY as a
+# secondary, diagnostic fallback when the per-repo `.permissions.push` read is ambiguous —
+# repository-specific permission is always preferred (r3). A fine-grained token reports an EMPTY
+# scope header, so an absent/blank list proves nothing and stays fail-open.
+_STATUS_WRITE_SCOPES = ("repo", "public_repo")
+_OAUTH_SCOPES_RE = re.compile(r"^x-oauth-scopes:[ \t]*(.*?)[ \t]*$", re.I | re.M)
+
+# Operator-facing detail fragments for the three positively-proven-incapable credentials the
+# probe can name (each is wrapped by ``review_status_hint`` into the full advisory).
+_APP_ONLY_DETAIL = (
+    "the board's gh credential is a GitHub App installation token — it can't create the commit "
+    "status the review gate publishes (that needs a user/PAT token)"
+)
+_NO_PUSH_DETAIL = (
+    "the board's gh credential has no write access to this repository — it can't create the "
+    "commit status the review gate publishes (a status needs `repo`/`statuses:write` on THIS "
+    "repo; a token valid on another repo, lapsed SSO, or a fine-grained token without Commit "
+    "Statuses is not enough)"
+)
+_NO_SCOPE_DETAIL = (
+    "the board's gh token's OAuth scopes do not include `repo` or `public_repo`, so it can't "
+    "create the commit status the review gate publishes"
+)
 
 
 def review_status_hint(detail: str) -> str:
@@ -200,13 +229,28 @@ def review_status_hint(detail: str) -> str:
 
 
 def _default_status_probe(run, cwd: str = ".") -> tuple[bool, str]:
-    """The default #354 capability detection: can the board's ``gh`` credential publish commit
-    statuses? A bounded, read-only ``gh api user`` — a user/PAT token (what commit-status
-    publication needs) returns the authed login (rc 0); a GitHub App INSTALLATION token 403s
-    ("must authenticate as a GitHub App" / "not accessible by integration"). That tells a
-    status-capable PAT from the App-only credential model #347 assumed. Returns ``(ok, detail)``:
-    ``(True, "")`` when capable OR when capability can't be proven either way (never a false
-    alarm), ``(False, detail)`` only on a positively App-only credential. Never raises."""
+    """The default #354 capability detection: can the board's ``gh`` credential publish the review
+    gate's commit status ON THE REPOSITORY THIS CHECKOUT TARGETS? Two bounded, read-only ``gh``
+    reads, in order — neither mutates anything (r4):
+
+    1. ``gh api user`` distinguishes credential SHAPE. A GitHub App INSTALLATION token 403s
+       ("must authenticate as a GitHub App" / "not accessible by integration") — the one
+       credential model that structurally cannot create a commit status — and returns
+       ``(False, …)`` at once. A user/PAT token returns its login (rc 0), which proves the token
+       is user-shaped but NOT that it can write THIS repo (a PAT valid on another repo, lapsed
+       SSO, or a fine-grained token without Commit Statuses all pass ``gh api user``); it is
+       necessary, not sufficient — so the probe continues to step 2.
+    2. ``gh api repos/{owner}/{repo} --jq .permissions.push`` (run in ``cwd``, gh fills the
+       placeholders from the checkout's remote) reads the PER-REPOSITORY capability publication
+       actually needs, against the SAME repo the verdict will be published to. ``push`` true ⇒
+       status-write on this repo (statuses:write rides repo push access) ⇒ ``(True, "")``;
+       ``push`` false ⇒ a credential with no write on THIS repo ⇒ ``(False, …)`` — the exact
+       former-``gh api user`` false-positive this fix closes (r2).
+
+    Fail-OPEN throughout (r3): a probe that can't run, an unresolvable slug, an offline / ambiguous
+    read, or scope evidence that proves nothing all return ``(True, "")`` rather than a startup
+    false alarm. ``(False, detail)`` ONLY on a positively-proven-incapable credential (App-only,
+    or user/PAT with no push on this repo). Never raises."""
     try:
         proc = run(
             ["gh", "api", "user", "--jq", ".login"],
@@ -216,17 +260,82 @@ def _default_status_probe(run, cwd: str = ".") -> tuple[bool, str]:
         )
     except Exception:  # noqa: BLE001 — a probe that can't run never manufactures a warning
         return True, ""
-    if getattr(proc, "returncode", 1) == 0:
-        return True, ""  # a user/PAT token → commit-status publication works
+    if getattr(proc, "returncode", 1) != 0:
+        text = str(getattr(proc, "stderr", "") or "") + str(getattr(proc, "stdout", "") or "")
+        if _APP_ONLY_RE.search(text):
+            return False, _APP_ONLY_DETAIL
+        # Any other `gh api user` failure (offline, unauthenticated) is the `gh` check's / per-run
+        # logs' story — fail open, don't manufacture a second, possibly-spurious status warning.
+        return True, ""
+    # The credential is user/PAT-shaped — necessary but NOT sufficient. Prove the per-repository
+    # capability against the checkout the status will actually be published to.
+    return _repo_push_capability(run, cwd)
+
+
+def _repo_push_capability(run, cwd: str) -> tuple[bool, str]:
+    """Step 2 of ``_default_status_probe``: does the (already-confirmed user/PAT) credential have
+    push — hence commit-status write — on the repo THIS checkout targets? Reads
+    ``.permissions.push`` off ``gh api repos/{owner}/{repo}`` in ``cwd`` (gh resolves the slug
+    from the remote), so the capability is assessed for the SAME repo the verdict publishes to.
+    ``true`` ⇒ capable; ``false`` ⇒ proven-incapable for this repo (r2); anything
+    unreadable/ambiguous defers to the scope-header fallback, which itself fails open (r3). A
+    read-only GET — mutates nothing (r4). Never raises."""
+    try:
+        proc = run(
+            ["gh", "api", _REPO_CAPABILITY_PATH, "--jq", ".permissions.push"],
+            capture_output=True,
+            text=True,
+            timeout=_REVIEW_STATUS_PROBE_TIMEOUT_S,
+            cwd=cwd,
+        )
+    except Exception:  # noqa: BLE001 — an unreadable per-repo probe never false-alarms
+        return True, ""
+    rc = getattr(proc, "returncode", 1)
+    out = str(getattr(proc, "stdout", "") or "").strip().lower()
+    if rc == 0 and out == "true":
+        return True, ""  # push ⇒ statuses:write on THIS repo
+    if rc == 0 and out == "false":
+        return False, _NO_PUSH_DETAIL  # user/PAT-shaped but no write on the reviewed repo (r2)
+    # rc 0 with `.permissions` absent/blank, or a non-zero read (offline, an SSO wall, repo not
+    # found) — the per-repo signal is AMBIGUOUS. An App-only token could surface only here too;
+    # otherwise consult the scope header as a secondary, still-fail-open fallback.
     text = str(getattr(proc, "stderr", "") or "") + str(getattr(proc, "stdout", "") or "")
     if _APP_ONLY_RE.search(text):
-        return False, (
-            "the board's gh credential is a GitHub App installation token — it can't create the "
-            "commit status the review gate publishes (that needs a user/PAT token)"
+        return False, _APP_ONLY_DETAIL
+    return _scope_header_fallback(run, cwd)
+
+
+def _scope_header_fallback(run, cwd: str) -> tuple[bool, str]:
+    """Secondary, DIAGNOSTIC-only capability evidence for when the per-repo ``.permissions.push``
+    read is ambiguous (r3): the token's OAuth scopes from the ``X-OAuth-Scopes`` response header
+    (``gh api user --include``). A classic PAT lists its scopes there; if that list is present and
+    non-empty yet carries NONE of ``_STATUS_WRITE_SCOPES``, the credential cannot write a status →
+    ``(False, …)``. Every other outcome fails OPEN (``(True, "")``): a header that DOES carry the
+    scope, an EMPTY header (fine-grained tokens report no scopes — absence proves nothing), a
+    missing header, or any gh error. Repository-specific permission is always preferred; this only
+    runs as the fallback and never overrides a decisive per-repo verdict. Never raises."""
+    try:
+        proc = run(
+            ["gh", "api", "user", "--include"],
+            capture_output=True,
+            text=True,
+            timeout=_REVIEW_STATUS_PROBE_TIMEOUT_S,
+            cwd=cwd,
         )
-    # Any other failure (offline, unauthenticated) is the `gh` check's / per-run logs' story —
-    # don't raise a second, possibly-spurious status warning on top of it.
-    return True, ""
+    except Exception:  # noqa: BLE001 — an unreadable fallback never false-alarms
+        return True, ""
+    if getattr(proc, "returncode", 1) != 0:
+        return True, ""
+    headers = str(getattr(proc, "stdout", "") or "")
+    m = _OAUTH_SCOPES_RE.search(headers)
+    if not m:
+        return True, ""  # no scope header at all → prove nothing → fail open
+    scopes = [s.strip() for s in m.group(1).split(",") if s.strip()]
+    if not scopes:
+        return True, ""  # fine-grained token (empty scope list) → fail open
+    if any(s in _STATUS_WRITE_SCOPES for s in scopes):
+        return True, ""  # a status-write scope is present → capable
+    return False, _NO_SCOPE_DETAIL
 
 
 def _cached_status_probe(probe, run, cwd: str) -> tuple[bool, str]:
@@ -582,9 +691,12 @@ def setup_status(
     # The #354 review-status capability advisory: with the review gate on, can the board's gh
     # credential publish the gate's `QA panel` commit status? A single cached probe — quiet when
     # the gate is off, gh is missing (the gh check owns that), or the credential is capable;
-    # an actionable warning only on a proven-incapable (App-only / no-scope) credential. Never
-    # a failing check or a pause — the verdict still rides the bead.
-    rs_ok, rs_hint = _review_status_capability(cfg, gh_ok=gh["ok"], run=run, probe=status_probe)
+    # an actionable warning only on a proven-incapable (App-only / no-push / no-scope) credential.
+    # Never a failing check or a pause — the verdict still rides the bead. The probe runs in the
+    # board's OWN checkout so its per-repo `.permissions.push` read assesses the SAME repository
+    # the reviewed status will be published to (r1) — not the process cwd.
+    repo_cwd = os.path.expanduser(str(cfg.get("repo") or ".").strip() or ".")
+    rs_ok, rs_hint = _review_status_capability(cfg, gh_ok=gh["ok"], run=run, probe=status_probe, cwd=repo_cwd)
     status["review_status_ok"] = rs_ok
     status["review_status_hint"] = rs_hint
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
