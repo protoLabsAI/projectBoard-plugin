@@ -3175,8 +3175,14 @@ class BoardLoop:
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
                         # keeps the prior history rather than blanking on a keep-worktree fix).
+                        # new_dispatch opens a fresh model-reached epoch WITHOUT clearing the
+                        # buffer, so the prior dispatch's still-visible gens can't answer the
+                        # pre-model check for this re-dispatch (#339 review): a re-run that
+                        # dies below the seam reads as "no model work THIS dispatch" and
+                        # blocks for infra triage instead of climbing the tier ladder.
                         result = await coder_seam.dispatch_coder_tapped(
-                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None,
+                            new_dispatch=True,
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
                         files_to_modify = feature.get("files_to_modify") or []

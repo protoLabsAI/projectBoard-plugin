@@ -144,9 +144,9 @@ def test_dispatch_reached_model_ignores_a_prior_dispatchs_activity():
     coder_seam.progress_thought("f", 2, "thinking about the fix")
     assert coder_seam.dispatch_reached_model("f") is True  # that dispatch did reach
     # Later dispatch: re-run gen 1 (keep-worktree) with NO progress_new_run — the stale
-    # gens 1 & 2 survive for the drawer. The seam throws before a first token, so the
-    # fresh gen 1 has no activity of its own.
-    coder_seam.progress_begin("f", 1, "reasoning")
+    # gens 1 & 2 survive for the drawer. new_dispatch opens a fresh epoch; the seam throws
+    # before a first token, so the fresh gen 1 has no activity of its own.
+    coder_seam.progress_begin("f", 1, "reasoning", new_dispatch=True)
     assert coder_seam.dispatch_reached_model("f") is False  # scoped to the current run
 
 
@@ -158,9 +158,40 @@ def test_dispatch_reached_model_true_when_the_re_dispatch_itself_streams():
     coder_seam.progress_new_run("f")
     coder_seam.progress_begin("f", 1, "smart")
     coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t1", "name": "edit_file"})
-    coder_seam.progress_begin("f", 1, "reasoning")  # keep-worktree re-run, new epoch
+    coder_seam.progress_begin("f", 1, "reasoning", new_dispatch=True)  # keep-worktree re-run, new epoch
     coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t2", "name": "edit_file"})
     assert coder_seam.dispatch_reached_model("f") is True
+
+
+def test_dispatch_reached_model_re_dispatch_fan_out_shares_one_epoch():
+    """The review finding on the first cut: a re-dispatch that FANS OUT to gen numbers
+    retained from the prior dispatch must put ALL its siblings on ONE epoch, so activity
+    from an earlier sibling of the SAME current dispatch still counts. The first cut
+    inferred the epoch per-gen and bumped EACH retained gen independently (gen 1→epoch 1,
+    gen 2→epoch 2), so ``dispatch_reached_model`` saw only the last gen and misread a
+    later pre-model failure as infra even though an earlier sibling reached the model.
+
+    With the explicit ``new_dispatch`` flag only the FIRST gen opens the epoch; its
+    siblings join it — so the re-dispatch's model work is seen as one dispatch."""
+    coder_seam._progress.clear()
+    # Prior dispatch reached the model on a solve/max-mode fan-out (gens 1 & 2), then ended.
+    coder_seam.progress_new_run("f")
+    coder_seam.progress_begin("f", 1, "smart")
+    coder_seam.progress_begin("f", 2, "smart")
+    coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t1", "name": "edit_file"})
+    coder_seam.progress_end("f", 1)
+    coder_seam.progress_end("f", 2)
+    # Keep-worktree re-dispatch re-fans-out to gens 1 & 2 (NO progress_new_run). Only the
+    # FIRST gen carries new_dispatch; the sibling joins the epoch it opened.
+    coder_seam.progress_begin("f", 1, "reasoning", new_dispatch=True)
+    coder_seam.progress_begin("f", 2, "reasoning")  # sibling of the SAME re-dispatch
+    # gen 1 streams a token; gen 2 fails pre-model. Because both share this dispatch's
+    # epoch, gen 1's activity answers for the dispatch — it reached the model.
+    coder_seam.progress_tool("f", 1, {"phase": "start", "id": "t2", "name": "edit_file"})
+    assert coder_seam.dispatch_reached_model("f") is True
+    # And the two fresh siblings share ONE epoch — not one-per-gen.
+    gens = coder_seam._progress["f"]
+    assert gens[1].run == gens[2].run
 
 
 def test_registry_evicts_the_oldest_features_beyond_the_cap():
