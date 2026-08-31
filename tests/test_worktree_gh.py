@@ -30,12 +30,15 @@ every push, the paths the loop actually opens PRs from.
 The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for_branch``,
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
 ``read_review_status``, ``_find_marked_comment``, ``post_or_update_pr_comment``, ``merge_pr``.
-Reads use the pinned fixture. The only writes are (1) ONE idempotent commit status keyed on a
-STABLE disposable ``(context, sha)`` and (2) ONE idempotent marked PR comment updated in place
-— both bounded so a reconcile/retry never stacks duplicates (r4). ``merge_pr`` is exercised
-with a DELIBERATELY wrong ``expected_head`` so GitHub refuses it atomically: the seam runs for
-real (on every path, under a token that cannot merge), its ``--match-head-commit`` head-pin is
-proven, and the permanently-open fixture is never merged (r5).
+Reads use the pinned fixture. The only writes are (1) EXACTLY ONE commit status per run, keyed
+on a STABLE disposable ``(context, sha)`` — GitHub records each POST as a new immutable entry
+(the combined-status rollup, which the review gate reads, reports only the latest per context),
+so the tier posts once and never re-posts to "prove idempotency", keeping the fixture head well
+clear of GitHub's 1000-per-(sha, context) cap — and (2) ONE marked PR comment, updated in place
+on a re-post via its hidden marker so a reconcile/retry never stacks a duplicate (r4).
+``merge_pr`` is exercised with a DELIBERATELY wrong ``expected_head`` so GitHub refuses it
+atomically: the seam runs for real (on every path, under a token that cannot merge), its
+``--match-head-commit`` head-pin is proven, and the permanently-open fixture is never merged (r5).
 """
 
 from __future__ import annotations
@@ -165,12 +168,18 @@ async def test_pr_url_for_branch_finds_the_fixture_pr(gh_fixture):
 async def test_pr_merge_info_reports_a_well_typed_shape(gh_fixture):
     """``pr_merge_info`` reads ``{mergeStateStatus, isDraft}`` off ONE ``gh pr view`` — the
     merge-relevant facts the auto-merge/rebase edges consume. Against real GitHub it must parse
-    to exactly those keys with the documented types; the fixture is a ready (non-draft) PR, so
-    ``isDraft`` is never ``True``."""
+    to exactly those keys with the documented types (``mergeStateStatus`` a str, ``isDraft`` a
+    ``bool`` or ``None``).
+
+    It does NOT assert non-draft: the fixture contract (``gh_fixture``) requires the PR to be
+    OPEN, not ready — a maintainer-pinned fixture or the PR-under-test may legitimately be an
+    OPEN draft, so ``isDraft=True`` is a VALID value the seam must report faithfully, not one to
+    reject. This test pins the shape/types the edges rely on; whether the fixture is a draft is
+    the fixture's business, not this seam's."""
     info = await worktree.pr_merge_info(gh_fixture.url, cwd=gh_fixture.repo_dir)
     assert set(info) == {"mergeStateStatus", "isDraft"}
     assert isinstance(info["mergeStateStatus"], str)
-    assert info["isDraft"] in (False, None)
+    assert isinstance(info["isDraft"], bool) or info["isDraft"] is None
 
 
 # ── pr_diff ─────────────────────────────────────────────────────────────────────────────
@@ -215,40 +224,44 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
     ``read_review_status`` reads it back off the head-scoped combined-status endpoint. This is the
     exact capability #354 proved a mock cannot validate.
 
-    Idempotent (r4): the status is keyed by ``(context, sha)``, so a second identical post
-    SUPERSEDES rather than stacks; both land True and the readback promotes ``passed`` for a
-    ``success`` state.
+    EXACTLY ONE post per run (r4): GitHub records every status POST as a NEW immutable entry — a
+    re-post is not an in-place update; only the combined-status ROLLUP reports the latest per
+    context — and the permanently-open fixture's head is stable, so posting twice to "prove
+    idempotency" would accrue two records every run toward GitHub's 1000-per-(sha, context) cap.
+    The idempotency that matters here is that the write is CONSTRAINED to one STABLE disposable
+    ``(context, sha)``: it never sprawls new contexts, and the rollup the review gate reads is
+    latest-per-context — so a single post + readback IS the whole capability proof, and repeated
+    CI runs converge on one live signal rather than accumulating distinct ones.
 
-    Head-safe (r5/#328): an EMPTY head posts nothing (no verdict against a head the gate never
-    examined) and reads back ``None`` — without shelling gh."""
+    Head-safe (r5/#328): the readback is scoped by the commit in its URL, so the verdict recorded
+    for the fixture head is NEVER attributed to a DIFFERENT head — a wrong (but well-formed) sha
+    reads back ``None`` even though the same context IS present on the true head. An EMPTY head
+    posts nothing (no verdict against a head the gate never examined) and reads back ``None`` —
+    without shelling gh."""
     slug, head, cwd = gh_fixture.slug, gh_fixture.head_sha, gh_fixture.repo_dir
 
     ok = await worktree.post_review_status(
         slug,
         head,
         state="success",
-        description="requires_gh tier probe (idempotent)",
+        description="requires_gh tier probe (stable disposable context)",
         target_url=gh_fixture.url,
         context=TEST_STATUS_CONTEXT,
         cwd=cwd,
     )
     assert ok is True
-    # Re-post the same (context, sha): supersedes in place, never a duplicate record.
-    ok_again = await worktree.post_review_status(
-        slug,
-        head,
-        state="success",
-        description="requires_gh tier probe (idempotent)",
-        target_url=gh_fixture.url,
-        context=TEST_STATUS_CONTEXT,
-        cwd=cwd,
-    )
-    assert ok_again is True
 
     read = await worktree.read_review_status(slug, head, context=TEST_STATUS_CONTEXT, cwd=cwd)
     assert read == {"state": "success", "head_sha": head, "passed": True}
 
-    # Head-safe skips: an unknown head neither posts nor reads a verdict.
+    # Head-identity (r5), reusing the single write above: the verdict is present on the TRUE head,
+    # yet a DIFFERENT well-formed head reads back None — the status is scoped by the commit in its
+    # URL (no status at that sha, or the commit doesn't exist → gh errors) and is never attributed
+    # to a moved head. No extra POST, so nothing else accumulates on the fixture.
+    wrong = _different_sha(head)
+    assert await worktree.read_review_status(slug, wrong, context=TEST_STATUS_CONTEXT, cwd=cwd) is None
+
+    # Head-safe skips: an unknown head neither posts nor reads a verdict (no gh shelled).
     assert (
         await worktree.post_review_status(
             slug, "", state="success", description="x", context=TEST_STATUS_CONTEXT, cwd=cwd
@@ -256,27 +269,6 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
         is False
     )
     assert await worktree.read_review_status(slug, "", context=TEST_STATUS_CONTEXT, cwd=cwd) is None
-
-
-@requires_gh_write
-async def test_review_status_read_fails_closed_on_a_head_it_never_examined(gh_fixture):
-    """r5, the head-identity invariant against real GitHub: ``read_review_status`` is scoped by the
-    commit in its URL, so a verdict recorded for the fixture head must NEVER be attributed to a
-    DIFFERENT head. Reading a sha that is not the fixture head returns ``None`` (no ``QA panel``/
-    test-context status exists there, or the commit does not exist → gh errors → fail closed),
-    even though the same context IS present on the real head."""
-    slug, cwd = gh_fixture.slug, gh_fixture.repo_dir
-    # Ensure the status really exists on the true head, so a naive read would find *something*.
-    await worktree.post_review_status(
-        slug,
-        gh_fixture.head_sha,
-        state="success",
-        description="requires_gh tier probe",
-        context=TEST_STATUS_CONTEXT,
-        cwd=cwd,
-    )
-    wrong = _different_sha(gh_fixture.head_sha)
-    assert await worktree.read_review_status(slug, wrong, context=TEST_STATUS_CONTEXT, cwd=cwd) is None
 
 
 # ── _find_marked_comment + post_or_update_pr_comment (the marked-comment write) ─────────
