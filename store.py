@@ -2813,6 +2813,14 @@ NEXT_ACTION_DRAFT = "draft (run `gh pr ready`)"
 # board_list(with_ci=True) stamped a red rollup on the row: "merge #N" on a red PR is
 # the wrong hint — the CI bounce / a fix is what moves it, not a merge.
 NEXT_ACTION_CI_FAILING = "ci failing"
+# #347: a coding card the review gate BOUNCED (changes-requested) is requeued out of
+# in_review to be re-driven — so `merge_posture` (in_review-only) projects nothing and
+# the card read `-` for the whole active fix round, exactly when the PM most needs to
+# know a fix is in flight. Its own next_action makes that round explicit; the coder is
+# re-driving off the findings on the bead. The `changes-requested` label rides the
+# requeue (set_review_substate never dropped it) — it is cleared only when the re-review
+# re-arms to `review-pending`, so this fires precisely while the fix round is live.
+NEXT_ACTION_FIXING_REVIEW = "fixing review findings"
 
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
 
@@ -2996,6 +3004,33 @@ def task_posture(feature: dict, *, is_driven) -> dict:
     return out
 
 
+def review_fix_posture(feature: dict) -> dict:
+    """The active-review-fix sibling of ``task_posture`` (#347). Returns the SAME
+    ``{"next_action", "awaiting_merge", "next_action_hint"}`` shape, all-empty except for a
+    CODING card the review gate bounced and requeued — ``ready`` / ``in_progress`` (the
+    re-drive window), NOT blocked, carrying the ``changes-requested`` label that rode the
+    requeue. It reads ``fixing review findings`` with a hint pointing at the bead's
+    findings, so the PM sees a live fix round instead of ``-`` (``merge_posture`` covers
+    ONLY in_review, and the card left in_review when it bounced).
+
+    Empty (no posture) for everything else: an in_review card (``merge_posture``'s lane),
+    a task-type bead (``task_posture``'s), a blocked card (its own posture wins), and any
+    card without ``changes-requested`` (never bounced, or already re-armed to review-pending
+    → back in_review). Labels + state only, no per-row network."""
+    out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    if feature.get("issue_type") == LABEL_TASK or feature.get("blocked"):
+        return out
+    if feature.get("board_state") not in ("ready", "in_progress"):
+        return out
+    if LABEL_CHANGES_REQUESTED not in set(feature.get("labels") or []):
+        return out
+    out["next_action"] = NEXT_ACTION_FIXING_REVIEW
+    out["next_action_hint"] = (
+        "the review gate requested changes — the coder is re-driving the fix; see the review findings on the bead"
+    )
+    return out
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — an ``in_review`` card from the board's config
@@ -3039,6 +3074,10 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
             # #305: not an in_review card — the one other card that owes the PM a next
             # action is a parked task awaiting an out-of-band deliverable.
             posture = task_posture(f, is_driven=is_driven)
+            if not posture["next_action"]:
+                # #347: …or a coding card in an active review-fix round (bounced +
+                # requeued, changes-requested riding the requeue) — re-driving a fix.
+                posture = review_fix_posture(f)
             if not posture["next_action"]:
                 continue
         elif f.get("ci_status") == "failing" and posture["next_action"] in (

@@ -958,6 +958,112 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     return "failing", summary
 
 
+# The review gate publishes its verdict as ONE head-pinned check run of this name
+# (#347). It matches the ``QA panel`` check the review workflow itself has historically
+# posted as a side effect — so the loop UPDATES that single record rather than racing a
+# parallel status: the fix is making the post RELIABLE + head-safe, not opening a new
+# best-effort lane beside the existing one.
+REVIEW_CHECK_NAME = "QA panel"
+
+# GitHub's check-run conclusions (the merge-relevant ones the gate uses). An unknown
+# value is coerced to ``neutral`` so a caller typo can never make gh reject the POST and
+# drop the verdict entirely.
+_CHECK_CONCLUSIONS = frozenset(
+    {"success", "failure", "action_required", "neutral", "cancelled", "skipped", "stale", "timed_out"}
+)
+# GitHub caps ``output.summary`` at 65535 chars; stay well under so a large findings
+# block never makes the whole post fail.
+_CHECK_SUMMARY_MAX = 60000
+
+
+async def _existing_review_check_id(repo_slug: str, head_sha: str, name: str, *, cwd: str) -> str:
+    """The id of a check run of ``name`` ALREADY on ``head_sha`` — so a re-post UPDATES it
+    instead of stacking a duplicate (#347 idempotency). GitHub keys check runs by id, not
+    by ``(name, head)``, so a second create would otherwise leave two ``QA panel`` records
+    on the same commit. ``""`` when none exists, the lookup can't be read, or gh errors —
+    the caller then CREATEs. Never raises into the loop."""
+    try:
+        rc, out, _err = await _gh(
+            "api", f"/repos/{repo_slug}/commits/{head_sha}/check-runs", "--jq", ".check_runs", cwd=cwd
+        )
+    except WorktreeError:
+        return ""
+    if rc != 0 or not out.strip():
+        return ""
+    try:
+        runs = json.loads(out)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(runs, list):
+        return ""
+    for run in runs:
+        if isinstance(run, dict) and run.get("name") == name and run.get("id") is not None:
+            return str(run["id"])
+    return ""
+
+
+async def post_review_check(
+    repo_slug: str,
+    head_sha: str,
+    *,
+    conclusion: str,
+    title: str,
+    summary: str,
+    name: str = REVIEW_CHECK_NAME,
+    cwd: str = ".",
+) -> bool:
+    """Publish (or UPDATE) the in-loop review gate's verdict as a GitHub check run pinned
+    to ``head_sha`` — the merge-relevant fact made visible where the PR is reviewed
+    (#347). Returns True on a landed POST/PATCH, False otherwise; NEVER raises into the
+    loop (the bead comment stays the durable audit record).
+
+    Head-safe (#328): an empty ``repo_slug`` or ``head_sha`` means the head the gate
+    reviewed is unknown, so NOTHING is posted — a verdict must never land against a head
+    the gate did not examine. Idempotent (#347): a check run of ``name`` already on this
+    exact head is updated IN PLACE, so a reconcile/retry of the same verdict reconciles the
+    single record (and takes ownership of the review workflow's own ``QA panel`` check)
+    instead of confusing the PR with duplicate statuses. ``conclusion`` is one of
+    ``_CHECK_CONCLUSIONS`` (an unknown value degrades to ``neutral``)."""
+    if not repo_slug or not head_sha:
+        return False
+    if conclusion not in _CHECK_CONCLUSIONS:
+        conclusion = "neutral"
+    summary = (summary or "")[:_CHECK_SUMMARY_MAX]
+    existing = await _existing_review_check_id(repo_slug, head_sha, name, cwd=cwd)
+    # A check run's head_sha is immutable, so it rides only the CREATE; the UPDATE targets
+    # the existing run BY ID and re-states name/status/conclusion/output.
+    fields = [
+        "-f",
+        f"name={name}",
+        "-f",
+        "status=completed",
+        "-f",
+        f"conclusion={conclusion}",
+        "-f",
+        f"output[title]={title}",
+        "-f",
+        f"output[summary]={summary}",
+    ]
+    if existing:
+        args = ["api", "--method", "PATCH", f"/repos/{repo_slug}/check-runs/{existing}", *fields]
+    else:
+        args = ["api", "--method", "POST", f"/repos/{repo_slug}/check-runs", "-f", f"head_sha={head_sha}", *fields]
+    try:
+        rc, _out, err = await _gh(*args, cwd=cwd)
+    except WorktreeError as exc:
+        log.warning("[project_board] review check post timed out for %s@%s: %s", repo_slug, head_sha[:12], exc)
+        return False
+    if rc != 0:
+        log.warning(
+            "[project_board] review check post failed (%s@%s): %s",
+            repo_slug,
+            head_sha[:12],
+            (err or "").strip()[:200],
+        )
+        return False
+    return True
+
+
 async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
     """The URL of the PR whose head is ``branch``, or ``""`` if there is none — used
     by crash recovery to tell a feature that already opened a PR (and just needs

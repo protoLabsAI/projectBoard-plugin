@@ -23,11 +23,13 @@ from project_board import api, store
 from project_board.loop import BoardLoop
 from project_board.store import (
     NEXT_ACTION_AWAITING_DELIVERABLE,
+    NEXT_ACTION_FIXING_REVIEW,
     NEXT_ACTION_MERGED_VERIFY_EXHAUSTED,
     annotate_next_action,
     knob_bool,
     merge_posture,
     pr_number,
+    review_fix_posture,
     task_posture,
 )
 
@@ -230,6 +232,72 @@ async def test_loop_auto_merge_blockers_reuse_merge_posture(monkeypatch):
     why = await loop._auto_merge_blockers(None, _feat(labels=["review-pending"]), PR, "/repo")
     assert seen == [{"auto_merge": True, "review_gate": True}]
     assert why == ["review in progress / changes requested"]
+
+
+# ── review_fix_posture: the active review-fix round (#347) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "state, labels, blocked, want",
+    [
+        # bounced + requeued: `changes-requested` rode the requeue → an actionable action
+        ("ready", ["changes-requested"], False, NEXT_ACTION_FIXING_REVIEW),
+        ("in_progress", ["changes-requested"], False, NEXT_ACTION_FIXING_REVIEW),
+        # blocked wins (its own posture); an exhausted card is blocked, not fixing
+        ("in_progress", ["changes-requested"], True, ""),
+        # no changes-requested label → never bounced (or already re-armed to review-pending)
+        ("in_progress", [], False, ""),
+        ("ready", ["review-pending"], False, ""),
+        # in_review is merge_posture's lane, done/backlog owe no action here
+        ("in_review", ["changes-requested"], False, ""),
+        ("backlog", ["changes-requested"], False, ""),
+        ("done", ["changes-requested"], False, ""),
+    ],
+)
+def test_review_fix_posture_table(state, labels, blocked, want):
+    p = review_fix_posture(_feat(state=state, labels=labels, blocked=blocked))
+    assert p["next_action"] == want
+    assert p["awaiting_merge"] is False
+    if want:
+        assert "review gate requested changes" in p["next_action_hint"]
+    else:
+        assert p["next_action_hint"] == ""
+
+
+def test_review_fix_posture_never_fires_for_a_task():
+    """A task-type bead ships a deliverable, not a coder PR — its active-work signal is
+    task_posture, never the review-fix round (which is coding-PR only)."""
+    t = {**_task(state="in_progress"), "labels": ["changes-requested"]}
+    assert review_fix_posture(t)["next_action"] == ""
+
+
+def test_annotate_stamps_fixing_review_on_a_bounced_coding_card():
+    """r7 through the seam: a coding card the gate bounced (requeued to ready/in_progress
+    with `changes-requested`) reads `fixing review findings` instead of `-`, so the PM
+    sees a live fix round — while in_review / task / clean cards keep their own posture."""
+    rows = annotate_next_action(
+        [
+            _feat(state="in_progress", labels=["changes-requested"], fid="bd-fix"),
+            _feat(state="ready", labels=["changes-requested"], fid="bd-fix2"),
+            _feat(state="in_review", labels=["changes-requested"], fid="bd-inrev"),
+            _feat(state="ready", labels=[], fid="bd-plain"),
+        ],
+        {"auto_merge": False, "review_gate": True},
+    )
+    by = {r["id"]: r for r in rows}
+    assert by["bd-fix"]["next_action"] == NEXT_ACTION_FIXING_REVIEW and by["bd-fix"]["awaiting_merge"] is False
+    assert "review findings on the bead" in by["bd-fix"]["next_action_hint"]
+    assert by["bd-fix2"]["next_action"] == NEXT_ACTION_FIXING_REVIEW
+    assert by["bd-inrev"]["next_action"] == "changes requested"  # in_review → merge_posture's lane
+    # a plain ready card (never bounced) still owes no next action
+    assert not {"next_action", "awaiting_merge", "next_action_hint"} & set(by["bd-plain"])
+
+
+def test_board_page_chips_the_active_review_fix_round():
+    """#347: the active fix round has its own warning chip; the hint rides the tooltip."""
+    from project_board.board_view import BOARD_PAGE
+
+    assert '"fixing review findings": ["pl-badge--warning", "fixing review"],' in BOARD_PAGE
 
 
 # ── annotate_next_action: config spellings ──────────────────────────────────────

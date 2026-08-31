@@ -71,6 +71,9 @@ const NEXT_ACTION_CHIP = {
   "auto-merge pending": ["pl-badge--info", "auto-merge pending"],
   "review in progress": ["pl-badge--info", "review in progress"],
   "changes requested": ["pl-badge--warning", "changes requested"],
+  // #347: a coding card the review gate bounced is requeued out of in_review to be
+  // re-driven — its own chip so an active fix round reads explicitly, not as `-`.
+  "fixing review findings": ["pl-badge--warning", "fixing review"],
   "awaiting review verdict (no review-clean)": ["pl-badge--warning", "awaiting review verdict"],
   "merge-hold (operator veto)": ["", "merge-hold"],
   "draft (run `gh pr ready`)": ["pl-badge--warning", "draft"],
