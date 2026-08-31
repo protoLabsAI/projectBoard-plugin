@@ -1232,10 +1232,11 @@ class ReconcileMixin:
         ``changes-requested`` or ABSENT local review verdict to ``review-clean`` (#323) —
         the inbound counterpart of #347's head-pinned publish.
 
-        #347 makes the board's own gate verdict a reliable, head-pinned ``QA panel`` check
-        run. This reads that SAME check back (``worktree.read_review_check`` — the identity
-        plumbing, not a second parsed signal): when a PROMOTED PASS whose recorded immutable
-        head equals the LIVE PR head exists, the local review substate is repaired to
+        #354 makes the board's own gate verdict a reliable, head-pinned ``QA panel`` commit
+        STATUS (the PAT-compatible successor to #347's check run). This reads that SAME status
+        back (``worktree.read_review_status`` — the identity plumbing, not a second parsed
+        signal): when a PROMOTED PASS whose head-scoped status equals the LIVE PR head exists —
+        never promoting from ambiguous/untrusted data — the local review substate is repaired to
         ``review-clean`` so the ordinary merged-state / CI / auto-merge gates decide the
         rest. It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a
         blocking state to clean (never manufactures a blocking one).
@@ -1278,10 +1279,10 @@ class ReconcileMixin:
         _number, repo_slug = _parse_pr_url(pr_url)
         if not repo_slug:
             return False  # no repo identity → fail closed
-        verdict = await worktree.read_review_check(repo_slug, head, cwd=repo)
+        verdict = await worktree.read_review_status(repo_slug, head, cwd=repo)
         if verdict is None:
-            # Unreadable / absent / malformed / ambiguous / another-head marker → fail closed,
-            # leaving the card unpromoted (r3).
+            # Unreadable / absent / malformed / ambiguous / another-head status → fail closed,
+            # leaving the card unpromoted (#354 r5). Never promotes from ambiguous/untrusted data.
             return False
         if not verdict.get("passed"):
             # A trusted, current-head FAIL is authoritative the OTHER way: it must never
@@ -1290,7 +1291,7 @@ class ReconcileMixin:
                 "[project_board] %s trusted QA verdict for current head %s is %s — not promoting (fail closed): %s",
                 fid,
                 head[:12],
-                verdict.get("conclusion"),
+                verdict.get("state"),
                 pr_url,
             )
             return False
@@ -1306,7 +1307,7 @@ class ReconcileMixin:
         # gate declines, and the card goes back for review. There is nothing to lose a race
         # to, and nothing to undo.
         note = (
-            f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('conclusion')}) is promoted for "
+            f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('state')}) is promoted for "
             f"PR head {head[:12]} — "
             + ("the stale changes-requested verdict" if stale_rejection else "no local review verdict was recorded")
             + " has been repaired to review-clean, PINNED to that head; the ordinary merge gates decide the rest"
@@ -1327,43 +1328,72 @@ class ReconcileMixin:
         )
         return True
 
-    async def _publish_gate_check(
-        self, fid: str, pr_url: str, repo: str, head_sha: str, *, conclusion: str, title: str, summary: str
+    async def _publish_gate_verdict(
+        self,
+        fid: str,
+        pr_url: str,
+        repo: str,
+        head_sha: str,
+        *,
+        state: str,
+        description: str,
+        comment: str = "",
     ) -> None:
-        """Publish the in-loop review-gate verdict as the head-pinned ``QA panel`` GitHub
-        check run (#347) — the merge-relevant fact made visible where the PR is reviewed.
+        """Publish the in-loop review-gate verdict where the PR is reviewed — a PAT-compatible
+        COMMIT STATUS (#354), replacing #347's check run. ``POST /repos/{slug}/statuses/{sha}``
+        succeeds under the board's user/PAT ``gh`` token; #347's ``POST /check-runs`` needs a
+        GitHub App installation token and 403s here ("You must authenticate via a GitHub App"),
+        so it never actually published. The status is a ``QA panel`` context (the same historic
+        name), one of success/failure/pending, a concise <=140-char ``description``, and the PR
+        link as the stable ``target_url``.
+
         Pinned to ``head_sha``, the IMMUTABLE head the gate actually reviewed (#328,
         ``reviewed_head`` read BEFORE the panel): an unknown head (gh couldn't read it, so
-        ``head_sha`` is empty) posts NOTHING, so a verdict never lands against a head the
-        gate did not see. Best-effort — the bead comment stays the durable audit record —
-        but keyed + idempotent (``worktree.post_review_check`` updates the single record in
-        place) so a reconcile/retry reconciles one status instead of stacking duplicates.
+        ``head_sha`` is empty) posts NOTHING — a verdict never lands against a head the gate did
+        not see. That missing-head skip is logged DISTINCTLY from a publication permission/API
+        refusal (#354 r7): the refusal surfaces from ``worktree.post_review_status`` itself.
 
-        Runs on EVERY verdict — clean, changes-requested, and the exhausted block — so the
-        historic inconsistency (the ``QA panel`` check appearing only when the review
-        workflow happened to post it as a side effect) is replaced by the loop reliably
-        publishing/updating that same check off the verdict it actually computed."""
+        For a BLOCKING verdict, ``comment`` carries the full actionable findings — posted/updated
+        as ONE board-authored PR comment (``worktree.post_or_update_pr_comment``, idempotent per
+        PR) so the human sees the rationale GitHub-side, not just the terse status line. The bead
+        comment stays the durable audit record throughout; a status/comment failure is best-effort
+        and never breaks the landed verdict."""
         if not head_sha:
-            log.info(
-                "[project_board] %s review verdict not published as a check — reviewed head unknown (#328 fail-closed)",
-                fid,
-            )
+            # Unreadable/no head SHA — a MISSING-HEAD skip (#354 r7), distinct from a permission
+            # refusal: there is nothing to pin to, so neither status nor comment is published.
+            log.info("[project_board] %s review verdict not published — reviewed head unknown (#328 fail-closed)", fid)
             return
         _number, repo_slug = _parse_pr_url(pr_url)
         if not repo_slug:
-            log.info("[project_board] %s review verdict not published as a check — no repo slug from %s", fid, pr_url)
+            log.info("[project_board] %s review verdict not published — no repo slug from %s", fid, pr_url)
             return
         try:
-            ok = await worktree.post_review_check(
-                repo_slug, head_sha, conclusion=conclusion, title=title, summary=summary, cwd=repo
+            ok = await worktree.post_review_status(
+                repo_slug, head_sha, state=state, description=description, target_url=pr_url, cwd=repo
             )
-        except Exception as exc:  # noqa: BLE001 — a check post must never break the landed verdict
-            log.warning("[project_board] %s review check post raised (verdict still on the bead): %s", fid, exc)
-            return
+        except Exception as exc:  # noqa: BLE001 — a status post must never break the landed verdict
+            log.warning("[project_board] %s review status post raised (verdict still on the bead): %s", fid, exc)
+            ok = False
         if not ok:
             log.warning(
-                "[project_board] %s review check not posted (gh failed / no head) — verdict rides the bead comment", fid
+                "[project_board] %s review status not posted (gh permission/API refusal) — verdict rides the bead "
+                "comment",
+                fid,
             )
+        # Blocking verdicts also carry the full findings to the PR as one idempotent comment, so
+        # the human sees the actionable rationale beside the non-success status (#354 r2).
+        if comment:
+            try:
+                posted = await worktree.post_or_update_pr_comment(pr_url, comment, cwd=repo)
+            except Exception as exc:  # noqa: BLE001 — the PR comment must never break the verdict
+                log.warning(
+                    "[project_board] %s review PR-comment post raised (findings still on the bead): %s", fid, exc
+                )
+                posted = False
+            if not posted:
+                log.warning(
+                    "[project_board] %s review findings not posted to the PR (gh failure) — findings ride the bead", fid
+                )
 
     # ── blocking review gate (plan M5) ────────────────────────────────────────
     async def _review_gate(self, store, fid: str, pr_url: str, repo: str) -> None:
@@ -1409,6 +1439,12 @@ class ReconcileMixin:
         # the stamp stays at the reviewed head and the next reconcile re-arms. "" when gh
         # can't be read → the verdict lands UNSTAMPED and the reconcile fails closed on it.
         reviewed_head = await worktree.pr_head_sha(pr_url, cwd=repo)
+        # Show a live ``QA panel`` PENDING status on the reviewed head while the gate runs
+        # (#354) — a fail-closed yellow the merge edge won't cross, resolved to success/failure
+        # below. No PR comment for pending (only the terminal blocking verdict carries findings).
+        await self._publish_gate_verdict(
+            fid, pr_url, repo, reviewed_head, state="pending", description="Review gate running…"
+        )
         output, why = await self._run_review_workflow(fid, pr_url)
         if output is None:
             # Could not review — ``why`` names the actual cause (#180: no runner +
@@ -1479,20 +1515,17 @@ class ReconcileMixin:
             # stale against a dead head — an absent stamp fails the reconcile CLOSED (#328).
             await self._stamp_reviewed_head(store, fid, "")
             await self._budget_reset(store, fid, "review-fix")
-            # r4: the clean verdict is a passing gate ON THE HEAD IT REVIEWED (#347). The
-            # stamp is cleared (a clean verdict pins no head for the reconcile), but the
-            # check must land against the exact reviewed head — the full sha, not "".
-            await self._publish_gate_check(
+            # r1: the clean verdict is a passing gate ON THE HEAD IT REVIEWED (#354). The
+            # stamp is cleared (a clean verdict pins no head for the reconcile), but the status
+            # must land against the exact reviewed head — the full sha, not "". No PR comment on
+            # a clean verdict (only the success status); the bead carries the audit note.
+            await self._publish_gate_verdict(
                 fid,
                 pr_url,
                 repo,
                 reviewed_head,
-                conclusion="success",
-                title="Review gate: clean",
-                summary=(
-                    f"The in-loop review gate found no blocking findings "
-                    f"({len(findings)} finding(s), none blocker/major).\n\n{pr_url}"
-                ),
+                state="success",
+                description=f"Review gate clean — {len(findings)} finding(s), none blocking",
             )
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
             return
@@ -1512,17 +1545,17 @@ class ReconcileMixin:
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             await self._budget_reset(store, fid, "review-fix")
-            # r3: a blocking verdict is a non-success gate carrying the surviving findings
-            # (#347). The exhausted round is terminal (a human owns it now), so `failure`,
-            # with the findings + the PR link as the durable actionable reference.
-            await self._publish_gate_check(
+            # r2: a blocking verdict is a NON-success status carrying the surviving findings to
+            # the PR as a comment (#354). The exhausted round is terminal (a human owns it now),
+            # so `failure`, and the findings comment names the persistence + the PR reference.
+            await self._publish_gate_verdict(
                 fid,
                 pr_url,
                 repo,
                 reviewed_head,
-                conclusion="failure",
-                title="Review gate: changes required",
-                summary=f"{rendered}\n\nThese findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
+                state="failure",
+                description=f"Review gate: {len(blocking)} finding(s) persist after {n} fix attempt(s) — needs human review",
+                comment=f"{rendered}\n\nThese findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
             )
             log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
             return
@@ -1541,17 +1574,17 @@ class ReconcileMixin:
         # unchanged head keeps matching this stamp and stays rejected. Empty (unreadable
         # head) writes no stamp → the reconcile fails closed on it, never re-arming blind.
         await self._stamp_reviewed_head(store, fid, reviewed_head[:_REVIEWED_HEAD_SHA_LEN] if reviewed_head else "")
-        # r3: publish the blocking verdict against the reviewed head as a non-success check
-        # (#347) — `action_required` (vs the exhausted `failure`): a fix round is active,
-        # the coder is re-driving. The full reviewed head, not the truncated stamp.
-        await self._publish_gate_check(
+        # r2: publish the blocking verdict against the reviewed head as a NON-success status
+        # (#354) with the surviving findings posted to the PR as a comment — a fix round is
+        # active, the coder is re-driving. The full reviewed head, not the truncated stamp.
+        await self._publish_gate_verdict(
             fid,
             pr_url,
             repo,
             reviewed_head,
-            conclusion="action_required",
-            title="Review gate: changes requested",
-            summary=f"{rendered}\n\nThe coder is re-driving a fix for these findings.\n\n{pr_url}",
+            state="failure",
+            description=f"Review gate: {len(blocking)} blocking finding(s) — a fix round is in progress",
+            comment=f"{rendered}\n\nThe coder is re-driving a fix for these findings.\n\n{pr_url}",
         )
         await asyncio.to_thread(store.requeue, fid)
         log.info(

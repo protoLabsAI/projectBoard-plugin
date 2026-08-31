@@ -5434,27 +5434,52 @@ def _no_real_read_review_check(monkeypatch):
     monkeypatch.setattr(worktree, "read_review_check", _none)
 
 
-def _record_review_checks(monkeypatch):
-    """Install a recorder over ``worktree.post_review_check`` and return the list it
-    appends each call's kwargs (+ positional slug/head) to — the seam the #347 gate tests
-    assert against without a real ``gh``."""
-    posts: list[dict] = []
+@pytest.fixture(autouse=True)
+def _no_real_review_status_seam(monkeypatch):
+    """#354: the gate now publishes via ``worktree.post_review_status`` + a findings PR comment
+    (``post_or_update_pr_comment``) and the reconcile reads back ``worktree.read_review_status``.
+    Pin all three to fail-closed / no-op defaults so no gate/reconcile test shells a real
+    ``gh api`` — a test that asserts the new seam installs its own recorder. Mirrors the
+    ``_no_real_post_review_check`` / ``_no_real_read_review_check`` guards above."""
 
-    async def _rec(repo_slug, head_sha, *, conclusion, title, summary, name="QA panel", cwd="."):
-        posts.append(
+    async def _ok(*a, **k):
+        return True
+
+    async def _none(*a, **k):
+        return None
+
+    monkeypatch.setattr(worktree, "post_review_status", _ok)
+    monkeypatch.setattr(worktree, "post_or_update_pr_comment", _ok)
+    monkeypatch.setattr(worktree, "read_review_status", _none)
+
+
+def _record_review_statuses(monkeypatch):
+    """Install recorders over the #354 publication seam — ``worktree.post_review_status`` (the
+    commit status) and ``worktree.post_or_update_pr_comment`` (the findings comment) — and return
+    ``(statuses, comments)``, the lists the gate tests assert against without a real ``gh``."""
+    statuses: list[dict] = []
+    comments: list[dict] = []
+
+    async def _status(repo_slug, head_sha, *, state, description, target_url="", context="QA panel", cwd="."):
+        statuses.append(
             {
                 "repo_slug": repo_slug,
                 "head_sha": head_sha,
-                "conclusion": conclusion,
-                "title": title,
-                "summary": summary,
-                "name": name,
+                "state": state,
+                "description": description,
+                "target_url": target_url,
+                "context": context,
             }
         )
         return True
 
-    monkeypatch.setattr(worktree, "post_review_check", _rec)
-    return posts
+    async def _comment(pr_url, body, *, marker=worktree.REVIEW_COMMENT_MARKER, cwd="."):
+        comments.append({"pr_url": pr_url, "body": body})
+        return True
+
+    monkeypatch.setattr(worktree, "post_review_status", _status)
+    monkeypatch.setattr(worktree, "post_or_update_pr_comment", _comment)
+    return statuses, comments
 
 
 def _gate_loop(monkeypatch, output, cfg=None):
@@ -5803,7 +5828,7 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     assert "drops data" in seen_inputs[1]["prior_findings"]
 
 
-# ── #347: publish the in-loop gate verdict as a head-pinned `QA panel` check run ──
+# ── #354: publish the in-loop gate verdict as a PAT-compatible `QA panel` commit status ──
 
 
 _FULL_HEAD = "0123456789abcdef0123456789abcdef01234567"  # a real 40-char sha
@@ -5816,88 +5841,91 @@ def _head_returning(sha):
     return _head
 
 
-async def test_gate_publishes_a_success_check_on_the_reviewed_head_when_clean(monkeypatch):
-    """r1/r4: a CLEAN verdict publishes a `QA panel` check with a success conclusion,
-    pinned to the EXACT reviewed head (the full sha — even though the reconcile stamp is
-    cleared for a clean verdict, the check must land on the head the gate examined)."""
+async def test_gate_publishes_a_success_status_on_the_reviewed_head_when_clean(monkeypatch):
+    """r1: a CLEAN verdict publishes a `QA panel` COMMIT STATUS with a success state, pinned to
+    the EXACT reviewed head (the full sha — the reconcile stamp is cleared for a clean verdict,
+    but the status must land on the head the gate examined), with the PR as the target url and no
+    findings comment. A `pending` status is published first (while the gate runs), then success."""
     _inject_fake_findings(monkeypatch)
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
-    posts = _record_review_checks(monkeypatch)
+    statuses, comments = _record_review_statuses(monkeypatch)
     store = _GateStore()
     loop = _gate_loop(monkeypatch, "clean.\n```json\n[]\n```")
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert store.review_states[-1][0] == "review-clean"
-    assert len(posts) == 1
-    (post,) = posts
-    assert post["conclusion"] == "success"
-    assert post["head_sha"] == _FULL_HEAD  # full immutable head, not the 12-char stamp
-    assert post["repo_slug"] == "o/r" and post["name"] == "QA panel"
+    assert [s["state"] for s in statuses] == ["pending", "success"]  # live-then-resolved
+    final = statuses[-1]
+    assert final["head_sha"] == _FULL_HEAD  # full immutable head, not the 12-char stamp
+    assert final["repo_slug"] == "o/r" and final["context"] == "QA panel"
+    assert final["target_url"] == "https://github.com/o/r/pull/9"
+    assert comments == []  # a clean verdict posts no findings comment
 
 
-async def test_gate_publishes_a_nonsuccess_check_with_findings_when_blocking(monkeypatch):
-    """r1/r3: a BLOCKING verdict publishes a NON-success check whose summary carries the
-    surviving blocking findings + a durable PR reference, pinned to the reviewed head."""
+async def test_gate_publishes_a_nonsuccess_status_and_findings_comment_when_blocking(monkeypatch):
+    """r2: a BLOCKING verdict publishes a NON-success status pinned to the reviewed head AND
+    posts a PR comment carrying the surviving blocking findings + a durable PR reference."""
     _inject_fake_findings(monkeypatch)
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
-    posts = _record_review_checks(monkeypatch)
+    statuses, comments = _record_review_statuses(monkeypatch)
     store = _GateStore()
     loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert ("requeue", "bd-1") in store.calls  # the fix round is active
-    assert len(posts) == 1
-    (post,) = posts
-    assert post["conclusion"] != "success"  # a blocking result is a non-success gate
-    assert post["head_sha"] == _FULL_HEAD
-    assert "drops data" in post["summary"]  # the surviving blocking finding
-    assert "github.com/o/r/pull/9" in post["summary"]  # a durable reference to it
+    final = statuses[-1]
+    assert final["state"] != "success"  # a blocking result is a non-success status
+    assert final["head_sha"] == _FULL_HEAD
+    assert len(comments) == 1
+    (comment,) = comments
+    assert "drops data" in comment["body"]  # the surviving blocking finding, in full
+    assert "github.com/o/r/pull/9" in comment["body"]  # a durable reference to it
 
 
-async def test_gate_publishes_a_failure_check_when_the_fix_budget_is_exhausted(monkeypatch):
-    """r3: the terminal (budget-exhausted) block also publishes a non-success check with
-    the persisting findings — a human owns it, and the PR shows why."""
+async def test_gate_publishes_a_failure_status_and_findings_comment_when_the_budget_is_exhausted(monkeypatch):
+    """r2: the terminal (budget-exhausted) block publishes a `failure` status AND a findings PR
+    comment with the persisting findings — a human owns it, and the PR shows why."""
     _inject_fake_findings(monkeypatch)
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
-    posts = _record_review_checks(monkeypatch)
+    statuses, comments = _record_review_statuses(monkeypatch)
     store = _GateStore()
     loop = _gate_loop(monkeypatch, _BLOCKER, cfg={"review_fix_max": 1})
     loop._review_fix_attempts["bd-1"] = 1  # budget already spent → blocks this round
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert any(c[0] == "flag_blocked" for c in store.calls)
-    assert len(posts) == 1
-    (post,) = posts
-    assert post["conclusion"] == "failure"
-    assert post["head_sha"] == _FULL_HEAD
-    assert "drops data" in post["summary"] and "needs human review" in post["summary"]
+    final = statuses[-1]
+    assert final["state"] == "failure"
+    assert final["head_sha"] == _FULL_HEAD
+    assert len(comments) == 1
+    assert "drops data" in comments[0]["body"] and "needs human review" in comments[0]["body"]
 
 
-async def test_gate_posts_no_check_when_the_reviewed_head_is_unknown(monkeypatch):
-    """r2/r6: the historic inconsistency reproduced — when the immutable head can't be
-    read (the autouse `_no_real_pr_head_sha` returns ""), the gate posts NO check rather
-    than stamping a verdict against a head it cannot prove it reviewed. The verdict still
-    lands on the bead (the audit record), so the gate itself is unaffected."""
+async def test_gate_posts_no_status_when_the_reviewed_head_is_unknown(monkeypatch):
+    """r2/r7: when the immutable head can't be read (the autouse `_no_real_pr_head_sha` returns
+    ""), the gate posts NO status and NO comment — never a verdict against a head it cannot prove
+    it reviewed. The verdict still lands on the bead (the audit record)."""
     _inject_fake_findings(monkeypatch)
     # pr_head_sha stays the autouse blank ("") — the unreadable-head path.
-    posts = _record_review_checks(monkeypatch)
+    statuses, comments = _record_review_statuses(monkeypatch)
     store = _GateStore()
     loop = _gate_loop(monkeypatch, f"brief…\n```json\n{_BLOCKER}\n```")
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
     assert store.review_states[-1][0] == "changes-requested"  # the verdict still lands on the bead
-    assert posts == []  # …but NO check against a head the gate can't prove it saw
+    assert statuses == [] and comments == []  # …but nothing against a head the gate can't prove it saw
 
 
-async def test_gate_check_is_reconciled_not_duplicated_across_the_seam(monkeypatch):
-    """r5 at the loop seam: two identical clean verdicts on the same head each call the
-    idempotent poster (which updates the single record) — the loop never opens a second,
-    parallel posting path, so posting is driven only through `worktree.post_review_check`."""
+async def test_gate_status_is_reconciled_not_duplicated_across_the_seam(monkeypatch):
+    """r4 at the loop seam: two identical clean verdicts on the same head each call the
+    idempotent poster (which supersedes the single per-context status) — the loop never opens a
+    second, parallel posting path, so publication is driven only through `post_review_status`."""
     _inject_fake_findings(monkeypatch)
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(_FULL_HEAD))
-    posts = _record_review_checks(monkeypatch)
+    statuses, _comments = _record_review_statuses(monkeypatch)
     for _ in range(2):
         store = _GateStore()
         loop = _gate_loop(monkeypatch, "clean.\n```json\n[]\n```")
         await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/9", "/repo")
-    assert [p["head_sha"] for p in posts] == [_FULL_HEAD, _FULL_HEAD]
-    assert all(p["conclusion"] == "success" and p["name"] == "QA panel" for p in posts)
+    successes = [s for s in statuses if s["state"] == "success"]
+    assert [s["head_sha"] for s in successes] == [_FULL_HEAD, _FULL_HEAD]
+    assert all(s["context"] == "QA panel" for s in successes)
 
 
 # ── #328: re-arm the review gate after an external push stales the verdict ────────
@@ -6418,15 +6446,16 @@ _QA_PR = "https://github.com/o/r/pull/9"
 
 def _qa_loop(monkeypatch, *, head, verdict, cfg=None):
     """A review_gate loop whose live PR head is ``head`` and whose head-pinned QA read
-    (``worktree.read_review_check``) returns ``verdict`` (a dict or None) for that exact
-    head — the two worktree reads #323's inbound reconcile turns on."""
+    (``worktree.read_review_status`` — the PAT-compatible successor to the #347 check read)
+    returns ``verdict`` (a dict or None) for that exact head — the two worktree reads #323's
+    inbound reconcile turns on."""
     loop = BoardLoop({"review_gate": True, "merge_poll": False, **(cfg or {})})
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(head))
 
     async def _read(repo_slug, head_sha, *, cwd="."):
         return verdict if head_sha == head else None
 
-    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "read_review_status", _read)
     return loop
 
 
@@ -6436,7 +6465,7 @@ async def test_trusted_qa_pass_repairs_changes_requested_to_clean(monkeypatch):
     ADOPTS the external verdict — no internal review is invented."""
     store = _RoundTripStore()
     store.labels = ["changes-requested", "reviewed-head:aaa111"]
-    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"state": "success", "head_sha": "aaa111", "passed": True})
     feature = {"id": "bd-1", "labels": list(store.labels)}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
     assert "review-clean" in store.labels and "changes-requested" not in store.labels
@@ -6450,7 +6479,7 @@ async def test_trusted_qa_pass_repairs_absent_review_state_to_clean(monkeypatch)
     on a trusted current-head PASS."""
     store = _RoundTripStore()
     store.labels = []
-    loop = _qa_loop(monkeypatch, head="h1", verdict={"conclusion": "success", "head_sha": "h1", "passed": True})
+    loop = _qa_loop(monkeypatch, head="h1", verdict={"state": "success", "head_sha": "h1", "passed": True})
     assert await loop._reconcile_trusted_qa_pass(store, {"id": "bd-1", "labels": []}, _QA_PR, "/repo") is True
     assert "review-clean" in store.labels
 
@@ -6460,9 +6489,7 @@ async def test_trusted_qa_fail_never_promotes(monkeypatch):
     or clears the blocking ``changes-requested`` state."""
     store = _RoundTripStore()
     store.labels = ["changes-requested", "reviewed-head:aaa111"]
-    loop = _qa_loop(
-        monkeypatch, head="aaa111", verdict={"conclusion": "failure", "head_sha": "aaa111", "passed": False}
-    )
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"state": "failure", "head_sha": "aaa111", "passed": False})
     feature = {"id": "bd-1", "labels": list(store.labels)}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert store.labels == ["changes-requested", "reviewed-head:aaa111"]  # untouched
@@ -6471,7 +6498,7 @@ async def test_trusted_qa_fail_never_promotes(monkeypatch):
 
 async def test_trusted_qa_none_fails_closed(monkeypatch):
     """r3: an unreadable / absent / malformed / ambiguous / another-head marker — all of
-    which ``read_review_check`` collapses to None — leaves the card unpromoted. A PASS for
+    which ``read_review_status`` collapses to None — leaves the card unpromoted. A PASS for
     another head cannot alter review state (this is also the stale-head case: the live head
     moved, so there is no ``QA panel`` verdict for the current head)."""
     store = _RoundTripStore()
@@ -6494,9 +6521,9 @@ async def test_trusted_qa_fails_closed_on_an_unreadable_live_head(monkeypatch):
 
     async def _read(repo_slug, head_sha, *, cwd="."):
         consulted.append(head_sha)
-        return {"conclusion": "success", "head_sha": head_sha, "passed": True}
+        return {"state": "success", "head_sha": head_sha, "passed": True}
 
-    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "read_review_status", _read)
     feature = {"id": "bd-1", "labels": ["changes-requested"]}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert consulted == []  # short-circuited before reading the check
@@ -6506,7 +6533,7 @@ async def test_trusted_qa_pass_does_not_overwrite_an_in_flight_gate(monkeypatch)
     """r4: while the internal review gate is in flight (or a drive/worktree is live), the
     reconcile must NOT adopt an external PASS — the running gate owns the verdict it is about
     to land. Even a valid current-head PASS is skipped, under EACH liveness signal."""
-    verdict = {"conclusion": "success", "head_sha": "aaa111", "passed": True}
+    verdict = {"state": "success", "head_sha": "aaa111", "passed": True}
     # (a) the gate is mid-transition (its own set-changes-requested not yet requeued)
     store = _RoundTripStore()
     store.labels = ["changes-requested", "reviewed-head:aaa111"]
@@ -6527,7 +6554,7 @@ async def test_trusted_qa_reconcile_is_idempotent_on_a_pending_or_clean_card(mon
     """r4/r5: a ``review-pending`` card (the internal gate's LIVE verdict) is never touched,
     and a ``review-clean`` card is a no-op — repeated polls converge, they don't churn or
     overwrite the internal gate's own verdicts."""
-    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"state": "success", "head_sha": "aaa111", "passed": True})
     for existing in (["review-pending"], ["review-clean"]):
         store = _RoundTripStore()
         store.labels = list(existing)
@@ -6542,7 +6569,7 @@ async def test_trusted_qa_reconcile_is_a_noop_when_the_gate_is_off(monkeypatch):
     is inert (it never manufactures a review-clean the board never gated for)."""
     store = _RoundTripStore()
     store.labels = ["changes-requested"]
-    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"conclusion": "success", "head_sha": "aaa111", "passed": True})
+    loop = _qa_loop(monkeypatch, head="aaa111", verdict={"state": "success", "head_sha": "aaa111", "passed": True})
     loop.review_gate = False
     feature = {"id": "bd-1", "labels": ["changes-requested"]}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
@@ -6573,12 +6600,12 @@ async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_revie
 
     async def _read(repo_slug, head_sha, *, cwd="."):
         assert head_sha == "aaa111"  # the loop asks about the LIVE head
-        return {"conclusion": "success", "head_sha": head_sha, "passed": True}
+        return {"state": "success", "head_sha": head_sha, "passed": True}
 
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_head_sha", _head)
-    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "read_review_status", _read)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     await loop._reconcile_prs()
@@ -6611,7 +6638,7 @@ async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_t
         return "bbb222"  # an external push moved the head off the reviewed one
 
     async def _read(repo_slug, head_sha, *, cwd="."):
-        return {"conclusion": "success", "head_sha": head_sha, "passed": True}  # a PASS is available…
+        return {"state": "success", "head_sha": head_sha, "passed": True}  # a PASS is available…
 
     async def _diff(url, *, cwd=".", max_chars=4000):
         return "diff --git a/a.py b/a.py"
@@ -6619,7 +6646,7 @@ async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_t
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_head_sha", _head)
-    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "read_review_status", _read)
     monkeypatch.setattr(worktree, "pr_diff", _diff)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
@@ -6656,7 +6683,7 @@ def _automerge_reconcile_env(monkeypatch, *, head, verdict, mss="CLEAN"):
 
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_head_sha", _pr_head)
-    monkeypatch.setattr(worktree, "read_review_check", _read)
+    monkeypatch.setattr(worktree, "read_review_status", _read)
     monkeypatch.setattr(worktree, "pr_merge_info", _info)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
     monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
@@ -6672,7 +6699,7 @@ async def test_reconcile_promotes_then_auto_merges_a_trusted_current_head_pass(m
     store.labels = []  # absent verdict → #328/#340 never fire; auto-merge is held pre-promotion
     loop = BoardLoop({"review_gate": True, "auto_merge": True, "merge_poll": False})
     merges = _automerge_reconcile_env(
-        monkeypatch, head="h1", verdict={"conclusion": "success", "head_sha": "h1", "passed": True}
+        monkeypatch, head="h1", verdict={"state": "success", "head_sha": "h1", "passed": True}
     )
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
@@ -6684,7 +6711,7 @@ async def test_reconcile_promotes_then_auto_merges_a_trusted_current_head_pass(m
 
 
 async def test_reconcile_fail_closed_leaves_auto_merge_held(monkeypatch):
-    """r3 end-to-end: with no provable current-head verdict (``read_review_check`` → None),
+    """r3 end-to-end: with no provable current-head verdict (``read_review_status`` → None),
     the absent review substate is NOT repaired — auto-merge stays held on "no review-clean
     verdict" and the PR is never merged."""
     store = _RoundTripStore()
