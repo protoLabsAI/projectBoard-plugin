@@ -563,6 +563,56 @@ aborts nor forgets it, and flipping it back on never starts a second one.
 Both references are covered by `tests/test_docs_reference.py`, which fails if a route or
 tool is added, renamed or removed without the doc changing — so they are worth trusting.
 
+## External-seam coverage — REAL, EXEMPT, or honest debt
+
+A function whose whole job is to make an external system do something is close to untested
+when it is validated only against a mock of that system — that shape shipped three GREEN-
+but-inert fixes in one night (#353, #354, #356). `tests/test_external_seams.py` makes that
+gap impossible to add silently: every seam that shells `gh`/`git`/`br` is CLASSIFIED, by
+AST rather than by name, as **REAL** (exercised against the real binary/API in the
+integration tier), **EXEMPT: `<reason>`** (real coverage genuinely not warranted, reason
+stated), or **UNCOVERED** (honest debt) — and the UNCOVERED count is a ratchet that may
+fall, never rise.
+
+`worktree.py` reached its final contract over #361: **23 REAL / 3 EXEMPT / 0 UNCOVERED**
+(`MAX_UNCOVERED_WORKTREE = 0`). The 11 local-git seams run against a real bare-origin +
+clone (slice 1); the 12 read-dominant `gh` seams run against a pinned, permanently-open PR
+with `PB_REQUIRE_GH=1` so an absent credential FAILS rather than skips (slice 2).
+
+The remaining three are the **PR-lifecycle writes** — `open_pr`, `close_pr`,
+`_promote_adopted_draft` — classified **EXEMPT** (slice 3). Each mutates real PR lifecycle
+state (create a PR, close a PR, promote an adopted draft to ready), so a REAL tier could
+only run by creating and tearing down real PRs against a **disposable sandbox repository**,
+and the operator's decision is not to provision that sandbox now. This is a deliberately
+recorded gap, **not mock confidence** and **not an untested path**: these three run
+repeatedly in normal board operation — every delivery opens a PR, closes stale ones and
+promotes adopted drafts — so they ARE exercised in production. The residual weakness is the
+**feedback channel**: a regression surfaces as a blocked card / operator signal rather than
+red CI. They are never mocked into a false REAL, and no CI job creates, closes or promotes a
+PR in a production repository. If the sandbox is ever provisioned, these flip to REAL and the
+exemption disappears.
+
+Because an EXEMPT drops a seam from the ratchet, the exemption is **not taken on faith** —
+it is verified against the source. `test_external_seams.py` asserts by AST that each of the
+three EXEMPT seams really shells a *fixture-destroying* `gh pr` write (`create` / `close` /
+`ready`) — the mutations that would consume the pinned read fixture — and, symmetrically,
+that **no** REAL seam shells one. So a read cannot hide under EXEMPT to escape the ratchet,
+and a mock cannot be relabeled REAL while mutating a real PR: either would fail the suite
+loudly rather than leave the contract green. `merge_pr` stays REAL because branch protection
+*refuses* `gh pr merge` on the pinned PR, so it runs for real without consuming it.
+
+EXEMPT is also **not an escape *from* the ratchet** — it is a second ratchet.
+`MAX_EXEMPT_WORKTREE` may only *fall* (each write flips to REAL the day a disposable sandbox
+repo is provisioned), never rise, so a fourth EXEMPT can't be minted to make debt disappear.
+And the exemption is backed by an **executable escape hatch**:
+`tests/test_worktree_pr_lifecycle_sandbox.py` drives all three writes — create, promote-draft,
+close — against a *throwaway* sandbox repo through the real `gh`, dormant (skipped) only until
+the operator sets `PB_SANDBOX_REPO` (and `PB_REQUIRE_SANDBOX=1` to enforce it); it refuses to
+run against the checkout's own repo, so no CI job ever mutates a production PR. That test's
+presence and its coverage of each EXEMPT seam are themselves asserted by
+`test_external_seams.py` — so the recorded gap is one env var from closing, not a promise on
+paper, and a regression that stops a seam issuing its `gh pr` write fails the contract today.
+
 ## Layout
 
 | File | What |
