@@ -88,6 +88,12 @@ _MERGED_VERIFIED_SHA_LEN = 12
 # stays exact only when both sides use the same abbreviation).
 _REVIEWED_HEAD_SHA_LEN = 12
 
+# The title the review gate renders its blocking-findings block under (``_render_findings``)
+# and records on the bead alongside ``changes-requested`` (set_review_substate's ``note``).
+# The #340 recovery scans the comment history for this anchor to re-derive the fix feedback
+# a shutdown dropped from the in-memory ``_ci_feedback`` — so the two MUST stay in sync.
+_REVIEW_FINDINGS_TITLE = "Review findings (blocking)"
+
 # After this many consecutive failed reap attempts for the same worktree path, stop
 # logging at WARNING and downgrade to DEBUG to avoid log spam (e.g. 464 lines for
 # one stuck path — the bug this constant defends against).
@@ -2598,6 +2604,24 @@ class BoardLoop:
                         and await self._rearm_review_for_new_head(store, f, pr_url, repo)
                     ):
                         f = await asyncio.to_thread(store.get_feature, fid) or f
+                    # The RECOVERY half of the review gate (#340): a shutdown/restart can
+                    # abort a fix round mid-transition and leave the card in_review +
+                    # changes-requested with the review gate's requeue never landed — no
+                    # live drive survives, the gate re-runs only on review-pending, and
+                    # auto-merge needs review-clean, so the card sits in_review forever
+                    # while merged-state verify churns. DISTINCT from the #328 re-arm above:
+                    # the trigger is a dead drive, not a moved head — #328 ran FIRST, so a
+                    # head that actually moved is already re-armed off changes-requested by
+                    # here (a genuine external push takes that path, never this one). Requeue
+                    # to ready to resume the SAME PR's fix round; the re-read guards against
+                    # #328 / the CI reconcile having just moved the card this same pass.
+                    if (
+                        self.review_gate
+                        and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
+                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
+                        and await self._requeue_stranded_review_fix(store, f, pr_url, repo)
+                    ):
+                        continue  # requeued to ready — the next dispatch resumes the fix; nothing else this pass
                     # The merge-edge half of the review gate (M5): an in_review PR still
                     # marked review-pending had its gate interrupted (host restart, dead
                     # workflow run) — finish it here so the gate can't silently lapse into
@@ -3886,6 +3910,104 @@ class BoardLoop:
         )
         return True
 
+    # ── recover a shutdown-stranded review fix round (#340) ───────────────────
+    async def _requeue_stranded_review_fix(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """Requeue an in_review ``changes-requested`` card whose fix round/drive no longer
+        exists — the shutdown/restart sibling of the #328 re-arm (#340).
+
+        The review gate marks ``changes-requested`` and ``requeue``s a card for a same-PR
+        fix round. If a shutdown/restart aborts that fix drive mid-transition (or the
+        gate's own ``set_review_substate`` → ``requeue`` sequence), the requeue never
+        lands and the card is stranded ``in_review`` + ``changes-requested``: no live
+        drive survives, ``_review_gate`` re-runs only on ``review-pending``, and auto-merge
+        requires ``review-clean`` — so the card sits in review forever while merged-state
+        verification churns. This restores the ESTABLISHED same-PR fix-round lifecycle by
+        requeuing to ``ready`` (the PR, the recorded findings, and the review-fix budget
+        all preserved), so the next dispatch resumes the existing branch and leads with the
+        findings — it invents no new review outcome.
+
+        The authoritative trigger is LIVENESS, not head identity: a ``changes-requested``
+        in_review card with NO surviving drive/fix round is stranded. That is DISTINCT from
+        #328, which fires on a demonstrable reviewed-head↔live-head mismatch (an external
+        push) and re-ARMS a fresh review; the reconcile runs #328 first, so a head that
+        actually moved is already off ``changes-requested`` before this is reached (a genuine
+        external-push card takes that path, never this one).
+
+        NEVER requeues a genuinely live drive: a review gate mid-transition INSIDE a running
+        drive is still ``changes-requested`` for the instant between its ``set_review_substate``
+        and its own ``requeue`` — the liveness guard (a registered drive task #211, a claimed
+        worktree, or an in-flight gate) keeps this from racing it, so nothing is requeued or
+        duplicated. NEVER spends a review-fix budget merely to restore liveness: the requeue
+        carries the budget through untouched, so the resumed round has exactly the bounces it
+        had before the crash and the recovery is idempotent across repeated sweeps/restarts
+        (once requeued, the card is ``ready`` and the in_review-only reconcile never sees it
+        again). Returns True only when it requeued."""
+        fid = feature["id"]
+        if LABEL_CHANGES_REQUESTED not in (feature.get("labels") or []):
+            return False  # only a blocking verdict can strand a fix round
+        # A live drive/fix round is not stranded — leave it, and never duplicate it. The
+        # three signals together span the whole window a fix round can be alive in this
+        # process: a registered drive TASK (process-stable across a reload, #211), a claimed
+        # worktree (``_inflight_files``), and a review gate still mid-transition
+        # (``_review_inflight`` — the instant a running gate has set changes-requested but
+        # not yet requeued). On a restart all three are empty, which is exactly the stranded
+        # case this recovery exists for.
+        if live_drive(fid) is not None or fid in self._inflight_files or fid in self._review_inflight:
+            return False
+        # Restore the fix-round prompt levers the aborted process dropped (best-effort),
+        # then requeue onto the SAME PR — requeue preserves external_ref, so the fix-round
+        # resume edge (open PR ⇒ resume the branch) continues the existing work. The
+        # review-fix budget is deliberately untouched (r5).
+        await self._reinject_review_feedback(store, fid, pr_url, repo)
+        await asyncio.to_thread(store.requeue, fid)
+        log.info(
+            "[project_board] %s review fix round stranded by shutdown (in_review + changes-requested, "
+            "no live drive) — requeued to ready to resume the fix on the same PR: %s",
+            fid,
+            pr_url,
+        )
+        return True
+
+    async def _reinject_review_feedback(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """Best-effort restore of a review fix round's prompt levers after a restart dropped
+        the in-memory copies (#340): the LATEST recorded findings block (the bead comment the
+        gate wrote alongside ``changes-requested``) back into ``_ci_feedback``, and the live
+        PR diff back into ``_ci_prior_diff`` — so the resumed dispatch leads with exactly the
+        findings and diff the pre-crash bounce carried, instead of re-opening the same PR
+        blind to what it must fix. A live in-memory copy is never clobbered, and any read
+        failure just leaves the levers empty (the fix round still resumes the branch, only
+        without the lead-in)."""
+        if self._ci_feedback.get(fid):
+            return  # a surviving in-memory copy already leads the next dispatch
+        findings = await asyncio.to_thread(self._last_review_findings, store, fid)
+        if not findings:
+            return
+        self._ci_feedback[fid] = (
+            "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
+            "below in the existing branch (the PR updates on push) — do not rewrite "
+            "unrelated code.\n\n" + findings
+        )
+        try:
+            self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
+        except Exception:  # noqa: BLE001 — the diff is a convenience; the branch is resumed regardless
+            self._ci_prior_diff.pop(fid, None)
+
+    @staticmethod
+    def _last_review_findings(store, fid: str) -> str:
+        """The LATEST recorded review-findings block for ``fid`` — the bead comment the
+        review gate wrote alongside ``changes-requested`` (``set_review_substate``'s ``note``,
+        a ``_REVIEW_FINDINGS_TITLE`` block). Scanned newest-first so a re-review's findings
+        win over an earlier round's. Returns "" when none is recorded or the comment history
+        can't be read (a store without ``feature_comments``, a ``br`` hiccup) — never raises."""
+        try:
+            comments = store.feature_comments(fid)
+        except Exception:  # noqa: BLE001 — a comment read must never break the recovery
+            return ""
+        for text in reversed(comments or []):
+            if _REVIEW_FINDINGS_TITLE in (text or ""):
+                return str(text).strip()
+        return ""
+
     async def _stamp_reviewed_head(self, store, fid: str, sha: str) -> None:
         """Best-effort stamp of the PR head the review verdict was rendered against
         (#328) — the ``reviewed-head:<sha>`` label the reconcile compares against the
@@ -4149,7 +4271,7 @@ class BoardLoop:
         try:
             from graph.review.findings import render_findings_markdown
 
-            return render_findings_markdown(findings, title="Review findings (blocking)")
+            return render_findings_markdown(findings, title=_REVIEW_FINDINGS_TITLE)
         except ImportError:  # unreachable when _parse_findings succeeded; belt+braces
             return "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in findings)
 

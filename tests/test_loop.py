@@ -26,6 +26,7 @@ from project_board import worktree
 import project_board.loop as loop_mod
 from project_board.loop import (
     _MERGED_VERIFIED_SHA_LEN,
+    _REVIEW_FINDINGS_TITLE,
     BoardLoop,
     _ci_failure_reason,
     _inject_source_issue_line,
@@ -5931,6 +5932,251 @@ async def test_rearm_review_does_not_reset_the_review_fix_budget(monkeypatch):
     assert runs == [store.pr_url]
     assert store.state == "blocked"  # spent budget → blocked, not a fresh bounce
     assert not any(c[0] == "requeue" for c in store.calls)
+
+
+# ── #340: requeue a shutdown-aborted changes-requested fix round ─────────────────
+
+
+class _StrandedFixStore(_RoundTripStore):
+    """_RoundTripStore + the bead comment history the #340 recovery reads back to
+    re-derive the fix feedback a shutdown dropped from the in-memory ``_ci_feedback``.
+    ``set_review_substate`` records its note the way the real store does (a comment), so
+    a findings block written by the gate before the crash is discoverable afterwards."""
+
+    def __init__(self):
+        super().__init__()
+        self.comments = []  # oldest-first, like store.feature_comments
+
+    def set_review_substate(self, fid, label, note=""):
+        if note:
+            self.comments.append(note)
+        return super().set_review_substate(fid, label, note)
+
+    def feature_comments(self, fid):
+        return list(self.comments)
+
+
+def _findings_comment():
+    return f"## {_REVIEW_FINDINGS_TITLE}\n- a.py:3 [blocker] drops data"
+
+
+async def test_reconcile_requeues_a_shutdown_stranded_changes_requested_fix_round(monkeypatch):
+    """r1/r2/r6: a fix drive aborted by shutdown leaves the card in_review +
+    changes-requested (the gate's requeue never landed) with the head UNCHANGED and no
+    live drive. #328 can't re-arm it (nothing was pushed) and the gate re-runs only on
+    review-pending, so it would sit in_review forever while merged-state verify churns.
+    The reconcile requeues it to ready (the PR preserved via external_ref) and re-injects
+    the recorded findings + live diff so the resumed dispatch leads with them and pushes to
+    the same branch."""
+    store = _StrandedFixStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111", "budget:review-fix:1"]
+    store.comments = [_findings_comment()]  # the pre-crash gate recorded its findings
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"  # unchanged since the verdict — NOT a #328 head move
+
+    async def _diff(pr_url, cwd="."):
+        return "diff --git a/a.py b/a.py"
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert ("requeue", "bd-1") in store.calls and store.state == "ready"  # r1: back to ready
+    assert "drops data" in loop._ci_feedback["bd-1"]  # r2: leads with the recorded findings
+    assert loop._ci_prior_diff["bd-1"] == "diff --git a/a.py b/a.py"  # r2: the diff to fix
+    assert store.review_states == []  # no re-arm (#328) and no fresh review outcome invented
+    assert "budget:review-fix:1" in store.labels  # r5: the fix budget preserved, not spent
+    assert loop._review_fix_attempts.get("bd-1", 0) == 0  # r5: no in-memory spend either
+
+
+async def test_reconcile_recovers_a_stranded_fix_round_with_no_head_stamp(monkeypatch):
+    """r1: the shutdown can also land BEFORE the gate stamped the reviewed head (between
+    set-changes-requested and the stamp). #328 fails closed with no stamp to compare, but
+    the liveness trigger still requeues the stranded round — the trigger is a dead drive,
+    not head identity."""
+    store = _StrandedFixStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested"]  # aborted before the reviewed-head stamp landed
+    store.comments = [_findings_comment()]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"  # reads fine, but there's no stamp to prove staleness against
+
+    async def _diff(pr_url, cwd="."):
+        return "d"
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert ("requeue", "bd-1") in store.calls and store.state == "ready"
+    assert "drops data" in loop._ci_feedback["bd-1"]
+
+
+async def test_reconcile_never_requeues_a_live_fix_round(monkeypatch):
+    """r3: while ANY liveness signal holds — a claimed worktree, a gate mid-transition, or
+    a registered drive task — the card is a LIVE fix round (the review gate is still
+    mid-transition inside the drive, briefly in_review + changes-requested before its own
+    requeue lands), never a stranded one. The recovery must leave it alone: no requeue, no
+    duplicate."""
+    import asyncio as _asyncio
+
+    from project_board.loop import _register_drive, _unregister_drive
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+
+    def _fresh():
+        store = _StrandedFixStore()
+        store.state = "in_review"
+        store.labels = ["changes-requested", "reviewed-head:aaa111"]
+        loop = BoardLoop({"review_gate": True, "merge_poll": False})
+        monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+        return store, loop
+
+    # (a) a live drive owns the worktree
+    store, loop = _fresh()
+    loop._inflight_files["bd-1"] = {("default", "a.py")}
+    await loop._reconcile_prs()
+    assert not any(c[0] == "requeue" for c in store.calls) and store.state == "in_review"
+
+    # (b) the gate is mid-transition (changes-requested set, its requeue not yet landed)
+    store, loop = _fresh()
+    loop._review_inflight.add("bd-1")
+    await loop._reconcile_prs()
+    assert not any(c[0] == "requeue" for c in store.calls) and store.state == "in_review"
+
+    # (c) a registered drive task is still running (process-stable across a reload, #211)
+    store, loop = _fresh()
+    release = _asyncio.Event()
+
+    async def _park():
+        await release.wait()
+
+    task = _asyncio.create_task(_park())
+    _register_drive("bd-1", task)
+    try:
+        await loop._reconcile_prs()
+        assert not any(c[0] == "requeue" for c in store.calls) and store.state == "in_review"
+    finally:
+        release.set()
+        await task
+        _unregister_drive("bd-1", task)
+
+
+async def test_reconcile_head_move_takes_the_328_path_not_the_340_recovery(monkeypatch):
+    """r4: a changes-requested card whose external head MOVED follows #328's stale-head
+    re-arm (→ review-pending, one fresh review) — the #340 recovery must NOT also requeue
+    it. #328 runs first and flips it off changes-requested, so this recovery never sees a
+    head that actually moved."""
+    _inject_fake_findings(monkeypatch)
+    store = _StrandedFixStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    runs = []
+
+    async def _run(fid, pr_url):
+        runs.append(pr_url)
+        return "clean.\n```json\n[]\n```", None  # the pushed head passes a fresh review
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "bbb222"  # an external push moved the head off the reviewed one
+
+    async def _diff(pr_url, cwd="."):
+        return "diff --git a/a.py b/a.py"
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert runs == [store.pr_url]  # #328 re-armed → exactly one fresh review for the new head
+    assert "review-clean" in store.labels  # that review landed; the head was NOT requeued blind
+    assert not any(c[0] == "requeue" for c in store.calls)  # NOT the #340 recovery path
+
+
+async def test_shutdown_recovery_is_idempotent_and_never_stuck_in_review(monkeypatch):
+    """r5/r6: repeated reconcile sweeps (a restart loop) requeue the stranded card EXACTLY
+    once per in_review stint and never spend a review-fix budget to do it — proving the
+    card does not remain in_review indefinitely, and that restoring liveness is free."""
+    store = _StrandedFixStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111", "budget:review-fix:1"]
+    store.comments = [_findings_comment()]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"
+
+    async def _diff(pr_url, cwd="."):
+        return "d"
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    await loop._reconcile_prs()  # a second sweep: the card is `ready` now → not re-scanned
+    assert [c for c in store.calls if c[0] == "requeue"] == [("requeue", "bd-1")]  # exactly once
+    assert store.state == "ready"  # not stuck in_review
+    assert "budget:review-fix:1" in store.labels  # r5: the fix budget preserved across sweeps
+    assert loop._review_fix_attempts.get("bd-1", 0) == 0
+
+
+async def test_reinject_review_feedback_never_clobbers_a_live_in_memory_copy(monkeypatch):
+    """r2: when the process did NOT restart (an in-process sweep after a cancelled drive),
+    the in-loop ``_ci_feedback`` may still hold the exact findings the gate wrote. The
+    recovery must not overwrite that live copy with a comment re-read."""
+    store = _StrandedFixStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", "reviewed-head:aaa111"]
+    store.comments = [_findings_comment()]
+    loop = BoardLoop({"review_gate": True, "merge_poll": False})
+    loop._ci_feedback["bd-1"] = "LIVE in-memory feedback"  # survived (no restart)
+
+    async def _pr_state(url, *, cwd="."):
+        return "OPEN"
+
+    async def _head(pr_url, *, cwd="."):
+        return "aaa111"
+
+    monkeypatch.setattr(worktree, "pr_state", _pr_state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert store.state == "ready"  # still recovered
+    assert loop._ci_feedback["bd-1"] == "LIVE in-memory feedback"  # the live copy is untouched
 
 
 # ── surfaced unrunnable-gate causes (#180) ───────────────────────────────────────
