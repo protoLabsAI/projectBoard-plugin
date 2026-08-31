@@ -444,16 +444,92 @@ class DriveMixin:
             busy |= files
             selected.append(claimed["id"])
             spawned = True
-        if selected or skipped or parked:
+        # #356: bound ready-queue livelocks — a candidate skipped for the SAME reason
+        # every scan is flagged blocked (→ the existing blocked sweep escalation) rather
+        # than retried forever. Runs each tick so progress (a claim, a changed reason, a
+        # card that left the scan) resets the counters, even on a tick that skipped nothing.
+        blocked = await self._bound_ready_skips(store, selected, parked, skipped)
+        if selected or skipped or parked or blocked:
             log.info(
                 "[project_board] claim_decision %s",
                 json.dumps(
-                    {"parked": parked, "selected": selected, "skipped": skipped},
+                    {"blocked": blocked, "parked": parked, "selected": selected, "skipped": skipped},
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
             )
         return spawned
+
+    async def _bound_ready_skips(self, store, selected: list[str], parked: list[str], skipped: list[dict]) -> list[str]:
+        """Bound ready-queue livelocks (#356) — the liveness invariant that an
+        indefinitely repeating ready-queue skip is NOT transient.
+
+        A ready candidate the puller passes over for the SAME reason every scan will
+        retry forever (the #356 bug: a task assigned to a non-actor target refused by
+        ``br --claim``, spinning as ``claim-race`` unnoticed). Count consecutive identical
+        skips per ``(fid, reason)``; once a card reaches ``ready_skip_max`` for one
+        unresolved reason, flag it blocked with actionable evidence so the EXISTING
+        blocked sweep (``_recover_blocked``) escalates the formerly-invisible
+        ready-but-unclaimable state to the operator — rather than the loop silently
+        spinning on it.
+
+        Progress resets the count (r5), so a one-off real claim race never blocks: a
+        successful claim/park, a CHANGED reason (a different `reason` restarts the
+        counter at 1), a card that LEFT the ready scan this tick (claimed elsewhere,
+        dependency-blocked, delivered — it is simply absent from ``skipped``), or a skip
+        that reflects ACTIVE progress elsewhere — a hot-file deferral behind a LIVE
+        in-flight build, which is watchdogged by ``coder_timeout`` and clears the moment
+        that build lands, so it is never itself the livelock. A card ALREADY in the blocked
+        lane (``READY_SKIP_EXEMPT_REASONS`` — a real block, or a preflight hold the preflight
+        mechanism owns) has already reached escalation, so it is neither accrued nor
+        re-flagged. Returns the fids blocked this scan (for the ``claim_decision`` payload)."""
+        # Cards that demonstrably moved this scan → their livelock budget resets.
+        progressed: set[str] = set(selected) | set(parked)
+        # The genuinely-stalled skips (fid → reason), minus the ones that are really
+        # "waiting on active progress elsewhere" (a hot file a live build owns) or already
+        # escalated (blocked / preflight-hold).
+        stalled: dict[str, str] = {}
+        for s in skipped:
+            fid = s["fid"]
+            reason = str(s.get("reason") or "")
+            if reason in READY_SKIP_EXEMPT_REASONS:
+                continue  # already in the blocked/escalation lane — nothing for the budget to add
+            if reason == "hot-file" and all(o in self._inflight_files for o in s.get("overlaps") or []):
+                progressed.add(fid)  # a live build owns the file — that IS progress (r5)
+                continue
+            stalled[fid] = reason
+        blocked: list[str] = []
+        for fid, reason in stalled.items():
+            prev = self._ready_skips.get(fid)
+            n = prev[1] + 1 if (prev and prev[0] == reason) else 1  # same reason accrues; a new one restarts
+            if n < self.ready_skip_max:
+                self._ready_skips[fid] = (reason, n)
+                continue
+            evidence = (
+                f"ready-queue livelock: skipped {n} consecutive scans as '{reason}' with no "
+                "progress — the card is ready but the loop cannot claim/advance it (e.g. a "
+                "dispatch target `br --claim` refuses, or a stale `ready` label). Needs an "
+                "operator: inspect the assignee/dispatch target and clear or requeue the card."
+            )
+            try:
+                await asyncio.to_thread(store.flag_blocked, fid, evidence)
+            except Exception:  # noqa: BLE001 — a failed block must not kill the tick; retry next scan
+                self._ready_skips[fid] = (reason, n)
+                log.warning("[project_board] %s ready-queue livelock block failed — will retry", fid, exc_info=True)
+                continue
+            blocked.append(fid)
+            self._ready_skips.pop(fid, None)  # blocked → leaves the ready scan; drop the counter
+            log.warning(
+                "[project_board] %s ready-queue livelock — flagged blocked after %d consecutive '%s' skips",
+                fid,
+                n,
+                reason,
+            )
+        # Reset every counter for a card that made progress or is no longer stalling.
+        for fid in list(self._ready_skips):
+            if fid in progressed or fid not in stalled:
+                self._ready_skips.pop(fid, None)
+        return blocked
 
     def _make_drive_done_cb(self, fid: str):
         """A drive task's done-callback: drop it from the running set and release the
@@ -501,7 +577,11 @@ class DriveMixin:
         if self._is_self_assignee(assignee):
             return await self._dispatch_self(store, candidate, assignee)
         delegate = self._resolve_task_delegate(assignee)
-        claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
+        # claim_task, NOT claim (#356): a task's assignee is its DISPATCH TARGET, so it
+        # transitions ready→in_progress by STATE and keeps that assignee — `br --claim`
+        # would refuse an already-assigned task (retry-forever `claim-race`) and, if it
+        # ran, reassign it to the actor.
+        claimed = await asyncio.to_thread(store.claim_task, cid, assignee=assignee)
         if claimed is None:
             return "race"
         if delegate is None:
@@ -568,7 +648,9 @@ class DriveMixin:
         # executing on the host. `host_invoke_busy()` is owned by that thread, so it stays
         # true until the call really returns and the second task parks instead of racing it.
         if invoke is None or self._self_inflight or coder_seam.host_invoke_busy():
-            claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
+            # claim_task (#356): a self task's assignee (`self`/`agent`/the coder name) is
+            # its dispatch target — preserve it through the park, never `--claim`.
+            claimed = await asyncio.to_thread(store.claim_task, cid, assignee=assignee)
             if claimed is None:
                 return "race"
             why = "no HOST.invoke seam" if invoke is None else "a self-dispatch is already in flight"
@@ -578,7 +660,7 @@ class DriveMixin:
                 why,
             )
             return "parked"
-        claimed = await asyncio.to_thread(store.claim, cid, assignee=assignee)
+        claimed = await asyncio.to_thread(store.claim_task, cid, assignee=assignee)  # #356: preserve the target
         if claimed is None:
             return "race"
         # Raise the one-in-flight guard BEFORE the drive is spawned, and clear it from the

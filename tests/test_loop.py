@@ -2712,6 +2712,7 @@ class _ClaimStore:
         self._features = [dict(f) for f in features]
         self._in_review = in_review
         self.claimed = []
+        self.blocked = []  # (fid, reason) the livelock budget flagged (#356)
         self.last_relaxed = None
 
     def ready_queue(self, relaxed=False):
@@ -2723,6 +2724,10 @@ class _ClaimStore:
             return None
         self.claimed.append(fid)
         return next((f for f in self._features if f["id"] == fid), None)
+
+    def flag_blocked(self, fid, reason="", category=""):
+        self.blocked.append((fid, reason))
+        return {"id": fid}
 
     def list_features(self, state=None):
         return [{"id": f"rev-{i}"} for i in range(self._in_review)] if state == "in_review" else []
@@ -2856,6 +2861,7 @@ class _TaskStore:
     def __init__(self, features):
         self._features = [dict(f) for f in features]
         self.claimed = []
+        self.claim_targets = {}  # fid -> assignee the task-claim path preserved (#356)
         self.calls = []  # (verb, fid, extra…)
 
     def ready_queue(self, relaxed=False):
@@ -2869,6 +2875,21 @@ class _TaskStore:
         if f is None:
             return None
         return dict(f, board_state="in_progress", assignee=assignee or f.get("assignee", ""))
+
+    def claim_task(self, fid, assignee=""):
+        # #356: the task-claim path — transitions ready→in_progress PRESERVING the
+        # dispatch-target assignee (never the actor), and refuses a card no longer ready.
+        # Mirrors BeadsBoard.claim_task; the --claim refusal it fixes is a real-`br` fact
+        # (see tests/test_integration.py), so the fake just records the preserved target.
+        if fid in self.claimed:
+            return None
+        f = next((x for x in self._features if x["id"] == fid), None)
+        if f is None or f.get("board_state") != "ready":
+            return None
+        self.claimed.append(fid)
+        target = assignee or f.get("assignee", "")
+        self.claim_targets[fid] = target
+        return dict(f, board_state="in_progress", assignee=target)
 
     def list_features(self, state=None):
         return []
@@ -3564,6 +3585,241 @@ async def test_spawn_ready_logs_a_claim_race_skip(monkeypatch, caplog):
     assert payload["selected"] == ["bd-lo"]
     skip = {s["fid"]: s for s in payload["skipped"]}
     assert skip["bd-hi"]["reason"] == "claim-race"
+
+
+# ── #356: task-claim preserves the dispatch target; ready-queue livelocks are bounded ──
+
+
+async def test_task_claim_preserves_assignee_for_every_dispatch_target(monkeypatch):
+    """#356 r1: ready tasks assigned to a sister agent, the board's OWN agent (self), or a
+    human all transition to in_progress via the task-claim path RETAINING exactly that
+    assignee — the target the loop then dispatches to — never rewritten to the board actor
+    the way `br --claim` would (which is why the claim path can't use `--claim` for a task)."""
+    store = _TaskStore(
+        [
+            _task("bd-sister", assignee="agent-bot"),
+            _task("bd-self", assignee="self"),
+            _task("bd-human", assignee="alice"),
+        ]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda: object())
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        return "delivered"
+
+    async def _dispatch_self(inv, prompt, session_id, *, timeout=None):
+        return "delivered"
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+    monkeypatch.setattr(coder_seam, "dispatch_self", _dispatch_self)
+
+    # actor/coder = proto — NONE of the three targets, so a `--claim` reassign would be
+    # detectable. agent-bot resolves to a sister agent; alice resolves to nothing (park).
+    loop = BoardLoop({"coder": "proto", "max_concurrent": 5})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object() if name == "agent-bot" else None)
+
+    await loop._spawn_ready()
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert set(store.claimed) == {"bd-sister", "bd-self", "bd-human"}  # all claimed via claim_task
+    # every target survived the claim verbatim — proof the actor never overwrote it.
+    assert store.claim_targets == {"bd-sister": "agent-bot", "bd-self": "self", "bd-human": "alice"}
+
+
+async def test_a_coding_feature_still_uses_the_atomic_claim_with_actor_assignment(monkeypatch):
+    """#356 r2: an ordinary coding feature keeps the existing atomic `claim` (`br --claim`,
+    actor assignment) — the task-claim path is strictly additive and never diverts a
+    feature onto it."""
+    calls = []
+
+    class _RecordingStore(_ClaimStore):
+        def claim(self, fid, assignee=""):
+            calls.append(("claim", fid, assignee))
+            return super().claim(fid, assignee=assignee)
+
+        def claim_task(self, fid, assignee=""):
+            calls.append(("claim_task", fid, assignee))
+            return None
+
+    store = _RecordingStore([_ready("bd-feat", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "coder": "proto"})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        assert await loop._spawn_ready() is True
+        assert calls == [("claim", "bd-feat", "proto")]  # atomic claim, assigned to the coder/actor
+    finally:
+        await finish()
+
+
+async def test_a_task_that_loses_the_claim_race_starts_no_drive(monkeypatch):
+    """#356 r3: when the task-claim races (the card moved off ready — claimed elsewhere,
+    blocked, delivered), claim_task returns None and the dispatch is classified `race`:
+    no drive starts, no stale card is claimed, and it is left to retry next scan."""
+
+    class _RacingTaskStore(_TaskStore):
+        def claim_task(self, fid, assignee=""):
+            return None  # lost the race / no longer ready
+
+    store = _RacingTaskStore([_task("bd-task", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _no_dispatch(*a, **k):
+        raise AssertionError("a lost claim race must NOT dispatch or start a drive")
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _no_dispatch)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    assert await loop._spawn_ready() is False  # nothing started
+    assert loop._drives == set()
+    assert "bd-task" not in loop._inflight_files
+    assert store.calls == []  # not delivered, not (yet) blocked — just retried
+
+
+async def test_ready_queue_livelock_blocks_after_the_skip_budget(monkeypatch):
+    """#356 r4/r6: a ready task the loop can NEVER claim (it keeps racing) is not retried
+    forever — after ready_skip_max consecutive identical skips it is flagged blocked with
+    actionable evidence, so the existing blocked sweep escalates the formerly-invisible
+    ready-but-unclaimable state. The reason classifies as terminal (NOT self-healing), so
+    the sweep alerts the operator rather than auto-unblocking straight back into the same
+    livelock."""
+
+    class _StuckStore(_TaskStore):
+        def claim_task(self, fid, assignee=""):
+            return None  # never claimable — the #356 livelock, unresolved every scan
+
+    store = _StuckStore([_task("bd-stuck", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "ready_skip_max": 3})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    for scan in range(loop.ready_skip_max - 1):
+        assert await loop._spawn_ready() is False
+        assert "flag_blocked" not in store.names(), f"a transient race must not block (scan {scan})"
+        assert loop._ready_skips["bd-stuck"] == ("claim-race", scan + 1)  # the count climbs
+
+    assert await loop._spawn_ready() is False
+    assert store.names() == ["flag_blocked"]  # the budget is spent → blocked, exactly once
+    fid, reason = store.calls[0][1], store.calls[0][2]
+    assert fid == "bd-stuck"
+    assert "livelock" in reason and "claim-race" in reason  # actionable evidence naming the reason
+    from project_board.failures import classify
+
+    assert classify(reason).category == "terminal"  # reaches operator escalation, not self-heal
+    assert "bd-stuck" not in loop._ready_skips  # the counter is cleared once blocked
+
+
+async def test_a_transient_claim_race_resets_the_skip_budget_on_progress(monkeypatch):
+    """#356 r5: a task that races a few times (under the budget) but is then claimed does
+    NOT block — a successful claim is progress and resets the counter, so a single/transient
+    claim race is never terminal."""
+
+    class _FlakyStore(_TaskStore):
+        def __init__(self, features):
+            super().__init__(features)
+            self.fail_claims = True
+
+        def claim_task(self, fid, assignee=""):
+            if self.fail_claims:
+                return None
+            return super().claim_task(fid, assignee=assignee)
+
+    store = _FlakyStore([_task("bd-flaky", assignee="agent-bot")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    async def _dispatch_task(delegate, prompt, *, timeout=None):
+        return "delivered"
+
+    monkeypatch.setattr(coder_seam, "dispatch_task", _dispatch_task)
+    loop = BoardLoop({"coder": "proto", "ready_skip_max": 3})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    await loop._spawn_ready()  # race 1
+    await loop._spawn_ready()  # race 2 — still under the budget of 3
+    assert loop._ready_skips["bd-flaky"] == ("claim-race", 2)
+    assert "flag_blocked" not in store.names()
+
+    store.fail_claims = False  # now it claims → progress
+    assert await loop._spawn_ready() is True
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert "bd-flaky" not in loop._ready_skips  # the successful claim reset the counter
+    assert "flag_blocked" not in store.names()  # …so it never blocked
+    assert "record_delivery" in store.names()
+
+
+async def test_a_changed_skip_reason_restarts_the_livelock_counter(monkeypatch):
+    """#356 r5: the budget is per (fid, reason) — a DIFFERENT skip reason for the same card
+    restarts the count at 1, so a card oscillating between reasons never trips the budget."""
+    store = _ClaimStore([_ready("bd-x", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"ready_skip_max": 3})
+
+    # scan 1: skipped as claim-race → count 1
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "claim-race"}])
+    assert loop._ready_skips["bd-x"] == ("claim-race", 1)
+    # scan 2: SAME reason → count 2
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "claim-race"}])
+    assert loop._ready_skips["bd-x"] == ("claim-race", 2)
+    # scan 3: a DIFFERENT reason resets to 1 (not 3 → no block)
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-x", "reason": "state=in_progress"}])
+    assert loop._ready_skips["bd-x"] == ("state=in_progress", 1)
+    assert store.blocked == []
+
+
+async def test_a_hot_file_skip_behind_a_live_build_is_not_a_livelock(monkeypatch):
+    """#356 r5: a candidate deferred by the hot-file guard while a LIVE build owns its file
+    is making progress-by-proxy, not livelocked — that build is watchdogged and this card
+    claims the moment it lands. So repeated hot-file skips behind a live owner never accrue
+    the livelock budget and never block, however long the build runs."""
+    store = _ClaimStore([_ready("bd-hot", ["shared.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "ready_skip_max": 2})
+    loop._inflight_files = {"bd-live": {("default", "shared.py")}}  # a live in-flight build owns shared.py
+
+    for _ in range(5):  # well past ready_skip_max=2
+        await loop._spawn_ready()
+
+    assert store.claimed == []  # never claimed (the file stays hot)…
+    assert "bd-hot" not in loop._ready_skips  # …but never accrued a livelock count…
+    assert store.blocked == []  # …and was never blocked
+
+
+async def test_a_card_that_leaves_the_ready_scan_resets_its_skip_budget(monkeypatch):
+    """#356 r5: a card that stops appearing in the ready scan (claimed elsewhere,
+    dependency-blocked, delivered) has demonstrably made progress — its livelock counter
+    is dropped, so it can never carry a stale count into a later, unrelated skip."""
+    store = _ClaimStore([])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"ready_skip_max": 3})
+
+    await loop._bound_ready_skips(store, [], [], [{"fid": "bd-y", "reason": "claim-race"}])
+    assert loop._ready_skips["bd-y"] == ("claim-race", 1)
+    # next scan: bd-y is no longer skipped (it left the queue) → counter dropped
+    await loop._bound_ready_skips(store, [], [], [])
+    assert "bd-y" not in loop._ready_skips
+
+
+async def test_an_already_blocked_skip_is_not_re_flagged_by_the_livelock_budget(monkeypatch):
+    """#356: a card ALREADY in the blocked lane keeps surfacing in the scan (flag_blocked
+    never drops its `ready` label), skipped as `blocked` every tick. That has already
+    reached escalation, so the livelock budget must neither accrue it nor re-flag it into
+    comment spam — the same exemption covers a `preflight-hold` the preflight owns."""
+    store = _ClaimStore([])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"ready_skip_max": 2})
+    for _ in range(6):  # well past the budget
+        await loop._bound_ready_skips(
+            store,
+            [],
+            [],
+            [{"fid": "bd-b", "reason": "blocked"}, {"fid": "bd-p", "reason": "preflight-hold"}],
+        )
+    assert loop._ready_skips == {}  # neither accrued a livelock count
+    assert store.blocked == []  # …and neither was re-flagged
 
 
 # ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────

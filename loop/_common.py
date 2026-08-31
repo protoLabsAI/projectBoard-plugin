@@ -838,6 +838,25 @@ _SELF_HEALING_BLOCKS = frozenset({"rate-limit", "transient", "merge-conflict"})
 # Deliberately small: a card that has failed transiently three times is not unlucky, it
 # has a problem a human needs to see.
 _UNBLOCK_RETRY_MAX = 2
+# Ready-queue livelock budget (#356): how many CONSECUTIVE scans a ready candidate may be
+# skipped for the SAME reason before the loop flags it blocked instead of retrying it
+# forever. A single ready-queue skip is transient (a lost claim race, a hot file behind a
+# live build); the SAME skip repeating every scan with no progress is a livelock — a
+# ready-but-unclaimable card the puller spins on silently. The threshold turns that into a
+# visible block the existing blocked sweep escalates. Deliberately > 1 so a one-off real
+# claim race never blocks (#356 r5); tunable via the ``ready_skip_max`` config key (YAML
+# only — an expert liveness knob, not a console field). The default is generous because an
+# idle loop ticks every ``loop_interval_s`` (~30s), so 20 consecutive identical skips is
+# ~10 minutes of a card going nowhere.
+READY_SKIP_MAX_DEFAULT = 20
+# Skip reasons the livelock budget (#356) does NOT accrue — the card has ALREADY reached
+# the blocked/escalation path, so the liveness invariant is already satisfied and
+# re-flagging it would only spam the bead. ``blocked`` is a card carrying both the `ready`
+# and `blocked` labels (flag_blocked never drops `ready`, so a blocked card keeps
+# surfacing in the scan); ``preflight-hold`` is owned by the preflight-hold mechanism,
+# which flags those cards itself. A ``hot-file`` skip behind a LIVE build is exempted
+# separately (it is active progress, not a stall), so it is not listed here.
+READY_SKIP_EXEMPT_REASONS = frozenset({"blocked", "preflight-hold"})
 # How long one blocked-card alert suppresses an identical repeat. Long, because a blocked
 # card can sit for hours and the inbox's 300s default would re-alert on every restart —
 # the exact noise #341 opened with. The KEY carries the incident, so a genuinely new
@@ -988,6 +1007,8 @@ __all__ = [
     "_BUDGET_KINDS",
     "_SELF_HEALING_BLOCKS",
     "_UNBLOCK_RETRY_MAX",
+    "READY_SKIP_MAX_DEFAULT",
+    "READY_SKIP_EXEMPT_REASONS",
     "_ALERT_DEDUP_S",
     "_inbox_db_path",
 ]

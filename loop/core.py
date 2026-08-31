@@ -97,6 +97,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # review, so the loop can't pile up PRs faster than they merge (flooding CI /
         # reviewers). 0 = unlimited. LIVE (see max_concurrent).
         self.max_pending_reviews = _knob_int(self.cfg, "max_pending_reviews", 5, floor=0)
+        # Ready-queue livelock budget (#356): consecutive identical skips of one ready
+        # candidate before it is flagged blocked instead of retried forever (see
+        # READY_SKIP_MAX_DEFAULT). Floored at 1; an expert YAML-only knob, not a console
+        # field — so it is deliberately absent from the manifest settings.
+        self.ready_skip_max = max(1, int(self.cfg.get("ready_skip_max", READY_SKIP_MAX_DEFAULT)))
         # Dependency gate: "merge" (default) — a dependent waits for every blocker to
         # merge (done); "review" — a NON-foundation blocker releases its dependents at
         # in_review (more parallelism, at the risk of building on un-merged code).
@@ -349,6 +354,14 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # files_to_modify of each in-flight feature, for the hot-file overlap guard
         # (don't run two parallel coders that edit the same file → sure conflict).
         self._inflight_files: dict[str, set[tuple[str, str]]] = {}  # fid -> {(project, path)} (#197)
+        # Ready-queue livelock budget (#356): fid → (last skip reason, consecutive count).
+        # A candidate skipped for the SAME reason every scan is spun on forever; at
+        # ready_skip_max it is flagged blocked so the existing blocked sweep escalates it.
+        # Reset the moment the card makes progress — claimed, its reason/state changes, it
+        # leaves the ready scan (dep-blocked / delivered elsewhere), or its skip reflects
+        # active progress (a hot file behind a LIVE build). In-memory, per process: a
+        # restart re-arms the count from zero, and a genuine livelock simply re-earns it.
+        self._ready_skips: dict[str, tuple[str, int]] = {}
         # #311: at most ONE self-dispatch (a task the board runs through HOST.invoke as
         # its own agent) in flight per board — a second self-assigned task parks rather
         # than invoking the host recursively. Set before the self-drive is spawned and

@@ -1647,6 +1647,41 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
+    def claim_task(self, fid: str, assignee: str = "") -> dict | None:
+        """Transition a ready **task** bead → ``in_progress`` WITHOUT ``br --claim``,
+        PRESERVING its existing assignee/dispatch target (#356).
+
+        A task's assignee is its DISPATCH TARGET (a sister agent, or ``self``/the board's
+        own agent), not the claim marker a coding feature stamps (#333/#334). ``br
+        --claim`` is wrong for that on two counts: it REASSIGNS the bead to the store
+        actor, and it REFUSES an already-assigned bead — so ``claim`` returned None for
+        every task assigned to any non-actor target, and the puller retried it forever as
+        ``claim-race``. This claims by STATE instead of by the assignee lock: flip
+        ``status`` → ``in_progress`` and drop the ``ready`` label, leaving the assignee
+        exactly as it was (re-affirming the passed ``assignee`` when given — the caller
+        passes the candidate's own target back, so the value round-trips unchanged; an
+        empty target never emits ``--assignee``, so an unassigned/human task stays
+        unassigned rather than being stamped with the actor).
+
+        State-race safe like ``claim``: the pre-transition ``board_state == "ready"``
+        re-read is the SAME guard ``claim`` runs before ``--claim`` — a bead that has
+        already moved off ``ready`` (raced to a claim elsewhere, blocked, delivered)
+        returns None and the caller retries/classifies it, so no stale ready card is
+        claimed and no second drive starts for one already in flight. Ordinary coding
+        features keep ``claim``'s atomic ``--claim`` path untouched — this is the task
+        sibling, not a replacement."""
+        f = self.get_feature(fid)
+        if f is None or f["board_state"] != "ready":
+            return None
+        args = ["update", fid, "--status", "in_progress", "--remove-label", LABEL_READY]
+        target = str(assignee or f.get("assignee") or "").strip()
+        if target:
+            # Re-affirm the dispatch target (idempotent — it is already the bead's
+            # assignee); NEVER `--claim`, which would overwrite it with the actor.
+            args += ["--assignee", target]
+        self._run(*args)
+        return self.get_feature(fid)
+
     # ── In Progress → In Review ───────────────────────────────────────────────
     def open_review(self, fid: str, *, pr_url: str = "") -> dict:
         """In Progress → In Review. ``pr_url`` is still REQUIRED for a coding feature

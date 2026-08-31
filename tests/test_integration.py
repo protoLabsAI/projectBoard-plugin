@@ -577,3 +577,48 @@ def test_review_clean_sha_label_fits_the_beads_label_cap(board):
     assert store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha=FULL_SHA)["blockers"] == []
     moved = store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha="b" * 40)["blockers"]
     assert any("review-clean verdict is for" in b for b in moved)
+
+
+# ── #356: `br --claim` refuses a non-actor assignee; claim_task preserves it ──────────
+
+
+@requires_br
+def test_task_claim_preserves_a_non_actor_assignee_where_claim_refuses_it(board):
+    """#356 r8: a ready TASK assigned to a non-actor dispatch target is REFUSED by real
+    `br --claim` (assignee != actor) — the live bug: the puller's `claim` swallows that to
+    None, so the task retried forever as `claim-race`. `claim_task` transitions it to
+    ``in_progress`` WITHOUT `--claim`, RETAINING its assignee. This is a beads decision the
+    fake `_run` tier (whose stub `claim`/`claim_task` never invoke real `--claim`) is
+    structurally blind to — the exact class this integration tier exists for.
+
+    Red-is-reachable: pointing `claim_task` back at `--claim` makes the real `br` refuse the
+    already-assigned bead and the ``in_progress`` assertion below FAIL."""
+    task = board.create_feature(
+        "Sister-agent task",
+        spec="s",
+        acceptance_criteria="- WHEN done THE SYSTEM SHALL deliver",
+        issue_type="task",
+        assignee="sister-agent",  # the board actor is "test" — a DIFFERENT identity
+    )
+    fid = task["id"]
+    board.mark_ready(fid)  # a task goes ready on spec + AC alone (no files_to_modify)
+    assert board.get_feature(fid)["board_state"] == "ready"
+
+    # The refusal, proven against real `br`: `--claim` on an already-assigned bead raises
+    # (assignee != actor). `br update` is atomic-or-clean (the #135 test proves it), so the
+    # bead is untouched — still ready, still assigned to the sister agent, never the actor.
+    with pytest.raises(BoardError):
+        board._run("update", fid, "--claim")
+    assert board.claim(fid) is None  # …and the puller's claim swallows it → the #356 symptom
+    still = board.get_feature(fid)
+    assert still["board_state"] == "ready"  # never claimed
+    assert still["assignee"] == "sister-agent"  # never reassigned to the actor
+
+    # claim_task reaches in_progress WITHOUT `--claim`, preserving the dispatch target.
+    claimed = board.claim_task(fid, assignee="sister-agent")
+    assert claimed is not None
+    assert claimed["board_state"] == "in_progress"
+    assert claimed["assignee"] == "sister-agent"  # NOT "test" (the actor)
+    assert LABEL_READY not in (claimed["labels"] or [])  # the ready label was dropped
+    # …and a second claim_task finds it no longer ready → None: no duplicate drive (r3).
+    assert board.claim_task(fid) is None
