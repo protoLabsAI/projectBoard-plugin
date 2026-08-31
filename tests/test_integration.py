@@ -301,6 +301,46 @@ def test_task_claim_preserves_a_non_actor_assignee_where_claim_would_refuse(boar
     assert board.claim_task(fid, assignee="quinn") is None
 
 
+@requires_br
+def test_task_claim_is_a_conditional_cas_not_an_unconditional_stomp(board):
+    """#356 r3, against REAL `br`: the review's blocking finding was that `claim_task`
+    did a non-atomic ready-check then an UNCONDITIONAL `--status in_progress` write — two
+    callers could pass the check and both dispatch. The fix routes the transition through
+    the SAME atomic, write-locked `br --claim` compare-and-swap the coding claim uses,
+    claimed AS the dispatch target so the target is preserved.
+
+    Prove it is now CONDITIONAL, the property a bare `--status` write lacks: if the bead
+    is reassigned to a DIFFERENT owner between the caller's read and the claim (an operator
+    grabbed it, a requeue cleared it), `claim_task` for the stale target must REFUSE and
+    return None — leaving the card untouched — rather than stomping it to in_progress and
+    reassigning it back. Only real `br` enforces the claim CAS; the fake tier is blind to
+    it."""
+    task = board.create_feature(
+        "Reassigned under us",
+        spec="s",
+        acceptance_criteria="- WHEN done THE SYSTEM SHALL deliver",
+        issue_type="task",
+        assignee="quinn",  # the target the puller reads off the candidate…
+    )
+    fid = task["id"]
+    board.mark_ready(fid)
+    # …but before the claim lands, an operator reassigns the bead to a different owner.
+    board._run("update", fid, "--assignee", "operator")
+
+    # claim_task for the STALE target must lose the atomic claim (assignee != target) and
+    # NOT stomp the card: None, and the bead stays exactly as the operator left it.
+    assert board.claim_task(fid, assignee="quinn") is None
+    still = board.get_feature(fid)
+    assert still["board_state"] == "ready"  # untouched — never moved to in_progress
+    assert still["assignee"] == "operator"  # the concurrent owner is preserved, not overwritten
+
+    # and the operator (the true current owner) CAN claim it — the transition works when
+    # the target actually matches, so the CAS refuses only the stale claimer.
+    claimed = board.claim_task(fid, assignee="operator")
+    assert claimed is not None and claimed["board_state"] == "in_progress"
+    assert claimed["assignee"] == "operator"
+
+
 @requires_br  # NOT @br_shape: asserts the 0.1.x `comments`-field STRUCTURE, so 0.1.23-pinned
 def test_json_shape_show_for_raw_features_with_comments(board):
     """`br show --json` re-fetch in raw_features_with_comments: the RAW bead must
