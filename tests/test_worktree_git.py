@@ -67,6 +67,15 @@ class _Origin:
         _git_run("-C", self.seed, "commit", "-m", "base commit")
         _git_run("-C", self.seed, "remote", "add", "origin", self.origin)
         _git_run("-C", self.seed, "push", "-u", "origin", self.base)
+        # Pin the bare origin's HEAD to `base` BEFORE cloning. A `git init --bare` leaves
+        # origin HEAD on the host's `init.defaultBranch` (e.g. `master` on CI), which no
+        # ref here matches — so `git clone` would warn "remote HEAD refers to nonexistent
+        # ref" and check out an EMPTY working tree. The main-checkout seam
+        # (`base_checkout_dirt`) reads that working tree, so an empty checkout makes a
+        # local edit land as an *untracked* file that `--untracked-files=no` hides. Pinning
+        # HEAD makes the clone check `base` out — faithful to production (origin/HEAD → the
+        # real default branch) and hermetic against the host's `init.defaultBranch`.
+        _git_run("-C", self.origin, "symbolic-ref", "HEAD", f"refs/heads/{self.base}")
         _git_run("clone", self.origin, self.clone)
         _configure_identity(self.clone)
 
