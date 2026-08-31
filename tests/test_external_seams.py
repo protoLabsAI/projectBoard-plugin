@@ -39,20 +39,23 @@ import re
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # ── the registry ────────────────────────────────────────────────────────────────────
-# worktree.py — shells `gh` and `git`. NOTHING here is covered against the real API
-# today: there is no GitHub sandbox tier at all, which is precisely how #354 shipped.
+# worktree.py — shells `gh` and `git`. The 11 LOCAL-GIT seams are now covered against
+# real `git` in tests/test_worktree_git.py (#361 S1: a temporary bare `origin` + a
+# clone, so `origin/<base>` and resume-branch existence resolve exactly as they do in
+# the deployed board). The `gh`/GitHub seams remain UNCOVERED — there is still no
+# GitHub sandbox tier, which is precisely how #354 shipped.
 WORKTREE_SEAMS: dict[str, str] = {
     "_find_marked_comment": "UNCOVERED",
     "_promote_adopted_draft": "UNCOVERED",
-    "base_checkout_dirt": "UNCOVERED",
+    "base_checkout_dirt": "REAL",
     "close_pr": "UNCOVERED",
-    "commit_worktree": "UNCOVERED",
-    "create_worktree": "UNCOVERED",
-    "delete_remote_branch": "UNCOVERED",
+    "commit_worktree": "REAL",
+    "create_worktree": "REAL",
+    "delete_remote_branch": "REAL",
     "merge_pr": "UNCOVERED",
-    "merged_state_worktree": "UNCOVERED",
+    "merged_state_worktree": "REAL",
     "open_pr": "UNCOVERED",
-    "origin_head_sha": "UNCOVERED",
+    "origin_head_sha": "REAL",
     "post_or_update_pr_comment": "UNCOVERED",
     "post_review_status": "UNCOVERED",
     "pr_ci_status": "UNCOVERED",
@@ -61,13 +64,13 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_merge_info": "UNCOVERED",
     "pr_state": "UNCOVERED",
     "pr_url_for_branch": "UNCOVERED",
-    "promote_worktree": "UNCOVERED",
-    "prune_stale_worktrees": "UNCOVERED",
+    "promote_worktree": "REAL",
+    "prune_stale_worktrees": "REAL",
     "read_review_status": "UNCOVERED",
-    "rebase_onto_base": "UNCOVERED",
-    "remove_worktree": "UNCOVERED",
+    "rebase_onto_base": "REAL",
+    "remove_worktree": "REAL",
     "repo_slug": "UNCOVERED",
-    "stage_all": "UNCOVERED",
+    "stage_all": "REAL",
 }
 
 # store.py — shells `br`. This is the strong tier: CI runs a real pinned binary across
@@ -122,7 +125,7 @@ STORE_SEAMS: dict[str, str] = {
 
 # The ratchet. These are the counts at the moment the contract was introduced; a change
 # that raises either number fails this file. Lower them as coverage lands.
-MAX_UNCOVERED_WORKTREE = 26
+MAX_UNCOVERED_WORKTREE = 15
 MAX_UNCOVERED_STORE = 21
 
 
