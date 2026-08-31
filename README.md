@@ -557,6 +557,7 @@ aborts nor forgets it, and flipping it back on never starts a second one.
 |---|---|
 | [`docs/api.md`](docs/api.md) | every HTTP route — the operator (bearer) and public (HMAC) surfaces |
 | [`docs/tools.md`](docs/tools.md) | every agent tool, with the lifecycle-changing ones flagged |
+| [`docs/configuration.md`](docs/configuration.md) | every config key, its default, and whether the change is live / reload / restart |
 | [`docs/adr/`](docs/adr/) | the decision records for subsystem behaviour |
 
 Both references are covered by `tests/test_docs_reference.py`, which fails if a route or

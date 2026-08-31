@@ -22,6 +22,7 @@ import re
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _API_DOC = _ROOT / "docs" / "api.md"
 _TOOLS_DOC = _ROOT / "docs" / "tools.md"
+_CONFIG_DOC = _ROOT / "docs" / "configuration.md"
 
 
 def _routes() -> set[tuple[str, str]]:
@@ -95,3 +96,43 @@ def test_the_readme_layout_table_matches_the_real_files():
             f"loop.py → loop/ and the table kept the old name — that is exactly the drift "
             f"this catches."
         )
+
+
+def _config_keys() -> set[str]:
+    """Every ``cfg.get("…")`` key the plugin reads, across the loop package and the
+    modules around it. Text-scanned rather than AST'd because the reads are spread over
+    eleven files and the pattern is unambiguous."""
+    keys: set[str] = set()
+    for name in (
+        "loop/core.py",
+        "loop/_common.py",
+        "loop/drive.py",
+        "loop/reconcile.py",
+        "loop/preflight.py",
+        "store.py",
+        "config.py",
+        "setup_check.py",
+        "api.py",
+        "__init__.py",
+        "br_fetch.py",
+    ):
+        path = _ROOT / name
+        if path.exists():
+            keys |= set(re.findall(r'(?:self\.)?cfg\.get\(\s*"([a-z_0-9]+)"', path.read_text()))
+    return keys
+
+
+def test_every_config_key_the_code_reads_is_documented():
+    """A knob nobody can find is a knob nobody can use.
+
+    18 of 56 keys were not even in the plugin manifest — including `coders` and
+    `projects`, the two a multi-repo board cannot work without — so `POST /api/settings`
+    refused them and the console never rendered them. Being YAML-only is a legitimate
+    choice; being UNDISCOVERABLE is not."""
+    doc = _CONFIG_DOC.read_text()
+    missing = sorted(k for k in _config_keys() if f"`{k}`" not in doc)
+    assert not missing, (
+        f"{len(missing)} config key(s) are read by the code but absent from "
+        f"docs/configuration.md: {missing}. Add them with a default and whether the change "
+        f"is live, reload or restart — a stranger configures this board from that table."
+    )
