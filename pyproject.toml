@@ -29,3 +29,8 @@ ignore = ["E402", "E501", "E702", "E731", "E741"]
 
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
+# The loop/ package (#268) shares one module-level kernel: each edge module does
+# `from ._common import *` so its lifted-verbatim methods see the exact globals the
+# monolithic loop.py had. That is a deliberate star re-export, so F403 (star import)
+# and F405 (name may be from a star import) are expected here, not smells.
+"loop/*.py" = ["F403", "F405"]
