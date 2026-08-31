@@ -351,6 +351,18 @@ LABEL_BUDGET_PREFIX = "budget:"
 # block on the same card can alert again — the marker is scoped to the alert kind, not a
 # blanket "ever notified" flag.
 LABEL_NOTIFIED_PREFIX = "notified:"
+# Recovery-generation counter (#341 review) — `recovery-gen:<n>`, a monotone per-card
+# tally of GENUINE recoveries (`clear_blocked` bumps it, replaced not accumulated). It
+# exists to close an ABA the `notified:blocked` re-read/rollback alone could not: a clear
+# that lands between ``record_notified``'s initial blocked read and its provisional add,
+# FOLLOWED by a re-block before the post-write read, leaves the card blocked at re-read —
+# so the "still blocked?" check keeps the marker, but that marker belongs to the RESOLVED
+# incident and now silences the NEW block's operator alert. The generation makes the two
+# blocks distinguishable: any recovery in the write window increments it, so
+# ``record_notified`` sees the count move and rolls its marker back. Monotone increment
+# means the counter itself can never ABA back to the value the writer read. Never removed
+# (a recovered card keeps its tally); scoped to this dedup, not surfaced in the projection.
+LABEL_RECOVERY_GEN_PREFIX = "recovery-gen:"
 # Crash-salvage record (#91) — `verified:<sha>`, replaced (never accumulated) each time
 # coder.solve()'s verify boundary promotes a test-PASSING candidate. Written on the bead
 # (not loop memory) so it survives a crash between verify and open_pr; recovery's no-PR
@@ -439,6 +451,24 @@ def notified_from_labels(labels) -> set[str]:
         if kind:
             out.add(kind)
     return out
+
+
+def recovery_gen_from_labels(labels) -> int:
+    """The card's recovery generation (#341 review) — the highest `recovery-gen:<n>` label,
+    else 0 for a card that has never recovered. ``record_notified`` reads this before and
+    after its marker write; a value that MOVED means a genuine recovery landed in the write
+    window, so the marker is rolled back rather than stranded on a superseded incident. Max
+    (not first) so a transient double-label from a lost-update on the counter still reads as
+    'advanced', never regressing below what a writer already observed."""
+    best = 0
+    for label in labels or []:
+        s = str(label)
+        if not s.startswith(LABEL_RECOVERY_GEN_PREFIX):
+            continue
+        num = s[len(LABEL_RECOVERY_GEN_PREFIX) :].strip()
+        if num.isdigit():
+            best = max(best, int(num))
+    return best
 
 
 def replace_prefixed_label_args(labels, prefix: str, desired: str) -> list[str]:
@@ -2135,6 +2165,18 @@ class BeadsBoard:
             if str(label).startswith(LABEL_NOTIFIED_PREFIX) and label != f"{LABEL_NOTIFIED_PREFIX}blocked"
             for a in ("--remove-label", label)
         ]
+        # Bump the recovery generation (#341 review): a genuine recovery is exactly what
+        # ``record_notified`` must be able to detect landing in its marker-write window, so
+        # the ABA — clear THEN re-block between its two reads — cannot strand the resolved
+        # incident's marker on the new block. Replaced (never accumulated): drop any prior
+        # `recovery-gen:` label and stamp count+1. `br` applies removes AFTER adds, so the
+        # new value always differs from the old (count+1 > count) and never self-cancels.
+        # Folded into this same update so the recovery edge stays one write.
+        gen = recovery_gen_from_labels(labels)
+        args += [
+            a for label in labels if str(label).startswith(LABEL_RECOVERY_GEN_PREFIX) for a in ("--remove-label", label)
+        ]
+        args += ["--add-label", f"{LABEL_RECOVERY_GEN_PREFIX}{gen + 1}"]
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2320,27 +2362,43 @@ class BeadsBoard:
         enforced by a RE-READ *after* the write: the add is treated as provisional, the
         live state is re-checked, and a `blocked` marker is ROLLED BACK when the card is no
         longer blocked. The recovery edge stays authoritative and a stale marker never
-        outlives the recovery that raced it. The rollback remove is itself safe under a
-        concurrent RE-block: a re-block re-adds `blocked`, so the re-read observes it and
-        KEEPS the marker — only a card seen not-blocked after the write is rolled back.
-        (Recording 'the operator was told about a block' is meaningless once the block is
-        gone, so a recovered card is a normal outcome that returns rather than raises; the
-        write only fails, and only then raises, when `br` itself refuses.)"""
+        outlives the recovery that raced it.
+
+        The 'still blocked?' re-read alone is NOT enough, because the block flag is an ABA
+        signal (#341 review): a clear that lands after the initial read but before the add,
+        FOLLOWED by a re-block before the re-read, leaves the card blocked at re-read — so
+        the plain presence check keeps a marker that belongs to the RESOLVED incident and
+        silences the NEW block's operator alert. To distinguish the two blocks the guard
+        ALSO carries the recovery GENERATION (``recovery-gen:<n>``, bumped by every
+        ``clear_blocked``): the count is captured at the initial read and re-checked after
+        the write, and any advance means a genuine recovery landed in the window, so the
+        marker is rolled back regardless of the card looking blocked again. The counter is
+        monotone, so it can never ABA back to the captured value. A card that simply stayed
+        blocked (no recovery) keeps the same generation and KEEPS its marker. (Recording
+        'the operator was told about a block' is meaningless once the block was resolved and
+        re-raised, so that outcome returns rather than raises; the write only fails, and only
+        then raises, when `br` itself refuses.)"""
         kind = str(kind or "").strip() or "blocked"
         label = f"{LABEL_NOTIFIED_PREFIX}{kind}"
         f = self._require(fid)
-        if kind == "blocked" and LABEL_BLOCKED not in (f.get("labels") or []):
+        f_labels = f.get("labels") or []
+        if kind == "blocked" and LABEL_BLOCKED not in f_labels:
             return f
-        if label in (f.get("labels") or []):
+        if label in f_labels:
             return self.get_feature(fid)  # already marked — idempotent, no self-cancelling re-add
+        gen_before = recovery_gen_from_labels(f_labels)  # #341 review: the ABA discriminator
         self._run("update", fid, "--add-label", label)
         # Re-read the LIVE state AFTER the add (see the docstring's TOCTOU note): a genuine
-        # unblock that raced the add leaves the marker stranded on a recovered card, so roll
-        # it back off any card no longer blocked. Only the marker THIS call added is undone,
-        # and only when the card is not blocked, so a concurrent re-block keeps its marker.
+        # unblock that raced the add leaves the marker stranded on a recovered card. Roll it
+        # back off any card that is no longer blocked, OR whose recovery generation ADVANCED
+        # since the initial read — an advance means a clear (and possibly a re-block) landed
+        # in the write window, so this marker belongs to a superseded incident, not the block
+        # now on the card. Only the marker THIS call added is undone; a card that merely
+        # stayed blocked (same generation) keeps it.
         after = self.get_feature(fid)
         after_labels = after.get("labels") or []
-        if kind == "blocked" and label in after_labels and LABEL_BLOCKED not in after_labels:
+        recovered_mid_write = recovery_gen_from_labels(after_labels) != gen_before
+        if kind == "blocked" and label in after_labels and (LABEL_BLOCKED not in after_labels or recovered_mid_write):
             self._run("update", fid, "--remove-label", label)
             return self.get_feature(fid)
         return after

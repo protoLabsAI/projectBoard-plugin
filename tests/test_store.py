@@ -543,6 +543,87 @@ def test_project_exposes_notified_markers(make_board):
     assert b._project({"id": "bd-2", "status": "open", "labels": []})["notified"] == []
 
 
+# ── recovery-generation ABA guard (#341 review) — the marker re-read must distinguish a
+#    card that STAYED blocked from one that recovered-and-re-blocked in the write window ──
+
+
+def test_recovery_gen_from_labels_reads_the_highest():
+    assert store.recovery_gen_from_labels(["recovery-gen:3", "blocked"]) == 3
+    assert store.recovery_gen_from_labels(["recovery-gen:1", "recovery-gen:2"]) == 2  # max, never regress
+    assert store.recovery_gen_from_labels(["recovery-gen:", "ready"]) == 0  # empty/malformed ignored
+    assert store.recovery_gen_from_labels(["recovery-gen:x"]) == 0  # non-numeric ignored
+    assert store.recovery_gen_from_labels(None) == 0
+
+
+def test_clear_blocked_starts_the_recovery_generation_at_one(make_board, monkeypatch):
+    """A card that has never recovered gets `recovery-gen:1` on its first genuine unblock —
+    the signal record_notified reads to detect a recovery racing its marker write (#341)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
+    b.clear_blocked("bd-1")
+    (up,) = br.cmds("update")
+    assert "recovery-gen:1" in up
+
+
+def test_clear_blocked_bumps_and_replaces_the_recovery_generation(make_board, monkeypatch):
+    """Every genuine unblock ADVANCES the monotone recovery generation, replacing the prior
+    label rather than accumulating (#341 review) — so the counter can never ABA back to a
+    value a concurrent record_notified already captured."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:2"]})
+    b.clear_blocked("bd-1")
+    (up,) = br.cmds("update")
+    assert "--add-label" in up and "recovery-gen:3" in up  # advanced count+1
+    assert "--remove-label" in up and "recovery-gen:2" in up  # prior generation replaced, not kept
+
+
+def test_record_notified_keeps_the_marker_when_the_generation_is_unchanged(make_board, monkeypatch):
+    """A card that simply STAYED blocked across the write keeps its marker: the recovery
+    generation is identical at both reads, so the ABA rollback does not fire (#341 review)."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:3"]})
+    monkeypatch.setattr(
+        b,
+        "get_feature",
+        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "recovery-gen:3"]},
+    )
+    b.record_notified("bd-1", "blocked")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
+    assert not any(c[:2] == ("update", "bd-1") and "--remove-label" in c for c in br.calls)  # kept
+
+
+def test_record_notified_rolls_back_when_a_recovery_raced_the_write(make_board, monkeypatch):
+    """The ABA the 'still blocked?' re-read alone could NOT catch (#341 review): a genuine
+    clear lands after the initial blocked read but before the marker add, and a NEW distinct
+    block lands before the re-read — so the card looks blocked again, and a presence-only
+    check would keep a marker that belongs to the RESOLVED incident and silence the new
+    block's operator alert. The recovery generation MOVED (clear_blocked bumped it), so the
+    marker is rolled back and the new incident stays eligible for its own notification."""
+    br = Br()
+    b = make_board(br)
+    # initial read: blocked at recovery generation 1
+    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:1"]})
+    # a clear (→ gen 2) then a re-block raced the add: the re-read still shows `blocked`, but
+    # at the ADVANCED generation; then the post-rollback read leaves the new block un-marked
+    reads = iter(
+        [
+            {"id": "bd-1", "labels": ["blocked", "notified:blocked", "recovery-gen:2"]},  # stray marker, new block
+            {"id": "bd-1", "labels": ["blocked", "recovery-gen:2"]},  # after rollback: clean, still blocked
+        ]
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: next(reads))
+    out = b.record_notified("bd-1", "blocked")
+    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls  # the add landed…
+    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls  # …then was rolled back
+    assert "notified:blocked" not in (out.get("labels") or [])  # the new block is left un-suppressed
+    assert "blocked" in (out.get("labels") or [])  # …and the new block itself stands
+
+
 # ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
 
 
