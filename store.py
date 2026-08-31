@@ -886,16 +886,22 @@ class BeadsBoard:
             )
 
     # ── br invocation ─────────────────────────────────────────────────────────
-    def _run(self, *args: str, want_json: bool = False, with_has_more: bool = False):
+    def _run(self, *args: str, want_json: bool = False, with_has_more: bool = False, actor: str = ""):
         """Shell one ``br`` command; THE blocking seam (subprocess + contention sleeps),
         so async callers must reach it via ``asyncio.to_thread`` (#258 — see
         ``_warn_blocking_on_event_loop``). With ``want_json`` returns the normalized
         payload; adding ``with_has_more`` returns ``(payload, has_more)`` instead, the
         truncation signal riding THIS call's return value — never instance state a
-        concurrent caller could overwrite before it's read."""
+        concurrent caller could overwrite before it's read.
+
+        ``actor`` overrides the ``--actor`` identity for THIS call only (default: the store
+        actor). The task-claim path (#356) uses it to run ``--claim`` AS the dispatch
+        target, so the atomic claim stamps that target as owner instead of the board actor
+        — ``br`` REFUSES a duplicate ``--actor``, so a caller that needs a non-default actor
+        must pass it here rather than in ``args``. Every other caller keeps ``self.actor``."""
         _warn_blocking_on_event_loop(args[0] if args else "")
         self._ensure_workspace()  # pin to the repo's own .beads/ before any br op (#48)
-        cmd = [BR, *args, "--actor", self.actor]
+        cmd = [BR, *args, "--actor", actor or self.actor]
         if self.db:
             cmd += ["--db", self.db]
         if want_json:
@@ -1645,6 +1651,61 @@ class BeadsBoard:
             return None
         if assignee:
             self._run("update", fid, "--assignee", assignee)
+        return self.get_feature(fid)
+
+    def claim_task(self, fid: str, assignee: str = "") -> dict | None:
+        """Transition a ready TASK bead → `in_progress` while PRESERVING its existing
+        assignee/dispatch target (#356) — the task sibling of ``claim``.
+
+        A task's ``assignee`` is its DISPATCH TARGET (a sister agent, or the
+        ``self``/``agent`` aliases / the board's own name for first-party work —
+        #333/#334), NOT the claim marker the board actor stamps. The generic ``claim``
+        above runs ``br update --claim`` AS THE BOARD ACTOR, which reassigns the bead to
+        the actor AND refuses a bead already carrying a foreign assignee — so every ready
+        task assigned to any target OTHER than the actor was rejected and retried forever
+        as a lost claim race (the #356 livelock).
+
+        This claims AS THE DISPATCH TARGET (``--actor target``) instead: the SAME atomic,
+        write-locked ``br --claim`` compare-and-swap the coding claim relies on, but the
+        owner it stamps IS the dispatch target — so the target survives the transition
+        exactly (r1), and neither of ``--claim``'s two board-actor failure modes fires (it
+        assigns to the target, and a bead already assigned to the target is claimable BY
+        that target). The caller's target-resolution path (ACP / A2A / self / park) then
+        drives it unchanged. This is why the transition still goes through ``--claim`` and
+        not a bare ``--status`` write: the write must be a conditional CAS, not an
+        unconditional stomp (the previous cut's bug).
+
+        Atomic / state-race safe like ``claim`` (r3): re-reads the bead and only
+        transitions FROM ``ready`` (returns None if it already left the ready lane —
+        claimed, moved, or gone), and the ``--claim`` itself REFUSES (BoardError → None →
+        retry) if a concurrent actor reassigned the bead to a DIFFERENT owner between the
+        re-read and the claim, so a stale or hijacked ready card is never stomped. (beads
+        has no status-level CAS, and a bead pre-assigned to a shared target cannot be
+        claimed to a per-loop-unique owner — two loop instances both claiming AS the same
+        target is the irreducible residual the #356 ready-queue skip bound is the backstop
+        for, exactly as a shared board actor is for the coding ``claim``.)
+
+        The dispatch target is the caller's resolved ``assignee``, else whatever the bead
+        already carries, else the store actor — so a truly-unassigned task falls back to a
+        clean board-actor ``--claim`` (the SAME owned in_progress the old park produced for
+        it), while a named target is preserved."""
+        f = self.get_feature(fid)
+        if f is None or f["board_state"] != "ready":
+            return None
+        target = str(assignee or "").strip() or str(f.get("assignee") or "").strip() or self.actor
+        try:
+            # Atomic `--claim` (write-locked CAS) AS the dispatch target — stamps the target
+            # as owner + status=in_progress and drops the `ready` label so it projects
+            # in_progress. `actor=target` keeps the dispatch target instead of the board
+            # actor AND lets the claim pass (a target claiming its own bead is not refused).
+            self._run("update", fid, "--claim", "--remove-label", LABEL_READY, actor=target)
+        except BoardError as exc:
+            # The bead was reassigned to a DIFFERENT owner (operator triage / requeue) or
+            # otherwise moved under us, so `--claim` refused it: not claimable → retry. This
+            # is the conditional guard the coding claim gets for free — the transition never
+            # stomps a card a concurrent actor has taken.
+            log.info("[project_board] %s task not claimable (raced or reassigned under us): %s", fid, exc)
+            return None
         return self.get_feature(fid)
 
     # ── In Progress → In Review ───────────────────────────────────────────────
