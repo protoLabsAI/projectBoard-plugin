@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import hashlib
 import json
 import logging
 import os
@@ -66,7 +67,6 @@ from .store import (
     get_store,
     knob_bool,
     merge_posture,
-    notified_from_labels,
     reconfigure_cached_store,
 )
 
@@ -822,6 +822,11 @@ _SELF_HEALING_BLOCKS = frozenset({"rate-limit", "transient", "merge-conflict"})
 # Deliberately small: a card that has failed transiently three times is not unlucky, it
 # has a problem a human needs to see.
 _UNBLOCK_RETRY_MAX = 2
+# How long one blocked-card alert suppresses an identical repeat. Long, because a blocked
+# card can sit for hours and the inbox's 300s default would re-alert on every restart —
+# the exact noise #341 opened with. The KEY carries the incident, so a genuinely new
+# failure is never suppressed by this window.
+_ALERT_DEDUP_S = 7 * 24 * 3600
 
 
 def _inbox_db_path():
@@ -2004,7 +2009,6 @@ class BoardLoop:
                     await self._budget_set(store, fid, "unblock-retry", spent + 1)
                     await asyncio.to_thread(store.clear_blocked, fid)
                     await asyncio.to_thread(store.requeue, fid)
-                    self._notified_blocks.discard(fid)  # a LATER block is news again
                     log.info(
                         "[project_board] blocked sweep: %s auto-unblocked (%s, retry %d/%d): %s",
                         fid,
@@ -2014,27 +2018,6 @@ class BoardLoop:
                         reason[:120],
                     )
                     continue
-                # #341: the operator was told about THIS block in a PRIOR process — the
-                # bead carries the durable `notified:blocked` marker, which survived the
-                # restart that rebuilt `_notified_blocks` empty. Seed the per-process memo
-                # and skip, so a restart does not re-alert a block the operator already
-                # saw (the pre-fix behaviour, caught only by the inbox's 300s window). The
-                # marker is dropped only on a genuine unblock (`clear_blocked`, above and
-                # via the operator verb), so a LATER distinct block is news again.
-                marked = "blocked" in notified_from_labels(f.get("labels"))
-                # The BEAD is the source of truth; `_notified_blocks` is only a per-process
-                # cache of it. Whenever the durable marker is absent, drop the memo — a
-                # genuine unblock, an operator clear, or a provisional write that
-                # `record_notified` rolled back after losing a clear-and-reblock race. The
-                # memo used to outlive the rolled-back marker, so the NEXT distinct block on
-                # that card was suppressed — no alert AND no persistence — until a restart,
-                # which is the failure #341 exists to prevent (review r3).
-                if not marked:
-                    self._notified_blocks.discard(fid)
-                if fid not in self._notified_blocks and marked:
-                    self._notified_blocks.add(fid)
-                    continue
-                already = fid in self._notified_blocks
                 why = (
                     f"{cls or 'unclassified'} block"
                     if spent < _UNBLOCK_RETRY_MAX
@@ -2051,55 +2034,47 @@ class BoardLoop:
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
                     f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    incident=f"{cls}|{reason}",
                 )
-                # Persist the durable marker AFTER the alert (the loud log is the alert of
-                # last resort, so reaching here always notified the operator). Only on the
-                # FIRST notify this process (`already` was false); a stayed-blocked card is
-                # one alert. This write is separated from the alert above by the `await`, so
-                # a concurrent genuine unblock can land in between; `record_notified` guards
-                # on the card STILL being blocked (store.py) so it never resurrects the
-                # marker on an already-recovered card — a card that unblocked here is left
-                # clean and a LATER distinct block is news again. Fail SAFE (#341 r5): a
-                # lost marker write is logged with actionable evidence and NOT treated as
-                # recorded — the missing label lets a later sweep/restart re-alert (inbox
-                # dedup is the secondary guard), never a false 'already notified' the loop
-                # would trust as durable truth.
-                if not already:
-                    try:
-                        await asyncio.to_thread(store.record_notified, fid, "blocked")
-                    except Exception:  # noqa: BLE001
-                        log.warning(
-                            "[project_board] %s operator-notified marker NOT persisted — a restart "
-                            "may re-alert this block (inbox dedup is the only remaining guard)",
-                            fid,
-                            exc_info=True,
-                        )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
 
-    def _notify_operator(self, fid: str, text: str) -> None:
+    def _notify_operator(self, fid: str, text: str, *, incident: str = "") -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
 
-        Deduped on the feature id so a card that stays blocked across many sweeps is
-        reported once, not every five minutes — the point is to be noticed, and an alert
-        that repeats forever is an alert that gets filtered. This process-local memo is
-        the FAST guard; its durable half — the fact survives a restart — is the bead's
-        `notified:blocked` marker the caller (`_recover_blocked`) persists after this
-        returns (#341), so the inbox's own 300s dedup window is only a secondary guard.
+        Dedup is the whole difficulty here, and it is deliberately NOT solved with state
+        on our side. Earlier cuts tried a per-process memo, then a durable
+        ``notified:blocked`` label, then a rollback when a recovery raced the write, then
+        a recovery-generation counter to make the rollback safe — and review found a
+        narrower race in each. Every one of them was trying to answer "is this the same
+        incident?" by tracking OUR OWN writes across a distributed edge, which is the hard
+        version of the question.
+
+        The easy version: let the KEY answer it. ``dedup_key`` carries the incident's
+        identity — the card plus its failure class and reason — so the same block dedups
+        by construction, a genuinely different block is a different key and alerts, and no
+        bead label, memo, generation or rollback exists to go stale. A recovery followed
+        by a re-block for a DIFFERENT reason alerts because the key changed; a re-block for
+        the SAME reason is the same incident and the operator has already been told.
+
+        The window is long (`_ALERT_DEDUP_S`) because a blocked card can sit for hours and
+        the default 300s would re-alert on every restart — the failure #341 opened with.
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
         silence a block used to leave."""
-        if fid in self._notified_blocks:
-            return
-        self._notified_blocks.add(fid)
+        key = f"blocked:{fid}"
+        if incident.strip():
+            key += ":" + hashlib.sha1(incident.encode("utf-8", "replace")).hexdigest()[:12]
         try:
             from inbox import InboxStore  # host module — absent on older hosts
 
             db = _inbox_db_path()
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
-            InboxStore(str(db)).add(text, priority="now", source="project_board", dedup_key=f"blocked:{fid}")
+            InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S).add(
+                text, priority="now", source="project_board", dedup_key=key
+            )
             log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
             log.warning(

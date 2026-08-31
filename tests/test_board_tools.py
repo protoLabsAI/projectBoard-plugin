@@ -298,9 +298,6 @@ def test_board_unblock_feature_removes_the_blocked_label(make_board, monkeypatch
     (update,) = br.cmds("update")
     assert update[:2] == ("update", "bd-1")
     assert "--remove-label" in update and "blocked" in update
-    # recovery also supersedes the operator-notified marker, removed unconditionally so a
-    # mark_notified write racing the unblock cannot survive it (#341 review)
-    assert "notified:blocked" in update
 
 
 # ── the shared error path: a bad id surfaces as an Error string, not an exception ───

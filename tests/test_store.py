@@ -427,201 +427,8 @@ def test_project_exposes_budgets_from_labels(make_board):
 # ── operator-notified markers (#341) — the durable half of the blocked-lane dedup ─
 
 
-def test_record_notified_adds_the_marker_label(make_board, monkeypatch):
-    br = Br()
-    b = make_board(br)
-    # the post-write re-read shows the card STILL blocked → the marker is kept, not rolled back
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "blocked-class:auth"]})
-    b.record_notified("bd-1", "blocked")
-    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
-    assert not any(c[:2] == ("update", "bd-1") and "--remove-label" in c for c in br.calls)  # marker kept
-
-
-def test_record_notified_defaults_the_kind_to_blocked(make_board, monkeypatch):
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
-    b.record_notified("bd-1", "")
-    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
-
-
-def test_record_notified_is_idempotent_when_already_present(make_board, monkeypatch):
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["notified:blocked"]})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
-    b.record_notified("bd-1", "blocked")
-    assert not br.cmds("update")  # marker already there → no self-cancelling re-add
-
-
-def test_record_notified_skips_a_card_that_already_unblocked(make_board, monkeypatch):
-    """The review race: the alert and this delayed write straddle an `await`, so a genuine
-    unblock (`clear_blocked`) can strip the `blocked` flag and the prior marker in between.
-    Re-stamping `notified:blocked` onto an already-recovered card would mute a LATER
-    distinct block, so the guard leaves a not-blocked card untouched — no write burned."""
-    br = Br()
-    b = make_board(br)
-    # fresh read shows the card has RECOVERED (no `blocked` label) — the unblock won the race
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["ready"]})
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": ["ready"]})
-    out = b.record_notified("bd-1", "blocked")
-    assert not br.cmds("update")  # no stale marker re-added onto the recovered card
-    assert "notified:blocked" not in (out.get("labels") or [])
-
-
-def test_record_notified_rolls_back_a_marker_stranded_by_a_concurrent_unblock(make_board, monkeypatch):
-    """The TOCTOU the pre-read guard alone left open (#341 review): the guard read still
-    sees `blocked`, but a genuine unblock lands in the GAP before the add — so the add
-    strands `notified:blocked` on a now-recovered card, which would mute the alert for its
-    LATER distinct block. record_notified re-reads AFTER the add and rolls the marker back
-    off the recovered card, so the recovery edge stays authoritative."""
-    br = Br()
-    b = make_board(br)
-    # guard read: the unblock hasn't landed yet, so the card still looks blocked
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
-    # the post-write re-read, then the post-rollback read: the unblock won the race, leaving
-    # only the marker THIS call just added — which must not survive on the recovered card
-    reads = iter(
-        [
-            {"id": "bd-1", "labels": ["notified:blocked"]},  # recovered (no `blocked`) + stray marker
-            {"id": "bd-1", "labels": ["ready"]},  # after rollback: clean
-        ]
-    )
-    monkeypatch.setattr(b, "get_feature", lambda fid: next(reads))
-    out = b.record_notified("bd-1", "blocked")
-    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls  # the add landed…
-    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls  # …then was rolled back
-    assert "notified:blocked" not in (out.get("labels") or [])  # recovered card left clean
-
-
-def test_clear_notified_drops_the_marker(make_board, monkeypatch):
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked"]})
-    b.clear_notified("bd-1")
-    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls
-
-
-def test_clear_notified_noops_without_a_marker(make_board, monkeypatch):
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "ready"]})
-    b.clear_notified("bd-1")
-    assert not br.cmds("update")  # nothing to drop → no br write burned
-
-
-def test_clear_blocked_supersedes_the_notified_marker(make_board, monkeypatch):
-    """A genuine unblock is THE recovery edge: it drops the `notified:blocked` marker in
-    the SAME update as the block flag, so a LATER distinct block can alert again (#341)."""
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
-    monkeypatch.setattr(
-        b,
-        "_require",
-        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "tier:opus"]},
-    )
-    b.clear_blocked("bd-1")
-    (up,) = br.cmds("update")
-    assert "--remove-label" in up and "blocked" in up and "notified:blocked" in up
-    assert "tier:opus" not in up  # an earned rung is untouched
-
-
-def test_notified_from_labels_parses_and_ignores_junk():
-    assert store.notified_from_labels(["notified:blocked", "ready", "budget:ci-fix:2"]) == {"blocked"}
-    assert store.notified_from_labels(["notified:", "blocked"]) == set()  # empty kind / non-marker → ignored
-    assert store.notified_from_labels(None) == set()
-
-
-def test_project_exposes_notified_markers(make_board):
-    b = make_board(Br())
-    f = b._project({"id": "bd-1", "status": "open", "labels": ["notified:blocked", "gens:3"]})
-    assert f["notified"] == ["blocked"]
-    assert b._project({"id": "bd-2", "status": "open", "labels": []})["notified"] == []
-
-
 # ── recovery-generation ABA guard (#341 review) — the marker re-read must distinguish a
 #    card that STAYED blocked from one that recovered-and-re-blocked in the write window ──
-
-
-def test_recovery_gen_from_labels_reads_the_highest():
-    assert store.recovery_gen_from_labels(["recovery-gen:3", "blocked"]) == 3
-    assert store.recovery_gen_from_labels(["recovery-gen:1", "recovery-gen:2"]) == 2  # max, never regress
-    assert store.recovery_gen_from_labels(["recovery-gen:", "ready"]) == 0  # empty/malformed ignored
-    assert store.recovery_gen_from_labels(["recovery-gen:x"]) == 0  # non-numeric ignored
-    assert store.recovery_gen_from_labels(None) == 0
-
-
-def test_clear_blocked_starts_the_recovery_generation_at_one(make_board, monkeypatch):
-    """A card that has never recovered gets `recovery-gen:1` on its first genuine unblock —
-    the signal record_notified reads to detect a recovery racing its marker write (#341)."""
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
-    b.clear_blocked("bd-1")
-    (up,) = br.cmds("update")
-    assert "recovery-gen:1" in up
-
-
-def test_clear_blocked_bumps_and_replaces_the_recovery_generation(make_board, monkeypatch):
-    """Every genuine unblock ADVANCES the monotone recovery generation, replacing the prior
-    label rather than accumulating (#341 review) — so the counter can never ABA back to a
-    value a concurrent record_notified already captured."""
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:2"]})
-    b.clear_blocked("bd-1")
-    (up,) = br.cmds("update")
-    assert "--add-label" in up and "recovery-gen:3" in up  # advanced count+1
-    assert "--remove-label" in up and "recovery-gen:2" in up  # prior generation replaced, not kept
-
-
-def test_record_notified_keeps_the_marker_when_the_generation_is_unchanged(make_board, monkeypatch):
-    """A card that simply STAYED blocked across the write keeps its marker: the recovery
-    generation is identical at both reads, so the ABA rollback does not fire (#341 review)."""
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:3"]})
-    monkeypatch.setattr(
-        b,
-        "get_feature",
-        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "recovery-gen:3"]},
-    )
-    b.record_notified("bd-1", "blocked")
-    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls
-    assert not any(c[:2] == ("update", "bd-1") and "--remove-label" in c for c in br.calls)  # kept
-
-
-def test_record_notified_rolls_back_when_a_recovery_raced_the_write(make_board, monkeypatch):
-    """The ABA the 'still blocked?' re-read alone could NOT catch (#341 review): a genuine
-    clear lands after the initial blocked read but before the marker add, and a NEW distinct
-    block lands before the re-read — so the card looks blocked again, and a presence-only
-    check would keep a marker that belongs to the RESOLVED incident and silence the new
-    block's operator alert. The recovery generation MOVED (clear_blocked bumped it), so the
-    marker is rolled back and the new incident stays eligible for its own notification."""
-    br = Br()
-    b = make_board(br)
-    # initial read: blocked at recovery generation 1
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked", "recovery-gen:1"]})
-    # a clear (→ gen 2) then a re-block raced the add: the re-read still shows `blocked`, but
-    # at the ADVANCED generation; then the post-rollback read leaves the new block un-marked
-    reads = iter(
-        [
-            {"id": "bd-1", "labels": ["blocked", "notified:blocked", "recovery-gen:2"]},  # stray marker, new block
-            {"id": "bd-1", "labels": ["blocked", "recovery-gen:2"]},  # after rollback: clean, still blocked
-        ]
-    )
-    monkeypatch.setattr(b, "get_feature", lambda fid: next(reads))
-    out = b.record_notified("bd-1", "blocked")
-    assert ("update", "bd-1", "--add-label", "notified:blocked") in br.calls  # the add landed…
-    assert ("update", "bd-1", "--remove-label", "notified:blocked") in br.calls  # …then was rolled back
-    assert "notified:blocked" not in (out.get("labels") or [])  # the new block is left un-suppressed
-    assert "blocked" in (out.get("labels") or [])  # …and the new block itself stands
 
 
 # ── merged-verify budget operator reset (ADR 0326, #326) ─────────────────────────
@@ -1940,7 +1747,6 @@ def test_clear_blocked_dispatch_infra_on_a_never_escalated_card_leaves_difficult
     assert up[:2] == ("update", "bd-9")
     assert "blocked" in up and "blocked-class:dispatch-infra" in up  # stale infra class dropped
     assert "diff:small" not in up  # difficulty untouched
-    assert "notified:blocked" in up  # unconditional marker removal (#341 review)
 
 
 def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board, monkeypatch):
@@ -1973,10 +1779,6 @@ def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):
     (up,) = br.cmds("update")
     assert up[:2] == ("update", "bd-9")
     assert "blocked" in up and "tier:reasoning" not in up  # the tier record is untouched
-    # …plus the unconditional operator-notified removal (#341 review): it is emitted even
-    # when the snapshot shows no marker, because a mark_notified add racing THIS read is
-    # invisible here and would otherwise survive the recovery and mute the NEXT incident.
-    assert "notified:blocked" in up
 
 
 # ── invariant #2: the single Done edge (record_merge) ───────────────────────────
@@ -4976,40 +4778,3 @@ def test_a_reblock_for_the_SAME_class_keeps_its_label(make_board, monkeypatch):
     (up,) = br.cmds("update")
     assert "blocked-class:transient" in up
     assert "--remove-label" not in up, "removing the label it is adding nets to removed"
-
-
-def test_clear_blocked_removes_the_notified_marker_it_cannot_see(make_board, monkeypatch):
-    """#341 review, the race: `mark_notified` writes its marker provisionally and re-reads
-    to roll it back if the card recovered meanwhile. If a `clear_blocked` that STARTED
-    before that write only removed markers its own snapshot saw, the new marker survived
-    the recovery — and a re-block arriving before the re-read then made that stale marker
-    look live, silently muting the alert for the NEW incident.
-
-    A read can never be authoritative about a write that has not happened yet, so the
-    canonical marker is removed regardless of the snapshot. `br` treats removing an absent
-    label as a no-op, so the only cost is one argument on a write already being made."""
-    br = Br()
-    b = make_board(br)
-    # the snapshot shows NO notified marker — exactly the racing-write case
-    monkeypatch.setattr(b, "_require", lambda fid: {"id": fid, "labels": ["blocked"]})
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
-    b.clear_blocked("bd-9")
-    (up,) = br.cmds("update")
-    assert "notified:blocked" in up
-
-
-def test_clear_blocked_still_drops_other_notified_kinds_it_can_see(make_board, monkeypatch):
-    """The unconditional removal covers the canonical `blocked` kind; any OTHER
-    `notified:<kind>` present in the snapshot is still dropped, and not duplicated."""
-    br = Br()
-    b = make_board(br)
-    monkeypatch.setattr(
-        b,
-        "_require",
-        lambda fid: {"id": fid, "labels": ["blocked", "notified:blocked", "notified:stalled"]},
-    )
-    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid})
-    b.clear_blocked("bd-9")
-    (up,) = br.cmds("update")
-    assert "notified:stalled" in up
-    assert up.count("notified:blocked") == 1  # unconditional + snapshot must not double up
