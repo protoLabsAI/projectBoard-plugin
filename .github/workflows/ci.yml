@@ -88,3 +88,53 @@ jobs:
         env:
           PB_REQUIRE_BR: "1"
         run: pytest -q ${{ matrix.pytest_args }}
+
+  test-gh:
+    # The real-GitHub integration tier (#361 slice 2, tests/test_worktree_gh.py): the ACTUAL
+    # `gh`/GitHub against a PINNED, permanently-open fixture PR. It exercises the 12 read-dominant
+    # worktree GitHub seams a mocked `_gh` cannot validate — the blindness that shipped #354 (a
+    # PAT that cannot POST /check-runs, green through every mock). It needs a credential that can
+    # create the ONE idempotent commit status (statuses: write) + ONE idempotent marked comment
+    # (pull-requests/issues: write) on the fixture PR, and the fixture PR URL.
+    #
+    # Runs only where that credential EXISTS: same-repo PRs (the loop opens its PRs from same-repo
+    # branches), pushes to main, and manual dispatch — NOT fork PRs, whose GITHUB_TOKEN is
+    # read-only and whose secrets are withheld. A fork PR is the credential-absent case the tier
+    # skips locally, NOT a misconfigured silent skip; the enforced legs above cover every PR the
+    # loop actually opens. `contents` stays READ so the token cannot merge — belt-and-suspenders
+    # with the wrong-`expected_head` refusal in the merge_pr test: the permanently-open fixture is
+    # never merged.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    name: test (real gh)
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Verify gh is present
+        run: gh --version
+
+      - name: Test (real-GitHub tier)
+        # PB_REQUIRE_GH=1 turns an absent/unusable credential — or an unconfigured fixture PR —
+        # into a FAILURE (the guard test in tests/test_worktree_gh.py) instead of a silent skip of
+        # the whole tier: a silent skip is exactly how #354 shipped green. GH_TOKEN is the ambient
+        # `gh` credential (no token is embedded in the suite); PB_GH_FIXTURE_PR is the maintained
+        # `PB_GH_FIXTURE_PR` repo variable pointing at the pinned, permanently-open fixture PR, so
+        # the number lives in one place rather than hard-coded into the tests (r6).
+        env:
+          PB_REQUIRE_GH: "1"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PB_GH_FIXTURE_PR: ${{ vars.PB_GH_FIXTURE_PR }}
+        run: pytest -q tests/test_worktree_gh.py

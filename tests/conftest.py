@@ -13,9 +13,15 @@ inside ``register()``), so no protoAgent host is needed to run these tests.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -107,3 +113,117 @@ def make_board(monkeypatch):
         return b
 
     return _make
+
+
+# ── Real-GitHub integration tier (#361 slice 2) ──────────────────────────────────────
+# Mirrors the real-`br` tier (tests/test_integration.py): tests/test_worktree_gh.py shells
+# the ACTUAL `gh`/GitHub against a PINNED, permanently-open PR to exercise the 12 read-
+# dominant worktree GitHub seams a mocked `_gh` cannot validate — the exact blindness that
+# shipped #354 (a PAT that cannot POST /check-runs, green through every mock, publishing to
+# nothing for a day). Locally the tier SKIPS when GitHub credentials are unavailable; CI sets
+# PB_REQUIRE_GH=1 so an absent/unusable credential (or an unconfigured fixture) FAILS the
+# guard test rather than silently skipping — a silent skip is a fake with extra ceremony.
+#
+# No credential is embedded here: the token rides the ambient `gh` auth (GH_TOKEN /
+# `gh auth login`); a PR URL is a PUBLIC identifier, never a secret. Required environment,
+# documented and credential-free:
+#   PB_GH_FIXTURE_PR — full URL of the pinned, permanently-open fixture PR in the checkout's
+#                      repo, e.g. https://github.com/protoLabsAI/projectBoard-plugin/pull/<n>.
+#                      CI wires the maintained value via the `PB_GH_FIXTURE_PR` repo variable
+#                      so the number lives in one place, never hard-coded into the suite.
+#   PB_REQUIRE_GH=1  — (CI only) turn an absent/unusable prerequisite into a FAILURE.
+#   GH_TOKEN         — (CI only) the gh credential; a repo-scoped token that can create a
+#                      commit status + a PR comment on the fixture PR (mirrors the board's PAT).
+
+GH_FIXTURE_PR_URL = (os.environ.get("PB_GH_FIXTURE_PR") or "").strip()
+_GH_PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+
+
+class GhFixture(NamedTuple):
+    """The resolved pinned-PR context the real-GitHub seam tests read against."""
+
+    url: str
+    slug: str
+    number: str
+    head_sha: str
+    head_branch: str
+    repo_dir: str
+
+
+def gh_credentialed() -> bool:
+    """`gh` on PATH AND carrying a usable credential — the real-GitHub tier's prerequisite.
+    ``gh auth status`` exits 0 only when a token (GH_TOKEN or a stored login) is present and
+    syntactically accepted; it is the same gate `gh` applies before every API call, so a green
+    here means the reads/writes can at least authenticate. Absent → the tier skips locally and
+    FAILS under PB_REQUIRE_GH."""
+    if shutil.which("gh") is None:
+        return False
+    try:
+        return subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30).returncode == 0
+    except Exception:  # noqa: BLE001 — an unusable gh is simply "not credentialed"
+        return False
+
+
+def gh_tier_ready() -> tuple[bool, str]:
+    """(ready, reason) for the whole real-GitHub tier: a usable `gh` credential AND a configured
+    pinned fixture PR. ``reason`` is the local skip message / the CI failure message."""
+    if not gh_credentialed():
+        return False, "no usable `gh` credential (set GH_TOKEN or run `gh auth login`) for the real-GitHub tier"
+    if not GH_FIXTURE_PR_URL:
+        return False, "PB_GH_FIXTURE_PR is not set to the pinned permanently-open fixture PR URL"
+    return True, ""
+
+
+def _gh_setup(*args: str, cwd: str, timeout: float = 60) -> str:
+    """Real `gh` for FIXTURE setup ONLY (never under test) — raises on a non-zero exit, returns
+    stripped stdout. The seam functions are what the tests exercise; this merely resolves the
+    pinned PR's immutable facts (state, head sha/branch) the assertions pin against, exactly as
+    tests/test_worktree_git.py uses ``_git_run`` for setup and ``worktree.*`` under test."""
+    proc = subprocess.run(["gh", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args)} failed ({proc.returncode}): {(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout.strip()
+
+
+def _gh_setup_json(*args: str, cwd: str, timeout: float = 60) -> dict:
+    """``_gh_setup`` that parses a ``gh ... --json`` object payload — one round-trip for the
+    fixture's whole identity, raising on a non-object/unparseable body."""
+    data = json.loads(_gh_setup(*args, cwd=cwd, timeout=timeout) or "{}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"gh {' '.join(args)} returned a non-object payload: {type(data).__name__}")
+    return data
+
+
+@pytest.fixture
+def gh_fixture() -> GhFixture:
+    """Resolve the pinned, permanently-open fixture PR into a :class:`GhFixture` via REAL `gh`
+    (setup calls, not the seams under test), or skip / fail per the tier's local/CI posture.
+
+    Reads the PR's identity ONCE — head sha (40-hex), head branch, slug, number — and asserts it
+    is OPEN, so every seam test pins its head-bound results against a SINGLE authoritative head
+    (#328/#347: a verdict must never be attributed to a moved head). ``repo_dir`` is the checkout
+    root, the cwd `gh` resolves repo + auth from."""
+    ready, reason = gh_tier_ready()
+    if not ready:
+        if os.environ.get("PB_REQUIRE_GH"):
+            pytest.fail(
+                f"PB_REQUIRE_GH is set but the real-GitHub tier cannot run: {reason}. Fix the CI "
+                f"credential/fixture wiring (GH_TOKEN + the PB_GH_FIXTURE_PR repo variable) — a silent "
+                f"skip here is exactly how #354 shipped green."
+            )
+        pytest.skip(reason)
+    m = _GH_PR_URL_RE.search(GH_FIXTURE_PR_URL)
+    assert m, f"PB_GH_FIXTURE_PR is not a GitHub PR URL: {GH_FIXTURE_PR_URL!r}"
+    slug, number = m.group(1), m.group(2)
+    repo_dir = str(ROOT)
+    facts = _gh_setup_json("pr", "view", GH_FIXTURE_PR_URL, "--json", "state,headRefOid,headRefName", cwd=repo_dir)
+    state, head_sha, head_branch = facts.get("state"), facts.get("headRefOid"), facts.get("headRefName")
+    assert state == "OPEN", (
+        f"the pinned fixture PR {GH_FIXTURE_PR_URL} is {state!r}, not OPEN — the tier needs a "
+        f"PERMANENTLY-open PR; repoint PB_GH_FIXTURE_PR at one that is kept open"
+    )
+    assert isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha), (
+        f"unexpected fixture head sha shape: {head_sha!r}"
+    )
+    assert isinstance(head_branch, str) and head_branch, f"unexpected fixture head branch: {head_branch!r}"
+    return GhFixture(GH_FIXTURE_PR_URL, slug, number, head_sha, head_branch, repo_dir)
