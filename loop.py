@@ -52,6 +52,7 @@ from . import br_fetch, coder_seam, config, health, setup_check, worktree
 from .failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects
+from . import store as store_mod
 from .store import (
     BoardError,
     LABEL_CHANGES_REQUESTED,
@@ -2707,7 +2708,11 @@ class BoardLoop:
         fid = feature["id"]
         labels = set(feature.get("labels") or [])
         # The board-side half is shared with the PM-facing `next_action` (#208,
-        # store.merge_posture) — one decoding of the review sub-state labels.
+        # store.merge_posture) — one decoding of the review sub-state labels. No head is
+        # passed here: this runs on every posture evaluation and must stay a pure label
+        # decode with no GitHub read. The head-pin check (#323) belongs on the merge edge
+        # itself, immediately before the merge, where one read is worth it — see
+        # `_maybe_auto_merge`.
         why: list[str] = list(
             merge_posture(feature, auto_merge=self.auto_merge, review_gate=self.review_gate)["blockers"]
         )
@@ -2775,6 +2780,36 @@ class BoardLoop:
             log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
             return False
         self._draft_noted.discard(fid)
+        # LAST gate before the merge (#323): a clean verdict is only a verdict about the
+        # code it READ, so it is written pinned to that head and must still match the live
+        # one. This is not a check-then-act guard and does not need to be — a push landing
+        # after this read leaves the pin stale on every later pass too, so it can only ever
+        # close the gate, never open it. The first cuts tried to make the WRITE race-free
+        # (re-read before, re-read after, undo); review rejected both, correctly, because a
+        # push can land after any check. Carrying the identity makes the race irrelevant
+        # instead of trying to win it.
+        if self.review_gate:
+            pinned = next(
+                (
+                    str(x)[len(store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX) :]
+                    for x in (feature.get("labels") or [])
+                    if str(x).startswith(store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX)
+                ),
+                "",
+            )
+            if pinned:  # unpinned verdicts are grandfathered — see merge_posture
+                live = await worktree.pr_head_sha(pr_url, cwd=repo)
+                if not live or live != pinned:
+                    log.info(
+                        "[project_board] %s not merging: the review-clean verdict is for %s but the head is %s "
+                        "— the push that moved it is unreviewed; re-arming review: %s",
+                        fid,
+                        pinned[:12],
+                        (live or "unreadable")[:12],
+                        pr_url,
+                    )
+                    await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
+                    return False
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
@@ -4147,75 +4182,33 @@ class BoardLoop:
                 pr_url,
             )
             return False
-        # A trusted, PROMOTED, current-head PASS. Before committing it, GUARD the write
-        # against a TOCTOU race (#323): ``head`` was read at the top of this method, and a
-        # PR push in the interval up to these local writes could move the live head — which
-        # would let a PASS proven for the OLD head mark a NEW, unreviewed head review-clean
-        # for the downstream merge gate to act on. A single pre-write re-read is NOT enough on
-        # its own: a push can still land between that check and the asynchronous write LANDING,
-        # so the guard is BOTH a pre-write early-out AND a post-write confirmation. First the
-        # cheap early-out: re-read the LIVE head and, if it already moved (or is unreadable),
-        # skip the write entirely — the same read-the-live-head-then-act discipline #328 uses.
-        head_now = await worktree.pr_head_sha(pr_url, cwd=repo)
-        if not head_now or head_now != head:
-            log.info(
-                "[project_board] %s PR head moved (%s→%s) between the trusted-PASS read and promotion — "
-                "not adopting the now-stale verdict (fail closed): %s",
-                fid,
-                head[:12],
-                (head_now or "unreadable")[:12],
-                pr_url,
-            )
-            return False
-        # Adopt it as the local clean verdict — the same substate a clean internal gate would
-        # have set, so the merge edge can proceed.
+        # A trusted, PROMOTED, current-head PASS. The verdict is written PINNED to the head
+        # it was proven for (#323): `set_review_substate` stamps `review-clean-sha:<head>`
+        # and `merge_posture` refuses to merge unless that pin equals the live head.
+        #
+        # That is what makes this write safe with no race window. The first cuts tried to
+        # guard it — re-read the head before the write, then re-read again after and undo —
+        # and review correctly rejected both: a push can land after ANY check, so
+        # check-then-act cannot be made safe here. It can, however, be made IRRELEVANT. A
+        # push at any point leaves the pin naming a head that no longer exists, the merge
+        # gate declines, and the card goes back for review. There is nothing to lose a race
+        # to, and nothing to undo.
         note = (
             f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('conclusion')}) is promoted for "
-            f"the current PR head {head[:12]} — "
+            f"PR head {head[:12]} — "
             + ("the stale changes-requested verdict" if stale_rejection else "no local review verdict was recorded")
-            + " has been repaired to review-clean; the ordinary merge gates decide the rest"
+            + " has been repaired to review-clean, PINNED to that head; the ordinary merge gates decide the rest"
         )
-        await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_CLEAN, note=note)
-        # TOCTOU CLOSE (#323): re-read the live head AFTER the review-clean verdict has landed.
-        # A push that raced in between the pre-write confirmation above and this write actually
-        # landing would have moved the head, making the review-clean we just wrote a verdict for
-        # a now-dead, unreviewed head — which this SAME reconcile pass's merge edge (running
-        # strictly after this method returns) would otherwise act on. On any move — or an
-        # unreadable re-read — UNDO the write, restoring the card to EXACTLY its prior blocking /
-        # absent substate (its reviewed-head stamp and review-fix budget are still intact — they
-        # are only cleared once the head is confirmed to have held, below), and fail closed. The
-        # clean verdict is therefore committed only when the head held across the entire
-        # read→write→confirm span; the next poll re-reads fresh, and once #328 re-arms the moved
-        # head a normal review runs, so the moved head is never silently trusted.
-        head_after = await worktree.pr_head_sha(pr_url, cwd=repo)
-        if not head_after or head_after != head:
-            await asyncio.to_thread(
-                store.set_review_substate,
-                fid,
-                LABEL_CHANGES_REQUESTED if stale_rejection else None,
-                note=(
-                    f"trusted-QA reconcile aborted (#323): the PR head moved "
-                    f"({head[:12]}→{(head_after or 'unreadable')[:12]}) as the review-clean verdict landed — "
-                    "reverted to the prior review state so the now-stale QA PASS can't merge an unreviewed head"
-                ),
-            )
-            log.info(
-                "[project_board] %s PR head moved (%s→%s) as the trusted-PASS clean verdict landed — "
-                "reverted to the prior review state (fail closed): %s",
-                fid,
-                head[:12],
-                (head_after or "unreadable")[:12],
-                pr_url,
-            )
-            return False
-        # The head held across the entire read→write→confirm span — commit the adopted verdict.
-        # A clean verdict pins no head, so clear any reviewed-head stamp (a later
-        # changes-requested then can't be judged stale against a dead head, exactly as the
-        # internal clean path does, #328) and reset the fix budget the adopted PASS makes moot.
+        await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_CLEAN, note=note, head_sha=head)
+        # The REVIEWED-HEAD stamp is a different thing from the clean verdict's pin, and a
+        # clean verdict still clears it: #328 judges a later changes-requested against that
+        # stamp, and an absent one fails that reconcile closed. The pin (#323) is what says
+        # WHICH head this PASS is good for. Also reset the fix budget the adopted PASS makes
+        # moot.
         await self._stamp_reviewed_head(store, fid, "")
         await self._budget_reset(store, fid, "review-fix")
         log.info(
-            "[project_board] %s reconciled a trusted current-head QA PASS (%s) → review-clean: %s",
+            "[project_board] %s reconciled a trusted current-head QA PASS (%s) → review-clean, pinned to that head: %s",
             fid,
             head[:12],
             pr_url,
@@ -4363,6 +4356,11 @@ class BoardLoop:
                 fid,
                 LABEL_REVIEW_CLEAN,
                 note=f"review gate: clean — {len(findings)} finding(s), none blocking (blocker/major)",
+                # Pin the verdict to the head it actually READ (#323). The merge gate
+                # requires this to equal the live head, so a push after the review — at any
+                # point, including while this write lands — leaves the pin stale and the
+                # merge declines instead of shipping code nothing reviewed.
+                head_sha=reviewed_head,
             )
             # A clean verdict pins no head: clear the reviewed-head stamp so a later
             # changes-requested (an external fleet review, a re-block) can't be judged

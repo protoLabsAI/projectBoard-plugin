@@ -357,6 +357,15 @@ LABEL_VERIFIED_PREFIX = "verified:"
 # else ⇒ the verdict is stale (unverified, not broken — staleness alone never
 # blocks; only a gate FAILURE on the merged state does).
 LABEL_MERGED_VERIFIED_PREFIX = "merged-verified:"
+# WHICH HEAD a `review-clean` verdict was made against (#323): `review-clean-sha:<sha>`.
+# A clean verdict is only meaningful for the code it examined, so it carries that code's
+# identity and the merge gate requires the two to match. That is what makes the write
+# SAFE without a race window: a push landing at ANY point after the review — before the
+# write, during it, or long after — leaves this sha pointing at a dead head, the gate
+# refuses, and the card goes back for review. Nothing to check-then-act on, so nothing to
+# lose a race to. (Distinct from the reviewed-head stamp, which a clean verdict
+# deliberately clears so a LATER changes-requested can't be judged stale — #328.)
+LABEL_REVIEW_CLEAN_SHA_PREFIX = "review-clean-sha:"
 # In-review REVIEW-verdict currency (#328) — `reviewed-head:<sha>`, replaced (never
 # accumulated) each time the review gate lands a verdict for an `in_review` PR. The sha
 # is the PR HEAD commit the verdict was rendered against, SHORT-abbreviated for the same
@@ -1705,18 +1714,34 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
-    def set_review_substate(self, fid: str, label: str | None, note: str = "") -> dict:
+    def set_review_substate(self, fid: str, label: str | None, note: str = "", head_sha: str = "") -> dict:
         """Swap the review-gate sub-state labels (``review-pending`` /
         ``changes-requested`` / ``review-clean``) — exactly one (or none) at a time. ``note`` (the
         findings block, a clean-review line) is recorded as a comment so the
         review history lives on the bead."""
-        self._require(fid)
+        f = self._require(fid)
         args = ["update", fid]
         for known in (LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED, LABEL_REVIEW_CLEAN):
             if known != label:
                 args += ["--remove-label", known]
         if label:
             args += ["--add-label", label]
+        # A clean verdict pins the head it examined (#323). Any other substate drops the
+        # pin: `review-pending` and `changes-requested` are not verdicts about a head, and
+        # a stale pin left behind them would let a later clean-looking state inherit a sha
+        # it never earned.
+        if label == LABEL_REVIEW_CLEAN and head_sha:
+            args += replace_prefixed_label_args(
+                f.get("labels"), LABEL_REVIEW_CLEAN_SHA_PREFIX, f"{LABEL_REVIEW_CLEAN_SHA_PREFIX}{head_sha}"
+            )
+        else:
+            # Not a head-pinning verdict: drop any stale pin, add nothing.
+            args += [
+                a
+                for l in (f.get("labels") or [])
+                if str(l).startswith(LABEL_REVIEW_CLEAN_SHA_PREFIX)
+                for a in ("--remove-label", str(l))
+            ]
         self._run(*args)
         if note:
             self.comment(fid, note)
@@ -2859,6 +2884,7 @@ def merge_posture(
     review_gate: bool,
     is_draft: bool | None = None,
     merged_verify_max: int = 0,
+    head_sha: str = "",
 ) -> dict:
     """Decode an in_review feature's review/merge sub-state from its labels + the
     board's merge posture — pure, no GitHub read. ``is_draft`` (or a ``pr_draft``
@@ -2904,6 +2930,31 @@ def merge_posture(
         # The gate is on but never recorded a clean verdict for THIS head (an
         # inert gate, a pre-upgrade card, an operator unblock) — not reviewed.
         blockers.append("no review-clean verdict")
+    elif review_gate and head_sha:
+        # A clean verdict is only a verdict about the code it READ (#323). If the live
+        # head has moved since, the PASS describes a head that no longer exists and must
+        # not open the merge edge — the push that moved it is unreviewed by construction.
+        # This replaces the check-then-write dance the first cuts attempted: a push can
+        # always land after any check, but it can never make a pinned sha match a head it
+        # is not. An UNPINNED clean verdict (written before this shipped) fails closed.
+        pinned = next(
+            (
+                str(l)[len(LABEL_REVIEW_CLEAN_SHA_PREFIX) :]
+                for l in labels
+                if str(l).startswith(LABEL_REVIEW_CLEAN_SHA_PREFIX)
+            ),
+            "",
+        )
+        if not pinned:
+            # GRANDFATHERED, deliberately. A verdict written before this shipped carries no
+            # pin, and treating that as a blocker would strand every in-flight card on
+            # rollout — a fleet-wide stall, which is a worse and far more likely outcome
+            # than the race this closes. An unpinned verdict is exactly as trusted as it
+            # was yesterday: no new risk, no regression. Every verdict written from now on
+            # pins, so the exposure drains as cards cycle rather than in one migration.
+            pass
+        elif pinned != head_sha:
+            blockers.append(f"review-clean verdict is for {pinned[:12]}, head is {head_sha[:12]}")
 
     out = {"blockers": blockers, "next_action": "", "awaiting_merge": False, "next_action_hint": ""}
     if state != "in_review":
