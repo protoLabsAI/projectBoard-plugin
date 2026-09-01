@@ -978,24 +978,57 @@ def test_breadth_gate_refuses_an_oversized_medium_card(make_board, monkeypatch):
     assert br.cmds("update") == []  # nothing mutated on a rejected gate
 
 
-def test_breadth_gate_exempts_a_large_card_with_a_design(make_board, monkeypatch):
-    """The SAME 8-path card, re-declared `large` with a design citing an ADR, passes:
-    large/architectural carry no breadth cap — they answer to the DESIGN gate instead."""
+def test_breadth_gate_caps_large_too_even_with_a_design(make_board, monkeypatch):
+    """#378: `large` used to be EXEMPT, on the theory that the design gate would catch a
+    card too wide to build. A live board disproved it — bd-sxxf was `large` with 8 paths,
+    carried a design citing ADR 0071, passed the design gate, and then timed out at 1800s
+    twice with all four candidates having written a complete implementation. Design quality
+    and buildable width are different properties; only the second causes timeouts. So the
+    SAME 8-path card, re-declared `large` WITH a design, is still refused."""
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(
         b, "get_feature", lambda fid: _breadth_feature(difficulty="large", design="Per ADR 0143, this is one unit.")
     )
+    with pytest.raises(BoardError) as exc_info:
+        b.mark_ready("bd-8")
+    err = str(exc_info.value)
+    assert "Breadth gate" in err
+    assert "cap of 6" in err  # large's cap, not medium's
+    assert br.cmds("update") == []  # nothing mutated on a rejected gate
+
+
+def test_breadth_gate_admits_a_large_card_inside_its_wider_cap(make_board, monkeypatch):
+    """`large` is capped, not banned: it earns a WIDER cap than medium (6 vs 4), so a
+    genuinely large-but-buildable card still goes ready — with its design, as before."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "get_feature",
+        lambda fid: _breadth_feature(
+            difficulty="large",
+            design="Per ADR 0143, this is one unit.",
+            files_to_modify=[f"f{i}.py (new)" for i in range(6)],
+        ),
+    )
     b.mark_ready("bd-8")
     assert ("update", "bd-8", "--add-label", "ready", "--remove-label", "designing") in br.calls
 
 
-def test_breadth_exempt_large_card_still_answers_to_the_design_gate(make_board, monkeypatch):
-    """large is exempt from the breadth cap but NOT from the design gate — an 8-path large
-    card with no design is still refused (by the design gate, not the breadth gate)."""
+def test_a_large_card_answers_to_the_design_gate_as_well_as_the_cap(make_board, monkeypatch):
+    """large now owes BOTH gates, and they are independent. Width is checked FIRST, so this
+    card sits INSIDE the breadth cap to isolate the design gate: still refused, for the
+    other reason. (The converse — wide but designed — is the test above.)"""
     br = Br()
     b = make_board(br)
-    monkeypatch.setattr(b, "get_feature", lambda fid: _breadth_feature(difficulty="large", design=""))
+    monkeypatch.setattr(
+        b,
+        "get_feature",
+        lambda fid: _breadth_feature(
+            difficulty="large", design="", files_to_modify=[f"f{i}.py (new)" for i in range(6)]
+        ),
+    )
     with pytest.raises(BoardError, match="Design gate"):
         b.mark_ready("bd-8")
     assert br.cmds("update") == []
