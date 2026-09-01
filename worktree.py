@@ -880,16 +880,30 @@ async def merged_state_worktree(repo: str, branch: str, base_sha: str, *, root: 
     return ("merged", abspath)
 
 
+# Appended when ``pr_diff`` had to cut the diff. Callers that need the WHOLE diff to be
+# sound — grounding a review finding's quote against it (#381) — test for this marker and
+# decline rather than judging against a fragment: a quote missing from a truncated diff is
+# indistinguishable from a quote that was never in the code.
+DIFF_TRUNCATED_MARKER = "…(diff truncated)"
+
+
+def truncate_diff(text: str, max_chars: int) -> str:
+    """``text`` capped at ``max_chars``, marked when it was actually cut."""
+    return text if len(text) <= max_chars else text[:max_chars] + f"\n{DIFF_TRUNCATED_MARKER}"
+
+
 async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
     """The PR's unified diff, truncated — the prior attempt's actual work, carried
     into the next (escalated) re-dispatch's prompt so a stronger coder FIXES the
     specific code that failed CI instead of re-deriving from scratch (fresh-both
-    keeps a fresh session, but the lesson travels). Best-effort: "" on any gh error."""
+    keeps a fresh session, but the lesson travels). Best-effort: "" on any gh error.
+
+    ``max_chars`` is a PROMPT budget, not a correctness one. Pass a large cap when the
+    caller needs the diff to be complete (see ``DIFF_TRUNCATED_MARKER``)."""
     rc, out, _err = await _gh("pr", "diff", pr_url, cwd=cwd)
     if rc != 0 or not out.strip():
         return ""
-    out = out.strip()
-    return out if len(out) <= max_chars else out[:max_chars] + "\n…(diff truncated)"
+    return truncate_diff(out.strip(), max_chars)
 
 
 def _is_blocking_check(c: dict) -> bool:

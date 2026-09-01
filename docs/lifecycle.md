@@ -37,6 +37,37 @@ requeue re-enters via `review-pending`, which drops `review-clean`.
 `merge-hold` is separate: the operator's per-card veto on auto-merge, for a green,
 reviewed PR they still want to QA by hand. **The loop never sets or clears it.**
 
+### A blocking finding must quote the diff it claims to have read
+
+ADR 0077 requires a finding's `evidence` to quote the diff **verbatim**, and says a quote
+that cannot be grounded against the file "loses the power to block". The gate enforces
+that: before a `blocker`/`major` finding bounces a card, every substantial line of its
+evidence must actually appear in the PR diff.
+
+A finding that fails grounding is **demoted to non-blocking, never dropped** — it is
+logged as a warning and written to the bead so a human still sees it. Nothing about the
+grounded path changes: a real quote bounces exactly as before.
+
+The guard deliberately fails **open** — it keeps today's blocking behaviour — wherever a
+demotion would be a guess rather than a finding:
+
+| Situation | Why it still blocks |
+|---|---|
+| the diff could not be read, or is empty | nothing to check the quote against |
+| the diff came back truncated | a fragment cannot disprove a quote |
+| the evidence is empty, or has no line long enough to carry signal | ADR 0077's own out is "cite `file:line` and describe the scenario" — no quote is not a mangled quote |
+| the finding names a file the diff never touches | a cross-file finding legitimately quotes a file `gh pr diff` does not carry |
+
+So the only demotion is a quote with real content that a complete diff of a file the PR
+*did* change demonstrably does not contain. Re-indentation and re-wrapping survive
+grounding; a changed literal does not.
+
+Why it exists (protoAgent#3306): a finding quoted `secret = "[REDACTED]"` from a test
+whose actual line was `secret = "sk-ABCDEF…"`, concluded the test asserted a
+contradiction, and blocked. The coder cannot fix code that already says the right thing,
+so the card burned both bounces and terminal-blocked with a green branch discarded. An
+ungrounded finding is unfalsifiable by construction, whatever mangled it.
+
 ### Verdicts are pinned to a head, not to a card
 
 A verdict means nothing without the commit it was made about, so three labels stamp a

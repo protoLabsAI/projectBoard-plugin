@@ -96,6 +96,14 @@ _REVIEWED_HEAD_SHA_LEN = 12
 # The #340 recovery scans the comment history for this anchor to re-derive the fix feedback
 # a shutdown dropped from the in-memory ``_ci_feedback`` — so the two MUST stay in sync.
 _REVIEW_FINDINGS_TITLE = "Review findings (blocking)"
+# The diff the review gate grounds findings against (#381) must be the WHOLE diff — the
+# prompt-sized default would make a hunk past the cut look absent and demote a real
+# finding. Large enough that a truncated diff means a genuinely huge PR, which the gate
+# then declines to ground at all rather than judging from a fragment.
+_GROUNDING_DIFF_MAX_CHARS = 400_000
+# What the bounce actually carries into the retry prompt — `pr_diff`'s own default, kept
+# so the grounding fetch replaces the prompt fetch instead of adding to it.
+_PRIOR_DIFF_MAX_CHARS = 4000
 
 # After this many consecutive failed reap attempts for the same worktree path, stop
 # logging at WARNING and downgrade to DEBUG to avoid log spam (e.g. 464 lines for
@@ -411,6 +419,86 @@ def _parse_requirements_reply(text: str) -> list[dict]:
             d["decline_reason"] = reason
         out.append(d)
     return out
+
+
+# ── grounding a review finding against the diff (#381) ────────────────────────
+#
+# ADR 0077's contract already tells finders that `evidence` "must quote the diff/file
+# VERBATIM" and that "a quote that isn't byte-for-byte cannot be grounded against the
+# file, so its finding is downgraded to `uncertain` and loses the power to block". That
+# rule was written down and never enforced — it was a prompt asking the model to police
+# itself. This is the enforcement.
+#
+# The failure it exists for (protoAgent#3306): a finding quoted
+# `secret = "[REDACTED]"` from a test whose actual line is
+# `secret = "sk-ABCDEF…"`, concluded the test asserted a contradiction, and blocked.
+# The coder cannot fix code that already says what it should; the card burned both
+# bounces and terminal-blocked with a green branch discarded. A finding whose quote is
+# not in the diff is unfalsifiable by construction, whatever mangled it.
+
+# Below this, a normalized line carries too little signal to ground anything ("}", "...",
+# "return"). Skipped rather than matched — demanding they appear would ground nothing.
+_MIN_GROUNDABLE_LINE = 8
+
+
+def _normalize_for_grounding(line: str) -> str:
+    """One line reduced to what a VERBATIM quote must still share with the diff: the
+    leading diff marker dropped, surrounding space stripped, internal runs of whitespace
+    collapsed. Re-indentation and re-wrapping survive this; a changed literal does not —
+    which is exactly the line the contract draws."""
+    if line[:1] in ("+", "-", " "):
+        line = line[1:]
+    return " ".join(line.split())
+
+
+def _groundable_lines(evidence: str) -> list[str]:
+    """The lines of ``evidence`` substantial enough to ground, normalized."""
+    return [
+        n for raw in (evidence or "").splitlines() if len(n := _normalize_for_grounding(raw)) >= _MIN_GROUNDABLE_LINE
+    ]
+
+
+def evidence_is_grounded(evidence: str, diff: str) -> bool:
+    """Is every substantial line of ``evidence`` actually present in ``diff``?
+
+    Deliberately fails OPEN — returns True — in every case where a False would be a
+    guess rather than a finding:
+
+    - no diff to check against (unreadable, empty),
+    - evidence with nothing substantial to match (an empty or one-token quote): the
+      contract's own out is "cite file:line and describe the scenario", so absence of a
+      quote is not evidence of mangling,
+
+    so the only False is a quote with real content that the diff demonstrably does not
+    contain. Callers must handle a TRUNCATED diff before calling (see
+    ``worktree.DIFF_TRUNCATED_MARKER``) — a fragment cannot disprove a quote."""
+    if not (diff or "").strip():
+        return True
+    lines = _groundable_lines(evidence)
+    if not lines:
+        return True
+    haystack = "\n".join(_normalize_for_grounding(raw) for raw in diff.splitlines())
+    return all(line in haystack for line in lines)
+
+
+def partition_by_grounding(findings, diff: str):
+    """``(grounded, ungrounded)`` for ``findings`` against ``diff``.
+
+    A finding whose ``file`` never appears in the diff is passed through as grounded: a
+    cross-file finding legitimately quotes a file the PR did not touch, and `gh pr diff`
+    would never carry it. Narrowing the guard to findings about files the diff DOES
+    contain keeps it aimed at the thing it was built for — a quote from a changed file
+    that the changed file does not contain."""
+    grounded, ungrounded = [], []
+    for f in findings:
+        path = str(getattr(f, "file", "") or "")
+        if path and path not in diff:
+            grounded.append(f)
+        elif evidence_is_grounded(str(getattr(f, "evidence", "") or ""), diff):
+            grounded.append(f)
+        else:
+            ungrounded.append(f)
+    return grounded, ungrounded
 
 
 def _requirement_gate_diagnostics(result: str, open_items: list[dict]) -> dict:
@@ -976,6 +1064,10 @@ _loop = sys.modules[__package__]
 # before the split. Underscore names are listed explicitly so ``import *`` picks
 # them up.
 __all__ = [
+    "_GROUNDING_DIFF_MAX_CHARS",
+    "_PRIOR_DIFF_MAX_CHARS",
+    "evidence_is_grounded",
+    "partition_by_grounding",
     "rung_delegates",
     "should_rotate_provider",
     "_next_rung_cursor",

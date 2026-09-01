@@ -29,6 +29,8 @@ from project_board.loop import (
     _REVIEW_FINDINGS_TITLE,
     BoardLoop,
     _ci_failure_reason,
+    evidence_is_grounded,
+    partition_by_grounding,
     _inject_source_issue_line,
     _issue_closed_by_board_sibling,
     _no_test_marker,
@@ -5936,7 +5938,7 @@ def _gate_loop(monkeypatch, output, cfg=None):
             return None, "no workflow runner available and no reviewer configured"
         return output, None
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "diff --git a/x b/x"
 
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
@@ -6258,7 +6260,7 @@ async def test_review_gate_passes_prior_findings_on_the_next_run(monkeypatch):
     monkeypatch.setitem(_sys.modules, "runtime", rt)
     monkeypatch.setitem(_sys.modules, "runtime.state", rt_state)
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "diff --git a/x b/x"
 
     monkeypatch.setattr(worktree, "pr_diff", _diff)
@@ -6682,7 +6684,7 @@ async def test_reconcile_requeues_a_shutdown_stranded_changes_requested_fix_roun
     async def _head(pr_url, *, cwd="."):
         return "aaa111"  # unchanged since the verdict — NOT a #328 head move
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "diff --git a/a.py b/a.py"
 
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
@@ -6716,7 +6718,7 @@ async def test_reconcile_recovers_a_stranded_fix_round_with_no_head_stamp(monkey
     async def _head(pr_url, *, cwd="."):
         return "aaa111"  # reads fine, but there's no stamp to prove staleness against
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "d"
 
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
@@ -6808,7 +6810,7 @@ async def test_reconcile_head_move_takes_the_328_path_not_the_340_recovery(monke
     async def _head(pr_url, *, cwd="."):
         return "bbb222"  # an external push moved the head off the reviewed one
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "diff --git a/a.py b/a.py"
 
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
@@ -6839,7 +6841,7 @@ async def test_shutdown_recovery_is_idempotent_and_never_stuck_in_review(monkeyp
     async def _head(pr_url, *, cwd="."):
         return "aaa111"
 
-    async def _diff(pr_url, cwd="."):
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
         return "d"
 
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
@@ -9962,3 +9964,155 @@ async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeyp
     monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _dispatch)
     await loop._drive({"id": "bd-2", "title": "t", "spec": "s"})
     assert "opus" in seen, f"a capability failure must reach the stronger rung, got {seen}"
+
+
+# ── #381: a blocking finding must quote the diff it claims to have read ───────
+#
+# The live failure (protoAgent#3306): three rounds of the same "confirmed" major
+# claiming a redaction test asserted a contradiction. The evidence quoted
+# `secret = "[REDACTED]"`; the file said `secret = "sk-ABCDEF…"`. The coder cannot
+# fix code that already says the right thing, so the card burned both bounces and
+# terminal-blocked with a green branch discarded. ADR 0077 already promised this
+# grounding ("a quote that isn't byte-for-byte … loses the power to block"); these
+# tests are the enforcement it never had.
+
+_3306_DIFF = """diff --git a/tests/test_fleet_diagnostics_tool.py b/tests/test_fleet_diagnostics_tool.py
+--- a/tests/test_fleet_diagnostics_tool.py
++++ b/tests/test_fleet_diagnostics_tool.py
+@@ -270,6 +270,12 @@
++async def test_secrets_are_redacted_at_the_tool_boundary(monkeypatch):
++    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"  # an OpenAI-shaped key redact() scrubs
++    out = await _logs("Alpha")
++    dumped = json.dumps(out)
++    assert secret not in dumped  # the raw credential never leaves the tool
++    assert "[REDACTED]" in dumped  # ...it left replaced by the marker
+"""
+
+
+def _finding_json(evidence: str, *, file: str = "tests/test_fleet_diagnostics_tool.py") -> str:
+    import json as _json
+
+    return _json.dumps(
+        [
+            {
+                "file": file,
+                "line": 278,
+                "severity": "major",
+                "claim": "the redaction test is unsatisfiable",
+                "evidence": evidence,
+                "verdict": "confirmed",
+            }
+        ]
+    )
+
+
+def _grounding_loop(monkeypatch, findings_json: str, diff: str, cfg=None):
+    loop = BoardLoop({"review_gate": True, **(cfg or {})})
+
+    async def _run(fid, pr_url):
+        return f"brief…\n```json\n{findings_json}\n```", None
+
+    async def _diff(pr_url, cwd=".", *, max_chars=4000):
+        return worktree.truncate_diff(diff, max_chars)
+
+    monkeypatch.setattr(loop, "_run_review_workflow", _run)
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    return loop
+
+
+async def test_a_finding_whose_evidence_is_absent_from_the_diff_does_not_block(monkeypatch):
+    """The #3306 shape: the quoted literal is not the one in the file → not blocking."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    mangled = (
+        'secret = "[REDACTED]"  # an OpenAI-shaped key redact() scrubs\n'
+        "assert secret not in dumped  # the raw credential never leaves the tool\n"
+        'assert "[REDACTED]" in dumped  # ...it left replaced by the marker'
+    )
+    loop = _grounding_loop(monkeypatch, _finding_json(mangled), _3306_DIFF)
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+
+    # No bounce, no changes-requested, no budget burned — the card stays reviewable.
+    assert ("requeue", "bd-1") not in store.calls
+    assert store.review_states[-1][0] == "review-clean"
+    assert loop._review_fix_attempts.get("bd-1", 0) == 0
+    # Demoted, never dropped: the finding is on the bead for a human to read.
+    demotions = [c for c in store.calls if c[0] == "comment" and "demoted to non-blocking" in c[2]]
+    assert len(demotions) == 1 and "the redaction test is unsatisfiable" in demotions[0][2]
+
+
+async def test_a_finding_whose_evidence_is_really_in_the_diff_still_blocks(monkeypatch):
+    """The guard only demotes ungrounded quotes — a real one bounces exactly as before."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    real = "assert secret not in dumped  # the raw credential never leaves the tool"
+    loop = _grounding_loop(monkeypatch, _finding_json(real), _3306_DIFF)
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+
+    assert ("requeue", "bd-1") in store.calls
+    assert store.review_states[-1][0] == "changes-requested"
+    assert loop._review_fix_attempts["bd-1"] == 1
+    assert not [c for c in store.calls if c[0] == "comment" and "demoted to non-blocking" in c[2]]
+
+
+async def test_grounding_survives_reindentation_but_not_a_changed_literal(monkeypatch):
+    """Re-indenting/re-wrapping a quote is not mangling it; changing a value is."""
+    reindented = "        assert   secret not in dumped   # the raw credential never leaves the tool"
+    assert evidence_is_grounded(reindented, _3306_DIFF)
+    assert not evidence_is_grounded('secret = "[REDACTED]"  # an OpenAI-shaped key redact() scrubs', _3306_DIFF)
+
+
+async def test_a_truncated_diff_never_demotes_a_finding(monkeypatch):
+    """A fragment cannot disprove a quote — fail closed and keep blocking."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _grounding_loop(
+        monkeypatch,
+        _finding_json('secret = "[REDACTED]"  # an OpenAI-shaped key redact() scrubs'),
+        _3306_DIFF,
+    )
+
+    async def _tiny(pr_url, cwd=".", *, max_chars=4000):
+        return worktree.truncate_diff(_3306_DIFF, 80)  # always cut, whatever the cap
+
+    monkeypatch.setattr(worktree, "pr_diff", _tiny)
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+    assert ("requeue", "bd-1") in store.calls
+    assert store.review_states[-1][0] == "changes-requested"
+
+
+async def test_a_finding_about_a_file_the_diff_never_touches_still_blocks(monkeypatch):
+    """A cross-file finding legitimately quotes a file `gh pr diff` does not carry."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _grounding_loop(
+        monkeypatch,
+        _finding_json("def resolve_member(name):  # never called with a roster miss", file="tools/other.py"),
+        _3306_DIFF,
+    )
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+    assert ("requeue", "bd-1") in store.calls
+
+
+def test_evidence_grounding_fails_open_on_what_it_cannot_judge():
+    """Every ambiguous input keeps today's behaviour; only a real absent quote is False."""
+    assert evidence_is_grounded("anything at all", "")  # no diff to check against
+    assert evidence_is_grounded("", _3306_DIFF)  # no quote offered
+    assert evidence_is_grounded("x", _3306_DIFF)  # nothing substantial to match
+    assert evidence_is_grounded("}\n...\n{", _3306_DIFF)  # punctuation carries no signal
+    assert not evidence_is_grounded("this line is nowhere in that diff at all", _3306_DIFF)
+
+
+def test_partition_by_grounding_splits_and_preserves_order():
+    from dataclasses import dataclass
+
+    @dataclass
+    class _F:
+        file: str
+        evidence: str
+
+    good = _F("tests/test_fleet_diagnostics_tool.py", "dumped = json.dumps(out)")
+    bad = _F("tests/test_fleet_diagnostics_tool.py", "assert nothing_like_this_exists_here(out)")
+    elsewhere = _F("tools/untouched.py", "assert nothing_like_this_exists_here(out)")
+    grounded, ungrounded = partition_by_grounding([good, bad, elsewhere], _3306_DIFF)
+    assert grounded == [good, elsewhere] and ungrounded == [bad]

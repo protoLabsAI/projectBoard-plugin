@@ -1528,6 +1528,41 @@ class ReconcileMixin:
         except Exception:  # noqa: BLE001 — memory is an optimization, never a gate failure
             self._review_prior.pop(fid, None)
         blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
+        # #381: enforce the grounding ADR 0077 already promises. A blocking finding must
+        # quote the diff VERBATIM; one whose quote the diff demonstrably does not contain
+        # cannot be fixed by editing code that already says the right thing, so it bounces
+        # the card twice and terminal-blocks a green branch. Fetch the WHOLE diff for this
+        # (the prompt-sized default would make a later hunk look absent) and decline to
+        # judge a truncated one. Reused below as the bounce's prior-diff, re-cut to the
+        # prompt budget, so the extra `gh pr diff` costs nothing.
+        full_diff = ""
+        if blocking:
+            full_diff = await worktree.pr_diff(pr_url, cwd=repo, max_chars=_GROUNDING_DIFF_MAX_CHARS)
+        if blocking and worktree.DIFF_TRUNCATED_MARKER not in full_diff:
+            blocking, ungrounded = partition_by_grounding(blocking, full_diff)
+            for f in ungrounded:
+                # Loud, and on the bead below — the finding is demoted, never dropped: a
+                # silent downgrade would hide a real defect behind a quoting slip.
+                log.warning(
+                    "[project_board] %s review finding NOT blocking — its evidence is absent "
+                    "from the PR diff (%s:%s %s): %s",
+                    fid,
+                    f.file,
+                    f.line,
+                    f.severity,
+                    f.claim,
+                )
+            if ungrounded:
+                try:
+                    await asyncio.to_thread(
+                        store.comment,
+                        fid,
+                        f"review gate: {len(ungrounded)} finding(s) demoted to non-blocking — evidence "
+                        f"absent from the PR diff (ADR 0077 requires a verbatim quote):\n"
+                        + "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in ungrounded),
+                    )
+                except Exception:  # noqa: BLE001 — bookkeeping must not fail the gate
+                    log.warning("[project_board] %s ungrounded-finding comment failed", fid, exc_info=True)
         if not blocking:
             await asyncio.to_thread(
                 store.set_review_substate,
@@ -1592,7 +1627,7 @@ class ReconcileMixin:
         await self._budget_set(store, fid, "review-fix", n + 1)
         # Carry the lesson exactly like the CI bounce: findings as the rejection
         # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
-        self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
+        self._ci_prior_diff[fid] = worktree.truncate_diff(full_diff, _PRIOR_DIFF_MAX_CHARS)
         self._ci_feedback[fid] = (
             "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
             "below in the existing branch (the PR updates on push) — do not rewrite "
