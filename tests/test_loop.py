@@ -10055,7 +10055,7 @@ async def test_a_finding_whose_evidence_is_really_in_the_diff_still_blocks(monke
     assert not [c for c in store.calls if c[0] == "comment" and "demoted to non-blocking" in c[2]]
 
 
-async def test_grounding_survives_reindentation_but_not_a_changed_literal(monkeypatch):
+def test_grounding_survives_reindentation_but_not_a_changed_literal():
     """Re-indenting/re-wrapping a quote is not mangling it; changing a value is."""
     reindented = "        assert   secret not in dumped   # the raw credential never leaves the tool"
     assert evidence_is_grounded(reindented, _3306_DIFF)
