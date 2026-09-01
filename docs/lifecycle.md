@@ -37,6 +37,50 @@ requeue re-enters via `review-pending`, which drops `review-clean`.
 `merge-hold` is separate: the operator's per-card veto on auto-merge, for a green,
 reviewed PR they still want to QA by hand. **The loop never sets or clears it.**
 
+### A blocking finding must quote the diff it claims to have read
+
+ADR 0077 requires a finding's `evidence` to quote the diff **verbatim**, and says a quote
+that cannot be grounded against the file "loses the power to block". The gate enforces
+that: before a `blocker`/`major` finding bounces a card, every substantial line of its
+evidence must actually appear in the PR diff.
+
+A finding that fails grounding is **demoted to non-blocking, never dropped** — it is
+logged as a warning and written to the bead so a human still sees it. Nothing about the
+grounded path changes: a real quote bounces exactly as before.
+
+The guard deliberately fails **open** — it keeps today's blocking behaviour — wherever a
+demotion would be a guess rather than a finding:
+
+| Situation | Why it still blocks |
+|---|---|
+| the diff could not be read, or is empty | nothing to check the quote against |
+| the diff came back truncated | a fragment cannot disprove a quote |
+| the evidence is empty, or has no line long enough to carry signal | ADR 0077's own out is "cite `file:line` and describe the scenario" — no quote is not a mangled quote |
+| the finding names a file the diff never touches | it legitimately quotes a file `gh pr diff` does not carry |
+| the finding's `category` is `cross-file` | its whole point is a file the PR did *not* change: it names the changed file but quotes the untouched one |
+| an evidence line is an elision (`…`, `...`) | ADR 0077 forbids stitching separate lines into one, so eliding between two real hunks is the honest quote — the elision is the finder's annotation, not part of it |
+
+So the only demotion is a quote with real content that a complete diff of a file the PR
+*did* change demonstrably does not contain. Re-indentation and re-wrapping survive
+grounding; a changed literal does not.
+
+**Every** substantial line must match, not merely one — #3306's mangled quote had two of
+its three lines verbatim, so an "any line matches" rule would have passed it straight
+through. Matching is substring rather than line equality, because a quote legitimately
+clips a line mid-way; erring toward "grounded" keeps a finding blocking, which is the
+safe direction for a guard that only ever demotes.
+
+A demoted finding is re-stamped `uncertain` — ADR 0077's own word for a quote that
+cannot be grounded — before the round's findings are carried into the next run's delta
+review, so the re-review is not handed back the `confirmed` verdict this round declined
+to act on.
+
+Why it exists (protoAgent#3306): a finding quoted `secret = "[REDACTED]"` from a test
+whose actual line was `secret = "sk-ABCDEF…"`, concluded the test asserted a
+contradiction, and blocked. The coder cannot fix code that already says the right thing,
+so the card burned both bounces and terminal-blocked with a green branch discarded. An
+ungrounded finding is unfalsifiable by construction, whatever mangled it.
+
 ### Verdicts are pinned to a head, not to a card
 
 A verdict means nothing without the commit it was made about, so three labels stamp a
