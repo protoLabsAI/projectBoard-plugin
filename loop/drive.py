@@ -1290,6 +1290,12 @@ class DriveMixin:
                     # it burned the whole tier ladder in ten seconds (three attempts,
                     # three tiers, a block; 2026-08-28, bd-cwpv.12/.16) and left `tier:`
                     # labels that misrouted the card when it was requeued after the reset.
+                    # #378: count timeouts durably, BEFORE the retry/escalate/block fork —
+                    # bd-sxxf timed out, escalated a tier, timed out again and only then
+                    # blocked, so a counter bumped at the block alone would have read 1.
+                    if isinstance(exc, worktree.CoderTimeout):
+                        timeouts = await self._budget_get(store, fid, "timeout") + 1
+                        await self._budget_set(store, fid, "timeout", timeouts)
                     dispatch_failed = str(exc).startswith("coder dispatch failed") and not policy.retryable
                     capability = (
                         isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
@@ -1412,6 +1418,23 @@ class DriveMixin:
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
                     await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+                    # #378: a card that has now timed out repeatedly is not model-limited, it
+                    # is too wide — and nothing in the block path says so, which is how one
+                    # sat parked while an operator guessed. Ask the board's own agent to split
+                    # it (once; `request_decomposition` no-ops on a repeat or on a task).
+                    if isinstance(exc, worktree.CoderTimeout) and self.decompose_after_timeouts:
+                        spent = await self._budget_get(store, fid, "timeout")
+                        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
+                        if spent >= self.decompose_after_timeouts and callable(ask):
+                            asked = await asyncio.to_thread(ask, fid, timeouts=spent)
+                            if asked:
+                                log.warning(
+                                    "[project_board] %s timed out %dx — filed %s to decompose it "
+                                    "(a timeout is a SIZE signal, not a capability one)",
+                                    fid,
+                                    spent,
+                                    asked.get("id", "?"),
+                                )
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
