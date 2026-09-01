@@ -3067,6 +3067,44 @@ async def test_reconcile_orphan_requeues_a_dead_acp_task(monkeypatch):
     assert store.names() == ["requeue"]
 
 
+@pytest.mark.parametrize("assignee", ["agent", "self", "AGENT", "proto"])
+async def test_reconcile_orphan_requeues_a_self_assigned_task(monkeypatch, assignee):
+    """#311 regression: a task assigned to the board's OWN agent — the `self`/`agent`
+    aliases (case-insensitively) or the configured coder name — whose drive is not live
+    IS orphaned, and must be requeued so `_dispatch_self` can pick it up again.
+
+    Before this, `_reconcile_orphan` asked only `_resolve_task_delegate(...)`, which
+    resolves SISTER agents and returns None for a self alias — so a self task was read as
+    an intentional human/unassigned park and left in_progress forever. `_is_self_assignee`
+    is consulted only in `_dispatch_task`, which sees `ready` candidates exclusively, so
+    without the requeue the whole self-dispatch path was unreachable for that card and the
+    sweep just re-logged "in_progress with no live drive" on every pass.
+
+    `_resolve_delegate` is stubbed to None throughout: these assignees must requeue on the
+    SELF edge, not by accidentally resolving to a delegate."""
+    store = _TaskStore([_task("bd-self", assignee=assignee)])
+    store.claimed.append("bd-self")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("bd-self")
+    assert store.names() == ["requeue"]
+
+
+async def test_reconcile_orphan_still_parks_a_human_task_next_to_the_self_alias(monkeypatch):
+    """The near-miss that made this bug hard to see: `agent-bot` is a sister-agent NAME and
+    `agent` is the reserved SELF alias — one token apart. A human assignee that is neither
+    must still be left parked, so widening the requeue to self assignees does not start
+    stealing work a person owns."""
+    store = _TaskStore([_task("bd-human", assignee="alice")])
+    store.claimed.append("bd-human")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("bd-human")
+    assert store.names() == []
+
+
 async def test_sweep_reclaims_a_dead_acp_task_end_to_end(monkeypatch):
     """#303 (r3): a task stuck in_progress with a dead ACP drive is reclaimed by the
     health sweep END TO END. The sweep enumerates ``list_features(state="in_progress")``

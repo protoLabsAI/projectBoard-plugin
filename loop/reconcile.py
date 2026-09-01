@@ -99,15 +99,36 @@ class ReconcileMixin:
         store = self._store()
         feature = await asyncio.to_thread(store.get_feature, fid) or {}
         # #217/#304: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
-        # salvage below never apply. A task parked on a human/unassigned assignee is
-        # NOT orphaned — it is intentionally in_progress awaiting async delivery
-        # (API/chat), the same "leave it, an out-of-band edge resolves it" posture an
-        # in_review PR gets — so leave it be. A task on a SISTER-AGENT assignee (ACP
-        # coder OR A2A agent) whose drive died mid-flight IS orphaned: requeue it for a
-        # clean re-dispatch.
+        # salvage below never apply. A task parked on a HUMAN assignee is NOT orphaned —
+        # it is intentionally in_progress awaiting async delivery (API/chat), the same
+        # "leave it, an out-of-band edge resolves it" posture an in_review PR gets — so
+        # leave it be. A task on a DISPATCHABLE target whose drive died mid-flight IS
+        # orphaned: requeue it for a clean re-dispatch. Dispatchable means either
+        #
+        #   - a SISTER-AGENT assignee (ACP coder OR A2A agent), or
+        #   - this board's OWN agent (#311 — the `self`/`agent` aliases, or the configured
+        #     coder name), which `_dispatch_self` drives through HOST.invoke.
+        #
+        # The self case was missing, and it stranded every self-assigned task PERMANENTLY:
+        # `_is_self_assignee` is only consulted in `_dispatch_task`, which only ever sees
+        # `ready` candidates, so a self task that reached in_progress without a live drive
+        # could never get back to `ready` — making the whole #311 self-dispatch path
+        # structurally unreachable for it. The sweep logged "in_progress with no live
+        # drive" against it forever instead.
+        #
+        # Note this also covers the TRULY-UNASSIGNED park: `claim_task` resolves a task
+        # with no target to the store actor, whose default name ("agent") IS a self alias,
+        # so an unassigned card arrives here reading self-assigned and now self-dispatches
+        # on the next tick rather than parking forever. That is the honest reading of the
+        # assignee-as-dispatch-target invariant `requeue` already protects (it deliberately
+        # keeps a task's assignee, because clearing it stranded a live self-assigned audit
+        # task once). A task that must wait on a PERSON has to name that person.
         if feature.get("issue_type") == LABEL_TASK:
             assignee = str(feature.get("assignee") or "").strip()
-            if self._resolve_task_delegate(assignee) is not None:
+            if self._is_self_assignee(assignee):
+                await asyncio.to_thread(store.requeue, fid)
+                log.info("[project_board] %s self task reset to ready (no live drive — re-dispatch)", fid)
+            elif self._resolve_task_delegate(assignee) is not None:
                 await asyncio.to_thread(store.requeue, fid)
                 log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
             return
