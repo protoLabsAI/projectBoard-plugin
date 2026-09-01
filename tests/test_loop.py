@@ -10116,3 +10116,76 @@ def test_partition_by_grounding_splits_and_preserves_order():
     elsewhere = _F("tools/untouched.py", "assert nothing_like_this_exists_here(out)")
     grounded, ungrounded = partition_by_grounding([good, bad, elsewhere], _3306_DIFF)
     assert grounded == [good, elsewhere] and ungrounded == [bad]
+
+
+# ── #381 follow-ups from review: the four ways the first cut got grounding wrong ──
+
+
+def test_an_elision_line_does_not_demote_a_genuine_finding():
+    """ADR 0077 forbids stitching separate lines into one, so eliding between two real
+    hunks is the honest quote. The elision is the finder's annotation, not a quote."""
+    evidence = 'dumped = json.dumps(out)\n... rest unchanged ...\nassert "[REDACTED]" in dumped'
+    assert evidence_is_grounded(evidence, _3306_DIFF)
+    assert evidence_is_grounded('dumped = json.dumps(out)\n…\nassert "[REDACTED]" in dumped', _3306_DIFF)
+    # …but an elision cannot launder a quote that is genuinely absent.
+    assert not evidence_is_grounded("... \nthis line is nowhere in that diff at all", _3306_DIFF)
+
+
+def test_a_cross_file_finding_is_never_demoted():
+    """It names the CHANGED file and quotes the untouched one — `gh pr diff` has neither."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _F:
+        file: str
+        evidence: str
+        category: str = ""
+
+    quoting_elsewhere = _F(
+        "tests/test_fleet_diagnostics_tool.py",  # a file the diff DOES contain
+        "def resolve_member(name):  # in an untouched module",
+        "cross-file",
+    )
+    same_but_not_cross_file = _F(
+        "tests/test_fleet_diagnostics_tool.py",
+        "def resolve_member(name):  # in an untouched module",
+        "correctness",
+    )
+    grounded, ungrounded = partition_by_grounding([quoting_elsewhere, same_but_not_cross_file], _3306_DIFF)
+    assert grounded == [quoting_elsewhere]
+    assert ungrounded == [same_but_not_cross_file]
+
+
+async def test_a_demoted_finding_rides_into_the_next_round_as_uncertain(monkeypatch):
+    """Otherwise the delta re-review is handed a `confirmed` verdict this round refused
+    to act on, and simply re-confirms it."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    loop = _grounding_loop(
+        monkeypatch,
+        _finding_json('secret = "[REDACTED]"  # an OpenAI-shaped key redact() scrubs'),
+        _3306_DIFF,
+    )
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+
+    assert store.review_states[-1][0] == "review-clean"  # demoted, so nothing blocking
+    carried = json.loads(loop._review_prior["bd-1"])
+    assert len(carried) == 1
+    assert carried[0]["verdict"] == "uncertain"  # not the "confirmed" it arrived as
+
+
+async def test_the_truncation_guard_only_fires_on_a_diff_that_was_actually_cut(monkeypatch):
+    """A diff whose BODY merely contains the marker string (this very PR's does) must not
+    silently disable grounding — only a diff cut at the end is untrustworthy."""
+    _inject_fake_findings(monkeypatch)
+    store = _GateStore()
+    diff_mentioning_the_marker = _3306_DIFF + '\n+DIFF_TRUNCATED_MARKER = "…(diff truncated)"\n+more = 1\n'
+    loop = _grounding_loop(
+        monkeypatch,
+        _finding_json('secret = "[REDACTED]"  # an OpenAI-shaped key redact() scrubs'),
+        diff_mentioning_the_marker,
+    )
+    await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
+    # The guard still ran: the ungrounded finding was demoted, not blocked.
+    assert store.review_states[-1][0] == "review-clean"
+    assert ("requeue", "bd-1") not in store.calls

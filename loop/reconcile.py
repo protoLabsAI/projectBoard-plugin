@@ -1520,13 +1520,6 @@ class ReconcileMixin:
             )
             log.warning("[project_board] %s review gate inert (no findings parser on this host)", fid)
             return
-        # Remember this round's findings — the next run (a bounce re-review) passes
-        # them back as the recipe's prior_findings input, making it a DELTA review
-        # (drop fixed, carry still-open) instead of a from-scratch re-litigation.
-        try:
-            self._review_prior[fid] = json.dumps([f.to_dict() for f in findings]) if findings else ""
-        except Exception:  # noqa: BLE001 — memory is an optimization, never a gate failure
-            self._review_prior.pop(fid, None)
         blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
         # #381: enforce the grounding ADR 0077 already promises. A blocking finding must
         # quote the diff VERBATIM; one whose quote the diff demonstrably does not contain
@@ -1538,9 +1531,15 @@ class ReconcileMixin:
         full_diff = ""
         if blocking:
             full_diff = await worktree.pr_diff(pr_url, cwd=repo, max_chars=_GROUNDING_DIFF_MAX_CHARS)
-        if blocking and worktree.DIFF_TRUNCATED_MARKER not in full_diff:
+        if blocking and not full_diff.endswith(worktree.DIFF_TRUNCATED_MARKER):
             blocking, ungrounded = partition_by_grounding(blocking, full_diff)
             for f in ungrounded:
+                # ADR 0077's own word for a quote that cannot be grounded. Set BEFORE
+                # `_review_prior` is serialized below so the demotion rides into the next
+                # round's delta review — otherwise the re-review is handed back a
+                # `confirmed` verdict for a finding this round refused to block on, and
+                # re-confirms it.
+                f.verdict = "uncertain"
                 # Loud, and on the bead below — the finding is demoted, never dropped: a
                 # silent downgrade would hide a real defect behind a quoting slip.
                 log.warning(
@@ -1553,6 +1552,11 @@ class ReconcileMixin:
                     f.claim,
                 )
             if ungrounded:
+                # Rendered by hand rather than through `_render_findings`: that stamps
+                # `_REVIEW_FINDINGS_TITLE`, which the recovery path scans for (see
+                # `_latest_review_findings`) to rebuild a card's BLOCKING findings. A
+                # demotion comment carrying that title would be read back as a blocking
+                # verdict — the opposite of what it records.
                 try:
                     await asyncio.to_thread(
                         store.comment,
@@ -1563,6 +1567,17 @@ class ReconcileMixin:
                     )
                 except Exception:  # noqa: BLE001 — bookkeeping must not fail the gate
                     log.warning("[project_board] %s ungrounded-finding comment failed", fid, exc_info=True)
+        # Remember this round's findings — the next run (a bounce re-review) passes
+        # them back as the recipe's prior_findings input, making it a DELTA review
+        # (drop fixed, carry still-open) instead of a from-scratch re-litigation.
+        # Serialized HERE, after the grounding partition (#381) and before either verdict
+        # branch, so a demoted finding rides into the next round as `uncertain` rather than
+        # as the `confirmed` this round declined to act on — which the re-review would
+        # simply re-confirm.
+        try:
+            self._review_prior[fid] = json.dumps([f.to_dict() for f in findings]) if findings else ""
+        except Exception:  # noqa: BLE001 — memory is an optimization, never a gate failure
+            self._review_prior.pop(fid, None)
         if not blocking:
             await asyncio.to_thread(
                 store.set_review_substate,
@@ -1627,7 +1642,7 @@ class ReconcileMixin:
         await self._budget_set(store, fid, "review-fix", n + 1)
         # Carry the lesson exactly like the CI bounce: findings as the rejection
         # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
-        self._ci_prior_diff[fid] = worktree.truncate_diff(full_diff, _PRIOR_DIFF_MAX_CHARS)
+        self._ci_prior_diff[fid] = worktree.truncate_diff(full_diff, worktree.PR_DIFF_MAX_CHARS)
         self._ci_feedback[fid] = (
             "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
             "below in the existing branch (the PR updates on push) — do not rewrite "

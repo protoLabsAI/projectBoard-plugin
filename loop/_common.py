@@ -101,9 +101,7 @@ _REVIEW_FINDINGS_TITLE = "Review findings (blocking)"
 # finding. Large enough that a truncated diff means a genuinely huge PR, which the gate
 # then declines to ground at all rather than judging from a fragment.
 _GROUNDING_DIFF_MAX_CHARS = 400_000
-# What the bounce actually carries into the retry prompt — `pr_diff`'s own default, kept
-# so the grounding fetch replaces the prompt fetch instead of adding to it.
-_PRIOR_DIFF_MAX_CHARS = 4000
+
 
 # After this many consecutive failed reap attempts for the same worktree path, stop
 # logging at WARNING and downgrade to DEBUG to avoid log spam (e.g. 464 lines for
@@ -438,7 +436,11 @@ def _parse_requirements_reply(text: str) -> list[dict]:
 
 # Below this, a normalized line carries too little signal to ground anything ("}", "...",
 # "return"). Skipped rather than matched — demanding they appear would ground nothing.
-_MIN_GROUNDABLE_LINE = 8
+_MIN_GROUNDABLE_LINE_CHARS = 8
+# An elision is the finder's OWN annotation, not a quote — ADR 0077 forbids stitching a
+# composite line out of separate lines, so "… rest unchanged" between two real hunks is the
+# honest way to quote a gap. Requiring it to appear in the diff would demote a good finding.
+_ELISION_MARKERS = ("...", "\u2026")
 
 
 def _normalize_for_grounding(line: str) -> str:
@@ -452,10 +454,14 @@ def _normalize_for_grounding(line: str) -> str:
 
 
 def _groundable_lines(evidence: str) -> list[str]:
-    """The lines of ``evidence`` substantial enough to ground, normalized."""
-    return [
-        n for raw in (evidence or "").splitlines() if len(n := _normalize_for_grounding(raw)) >= _MIN_GROUNDABLE_LINE
-    ]
+    """The lines of ``evidence`` substantial enough to ground, normalized — elisions and
+    lines too short to carry signal dropped."""
+    out = []
+    for raw in (evidence or "").splitlines():
+        n = _normalize_for_grounding(raw)
+        if len(n) >= _MIN_GROUNDABLE_LINE_CHARS and not any(m in n for m in _ELISION_MARKERS):
+            out.append(n)
+    return out
 
 
 def evidence_is_grounded(evidence: str, diff: str) -> bool:
@@ -478,21 +484,36 @@ def evidence_is_grounded(evidence: str, diff: str) -> bool:
     if not lines:
         return True
     haystack = "\n".join(_normalize_for_grounding(raw) for raw in diff.splitlines())
+    # EVERY substantial line, not merely one. #3306's mangled quote had two of its three
+    # lines verbatim — grounding on "any line matches" would have passed it straight
+    # through and fixed nothing. Substring rather than line equality, deliberately: a
+    # quote legitimately clips a line mid-way, and erring toward "grounded" keeps a
+    # finding blocking, which is the safe direction for a guard that only ever demotes.
     return all(line in haystack for line in lines)
 
 
-def partition_by_grounding(findings, diff: str):
+# ADR 0077's category for a finding whose whole point is a file the diff did NOT change.
+# Such a finding names the changed file but quotes the untouched one, so grounding it
+# against the diff would demote exactly the findings hardest to make and easiest to lose.
+_CROSS_FILE_CATEGORY = "cross-file"
+
+
+def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
     """``(grounded, ungrounded)`` for ``findings`` against ``diff``.
 
-    A finding whose ``file`` never appears in the diff is passed through as grounded: a
-    cross-file finding legitimately quotes a file the PR did not touch, and `gh pr diff`
-    would never carry it. Narrowing the guard to findings about files the diff DOES
-    contain keeps it aimed at the thing it was built for — a quote from a changed file
-    that the changed file does not contain."""
+    Two pass-throughs, both for findings that legitimately quote something `gh pr diff`
+    never carries: one whose ``file`` is absent from the diff, and one whose ``category``
+    is ``cross-file``. That keeps the guard aimed at the case it was built for — a quote
+    from a CHANGED file that the changed file does not contain.
+
+    Attributes are read defensively: the ``Finding`` shape comes from the HOST
+    (``graph.review.findings``, imported lazily by ``_parse_findings``), so an older host
+    may not carry every field this plugin knows about."""
     grounded, ungrounded = [], []
     for f in findings:
         path = str(getattr(f, "file", "") or "")
-        if path and path not in diff:
+        category = str(getattr(f, "category", "") or "").strip().lower()
+        if (path and path not in diff) or category == _CROSS_FILE_CATEGORY:
             grounded.append(f)
         elif evidence_is_grounded(str(getattr(f, "evidence", "") or ""), diff):
             grounded.append(f)
@@ -1065,7 +1086,6 @@ _loop = sys.modules[__package__]
 # them up.
 __all__ = [
     "_GROUNDING_DIFF_MAX_CHARS",
-    "_PRIOR_DIFF_MAX_CHARS",
     "evidence_is_grounded",
     "partition_by_grounding",
     "rung_delegates",

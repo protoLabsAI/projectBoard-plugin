@@ -886,13 +886,17 @@ async def merged_state_worktree(repo: str, branch: str, base_sha: str, *, root: 
 # indistinguishable from a quote that was never in the code.
 DIFF_TRUNCATED_MARKER = "…(diff truncated)"
 
+# The prompt budget for a carried diff — one source, so a caller re-cutting a diff it
+# already fetched cannot drift from `pr_diff`'s own default.
+PR_DIFF_MAX_CHARS = 4000
+
 
 def truncate_diff(text: str, max_chars: int) -> str:
     """``text`` capped at ``max_chars``, marked when it was actually cut."""
     return text if len(text) <= max_chars else text[:max_chars] + f"\n{DIFF_TRUNCATED_MARKER}"
 
 
-async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = 4000) -> str:
+async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = PR_DIFF_MAX_CHARS) -> str:
     """The PR's unified diff, truncated — the prior attempt's actual work, carried
     into the next (escalated) re-dispatch's prompt so a stronger coder FIXES the
     specific code that failed CI instead of re-deriving from scratch (fresh-both
