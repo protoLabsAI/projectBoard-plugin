@@ -49,7 +49,7 @@ import threading
 import time
 import types
 
-from .. import br_fetch, coder_seam, config, health, setup_check, worktree
+from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
 from ..failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
 from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
@@ -959,6 +959,7 @@ __all__ = [
     "config",
     "health",
     "setup_check",
+    "work_snapshot",
     "worktree",
     "PRE_MODEL_DISPATCH_CLASS",
     "classify",

@@ -153,6 +153,19 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — planning layer is best-effort
         log.exception("[project_board] registering planning subagents/skill failed")
 
+    # The board's open cards in the AGENT'S OWN working state (protoAgent ADR 0079).
+    # Feature-detected: this seam is newer than the plugin's `min_protoagent_version`
+    # floor, so on an older host it is simply absent and the board contributes nothing —
+    # the same posture `coder_seam.resolve_self_invoke` takes for `HOST.invoke`. MERGED is
+    # not RELEASED; never assume a host seam exists because it exists upstream.
+    from . import work_snapshot
+
+    register_work_provider = getattr(registry, "register_work_provider", None)
+    if callable(register_work_provider):
+        register_work_provider("cards", work_snapshot.provider, label="Open board cards")
+    else:
+        log.debug("[project_board] host has no register_work_provider seam — board work not surfaced")
+
     log.info(
         "[project_board] registered board API + loop + tools + planning (coder=%s reviewer=%s)",
         # No default coder (v0.42.0): an unset `coder` logs as <unset> and is a

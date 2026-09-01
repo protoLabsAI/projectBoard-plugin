@@ -5302,6 +5302,56 @@ async def test_sweep_reconciles_in_progress_with_no_live_drive(monkeypatch):
     assert store.requeued == ["bd-1"]  # bd-1 (no PR, no drive) reset; bd-2 left alone
 
 
+async def test_sweep_publishes_the_work_snapshot_for_the_host_working_state(monkeypatch):
+    """The wiring that makes the ADR 0079 work provider non-empty. Without this the provider
+    is registered, callable, and returns [] forever — a feature that ships inert.
+
+    The sweep is the refresh cadence on purpose: the provider itself may not touch the store
+    (it runs inline on every agent turn and every board read is a `br` subprocess), so the
+    snapshot has to be pushed to it from somewhere that is already doing board I/O."""
+    from project_board import work_snapshot
+
+    class _Store(_SweepStore):
+        def list_features(self, state=None):
+            if state is None:  # the snapshot read: the whole live board
+                return [
+                    {"id": "bd-live", "board_state": "blocked", "title": "Stuck card"},
+                    {"id": "bd-done", "board_state": "done", "title": "Finished"},
+                ]
+            return super().list_features(state)
+
+    work_snapshot.reset()
+    store = _Store()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
+    try:
+        await BoardLoop({})._sweep()
+        assert [i["id"] for i in work_snapshot.provider()] == ["bd-live"]  # terminal card excluded
+    finally:
+        work_snapshot.reset()
+
+
+async def test_a_failing_snapshot_never_stops_the_sweep(monkeypatch):
+    """The snapshot is a convenience; the sweep is the board's self-heal. If publishing ever
+    raises, the sweep must still reconcile and archive."""
+    from project_board import work_snapshot
+
+    def _boom(_features):
+        raise RuntimeError("snapshot exploded")
+
+    monkeypatch.setattr(work_snapshot, "publish", _boom)
+    store = _SweepStore(in_progress=["bd-1"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
+
+    async def _no_pr(branch, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
+    await BoardLoop({})._sweep()
+    assert store.requeued == ["bd-1"]  # the sweep still did its real job
+
+
 async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
     store = _SweepStore(features={"bd-done": "done", "bd-cancelled": "cancelled", "bd-rev": "in_review"})
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)

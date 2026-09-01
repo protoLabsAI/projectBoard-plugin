@@ -282,6 +282,15 @@ class ReconcileMixin:
         (#115) — the board's growth valve; archival only, nothing is ever deleted.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
+        # Publish the board's live projection for the host's <working_state> block (ADR
+        # 0079 Observe). Done on the SWEEP cadence, not per tick: it is one extra `br`
+        # call per sweep, and the provider that reads it must never touch the store
+        # itself — it runs inline on every agent turn. Best-effort, like the rest of the
+        # sweep.
+        try:
+            await asyncio.to_thread(lambda: work_snapshot.publish(store.list_features()))
+        except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the sweep
+            log.warning("[project_board] work snapshot refresh failed (ignored)", exc_info=True)
         for f in await asyncio.to_thread(store.list_features, state="in_progress"):
             fid = f["id"]
             if fid in self._inflight_files:
