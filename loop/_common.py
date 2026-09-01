@@ -229,6 +229,37 @@ def _parse_gate_files(raw: object) -> list[str]:
 # Resolved once at construction (the coder only ever touches worktrees, so the bound
 # checkout is a stable base); the deployment clones the repo before the loop starts.
 _PNPM_INSTALL = "pnpm install --frozen-lockfile --prefer-offline"
+
+# WHICH package manager, read from the LOCKFILE rather than assumed. A repo's lockfile is
+# the authoritative statement of how it installs, and guessing wrong produces a gate that
+# can never pass: `pnpm install --frozen-lockfile` in an npm-workspaces repo dies with
+# ERR_PNPM_NO_LOCKFILE, which the fail-closed preflight then reads as "this project's gate
+# is not runnable" and holds EVERY card in the project (observed 2026-08-31 — a whole
+# board stalled on a repo whose only sin was using npm).
+#
+# (name, install, run-one, recursive-run) per manager. The recursive form is the no-declared
+# -script fallback; a manager with no clean workspace-recursive flag gets None, and the
+# caller degrades to "no gate discovered" — no gate is safer than a wrong one.
+# pnpm stays the default when NO lockfile is present, so existing behaviour is untouched.
+_NODE_PACKAGE_MANAGERS = (
+    ("pnpm-lock.yaml", "pnpm", _PNPM_INSTALL, "pnpm run", "pnpm -r --if-present"),
+    ("package-lock.json", "npm", "npm ci", "npm run", "npm run --workspaces --if-present"),
+    ("yarn.lock", "yarn", "yarn install --frozen-lockfile", "yarn run", None),
+    ("bun.lockb", "bun", "bun install --frozen-lockfile", "bun run", None),
+    ("bun.lock", "bun", "bun install --frozen-lockfile", "bun run", None),
+)
+
+
+def _node_package_manager(repo_path: str):
+    """``(install, run_one, recursive_run)`` for the repo's Node package manager, chosen by
+    which lockfile is committed. Falls back to pnpm when no lockfile is present — that case
+    is genuinely ambiguous and pnpm is the prior behaviour."""
+    for lockfile, _name, install, run_one, recursive in _NODE_PACKAGE_MANAGERS:
+        if os.path.isfile(os.path.join(repo_path, lockfile)):
+            return install, run_one, recursive
+    return _PNPM_INSTALL, "pnpm run", "pnpm -r --if-present"
+
+
 # Precedence of DECLARED target names. ``gate`` first: it is the unambiguous "this is
 # the pre-PR coder gate (the fast slice)", so a repo whose ``ci`` is the whole heavy
 # suite can point coders at ``gate`` without the loop grabbing the heavy target.
@@ -248,16 +279,17 @@ def _resolve_gate_cmd(raw: str, repo_path: str) -> str:
                 scripts = (json.load(fh) or {}).get("scripts", {}) or {}
         except (OSError, ValueError):
             scripts = {}
+        install, run_one, recursive = _node_package_manager(repo_path)
         for name in _GATE_TARGET_NAMES:
             if name in scripts:
-                return f"{_PNPM_INSTALL} && pnpm run {name}"
+                return f"{install} && {run_one} {name}"
         # No declared entrypoint — run the standard checks any workspace exposes.
-        # ``-r --if-present`` self-skips workspaces missing the script, so this is a
-        # safe superset: a repo with only tests runs only tests.
-        return (
-            f"{_PNPM_INSTALL} && pnpm -r --if-present typecheck "
-            "&& pnpm -r --if-present build && pnpm -r --if-present test"
-        )
+        # ``--if-present`` self-skips workspaces missing the script, so this is a safe
+        # superset: a repo with only tests runs only tests. A manager with no clean
+        # recursive form falls through to the no-gate warning below rather than getting a
+        # command that cannot run.
+        if recursive:
+            return f"{install} && {recursive} typecheck && {recursive} build && {recursive} test"
     for fname, runner in (("Makefile", "make"), ("makefile", "make"), ("justfile", "just"), ("Justfile", "just")):
         fpath = os.path.join(repo_path, fname)
         if os.path.isfile(fpath):
@@ -996,6 +1028,7 @@ __all__ = [
     "queue_review_feedback",
     "_parse_gate_files",
     "_PNPM_INSTALL",
+    "_node_package_manager",
     "_GATE_TARGET_NAMES",
     "_resolve_gate_cmd",
     "_TEST_PATH_RE",
