@@ -80,6 +80,23 @@ def test_a_malformed_publish_never_raises():
     assert work_snapshot.provider() == []
 
 
+def test_one_malformed_row_costs_only_that_row():
+    """Per-item, not all-or-nothing. Building the list inside one try meant a single bad row
+    aborted the whole update — the good cards alongside it were lost too."""
+    work_snapshot.publish([_feature("bd-ok", "ready"), None, 42, _feature("bd-ok2", "blocked")])
+    assert [i["id"] for i in work_snapshot.provider()] == ["bd-ok2", "bd-ok"]
+
+
+def test_a_malformed_publish_does_not_silently_serve_a_STALE_snapshot():
+    """The failure mode that made the all-or-nothing version dangerous: `_SNAPSHOT` kept its
+    PREVIOUS value, so the agent went on being shown a board that no longer existed with
+    nothing to signal it. A publish that finds nothing usable must clear, not freeze."""
+    work_snapshot.publish([_feature("bd-old", "ready")])
+    assert [i["id"] for i in work_snapshot.provider()] == ["bd-old"]
+    work_snapshot.publish([None, 42, {"no": "board_state"}])
+    assert work_snapshot.provider() == []
+
+
 def test_provider_returns_a_copy_so_a_caller_cannot_mutate_the_snapshot():
     work_snapshot.publish([_feature("bd-1", "ready")])
     work_snapshot.provider().clear()
