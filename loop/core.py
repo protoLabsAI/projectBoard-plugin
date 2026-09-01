@@ -429,6 +429,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # How many times the blocked sweep has auto-cleared each card (see
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}
+        # #382: ledger-only follow-ups spent on this card — the requirement gate's answer
+        # to a reply that omitted the `## Requirements` section entirely. Separate from
+        # `req-fix` on purpose: a protocol miss must not spend the budget (or the tier)
+        # that a genuine unmet-requirement bounce needs.
+        self._ledger_only_attempts: dict[str, int] = {}
         # Feature ids already reported to the operator as stuck, so a card that stays
         # blocked is announced once rather than every sweep (see _notify_operator). This
         # set is a per-process CACHE only: the DURABLE dedup is the bead's

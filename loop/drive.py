@@ -1095,6 +1095,60 @@ class DriveMixin:
                             _requirement_gate_diag_line(diag),
                         )
                         listing = "\n".join(f"- {i.get('id')}: {i.get('text')}" for i in open_items)
+                        # #382: SILENCE (no `## Requirements` heading at all) is a protocol
+                        # miss, not a capability failure — and the two must not share a
+                        # remedy. The diagnostic above has always been able to tell them
+                        # apart; nothing acted on it, so a coder that simply forgot the
+                        # section got the full ladder: two `req-fix` re-dispatches, a tier
+                        # escalation, two more, then a terminal block that reaps the
+                        # worktree. bd-neiz burned seven ACP sessions and ~40 minutes that
+                        # way and lost an implementation which had ALREADY passed its
+                        # acceptance tests, because escalating the model cannot fix a
+                        # missing markdown heading — the same "a timeout teaches nothing"
+                        # shape as #143/#378: attempt N+1 gets a byte-identical instruction.
+                        #
+                        # So ask for the ledger ALONE first: implementation untouched on
+                        # disk, same tier, `req-fix` unspent. On exhaustion this falls
+                        # through to the ordinary bounce below — no new terminal edge.
+                        if not diag["has_requirements_heading"]:
+                            m = await self._budget_get(store, fid, "ledger-only", feature)
+                            if m < _LEDGER_ONLY_MAX:
+                                await self._budget_set(store, fid, "ledger-only", m + 1)
+                                self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
+                                self._ci_feedback[fid] = (
+                                    "Your implementation is COMPLETE and staying as it is — do NOT edit "
+                                    "code, tests, or docs this round. The ONLY thing missing is the "
+                                    "disposition ledger, which your last reply left out entirely.\n\n"
+                                    "Reply with a `## Requirements` section and nothing else of "
+                                    "substance: ONE line per item below, each exactly `- <id>: done` or "
+                                    "`- <id>: declined — <concrete reason>`. Every item needs a line; "
+                                    "silence is not a disposition. Mark an item `done` if the work "
+                                    "already in the worktree satisfies it.\n\n" + listing
+                                )
+                                try:
+                                    await asyncio.to_thread(
+                                        store.comment,
+                                        fid,
+                                        f"requirement ledger missing — ledger-only follow-up "
+                                        f"{m + 1}/{_LEDGER_ONLY_MAX} (no tier escalation, req-fix "
+                                        f"unspent) — diagnostics: {_requirement_gate_diag_line(diag)}",
+                                    )
+                                except Exception:  # noqa: BLE001 — bookkeeping must not fail the build
+                                    log.warning(
+                                        "[project_board] %s ledger-only follow-up comment failed",
+                                        fid,
+                                        exc_info=True,
+                                    )
+                                log.info(
+                                    "[project_board] %s requirement ledger absent — ledger-only "
+                                    "follow-up %d/%d (tier=%s, keep worktree, req-fix unspent)",
+                                    fid,
+                                    m + 1,
+                                    _LEDGER_ONLY_MAX,
+                                    tier or "default",
+                                )
+                                keep_wt = True
+                                continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
                             await self._budget_set(store, fid, "req-fix", n + 1)
