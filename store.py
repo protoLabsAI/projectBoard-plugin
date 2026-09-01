@@ -321,12 +321,21 @@ ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # Breadth cap (#143): the most files_to_modify a card of a given difficulty may name
 # before the Ready gate refuses it. A card wider than this times out before it lands —
 # and a timeout teaches nothing (the single worst failure mode: it burns the tiers with
-# zero diff). So the gate forces the author to SPLIT the work or re-declare the card
-# `large` (which then owes the design + ADR the DESIGN gate enforces). `large`/
-# `architectural` carry NO cap (absent from this dict) — they answer to the design gate,
-# not the breadth cap. Configurable via the `max_files_by_difficulty` config key (threaded
-# to BeadsBoard through store_kw, beside repo/base_branch); a None override keeps this default.
-MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4}
+# zero diff). So the gate forces the author to SPLIT the work.
+#
+# `large` IS capped (#378). It originally was not, on the theory that a wide card would be
+# caught by the design gate instead — large/architectural owe a design citing an ADR. That
+# theory was wrong, and a live board disproved it: bd-sxxf was `large` with EIGHT paths, had
+# a design citing ADR 0071, passed the design gate cleanly, and then timed out at 1800s
+# twice. All four best-of-k candidates had written a complete implementation and simply ran
+# out of clock. Design quality and buildable width are different properties, and only the
+# second one causes timeouts, so the design gate cannot stand in for a breadth cap.
+#
+# `architectural` stays uncapped deliberately: it is a decision-shaped card that should
+# spawn children rather than be built directly, so a cap there would be measuring the wrong
+# thing. Configurable via the `max_files_by_difficulty` config key (threaded to BeadsBoard
+# through store_kw, beside repo/base_branch); a None override keeps this default.
+MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4, "large": 6}
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
@@ -1508,10 +1517,11 @@ class BeadsBoard:
             raise BoardError(
                 f"Breadth gate: feature {fid!r} is difficulty={diff!r} and names {n} "
                 f"files_to_modify, over the cap of {cap} for a {diff} card — a card this wide "
-                "times out before it lands, and a timeout teaches nothing. Either SPLIT it into "
-                "cards each at or under the cap, or re-declare it difficulty=`large` (which then "
-                "owes a design + ADR reference before it can go ready). Tune the limit with the "
-                "max_files_by_difficulty config key if this cap is wrong."
+                "times out before it lands, and a timeout teaches nothing. SPLIT it into cards "
+                "each at or under the cap. Re-declaring it `large` raises the cap but does not "
+                "remove it (#378: a large card with a design still timed out twice), and `large` "
+                "additionally owes a design + ADR reference before it can go ready. Tune the "
+                "limit with the max_files_by_difficulty config key if this cap is wrong."
             )
         # SHARED-FILE overlap (#143): two non-terminal cards naming the same file with no
         # depends_on edge between them build off a stale base and collide — the loop can claim
