@@ -638,14 +638,16 @@ async def _drive_with(
     seed=None,
     feature=None,
     store_features=None,
+    store=None,
 ):
     """Run _drive over FEATURE with the worktree helpers + delegate stubbed.
     Returns the FakeLoopStore so the test can assert the recorded transitions.
 
     ``judge`` stubs ``_judge_candidates`` (Max-Mode best-of-N); ``seed`` is a callable
     run on the loop before the drive (e.g. to pre-seed _ci_feedback for a CI-bounce test);
-    ``store_features`` pre-seeds ``store.list_features`` rows (the #253 sibling scan)."""
-    store = FakeLoopStore()
+    ``store_features`` pre-seeds ``store.list_features`` rows (the #253 sibling scan);
+    ``store`` swaps in a FakeLoopStore subclass when the test needs extra store verbs."""
+    store = store if store is not None else FakeLoopStore()
     store.features = store_features or []
     store.creates = []  # fids create_worktree was called for (a goal-fix retry reuses, so won't re-create)
     store.removes = []  # worktrees remove_worktree was called for
@@ -2357,6 +2359,130 @@ async def test_drive_blocks_on_a_coder_timeout_not_transient_retried(monkeypatch
     assert calls["n"] == 1
     assert "flag_blocked" in store.names()
     assert loop._inflight == {}
+
+
+async def _unreached_pr(wt, branch, *, base, title, body, promote_draft=True):
+    raise AssertionError("open_pr should not run after a coder timeout")
+
+
+class _DecomposeStore(FakeLoopStore):
+    """Records the decompose ask and persists budget labels, so a test can prove the
+    counter is DURABLE (label-backed) rather than only a per-process cache."""
+
+    def __init__(self):
+        super().__init__()
+        self.asked = []
+        self.budgets: dict[str, int] = {}
+
+    def record_budget(self, fid, kind, n):
+        self.budgets[f"{fid}:{kind}"] = n
+        return {"id": fid}
+
+    def get_feature(self, fid):
+        labels = [f"budget:{k.split(':', 1)[1]}:{v}" for k, v in self.budgets.items() if k.startswith(f"{fid}:")]
+        return {"id": fid, "labels": labels}
+
+    def request_decomposition(self, fid, *, timeouts):
+        self.asked.append((fid, timeouts))
+        return {"id": "bd-split"}
+
+
+async def test_one_timeout_blocks_without_asking_for_a_decomposition(monkeypatch):
+    """#378: the ask is for a REPEATED timeout. One can be an unlucky gate run, and asking
+    on the first would file a decompose task for every slow build."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    loop, store = await _drive_with(monkeypatch, open_pr=_unreached_pr, dispatch=_dispatch, store=_DecomposeStore())
+    assert "flag_blocked" in store.names()
+    assert store.asked == []  # blocked, but not yet asked to split
+
+
+async def test_a_repeated_timeout_asks_the_agent_to_split_the_card(monkeypatch):
+    """The payoff. A timeout carries no diff and no CI output, so a retry re-sends the same
+    prompt and a tier climb spends a stronger model on a card that was never model-limited.
+    On the SECOND timeout the loop files the decompose ask instead of leaving the card
+    parked for an operator to diagnose by hand."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        # The model DID work before the clock ran out — that is what makes this a size
+        # signal rather than the pre-first-token infra timeout handled at step 1.5.
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {"path": "a.py"}})
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    store = _DecomposeStore()
+    store.budgets["bd-1:timeout"] = 1  # a prior process already saw one timeout
+    loop, store = await _drive_with(monkeypatch, open_pr=_unreached_pr, dispatch=_dispatch, store=store)
+    assert store.asked == [("bd-1", 2)]  # the count is CUMULATIVE across restarts
+    assert "flag_blocked" in store.names()  # and it still blocks — the ask is additive
+
+
+async def test_the_timeout_counter_survives_a_restart(monkeypatch):
+    """The counter rides a `budget:` label, not just the loop's dict — an oversized card
+    that reset to zero on every reload would never reach the threshold."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    store = _DecomposeStore()
+    await _drive_with(monkeypatch, open_pr=_unreached_pr, dispatch=_dispatch, store=store)
+    assert store.budgets["bd-1:timeout"] == 1  # persisted, not only cached
+
+
+async def test_decompose_ask_can_be_switched_off(monkeypatch):
+    """0 restores the old behaviour exactly: block, ask nothing."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {"path": "a.py"}})
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    store = _DecomposeStore()
+    store.budgets["bd-1:timeout"] = 5  # well past any threshold
+    loop, store = await _drive_with(
+        monkeypatch,
+        open_pr=_unreached_pr,
+        dispatch=_dispatch,
+        store=store,
+        cfg={"coder": "proto", "decompose_after_timeouts": 0},
+    )
+    assert store.asked == []
+    assert "flag_blocked" in store.names()
+
+
+async def test_a_pre_first_token_timeout_never_asks_for_a_decomposition(monkeypatch):
+    """A CoderTimeout with NO model activity is a wedged adapter/session (#339), not a card
+    that is too wide — splitting it would be the wrong remedy for an infra fault. It blocks
+    on the pre-model path and must never reach the ask, however many have accumulated."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        # deliberately no progress_tool/progress_thought — the model never started
+        raise worktree.CoderTimeout("coder timed out after 1800s")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    store = _DecomposeStore()
+    store.budgets["bd-1:timeout"] = 5
+    loop, store = await _drive_with(monkeypatch, open_pr=_unreached_pr, dispatch=_dispatch, store=store)
+    assert store.asked == []
+    assert any(c[0] == "flag_blocked" and c[3] == "dispatch-infra" for c in store.calls)
+
+
+async def test_a_non_timeout_failure_never_asks_for_a_decomposition(monkeypatch):
+    """Size is the ONLY signal this reacts to. A review bounce or a red gate carries
+    feedback the next attempt can use, so those must keep their existing path."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        raise worktree.WorktreeError("some other failure")
+
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    store = _DecomposeStore()
+    store.budgets["bd-1:timeout"] = 5
+    loop, store = await _drive_with(monkeypatch, open_pr=_unreached_pr, dispatch=_dispatch, store=store)
+    assert store.asked == []
 
 
 class _EscalatingStore(FakeLoopStore):

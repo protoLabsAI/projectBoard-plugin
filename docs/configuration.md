@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **21 of 65 keys are in this state, including `coders` and `projects`** —
+never renders it. **21 of 66 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -132,10 +132,19 @@ The gates between a green build and main.
 | Key | Default | Applies |
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
+| `decompose_after_timeouts` | `2` | **restart** |
 | `max_files_by_difficulty` | `—` | reload **· YAML only** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
+
+`decompose_after_timeouts` is the one that changes behaviour rather than tuning it. A coder
+timeout is a **size** signal, not a capability one: it produces no diff and no CI output, so a
+retry re-sends a near-identical prompt and climbing the model ladder spends a stronger model on
+a card that was never model-limited. After this many timeouts on one card, the loop files a task
+asking this agent to split it into buildable slices — once per card, and never for a
+pre-first-token timeout (that is an infra fault, and splitting would be the wrong remedy). Set
+`0` to switch the ask off and have the card simply block, as it did before.
 
 ## Concurrency
 
