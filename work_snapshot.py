@@ -50,23 +50,42 @@ def publish(features) -> None:
     in_progress, ready), and trims to ``MAX_ITEMS``. Never raises: a bad snapshot must not
     break the sweep."""
     global _SNAPSHOT
+    # PER-ITEM, not all-or-nothing. Building the whole list inside one try meant a single
+    # malformed card (a None in the list, a non-dict row) aborted the entire update and left
+    # `_SNAPSHOT` holding its PREVIOUS value — so the agent kept being shown a stale board
+    # indefinitely, with nothing in the working state to say so. One bad card must cost that
+    # card, not the whole view.
+    rank = {state: i for i, state in enumerate(("blocked", "in_review", "in_progress", "ready"))}
+    live = []
+    skipped = 0
+    for f in features or []:
+        try:
+            if str(f.get("board_state") or "") in LIVE_STATES:
+                live.append(f)
+        except Exception:  # noqa: BLE001 — not a dict / no .get: drop this row only
+            skipped += 1
     try:
-        rank = {state: i for i, state in enumerate(("blocked", "in_review", "in_progress", "ready"))}
-        live = [f for f in (features or []) if str(f.get("board_state") or "") in LIVE_STATES]
         live.sort(key=lambda f: (rank.get(str(f.get("board_state")), 99), str(f.get("id") or "")))
-        _SNAPSHOT = [
-            {
-                "id": str(f.get("id") or ""),
-                "title": str(f.get("title") or "")[:90],
-                "state": str(f.get("board_state") or ""),
-                # `next_action_hint` is the board's own one-line "what unsticks this" —
-                # reuse it rather than inventing a second phrasing for the same thing.
-                "hint": str(f.get("next_action_hint") or "").strip(),
-            }
-            for f in live[:MAX_ITEMS]
-        ]
-    except Exception:  # noqa: BLE001 — a snapshot is a convenience, never a failure mode
-        log.warning("[project_board] work snapshot publish failed (ignored)", exc_info=True)
+    except Exception:  # noqa: BLE001 — an unsortable row must not cost the snapshot
+        log.warning("[project_board] work snapshot sort failed — publishing unsorted", exc_info=True)
+    built = []
+    for f in live[:MAX_ITEMS]:
+        try:
+            built.append(
+                {
+                    "id": str(f.get("id") or ""),
+                    "title": str(f.get("title") or "")[:90],
+                    "state": str(f.get("board_state") or ""),
+                    # `next_action_hint` is the board's own one-line "what unsticks this" —
+                    # reuse it rather than inventing a second phrasing for the same thing.
+                    "hint": str(f.get("next_action_hint") or "").strip(),
+                }
+            )
+        except Exception:  # noqa: BLE001
+            skipped += 1
+    if skipped:
+        log.warning("[project_board] work snapshot: skipped %d malformed feature row(s)", skipped)
+    _SNAPSHOT = built
 
 
 def provider() -> list[dict]:
