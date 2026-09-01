@@ -28,6 +28,7 @@ from project_board.loop import (
     _MERGED_VERIFIED_SHA_LEN,
     _REVIEW_FINDINGS_TITLE,
     BoardLoop,
+    _LEDGER_ONLY_MAX,
     _ci_failure_reason,
     evidence_is_grounded,
     partition_by_grounding,
@@ -2128,7 +2129,10 @@ async def test_requirement_gate_diagnostic_comment_failure_never_breaks_the_buil
     and the build still re-dispatches and opens the PR (#284)."""
     replies = iter(
         [
-            "no requirements section here — r1 stays open",
+            # A heading with no parseable disposition: the item stays open, so this is
+            # the ordinary req-fix bounce (#284) and NOT #382's ledger-only follow-up,
+            # which only fires when the section is missing altogether.
+            "## Requirements\n- r1: still working on it\n\n## Summary\nwip",
             "## Requirements\n- r1: done\n\n## Summary\nshipped",
         ]
     )
@@ -2671,7 +2675,10 @@ async def test_drive_ledger_gate_exhaustion_escalates_into_the_same_worktree(mon
         # smart build finally disposes it so the gate passes and the PR opens.
         if len(prompts) >= 3:
             return "## Requirements\n- r1: done\n\n## Summary\nshipped"
-        return "## Summary\nwip"
+        # Heading present, no parseable disposition → r1 stays open on the req-fix
+        # ladder. Silence would take #382's ledger-only path instead, which is a
+        # different edge and deliberately does NOT escalate.
+        return "## Requirements\n- r1: still working on it\n\n## Summary\nwip"
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/282"
@@ -2802,7 +2809,10 @@ async def test_drive_keep_worktree_exhaustion_clears_feedback_when_no_worktree(m
         feedback_seen.append(loop._ci_feedback.get("bd-1"))
         if len(prompts) >= 3:
             return "## Requirements\n- r1: done\n\n## Summary\nshipped"
-        return "## Summary\nwip"
+        # Heading present, no parseable disposition → r1 stays open on the req-fix
+        # ladder. Silence would take #382's ledger-only path instead, which is a
+        # different edge and deliberately does NOT escalate.
+        return "## Requirements\n- r1: still working on it\n\n## Summary\nwip"
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         return "https://example/pr/3"
@@ -10189,3 +10199,196 @@ async def test_the_truncation_guard_only_fires_on_a_diff_that_was_actually_cut(m
     # The guard still ran: the ungrounded finding was demoted, not blocked.
     assert store.review_states[-1][0] == "review-clean"
     assert ("requeue", "bd-1") not in store.calls
+
+
+# ── #382: a missing ledger is a protocol miss, not a capability failure ───────
+#
+# bd-neiz: the coder's work passed its acceptance tests at 14:29, then the reply
+# omitted the `## Requirements` section six times running. The gate spent two
+# `req-fix` rounds, escalated reasoning→opus, spent two more, and terminal-blocked
+# — seven ACP sessions and ~40 minutes to discard a passing implementation,
+# because escalating the model cannot fix a missing markdown heading.
+
+
+def _ledger_drive_loop(monkeypatch, replies, store, cfg=None):
+    """A `_drive` loop whose coder returns `replies` in order, in one reused worktree."""
+    prompts = []
+    creates = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        creates.append(fid)
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        return replies[min(len(prompts) - 1, len(replies) - 1)]
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/382"
+
+    async def _noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _noop)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _noop)
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_fix_max": 1, **(cfg or {})})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+    return loop, prompts, creates
+
+
+_ONE_REQ = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+
+
+async def test_a_missing_ledger_gets_a_ledger_only_followup_not_an_escalation(monkeypatch):
+    """The bd-neiz shape: silence → ask for the ledger alone. No tier climb, no req-fix."""
+    store = _EscalatingStore(tiers=["smart"])
+    loop, prompts, creates = _ledger_drive_loop(
+        monkeypatch,
+        ["## Summary\nwip", "## Requirements\n- r1: done\n\n## Summary\nshipped"],
+        store,
+    )
+    await loop._drive(dict(_ONE_REQ))
+
+    # The card shipped on the SAME tier — the ladder was never touched.
+    assert store.escalated == []
+    assert ("open_review", "bd-1", "https://example/pr/382") in store.calls
+    # …in the same worktree, and req-fix was never spent — only the new budget.
+    assert creates == ["bd-1"]
+    assert loop._req_fix_attempts.get("bd-1", 0) == 0
+    # The follow-up happened — its durable record is the bead comment, since the passed
+    # gate re-arms `ledger-only` along with the other pre-PR budgets.
+    assert [c for c in store.calls if c[0] == "comment" and "ledger-only follow-up 1/1" in c[2]]
+    assert loop._ledger_only_attempts.get("bd-1", 0) == 0  # re-armed for the card's next round
+    # The follow-up asks for the ledger and the summary, and nothing else — impl stays put.
+    assert "do NOT edit" in prompts[1] and "## Requirements" in prompts[1]
+    assert "- r1: do x" in prompts[1]
+    # …and it must ask for `## Summary` back: the PR body is built from it, and the
+    # pre-PR goal gate re-reads it for a `NO_TEST_NEEDED:` declaration. Dropping it
+    # would make the follow-up round undo work the card had already banked.
+    assert "## Summary" in prompts[1] and "NO_TEST_NEEDED" in prompts[1]
+
+
+async def test_the_ledger_only_followup_is_bounded_and_falls_through(monkeypatch):
+    """Exhausted, it hands back to the ordinary req-fix bounce — no new terminal edge."""
+    store = _EscalatingStore(tiers=["smart"])
+    loop, prompts, _ = _ledger_drive_loop(monkeypatch, ["## Summary\nwip"], store)
+    await loop._drive(dict(_ONE_REQ))
+
+    # One ledger-only follow-up, then the ordinary ladder resumes and runs to its end.
+    assert loop._ledger_only_attempts["bd-1"] == _LEDGER_ONLY_MAX == 1
+    assert loop._req_fix_attempts.get("bd-1", 0) >= 1
+    assert store.escalated and "requirements unresolved" in store.escalated[0][1]
+    # The fall-through prompt is the ordinary bounce again, not another ledger-only ask.
+    assert "ALREADY in this worktree" in prompts[-1]
+    assert ("open_review", "bd-1", "https://example/pr/382") not in store.calls
+
+
+async def test_a_partial_disposition_never_takes_the_ledger_only_path(monkeypatch):
+    """Heading present + item open is a genuine unmet requirement — unchanged behaviour."""
+    store = _EscalatingStore(tiers=["smart"])
+    loop, prompts, _ = _ledger_drive_loop(
+        monkeypatch,
+        ["## Requirements\n- r1: still working on it\n\n## Summary\nwip"],
+        store,
+    )
+    await loop._drive(dict(_ONE_REQ))
+
+    assert loop._ledger_only_attempts.get("bd-1", 0) == 0  # never fired
+    assert loop._req_fix_attempts.get("bd-1", 0) >= 1
+    assert store.escalated and "requirements unresolved" in store.escalated[0][1]
+    assert "ALREADY in this worktree" in prompts[1]
+
+
+async def test_ledger_only_followup_comment_failure_never_breaks_the_build(monkeypatch, caplog):
+    """The follow-up's bead comment is bookkeeping — a store.comment failure is swallowed."""
+    import logging as _logging
+
+    class _NoComment(_EscalatingStore):
+        def comment(self, fid, text):
+            raise RuntimeError("br is down")
+
+    store = _NoComment(tiers=["smart"])
+    loop, _prompts, _ = _ledger_drive_loop(
+        monkeypatch,
+        ["## Summary\nwip", "## Requirements\n- r1: done\n\n## Summary\nshipped"],
+        store,
+    )
+    with caplog.at_level(_logging.WARNING):
+        await loop._drive(dict(_ONE_REQ))
+
+    assert "ledger-only follow-up comment failed" in caplog.text
+    assert ("open_review", "bd-1", "https://example/pr/382") in store.calls  # build survived
+
+
+async def test_a_card_with_no_requirements_is_untouched_by_the_ledger_path(monkeypatch):
+    """No ledger, no gate — a silent reply opens its PR exactly as before."""
+    store = _EscalatingStore(tiers=["smart"])
+    loop, prompts, _ = _ledger_drive_loop(monkeypatch, ["## Summary\nshipped"], store)
+    await loop._drive({**FEATURE, "requirements": []})
+
+    assert loop._ledger_only_attempts.get("bd-1", 0) == 0
+    assert len(prompts) == 1
+    assert ("open_review", "bd-1", "https://example/pr/382") in store.calls
+
+
+async def test_the_ledger_only_round_does_not_undo_a_no_test_declaration(monkeypatch):
+    """The pre-PR goal gate runs BEFORE the requirement gate and re-reads the coder's
+    reply for `NO_TEST_NEEDED:` inside `## Summary`. A ledger-only round that dropped the
+    summary would fail goal-verify and be told to add tests — inverting the fix. So the
+    follow-up must ask for the summary back, and the round must still pass the gate."""
+    store = _EscalatingStore(tiers=["smart"])
+    summary = "## Summary\nrefactor only\nNO_TEST_NEEDED: pure refactor, no behavior change"
+    prompts = []
+    creates = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        creates.append(fid)
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return summary  # a code change with no test, excused via the hatch — no ledger
+        # A coder answers what it was ASKED for: the summary comes back only if the
+        # follow-up asked for it. That is what makes this test constrain the prompt.
+        ledger = "## Requirements\n- r1: done"
+        return f"{ledger}\n\n{summary}" if "RE-EMIT your previous summary" in prompt else ledger
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/382"
+
+    async def _noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _open_pr)
+    monkeypatch.setattr(worktree, "remove_worktree", _noop)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _noop)
+    loop = BoardLoop({"coders": {"fast": "pf", "smart": "ps"}, "goal_fix_max": 1, "goal_verify": True})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: object())
+
+    async def _stage(_wt):
+        return None
+
+    async def _git(_wt, *args):
+        # A code change with no test file — exactly the shape that needs the hatch.
+        return (0, "operator_api/provider_routes.py", "")
+
+    monkeypatch.setattr(worktree, "stage_all", _stage)
+    monkeypatch.setattr(worktree, "_git", _git)
+    await loop._drive({**_ONE_REQ, "acceptance_criteria": "it works"})
+
+    # The follow-up asked for the summary back …
+    assert "## Summary" in prompts[1] and "NO_TEST_NEEDED" in prompts[1]
+    # … and the card shipped: no goal-fix bounce, no escalation, no "add a test" round.
+    assert loop._goal_fix_attempts.get("bd-1", 0) == 0
+    assert store.escalated == []
+    assert ("open_review", "bd-1", "https://example/pr/382") in store.calls

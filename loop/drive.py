@@ -1095,6 +1095,64 @@ class DriveMixin:
                             _requirement_gate_diag_line(diag),
                         )
                         listing = "\n".join(f"- {i.get('id')}: {i.get('text')}" for i in open_items)
+                        # #382: SILENCE (no `## Requirements` heading at all) is a protocol
+                        # miss, not a capability failure — and the two must not share a
+                        # remedy. The diagnostic above has always been able to tell them
+                        # apart; nothing acted on it, so a coder that simply forgot the
+                        # section got the full ladder: two `req-fix` re-dispatches, a tier
+                        # escalation, two more, then a terminal block that reaps the
+                        # worktree. bd-neiz burned seven ACP sessions and ~40 minutes that
+                        # way and lost an implementation which had ALREADY passed its
+                        # acceptance tests, because escalating the model cannot fix a
+                        # missing markdown heading — the same "a timeout teaches nothing"
+                        # shape as #143/#378: attempt N+1 gets a byte-identical instruction.
+                        #
+                        # So ask for the ledger ALONE first: implementation untouched on
+                        # disk, same tier, `req-fix` unspent. On exhaustion this falls
+                        # through to the ordinary bounce below — no new terminal edge.
+                        if not diag["has_requirements_heading"]:
+                            m = await self._budget_get(store, fid, "ledger-only", feature)
+                            if m < _LEDGER_ONLY_MAX:
+                                await self._budget_set(store, fid, "ledger-only", m + 1)
+                                self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
+                                self._ci_feedback[fid] = (
+                                    "Your implementation is COMPLETE and staying as it is — do NOT edit "
+                                    "code, tests, or docs this round. The ONLY thing missing is the "
+                                    "disposition ledger, which your last reply left out entirely.\n\n"
+                                    "Reply with TWO sections and nothing else:\n\n"
+                                    "1. `## Requirements` — ONE line per item below, each exactly "
+                                    "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
+                                    "item needs a line; silence is not a disposition. Mark an item "
+                                    "`done` if the work already in the worktree satisfies it.\n"
+                                    "2. `## Summary` — RE-EMIT your previous summary of this work, "
+                                    "including any `NO_TEST_NEEDED: <reason>` line it carried, "
+                                    "verbatim. The PR body is built from this section and the pre-PR "
+                                    "gates re-read it, so dropping it loses work you already did.\n\n" + listing
+                                )
+                                try:
+                                    await asyncio.to_thread(
+                                        store.comment,
+                                        fid,
+                                        f"requirement ledger missing — ledger-only follow-up "
+                                        f"{m + 1}/{_LEDGER_ONLY_MAX} (no tier escalation, req-fix "
+                                        f"unspent) — diagnostics: {_requirement_gate_diag_line(diag)}",
+                                    )
+                                except Exception:  # noqa: BLE001 — bookkeeping must not fail the build
+                                    log.warning(
+                                        "[project_board] %s ledger-only follow-up comment failed",
+                                        fid,
+                                        exc_info=True,
+                                    )
+                                log.info(
+                                    "[project_board] %s requirement ledger absent — ledger-only "
+                                    "follow-up %d/%d (tier=%s, keep worktree, req-fix unspent)",
+                                    fid,
+                                    m + 1,
+                                    _LEDGER_ONLY_MAX,
+                                    tier or "default",
+                                )
+                                keep_wt = True
+                                continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
                             await self._budget_set(store, fid, "req-fix", n + 1)
@@ -1271,7 +1329,9 @@ class DriveMixin:
                                     tried_here = 0  # a NEW rung has its own providers (#362)
                                     # Fresh per-tier budgets on the climb — mirrors the
                                     # shared capability-escalation path below.
-                                    await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
+                                    await self._budget_reset(
+                                        store, fid, "goal-fix", "gate-fix", "req-fix", "ledger-only"
+                                    )
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             await asyncio.to_thread(store.flag_blocked, fid, reason)
@@ -1413,7 +1473,7 @@ class DriveMixin:
                             # otherwise a tier that exhausted its retries hands the next
                             # (stronger) tier a spent budget, so it blocks on its first gap
                             # without a real shot.
-                            await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
+                            await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "ledger-only")
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
@@ -1445,7 +1505,7 @@ class DriveMixin:
                 await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
                 # requirement ledger #113, and the empty-result count #198).
-                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result")
+                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.

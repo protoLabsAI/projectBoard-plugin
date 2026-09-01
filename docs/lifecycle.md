@@ -135,6 +135,39 @@ reconcile runs them **in this order** — the ordering is load-bearing:
 An unchanged head that was genuinely rejected stays rejected. That is the point of pinning
 identity to a sha rather than to a timestamp or the presence of a label.
 
+## The requirement ledger, and the two ways it can be unsatisfied
+
+A card decomposed at `mark_ready` carries a ledger of requirement items. Before its PR
+opens, the coder must dispose of every one — a `## Requirements` section with `- <id>:
+done` or `- <id>: declined — <reason>` per item. Silence is not a disposition.
+
+A reply can leave the ledger unsatisfied in two very different ways, and the gate treats
+them differently (#382):
+
+| What came back | What it means | What the gate does |
+|---|---|---|
+| a `## Requirements` section, items still open | a genuine **unmet requirement** — the coder engaged with the ledger | the ordinary `req-fix` bounce: re-dispatch with the open items, then escalate the tier, then block |
+| **no `## Requirements` section at all** | a **protocol miss** — the coder forgot the section | one ledger-only follow-up: ask for the ledger *alone*, implementation untouched, same tier, `req-fix` unspent |
+
+The split matters because escalating the model ladder cannot fix a missing markdown
+heading. `bd-neiz` spent seven ACP sessions and ~40 minutes climbing `reasoning → opus`
+on a card whose implementation had **already passed its acceptance tests**, then
+terminal-blocked and reaped the worktree — the whole diff lost to a formatting omission.
+It is the same shape as a repeated timeout (#143, #378): there is no error text to fold
+into the retry, so attempt N+1 gets a byte-identical instruction and misses identically.
+
+The follow-up is bounded by `_LEDGER_ONLY_MAX` (one). On exhaustion it falls through to
+the ordinary `req-fix` bounce — a protocol miss adds no new terminal edge, it only gets
+one cheap chance to be a slip rather than a capability failure. Like its sibling pre-PR
+budgets it re-arms on a tier climb and on a passed gate, so a card that later returns for
+an unrelated reason still gets one.
+
+The follow-up asks for the `## Summary` section back alongside the ledger, which matters
+more than it looks: the **goal gate runs before the requirement gate** and re-reads the
+coder's reply for a `NO_TEST_NEEDED:` declaration. A ledger-only round that dropped the
+summary would fail goal-verify and be told to add a test — inverting the fix and undoing
+work the card had already banked. The PR body is built from that section too.
+
 ## Blocked cards — self-heal, then page a human
 
 `blocked` carries a **class**, on a `blocked-class:<cls>` label, and the class decides what

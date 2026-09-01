@@ -1027,7 +1027,15 @@ _BUDGET_KINDS: dict[str, str] = {
     # threshold that asks for a decomposition.
     "timeout": "_timeout_attempts",
     "unblock-retry": "_unblock_retries",
+    "ledger-only": "_ledger_only_attempts",
 }
+
+# How many ledger-only follow-ups one card may get before the requirement gate falls
+# through to its ordinary `req-fix` bounce (#382). ONE: a coder that ignores an
+# instruction whose entire content is "write these lines" is not going to be talked
+# round by a second identical ask — at that point the miss stops looking like a slip,
+# and the normal bounce, which also re-examines the work itself, is the right next move.
+_LEDGER_ONLY_MAX = 1
 
 # Which classifier categories the blocked sweep will clear on its own. A block self-heals
 # only when the thing that caused it is the kind that passes: a rate limit, a network or
@@ -1088,6 +1096,7 @@ __all__ = [
     "_GROUNDING_DIFF_MAX_CHARS",
     "evidence_is_grounded",
     "partition_by_grounding",
+    "_LEDGER_ONLY_MAX",
     "rung_delegates",
     "should_rotate_provider",
     "_next_rung_cursor",
