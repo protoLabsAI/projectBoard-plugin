@@ -1594,6 +1594,83 @@ class BeadsBoard:
                     f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
                 )
 
+    # Label marking a card whose repeated timeouts already asked for a decomposition
+    # (#378) — so the ask happens ONCE per card, never on every subsequent timeout.
+    LABEL_DECOMPOSE_ASKED = "decompose-asked"
+
+    def request_decomposition(self, fid: str, *, timeouts: int) -> dict | None:
+        """Ask the board's own agent to split an oversized card (#378).
+
+        A repeated ``CoderTimeout`` is the one failure class that teaches the next attempt
+        nothing: there is no diff and no CI output, so a retry receives a near-identical
+        prompt and spends the clock the same way. Escalating the model tier does not help
+        either — the card was never model-limited, it was too wide.
+
+        Rather than decompose inline (the ``decompose`` subagent is a pure proposer driven
+        by a skill, and an LLM call inside the drive loop can itself time out), file a
+        TASK assigned to the board's own agent. The existing self-dispatch path (#311)
+        picks it up, the agent decomposes with the board tools it already has, and the
+        Ready gate enforces that the slices are actually well-formed — which is the part
+        an unattended splitter gets wrong.
+
+        Returns the new task, or None when the ask was already made (idempotent) or the
+        card is itself a decomposition task (never recurse). Never raises: failing to ask
+        must not change how the timeout itself is handled."""
+        try:
+            f = self.get_feature(fid)
+            if not f:
+                return None
+            labels = list(f.get("labels") or [])
+            if self.LABEL_DECOMPOSE_ASKED in labels or f.get("issue_type") == LABEL_TASK:
+                return None
+            files = list(f.get("files_to_modify") or [])
+            spec = (
+                f"Card {fid} ({f.get('title') or 'untitled'}) has timed out {timeouts}x under the "
+                f"coder and is too wide to build in one dispatch. Split it into slices and retire it.\n\n"
+                f"A timeout is not a capability failure — it carries no diff and no CI output, so "
+                f"retrying or escalating the tier spends the clock again on a card that was never "
+                f"model-limited. It is a SIZE signal.\n\n"
+                f"ORIGINAL SPEC\n{f.get('spec') or '(none)'}\n\n"
+                f"ORIGINAL ACCEPTANCE CRITERIA\n{f.get('acceptance_criteria') or '(none)'}\n\n"
+                f"ORIGINAL files_to_modify ({len(files)})\n"
+                + ("\n".join(f"- {p}" for p in files) or "- (none)")
+                + "\n\nHOW TO SPLIT (the board's own gates will refuse a sloppy decomposition, so "
+                "satisfy them up front):\n"
+                "- Each slice must sit at or under the breadth cap for its difficulty, and must be "
+                "independently buildable and gate-passing on its own — not a fragment that only "
+                "compiles once its siblings land.\n"
+                "- A slice naming a file that does not exist YET must mark it `(new)`, or the Ready "
+                "gate refuses it as a phantom path.\n"
+                "- Slices editing the SAME file need a depends_on edge so one waits for the other. "
+                "The edge counts in either direction, but only between the two cards that actually "
+                "share the file: in a chain A->B->C, the A/C pair needs its OWN edge.\n"
+                "- Order them so the first slice is independently useful and the rest gate behind it.\n\n"
+                f"Then cancel {fid} as superseded, naming the slice ids in the reason."
+            )
+            criteria = (
+                f"- {fid} is cancelled with a reason naming the slices that replace it.\n"
+                "- Every slice is `ready` (or dag_blocked behind a sibling), so no slice needs a "
+                "second pass to become buildable.\n"
+                "- Together the slices cover the original acceptance criteria, with nothing dropped.\n"
+                "- No slice exceeds the breadth cap for its declared difficulty."
+            )
+            task = self.create_feature(
+                title=f"Decompose {fid} — timed out {timeouts}x, too wide to build",
+                spec=spec,
+                acceptance_criteria=criteria,
+                issue_type=LABEL_TASK,
+                assignee="agent",
+                priority=1,
+                project=str(f.get("project") or ""),
+                source_issue=str(f.get("source_issue") or ""),
+            )
+            self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
+            self.comment(fid, f"decompose requested after {timeouts} timeouts → {(task or {}).get('id', '?')}")
+            return task
+        except Exception:  # noqa: BLE001 — the ask is best-effort; the block still happens
+            log.warning("[project_board] %s decompose request failed (ignored)", fid, exc_info=True)
+            return None
+
     def mark_ready(self, fid: str) -> dict:
         """Promote a single feature to `ready` (backlog → ready): enforce the gate,
         materialize the requirement ledger, then flip the `ready` label."""

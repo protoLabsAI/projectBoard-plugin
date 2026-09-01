@@ -658,3 +658,30 @@ def test_review_clean_sha_label_fits_the_beads_label_cap(board):
     assert store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha=FULL_SHA)["blockers"] == []
     moved = store_mod.merge_posture(row, auto_merge=True, review_gate=True, head_sha="b" * 40)["blockers"]
     assert any("review-clean verdict is for" in b for b in moved)
+
+
+def test_request_decomposition_files_a_real_task_and_marks_the_card(board):
+    """#378, against REAL `br`: a repeated timeout asks the board's own agent to split the
+    card. Exercised end to end because every step here is a `br` write — the task create,
+    the `decompose-asked` label, and the audit comment — and a stubbed version of this would
+    prove only that the stubs agree with each other."""
+    wide = board.create_feature(
+        "Wide card that keeps timing out",
+        spec="build the whole subsystem",
+        acceptance_criteria="- WHEN done THE SYSTEM SHALL work",
+        files_to_modify=["a.py (new)", "b.py (new)"],
+    )
+    fid = wide["id"]
+
+    task = board.request_decomposition(fid, timeouts=2)
+    assert task is not None
+    got = board.get_feature(task["id"])
+    # It must be dispatchable by the SELF path (#311): a task assigned to the board's agent.
+    assert got["issue_type"] == "task"
+    assert got["assignee"] == "agent"
+    assert fid in got["title"]
+    assert "build the whole subsystem" in got["spec"]  # the original intent rode along
+
+    # The original is marked, so the ask cannot re-fire on the next timeout.
+    assert "decompose-asked" in (board.get_feature(fid).get("labels") or [])
+    assert board.request_decomposition(fid, timeouts=3) is None

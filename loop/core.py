@@ -123,6 +123,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # out of the default board view, NEVER deleted (query back via
         # include_archived). Rides the sweep cadence; no scheduler of its own.
         self.archive_after_days = float(self.cfg.get("archive_after_days", 7))
+        # #378: how many CoderTimeouts on one card before the loop asks the board's own
+        # agent to decompose it. 2, not 1 — a single timeout can be an unlucky gate run,
+        # and asking on the first one would file a decompose task for every slow build.
+        # 0 disables the ask entirely (the card just blocks, as it did before).
+        self.decompose_after_timeouts = int(self.cfg.get("decompose_after_timeouts", 2))
         # CI-feedback edge (closed-loop verify): poll in_review PRs' check-runs and,
         # on a FAILING rollup, bounce the feature back to the coder with the failure
         # injected as feedback (vs the old open-loop: a red PR sat in_review forever).
@@ -419,6 +424,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # instead of re-burning the workflow every poll (ADR 0078 D3: fail closed,
         # escalate; never judge from a partial panel).
         self._review_run_failures: dict[str, int] = {}
+        # #378: how many times a coder has timed out on this card, across restarts.
+        self._timeout_attempts: dict[str, int] = {}
         # How many times the blocked sweep has auto-cleared each card (see
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}

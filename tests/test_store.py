@@ -943,6 +943,85 @@ def test_design_gate_ignores_small_and_medium_features(make_board, monkeypatch):
     assert br.cmds("update")
 
 
+# ── request_decomposition: a repeated timeout asks the agent to split the card (#378) ──
+
+
+def _oversized(**over):
+    base = {
+        "id": "bd-8",
+        "title": "Wide card",
+        "board_state": "blocked",
+        "spec": "build the whole thing",
+        "acceptance_criteria": "- it works",
+        "files_to_modify": [f"f{i}.py" for i in range(8)],
+        "issue_type": "feature",
+        "labels": [],
+        "project": "proj",
+        "source_issue": "org/repo#1",
+    }
+    base.update(over)
+    return base
+
+
+def test_request_decomposition_files_a_task_for_the_boards_own_agent(make_board, monkeypatch):
+    """The ask is a TASK assigned to `agent`, so the existing self-dispatch path (#311)
+    drives it: the agent already holds the board tools, and the Ready gate then enforces
+    that the slices it writes are actually well-formed."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _oversized())
+    created = {}
+    monkeypatch.setattr(
+        b, "create_feature", lambda title, **kw: created.update({"title": title, **kw}) or {"id": "bd-9"}
+    )
+    monkeypatch.setattr(b, "comment", lambda fid, text: None)
+    out = b.request_decomposition("bd-8", timeouts=2)
+    assert out == {"id": "bd-9"}
+    assert created["issue_type"] == "task"
+    assert created["assignee"] == "agent"
+    assert created["project"] == "proj"  # the slices belong to the same repo
+    assert "bd-8" in created["title"] and "2" in created["title"]
+    # the ask must carry the ORIGINAL intent, or the agent decomposes from the title alone
+    assert "build the whole thing" in created["spec"]
+    assert "- it works" in created["acceptance_criteria"] or "acceptance" in created["spec"].lower()
+    # and the gate constraints, since a decomposition that trips them fails unattended
+    assert "(new)" in created["spec"] and "depends_on" in created["spec"]
+    assert ("update", "bd-8", "--add-label", "decompose-asked") in br.calls
+
+
+def test_request_decomposition_is_idempotent(make_board, monkeypatch):
+    """Once per card. Without this the ask re-fires on every later timeout and the board
+    fills with duplicate decompose tasks for the same feature."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _oversized(labels=["decompose-asked"]))
+    monkeypatch.setattr(b, "create_feature", lambda *a, **k: pytest.fail("must not ask twice"))
+    assert b.request_decomposition("bd-8", timeouts=3) is None
+
+
+def test_request_decomposition_never_recurses_on_a_task(make_board, monkeypatch):
+    """A decompose task is itself a task. If one times out, splitting THAT would recurse —
+    it escalates to the operator instead."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: _oversized(issue_type="task"))
+    monkeypatch.setattr(b, "create_feature", lambda *a, **k: pytest.fail("must not split a task"))
+    assert b.request_decomposition("bd-8", timeouts=9) is None
+
+
+def test_request_decomposition_never_raises(make_board, monkeypatch):
+    """It runs on the block path. A failure to ASK must not change how the timeout that
+    triggered it is handled — the card still blocks either way."""
+    br = Br()
+    b = make_board(br)
+
+    def _boom(fid):
+        raise RuntimeError("br exploded")
+
+    monkeypatch.setattr(b, "get_feature", _boom)
+    assert b.request_decomposition("bd-8", timeouts=2) is None
+
+
 # ── the BREADTH cap: small/medium cards may not exceed the files_to_modify cap (#143) ──
 
 

@@ -208,6 +208,11 @@ config:
                             # before the feature is Blocked for a manual rebase. 0 = block on
                             # the first conflict (clean BEHIND rebases still run — they need no coder).
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
+  # A repeated coder timeout is a SIZE signal, not a capability one: it carries no diff and
+  # no CI output, so a retry gets a near-identical prompt and a tier climb spends a stronger
+  # model on a card that was never model-limited. After this many timeouts on one card, the
+  # loop files a task asking the board's own agent to split it (once per card). 0 = off.
+  decompose_after_timeouts: 2
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.
   br_autofetch: true        # `br` fetched on first run (v0.43.0). With no `br` on PATH the
@@ -254,6 +259,8 @@ settings_tabs:
 settings:
   - { key: loop_enabled, label: "Run orchestration loop", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Start the background puller after the member restarts. Off keeps the board and tools available without dispatching work." }
+  - { key: decompose_after_timeouts, label: "Ask to split after N timeouts", type: number, minimum: 0, maximum: 10, group: "Project Board", tab: automation, restart: true,
+      description: "A repeated coder timeout means the card is too WIDE, not that the model is too weak: it produces no diff and no CI output, so a retry re-sends the same prompt and a tier climb spends a stronger model on the wrong problem. After this many timeouts on one card, file a task asking this agent to split it into buildable slices (once per card). 0 turns the ask off and the card simply blocks." }
   - { key: coder, label: "Coder delegate", type: string, group: "Project Board", tab: automation,
       description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a paused loop resumes on its next check." }
   - { key: br_autofetch, label: "Fetch br automatically", type: bool, group: "Project Board", tab: automation,

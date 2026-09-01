@@ -167,6 +167,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_merge": "REAL",
     "record_merged_verified": "REAL",
     "record_reviewed_head": "UNCOVERED",
+    "request_decomposition": "REAL",
     "record_verification": "UNCOVERED",
     "record_verified_candidate": "REAL",
     "remove_dependency": "UNCOVERED",

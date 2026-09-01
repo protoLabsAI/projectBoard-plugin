@@ -912,6 +912,11 @@ _BUDGET_KINDS: dict[str, str] = {
     "auto-merge": "_auto_merge_failures",
     "review-fix": "_review_fix_attempts",
     "review-run": "_review_run_failures",
+    # Cumulative CoderTimeouts on this card (#378). Not a fix budget like its siblings —
+    # nothing retries on it — but it wants exactly their durability: the count must survive
+    # a loop restart, or an oversized card resets to zero every reload and never reaches the
+    # threshold that asks for a decomposition.
+    "timeout": "_timeout_attempts",
     "unblock-retry": "_unblock_retries",
 }
 
