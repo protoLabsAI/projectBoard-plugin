@@ -1119,11 +1119,15 @@ class DriveMixin:
                                     "Your implementation is COMPLETE and staying as it is — do NOT edit "
                                     "code, tests, or docs this round. The ONLY thing missing is the "
                                     "disposition ledger, which your last reply left out entirely.\n\n"
-                                    "Reply with a `## Requirements` section and nothing else of "
-                                    "substance: ONE line per item below, each exactly `- <id>: done` or "
-                                    "`- <id>: declined — <concrete reason>`. Every item needs a line; "
-                                    "silence is not a disposition. Mark an item `done` if the work "
-                                    "already in the worktree satisfies it.\n\n" + listing
+                                    "Reply with TWO sections and nothing else:\n\n"
+                                    "1. `## Requirements` — ONE line per item below, each exactly "
+                                    "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
+                                    "item needs a line; silence is not a disposition. Mark an item "
+                                    "`done` if the work already in the worktree satisfies it.\n"
+                                    "2. `## Summary` — RE-EMIT your previous summary of this work, "
+                                    "including any `NO_TEST_NEEDED: <reason>` line it carried, "
+                                    "verbatim. The PR body is built from this section and the pre-PR "
+                                    "gates re-read it, so dropping it loses work you already did.\n\n" + listing
                                 )
                                 try:
                                     await asyncio.to_thread(
@@ -1325,7 +1329,9 @@ class DriveMixin:
                                     tried_here = 0  # a NEW rung has its own providers (#362)
                                     # Fresh per-tier budgets on the climb — mirrors the
                                     # shared capability-escalation path below.
-                                    await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
+                                    await self._budget_reset(
+                                        store, fid, "goal-fix", "gate-fix", "req-fix", "ledger-only"
+                                    )
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             await asyncio.to_thread(store.flag_blocked, fid, reason)
@@ -1467,7 +1473,7 @@ class DriveMixin:
                             # otherwise a tier that exhausted its retries hands the next
                             # (stronger) tier a spent budget, so it blocks on its first gap
                             # without a real shot.
-                            await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix")
+                            await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "ledger-only")
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
@@ -1499,7 +1505,7 @@ class DriveMixin:
                 await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
                 # requirement ledger #113, and the empty-result count #198).
-                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result")
+                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.

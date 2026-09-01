@@ -158,7 +158,15 @@ into the retry, so attempt N+1 gets a byte-identical instruction and misses iden
 
 The follow-up is bounded by `_LEDGER_ONLY_MAX` (one). On exhaustion it falls through to
 the ordinary `req-fix` bounce — a protocol miss adds no new terminal edge, it only gets
-one cheap chance to be a slip rather than a capability failure.
+one cheap chance to be a slip rather than a capability failure. Like its sibling pre-PR
+budgets it re-arms on a tier climb and on a passed gate, so a card that later returns for
+an unrelated reason still gets one.
+
+The follow-up asks for the `## Summary` section back alongside the ledger, which matters
+more than it looks: the **goal gate runs before the requirement gate** and re-reads the
+coder's reply for a `NO_TEST_NEEDED:` declaration. A ledger-only round that dropped the
+summary would fail goal-verify and be told to add a test — inverting the fix and undoing
+work the card had already banked. The PR body is built from that section too.
 
 ## Blocked cards — self-heal, then page a human
 
