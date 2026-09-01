@@ -7779,6 +7779,58 @@ def test_resolve_gate_auto_prefers_gate_over_ci_script(tmp_path):
     assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run gate"
 
 
+def test_resolve_gate_auto_uses_the_package_manager_the_lockfile_names(tmp_path):
+    """The gate must be built from the repo's OWN package manager, not a house default.
+
+    Guessing wrong yields a gate that can never pass — `pnpm install --frozen-lockfile` in
+    an npm-workspaces repo dies with ERR_PNPM_NO_LOCKFILE — and because the preflight is
+    fail-closed, that reads as "this project's gate is not runnable" and holds EVERY card
+    in the project. That is exactly what stalled a live board on 2026-08-31."""
+    _write(tmp_path, "package.json", '{"scripts": {"gate": "x"}}')
+    _write(tmp_path, "package-lock.json", "{}")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == "npm ci && npm run gate"
+
+
+def test_resolve_gate_auto_npm_workspace_fallback_when_no_script(tmp_path):
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run"}}')
+    _write(tmp_path, "package-lock.json", "{}")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == (
+        "npm ci && npm run --workspaces --if-present typecheck "
+        "&& npm run --workspaces --if-present build && npm run --workspaces --if-present test"
+    )
+
+
+def test_resolve_gate_auto_uses_yarn_when_yarn_lock_present(tmp_path):
+    _write(tmp_path, "package.json", '{"scripts": {"gate": "x"}}')
+    _write(tmp_path, "yarn.lock", "")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == "yarn install --frozen-lockfile && yarn run gate"
+
+
+def test_resolve_gate_auto_declines_to_guess_a_recursive_form_it_lacks(tmp_path):
+    """yarn/bun have no clean workspace-recursive `--if-present`, so with no declared script
+    there is nothing safe to emit. No gate (fail-open, warned) beats a gate that cannot run
+    — the whole failure mode this fixes is a wrong command reading as a broken project."""
+    _write(tmp_path, "package.json", '{"scripts": {"test": "vitest run"}}')
+    _write(tmp_path, "yarn.lock", "")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == ""
+
+
+def test_resolve_gate_auto_still_defaults_to_pnpm_with_no_lockfile(tmp_path):
+    """The genuinely ambiguous case keeps its prior behaviour rather than changing under
+    repos that were working."""
+    _write(tmp_path, "package.json", '{"scripts": {"gate": "x"}}')
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run gate"
+
+
+def test_resolve_gate_auto_prefers_pnpm_lock_over_a_stray_package_lock(tmp_path):
+    """Precedence is declaration order, so a repo that migrated to pnpm but still has an
+    abandoned package-lock.json gates with pnpm."""
+    _write(tmp_path, "package.json", '{"scripts": {"gate": "x"}}')
+    _write(tmp_path, "pnpm-lock.yaml", "")
+    _write(tmp_path, "package-lock.json", "{}")
+    assert _resolve_gate_cmd("auto", str(tmp_path)) == f"{loop_install()} && pnpm run gate"
+
+
 def test_resolve_gate_auto_reads_makefile_ci_target(tmp_path):
     _write(tmp_path, "Makefile", "build:\n\tgo build ./...\nci:\n\tgo test ./...\n")
     assert _resolve_gate_cmd("auto", str(tmp_path)) == "make ci"
