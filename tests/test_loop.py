@@ -4142,6 +4142,48 @@ async def test_board_dispatch_reports_all_candidates_held(monkeypatch):
     assert {s["fid"]: s["reason"] for s in out["skipped"]} == {"bd-1": "blocked"}
 
 
+async def test_board_dispatch_runs_the_fail_closed_preflight_before_claiming(monkeypatch):
+    """The review finding on #390: the periodic tick (`_run`) runs `_maybe_preflight`
+    immediately before its claim scan, so an on-demand dispatch must too — otherwise an
+    interactive kick could claim work past a newly-required or freshly-failing per-project
+    gate the next tick would have held. A preflight that holds the card's project is
+    honored: the card is skipped `preflight-hold`, never claimed (r4)."""
+    card = _ready("bd-1", ["a.py"])
+    store = _ClaimStore([card])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    ran = []
+
+    async def _preflight_holds_the_project():
+        ran.append(True)  # stand in for a real smoke that found the gate un-runnable
+        loop._preflight_state[loop._project_name(card)] = "gate failed on clean base"
+
+    monkeypatch.setattr(loop, "_maybe_preflight", _preflight_holds_the_project)
+    out = await loop.dispatch_now()
+    assert ran == [True]  # dispatch_now ran the preflight BEFORE the claim scan
+    assert out["outcome"] == "all-candidates-held"
+    assert store.claimed == []  # the fresh preflight hold stopped the claim — no bypass
+    assert {s["fid"]: s["reason"] for s in out["skipped"]} == {"bd-1": "preflight-hold"}
+
+
+async def test_board_dispatch_preflight_crash_is_a_diagnostic_not_a_claim(monkeypatch):
+    """A preflight that raises unexpectedly yields an `error` record and never reaches the
+    claim scan (fail-closed) — no exception into the agent loop, no claim on a base no gate
+    cleared."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+
+    async def _boom():
+        raise RuntimeError("preflight blew up")
+
+    monkeypatch.setattr(loop, "_maybe_preflight", _boom)
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "error"
+    assert out["dispatched"] == []
+    assert store.claimed == []  # the scan never ran — nothing was claimed
+
+
 async def test_request_dispatch_reports_no_running_loop(monkeypatch):
     """The tool seam: with no live loop surface in this process, request_dispatch reports
     `loop-not-running` rather than raising — there is nothing to ask."""

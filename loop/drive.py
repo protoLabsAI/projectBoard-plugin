@@ -654,6 +654,21 @@ class DriveMixin:
             "parked": [],
         }
 
+    def _dispatch_error_record(self, stage: str, exc: Exception) -> dict:
+        """The decision record for an UNEXPECTED crash in an on-demand dispatch stage (the
+        fail-closed preflight or the claim scan raised — not a gate verdict, which never
+        raises). A crashed diagnostic is a result, never an exception into the agent
+        loop."""
+        return {
+            "dispatched": [],
+            "outcome": "error",
+            "detail": f"the {stage} errored: {type(exc).__name__}: {exc}",
+            "running": len(self._drives),
+            "max_concurrent": self.max_concurrent,
+            "skipped": [],
+            "parked": [],
+        }
+
     async def dispatch_now(self) -> dict:
         """Evaluate the ready queue right now instead of waiting for the next interval —
         the observable entry point behind the ``board_dispatch``/``board_kick`` tool (#390).
@@ -661,10 +676,13 @@ class DriveMixin:
         This is NOT a second scheduler: it runs the very ``_spawn_ready`` a periodic tick
         runs, under the same claim lock, and bypasses nothing — ``loop_enabled``, the
         per-project preflight hold, ``max_concurrent``, the review-WIP limit and the
-        hot-file guard all apply exactly as in a tick. So a repeated or concurrent call can
-        never double-claim or over-dispatch an in-flight feature: a card the tick already
-        claimed is gone from the ready queue, and a full slot / WIP ceiling holds the scan
-        (r3/r4).
+        hot-file guard all apply exactly as in a tick. In particular it runs the SAME
+        fail-closed ``_maybe_preflight`` a tick runs immediately before its claim scan
+        (``_run``): without it an interactive kick could claim work past a newly required
+        or freshly failing per-project gate that the next tick would have held. So a
+        repeated or concurrent call can never double-claim or over-dispatch an in-flight
+        feature: a card the tick already claimed is gone from the ready queue, and a full
+        slot / WIP ceiling / preflight hold holds the scan (r3/r4).
 
         Returns a decision record — ``{dispatched, outcome, detail, running,
         max_concurrent, skipped, parked}`` — whose ``outcome`` tells the principal cases
@@ -675,20 +693,22 @@ class DriveMixin:
         or ``loop-disabled``."""
         if not self.enabled:
             return self._dispatch_disabled_record()
+        # Fail-closed preflight FIRST, exactly as the periodic tick does before its claim
+        # scan (`_run`): a newly-required or freshly-failing per-project gate must hold this
+        # on-demand dispatch too, or an interactive kick could claim work the next tick
+        # would have held. Run it OUTSIDE the claim lock — same as the tick — since it
+        # smokes a gate subprocess and must not serialize the claim scan.
+        try:
+            await self._maybe_preflight()
+        except Exception as exc:  # noqa: BLE001 — a preflight crash is a diagnostic result, not a crash
+            log.warning("[project_board] board_dispatch: preflight evaluation failed", exc_info=True)
+            return self._dispatch_error_record("preflight evaluation", exc)
         async with self._claim_guard():
             try:
                 await self._spawn_ready()
             except Exception as exc:  # noqa: BLE001 — a failed scan is a diagnostic result, not a crash
                 log.warning("[project_board] board_dispatch: ready-queue evaluation failed", exc_info=True)
-                return {
-                    "dispatched": [],
-                    "outcome": "error",
-                    "detail": f"the ready-queue evaluation errored: {type(exc).__name__}: {exc}",
-                    "running": len(self._drives),
-                    "max_concurrent": self.max_concurrent,
-                    "skipped": [],
-                    "parked": [],
-                }
+                return self._dispatch_error_record("ready-queue evaluation", exc)
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
         return self._dispatch_decision_record(decision)
 
