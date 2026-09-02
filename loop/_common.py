@@ -522,6 +522,46 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
     return grounded, ungrounded
 
 
+# ── "the gate was killed" vs "the gate said no" (#386) ────────────────────────
+#
+# A gate that dies on a signal reached NO verdict, and a verdict is what the caller
+# needs. `subprocess` says so with a NEGATIVE return code, but only when the gate
+# process is the one that died: a WRAPPER script (protoAgent's `scripts/gate.py`, most
+# repos' `make check`) runs the real tool as ITS child, so the signal lands one level
+# down and the wrapper's own exit code is whatever it chooses to return. Flattening that
+# to 1 is the common choice, and it makes a killed gate byte-identical to a red one.
+#
+# 128+N — the shell's own convention for "killed by signal N" — is the portable way to
+# carry that across the process boundary, so this reads BOTH forms. Deliberately a
+# numeric convention and not an output marker: this loop gates many repos and must not
+# learn any one repo's log format.
+#
+# Cost of the ambiguity (#386): pytest took a SIGTERM at 65%, the wrapper returned 1, and
+# a card was terminal-blocked ~40 minutes as "the RESULT is broken" with a merged state
+# that was fully green — holding its dependent behind it.
+
+# Highest real signal number on any platform this runs on; above it, 128+N stops being a
+# plausible signal death and is just a large exit code.
+_MAX_SIGNAL = 64
+
+
+def killed_by_signal(returncode: int | None) -> int | None:
+    """The signal that killed the gate, or None if it exited under its own control.
+
+    Reads both the direct form (`-N`, the gate process itself died) and the shell
+    convention (`128+N`, a wrapper reporting a child's signal death). Ambiguity is
+    resolved toward "killed", because the two failure modes are not symmetric: calling a
+    killed gate red states something false about the code and blocks, while calling a red
+    gate killed only re-runs it — and the genuine failure is still there on the next run."""
+    if returncode is None:
+        return None
+    if returncode < 0:
+        return -returncode
+    if 128 < returncode <= 128 + _MAX_SIGNAL:
+        return returncode - 128
+    return None
+
+
 def _requirement_gate_diagnostics(result: str, open_items: list[dict]) -> dict:
     """The requirement-gate diagnostic payload (#284). When the completion gate bounces
     a feature for unresolved dispositions, these are the fields that tell a *parse* miss
@@ -1093,6 +1133,7 @@ _loop = sys.modules[__package__]
 # before the split. Underscore names are listed explicitly so ``import *`` picks
 # them up.
 __all__ = [
+    "killed_by_signal",
     "_GROUNDING_DIFF_MAX_CHARS",
     "evidence_is_grounded",
     "partition_by_grounding",

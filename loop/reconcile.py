@@ -1806,18 +1806,21 @@ class ReconcileMixin:
                 return None
             if proc.returncode == 0:
                 return None
-            if proc.returncode is not None and proc.returncode < 0:
+            sig = killed_by_signal(proc.returncode)
+            if sig is not None:
                 # Killed by a signal — the member shutting down (SIGTERM reaches the
                 # child), an operator `kill`, the OOM killer — NOT the repo failing its
                 # own gate. Same posture as the timeout above: the gate couldn't run to
                 # a verdict, so it must not produce one. Seen 2026-08-20: a restart
                 # landed mid merged-state gate, pytest died at 13% with rc=-15, and the
                 # feature was flag_blocked "gate FAILED on the merged state" against a
-                # PR whose CI was fully green.
+                # PR whose CI was fully green. Seen AGAIN 2026-09-01 (#386) through a
+                # wrapper that flattened the signal to 1 — which is why this now reads
+                # 128+N too; see `killed_by_signal`.
                 log.warning(
                     "[project_board] pre-PR gate killed by signal %d (shutdown / external kill) — "
                     "no verdict, treating as pass (CI still gates)",
-                    -proc.returncode,
+                    sig,
                 )
                 return None
             text = (out or b"").decode("utf-8", "replace").strip()
