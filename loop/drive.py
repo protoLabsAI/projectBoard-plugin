@@ -704,10 +704,27 @@ class DriveMixin:
             log.warning("[project_board] board_dispatch: preflight evaluation failed", exc_info=True)
             return self._dispatch_error_record("preflight evaluation", exc)
         async with self._claim_guard():
+            running_drives = getattr(self, "_drives", {})
+            dispatched_before = set(running_drives.keys() if hasattr(running_drives, "keys") else running_drives)
             try:
                 await self._spawn_ready()
             except Exception as exc:  # noqa: BLE001 — a failed scan is a diagnostic result, not a crash
                 log.warning("[project_board] board_dispatch: ready-queue evaluation failed", exc_info=True)
+                running_drives = getattr(self, "_drives", {})
+                dispatched_after = set(running_drives.keys() if hasattr(running_drives, "keys") else running_drives)
+                dispatched = sorted(dispatched_after - dispatched_before)
+                if dispatched:
+                    return self._dispatch_record(
+                        "dispatched",
+                        f"Dispatched {', '.join(dispatched)} before ready-queue evaluation failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        dispatched=dispatched,
+                        error={
+                            "phase": "ready-queue evaluation",
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    )
                 return self._dispatch_error_record("ready-queue evaluation", exc)
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
         return self._dispatch_decision_record(decision)
