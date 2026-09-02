@@ -168,6 +168,31 @@ coder's reply for a `NO_TEST_NEEDED:` declaration. A ledger-only round that drop
 summary would fail goal-verify and be told to add a test — inverting the fix and undoing
 work the card had already banked. The PR body is built from that section too.
 
+## A killed gate is not a failed gate
+
+The pre-PR and merged-state gates both run a repo's own command. When that command dies on
+a **signal** — the member shutting down, an operator `kill`, a worktree reaped underneath
+it, the OOM killer — it reached no verdict, so it must not produce one. Like a gate
+timeout, it degrades to a pass; CI is still the real gate.
+
+Two forms are read, and both are needed:
+
+| Return code | Means |
+|---|---|
+| `-N` | the gate process itself died on signal N |
+| `128 + N` | a **wrapper** reporting that its child died on signal N — the shell's own convention |
+
+The wrapper form is the one that actually bites. Most gate commands are a script
+(protoAgent's `scripts/gate.py`, a `make check`) that runs the real tool as its own child,
+so the signal lands one level down and the wrapper chooses its own exit code. A wrapper
+that flattens everything to `1` makes a killed gate byte-identical to a red one, and no
+guard downstream can recover the difference — which is exactly how #386 blocked a card for
+~40 minutes as *"the RESULT is broken"* against a merged state that was fully green.
+
+Ambiguity resolves toward "killed" on purpose: the two errors are not symmetric. Calling a
+killed gate red states something false about the code and stops the board; calling a red
+gate killed only re-runs it, and the genuine failure is still there on the next run.
+
 ## Blocked cards — self-heal, then page a human
 
 `blocked` carries a **class**, on a `blocked-class:<cls>` label, and the class decides what

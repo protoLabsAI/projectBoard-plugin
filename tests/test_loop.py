@@ -30,6 +30,7 @@ from project_board.loop import (
     BoardLoop,
     _LEDGER_ONLY_MAX,
     _ci_failure_reason,
+    killed_by_signal,
     evidence_is_grounded,
     partition_by_grounding,
     _inject_source_issue_line,
@@ -599,6 +600,42 @@ async def test_run_local_gate_signal_kill_is_no_verdict_not_a_failure(tmp_path, 
         out = await BoardLoop({"local_gate_cmd": cmd})._run_local_gate(str(tmp_path))
     assert out is None
     assert "killed by signal 15" in caplog.text
+
+
+async def test_run_local_gate_treats_a_wrapper_reported_signal_death_as_no_verdict(tmp_path, caplog):
+    """The #386 shape, and the one the `< 0` guard could never see. A WRAPPER script
+    (protoAgent's `scripts/gate.py`, most repos' `make check`) runs the real tool as its
+    own child, so the signal lands one level down and the wrapper picks its own exit code.
+    Reporting 128+N — the shell's convention — is what makes the kill legible; the loop has
+    to read it. Live cost of not reading it: pytest took a SIGTERM at 65%, the wrapper
+    returned 1, and a card was terminal-blocked ~40 minutes as "the RESULT is broken"
+    against a merged state that was fully green."""
+    cmd = "echo 'tests/x.py ....... [ 65%]'; echo 'gate: KILLED unit tests (signal 15)'; exit 143"
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        out = await BoardLoop({"local_gate_cmd": cmd})._run_local_gate(str(tmp_path))
+    assert out is None
+    assert "killed by signal 15" in caplog.text
+
+
+async def test_run_local_gate_still_fails_on_an_ordinary_red_gate(tmp_path):
+    """The whole point is that a REAL failure still blocks — including exit 1, which is
+    what the flattening wrapper used to return for everything."""
+    cmd = "echo 'FAILED tests/test_x.py::test_y'; exit 1"
+    out = await BoardLoop({"local_gate_cmd": cmd})._run_local_gate(str(tmp_path))
+    assert out is not None and "FAILED tests/test_x.py::test_y" in out
+
+
+def test_killed_by_signal_reads_both_forms_and_nothing_else():
+    """Direct (`-N`) and wrapper (`128+N`); an ordinary exit code is not a signal."""
+    assert killed_by_signal(-15) == 15  # the gate process itself died
+    assert killed_by_signal(143) == 15  # a wrapper reporting its child's SIGTERM
+    assert killed_by_signal(137) == 9  # …SIGKILL
+    assert killed_by_signal(0) is None
+    assert killed_by_signal(1) is None  # the ordinary red gate
+    assert killed_by_signal(2) is None
+    assert killed_by_signal(128) is None  # the band is EXCLUSIVE of 128 — signal 0 is no kill
+    assert killed_by_signal(255) is None  # far above any real signal
+    assert killed_by_signal(None) is None  # process never reaped
 
 
 async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
