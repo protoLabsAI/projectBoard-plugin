@@ -1038,6 +1038,36 @@ def _board_tools(cfg: dict):
             indent=2,
         )
 
+    @tool
+    async def board_dispatch() -> str:
+        """Ask the running board loop to evaluate its ready queue RIGHT NOW instead of
+        waiting for the next interval, and report what happened (#390) — the observable
+        entry point into the loop's OWN claim path, NOT a second scheduler.
+
+        Returns a JSON decision record. `outcome` is one of: `dispatched` (a card was
+        claimed and a drive started — its feature id is in `dispatched`); `empty-queue`
+        (nothing is ready); `at-capacity` (all `max_concurrent` drive slots are full);
+        `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
+        task-type card was claimed to in_progress awaiting async delivery, holding no
+        slot); `all-candidates-held` (every ready card was blocked/held, deferred by the
+        hot-file guard, held by a per-project preflight, or lost a claim race — see
+        `skipped`); `loop-disabled` (project_board.loop_enabled=false); or
+        `loop-not-running` (no loop surface is live in this process). `detail` is a
+        one-sentence human summary; `running`/`max_concurrent` show the live slot picture.
+
+        Every scheduling gate a periodic tick honors — loop_enabled, project isolation,
+        concurrency, review-WIP and the hot-file protection — applies here unchanged and
+        under the same claim lock, so calling this repeatedly or concurrently can never
+        double-claim or double-dispatch an in-flight feature; it only makes the loop act
+        now rather than at the next tick, and it claims a card only when one is genuinely
+        ready and there is capacity."""
+        from .loop import request_dispatch
+
+        try:
+            return json.dumps(await request_dispatch())
+        except Exception as exc:  # noqa: BLE001 — never raise into the agent loop (mirror the store verbs)
+            return f"Error: {type(exc).__name__}: {exc}"
+
     tools = [
         board_create_epic,
         board_create_feature,
@@ -1055,6 +1085,7 @@ def _board_tools(cfg: dict):
         board_reset_merged_verify_budget,
         board_list,
         board_retro,
+        board_dispatch,
     ]
 
     # Runtime project registration (#167). Appended rather than folded in above because
