@@ -336,6 +336,8 @@ ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # thing. Configurable via the `max_files_by_difficulty` config key (threaded to BeadsBoard
 # through store_kw, beside repo/base_branch); a None override keeps this default.
 MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4, "large": 6}
+PRIORITY_MIN = 0
+PRIORITY_MAX = 4
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
 # seam) — `gens:<total>`, replaced (not accumulated as separate labels) each time so a
 # single label always carries the running total for `portfolio_rollup` to read.
@@ -656,6 +658,24 @@ def normalize_project(raw) -> str:
             "underscores (safe for a beads label); rename the project in project_board.projects."
         )
     return s
+
+
+def validate_priority(raw) -> int:
+    """Normalize + validate a bead scheduling priority.
+
+    beads priorities are integer ranks where 0 is highest. Validate before any
+    write so create/update callers get the same named rejection and never leave a
+    partial mutation behind.
+    """
+    if isinstance(raw, bool):
+        raise BoardError(f"priority must be an integer from {PRIORITY_MIN} to {PRIORITY_MAX}")
+    try:
+        priority = int(raw)
+    except (TypeError, ValueError):
+        raise BoardError(f"priority must be an integer from {PRIORITY_MIN} to {PRIORITY_MAX}") from None
+    if priority < PRIORITY_MIN or priority > PRIORITY_MAX:
+        raise BoardError(f"priority {priority} is out of range; accepted range is {PRIORITY_MIN} to {PRIORITY_MAX}")
+    return priority
 
 
 def _render_notes(files, source_issue: str = "", requirements=()) -> str:
@@ -996,6 +1016,7 @@ class BeadsBoard:
         description: str = "",
         external_ref: str = "",
     ) -> str:
+        priority = validate_priority(priority)
         args = ["create", title, "--type", itype, "-p", str(priority), "--silent"]
         if parent:
             args += ["--parent", parent]
@@ -1366,6 +1387,7 @@ class BeadsBoard:
         depends_on: list[str] | None = None,
         foundation: bool | None = None,
         source_issue: str | None = None,
+        priority: int | None = None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -1379,7 +1401,8 @@ class BeadsBoard:
         (None/False = untouched) — the repair half of create's success-with-warning
         contract. ``source_issue`` (a full GitHub issue URL or ``owner/repo#N``)
         sets/replaces the originating-issue record the PR opener stamps as
-        ``Fixes #N`` (#97)."""
+        ``Fixes #N`` (#97). ``priority`` changes the scheduling rank in place
+        when supplied; None leaves the current priority untouched."""
         f = self._require(fid)
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
@@ -1394,6 +1417,8 @@ class BeadsBoard:
             args += [f"--acceptance-criteria={acceptance_criteria}"]
         if design is not None:
             args += [f"--design={design}"]
+        if priority is not None:
+            args += ["-p", str(validate_priority(priority))]
         set_source = source_issue is not None and str(source_issue).strip()
         if files_to_modify is not None or set_source:
             # files_to_modify + source_issue + the requirement ledger SHARE the bead

@@ -1,10 +1,11 @@
-"""source_issue wiring through the agent tools (#97).
+"""source_issue and priority wiring through the agent tools (#97/#389).
 
 ``board_create_feature`` / ``board_update_feature`` gain an optional ``source_issue``
 param — the ORIGINATING GitHub issue (a full issue URL or ``owner/repo#N``) the
 loop's PR opener stamps as ``Fixes #N``. The tools forward it (quote-stripped) to
 the store, which normalizes and stores it on the bead; an invalid value surfaces as
-the store's named error through the tool's ``Error: …`` boundary.
+the store's named error through the tool's ``Error: …`` boundary. ``board_update_feature``
+also forwards an explicitly supplied priority, including 0, while omission stays a no-op.
 
 Tool-level flows patch ``project_board.store.get_store`` exactly as
 test_board_create_feature_dedup does; the store's own normalize/store/project logic
@@ -108,6 +109,26 @@ def test_update_tool_treats_absent_or_whitespace_source_issue_as_none(monkeypatc
     assert fake.updated["source_issue"] is None  # blank, never a "set it" signal
 
 
+def test_update_tool_forwards_priority_zero(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "priority": 0})
+
+    assert fake.updated["priority"] == 0
+
+
+def test_update_tool_omitted_priority_is_none(monkeypatch):
+    fake = _UpdateRecordingStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    update = _get_tool("board_update_feature")
+
+    update.invoke({"feature_id": "bd-1", "spec": "s"})
+
+    assert "priority" not in fake.updated
+
+
 # ── the store's named rejection surfaces through the tool boundary ──────────────────
 
 
@@ -148,6 +169,16 @@ def test_update_tool_surfaces_the_named_invalid_source_issue_error(make_board, m
 
     assert out.startswith("Error:") and "invalid source_issue" in out
     assert not any(c and c[0] == "update" for c in calls)  # nothing written
+
+
+def test_update_tool_surfaces_invalid_priority_range_and_writes_nothing(make_board, monkeypatch):
+    _b, calls = _stateful_board(make_board, monkeypatch)
+    update = _get_tool("board_update_feature")
+
+    out = update.invoke({"feature_id": "bd-1", "title": "Renamed", "priority": 5})
+
+    assert out.startswith("Error:") and "accepted range is 0 to 4" in out
+    assert not any(c and c[0] == "update" for c in calls)
 
 
 def test_create_tool_lands_the_normalized_source_note_end_to_end(make_board, monkeypatch):
@@ -206,6 +237,7 @@ class _RoundTripStore:
         depends_on=None,
         foundation=None,
         source_issue=None,
+        priority=None,
     ):
         if title is not None:
             self.f["title"] = title
@@ -219,6 +251,8 @@ class _RoundTripStore:
             self.f["files_to_modify"] = files_to_modify
         if difficulty is not None:
             self.f["difficulty"] = difficulty
+        if priority is not None:
+            self.f["priority"] = priority
         return {"id": fid, "title": self.f["title"], "board_state": self.f["board_state"]}
 
     def get_feature(self, fid):

@@ -603,6 +603,7 @@ def _board_tools(cfg: dict):
         depends_on: str = "",
         foundation: bool = False,
         source_issue: str = "",
+        priority: int | None = None,
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
@@ -619,9 +620,10 @@ def _board_tools(cfg: dict):
         `Fixes #N`. There is deliberately NO `project` argument: a feature's project
         (#90) is immutable once stamped — it determines which repo the feature's
         worktree/PR target, and re-homing an in-flight card mid-stream would strand its
-        branch; cancel and recreate to move a feature to another project. Inputs are
-        stripped of any literal wrapping double quotes before storage (same hygiene as
-        board_create_feature)."""
+        branch; cancel and recreate to move a feature to another project. `priority`
+        changes the scheduling rank in place when supplied (0 = highest); omitted/None
+        leaves the current priority untouched. Inputs are stripped of any literal
+        wrapping double quotes before storage (same hygiene as board_create_feature)."""
         try:
             store = get_store(**store_kw)
             title = _strip_wrapping_quotes(title)
@@ -634,8 +636,7 @@ def _board_tools(cfg: dict):
             source_issue = _strip_wrapping_quotes(source_issue)
             files = _split_list(files_to_modify)
             deps = _split_list(depends_on)
-            f = store.update_feature(
-                feature_id,
+            update_kw = dict(
                 # strip BEFORE the truthiness check (the difficulty convention below) so a
                 # whitespace-only title is a no-op (None), never a "set the title" signal.
                 title=title.strip() or None,
@@ -650,6 +651,9 @@ def _board_tools(cfg: dict):
                 foundation=foundation or None,
                 source_issue=source_issue.strip() or None,
             )
+            if priority is not None:
+                update_kw["priority"] = priority
+            f = store.update_feature(feature_id, **update_kw)
             return _feature_reply(f)
         except BoardError as exc:
             return f"Error: {exc}"
