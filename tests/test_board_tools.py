@@ -63,6 +63,7 @@ def test_lifecycle_tools_are_registered():
         "board_cancel_feature",
         "board_mark_done",
         "board_requeue_feature",
+        "board_requeue_ci_fix",
         "board_block_feature",
         "board_unblock_feature",
     } <= names
@@ -455,6 +456,7 @@ _MINIMAL_ARGS = {
     "board_deliver": {"feature_id": "bd-1"},
     "board_verify": {"feature_id": "bd-1"},
     "board_requeue_feature": {"feature_id": "bd-1"},
+    "board_requeue_ci_fix": {"feature_id": "bd-1", "ci_failure": "ci failed"},
     "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
     "board_unblock_feature": {"feature_id": "bd-1"},
     "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
