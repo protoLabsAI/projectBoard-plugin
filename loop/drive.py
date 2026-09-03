@@ -49,6 +49,34 @@ def _is_livelock_skip_reason(reason: str) -> bool:
     return bool(r) and r not in _NON_LIVELOCK_SKIP_REASONS and not r.startswith("state=")
 
 
+# ── on-demand queue dispatch diagnostic (board_dispatch, #390) ────────────────────
+async def request_dispatch() -> dict:
+    """Ask the RUNNING board loop to evaluate its ready queue immediately and return its
+    structured decision record — the seam the ``board_dispatch`` tool calls.
+
+    Reaches the live loop through the process-stable registry (``live_loop`` — the same
+    handle the operator cancel / budget-reset verbs use, monkeypatch-visible via the
+    ``_loop`` package). Delegates every gate to :meth:`BoardLoop.dispatch_now`, which uses
+    the ORDINARY scheduling path and bypasses nothing (loop_enabled, project isolation,
+    concurrency, review-WIP, hot-file). Answers ``loop-not-running`` when no loop surface
+    is live in this process (never started, or already stopped) — there is nothing to ask;
+    a DISABLED loop is registered and is answered by ``dispatch_now`` itself
+    (``loop-disabled``)."""
+    loop = _loop.live_loop()
+    if loop is None:
+        return {
+            "dispatched": [],
+            "outcome": "loop-not-running",
+            "detail": (
+                "no board loop surface is running in this process (it was never started, or has "
+                "stopped) — there is nothing to ask to evaluate the queue"
+            ),
+            "skipped": [],
+            "parked": [],
+        }
+    return await loop.dispatch_now()
+
+
 class DriveMixin:
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
@@ -352,7 +380,11 @@ class DriveMixin:
                 await self._maybe_reconcile()
                 await self._maybe_sweep()
                 await self._maybe_preflight()  # fail-closed: hold work if the gate can't run
-                spawned = await self._spawn_ready()
+                # Under the claim lock so an on-demand board_dispatch (#390) evaluating the
+                # SAME queue can never interleave with this tick into over-claiming past
+                # max_concurrent or double-dispatching a card.
+                async with self._claim_guard():
+                    spawned = await self._spawn_ready()
             except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
                 log.exception("[project_board] loop tick failed")
             # Idle (nothing started, nothing running) → sleep the full interval. Busy
@@ -384,6 +416,14 @@ class DriveMixin:
         of a higher one — the payload is JSON, so a future observer parses it without
         grepping log levels."""
         if len(self._drives) >= self.max_concurrent:
+            self._last_claim_decision = {
+                "gate": "max_concurrent",
+                "selected": [],
+                "skipped": [],
+                "parked": [],
+                "running": len(self._drives),
+                "max_concurrent": self.max_concurrent,
+            }
             return False
         # Fail-closed gate preflight, per-project (#90): a project whose gate can't run on
         # clean base HOLDS its own ready work (surfaced on the board) rather than dispatch
@@ -394,11 +434,20 @@ class DriveMixin:
             await asyncio.to_thread(self._hold_ready_for_preflight)
         store = self._store()
         # Review-queue WIP limit — don't claim new work while the review queue is full.
-        if (
-            self.max_pending_reviews
-            and len(await asyncio.to_thread(store.list_features, state="in_review")) >= self.max_pending_reviews
-        ):
-            return False
+        # (list_features is only read when the limit is enabled, exactly as before; the
+        # count is captured so the board_dispatch diagnostic can report it, #390.)
+        if self.max_pending_reviews:
+            pending_reviews = len(await asyncio.to_thread(store.list_features, state="in_review"))
+            if pending_reviews >= self.max_pending_reviews:
+                self._last_claim_decision = {
+                    "gate": "max_pending_reviews",
+                    "selected": [],
+                    "skipped": [],
+                    "parked": [],
+                    "pending_reviews": pending_reviews,
+                    "max_pending_reviews": self.max_pending_reviews,
+                }
+                return False
         spawned = False
         # file → the in-flight (or claimed-this-tick) fid that owns it, so a hot-file
         # skip can NAME the build it collides with, not just report "some overlap".
@@ -485,6 +534,17 @@ class DriveMixin:
                     sort_keys=True,
                 ),
             )
+        # Record the claim scan for the on-demand dispatch diagnostic (board_dispatch, #390):
+        # the same selected/skipped/parked the claim_decision line carries, read back by
+        # dispatch_now so an empty board is distinguishable from a held/stalled one.
+        self._last_claim_decision = {
+            "gate": "scan",
+            "selected": list(selected),
+            "skipped": list(skipped),
+            "parked": list(parked),
+            "running": len(self._drives),
+            "max_concurrent": self.max_concurrent,
+        }
         # #356: bound ready-queue skip livelocks — an indefinitely repeating skip enters
         # the blocked/escalation path rather than retrying forever.
         await self._bound_ready_skips(store, selected, parked, skipped)
@@ -563,6 +623,178 @@ class DriveMixin:
         for fid in list(counters):
             if fid not in seen:
                 counters.pop(fid, None)
+
+    # ── on-demand queue dispatch (board_dispatch, #390) ───────────────────────────
+    def _claim_guard(self):
+        """The ``asyncio.Lock`` serializing the ready-queue claim scan. The periodic tick
+        and the on-demand ``dispatch_now`` both hold it around ``_spawn_ready``, so an
+        interactive dispatch can never race the tick into over-claiming past
+        ``max_concurrent`` or double-dispatching a card (r3/r4). Lazily created — no
+        BoardLoop ``__init__`` change — so it binds to whichever running event loop first
+        drives a scan (the one the surface and the tools share)."""
+        lock = getattr(self, "_claim_lock", None)
+        if lock is None:
+            lock = self._claim_lock = asyncio.Lock()
+        return lock
+
+    def _dispatch_disabled_record(self) -> dict:
+        """The decision record for a DISABLED loop — no scan, no claim (r4). A disabled
+        loop is still registered (``start`` publishes it before the enabled gate), so the
+        diagnostic can report the disabled state rather than a silent no-op."""
+        return {
+            "dispatched": [],
+            "outcome": "loop-disabled",
+            "detail": (
+                "the board loop is disabled (project_board.loop_enabled=false) — no card is "
+                "dispatched until it is enabled in Settings ▸ Project Board"
+            ),
+            "running": len(self._drives),
+            "max_concurrent": self.max_concurrent,
+            "skipped": [],
+            "parked": [],
+        }
+
+    def _dispatch_error_record(self, stage: str, exc: Exception, dispatched=None) -> dict:
+        """The decision record for an UNEXPECTED crash in an on-demand dispatch stage (the
+        fail-closed preflight or the claim scan raised — not a gate verdict, which never
+        raises). A crashed diagnostic is a result, never an exception into the agent loop.
+        If the claim scan had already started drive(s) before it raised, their feature ids
+        are carried in ``dispatched`` so a partial-then-crashed pass is reported rather than
+        silently lost (the claim is real; the caller must still see it)."""
+        dispatched = sorted(dispatched or [])
+        detail = f"the {stage} errored: {type(exc).__name__}: {exc}"
+        if dispatched:
+            detail = f"dispatched {', '.join(dispatched)} before " + detail
+        return {
+            "dispatched": dispatched,
+            "outcome": "error",
+            "detail": detail,
+            "running": len(self._drives),
+            "max_concurrent": self.max_concurrent,
+            "skipped": [],
+            "parked": [],
+        }
+
+    def _drive_fids(self, tasks) -> list:
+        """Feature ids for the given drive tasks, recovered from their ``pb-*-<fid>`` task
+        names (``pb-drive-`` coding drives, ``pb-task-`` sister-agent tasks, ``pb-self-``
+        first-party tasks). ``self._drives`` holds asyncio Tasks, not ids, so a task-set
+        diff has to be mapped back through the stable drive-name prefixes to report which
+        cards an on-demand scan had already dispatched when it raised mid-pass."""
+        prefixes = ("pb-drive-", "pb-task-", "pb-self-")
+        fids = []
+        for t in tasks:
+            name = t.get_name() if hasattr(t, "get_name") else ""
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    fids.append(name[len(prefix) :])
+                    break
+        return sorted(fids)
+
+    async def dispatch_now(self) -> dict:
+        """Evaluate the ready queue right now instead of waiting for the next interval —
+        the observable entry point behind the ``board_dispatch`` tool (#390).
+
+        This is NOT a second scheduler: it runs the very ``_spawn_ready`` a periodic tick
+        runs, under the same claim lock, and bypasses nothing — ``loop_enabled``, the
+        per-project preflight hold, ``max_concurrent``, the review-WIP limit and the
+        hot-file guard all apply exactly as in a tick. In particular it runs the SAME
+        fail-closed ``_maybe_preflight`` a tick runs immediately before its claim scan
+        (``_run``): without it an interactive kick could claim work past a newly required
+        or freshly failing per-project gate that the next tick would have held. So a
+        repeated or concurrent call can never double-claim or over-dispatch an in-flight
+        feature: a card the tick already claimed is gone from the ready queue, and a full
+        slot / WIP ceiling / preflight hold holds the scan (r3/r4).
+
+        Returns a decision record — ``{dispatched, outcome, detail, running,
+        max_concurrent, skipped, parked}`` — whose ``outcome`` tells the principal cases
+        apart: ``dispatched`` (with the claimed feature id[s] in ``dispatched``),
+        ``empty-queue``, ``at-capacity``, ``review-wip-limit``, ``all-candidates-held``
+        (every ready card was blocked/held/hot-file-deferred or lost a claim race — see
+        ``skipped``), ``parked`` (a task claimed to in_progress awaiting async delivery),
+        ``loop-disabled``, or ``error`` (a dispatch stage — the preflight or the claim scan
+        — raised unexpectedly; it is captured as a record, never re-raised into the agent
+        loop, and any drive already started before the crash is still named in
+        ``dispatched``)."""
+        if not self.enabled:
+            return self._dispatch_disabled_record()
+        # Fail-closed preflight FIRST, exactly as the periodic tick does before its claim
+        # scan (`_run`): a newly-required or freshly-failing per-project gate must hold this
+        # on-demand dispatch too, or an interactive kick could claim work the next tick
+        # would have held. Run it OUTSIDE the claim lock — same as the tick — since it
+        # smokes a gate subprocess and must not serialize the claim scan.
+        try:
+            await self._maybe_preflight()
+        except Exception as exc:  # noqa: BLE001 — a preflight crash is a diagnostic result, not a crash
+            log.warning("[project_board] board_dispatch: preflight evaluation failed", exc_info=True)
+            return self._dispatch_error_record("preflight evaluation", exc)
+        async with self._claim_guard():
+            drives_before = set(getattr(self, "_drives", ()) or ())  # drive-task snapshot
+            try:
+                await self._spawn_ready()
+            except Exception as exc:  # noqa: BLE001 — a failed scan is a diagnostic result, not a crash
+                log.warning("[project_board] board_dispatch: ready-queue evaluation failed", exc_info=True)
+                # `_spawn_ready` writes `_last_claim_decision` only on a clean pass, so a
+                # mid-scan crash loses it — recover the feature ids of any drive it DID
+                # start from the drive-task set diff, so a partial-then-crashed pass still
+                # reports what it dispatched rather than swallowing it (r1/r3).
+                started = self._drive_fids(set(getattr(self, "_drives", ()) or ()) - drives_before)
+                return self._dispatch_error_record("ready-queue evaluation", exc, dispatched=started)
+            decision = dict(getattr(self, "_last_claim_decision", None) or {})
+        return self._dispatch_decision_record(decision)
+
+    def _dispatch_decision_record(self, decision: dict) -> dict:
+        """Turn a ``_spawn_ready`` scan decision into the human-readable dispatch record.
+        Pure over ``decision`` (+ the current knobs) so the outcome mapping is testable on
+        its own and the tick's claim path stays untouched."""
+        gate = decision.get("gate")
+        selected = list(decision.get("selected") or [])
+        skipped = list(decision.get("skipped") or [])
+        parked = list(decision.get("parked") or [])
+        running = decision.get("running", len(self._drives))
+        if gate == "max_concurrent":
+            outcome = "at-capacity"
+            detail = (
+                f"concurrency limit reached: {running}/{self.max_concurrent} drives already in flight — "
+                "no new card is claimed until a slot frees (max_concurrent)"
+            )
+        elif gate == "max_pending_reviews":
+            pending = decision.get("pending_reviews")
+            outcome = "review-wip-limit"
+            detail = (
+                f"review WIP limit reached: {pending}/{self.max_pending_reviews} PRs already await review — "
+                "the loop pauses new claims until the review queue drains (max_pending_reviews)"
+            )
+        elif selected:
+            outcome = "dispatched"
+            detail = f"dispatched {', '.join(selected)} — the loop claimed it and a drive is now running"
+        elif not skipped and not parked:
+            outcome = "empty-queue"
+            detail = "the ready queue is empty — no card is ready to dispatch"
+        elif parked and not skipped:
+            outcome = "parked"
+            detail = (
+                f"claimed {', '.join(parked)} to in_progress awaiting async delivery — no coding drive was "
+                "started and no concurrency slot is held"
+            )
+        else:
+            reasons = sorted({str(s.get("reason") or "") for s in skipped if s.get("reason")})
+            outcome = "all-candidates-held"
+            detail = (
+                "every ready candidate was passed over ("
+                + (", ".join(reasons) or "no runnable candidate")
+                + ") — blocked/held cards, a per-project preflight hold, a hot-file wait, or a lost claim "
+                "race; nothing could be dispatched this pass"
+            )
+        return {
+            "dispatched": selected,
+            "outcome": outcome,
+            "detail": detail,
+            "running": running,
+            "max_concurrent": self.max_concurrent,
+            "skipped": skipped,
+            "parked": parked,
+        }
 
     def _make_drive_done_cb(self, fid: str):
         """A drive task's done-callback: drop it from the running set and release the

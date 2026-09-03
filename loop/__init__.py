@@ -20,5 +20,6 @@ from __future__ import annotations
 from ._common import *  # noqa: F401,F403 — re-export the loop kernel
 from ._common import __all__ as _kernel_all
 from .core import BoardLoop
+from .drive import request_dispatch  # the board_dispatch tool seam (#390)
 
-__all__ = [*_kernel_all, "BoardLoop"]
+__all__ = [*_kernel_all, "BoardLoop", "request_dispatch"]

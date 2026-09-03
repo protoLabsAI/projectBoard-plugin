@@ -4029,6 +4029,286 @@ def test_ready_skip_max_floors_so_a_single_race_is_never_terminal():
     )  # malformed → default
 
 
+# ── #390: board_dispatch — the on-demand queue dispatch diagnostic ────────────────
+#
+# dispatch_now runs the SAME `_spawn_ready` a periodic tick runs (under the same claim
+# lock) and reports a structured decision record. These pin the successful kick and each
+# principal no-dispatch outcome, and prove the diagnostic never bypasses a gate: a
+# disabled loop / full slot / review-WIP ceiling claims nothing, and a repeated call
+# never double-claims an already-in-progress card.
+
+
+async def test_board_dispatch_dispatches_a_ready_card(monkeypatch):
+    """r1: a runnable ready card + an enabled loop with capacity → dispatch_now claims it
+    immediately and reports the dispatched feature id."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        out = await loop.dispatch_now()
+        assert len(loop._drives) == 1  # a real drive was started (assert while it's held)
+    finally:
+        await finish()
+    assert out["outcome"] == "dispatched"
+    assert out["dispatched"] == ["bd-1"]  # the claimed feature id is reported
+    assert store.claimed == ["bd-1"]  # it went through the ordinary claim path
+
+
+async def test_board_dispatch_reports_an_empty_queue(monkeypatch):
+    """r2: nothing ready → a distinct `empty-queue` outcome (an empty board is not a stall)."""
+    store = _ClaimStore([])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "empty-queue"
+    assert out["dispatched"] == []
+    assert store.claimed == []
+
+
+async def test_board_dispatch_reports_a_disabled_loop_without_claiming(monkeypatch):
+    """r2/r4: a disabled loop is reported as `loop-disabled` and claims nothing — the
+    diagnostic honors loop_enabled exactly as the tick's start() gate does."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})  # loop_enabled defaults False
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "loop-disabled"
+    assert out["dispatched"] == []
+    assert store.claimed == []  # a disabled loop never evaluates the queue
+
+
+async def test_board_dispatch_respects_the_review_wip_limit(monkeypatch):
+    """r2/r4: with the review queue already at max_pending_reviews, dispatch_now reports
+    `review-wip-limit` and claims nothing — the same back-pressure the tick applies."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])], in_review=5)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "max_pending_reviews": 5, "loop_enabled": True})
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "review-wip-limit"
+    assert out["dispatched"] == []
+    assert store.claimed == []
+
+
+async def test_board_dispatch_reports_at_capacity_and_never_over_claims(monkeypatch):
+    """r3/r4: once max_concurrent slots are full a second dispatch reports `at-capacity`
+    and claims nothing — the on-demand path can never over-claim past the cap."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "loop_enabled": True})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        first = await loop.dispatch_now()
+        second = await loop.dispatch_now()
+        assert len(loop._drives) == 1  # still one held drive — the cap was respected
+    finally:
+        await finish()
+    assert first["outcome"] == "dispatched" and first["dispatched"] == ["bd-1"]
+    assert second["outcome"] == "at-capacity"
+    assert second["dispatched"] == []
+    assert store.claimed == ["bd-1"]  # the full slot held the scan — no second claim
+
+
+async def test_board_dispatch_repeated_call_does_not_double_dispatch(monkeypatch):
+    """r3: a card claimed by the first call is gone from the ready queue, so a repeated
+    dispatch (even with free capacity) never re-claims or double-dispatches it."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 3, "loop_enabled": True})  # capacity to spare
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        first = await loop.dispatch_now()
+        second = await loop.dispatch_now()
+        assert len(loop._drives) == 1  # exactly one drive, from the single claim
+    finally:
+        await finish()
+    assert first["dispatched"] == ["bd-1"]
+    assert second["outcome"] == "empty-queue"  # bd-1 already in progress → no longer ready
+    assert second["dispatched"] == []
+    assert store.claimed == ["bd-1"]  # claimed exactly once
+
+
+class _SlowClaimStore(_ClaimStore):
+    """A _ClaimStore whose queue read is slow enough to make the claim-scan race
+    deterministic. `_spawn_ready` reads the store through `asyncio.to_thread` (#258), so
+    the sleep is a REAL yield point: two unserialized scans both read the queue before
+    either claims, and both then claim past the cap."""
+
+    def ready_queue(self, relaxed=False):
+        time.sleep(0.05)
+        return super().ready_queue(relaxed=relaxed)
+
+
+async def test_board_dispatch_serializes_concurrent_kicks(monkeypatch):
+    """The lock's actual job, tested concurrently.
+
+    `test_board_dispatch_reports_at_capacity_and_never_over_claims` and
+    `..._repeated_call_does_not_double_dispatch` both `await` the two dispatches in
+    SEQUENCE, so the second begins only after the first has fully returned. Neither ever
+    has two scans in flight, so both pass whether or not `_claim_guard` exists — they
+    cannot fail for the reason they are named after. This one drives two kicks through
+    `asyncio.gather` against a store whose queue read yields, so the scans genuinely
+    overlap.
+
+    Verified by neutralizing `_claim_guard`: this test fails, both of those still pass.
+    What actually breaks without the lock is the REPORT, not the claim — both scans read
+    the queue, one claims `bd-1`, and the loser returns `all-candidates-held` (a lost
+    claim race) instead of the true `at-capacity`. `store.claim()` is atomic, so it is
+    the claim itself — not the lock — that stops a genuine double-claim; the lock is what
+    keeps a concurrent kick from reporting a phantom contention as a held queue."""
+    store = _SlowClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "loop_enabled": True})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        first, second = await asyncio.gather(loop.dispatch_now(), loop.dispatch_now())
+        assert len(loop._drives) == 1  # the cap held across two OVERLAPPING scans
+    finally:
+        await finish()
+    assert store.claimed == ["bd-1"]  # claimed exactly once, never past max_concurrent
+    outcomes = sorted([first["outcome"], second["outcome"]])
+    assert outcomes == ["at-capacity", "dispatched"]
+    assert sorted(first["dispatched"] + second["dispatched"]) == ["bd-1"]
+
+
+async def test_board_dispatch_reports_all_candidates_held(monkeypatch):
+    """r2: a ready card carrying the blocked flag is passed over — dispatch_now reports
+    `all-candidates-held` with the per-candidate skip reason, never a claim."""
+    blocked = {"id": "bd-1", "board_state": "ready", "blocked": True, "files_to_modify": ["a.py"], "project": ""}
+    store = _ClaimStore([blocked])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "all-candidates-held"
+    assert out["dispatched"] == []
+    assert store.claimed == []  # a blocked-flagged ready card is never claimed
+    assert {s["fid"]: s["reason"] for s in out["skipped"]} == {"bd-1": "blocked"}
+
+
+async def test_board_dispatch_runs_the_fail_closed_preflight_before_claiming(monkeypatch):
+    """The review finding on #390: the periodic tick (`_run`) runs `_maybe_preflight`
+    immediately before its claim scan, so an on-demand dispatch must too — otherwise an
+    interactive kick could claim work past a newly-required or freshly-failing per-project
+    gate the next tick would have held. A preflight that holds the card's project is
+    honored: the card is skipped `preflight-hold`, never claimed (r4)."""
+    card = _ready("bd-1", ["a.py"])
+    store = _ClaimStore([card])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    ran = []
+
+    async def _preflight_holds_the_project():
+        ran.append(True)  # stand in for a real smoke that found the gate un-runnable
+        loop._preflight_state[loop._project_name(card)] = "gate failed on clean base"
+
+    monkeypatch.setattr(loop, "_maybe_preflight", _preflight_holds_the_project)
+    out = await loop.dispatch_now()
+    assert ran == [True]  # dispatch_now ran the preflight BEFORE the claim scan
+    assert out["outcome"] == "all-candidates-held"
+    assert store.claimed == []  # the fresh preflight hold stopped the claim — no bypass
+    assert {s["fid"]: s["reason"] for s in out["skipped"]} == {"bd-1": "preflight-hold"}
+
+
+async def test_board_dispatch_preflight_crash_is_a_diagnostic_not_a_claim(monkeypatch):
+    """A preflight that raises unexpectedly yields an `error` record and never reaches the
+    claim scan (fail-closed) — no exception into the agent loop, no claim on a base no gate
+    cleared."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+
+    async def _boom():
+        raise RuntimeError("preflight blew up")
+
+    monkeypatch.setattr(loop, "_maybe_preflight", _boom)
+    out = await loop.dispatch_now()
+    assert out["outcome"] == "error"
+    assert out["dispatched"] == []
+    assert store.claimed == []  # the scan never ran — nothing was claimed
+
+
+async def test_board_dispatch_claim_scan_crash_after_a_partial_dispatch_reports_what_started(monkeypatch):
+    """A claim scan that raises AFTER it already started a drive yields an `error` record
+    that STILL names the card it dispatched — recovered from the drive-task set, since
+    `_spawn_ready` only writes `_last_claim_decision` on a clean pass. The crash handler
+    must never itself raise, and a real claim must never be swallowed (r1/r3)."""
+
+    class _CrashOnSecondClaim(_ClaimStore):
+        def claim(self, fid, assignee=""):
+            if fid == "bd-2":  # bd-1 already claimed + dispatched by the time we get here
+                raise RuntimeError("claim scan blew up mid-pass")
+            return super().claim(fid, assignee=assignee)
+
+    store = _CrashOnSecondClaim([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 3, "loop_enabled": True})  # capacity for both
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        out = await loop.dispatch_now()
+        assert len(loop._drives) == 1  # bd-1's drive really started before the crash
+    finally:
+        await finish()
+    assert out["outcome"] == "error"
+    assert out["dispatched"] == ["bd-1"]  # the partial dispatch is reported, not lost
+    assert "bd-1" in out["detail"] and "claim scan blew up" in out["detail"]
+    assert store.claimed == ["bd-1"]  # bd-1 claimed once; bd-2's claim raised, never claimed
+
+
+async def test_request_dispatch_reports_no_running_loop(monkeypatch):
+    """The tool seam: with no live loop surface in this process, request_dispatch reports
+    `loop-not-running` rather than raising — there is nothing to ask."""
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: None)
+    out = await loop_mod.request_dispatch()
+    assert out["outcome"] == "loop-not-running"
+    assert out["dispatched"] == []
+
+
+async def test_request_dispatch_evaluates_the_live_loop(monkeypatch):
+    """The tool seam reaches the running loop through the process-stable registry and
+    returns its dispatch decision."""
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: loop)
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        out = await loop_mod.request_dispatch()
+    finally:
+        await finish()
+    assert out["outcome"] == "dispatched" and out["dispatched"] == ["bd-1"]
+    assert store.claimed == ["bd-1"]
+
+
+async def test_board_dispatch_tool_returns_the_decision_record(monkeypatch):
+    """The registered `board_dispatch` tool returns the decision as JSON (async tool →
+    ainvoke), driving the same live loop."""
+    import project_board
+
+    store = _ClaimStore([_ready("bd-1", ["a.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2, "loop_enabled": True})
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: loop)
+    finish = await _hold_drives(loop, monkeypatch)
+    tool = {t.name: t for t in project_board._board_tools({})}["board_dispatch"]
+    try:
+        out = json.loads(await tool.ainvoke({}))
+    finally:
+        await finish()
+    assert out["outcome"] == "dispatched"
+    assert out["dispatched"] == ["bd-1"]
+
+
+async def test_board_dispatch_tool_reports_no_loop_as_json_not_a_raise(monkeypatch):
+    """The tool never raises into the agent loop: with no live loop it returns the
+    `loop-not-running` record as JSON."""
+    import project_board
+
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: None)
+    tool = {t.name: t for t in project_board._board_tools({})}["board_dispatch"]
+    out = json.loads(await tool.ainvoke({}))
+    assert out["outcome"] == "loop-not-running"
+
+
 # ── the PR reconcile (terminal-edge fallback) ───────────────────────────────────
 
 
