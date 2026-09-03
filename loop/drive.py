@@ -671,7 +671,7 @@ class DriveMixin:
 
     async def dispatch_now(self) -> dict:
         """Evaluate the ready queue right now instead of waiting for the next interval —
-        the observable entry point behind the ``board_dispatch``/``board_kick`` tool (#390).
+        the observable entry point behind the ``board_dispatch`` tool (#390).
 
         This is NOT a second scheduler: it runs the very ``_spawn_ready`` a periodic tick
         runs, under the same claim lock, and bypasses nothing — ``loop_enabled``, the

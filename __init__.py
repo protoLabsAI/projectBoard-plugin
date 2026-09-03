@@ -1052,7 +1052,10 @@ def _board_tools(cfg: dict):
         slot); `all-candidates-held` (every ready card was blocked/held, deferred by the
         hot-file guard, held by a per-project preflight, or lost a claim race — see
         `skipped`); `loop-disabled` (project_board.loop_enabled=false); or
-        `loop-not-running` (no loop surface is live in this process). `detail` is a
+        `loop-not-running` (no loop surface is live in this process); or `error` (a
+        dispatch stage crashed — the fail-closed preflight or the claim scan raised, and
+        the record carries the stage and exception rather than raising into the agent
+        loop). `detail` is a
         one-sentence human summary; `running`/`max_concurrent` show the live slot picture.
 
         Every scheduling gate a periodic tick honors — loop_enabled, project isolation,

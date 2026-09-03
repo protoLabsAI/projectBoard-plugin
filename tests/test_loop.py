@@ -4128,6 +4128,49 @@ async def test_board_dispatch_repeated_call_does_not_double_dispatch(monkeypatch
     assert store.claimed == ["bd-1"]  # claimed exactly once
 
 
+class _SlowClaimStore(_ClaimStore):
+    """A _ClaimStore whose queue read is slow enough to make the claim-scan race
+    deterministic. `_spawn_ready` reads the store through `asyncio.to_thread` (#258), so
+    the sleep is a REAL yield point: two unserialized scans both read the queue before
+    either claims, and both then claim past the cap."""
+
+    def ready_queue(self, relaxed=False):
+        time.sleep(0.05)
+        return super().ready_queue(relaxed=relaxed)
+
+
+async def test_board_dispatch_serializes_concurrent_kicks(monkeypatch):
+    """The lock's actual job, tested concurrently.
+
+    `test_board_dispatch_reports_at_capacity_and_never_over_claims` and
+    `..._repeated_call_does_not_double_dispatch` both `await` the two dispatches in
+    SEQUENCE, so the second begins only after the first has fully returned. Neither ever
+    has two scans in flight, so both pass whether or not `_claim_guard` exists — they
+    cannot fail for the reason they are named after. This one drives two kicks through
+    `asyncio.gather` against a store whose queue read yields, so the scans genuinely
+    overlap.
+
+    Verified by neutralizing `_claim_guard`: this test fails, both of those still pass.
+    What actually breaks without the lock is the REPORT, not the claim — both scans read
+    the queue, one claims `bd-1`, and the loser returns `all-candidates-held` (a lost
+    claim race) instead of the true `at-capacity`. `store.claim()` is atomic, so it is
+    the claim itself — not the lock — that stops a genuine double-claim; the lock is what
+    keeps a concurrent kick from reporting a phantom contention as a held queue."""
+    store = _SlowClaimStore([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1, "loop_enabled": True})
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        first, second = await asyncio.gather(loop.dispatch_now(), loop.dispatch_now())
+        assert len(loop._drives) == 1  # the cap held across two OVERLAPPING scans
+    finally:
+        await finish()
+    assert store.claimed == ["bd-1"]  # claimed exactly once, never past max_concurrent
+    outcomes = sorted([first["outcome"], second["outcome"]])
+    assert outcomes == ["at-capacity", "dispatched"]
+    assert sorted(first["dispatched"] + second["dispatched"]) == ["bd-1"]
+
+
 async def test_board_dispatch_reports_all_candidates_held(monkeypatch):
     """r2: a ready card carrying the blocked flag is passed over — dispatch_now reports
     `all-candidates-held` with the per-candidate skip reason, never a claim."""
