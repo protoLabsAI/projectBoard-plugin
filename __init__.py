@@ -850,6 +850,38 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_requeue_ci_fix(feature_id: str, ci_failure: str = "") -> str:
+        """Requeue a bounced coding feature for a CI-fix round on its existing PR.
+
+        This is the recovery verb for the intentional open-PR lifecycle:
+        `open_review` moves a coding feature to `in_review` with `pr_url`; a failing
+        check goes through `bounce_ci_fail`, which deliberately removes `in-review` and
+        parks that same open-PR feature in `in_progress`; this tool records the concrete
+        CI failure as a DISTINCT CI-fix comment, queues it so the NEXT coder dispatch
+        prompt LEADS with the failure, then requeues the same card to `ready` with its PR
+        preserved. It accepts only that bounced shape: a coding feature, `in_progress`,
+        non-empty `ci_failure`, and an open `pr_url`. Use
+        `board_requeue_feature(feature_id, findings=...)` for adverse HUMAN review
+        findings; that guard still requires `in_review`."""
+        try:
+            store = get_store(**store_kw)
+            ci_failure = _strip_wrapping_quotes(ci_failure)
+            store.record_ci_fix_feedback(feature_id, ci_failure)
+            from .loop import queue_ci_feedback
+
+            queue_ci_feedback(feature_id, ci_failure)
+            f = store.requeue(feature_id)
+            return json.dumps(
+                {
+                    "id": f["id"],
+                    "state": f["board_state"],
+                    "pr_url": f.get("pr_url", ""),
+                }
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_block_feature(feature_id: str, reason: str) -> str:
         """Flag a feature `blocked` with a `reason` — it stays ON the board (blocked is a
         flag, not a lane) with the reason visible, and is skipped by the puller until
@@ -1083,6 +1115,7 @@ def _board_tools(cfg: dict):
         board_deliver,
         board_verify,
         board_requeue_feature,
+        board_requeue_ci_fix,
         board_block_feature,
         board_unblock_feature,
         board_reset_merged_verify_budget,

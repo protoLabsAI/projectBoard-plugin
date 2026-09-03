@@ -23,6 +23,7 @@ these can retire work.
 | `board_list` | `state, include_archived, with_ci, failing_only, project` | List board features, optionally filtered by board `state` (backlog/ready/ in_progress/in_review/done/blocked). Priority order. Terminal features (done/cancelled) past the archive window carry an `archived` label and are EXCLUDED from this default response (#115) — the live board, not all of history. Pass `include_archi… |
 | `board_mark_done` ⚠️ | `feature_id, reason` | Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that shipped OUTSIDE the board's PR lifecycle (the change landed via another repo/tool, or the feature completed off-board), where record_merge's automatic pr_url match never fires. Accepts only an in-flight card (in_progress / in_review / blocked) a… |
 | `board_mark_ready` | `feature_id` | Promote a feature backlog → ready. Fails if it lacks a spec + acceptance_criteria (the Ready gate). Only `ready` features are pulled. |
+| `board_requeue_ci_fix` ⚠️ | `feature_id, ci_failure` | Requeue a bounced coding feature for a CI-fix round on its existing PR. Lifecycle: `open_review` enters `in_review` with `pr_url`; `bounce_ci_fail` intentionally removes `in-review` and parks the same open-PR feature in `in_progress`; this verb records the concrete CI failure as a distinct `CI fix requested:` comment, queues it into the next coder prompt, and requeues the same card to `ready` with its PR preserved. Accepts only a coding feature in `in_progress` with non-empty `ci_failure` and an open `pr_url`; use `board_requeue_feature(feature_id, findings=...)` for adverse human review, which still requires `in_review`. |
 | `board_requeue_feature` ⚠️ | `feature_id, findings` | Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb the fix-round doctrine needs to carry review findings to the SAME branch. WITH `findings` (an adverse review's requested changes): mirrors `POST /features/{fid}/review` — records a DISTINCT review-bounce comment on the bead (`record_review_bo… |
 | `board_reset_merged_verify_budget` | `feature_id` | Reset ONE feature's merged-state re-verify budget (ADR 0326, #326) — the supported way to un-stick an in_review card whose `next_action` reads `auto-merge held: merged-verify budget exhausted`. When a sibling merge keeps moving base under an in_review PR, the loop re-runs the gate against the merged state and stamps `m… |
 | `board_retro` | `—` | Retro the board: mine the attempt/outcome history of completed + blocked features into recurring failure CLASSES + flow stats (escalation / block / multi-attempt rates + the blocked features and why). The loop-retro skill reads this to distill durable grounding (PROTO.md gotchas) so the next runs stop repeating known f… |
@@ -35,7 +36,7 @@ these can retire work.
 - Every tool returns **JSON on success** and a plain `Error: …` string on failure. They
   never raise into the agent loop — a bad id is a message, not a traceback.
 - `feature_id` is a bead id (`bd-a1b2`).
-- Tools that accept prose (`spec`, `reason`, `findings`) strip literal wrapping quotes
-  first, because models frequently emit `"…"` around a whole argument.
+- Tools that accept prose (`spec`, `reason`, `findings`, `ci_failure`) strip literal
+  wrapping quotes first, because models frequently emit `"…"` around a whole argument.
 - The board must be **set up** for these to work: `br` on PATH, a `repo`, and — for the
   dispatch verbs — a coder delegate. `GET /status` reports what is missing.

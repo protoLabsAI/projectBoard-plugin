@@ -1930,6 +1930,27 @@ class BeadsBoard:
         self.comment(fid, f"review requested changes: {findings}" if findings else "review requested changes")
         return f
 
+    def record_ci_fix_feedback(self, fid: str, ci_failure: str = "") -> dict:
+        """Record concrete CI feedback for a bounced coding feature.
+
+        This is the CI-specific sibling of ``record_review_bounce``. A CI failure first
+        goes through ``bounce_ci_fail``, which intentionally removes ``in-review`` and
+        parks the open-PR feature in ``in_progress``. Only that state is accepted here:
+        the caller queues the failure for the next coder prompt, then ``requeue``s the
+        same bead so the existing PR branch is fixed in place."""
+        f = self._require(fid)
+        text = str(ci_failure or "").strip()
+        if not text:
+            raise BoardError("CI fix feedback requires a named CI failure")
+        if f["board_state"] != "in_progress":
+            raise BoardError(f"CI fix expects in_progress after CI bounce, got {f['board_state']!r}")
+        if f.get("issue_type") == LABEL_TASK:
+            raise BoardError("CI fix expects a coding feature, got task")
+        if not str(f.get("pr_url") or "").strip():
+            raise BoardError("CI fix requires an open PR on the bounced feature")
+        self.comment(fid, f"CI fix requested: {text}")
+        return f
+
     def requeue(self, fid: str) -> dict:
         """Put a feature back to `ready` for re-dispatch (keeps its open PR via
         external_ref). The puller re-claims it and the loop re-dispatches — at the

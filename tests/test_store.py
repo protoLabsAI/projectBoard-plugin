@@ -2827,6 +2827,157 @@ def test_record_review_bounce_rejects_a_non_in_review_state(make_board, monkeypa
         b.record_review_bounce("bd-9", "x")
 
 
+def test_record_ci_fix_feedback_comments_from_bounced_open_pr(make_board, monkeypatch):
+    """CI-fix feedback is the sibling of review feedback, but it accepts the deliberate
+    post-CI-bounce state: in_progress with an open PR."""
+    br = Br()
+    b = make_board(br)
+    comments = []
+    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append((fid, text)))
+    monkeypatch.setattr(
+        b,
+        "get_feature",
+        lambda fid: {
+            "id": fid,
+            "board_state": "in_progress",
+            "issue_type": "feature",
+            "pr_url": "https://example/pr/1",
+        },
+    )
+    b.record_ci_fix_feedback("bd-9", "ruff format --check failed")
+    assert comments == [("bd-9", "CI fix requested: ruff format --check failed")]
+    assert "review requested changes" not in comments[0][1]
+    assert br.cmds("update") == []
+
+
+@pytest.mark.parametrize(
+    "feature,ci_failure,match",
+    [
+        (
+            {
+                "id": "bd-9",
+                "board_state": "in_review",
+                "issue_type": "feature",
+                "pr_url": "https://example/pr/1",
+            },
+            "ruff failed",
+            "expects in_progress",
+        ),
+        (
+            {
+                "id": "bd-9",
+                "board_state": "in_progress",
+                "issue_type": "feature",
+                "pr_url": "",
+            },
+            "ruff failed",
+            "requires an open PR",
+        ),
+        (
+            {
+                "id": "bd-9",
+                "board_state": "in_progress",
+                "issue_type": "task",
+                "pr_url": "https://example/pr/1",
+            },
+            "ruff failed",
+            "expects a coding feature",
+        ),
+        (
+            {
+                "id": "bd-9",
+                "board_state": "in_progress",
+                "issue_type": "feature",
+                "pr_url": "https://example/pr/1",
+            },
+            "   ",
+            "requires a named CI failure",
+        ),
+    ],
+)
+def test_record_ci_fix_feedback_rejects_ineligible_cards_without_mutation(
+    make_board,
+    monkeypatch,
+    feature,
+    ci_failure,
+    match,
+):
+    br = Br()
+    b = make_board(br)
+    comments = []
+    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append((fid, text)))
+    monkeypatch.setattr(b, "get_feature", lambda fid: feature)
+    with pytest.raises(BoardError, match=match):
+        b.record_ci_fix_feedback("bd-9", ci_failure)
+    assert comments == []
+    assert br.calls == []
+
+
+def test_board_requeue_ci_fix_records_feedback_and_requeues_same_open_pr(make_board, monkeypatch):
+    """Historical #391 shape: CI bounce removed in-review, leaving an in_progress
+    coding feature with an open PR. The CI-fix route records distinct feedback, queues it
+    for the next prompt, and requeues the same PR."""
+    import project_board.loop as loop_mod
+
+    loop_mod._PENDING_FEEDBACK.clear()
+    br = Br()
+    b = make_board(br)
+    features = [
+        {
+            "id": "bd-9",
+            "board_state": "in_progress",
+            "issue_type": "feature",
+            "pr_url": "https://example/pr/1",
+        },
+        {
+            "id": "bd-9",
+            "board_state": "in_progress",
+            "issue_type": "feature",
+            "pr_url": "https://example/pr/1",
+        },
+        {
+            "id": "bd-9",
+            "board_state": "ready",
+            "issue_type": "feature",
+            "pr_url": "https://example/pr/1",
+        },
+    ]
+    monkeypatch.setattr(b, "get_feature", lambda fid: features.pop(0))
+    monkeypatch.setattr(store, "get_store", lambda **_kw: b)
+
+    out = json.loads(
+        {t.name: t for t in pb._board_tools({})}["board_requeue_ci_fix"].invoke(
+            {"feature_id": "bd-9", "ci_failure": "pytest failed in tests/test_store.py"}
+        )
+    )
+
+    assert out == {"id": "bd-9", "state": "ready", "pr_url": "https://example/pr/1"}
+    assert "CI FAILED" in loop_mod._PENDING_FEEDBACK["bd-9"]
+    assert "pytest failed in tests/test_store.py" in loop_mod._PENDING_FEEDBACK["bd-9"]
+    assert br.cmds("comments") == [
+        (
+            "comments",
+            "add",
+            "bd-9",
+            "CI fix requested: pytest failed in tests/test_store.py",
+        )
+    ]
+    assert br.cmds("update") == [
+        (
+            "update",
+            "bd-9",
+            "--status",
+            "open",
+            "--assignee",
+            "",
+            "--add-label",
+            "ready",
+            "--remove-label",
+            "in-review",
+        )
+    ]
+
+
 def test_requeue_preserves_the_open_pr_and_clears_the_assignee(make_board, monkeypatch):
     """A requeue (the /ci + /review re-dispatch path) keeps the open PR — it never
     touches external_ref — and clears the assignee so the re-pull can `--claim`."""

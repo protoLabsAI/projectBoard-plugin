@@ -173,18 +173,36 @@ def _feedback_slot():
 _PENDING_FEEDBACK: dict[str, str] = _feedback_slot().pending
 
 
+def _queue_feedback(fid: str, text: str, message: str) -> None:
+    text = str(text or "").strip()
+    if not text:
+        return
+    _PENDING_FEEDBACK[fid] = message + "\n\n" + text
+
+
 def queue_review_feedback(fid: str, findings: str) -> None:
     """Stash an adverse-review bounce's ``findings`` so the loop leads ``fid``'s next
     dispatch prompt with them — the cross-instance sibling of the in-loop review
     gate's ``_ci_feedback`` write (``POST /features/{fid}/review`` calls this). Blank
     findings are a no-op (nothing to carry back)."""
-    text = str(findings or "").strip()
-    if not text:
-        return
-    _PENDING_FEEDBACK[fid] = (
+    _queue_feedback(
+        fid,
+        findings,
         "An adverse code review REQUESTED CHANGES on your PR. Fix every finding "
         "below in the existing branch (the PR updates on push) — do not rewrite "
-        "unrelated code.\n\n" + text
+        "unrelated code.",
+    )
+
+
+def queue_ci_feedback(fid: str, ci_failure: str) -> None:
+    """Stash concrete CI failure feedback for a bounced open-PR feature so the next
+    dispatch fixes the existing branch. Blank feedback is a no-op; the public CI-fix
+    route validates before calling this."""
+    _queue_feedback(
+        fid,
+        ci_failure,
+        "CI FAILED on your PR after review opened. Fix the failure below in the "
+        "existing branch (the PR updates on push) — do not rewrite unrelated code.",
     )
 
 
@@ -1192,6 +1210,7 @@ __all__ = [
     "_FEEDBACK_SLOT_PREFIX",
     "_feedback_slot",
     "_PENDING_FEEDBACK",
+    "queue_ci_feedback",
     "queue_review_feedback",
     "_parse_gate_files",
     "_PNPM_INSTALL",

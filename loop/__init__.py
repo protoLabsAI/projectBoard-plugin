@@ -5,7 +5,8 @@ public ``BoardLoop`` plus the module-level helpers, constants, and process-stabl
 state — so existing imports and plugin registration resolve unchanged. The
 edge-specific implementation lives in the sibling modules over a shared kernel:
 
-    _common     module-level kernel (imports, constants, helpers, live state)
+    _common     module-level kernel (imports, constants, helpers, live state,
+                external feedback bridge for review and CI-fix requeues)
     drive       claim / dispatch / drive lifecycle
     reconcile   CI / rebase / merged-state / review gate / auto-merge / recovery
     preflight   fail-closed gate preflight
