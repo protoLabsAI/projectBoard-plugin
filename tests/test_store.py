@@ -697,6 +697,71 @@ def test_update_feature_replaces_a_changed_diff(make_board, monkeypatch):
     assert _update_call(br) == ("update", "bd-1", "--remove-label", "diff:small", "--add-label", "diff:medium")
 
 
+def test_update_feature_changes_priority_in_place(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    current = {
+        "id": "bd-1",
+        "title": "T",
+        "priority": 3,
+        "labels": ["ready", "customer"],
+        "comments": [{"text": "history"}],
+        "depends_on": ["bd-parent"],
+        "pr_url": "https://example/pr/1",
+    }
+    monkeypatch.setattr(b, "_require", lambda fid: dict(current))
+    monkeypatch.setattr(b, "get_feature", lambda fid: {**current, "priority": 0})
+
+    f = b.update_feature("bd-1", priority=0)
+
+    assert _update_call(br) == ("update", "bd-1", "-p", "0")
+    assert f["id"] == "bd-1"
+    assert f["priority"] == 0
+    assert f["labels"] == ["ready", "customer"]
+    assert f["comments"] == [{"text": "history"}]
+    assert f["depends_on"] == ["bd-parent"]
+    assert f["pr_url"] == "https://example/pr/1"
+
+
+def test_update_feature_without_priority_leaves_priority_untouched(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    current = {"id": "bd-1", "title": "T", "priority": 3, "labels": []}
+    monkeypatch.setattr(b, "_require", lambda fid: dict(current))
+    monkeypatch.setattr(b, "get_feature", lambda fid: dict(current))
+
+    f = b.update_feature("bd-1", title="Renamed")
+
+    assert _update_call(br) == ("update", "bd-1", "--title=Renamed")
+    assert "-p" not in _update_call(br)
+    assert f["priority"] == 3
+
+
+def test_update_feature_invalid_priority_raises_and_writes_nothing(make_board, monkeypatch):
+    br = Br()
+    b = make_board(br)
+    current = {"id": "bd-1", "title": "T", "priority": 3, "labels": []}
+    monkeypatch.setattr(b, "_require", lambda fid: dict(current))
+    monkeypatch.setattr(b, "get_feature", lambda fid: dict(current))
+
+    with pytest.raises(BoardError) as exc_info:
+        b.update_feature("bd-1", title="Renamed", depends_on=["bd-parent"], priority=5)
+
+    assert "accepted range is 0 to 4" in str(exc_info.value)
+    assert not br.cmds("update")
+    assert not br.cmds("dep")
+
+
+def test_create_feature_invalid_priority_rejects_before_minting_a_bead(make_board):
+    calls = []
+    b = make_board(_enrich_run(calls=calls))
+
+    with pytest.raises(BoardError, match="accepted range is 0 to 4"):
+        b.create_feature("T", spec="s", priority=-1)
+
+    assert not any(c and c[0] == "create" for c in calls)
+
+
 def test_record_budget_unchanged_count_keeps_one_label(make_board, monkeypatch):
     # the fifth site the shared helper closes: a re-stamp of the same budget count must
     # not self-cancel, and another kind's budget stays untouched
