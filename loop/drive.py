@@ -687,7 +687,7 @@ class DriveMixin:
             name = t.get_name() if hasattr(t, "get_name") else ""
             for prefix in prefixes:
                 if name.startswith(prefix):
-                    fids.append(name[len(prefix):])
+                    fids.append(name[len(prefix) :])
                     break
         return sorted(fids)
 
