@@ -4227,6 +4227,33 @@ async def test_board_dispatch_preflight_crash_is_a_diagnostic_not_a_claim(monkey
     assert store.claimed == []  # the scan never ran — nothing was claimed
 
 
+async def test_board_dispatch_claim_scan_crash_after_a_partial_dispatch_reports_what_started(monkeypatch):
+    """A claim scan that raises AFTER it already started a drive yields an `error` record
+    that STILL names the card it dispatched — recovered from the drive-task set, since
+    `_spawn_ready` only writes `_last_claim_decision` on a clean pass. The crash handler
+    must never itself raise, and a real claim must never be swallowed (r1/r3)."""
+
+    class _CrashOnSecondClaim(_ClaimStore):
+        def claim(self, fid, assignee=""):
+            if fid == "bd-2":  # bd-1 already claimed + dispatched by the time we get here
+                raise RuntimeError("claim scan blew up mid-pass")
+            return super().claim(fid, assignee=assignee)
+
+    store = _CrashOnSecondClaim([_ready("bd-1", ["a.py"]), _ready("bd-2", ["b.py"])])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 3, "loop_enabled": True})  # capacity for both
+    finish = await _hold_drives(loop, monkeypatch)
+    try:
+        out = await loop.dispatch_now()
+        assert len(loop._drives) == 1  # bd-1's drive really started before the crash
+    finally:
+        await finish()
+    assert out["outcome"] == "error"
+    assert out["dispatched"] == ["bd-1"]  # the partial dispatch is reported, not lost
+    assert "bd-1" in out["detail"] and "claim scan blew up" in out["detail"]
+    assert store.claimed == ["bd-1"]  # bd-1 claimed once; bd-2's claim raised, never claimed
+
+
 async def test_request_dispatch_reports_no_running_loop(monkeypatch):
     """The tool seam: with no live loop surface in this process, request_dispatch reports
     `loop-not-running` rather than raising — there is nothing to ask."""

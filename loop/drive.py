@@ -654,20 +654,42 @@ class DriveMixin:
             "parked": [],
         }
 
-    def _dispatch_error_record(self, stage: str, exc: Exception) -> dict:
+    def _dispatch_error_record(self, stage: str, exc: Exception, dispatched=None) -> dict:
         """The decision record for an UNEXPECTED crash in an on-demand dispatch stage (the
         fail-closed preflight or the claim scan raised — not a gate verdict, which never
-        raises). A crashed diagnostic is a result, never an exception into the agent
-        loop."""
+        raises). A crashed diagnostic is a result, never an exception into the agent loop.
+        If the claim scan had already started drive(s) before it raised, their feature ids
+        are carried in ``dispatched`` so a partial-then-crashed pass is reported rather than
+        silently lost (the claim is real; the caller must still see it)."""
+        dispatched = sorted(dispatched or [])
+        detail = f"the {stage} errored: {type(exc).__name__}: {exc}"
+        if dispatched:
+            detail = f"dispatched {', '.join(dispatched)} before " + detail
         return {
-            "dispatched": [],
+            "dispatched": dispatched,
             "outcome": "error",
-            "detail": f"the {stage} errored: {type(exc).__name__}: {exc}",
+            "detail": detail,
             "running": len(self._drives),
             "max_concurrent": self.max_concurrent,
             "skipped": [],
             "parked": [],
         }
+
+    def _drive_fids(self, tasks) -> list:
+        """Feature ids for the given drive tasks, recovered from their ``pb-*-<fid>`` task
+        names (``pb-drive-`` coding drives, ``pb-task-`` sister-agent tasks, ``pb-self-``
+        first-party tasks). ``self._drives`` holds asyncio Tasks, not ids, so a task-set
+        diff has to be mapped back through the stable drive-name prefixes to report which
+        cards an on-demand scan had already dispatched when it raised mid-pass."""
+        prefixes = ("pb-drive-", "pb-task-", "pb-self-")
+        fids = []
+        for t in tasks:
+            name = t.get_name() if hasattr(t, "get_name") else ""
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    fids.append(name[len(prefix):])
+                    break
+        return sorted(fids)
 
     async def dispatch_now(self) -> dict:
         """Evaluate the ready queue right now instead of waiting for the next interval —
@@ -690,7 +712,10 @@ class DriveMixin:
         ``empty-queue``, ``at-capacity``, ``review-wip-limit``, ``all-candidates-held``
         (every ready card was blocked/held/hot-file-deferred or lost a claim race — see
         ``skipped``), ``parked`` (a task claimed to in_progress awaiting async delivery),
-        or ``loop-disabled``."""
+        ``loop-disabled``, or ``error`` (a dispatch stage — the preflight or the claim scan
+        — raised unexpectedly; it is captured as a record, never re-raised into the agent
+        loop, and any drive already started before the crash is still named in
+        ``dispatched``)."""
         if not self.enabled:
             return self._dispatch_disabled_record()
         # Fail-closed preflight FIRST, exactly as the periodic tick does before its claim
@@ -704,28 +729,17 @@ class DriveMixin:
             log.warning("[project_board] board_dispatch: preflight evaluation failed", exc_info=True)
             return self._dispatch_error_record("preflight evaluation", exc)
         async with self._claim_guard():
-            running_drives = getattr(self, "_drives", {})
-            dispatched_before = set(running_drives.keys() if hasattr(running_drives, "keys") else running_drives)
+            drives_before = set(getattr(self, "_drives", ()) or ())  # drive-task snapshot
             try:
                 await self._spawn_ready()
             except Exception as exc:  # noqa: BLE001 — a failed scan is a diagnostic result, not a crash
                 log.warning("[project_board] board_dispatch: ready-queue evaluation failed", exc_info=True)
-                running_drives = getattr(self, "_drives", {})
-                dispatched_after = set(running_drives.keys() if hasattr(running_drives, "keys") else running_drives)
-                dispatched = sorted(dispatched_after - dispatched_before)
-                if dispatched:
-                    return self._dispatch_record(
-                        "dispatched",
-                        f"Dispatched {', '.join(dispatched)} before ready-queue evaluation failed: "
-                        f"{type(exc).__name__}: {exc}",
-                        dispatched=dispatched,
-                        error={
-                            "phase": "ready-queue evaluation",
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        },
-                    )
-                return self._dispatch_error_record("ready-queue evaluation", exc)
+                # `_spawn_ready` writes `_last_claim_decision` only on a clean pass, so a
+                # mid-scan crash loses it — recover the feature ids of any drive it DID
+                # start from the drive-task set diff, so a partial-then-crashed pass still
+                # reports what it dispatched rather than swallowing it (r1/r3).
+                started = self._drive_fids(set(getattr(self, "_drives", ()) or ()) - drives_before)
+                return self._dispatch_error_record("ready-queue evaluation", exc, dispatched=started)
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
         return self._dispatch_decision_record(decision)
 
