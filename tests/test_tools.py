@@ -359,3 +359,172 @@ def test_get_feature_unknown_id_surfaces_a_named_error(monkeypatch):
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
     out = _get_tool("board_get_feature").invoke({"feature_id": "nope"})
     assert out.startswith("Error:") and "unknown feature" in out
+
+
+# ── board_comments: bounded read-only comment history (#396) ───────────────────────
+
+
+class _CommentStore:
+    def __init__(self, comments=(), error=""):
+        self.comments = list(comments)
+        self.error = error
+        self.calls = []
+
+    def feature_comments(self, fid, *, records=False, unknown_ok=True):
+        self.calls.append((fid, records, unknown_ok))
+        if self.error:
+            raise pb.store.BoardError(self.error)
+        return list(self.comments)
+
+
+def test_board_comments_is_registered_and_reads_comment_records(monkeypatch):
+    fake = _CommentStore([{"position": 0, "text": "first"}])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-1"}))
+
+    assert out["feature_id"] == "bd-1"
+    assert out["comments"] == [{"position": 0, "text": "first"}]
+    assert fake.calls == [("bd-1", True, False)]
+
+
+def test_board_comments_normalizes_upstream_shapes_and_orders_oldest_first(make_board, monkeypatch):
+    bead = {
+        "id": "bd-1",
+        "status": "open",
+        "comments": [
+            {"id": 2, "body": "  second  ", "author": {"login": "bob"}, "created_at": "2026-01-02T00:00:00Z"},
+            {"comment_id": "c1", "text": "first", "created_by": "alice", "timestamp": "2026-01-01T00:00:00Z"},
+            {"uuid": "c3", "content": "third", "user": {"name": "Cara"}, "time": "2026-01-03T00:00:00Z"},
+            {"text": "   "},
+        ],
+    }
+    b = make_board(lambda *args, want_json=False: [bead] if args and args[0] == "show" else [])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: b)
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-1", "page_size": 10}))
+
+    assert [c["text"] for c in out["comments"]] == ["first", "second", "third"]
+    assert [c["position"] for c in out["comments"]] == [0, 1, 2]
+    assert out["comments"][0] == {
+        "id": "c1",
+        "author": "alice",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "text": "first",
+        "position": 0,
+    }
+    assert out["comments"][1]["id"] == "2"
+    assert out["comments"][1]["author"] == "bob"
+    assert out["comments"][2]["author"] == "Cara"
+
+
+def test_board_comments_assigns_stable_positions_when_metadata_is_absent(make_board, monkeypatch):
+    bead = {
+        "id": "bd-1",
+        "status": "open",
+        "comments": ["  one  ", {"comment": "two"}, {"body": ""}, {"body": "three"}],
+    }
+    b = make_board(lambda *args, want_json=False: [bead] if args and args[0] == "show" else [])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: b)
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-1"}))
+
+    assert out["comments"] == [
+        {"text": "one", "position": 0},
+        {"text": "two", "position": 1},
+        {"text": "three", "position": 2},
+    ]
+
+
+def test_board_comments_paginates_with_explicit_continuation(monkeypatch):
+    fake = _CommentStore(
+        [
+            {"position": 0, "text": "one"},
+            {"position": 1, "text": "two"},
+            {"position": 2, "text": "three"},
+        ]
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-1", "page_size": 2, "offset": 1}))
+
+    assert out["offset"] == 1
+    assert out["page_size"] == 2
+    assert out["count"] == 2
+    assert out["total"] == 3
+    assert out["has_more"] is False
+    assert out["next_offset"] is None
+    assert [c["text"] for c in out["comments"]] == ["two", "three"]
+
+
+def test_board_comments_continuation_signals_more_pages(monkeypatch):
+    fake = _CommentStore(
+        [
+            {"position": 0, "text": "one"},
+            {"position": 1, "text": "two"},
+            {"position": 2, "text": "three"},
+        ]
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-1", "page_size": 2, "offset": 0}))
+
+    assert out["has_more"] is True
+    assert out["next_offset"] == 2
+    assert [c["text"] for c in out["comments"]] == ["one", "two"]
+
+
+def test_board_comments_known_feature_with_no_comments_returns_empty_page(monkeypatch):
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _CommentStore([]))
+
+    out = json.loads(_get_tool("board_comments").invoke({"feature_id": "bd-empty"}))
+
+    assert out == {
+        "feature_id": "bd-empty",
+        "offset": 0,
+        "page_size": 50,
+        "count": 0,
+        "total": 0,
+        "has_more": False,
+        "next_offset": None,
+        "comments": [],
+    }
+
+
+def test_board_comments_unknown_feature_surfaces_named_error(monkeypatch):
+    monkeypatch.setattr(
+        "project_board.store.get_store",
+        lambda **_kw: _CommentStore(error="unknown feature 'bd-missing'"),
+    )
+
+    out = _get_tool("board_comments").invoke({"feature_id": "bd-missing"})
+
+    assert out.startswith("Error:") and "unknown feature 'bd-missing'" in out
+
+
+def test_board_comments_reconstructs_audit_from_multiple_pages(monkeypatch):
+    fake = _CommentStore([{"position": i, "text": f"comment {i}"} for i in range(5)])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    tool = _get_tool("board_comments")
+
+    offset = 0
+    reconstructed = []
+    while True:
+        page = json.loads(tool.invoke({"feature_id": "bd-1", "page_size": 2, "offset": offset}))
+        reconstructed.extend(c["text"] for c in page["comments"])
+        if not page["has_more"]:
+            break
+        offset = page["next_offset"]
+
+    assert reconstructed == ["comment 0", "comment 1", "comment 2", "comment 3", "comment 4"]
+
+
+def test_board_comments_rejects_unbounded_or_invalid_page_requests(monkeypatch):
+    fake = _CommentStore([{"position": 0, "text": "one"}])
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    tool = _get_tool("board_comments")
+
+    assert tool.invoke({"feature_id": "bd-1", "page_size": 0}).startswith("Error: page_size")
+    assert tool.invoke({"feature_id": "bd-1", "page_size": 101}).startswith("Error: page_size")
+    assert tool.invoke({"feature_id": "bd-1", "offset": -1}).startswith("Error: offset")
+    assert fake.calls == []
