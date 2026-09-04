@@ -450,6 +450,7 @@ _MINIMAL_ARGS = {
     "board_create_task": {"title": "t"},
     "board_update_feature": {"feature_id": "bd-1", "title": "t"},
     "board_get_feature": {"feature_id": "bd-1"},
+    "board_comments": {"feature_id": "bd-1"},
     "board_mark_ready": {"feature_id": "bd-1"},
     "board_cancel_feature": {"feature_id": "bd-1"},
     "board_mark_done": {"feature_id": "bd-1"},

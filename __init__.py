@@ -706,6 +706,50 @@ def _board_tools(cfg: dict):
         )
 
     @tool
+    def board_comments(feature_id: str, page_size: int = 50, offset: int = 0) -> str:
+        """Read one feature's persisted comment history as paginated JSON.
+
+        This is the audit-scale read path for bead comments: it uses the board store's
+        owned ``br show`` projection, normalizes every comment's text, preserves
+        available id/author/timestamp metadata, and assigns a stable zero-based
+        ``position`` to every returned comment. Results are oldest-first. ``page_size``
+        must be 1..100, ``offset`` is the zero-based comment offset, and the response
+        includes ``has_more`` plus ``next_offset`` so callers can reconstruct long
+        histories without direct SQLite/shell access or silent truncation. Unknown
+        features return ``Error: unknown feature …``; known/commentless features return
+        an empty successful page."""
+        try:
+            feature_id = _strip_wrapping_quotes(feature_id).strip()
+            page_size = int(page_size)
+            offset = int(offset)
+            if not feature_id:
+                return "Error: feature_id is required"
+            if page_size < 1 or page_size > 100:
+                return "Error: page_size must be between 1 and 100"
+            if offset < 0:
+                return "Error: offset must be non-negative"
+            comments = get_store(**store_kw).feature_comments(feature_id, records=True, unknown_ok=False)
+        except (TypeError, ValueError):
+            return "Error: page_size and offset must be integers"
+        except BoardError as exc:
+            return f"Error: {exc}"
+        page = comments[offset : offset + page_size]
+        next_offset = offset + len(page)
+        has_more = next_offset < len(comments)
+        return json.dumps(
+            {
+                "feature_id": feature_id,
+                "offset": offset,
+                "page_size": page_size,
+                "count": len(page),
+                "total": len(comments),
+                "has_more": has_more,
+                "next_offset": next_offset if has_more else None,
+                "comments": page,
+            }
+        )
+
+    @tool
     def board_mark_ready(feature_id: str) -> str:
         """Promote a feature backlog → ready. Fails if it lacks a spec +
         acceptance_criteria (the Ready gate). Only `ready` features are pulled."""
@@ -1113,6 +1157,7 @@ def _board_tools(cfg: dict):
         board_create_task,
         board_update_feature,
         board_get_feature,
+        board_comments,
         board_mark_ready,
         board_cancel_feature,
         board_mark_done,

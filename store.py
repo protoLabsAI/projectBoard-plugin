@@ -744,6 +744,76 @@ def _parse_closed_at(raw) -> float | None:
     return dt.timestamp()
 
 
+def _comment_text(raw) -> str:
+    """Normalize one ``br show`` comment shape to text."""
+    if isinstance(raw, dict):
+        txt = raw.get("text") or raw.get("body") or raw.get("content") or raw.get("comment") or ""
+    else:
+        txt = str(raw or "")
+    return str(txt or "").strip()
+
+
+def _comment_author(raw) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    author = raw.get("author") or raw.get("user") or raw.get("created_by") or raw.get("actor") or ""
+    if isinstance(author, dict):
+        author = author.get("name") or author.get("login") or author.get("username") or author.get("id") or ""
+    return str(author or "").strip()
+
+
+def _comment_timestamp(raw) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    ts = (
+        raw.get("created_at")
+        or raw.get("created")
+        or raw.get("timestamp")
+        or raw.get("time")
+        or raw.get("date")
+        or raw.get("updated_at")
+        or ""
+    )
+    return str(ts or "").strip()
+
+
+def _normalize_comment_records(raw_comments) -> list[dict]:
+    """A ``br show`` comments list → stable oldest-first audit records.
+
+    ``br`` has shipped several comment shapes. Keep one normalizer for every board
+    reader: text is always trimmed; available id/author/timestamp metadata rides
+    along; and a stable ``position`` is assigned after ordering so comments with no
+    upstream id still have an audit handle.
+    """
+    prepared = []
+    for source_position, raw in enumerate(raw_comments or []):
+        text = _comment_text(raw)
+        if not text:
+            continue
+        rec = {"text": text}
+        if isinstance(raw, dict):
+            cid = raw.get("id") or raw.get("comment_id") or raw.get("uuid")
+            if cid is not None and str(cid).strip():
+                rec["id"] = str(cid).strip()
+            author = _comment_author(raw)
+            if author:
+                rec["author"] = author
+            timestamp = _comment_timestamp(raw)
+            if timestamp:
+                rec["timestamp"] = timestamp
+        prepared.append((source_position, rec, _parse_closed_at(rec.get("timestamp"))))
+
+    if prepared and all(ts is not None for _pos, _rec, ts in prepared):
+        prepared.sort(key=lambda item: (item[2], item[0]))
+
+    out: list[dict] = []
+    for position, (_source_position, rec, _ts) in enumerate(prepared):
+        rec = dict(rec)
+        rec["position"] = position
+        out.append(rec)
+    return out
+
+
 def _complete(coro):
     """Run an async worktree coroutine to completion from this synchronous module.
 
@@ -2708,24 +2778,30 @@ class BeadsBoard:
                 raw.append(rows[0] if isinstance(rows, list) else rows)
         return raw
 
-    def feature_comments(self, fid: str) -> list[str]:
-        """The comment text history for ONE feature, oldest-first — a per-feature read
+    def feature_comments(self, fid: str, *, records: bool = False, unknown_ok: bool = True) -> list:
+        """The comment history for ONE feature, oldest-first — a per-feature read
         via ``br show`` (which carries the full comment thread; ``br list`` omits it,
         and ``raw_features_with_comments`` fetches by board STATE, not by id). Consumed
         by the coder-monitor read side (#226 S2), which filters for ``coder-monitor:``
-        gen snapshots. Returns ``[]`` for an unknown feature or one with no comments;
-        each comment is normalized to its text however ``br`` shapes the entry."""
-        rows = self._run("show", fid, want_json=True)
+        gen snapshots. By default returns the legacy ``list[str]`` text view and keeps
+        unknown/commentless features as ``[]``; callers that need audit metadata can
+        pass ``records=True`` and ``unknown_ok=False`` for a named unknown-feature
+        error. Both shapes share the same comment normalizer."""
+        try:
+            rows = self._run("show", fid, want_json=True)
+        except BoardNotFound:
+            if unknown_ok:
+                return []
+            raise BoardError(f"unknown feature {fid!r}") from None
         if not rows:
-            return []
+            if unknown_ok:
+                return []
+            raise BoardError(f"unknown feature {fid!r}")
         bead = rows[0] if isinstance(rows, list) else rows
-        out: list[str] = []
-        for c in bead.get("comments") or []:
-            txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
-            txt = txt.strip()
-            if txt:
-                out.append(txt)
-        return out
+        normalized = _normalize_comment_records(bead.get("comments") or [])
+        if records:
+            return normalized
+        return [c["text"] for c in normalized]
 
     def ready_queue(self, relaxed: bool = False) -> list[dict]:
         """Board-`ready`, dep-unblocked **features and task-type beads**
@@ -2916,8 +2992,7 @@ class BeadsBoard:
         delivered_by = bead.get("assignee", "")
         blocked_reason = ""
         for c in bead.get("comments") or []:
-            txt = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
-            txt = txt.strip()
+            txt = _comment_text(c)
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
             elif txt.startswith(BLOCKED_REASON_PREFIX):
