@@ -41,25 +41,35 @@ function message(text, error=false){
   if (text) el.scrollIntoView({block:"nearest"});
 }
 function clearMessages(){ $("notice").hidden = true; $("error").hidden = true; }
+// Editing needs a consented SPACE, not just the switch. The host refuses any write whose
+// repo doesn't resolve under `onboarding.root`, so gating on `enabled` alone would leave a
+// live button whose every submit fails server-side — which is what defaulting `enabled` on
+// (protoAgent#3396) would otherwise have produced here.
+function canEdit(){ return state.onboarding.enabled && Boolean(state.onboarding.root); }
+
 function syncControls(){
   const busy = loading || mutating;
   $("app").setAttribute("aria-busy", busy ? "true" : "false");
-  $("add").disabled = busy || !state.onboarding.enabled;
+  $("add").disabled = busy || !canEdit();
   $("retry").disabled = busy;
   $("editor-fields").disabled = mutating;
   $("cancel").disabled = mutating;
   $("projects").querySelectorAll("button").forEach((button) => {
-    const editBlocked = button.hasAttribute("data-edit") && (!state.onboarding.enabled || button.dataset.editable === "false");
+    const editBlocked = button.hasAttribute("data-edit") && (!canEdit() || button.dataset.editable === "false");
     button.disabled = busy || editBlocked;
   });
 }
 
 function render(){
   $("loading").hidden = true;
+  // Name the ONE thing that is missing, and where to set it — the old copy described both
+  // bounds at once whichever was unmet, so it read as a wall rather than an instruction.
   const onboard = $("onboarding");
-  onboard.hidden = state.onboarding.enabled;
-  const root = state.onboarding.root ? ` Current root: ${state.onboarding.root}.` : " No onboarding root is configured.";
-  onboard.textContent = state.onboarding.enabled ? "" : `Adding or editing projects is unavailable until Project onboarding is enabled and its root is set.${root} Existing projects remain visible; deletion remains available for unused entries.`;
+  onboard.hidden = canEdit();
+  const tail = " Existing projects remain visible; deletion remains available for unused entries.";
+  onboard.textContent = canEdit() ? "" : (state.onboarding.enabled
+    ? `Adding or editing projects needs an onboarding root: set Settings ▸ Capabilities ▸ Project onboarding ▸ Onboarding root. Repos must resolve under it.${tail}`
+    : `Adding or editing projects needs Project onboarding switched on: Settings ▸ Capabilities ▸ Project onboarding.${tail}`);
   if (!state.projects.length){
     $("projects").innerHTML = '<div class="empty">No explicit board projects yet. Add one to replace the legacy single-repo configuration.</div>';
     syncControls();
