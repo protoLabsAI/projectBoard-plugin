@@ -62,3 +62,19 @@ def test_projects_page_distinguishes_applied_mutations_from_refresh_failures():
     assert "state.projects = state.projects.filter" in PROJECTS_PAGE
     assert 'button.textContent = "Delete"' in PROJECTS_PAGE
     assert 'removeAttribute("aria-busy")' in PROJECTS_PAGE
+
+
+def test_projects_page_gates_editing_on_a_usable_onboarding_space():
+    """Editing needs a root, not just the switch (protoAgent#3396).
+
+    The host refuses a write whose repo can't resolve under `onboarding.root`, so a
+    button gated on `enabled` alone goes live the moment onboarding defaults on and then
+    fails on submit. The notice must also name the ONE missing piece and where to set it,
+    rather than restating both bounds whichever is unmet."""
+    assert "function canEdit(){ return state.onboarding.enabled && Boolean(state.onboarding.root); }" in PROJECTS_PAGE
+    assert '$("add").disabled = busy || !canEdit();' in PROJECTS_PAGE
+    assert '!canEdit() || button.dataset.editable === "false"' in PROJECTS_PAGE
+    assert "onboard.hidden = canEdit();" in PROJECTS_PAGE
+    assert "needs an onboarding root" in PROJECTS_PAGE
+    assert "needs Project onboarding switched on" in PROJECTS_PAGE
+    assert "Settings ▸ Capabilities ▸ Project onboarding" in PROJECTS_PAGE
