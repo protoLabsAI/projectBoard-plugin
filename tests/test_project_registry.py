@@ -167,6 +167,34 @@ def test_the_merge_is_a_superset_and_idempotent(existing, adding, expected):
     assert set(merged) == expected
 
 
+def apply_like_host(cfg):
+    """An ``apply_settings`` fake with the REAL host's merge semantics.
+
+    ``dict.update(patch["project_board"])` — what these tests used to do — REPLACES the
+    whole ``projects`` map, so omitting a member deleted it. The host does the opposite:
+    ``graph.config_io.apply_updates_to_yaml`` MERGES a section-member map (siblings are
+    kept by design, so a concurrent writer's entry survives) and removes a key only when
+    its value is ``None``. Under the old fake a delete that sent just the surviving map
+    passed; against the host it deleted nothing (#408), which is the whole reason a fake
+    at an external seam has to match the seam.
+    """
+
+    def apply_settings(patch):
+        section = cfg.plugin_config.setdefault("project_board", {})
+        for key, value in (patch.get("project_board") or {}).items():
+            if isinstance(value, dict) and isinstance(section.get(key), dict):
+                for inner, inner_value in value.items():  # member map: merge, None deletes
+                    if inner_value is None:
+                        section[key].pop(inner, None)
+                    else:
+                        section[key][inner] = inner_value
+            else:
+                section[key] = value
+        return True, []
+
+    return apply_settings
+
+
 def _wire_host(monkeypatch, cfg, apply_settings):
     fake_sdk = types.ModuleType("graph.sdk")
     fake_sdk.config = lambda: cfg
@@ -189,10 +217,11 @@ async def test_register_persists_superset_and_reports_live_without_restart(monke
     )
     applied = []
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
         applied.append(patch)
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     tool = build_register_tool({})
@@ -266,9 +295,10 @@ async def test_register_with_gate_auto_persists_the_discovery_sentinel(monkeypat
         plugin_config={"project_board": {"projects": {}}},
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     tool = build_register_tool({})
@@ -310,9 +340,10 @@ async def test_agent_reregister_with_blank_gate_preserves_the_operator_set_one(m
         plugin_config={"project_board": {"projects": {"alpha": {"repo": str(repo), "local_gate_cmd": "make gate"}}}},
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     tool = build_register_tool({})
@@ -338,9 +369,10 @@ async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monke
         },
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     result = await upsert_project("alpha", str(repo), local_gate_cmd="", replace_optional=True)
@@ -406,9 +438,10 @@ async def test_simultaneous_upserts_serialize_the_live_read_merge_write(monkeypa
         plugin_config={"project_board": {"projects": {}}},
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     await asyncio.gather(upsert_project("a", str(a)), upsert_project("b", str(b)))
@@ -430,9 +463,10 @@ async def test_adding_a_second_project_preserves_the_implicit_sole_default(monke
         plugin_config={"project_board": {"projects": {"alpha": {"repo": str(alpha)}}}},
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     result = await upsert_project("beta", str(beta))
@@ -512,9 +546,10 @@ async def test_delete_reassigns_a_deleted_default_to_the_only_survivor(monkeypat
         },
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     await delete_project("alpha")
@@ -531,9 +566,10 @@ async def test_editor_refuses_to_claim_it_cleared_an_implicit_sole_default(monke
         plugin_config={"project_board": {"default_project": "alpha", "projects": {"alpha": {"repo": str(repo)}}}},
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     with pytest.raises(ProjectRegistryError, match="only project"):
@@ -555,9 +591,10 @@ async def test_editor_can_clear_an_explicit_default_on_a_multi_project_board(mon
         },
     )
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     _wire_host(monkeypatch, cfg, apply_settings)
     result = await upsert_project("alpha", str(alpha), clear_default=True)
@@ -589,10 +626,11 @@ async def test_delete_runs_live_unused_check_inside_registry_mutation(monkeypatc
     )
     events = []
 
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
         events.append("apply")
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     async def assert_unused(name, effective_default):
         events.append(f"check:{name}")
@@ -623,10 +661,11 @@ def _smoke_cfg(root: Path) -> types.SimpleNamespace:
 
 
 def _recording_apply(cfg, applied):
+    _host_apply = apply_like_host(cfg)
+
     def apply_settings(patch):
         applied.append(patch)
-        cfg.plugin_config["project_board"].update(patch["project_board"])
-        return True, []
+        return _host_apply(patch)
 
     return apply_settings
 
