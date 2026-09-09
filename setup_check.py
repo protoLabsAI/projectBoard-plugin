@@ -184,6 +184,7 @@ def _workspace_has_cards(repo: str) -> bool:
 
     Fails SAFE: anything unreadable, unexpected, or simply unknown counts as "has cards"
     and keeps the warning. Silence is only for a workspace we can prove is empty."""
+    import contextlib
     import glob
     import sqlite3
 
@@ -192,7 +193,10 @@ def _workspace_has_cards(repo: str) -> bool:
         return True  # a workspace whose shape we don't recognise — say something
     for db in dbs:
         try:
-            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            # `with sqlite3.connect(...)` is a TRANSACTION context, not a closing one — it
+            # commits or rolls back and leaves the handle open until GC. This runs on every
+            # preflight, so close it explicitly rather than leaning on refcounting.
+            with contextlib.closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
                 if conn.execute("select 1 from issues limit 1").fetchone() is not None:
                     return True
         except Exception:  # noqa: BLE001 — unreadable/foreign schema: warn rather than guess

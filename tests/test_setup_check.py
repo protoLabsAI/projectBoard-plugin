@@ -1514,3 +1514,31 @@ def test_workspace_has_cards_counts_rows_and_fails_safe(tmp_path):
     conn.commit()
     conn.close()
     assert _workspace_has_cards(str(tmp_path)) is True
+
+
+def test_workspace_has_cards_fails_safe_on_an_unreadable_or_foreign_db(tmp_path):
+    """The fail-safe branch is the whole safety claim, so it gets its own test.
+
+    Silence is only ever earned by a workspace we can PROVE is empty. A db we cannot
+    read, or one whose schema isn't beads', must keep warning — otherwise a genuinely
+    stranded set of cards would go unmentioned, which is the failure this advisory
+    exists to prevent.
+    """
+    import sqlite3
+
+    from project_board.setup_check import _workspace_has_cards
+
+    beads = tmp_path / ".beads"
+    beads.mkdir()
+
+    # Not a database at all.
+    (beads / "beads.db").write_text("this is not sqlite")
+    assert _workspace_has_cards(str(tmp_path)) is True
+
+    # A real database with a FOREIGN schema — readable, but no `issues` table.
+    (beads / "beads.db").unlink()
+    conn = sqlite3.connect(beads / "beads.db")
+    conn.execute("create table something_else (id text)")
+    conn.commit()
+    conn.close()
+    assert _workspace_has_cards(str(tmp_path)) is True
