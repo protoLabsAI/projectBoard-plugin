@@ -143,11 +143,13 @@ def legacy_store_hint(repos: list[str]) -> str:
     )
 
 
-def legacy_store_repos(cfg: dict, isdir=None) -> list[str]:
+def legacy_store_repos(cfg: dict, isdir=None, has_cards=None) -> list[str]:
     """The configured project repos still carrying a ``.beads/`` workspace while the
     board rides the instance store (no explicit ``db_path``) — the pre-D3 upgrade
     signature: per-repo discovery made each of those the board's store, so cards left
     there are invisible until ``db_path`` pins back to the file or they are migrated.
+    A workspace holding NO cards strands nothing, so it is not reported (#411) — see
+    ``_workspace_has_cards``; ``has_cards`` is injectable for the suite.
     Empty when ``db_path`` is set (the operator's pin decides, wherever it points — an
     EXPLICITLY blank value is not a pin, it rides the instance store like an absent
     key), when the ``projects:`` map is malformed (the repo check owns that finding),
@@ -155,6 +157,7 @@ def legacy_store_repos(cfg: dict, isdir=None) -> list[str]:
     may share a repo)."""
     cfg = cfg or {}
     isdir = isdir or os.path.isdir
+    has_cards = has_cards or _workspace_has_cards
     if str(cfg.get("db_path") or "").strip():
         return []
     try:
@@ -164,9 +167,37 @@ def legacy_store_repos(cfg: dict, isdir=None) -> list[str]:
     out: list[str] = []
     for entry in resolved.values():
         path = str((entry or {}).get("repo") or "").strip()
-        if path and path not in out and isdir(os.path.join(path, ".beads")):
+        if path and path not in out and isdir(os.path.join(path, ".beads")) and has_cards(path):
             out.append(path)
     return out
+
+
+def _workspace_has_cards(repo: str) -> bool:
+    """Does this repo's ``.beads/`` actually hold cards?
+
+    The advisory is about cards STRANDED by the D3 switch, so a workspace with none
+    strands nothing and there is nothing to migrate. Presence of the directory alone is
+    not the upgrade signature it was taken for: ``br init`` creates an empty workspace,
+    and protoAgent's own onboard-project skill runs it — so onboarding a repo produced a
+    board warning that the operator's cards might be invisible when the count was zero
+    (#411). An empty schema file is ~276KB, so size is no proxy either; count the rows.
+
+    Fails SAFE: anything unreadable, unexpected, or simply unknown counts as "has cards"
+    and keeps the warning. Silence is only for a workspace we can prove is empty."""
+    import glob
+    import sqlite3
+
+    dbs = sorted(glob.glob(os.path.join(repo, ".beads", "*.db")))
+    if not dbs:
+        return True  # a workspace whose shape we don't recognise — say something
+    for db in dbs:
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+                if conn.execute("select 1 from issues limit 1").fetchone() is not None:
+                    return True
+        except Exception:  # noqa: BLE001 — unreadable/foreign schema: warn rather than guess
+            return True
+    return False
 
 
 # ── #354: review-status publication capability probe ─────────────────────────────────

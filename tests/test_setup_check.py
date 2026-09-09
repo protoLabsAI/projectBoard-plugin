@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import project_board as pb
+from project_board.setup_check import legacy_store_repos
 from project_board import api, projects, setup_check
 from project_board.loop import BoardLoop
 from project_board.setup_check import GapReporter, setup_status
@@ -1469,3 +1470,47 @@ def test_a_list_rung_is_not_reported_as_an_uncovered_tier():
     as COVERED, or the board reports a ladder gap and pauses on a perfectly valid config."""
     assert setup_check.uncovered_tiers({"smart": ["codex", "sonnet"], "reasoning": "opus", "opus": "opus"}) == []
     assert "smart" in setup_check.uncovered_tiers({"smart": [], "reasoning": "opus", "opus": "opus"})
+
+
+# ── #411: an EMPTY .beads/ strands nothing ───────────────────────────────────────────
+# The advisory is about cards the D3 switch made invisible. Presence of the directory was
+# taken as the upgrade signature, but `br init` creates an empty workspace and protoAgent's
+# own onboard-project skill runs it — so onboarding a repo warned the operator their cards
+# might be stranded when there were none. Silence is earned only by a provably empty
+# workspace; anything unreadable still warns.
+
+
+def test_legacy_store_skips_a_workspace_with_no_cards():
+    cfg = {"projects": {"a": {"repo": "/r/a"}}}
+    assert legacy_store_repos(cfg, isdir=lambda p: True, has_cards=lambda repo: False) == []
+
+
+def test_legacy_store_still_reports_a_workspace_holding_cards():
+    cfg = {"projects": {"a": {"repo": "/r/a"}}}
+    assert legacy_store_repos(cfg, isdir=lambda p: True, has_cards=lambda repo: True) == ["/r/a"]
+
+
+def test_workspace_has_cards_counts_rows_and_fails_safe(tmp_path):
+    import sqlite3
+
+    from project_board.setup_check import _workspace_has_cards
+
+    beads = tmp_path / ".beads"
+    beads.mkdir()
+    # No db at all — an unrecognised shape warns rather than guessing.
+    assert _workspace_has_cards(str(tmp_path)) is True
+
+    db = beads / "beads.db"
+    conn = sqlite3.connect(db)
+    conn.execute("create table issues (id text)")
+    conn.commit()
+    conn.close()
+    # Schema present, zero rows — exactly what `br init` leaves, and what a 276KB empty
+    # file would defeat a size heuristic with.
+    assert _workspace_has_cards(str(tmp_path)) is False
+
+    conn = sqlite3.connect(db)
+    conn.execute("insert into issues values ('bd-1')")
+    conn.commit()
+    conn.close()
+    assert _workspace_has_cards(str(tmp_path)) is True
