@@ -450,7 +450,16 @@ async def _apply_registry(
         raise ProjectRegistryError("project changes are unavailable — the host is not wired for config apply")
 
     intended = copy.deepcopy(projects)
-    section: dict[str, Any] = {"projects": copy.deepcopy(intended)}
+    # A removed project needs an explicit `None` — the host's `apply_updates_to_yaml`
+    # MERGES a section-member map (siblings under `projects:` are kept by design, so a
+    # concurrent writer's entry is never dropped), and only a `None` value removes a key.
+    # Sending the surviving map alone therefore deletes nothing: the entry stays in the
+    # YAML, and the readback below is the only reason that surfaced instead of reporting
+    # a success that never happened. (#408)
+    written: dict[str, Any] = copy.deepcopy(intended)
+    for gone in absent or set():
+        written[gone] = None
+    section: dict[str, Any] = {"projects": written}
     if default_project is not None:
         section["default_project"] = default_project
     ok, messages = await asyncio.to_thread(HOST.apply_settings, {"project_board": section})
