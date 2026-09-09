@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
+import project_board as pb
+from project_board import setup_check
 from project_board import store as store_mod
 from project_board.loop import _MERGED_VERIFIED_SHA_LEN
 from project_board.store import (
@@ -685,3 +688,97 @@ def test_request_decomposition_files_a_real_task_and_marks_the_card(board):
     # The original is marked, so the ask cannot re-fire on the next timeout.
     assert "decompose-asked" in (board.get_feature(fid).get("labels") or [])
     assert board.request_decomposition(fid, timeouts=3) is None
+
+
+# ── structured setup-gap actions: the register() wiring, end to end ───────────────────
+# NOT part of the real-`br` tier above — HOST-FREE (no binary needed, every probe pinned).
+# These drive the plugin's public register() entry point against a host that supports the
+# structured setup-gap `actions=` contract and against a legacy host that exposes only the
+# prior `report_setup_gap(key, message, *, label=None)` seam, proving the coder/repo
+# configuration blockers reach the operator with — and, on an older host, without — the
+# allowlisted `plugin_config` action that opens Project Board's Configure dialog.
+
+CONFIGURE_CTA = {"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}
+
+
+class _BaseRegistry:
+    def __init__(self, config):
+        self.config = config
+        self.tools, self.routers, self.surfaces = [], [], []
+        self.subagents, self.skill_dirs = [], []
+
+    def register_tool(self, t):
+        self.tools.append(t)
+
+    def register_router(self, router, prefix):
+        self.routers.append(prefix)
+
+    def register_surface(self, start, stop=None, name=None, reload=None):
+        self.surfaces.append(name)
+
+    def register_subagent(self, config):
+        self.subagents.append(config)
+
+    def register_skill_dir(self, path):
+        self.skill_dirs.append(path)
+
+
+class _ActionRegistry(_BaseRegistry):
+    """A host on the EXTENDED seam — report_setup_gap accepts `actions=`."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.gaps = []
+
+    def report_setup_gap(self, key, message, *, label=None, actions=None):
+        self.gaps.append((key, message, actions))
+
+
+class _LegacyRegistry(_BaseRegistry):
+    """A host on the PRIOR seam — report_setup_gap(key, message, *, label=None)."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.gaps = []
+
+    def report_setup_gap(self, key, message, *, label=None):
+        self.gaps.append((key, message, label))
+
+
+def _pin_setup_probes(monkeypatch, *, which, delegates):
+    """Pin register()'s live preflight probes so the wiring runs with no PATH, roster, or
+    subprocess (mirrors test_setup_check's `_pin_probes`)."""
+    monkeypatch.setattr(setup_check.shutil, "which", which)
+    monkeypatch.setattr(setup_check, "_default_delegates", lambda: delegates)
+    monkeypatch.setattr(
+        setup_check, "_subprocess_run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="br 0.1.23")
+    )
+
+
+def test_register_attaches_the_configure_action_on_a_structured_host(monkeypatch):
+    """r1: register() on a structured-action host forwards the active `coder` and `repo`
+    configuration blockers with the allowlisted `plugin_config` CTA targeting Project Board."""
+    _pin_setup_probes(monkeypatch, which=lambda n: f"/usr/local/bin/{n}", delegates=lambda n: None)
+    reg = _ActionRegistry({"coder": "", "repo": "/nowhere"})
+    pb.register(reg)  # must not raise
+    by_key = {key: (msg, actions) for key, msg, actions in reg.gaps}
+    # both blockers are active and carry the Configure-dialog action
+    assert by_key["coder"][0] == setup_check.NO_CODER_HINT and by_key["coder"][1] == [CONFIGURE_CTA]
+    assert "/nowhere" in by_key["repo"][0] and by_key["repo"][1] == [CONFIGURE_CTA]
+    # br/gh resolve here, so no misleading settings CTA rides a non-config key (r4)
+    assert by_key["br"][1] is None and by_key["gh"][1] is None
+    assert by_key["coder"][1] == [{"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}]
+    # registration still mounts the board API + loop surface regardless of the seam
+    assert "/plugins/project_board" in reg.routers and "project-board-loop" in reg.surfaces
+
+
+def test_register_degrades_to_plain_warnings_on_a_legacy_host(monkeypatch):
+    """r3: register() on a host that exposes only the prior two-argument seam loads fine and
+    reports the same blockers as plain warnings — no action, no exception."""
+    _pin_setup_probes(monkeypatch, which=lambda n: f"/usr/local/bin/{n}", delegates=lambda n: None)
+    reg = _LegacyRegistry({"coder": "", "repo": "/nowhere"})
+    pb.register(reg)  # must not raise on the prior signature
+    by_key = {key: (msg, label) for key, msg, label in reg.gaps}
+    assert by_key["coder"] == (setup_check.NO_CODER_HINT, None)  # plain warning, no action/label
+    assert "/nowhere" in by_key["repo"][0] and by_key["repo"][1] is None
+    assert "/plugins/project_board" in reg.routers and "project-board-loop" in reg.surfaces

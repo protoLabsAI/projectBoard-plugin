@@ -626,6 +626,150 @@ def test_reporter_swallows_a_host_side_failure(caplog):
     assert any("report_setup_gap('gh') failed" in r.message for r in caplog.records)
 
 
+# ── structured setup-gap actions: the Configure-dialog CTA, feature-detected ──────
+# When the host exposes the EXTENDED seam (report_setup_gap accepts `actions=`), the two
+# CONFIGURATION blockers — an unresolved `coder`, an unbound/invalid `repo` — carry an
+# allowlisted `plugin_config` action that opens Project Board's Configure dialog. `br`/`gh`
+# (PATH/install faults) and the advisories never do (r4). On the prior two-argument seam the
+# same gaps degrade to their plain hint strings, with identical message/key/edge semantics.
+
+
+class _HostWithActionSeam:
+    """A host on the EXTENDED seam: report_setup_gap accepts the structured `actions=`
+    list the console renders as buttons (plus the prior `label=`). Records
+    (key, message, actions) per call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def report_setup_gap(self, key, message, *, label=None, actions=None):
+        self.calls.append((key, message, actions))
+
+
+class _LegacyLabelHost:
+    """The PRIOR seam, exactly: report_setup_gap(key, message, *, label=None) — no
+    structured `actions` parameter. The degraded path (r3)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def report_setup_gap(self, key, message, *, label=None):
+        self.calls.append((key, message, label))
+
+
+class _KwargsSeamHost:
+    """A host whose seam swallows any keyword via **kwargs — treated as action-capable."""
+
+    def __init__(self):
+        self.calls = []
+
+    def report_setup_gap(self, key, message, **kw):
+        self.calls.append((key, message, kw.get("actions")))
+
+
+class _OverPromisingActionHost:
+    """A pathological host whose SIGNATURE advertises `actions=` but rejects the call (a
+    decorator whose wrapped signature over-promises). The reporter must still land the
+    plain warning — never drop a gap on a TypeError — and stop probing actions."""
+
+    def __init__(self):
+        self.calls = []
+
+    def report_setup_gap(self, key, message, *, label=None, actions=None):
+        if actions is not None:
+            raise TypeError("this seam does not really accept actions")
+        self.calls.append((key, message))
+
+
+CONFIGURE_CTA = {"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}
+
+
+def test_plugin_config_action_is_the_allowlisted_configure_cta():
+    """The action is a declarative `plugin_config` targeting the stable `project_board`
+    id (visible label `Project Board`) — it opens the config surface, nothing more."""
+    assert setup_check.plugin_config_action() == CONFIGURE_CTA
+    assert setup_check.CONFIG_PLUGIN_ID == "project_board"
+    assert setup_check.CONFIG_PLUGIN_LABEL == "Project Board"
+    assert setup_check.CONFIG_ACTION_KEYS == ("coder", "repo")
+
+
+def test_seam_accepts_actions_distinguishes_the_two_contracts():
+    from project_board.setup_check import _seam_accepts_actions
+
+    def extended(key, message, *, label=None, actions=None): ...
+    def kwargs_seam(key, message, **kw): ...
+    def legacy(key, message, *, label=None): ...
+    def two_arg(key, message): ...
+
+    assert _seam_accepts_actions(extended) is True
+    assert _seam_accepts_actions(kwargs_seam) is True
+    assert _seam_accepts_actions(legacy) is False  # `label` is not `actions`
+    assert _seam_accepts_actions(two_arg) is False
+
+
+def test_reporter_attaches_the_configure_action_to_coder_and_repo_gaps():
+    host = _HostWithActionSeam()
+    rep = GapReporter(host)
+    assert rep.available is True and rep.actions_supported is True
+    rep.report(_status(br=False, gh=False, coder=False, repo=False))
+    by_key = {key: (msg, actions) for key, msg, actions in host.calls}
+    # the two configuration blockers carry the Configure-dialog CTA…
+    assert by_key["coder"] == ("coder hint", [CONFIGURE_CTA])
+    assert by_key["repo"] == ("repo hint", [CONFIGURE_CTA])
+    # …br/gh (PATH/install faults) and every advisory do NOT (r4)
+    assert by_key["br"][0] == "br hint" and by_key["br"][1] is None
+    assert by_key["gh"][0] == "gh hint" and by_key["gh"][1] is None
+    for advisory in ("loop", "db", "db_legacy", "review_status"):
+        assert by_key[advisory][1] is None
+
+
+def test_reporter_clears_a_config_gap_without_an_action():
+    """The clear (msg None) carries NO action — an action only accompanies an ACTIVE gap,
+    and the edge-triggered send/steady/clear semantics are unchanged (r2)."""
+    host = _HostWithActionSeam()
+    rep = GapReporter(host)
+    rep.report(_status(coder=False))
+    assert ("coder", "coder hint", [CONFIGURE_CTA]) in host.calls
+    assert rep.report(_status(coder=False)) == {}  # steady state → nothing re-sent
+    host.calls.clear()
+    rep.report(_status())  # coder recovers
+    assert [c for c in host.calls if c[0] == "coder"][-1] == ("coder", None, None)
+
+
+def test_reporter_detects_a_kwargs_seam_and_attaches_the_action():
+    host = _KwargsSeamHost()
+    rep = GapReporter(host)
+    assert rep.actions_supported is True
+    rep.report(_status(repo=False))
+    assert [c for c in host.calls if c[0] == "repo"][-1] == ("repo", "repo hint", [CONFIGURE_CTA])
+
+
+def test_reporter_degrades_to_plain_warnings_on_the_legacy_label_seam():
+    """r3: a host on the prior `report_setup_gap(key, message, *, label=None)` seam still
+    reports every gap — as plain warnings, no action, no exception — and loads fine."""
+    host = _LegacyLabelHost()
+    rep = GapReporter(host)
+    assert rep.available is True and rep.actions_supported is False
+    changes = rep.report(_status(coder=False, repo=False))
+    assert changes["coder"] == "coder hint" and changes["repo"] == "repo hint"
+    by_key = {key: (msg, label) for key, msg, label in host.calls}
+    assert by_key["coder"] == ("coder hint", None)  # no action, no label — the plain seam
+    assert by_key["repo"] == ("repo hint", None)
+
+
+def test_reporter_survives_a_seam_that_over_promises_actions(caplog):
+    """A seam whose signature accepts `actions=` but rejects the call at runtime must not
+    drop the warning: the reporter falls back to the plain call and stops probing (r3)."""
+    host = _OverPromisingActionHost()
+    rep = GapReporter(host)
+    assert rep.actions_supported is True  # the signature advertised it
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        rep.report(_status(coder=False))
+    assert ("coder", "coder hint") in host.calls  # the plain warning still landed
+    assert not any("report_setup_gap('coder') failed" in r.message for r in caplog.records)
+    assert rep.actions_supported is False  # downgraded in place after the rejection
+
+
 # ── register(): reports at mount time, logs coder=<unset> ────────────────────────
 
 

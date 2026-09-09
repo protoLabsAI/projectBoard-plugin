@@ -531,6 +531,17 @@ Where it surfaces:
   in `GET /api/runtime/status`. Edge-triggered after a first evaluation that sends every
   key unconditionally — so a reload's fresh reporter clears a warning the previous
   instance raised. Guarded: a host without the seam just gets the log lines.
+  **Structured actions (feature-detected):** on a host whose seam accepts an `actions=`
+  argument, the two *configuration* blockers — an unresolved `coder`, an unbound/invalid
+  `repo` — are forwarded with an allowlisted `plugin_config` action
+  (`{"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}`) so the
+  operator warning links straight to Project Board's Configure dialog, the surface where the
+  gap is actually resolved. The action only *navigates* there — it manufactures no coder and
+  mutates no config. `br`/`gh` (PATH/install faults, fixed on the shell) and the advisories
+  never carry that CTA, so it can't mislead. `GapReporter` detects the extended seam per
+  instance (signature introspection, with a runtime fallback if the call is rejected), so an
+  older host that exposes only `report_setup_gap(key, message, *, label=None)` degrades to
+  the plain hint string — same message text, key identity and edge-triggering either way.
 - **The loop pauses, it doesn't traceback.** With `loop_enabled: true` and a blocker
   standing (`br`, `coder`, `repo` — a missing `gh` only fails the PR edge, so it is
   reported but not paused on) the puller logs ONE `loop paused: …` warning and
