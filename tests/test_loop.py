@@ -10709,3 +10709,41 @@ async def test_the_ledger_only_round_does_not_undo_a_no_test_declaration(monkeyp
     assert loop._goal_fix_attempts.get("bd-1", 0) == 0
     assert store.escalated == []
     assert ("open_review", "bd-1", "https://example/pr/382") in store.calls
+
+
+# ── #410: "disabled" vs "enabled, pending a restart" ─────────────────────────────────
+
+
+def _disabled_loop(monkeypatch, live_enabled):
+    """A stopped loop whose LIVE config reports `live_enabled` for loop_enabled."""
+    from project_board.loop.core import BoardLoop
+
+    loop = BoardLoop.__new__(BoardLoop)
+    loop._drives = {}
+    loop.max_concurrent = 1
+    monkeypatch.setattr(BoardLoop, "_loop_enabled_in_live_config", lambda self: live_enabled, raising=False)
+    return loop
+
+
+def test_dispatch_reports_a_genuinely_disabled_loop(monkeypatch):
+    rec = _disabled_loop(monkeypatch, False)._dispatch_disabled_record()
+    assert rec["outcome"] == "loop-disabled"
+    assert rec["restart_pending"] is False
+    assert "loop_enabled=false" in rec["detail"]
+
+
+def test_dispatch_says_restart_pending_when_config_already_enabled_it(monkeypatch):
+    """The reported confusion (#410): show_config said true, board_dispatch said false and
+    told the operator to go enable the setting they had just enabled. `loop_enabled` is
+    restart-only, so both readings are accurate — the message has to say which is which."""
+    rec = _disabled_loop(monkeypatch, True)._dispatch_disabled_record()
+    assert rec["outcome"] == "loop-disabled"
+    assert rec["restart_pending"] is True
+    assert "enabled in config" in rec["detail"] and "restart" in rec["detail"]
+    # Never tell them to go do the thing they already did.
+    assert "enable it in Settings" not in rec["detail"]
+
+
+def test_dispatch_falls_back_to_plain_copy_without_a_host(monkeypatch):
+    rec = _disabled_loop(monkeypatch, None)._dispatch_disabled_record()
+    assert rec["restart_pending"] is False and "loop_enabled=false" in rec["detail"]

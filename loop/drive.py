@@ -637,17 +637,51 @@ class DriveMixin:
             lock = self._claim_lock = asyncio.Lock()
         return lock
 
+    def _loop_enabled_in_live_config(self) -> bool | None:
+        """``project_board.loop_enabled`` as CONFIGURED right now, or ``None`` when it
+        can't be read (no host — tests, CLI). The loop captured its own value at start
+        (``core.py``: ``self.enabled``) and ``loop_enabled`` is restart-only, so after an
+        operator enables it the two legitimately disagree until the member restarts."""
+        try:
+            from graph.sdk import config as host_config
+
+            # `plugin_cfg` is the host's WHOLE plugin_config map; `section` (this repo's
+            # word for the board's own config) is what comes out of it. Naming the map
+            # `section` reads as "the board section", which is also how the docs gate
+            # parses it — it flagged `project_board` as an undocumented config key.
+            plugin_cfg = getattr(host_config(), "plugin_config", None) or {}
+            section = plugin_cfg["project_board"] if isinstance(plugin_cfg, dict) else None
+            if not isinstance(section, dict) or "loop_enabled" not in section:
+                return None
+            return bool(section.get("loop_enabled"))
+        except Exception:  # noqa: BLE001 — no host: fall back to the plain disabled copy
+            return None
+
     def _dispatch_disabled_record(self) -> dict:
         """The decision record for a DISABLED loop — no scan, no claim (r4). A disabled
         loop is still registered (``start`` publishes it before the enabled gate), so the
-        diagnostic can report the disabled state rather than a silent no-op."""
+        diagnostic can report the disabled state rather than a silent no-op.
+
+        Distinguishes "off in config" from "on, pending a restart" (#410). ``loop_enabled``
+        is restart-only, so an operator who just enabled it sees a setting reading `true`
+        and, previously, a tool insisting it was `false` and telling them to go set it —
+        the one thing they had already done. Report the runtime value as what it is."""
+        configured = self._loop_enabled_in_live_config()
+        if configured:
+            detail = (
+                "the board loop is enabled in config but this member started before that "
+                f"changed — {setup_check.RESTART_NOTE}. No card is dispatched until then"
+            )
+        else:
+            detail = (
+                "the board loop is disabled (project_board.loop_enabled=false) — no card is "
+                "dispatched until it is enabled in Settings ▸ Project Board"
+            )
         return {
             "dispatched": [],
             "outcome": "loop-disabled",
-            "detail": (
-                "the board loop is disabled (project_board.loop_enabled=false) — no card is "
-                "dispatched until it is enabled in Settings ▸ Project Board"
-            ),
+            "detail": detail,
+            "restart_pending": bool(configured),
             "running": len(self._drives),
             "max_concurrent": self.max_concurrent,
             "skipped": [],
