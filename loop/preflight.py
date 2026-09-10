@@ -91,7 +91,7 @@ class PreflightMixin:
         meaning, and each is decided only on evidence that supports it."""
         log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await worktree.spawn_shell(
                 cmd,
                 cwd=repo,
                 env=self._child_env(),
@@ -99,12 +99,10 @@ class PreflightMixin:
                 stderr=asyncio.subprocess.STDOUT,
             )
             try:
-                out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.preflight_timeout)
+                # Whole-tree kill on a timeout or cancel (#423): this runs in the operator's
+                # base checkout, so an orphaned install left behind here is the worst kind.
+                out, _ = await worktree.communicate_or_kill(proc, timeout=self.preflight_timeout)
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
                 log.warning(
                     "[project_board] preflight[%s] timed out (%ss) — indeterminate, allowing dispatch",
                     name,

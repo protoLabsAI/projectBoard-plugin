@@ -1937,14 +1937,16 @@ class DriveMixin:
         if not cmd:
             return
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await worktree.spawn_shell(
                 cmd,
                 cwd=wt,
                 env=self._child_env(),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=180)
+            # A timeout here used to kill NOTHING (#423): wait_for raised, the except below
+            # swallowed it, and the formatter kept running in a worktree about to be PR'd.
+            await worktree.communicate_or_kill(proc, timeout=180)
         except Exception as exc:  # noqa: BLE001 — best-effort; CI still gates lint
             log.info("[project_board] fixups command failed (proceeding — CI still gates): %s", exc)
 

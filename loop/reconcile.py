@@ -1788,7 +1788,7 @@ class ReconcileMixin:
         if not cmd:
             return None
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await worktree.spawn_shell(
                 cmd,
                 cwd=wt,
                 env=self._child_env(),
@@ -1796,12 +1796,10 @@ class ReconcileMixin:
                 stderr=asyncio.subprocess.STDOUT,
             )
             try:
-                out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.local_gate_timeout)
+                # Kills the whole gate tree on a timeout or cancel (#423) — killing only
+                # the shell orphaned `pnpm install` behind every timed-out gate.
+                out, _ = await worktree.communicate_or_kill(proc, timeout=self.local_gate_timeout)
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
                 log.warning("[project_board] pre-PR gate timed out (%ss) — treating as pass", self.local_gate_timeout)
                 return None
             if proc.returncode == 0:

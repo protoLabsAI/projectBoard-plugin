@@ -353,6 +353,7 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=repo,
+            stdin=asyncio.subprocess.DEVNULL,  # #423: never the server's stdin
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             # Own process group, so a timeout can kill the whole gate tree — not just

@@ -1735,7 +1735,7 @@ class _WorktreeSolveAdapter:
     async def _run_acceptance_tests(self, candidate_wt: str):
         Verdict = self.verdict_cls
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await worktree.spawn_shell(
                 self.test_cmd,
                 cwd=candidate_wt,
                 # #86: with NO env= the child inherits os.environ verbatim (the host's
@@ -1751,13 +1751,11 @@ class _WorktreeSolveAdapter:
         except OSError as exc:
             return Verdict(passed=False, total=1, failed=1, output=f"could not launch acceptance tests: {exc}")
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.test_timeout)
+            # The whole tree dies on a timeout (#423). This used to kill only the shell and
+            # then `await proc.wait()` — which on Python >= 3.12 waits for the orphaned
+            # test runner to close its pipe, so a hung `pnpm install` froze the drive.
+            out, _ = await worktree.communicate_or_kill(proc, timeout=self.test_timeout)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
             # Unlike the pre-PR local gate (which fails OPEN on a timeout — a broken
             # gate must never block otherwise-good work), THIS is the ladder's own
             # search oracle: a candidate we couldn't confirm passed must never be
