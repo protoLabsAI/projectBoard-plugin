@@ -16,6 +16,7 @@ API (``/features/{id}/ci``); this module only builds + opens the PR.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -23,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -62,28 +64,38 @@ class StrandedTree:
 
 @dataclasses.dataclass(frozen=True)
 class PreservedTree:
-    """A stranded tree whose work was saved on a branch of its own before the tree was
-    removed (#405) — ``preserve_worktree``'s receipt."""
+    """A stranded tree whose work was saved before the tree was cleared (#405) — the
+    receipt ``preserve_worktree`` and the removal edges hand back.
+
+    Saved one of two ways: onto a ``stranded/…`` branch (``ref``/``commit`` set), or — a
+    husk git can no longer read, whose work cannot be committed — by MOVING the directory
+    aside, bytes intact (``moved_to`` set). ``removed`` says whether the tree then really
+    left its path; ``why`` says why not."""
 
     path: str  # where the tree was
     branch: str  # the branch it was built on
-    ref: str  # the preservation branch: stranded/<tree id>/<UTC stamp>
+    ref: str  # the preservation branch: stranded/<tree dir>/<UTC stamp>; "" when moved aside
     commit: str  # its tip
     summary: str  # what the tree held (``unpublished_work``)
     diffstat: str  # `git diff --shortstat` of the uncommitted part; "" when it was only commits
+    moved_to: str = ""  # a husk's new home, when it was moved aside instead of committed
+    removed: bool = False  # the tree left its path after the save
+    why: str = ""  # …and if not, why not
 
 
 class StrandedWorkError(WorktreeError):
     """A worktree the board was about to replace or reap holds work that exists nowhere
-    else, and saving that work to a branch FAILED (#405) — so the tree was kept, untouched.
-    Carries the ``trees`` and the ``repo`` they live in.
+    else, and it could not be cleared safely — saving it FAILED, or it was saved but the
+    tree would not come off its path (#405). The tree was kept. Carries the ``trees`` and
+    the ``repo`` they live in; each tree's ``summary`` says exactly which it was.
 
-    The only stranded tree that stops anything: one whose work is safely on a
-    ``stranded/…`` branch is removed and the build goes on. This one is not a failure of
-    the build either (it never started), so nothing retries, escalates or reaps on it — the
-    loop blocks the card under its own ``stranded-work`` class. The message becomes that
-    block's reason, the one place the recovery is written down, so it names every path,
-    what is in it, why saving failed, and both ways out."""
+    The only stranded tree that stops anything: one whose work is safe on a ``stranded/…``
+    branch (or, a husk, moved aside) and whose path is free again lets the build go on.
+    Not a failure of the build either (it never started), so nothing retries, escalates or
+    reaps on it — the loop blocks the card under its own ``stranded-work`` class. The
+    message becomes that block's reason, the one place the recovery is written down, so it
+    names every path, what is in it, what went wrong, and both ways out. The discard works
+    on a husk too: ``git worktree remove`` refuses one, ``rm`` + ``prune`` do not."""
 
     def __init__(self, repo: str, trees: Iterable[StrandedTree]):
         self.repo = repo
@@ -92,12 +104,17 @@ class StrandedWorkError(WorktreeError):
         one = self.trees[0] if len(self.trees) == 1 else None
         path, branch = (one.path, one.branch) if one else ("<path>", "<branch>")
         super().__init__(
-            f"{len(self.trees)} worktree(s) hold work that exists nowhere else and could not be saved "
-            f"to a branch, so the board kept them and will not build over them — {where}. Recover it "
-            f"(switch the tree to a branch of your own and commit, or open a PR from it) or discard it "
-            f"(`git -C {repo} worktree remove --force {path} && git -C {repo} branch -D {branch}`"
-            f"{'' if one else ' for each'}), then unblock the card."
+            f"{len(self.trees)} worktree(s) hold work that exists nowhere else and could not be cleared "
+            f"safely, so the board kept them and will not build over them — {where}. Recover it (switch "
+            f"the tree to a branch of your own and commit, or open a PR from it) or discard it (`chmod -R "
+            f"u+w {path} && rm -rf {path} && git -C {repo} worktree prune && git -C {repo} branch -D "
+            f"{branch}`{'' if one else ' for each'}), then unblock the card."
         )
+
+
+class _Husk(WorktreeError):
+    """``preserve_worktree`` met a tree git can no longer read (its admin entry is gone —
+    a removal interrupted half-way): nothing can be committed from it."""
 
 
 async def _git(repo: str, *args: str, timeout: float = 60, env: dict[str, str] | None = None) -> tuple[int, str, str]:
@@ -265,28 +282,105 @@ def _is_board_link(tree: str, entry: str) -> bool:
     return os.path.basename(rel) == "node_modules" and os.path.islink(os.path.join(tree, rel))
 
 
-def _is_candidate_branch(branch: str) -> bool:
-    """``feat/<id>.g<n>`` / ``.c<n>`` / ``.test`` — a throwaway candidate's branch, which
-    the board never pushes, rebases or merges."""
-    wt_id = branch[len("feat/") :] if branch.startswith("feat/") else ""
-    return bool(wt_id) and parent_feature_id(wt_id) != wt_id
+# `-c core.hooksPath=/dev/null`: a save runs with the repo's hooks OFF. `update-ref` fires
+# `reference-transaction`, and a policy hook that rejects it would otherwise make a tree
+# impossible to save — a failure our own machinery caused (#405).
+_NO_HOOKS = ("-c", "core.hooksPath=/dev/null")
 
 
-async def unpublished_work(path: str, *, branch: str = "") -> str:
+async def _tree_status(path: str) -> tuple[list[str], list[str], str]:
+    """The tree's uncommitted changes, as ``(changes, nested, unreadable)``: ``"XY path"``
+    entries minus the board's own droppings (``CODER_SCRATCH``, the ``node_modules`` links),
+    the nested git repositories among them, and — when git cannot read the tree at all —
+    why, with the lists empty.
+
+    ``-z`` so a path with spaces reaches the nested-repo check unquoted. A nested
+    repository is a directory holding its own ``.git``: git reports an untracked one as a
+    single ``dir/`` entry and never looks inside, and a branch could only record it as a
+    pointer — its files and history would not come along."""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    try:
+        # --no-optional-locks: a probe must never take the index lock out from under a
+        # tree something may still be writing to (a hung drive's coder, bd-ezs7).
+        rc, out, err = await _git(
+            path, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".", *excludes
+        )
+    except WorktreeError as exc:
+        return [], [], f"unreadable ({exc})"
+    if rc != 0:
+        return [], [], f"unreadable (git status failed: {(err or out).strip()[:160]})"
+    changes: list[str] = []
+    nested: list[str] = []
+    items = iter(out.split("\0"))
+    for item in items:
+        if len(item) < 4:
+            continue
+        xy, entry = item[:2], item[3:]
+        if xy[0] in "RC":
+            next(items, None)  # a rename/copy's source path rides the next field
+        if xy == "??" and _is_board_link(path, entry):
+            continue
+        changes.append(f"{xy.strip()} {entry}")
+        rel = entry.rstrip("/")
+        if os.path.exists(os.path.join(path, rel, ".git")):
+            nested.append(rel)
+    return changes, nested, ""
+
+
+async def _unique_commits(where: str, branch: str = "", base: str = "", *, head: bool = True) -> int:
+    """How many commits the tree's ``HEAD`` (unless ``head=False``) and its ``branch`` hold
+    that exist nowhere else — no other branch, tag or remote-tracking ref has them, and
+    their content is not already published. Raises ``WorktreeError`` when git cannot say.
+
+    ``HEAD`` AND the branch: a detached HEAD can carry commits its branch never saw, and a
+    branch a detached HEAD moved off can carry commits HEAD never saw; ``branch -D`` and a
+    forced removal drop both. Every branch counts, candidate or canonical: the verified
+    candidate is committed onto the canonical branch before ``open_pr`` pushes it, and a
+    restart in that window used to throw the commit away.
+
+    "Already published" keeps the board's own history from reading as stranded work. A
+    rebase force-pushes rewritten commits, so the local branch's originals are on no ref;
+    a squash-merge lands the content under a new commit and the branch gets deleted. Both
+    leave commits git calls unique whose CONTENT is safe, so each is checked by content: if
+    merging them into ``origin/<branch>``, ``origin/<base>`` or ``origin/HEAD`` would
+    change nothing, they are published (``git merge-tree --write-tree``, in memory)."""
+    starts = ["HEAD"] if head else []
+    if branch and (await _git(where, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"))[0] == 0:
+        starts.append(f"refs/heads/{branch}")
+    if not starts:
+        return 0
+    negate = ["--not", *([f"--exclude={branch}"] if branch else []), "--branches", "--remotes", "--tags"]
+    rc, out, err = await _git(where, "rev-list", *starts, *negate)
+    if rc != 0:
+        raise WorktreeError(f"cannot list its commits: {(err or out).strip()[:160]}")
+    unique = out.split()
+    if not unique:
+        return 0
+    upstreams = [f"refs/remotes/origin/{b}" for b in (branch, base) if b] + ["refs/remotes/origin/HEAD"]
+    for upstream in dict.fromkeys(upstreams):
+        rc, up_tree, _err = await _git(where, "rev-parse", "--verify", "--quiet", f"{upstream}^{{tree}}")
+        if rc != 0:
+            continue
+        for start in starts:
+            rc, merged, _err = await _git(where, "merge-tree", "--write-tree", upstream, start)
+            if rc != 0 or merged.split("\n", 1)[0].strip() != up_tree.strip():
+                break
+        else:
+            return 0
+    return len(unique)
+
+
+async def unpublished_work(path: str, *, branch: str = "", base: str = "") -> str:
     """What removing the worktree at ``path`` — and deleting ``branch`` with it — would
     destroy, as a short summary; ``""`` when nothing would be lost (#405).
 
-    Counts every uncommitted change git can see: modified, staged, deleted and untracked
-    files. Not the board's own droppings: the coder's session scratch (``CODER_SCRATCH`` —
-    the exclusion ``stage_all`` applies, so "clean" here means exactly "nothing a PR would
-    carry") and the ``node_modules`` links ``create_worktree`` makes.
-
-    For a CANDIDATE branch it also counts commits no other branch, tag or remote holds.
-    The brief tells a coder it is edit-only, but one with a shell can commit, and ``git
-    branch -D`` drops that commit as surely as ``--force`` drops a file. Candidates only:
-    the board pushes, rebases and squash-merges a CANONICAL branch, so a canonical commit
-    missing from every other ref is routine — a force-pushed rebase leaves the pre-rebase
-    commits exactly there — and says nothing about stranded work.
+    Counts every uncommitted change git can see — modified, staged, deleted, untracked —
+    minus the board's own droppings (the coder's session scratch, ``CODER_SCRATCH``, the
+    exclusion ``stage_all`` applies, so "clean" means "nothing a PR would carry"; and the
+    ``node_modules`` links ``create_worktree`` makes). Names any nested git repository,
+    which no branch can hold. And counts the commits ``HEAD`` and ``branch`` hold that
+    exist nowhere else (``_unique_commits``); ``base``, when the caller knows it, sharpens
+    the published check.
 
     ``""`` when ``path`` is not a worktree root (no ``.git`` in it): trees live inside the
     main checkout, so git would answer for THAT repo instead. Fails toward keeping the
@@ -294,83 +388,97 @@ async def unpublished_work(path: str, *, branch: str = "") -> str:
     which every caller treats as work."""
     if not os.path.exists(os.path.join(path, ".git")):
         return ""
-    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
-    try:
-        # --no-optional-locks: a probe must never take the index lock out from under a
-        # tree something may still be writing to (a hung drive's coder, bd-ezs7).
-        rc, out, err = await _git(
-            path, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--", ".", *excludes
-        )
-    except WorktreeError as exc:
-        return f"unreadable ({exc})"
-    if rc != 0:
-        return f"unreadable (git status failed: {(err or out).strip()[:160]})"
-    changes = []
-    for line in out.splitlines():
-        # "XY PATH" — slice the status columns off each RAW line (see base_checkout_dirt).
-        entry = line[3:]
-        if entry and not (line.startswith("?? ") and _is_board_link(path, entry)):
-            changes.append(f"{line[:2].strip()} {entry}")
+    changes, nested, unreadable = await _tree_status(path)
+    if unreadable:
+        return unreadable
     parts = []
     if changes:
         more = f", … ({len(changes) - 5} more)" if len(changes) > 5 else ""
         parts.append(f"{len(changes)} uncommitted file(s): {', '.join(changes[:5])}{more}")
-    if _is_candidate_branch(branch):
-        try:
-            rc, out, _err = await _git(
-                path,
-                "rev-list",
-                "--count",
-                f"refs/heads/{branch}",
-                "--not",
-                f"--exclude={branch}",
-                "--branches",
-                "--remotes",
-                "--tags",
-            )
-        except WorktreeError as exc:
-            return "; ".join([*parts, f"unreadable ({exc})"])
-        n = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0  # no branch → nothing to drop
-        if n:
-            parts.append(f"{n} commit(s) on {branch} that no other branch or remote holds")
+    if nested:
+        parts.append(f"a nested git repository at {', '.join(nested[:3])}")
+    try:
+        n = await _unique_commits(path, branch, base)
+    except WorktreeError as exc:
+        return "; ".join([*parts, f"unreadable ({exc})"])
+    if n:
+        parts.append(f"{n} commit(s) that no other branch, tag or remote holds")
     return "; ".join(parts)
 
 
 # Where a stranded tree's work goes before the tree is removed (#405): one NEW branch per
-# tree and moment, `stranded/<tree id>/<UTC stamp>`. Outside the board's `feat/` namespace,
+# tree and moment, `stranded/<tree dir>/<UTC stamp>`. Outside the board's `feat/` namespace,
 # so no reap, rebuild or `branch -D` of the board's ever reaches it.
 STRANDED_REF_PREFIX = "stranded/"
+_REF_TRIES = 20  # names tried before a save may fail on naming — never, in practice
 
 
 def _stamp() -> str:
-    """The UTC stamp a preservation branch is named with. A seam so a test can force the
-    collision ``preserve_worktree`` must refuse rather than overwrite."""
-    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    """The UTC stamp, to the millisecond, a preservation branch is named with. A seam so a
+    test can pin it and force the collision a save must survive."""
+    now = time.time()
+    return time.strftime("%Y%m%dT%H%M%S", time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z"
+
+
+async def _create_stranded_ref(where: str, name: str, commit: str) -> str:
+    """Create ``stranded/<name>/<stamp>`` at ``commit`` and return it — a NEW branch, never
+    an overwrite: ``update-ref`` with an empty old value refuses a name that exists, and a
+    taken name is retried with a ``-2``, ``-3``… suffix rather than failing the save. The
+    tree dir in the name keeps two trees apart, the millisecond stamp two moments; the
+    suffix covers what is left, so a save can never fail on a collision of our own making.
+    Hooks off (``_NO_HOOKS``). Raises ``WorktreeError`` on any other refusal."""
+    first = f"refs/heads/{STRANDED_REF_PREFIX}{name}/{_stamp()}"
+    for n in range(_REF_TRIES):
+        ref = first if n == 0 else f"{first}-{n + 1}"
+        rc, out, err = await _git(where, *_NO_HOOKS, "update-ref", ref, commit, "")
+        if rc == 0:
+            return ref[len("refs/heads/") :]
+        if (await _git(where, "rev-parse", "--verify", "--quiet", ref))[0] != 0:
+            raise WorktreeError(f"creating {ref} failed: {(err or out).strip()[:200]}")
+    raise WorktreeError(f"every name tried for the branch of {name} was taken")
 
 
 async def preserve_worktree(repo: str, path: str, branch: str, *, summary: str = "") -> PreservedTree:
     """Save everything the tree at ``path`` holds that exists nowhere else onto a NEW branch,
-    ``stranded/<tree id>/<UTC stamp>``, without touching the tree, its index or its branch —
-    and prove it landed (#405). Raises ``WorktreeError`` on any failure: the caller must then
-    KEEP the tree, because work that could not be saved must never be destroyed.
+    ``stranded/<tree dir>/<UTC stamp>``, without touching the tree, its index or its branch —
+    and prove it landed (#405). Raises ``WorktreeError`` on any failure — ``_Husk`` when git
+    cannot read the tree at all — and the caller must then keep the tree, or at most move
+    it aside: work that could not be saved is never destroyed.
 
     The commit is the tree's HEAD plus its working state, staged through ``stage_all`` into
     a PRIVATE index (``GIT_INDEX_FILE``, seeded from a copy of the tree's own for its stat
     cache). So it carries exactly what a PR would — tracked and untracked changes, no coder
-    scratch, no board ``node_modules`` link — and the tree's index is never written.
-    ``commit-tree`` rather than ``commit``: no hooks run (a repo's husky tree has no
-    business in a salvage), ``--no-gpg-sign`` means no signing prompt can hang it, and the
-    identity is pinned so a repo with none configured can still save. A tree whose only
-    unique work is commits (a coder that committed on its candidate branch) gets the branch
-    at its HEAD, with no new commit.
+    scratch, no board ``node_modules`` link — and the tree's index is never written. When
+    the branch holds commits a detached HEAD does not, its tip becomes a second parent, so
+    both histories survive. ``commit-tree`` rather than ``commit``, and every step with the
+    repo's hooks OFF (``_NO_HOOKS`` — ``update-ref`` would otherwise fire
+    ``reference-transaction``); ``--no-gpg-sign`` so no signing prompt can hang it; the
+    identity pinned so a repo with none configured can still save. A tree whose only unique
+    work is commits gets the branch at its HEAD, with no new commit.
 
-    ``update-ref`` with an empty old value creates the ref only if it does not exist yet, so
-    an existing branch is never overwritten. The ref is then read back and its tree compared
-    with the one just written: that proof, not an exit code, is what lets a caller remove
-    the tree."""
-    name = os.path.basename(os.path.normpath(path))
-    ref = f"{STRANDED_REF_PREFIX}{_wt_id_from_dirname(name) if name.startswith('feat-') else name}/{_stamp()}"
-    head = _checked(await _git(path, "rev-parse", "--verify", "HEAD"), path, "reading HEAD")
+    A nested git repository refuses the save: a branch would hold only a pointer to it,
+    and removing the tree would take its files and history.
+
+    The ref is read back and its tree compared with the one just written: that proof, not
+    an exit code, is what lets a caller remove the tree."""
+    rc, head, err = await _git(path, "rev-parse", "--verify", "HEAD")
+    if rc != 0:
+        raise _Husk(f"preserving {path}: git cannot read the tree ({(err or head).strip()[:160]})")
+    head = head.strip()
+    _changes, nested, unreadable = await _tree_status(path)
+    if unreadable:
+        raise _Husk(f"preserving {path}: git cannot read the tree ({unreadable})")
+    if nested:
+        raise WorktreeError(
+            f"preserving {path}: it holds a nested git repository at {', '.join(nested[:3])} — a branch "
+            "can record that only as a pointer, not its files or history, so the tree is kept as it is"
+        )
+    parents = [head]
+    if branch:
+        rc, tip, _err = await _git(path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        tip = tip.strip()
+        if rc == 0 and tip and tip != head and (await _git(path, "merge-base", "--is-ancestor", tip, head))[0] != 0:
+            parents.append(tip)
     scratch = tempfile.mkdtemp(prefix="pb-stranded-")
     try:
         index = os.path.join(scratch, "index")
@@ -386,7 +494,8 @@ async def preserve_worktree(repo: str, path: str, branch: str, *, summary: str =
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     commit, diffstat = head, ""
-    if tree != _checked(await _git(path, "rev-parse", "--verify", f"{head}^{{tree}}"), path, "reading HEAD's tree"):
+    head_tree = _checked(await _git(path, "rev-parse", "--verify", f"{head}^{{tree}}"), path, "reading HEAD's tree")
+    if tree != head_tree or len(parents) > 1:
         message = (
             f"stranded work from {path} ({branch or 'no branch'})\n\n"
             f"Saved by project-board before the tree was removed (#405). It held: {summary or 'unknown'}"
@@ -394,14 +503,14 @@ async def preserve_worktree(repo: str, path: str, branch: str, *, summary: str =
         commit = _checked(
             await _git(
                 path,
+                *_NO_HOOKS,
                 "-c",
                 "user.name=project-board",
                 "-c",
                 "user.email=project-board@localhost",
                 "commit-tree",
                 "--no-gpg-sign",
-                "-p",
-                head,
+                *[arg for parent in parents for arg in ("-p", parent)],
                 "-m",
                 message,
                 tree,
@@ -410,7 +519,10 @@ async def preserve_worktree(repo: str, path: str, branch: str, *, summary: str =
             "committing",
         )
         diffstat = _checked(await _git(path, "diff", "--shortstat", head, commit), path, "measuring the diff")
-    _checked(await _git(path, "update-ref", f"refs/heads/{ref}", commit, ""), path, f"creating {ref}")
+    try:
+        ref = await _create_stranded_ref(path, os.path.basename(os.path.normpath(path)), commit)
+    except WorktreeError as exc:
+        raise WorktreeError(f"preserving {path}: {exc}") from exc
     if _checked(await _git(path, "rev-parse", "--verify", f"refs/heads/{ref}^{{tree}}"), path, "reading back") != tree:
         raise WorktreeError(f"preserving {path}: {ref} does not hold the tree's state")
     return PreservedTree(os.path.abspath(path), branch, ref, commit, summary, diffstat)
@@ -426,26 +538,34 @@ def _checked(result: tuple[int, str, str], path: str, step: str) -> str:
 
 
 def preserved_note(repo: str, preserved: Iterable[PreservedTree], *, base: str = "") -> str:
-    """The card comment for trees whose work was saved and then removed (#405): each
-    branch, what it holds, and how to look at it or take it back. ``base`` (the card's base
-    branch) makes the inspect/salvage commands exact; without it they fall back to the
-    preserved commit alone."""
+    """The card comment for trees whose work was saved (#405): each branch — or, for a
+    husk, the place it was moved — what it holds, whether the tree really left its path,
+    and how to look at the work or take it back. ``base`` (the card's base branch) makes the
+    inspect/salvage commands exact; without it they fall back to the preserved commit."""
     trees = list(preserved)
-    lines = [
-        f"stranded work preserved: {len(trees)} worktree(s) held changes that existed nowhere else. "
-        f"Each is saved on a branch of its own, and the tree was removed so the card can build again."
-    ]
+    lines = [f"stranded work preserved: {len(trees)} worktree(s) held changes that existed nowhere else."]
     for t in trees:
-        held = t.diffstat or "commits only"
-        lines.append(f"- {t.ref} — from {t.path} ({t.branch}): {held}; it held {t.summary}")
-    ref = trees[0].ref if len(trees) == 1 else "<branch>"
-    if base:
-        lines.append(f"Inspect: git -C {repo} diff origin/{base}...{ref}")
-        lines.append(f"Salvage: git -C {repo} cherry-pick origin/{base}..{ref} — or push {ref} and open a PR from it.")
-    else:
-        lines.append(f"Inspect: git -C {repo} show --stat {ref}")
-        lines.append(f"Salvage: cherry-pick its commits onto your branch, or push {ref} and open a PR from it.")
-    lines.append(f"Delete it once it is no longer needed: git -C {repo} branch -D {ref}")
+        if t.moved_to:
+            where = f"git could no longer read it, so the directory was moved, as it was, to {t.moved_to}" + (
+                f", and its branch's commits saved on {t.ref}" if t.ref else ""
+            )
+        else:
+            where = f"saved on {t.ref} ({t.diffstat or 'commits only'})" + (
+                ", and the tree removed" if t.removed else f" — but the tree could NOT be removed: {t.why}"
+            )
+        lines.append(f"- {t.path} ({t.branch}): {where}. It held {t.summary}")
+    refs = [t.ref for t in trees if t.ref]
+    if refs:
+        ref = refs[0] if len(refs) == 1 else "<branch>"
+        if base:
+            lines.append(f"Inspect: git -C {repo} diff origin/{base}...{ref}")
+            lines.append(
+                f"Salvage: git -C {repo} cherry-pick origin/{base}..{ref} — or push {ref} and open a PR from it."
+            )
+        else:
+            lines.append(f"Inspect: git -C {repo} show --stat {ref}")
+            lines.append(f"Salvage: cherry-pick its commits onto your branch, or push {ref} and open a PR from it.")
+        lines.append(f"Delete it once it is no longer needed: git -C {repo} branch -D {ref}")
     return "\n".join(lines)
 
 
@@ -573,7 +693,7 @@ async def create_worktree(
     # tree holding work is saved to a `stranded/…` branch first, or refused if that fails.
     # (The drive sets such trees aside itself, with a card comment, before it asks for a
     # fresh tree; this is the backstop for every other caller.)
-    await _preserve_or_refuse(repo, path, branch, "replacing")
+    await _clear_for(repo, path, branch, base, "replacing")
     # Best-effort cleanup of a prior run's leftovers.
     await _git(repo, "worktree", "remove", "--force", rel)
     await _git(repo, "branch", "-D", branch)
@@ -682,7 +802,14 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     return removed
 
 
-def _feature_tree_names(base: str, fid: str) -> tuple[list[str], list[str]]:
+def _is_test_rung(wt_id: str, fid: str) -> bool:
+    """Is ``feat-<wt_id>`` a test-rung tree (``<fid>.test`` / ``<fid>.test.g<n>``) — the
+    operator-only diagnostic's, which owns and reaps its own and may be LIVE while the card
+    builds? A card's own sweep must never take it (#405)."""
+    return bool(re.search(r"\.test(?:\.|$)", wt_id[len(fid) :]))
+
+
+def _feature_tree_names(base: str, fid: str, *, test_rung: bool = True) -> tuple[list[str], list[str]]:
     """The on-disk worktree dirs under ``base`` that feature ``fid`` owns BY SCAN, as
     ``(slugged canonical names, candidate names)``, sorted. The bare ``feat-<fid>`` is
     not scanned for — its name is computable, and ``reap_feature_worktree`` attempts it
@@ -692,21 +819,124 @@ def _feature_tree_names(base: str, fid: str) -> tuple[list[str], list[str]]:
     ``feat-<fid>.<suffix>`` whose suffixes strip back to ``fid`` (the stacked
     ``.test.g2`` shape included; ``feat-<fid>x`` prefix-collisions and non-candidate dots
     like ``.gx`` excluded). A candidate uses a ``.`` separator, so neither scan can
-    mistake one kind for the other. Branches mirror the names (``feat-`` → ``feat/``)."""
+    mistake one kind for the other. Branches mirror the names (``feat-`` → ``feat/``).
+    ``test_rung=False`` leaves out the test-rung diagnostic's trees."""
     try:
         names = sorted(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
     except OSError:
         return [], []
     slugged = [n for n in names if n.startswith(f"feat-{fid}-")]
-    candidates = [n for n in names if n.startswith(f"feat-{fid}.") and parent_feature_id(n[len("feat-") :]) == fid]
+    candidates = [
+        n
+        for n in names
+        if n.startswith(f"feat-{fid}.")
+        and parent_feature_id(n[len("feat-") :]) == fid
+        and (test_rung or not _is_test_rung(n[len("feat-") :], fid))
+    ]
     return slugged, candidates
 
 
-async def _save(repo: str, path: str, branch: str, summary: str, why: str) -> PreservedTree | StrandedTree:
-    """``preserve_worktree``, logged: the receipt on success, or — when saving failed — the
-    ``StrandedTree`` (reason included) that the caller must keep rather than destroy."""
+# One lock per tree path (and event loop): the removal edges can reach the same tree at
+# once — an operator cancel's route reaps it while the cancelled drive clears it — and a
+# save must never run while another edge deletes the files it is reading (#405). Keyed by
+# loop too: an uncontended asyncio.Lock never binds to one, a contended one does.
+_TREE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+@contextlib.asynccontextmanager
+async def _tree_lock(path: str):
+    key = (id(asyncio.get_running_loop()), os.path.abspath(path))
+    async with _TREE_LOCKS.setdefault(key, asyncio.Lock()):
+        yield
+
+
+def _is_locked(path: str) -> bool:
+    """Is the tree at ``path`` locked (``git worktree lock``)? That lock is the operator's
+    say-so, and no fallback may delete such a tree."""
+    try:
+        with open(os.path.join(path, ".git")) as fh:
+            gitdir = fh.read().split("gitdir:", 1)[1].strip()
+    except (OSError, IndexError):
+        return False
+    gitdir = gitdir if os.path.isabs(gitdir) else os.path.join(path, gitdir)
+    return os.path.exists(os.path.join(gitdir, "locked"))
+
+
+def _delete_tree(path: str) -> None:
+    """Delete a tree whose work is already safe, whatever git thinks of it: directories are
+    made writable first (a read-only one stops both ``git worktree remove`` and
+    ``rmtree``). ``os.walk`` never follows a link, so the ``node_modules`` link — the MAIN
+    checkout's deps — is unlinked, never recursed into or chmodded."""
+    for root, _dirs, _files in os.walk(path):
+        try:
+            os.chmod(root, stat.S_IRWXU)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+async def _remove_saved(repo: str, path: str, branch: str) -> tuple[bool, str]:
+    """Remove a tree whose work is ALREADY saved: ``remove_worktree`` first; if git refuses
+    (a read-only directory, a removal interrupted half-way) the directory is deleted outright
+    and ``remove_worktree`` run again to prune its admin entry and drop its branch — the work
+    is on its branch, so nothing is lost. Never a LOCKED tree. Returns ``(removed, why_not)``."""
+    if await remove_worktree(repo, path, branch) or not os.path.exists(path):
+        return True, ""
+    if _is_locked(path):
+        return False, "it is locked (git worktree lock); unlock it or remove it by hand"
+    _delete_tree(path)
+    await remove_worktree(repo, path, branch)
+    if os.path.exists(path):
+        return False, "the directory could not be deleted"
+    return True, ""
+
+
+async def _move_aside(repo: str, path: str) -> str:
+    """Move a husk — a tree git can no longer read — out of the board's way, bytes intact,
+    to ``<worktrees root>/.stranded/<dir>-<stamp>``, and prune its dangling admin entry.
+    Returns the new path; raises ``OSError`` if the move fails."""
+    dest_dir = os.path.join(os.path.dirname(os.path.abspath(path)), ".stranded")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, f"{os.path.basename(os.path.normpath(path))}-{_stamp()}")
+    os.rename(path, dest)
+    await prune_stale_worktrees(repo)
+    return dest
+
+
+async def _save_branch(repo: str, branch: str, name: str, base: str = "") -> str:
+    """Keep the commits ``branch`` holds that exist nowhere else — a husk's, or a branch
+    whose tree was deleted by hand — on a ``stranded/<name>/…`` branch before anything runs
+    ``branch -D`` on it. ``""`` when it holds none (or does not exist)."""
+    if not branch or not await _unique_commits(repo, branch, base, head=False):
+        return ""
+    return await _create_stranded_ref(repo, name, f"refs/heads/{branch}")
+
+
+async def _save(
+    repo: str, path: str, branch: str, summary: str, why: str, base: str = ""
+) -> PreservedTree | StrandedTree:
+    """``preserve_worktree``, logged: the receipt on success. A husk git cannot read is
+    moved aside instead — its bytes intact, its branch's commits saved — and the receipt
+    says so (a husk must never block a card forever, nor be deleted unsaved). Any other
+    failure returns the ``StrandedTree`` (reason included) that the caller must keep."""
     try:
         saved = await preserve_worktree(repo, path, branch, summary=summary)
+    except _Husk as exc:
+        name = os.path.basename(os.path.normpath(path))
+        try:
+            moved = await _move_aside(repo, path)
+            ref = await _save_branch(repo, branch, name, base)
+        except (OSError, WorktreeError) as err:
+            return StrandedTree(os.path.abspath(path), branch, f"{summary} — {exc}, and moving it aside failed: {err}")
+        log.warning(
+            "[project_board] %s: git cannot read it (%s) — moved it aside to %s%s before %s it (#405)",
+            path,
+            exc,
+            moved,
+            f", its branch's commits saved on {ref}" if ref else "",
+            why,
+        )
+        return PreservedTree(os.path.abspath(path), branch, ref, "", summary, "", moved_to=moved, removed=True)
     except WorktreeError as exc:
         return StrandedTree(os.path.abspath(path), branch, f"{summary} — saving it to a branch failed: {exc}")
     log.warning(
@@ -719,31 +949,68 @@ async def _save(repo: str, path: str, branch: str, summary: str, why: str) -> Pr
     return saved
 
 
-async def _preserve_or_refuse(repo: str, path: str, branch: str, why: str) -> PreservedTree | None:
+async def discard_worktree(
+    repo: str, path: str, branch: str = "", *, base: str = "", why: str = "removing"
+) -> tuple[bool, PreservedTree | StrandedTree | None]:
+    """Remove the tree at ``path`` — after saving any work in it that exists nowhere else
+    (#405). The one save-then-remove every edge that ends a tree goes through: the reap,
+    a fresh build's set-aside, a drive's terminal block or cancel, shutdown.
+
+    Returns ``(removed, record)``: ``record`` is ``None`` for a clean tree (removed exactly
+    as ``remove_worktree`` always did), a ``PreservedTree`` for one whose work was saved
+    (``removed`` false, with ``why``, if the tree still would not come off its path), or a
+    ``StrandedTree`` for one whose work could NOT be saved — kept, exactly as it is.
+
+    Serialized per path (``_tree_lock``) and re-checked inside the lock: two edges racing to
+    the same tree get one save, one removal, and a no-op."""
+    async with _tree_lock(path):
+        stranded = await unpublished_work(path, branch=branch, base=base)
+        if not stranded:
+            return bool(await remove_worktree(repo, path, branch)), None
+        record = await _save(repo, path, branch, stranded, why, base)
+        if isinstance(record, StrandedTree):
+            return False, record  # not saved: kept exactly as it is
+        if record.moved_to:
+            return True, record  # a husk, moved aside: its path is already free
+        removed, why_not = await _remove_saved(repo, path, branch)
+        return removed, dataclasses.replace(record, removed=removed, why=why_not)
+
+
+async def _clear_for(repo: str, path: str, branch: str, base: str, why: str) -> None:
     """Before ``create_worktree`` / ``promote_worktree`` force-clear the tree at ``path``:
-    save whatever it holds that exists nowhere else to a ``stranded/…`` branch (#405).
-    ``None`` when it held nothing; raises ``StrandedWorkError`` — leaving the tree exactly as
-    it is — when there was work and saving it failed."""
-    stranded = await unpublished_work(path, branch=branch)
-    if not stranded:
-        return None
-    saved = await _save(repo, path, branch, stranded, why)
-    if isinstance(saved, StrandedTree):
-        raise StrandedWorkError(repo, [saved])
-    return saved
+    save whatever it holds that exists nowhere else, and take the tree off its path (#405).
+    A branch whose tree is already gone gets its unique commits saved before the caller's
+    ``branch -D``. Raises ``StrandedWorkError`` — the tree left as it is — when there was
+    work that could not be saved, or a saved tree that would not come off its path."""
+    async with _tree_lock(path):
+        if not os.path.exists(path):
+            await _save_branch(repo, branch, os.path.basename(os.path.normpath(path)), base)
+            return
+        stranded = await unpublished_work(path, branch=branch, base=base)
+        if not stranded:
+            return
+        record = await _save(repo, path, branch, stranded, why, base)
+        if isinstance(record, StrandedTree):
+            raise StrandedWorkError(repo, [record])
+        if record.moved_to:
+            return
+        removed, why_not = await _remove_saved(repo, path, branch)
+        if not removed:
+            raise StrandedWorkError(
+                repo,
+                [StrandedTree(record.path, branch, f"its work is safe on {record.ref}, but the tree {why_not}")],
+            )
 
 
 async def _reap_saving(repo: str, path: str, branch: str, kept: list[StrandedTree]) -> bool:
-    """``remove_worktree``, after first saving any work the tree holds that exists nowhere
-    else to a ``stranded/…`` branch (#405). If saving fails, the tree is left exactly as it
-    is, recorded in ``kept``, and reported not-removed."""
-    stranded = await unpublished_work(path, branch=branch)
-    if stranded:
-        saved = await _save(repo, path, branch, stranded, "reaping")
-        if isinstance(saved, StrandedTree):
-            kept.append(saved)
-            return False
-    return await remove_worktree(repo, path, branch)
+    """``discard_worktree`` for the by-id reap: a tree that could not be saved — or was saved
+    but would not come off its path — is recorded in ``kept`` and reported not-removed."""
+    removed, record = await discard_worktree(repo, path, branch, why="reaping")
+    if isinstance(record, StrandedTree):
+        kept.append(record)
+    elif record is not None and not record.removed:
+        kept.append(StrandedTree(record.path, branch, f"its work is safe on {record.ref}, but the tree {record.why}"))
+    return removed
 
 
 # (path, summary) pairs already reported by ``_warn_kept`` in this process. The health
@@ -755,12 +1022,12 @@ _KEPT_WARNED: set[tuple[str, str]] = set()
 def _warn_kept(fid: str, kept: list[StrandedTree]) -> None:
     for t in kept:
         if (t.path, t.summary) in _KEPT_WARNED:
-            log.debug("[project_board] %s: still keeping %s — its work could not be saved", fid, t.path)
+            log.debug("[project_board] %s: still keeping %s", fid, t.path)
             continue
         _KEPT_WARNED.add((t.path, t.summary))
         log.warning(
             "[project_board] %s: KEPT %s (%s) — it holds work that exists nowhere else and could not be "
-            "saved to a branch: %s. The board will not reap it; recover or discard it by hand (#405)",
+            "cleared safely: %s. The board will not reap it; recover or discard it by hand (#405)",
             fid,
             t.path,
             t.branch,
@@ -790,12 +1057,11 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     with its matching ``feat/<id>-<slug>`` branch.
 
     Every caller is cleaning up after a run that is already over, and a coder that died
-    before promotion leaves its only copy of the work exactly here — so a tree still holding
-    work that exists nowhere else (``unpublished_work``) is saved to a ``stranded/…`` branch
-    before it is reaped, and logged with that branch (#405). If saving fails the tree is
-    KEPT, logged by path once, never destroyed. A drive discarding the trees it just built
-    itself — rejected candidates — removes them by path with ``remove_worktree``, never
-    through here."""
+    before promotion leaves its only copy of the work exactly here — so every tree goes
+    through ``discard_worktree``: work that exists nowhere else is saved first, and a tree
+    whose work could not be saved is KEPT, logged by path once, never destroyed (#405). A
+    drive discarding the trees it just built itself — rejected candidates — removes them by
+    path with ``remove_worktree``, never through here."""
     base = os.path.join(repo, worktrees_root)
     canonical = os.path.join(base, f"feat-{fid}")
     kept: list[StrandedTree] = []
@@ -819,43 +1085,58 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     return removed
 
 
-async def stranded_worktrees(repo: str, worktrees_root: str, fid: str) -> list[StrandedTree]:
-    """Every tree feature ``fid`` has on disk that holds work existing nowhere else (#405)
-    — its canonical ``feat-<id>[-<slug>]`` and every candidate ``feat-<id>.<suffix>``, by
-    the naming ``reap_feature_worktree`` sweeps. Empty when removing them loses nothing."""
+def feature_worktrees(repo: str, worktrees_root: str, fid: str) -> list[tuple[str, str]]:
+    """``(path, branch)`` for every worktree the CARD ``fid`` owns on disk — its canonical
+    ``feat-<id>[-<slug>]`` first, then every candidate ``feat-<id>.<suffix>`` — by the
+    naming ``reap_feature_worktree`` sweeps, minus the test-rung diagnostic's trees (it
+    owns and reaps its own). A directory listing; no git."""
     base = os.path.join(repo, worktrees_root)
-    slugged, candidates = _feature_tree_names(base, fid)
+    slugged, candidates = _feature_tree_names(base, fid, test_rung=False)
+    bare = [f"feat-{fid}"] if os.path.isdir(os.path.join(base, f"feat-{fid}")) else []
+    return [
+        (os.path.abspath(os.path.join(base, n)), "feat/" + n[len("feat-") :]) for n in [*bare, *slugged, *candidates]
+    ]
+
+
+async def stranded_worktrees(repo: str, worktrees_root: str, fid: str, *, base: str = "") -> list[StrandedTree]:
+    """Every tree the card ``fid`` owns (``feature_worktrees``) that holds work existing
+    nowhere else (#405). Empty when removing them loses nothing."""
     trees: list[StrandedTree] = []
-    for name in [f"feat-{fid}", *slugged, *candidates]:
-        path = os.path.join(base, name)
-        stranded = await unpublished_work(path, branch="feat/" + name[len("feat-") :])
+    for path, branch in feature_worktrees(repo, worktrees_root, fid):
+        stranded = await unpublished_work(path, branch=branch, base=base)
         if stranded:
-            trees.append(StrandedTree(os.path.abspath(path), "feat/" + name[len("feat-") :], stranded))
+            trees.append(StrandedTree(path, branch, stranded))
     return trees
 
 
 async def set_aside_stranded_worktrees(
-    repo: str, worktrees_root: str, fid: str
+    repo: str, worktrees_root: str, fid: str, *, base: str = ""
 ) -> tuple[list[PreservedTree], list[StrandedTree]]:
-    """Clear the ground for a fresh build of ``fid`` without losing a line (#405): save
-    every stranded tree the card owns (``stranded_worktrees``) to a ``stranded/…`` branch,
-    then remove it. Returns ``(saved, unsaved)`` — ``unsaved`` are the trees whose saving
-    failed; they are left exactly as they are.
+    """Clear the ground for a fresh build of ``fid`` without losing a line (#405): every
+    stranded tree the card owns goes through ``discard_worktree`` — saved, then removed.
+    Returns ``(saved, blocking)``: every save's receipt (``removed`` true or not), and the
+    trees the build cannot get past — work that could not be saved, or saved work whose
+    tree would not come off its path — each left exactly where it is.
 
     Every tree, not just the one this build will reuse: a stale ``.g2`` would otherwise
     surface mid-ladder, after the greedy rung was already spent. Removing each saved tree
     here, rather than leaving it to the next ``create_worktree``, keeps a tree this build
     never recreates from being saved a second time by a later reap."""
     saved: list[PreservedTree] = []
-    unsaved: list[StrandedTree] = []
-    for tree in await stranded_worktrees(repo, worktrees_root, fid):
-        result = await _save(repo, tree.path, tree.branch, tree.summary, "rebuilding over")
-        if isinstance(result, StrandedTree):
-            unsaved.append(result)
-            continue
-        await remove_worktree(repo, tree.path, tree.branch)
-        saved.append(result)
-    return saved, unsaved
+    blocking: list[StrandedTree] = []
+    for tree in await stranded_worktrees(repo, worktrees_root, fid, base=base):
+        _removed, record = await discard_worktree(repo, tree.path, tree.branch, base=base, why="rebuilding over")
+        if isinstance(record, StrandedTree):
+            blocking.append(record)
+        elif record is not None:
+            saved.append(record)
+            if not record.removed:
+                blocking.append(
+                    StrandedTree(
+                        record.path, tree.branch, f"its work is safe on {record.ref}, but the tree {record.why}"
+                    )
+                )
+    return saved, blocking
 
 
 async def promote_worktree(
@@ -884,7 +1165,7 @@ async def promote_worktree(
         return os.path.abspath(canon_path), canon_branch
     # A canonical tree an earlier drive left mid-build is the same stranded work a dead
     # candidate is (#405): save it before the forced clear — and before the winner moves.
-    await _preserve_or_refuse(repo, canon_path, canon_branch, "replacing")
+    await _clear_for(repo, canon_path, canon_branch, "", "replacing")
     # Free the destination: drop any stale canonical worktree/branch leftover.
     await _git(repo, "worktree", "remove", "--force", canon_rel)
     await _git(repo, "branch", "-D", canon_branch)
@@ -1092,9 +1373,10 @@ async def open_pr(
 
 async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
     """#207: the "already exists" PR we adopt may be one the CODER opened itself
-    (``gh pr create --draft`` from its worktree, before the loop got here). The loop
-    owns the PR lifecycle — the coder was told to build and push, not to gate the
-    merge — so a draft is not a signal to honour: mark it ready BEFORE the review /
+    (``gh pr create --draft`` from its worktree, before the loop got here — against a
+    brief that tells it to edit only and leave committing, pushing and the PR to the
+    loop, #400). The loop owns the PR lifecycle, so a coder's draft is not a signal to
+    honour: mark it ready BEFORE the review /
     merge gates run. Otherwise the card walks CI-fix → review-clean normally and then
     parks: GitHub reports ``mergeStateStatus=CLEAN`` for a draft, ``gh pr merge``
     refuses with "pull request is in draft state", and every retry burns an

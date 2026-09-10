@@ -248,41 +248,57 @@ class DriveMixin:
                 # Saving whatever the tree holds first (#405). A restart mid-drive used to
                 # reap it, and a finished implementation waiting on its gate went with it.
                 # Now its work lands on a `stranded/…` branch, the card says where, and the
-                # next boot rebuilds as before. If saving fails, the tree is kept and the
+                # next boot rebuilds as before. If saving fails the tree is kept, and the
                 # card's next dispatch tries again — and blocks, naming it, if it still can't.
-                stranded = await worktree.unpublished_work(wt, branch=branch or "")
-                if stranded:
-                    try:
-                        saved = await worktree.preserve_worktree(repo, wt, branch or "", summary=stranded)
-                    except worktree.WorktreeError as exc:
-                        log.warning(
-                            "[project_board] kept in-flight worktree on shutdown: %s holds work that exists "
-                            "nowhere else (%s) and saving it failed: %s",
-                            wt,
-                            stranded,
-                            exc,
-                        )
-                        continue
-                    await self._note_preserved(fid, repo, [saved])
-                ok = await worktree.remove_worktree(repo, wt, branch or "")
-                if ok:
-                    log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
-                else:
-                    log.warning("[project_board] worktree reap on shutdown failed (directory remains): %s", wt)
+                trail = await self._discard_tree(None, fid, repo, wt, branch)
+                log.info("[project_board] in-flight worktree on shutdown: %s — %s", wt, trail)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
+
+    async def _discard_tree(
+        self, store, fid: str, repo: str, wt, branch, *, base: str = "", comment: bool = True
+    ) -> str:
+        """End this drive's own tree at a terminal edge — a block, a cancel, shutdown —
+        SAVING any work in it that exists nowhere else first (``worktree.discard_worktree``,
+        #405). A push GitHub refuses (a token without `workflow` scope) is a terminal block
+        on a finished, committed implementation; removing the tree used to take it along.
+
+        Returns a one-line trail for the caller's own note. With ``comment`` (the default),
+        a save — or a tree kept because it could not be saved — is also written to the card
+        (``store`` may be None: resolved lazily, best-effort). A clean tree is removed exactly
+        as before, with nothing written."""
+        if not wt:
+            return ""
+        removed, record = await worktree.discard_worktree(repo, wt, branch or "", base=base, why="clearing")
+        if record is None:
+            return (
+                "worktree reaped" if removed or not os.path.exists(wt) else "worktree reap failed (directory remains)"
+            )
+        if isinstance(record, worktree.StrandedTree):
+            text = f"worktree KEPT at {record.path}: it holds work that could not be cleared safely — {record.summary}"
+            trail = f"worktree KEPT (its work could not be saved): {record.path}"
+        else:
+            text = worktree.preserved_note(repo, [record], base=base)
+            where = record.ref or record.moved_to
+            trail = f"its work saved on {where}" + ("" if record.removed else f", but the tree remains: {record.why}")
+        if comment:
+            await self._comment(store, fid, text)
+        return trail
+
+    async def _comment(self, store, fid: str, text: str) -> None:
+        """A best-effort card comment — the trail must never break an edge."""
+        log.info("[project_board] %s %s", fid, text.splitlines()[0])
+        try:
+            await asyncio.to_thread((store or self._store()).comment, fid, text)
+        except Exception:  # noqa: BLE001 — the work is safe (or kept); this is only the pointer
+            log.warning("[project_board] %s: could not write to the card: %s", fid, text[:160], exc_info=True)
 
     async def _note_preserved(self, fid: str, repo: str, saved: list, *, base: str = "", store=None) -> None:
         """Tell the card where its stranded work went (#405): each ``stranded/…`` branch,
         what it holds, and how to inspect or salvage it. Best-effort — the work is already
         safe on its branch, so a failed comment costs only the pointer, and the WARNING
         ``worktree`` logged when it saved the tree still names the branch."""
-        note = worktree.preserved_note(repo, saved, base=base)
-        log.info("[project_board] %s %s", fid, note.splitlines()[0])
-        try:
-            await asyncio.to_thread((store or self._store()).comment, fid, note)
-        except Exception:  # noqa: BLE001 — the branch holds the work; this is only the pointer
-            log.warning("[project_board] %s: could not comment where its stranded work went", fid, exc_info=True)
+        await self._comment(store, fid, worktree.preserved_note(repo, saved, base=base))
 
     def _notify_operator(self, fid: str, text: str, *, incident: str = "") -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
@@ -1217,7 +1233,7 @@ class DriveMixin:
                             await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
                             wt = branch = None
-                        saved, unsaved = await worktree.set_aside_stranded_worktrees(repo, self.root, fid)
+                        saved, unsaved = await worktree.set_aside_stranded_worktrees(repo, self.root, fid, base=base)
                         if saved:
                             await self._note_preserved(fid, repo, saved, base=base, store=store)
                         if unsaved:
@@ -1571,7 +1587,7 @@ class DriveMixin:
                                 exc_info=True,
                             )
                             await asyncio.to_thread(store.flag_blocked, fid, reason)
-                        await worktree.remove_worktree(repo, wt, branch or "")
+                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
                     # Operator cancel (#211): re-read the card right before the PR edge.
@@ -1711,8 +1727,10 @@ class DriveMixin:
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             await asyncio.to_thread(store.flag_blocked, fid, reason)
-                            if wt:
-                                await worktree.remove_worktree(repo, wt, branch or "")
+                            # Saving what the tree holds first: a terminal block can land on a finished,
+                            # committed implementation (a push GitHub refused), and removing the tree used
+                            # to take it along (#405).
+                            await self._discard_tree(store, fid, repo, wt, branch, base=base)
                             self._inflight.pop(fid, None)
                             return
                     # A capability failure = the coder didn't deliver (no diff / dispatch
@@ -1856,8 +1874,10 @@ class DriveMixin:
                             )
                         log.warning("[project_board] %s blocked (%s, tier untouched): %s", fid, category, reason)
                         await asyncio.to_thread(store.flag_blocked, fid, reason, category=category)
-                        if wt:
-                            await worktree.remove_worktree(repo, wt, branch or "")
+                        # Saving what the tree holds first: a terminal block can land on a finished,
+                        # committed implementation (a push GitHub refused), and removing the tree used
+                        # to take it along (#405).
+                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
                     # 1.5 Pre-model dispatch/infra failure → block DIRECTLY for triage, no
@@ -1876,8 +1896,10 @@ class DriveMixin:
                             exc,
                         )
                         await asyncio.to_thread(store.flag_blocked, fid, reason, category=PRE_MODEL_DISPATCH_CLASS)
-                        if wt:
-                            await worktree.remove_worktree(repo, wt, branch or "")
+                        # Saving what the tree holds first: a terminal block can land on a finished,
+                        # committed implementation (a push GitHub refused), and removing the tree used
+                        # to take it along (#405).
+                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
@@ -1946,8 +1968,10 @@ class DriveMixin:
                                     spent,
                                     asked.get("id", "?"),
                                 )
-                    if wt:
-                        await worktree.remove_worktree(repo, wt, branch or "")
+                    # Saving what the tree holds first: a terminal block can land on a finished,
+                    # committed implementation (a push GitHub refused), and removing the tree used
+                    # to take it along (#405).
+                    await self._discard_tree(store, fid, repo, wt, branch, base=base)
                     self._inflight.pop(fid, None)
                     return
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
@@ -1990,8 +2014,7 @@ class DriveMixin:
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
             await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
-            if wt:
-                await worktree.remove_worktree(repo, wt, branch or "")
+            await self._discard_tree(store, fid, repo, wt, branch, base=base)
             self._inflight.pop(fid, None)
 
     # ── operator cancel during a drive (#211) ────────────────────────────────
@@ -2052,8 +2075,9 @@ class DriveMixin:
                 note = f"cancelled by operator — could not close {pr_url} ({detail[:200]}); close it by hand"
                 log.warning("[project_board] %s cancelled — could not close %s: %s", fid, pr_url, detail[:300])
         if wt:
-            await worktree.remove_worktree(repo, wt, branch or "")
-            note += "; worktree reaped"
+            # Save-then-remove, like every other edge that ends a tree (#405): the cancel verb's
+            # route reaps the same tree, and the two are serialized per path.
+            note += "; " + await self._discard_tree(store, fid, repo, wt, branch, comment=False)
         try:
             await asyncio.to_thread(store.comment, fid, note)
         except Exception:  # noqa: BLE001 — the trail is best-effort

@@ -58,6 +58,13 @@ class PromptMixin:
         # #90: gate files + conventions resolve from THIS feature's project, so a coder
         # on a multi-repo board gets the standing obligations of the repo it builds in.
         gate_files = self._gate_files_for(feature)
+        # The publish rule says what the loop really does: it runs the repo's pre-PR checks
+        # only when a gate command is configured for this project (#400).
+        checks = (
+            (", runs the repo's pre-PR checks", "those checks and in ")
+            if self._local_gate_cmd_for(feature)
+            else ("", "")
+        )
         gate_files_block = (
             "\n## Repo standing gate files (keep these green — repo-wide, not per-card)\n"
             + "\n".join(f"- {g}" for g in gate_files)
@@ -186,11 +193,10 @@ class PromptMixin:
             f"write a single line `NO_TEST_NEEDED: <reason>` inside the final `## Summary` "
             f"section of your final message instead — it does not count anywhere else.\n"
             f"- You are edit-only: make every change as a file edit in this worktree. Do NOT "
-            f"commit or push — when you stop, the loop commits whatever you left here, runs "
-            f"the repo's pre-PR checks and pushes the branch. And do NOT open a PR (draft or "
-            f"otherwise) — the loop opens it with the title/body it composes and owns the PR "
-            f"lifecycle. The tests you write run in those checks and in CI, so they must be "
-            f"correct and self-contained.\n"
+            f"commit or push — when you stop, the loop commits whatever you left here"
+            f"{checks[0]} and pushes the branch. And do NOT open a PR (draft or otherwise) — "
+            f"the loop opens it with the title/body it composes and owns the PR lifecycle. The "
+            f"tests you write run in {checks[1]}CI, so they must be correct and self-contained.\n"
             f"- **Your FINAL message becomes the PR description, verbatim.** End with a "
             f"short, clean summary for a reviewer — what changed and why, 2-6 sentences "
             f"or a few bullet points. Do NOT narrate your process: no step-by-step "
