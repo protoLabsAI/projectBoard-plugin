@@ -249,6 +249,37 @@ Delivery is **feature-detected**: the operator inbox is a host module the plugin
 hard-depend on. On a host without it — or if the inbox refuses — the block is still logged
 as a WARNING, which is strictly louder than the silence a block used to leave.
 
+## Attaching a PR the board didn't open
+
+The loop adopts PRs it did not see opened in exactly one place: crash recovery finds the PR
+whose head is a card's own branch and moves the card to `in_review`. A PR an operator opens
+by hand needs the same thing, for example recovered work pushed from a dead coder's worktree.
+`board_attach_pr` / `POST /features/{fid}/attach-pr` (#402) is that edge, and it is no wider
+than recovery.
+
+| The PR must be | Because |
+|---|---|
+| **open**, in the card's project repo, not from a fork | fix rounds push to this repo's branch; a merged PR has nothing left to review (use the manual Done edge) |
+| on the card's own branch, `feat/<id>-<slug>` | every later edge keys on it: CI and review fix rounds resume `origin/<that branch>`, and so do recovery and the reap. A PR on any other branch would be abandoned by the first fix round, which opens a second PR |
+| targeting the project's base branch | the rebase and merge edges work against that base |
+
+The card must be a coding feature that is `ready`, `in_progress` or `blocked`, with no PR of
+its own in review and no open dependency. The board tracks one PR per card. A card whose
+earlier PR was closed (rejected, then reworked on the same branch) can take the new PR in
+its place. An earlier PR that is still open, or already merged, is refused. The loop must not
+be working the card: no live drive, no claimed build, no review gate running. Every refusal
+changes nothing and says what to do instead.
+
+The write is one `br update` under the loop's claim lock, so a `ready` card cannot be claimed
+halfway through. It leaves the card where `open_review` would: `in_review` with the PR on
+`external_ref`. It drops `ready`, the `blocked` flag and its class, and any review verdict
+or head pin left from an earlier head. When `review_gate` is on it sets `review-pending`, so
+the gate reviews the attached head instead of the merge edge waiting forever for a verdict.
+From there the ordinary reconcile drives the card: CI, review, rebase, then merge → `done`.
+The attach is an `attached PR:` comment on the card, naming who attached it, the state it
+left, and why. Fix budgets the card already spent are not reset. A card whose automated fix
+rounds are exhausted still stops at the next failure, for a human.
+
 ## Where to look next
 
 - [`docs/configuration.md`](configuration.md) — `review_gate`, `review_dispatch`,

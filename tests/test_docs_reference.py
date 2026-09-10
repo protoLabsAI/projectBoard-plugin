@@ -44,10 +44,13 @@ def _routes() -> set[tuple[str, str]]:
 
 
 def _tools() -> set[str]:
+    # BOTH def and async def: an `async def board_…` tool is just as callable, and matching
+    # FunctionDef alone let board_dispatch ship undocumented and would have let the next
+    # async tool do the same (#402 added one).
     return {
         n.name
         for n in ast.walk(ast.parse((_ROOT / "__init__.py").read_text()))
-        if isinstance(n, ast.FunctionDef) and n.name.startswith("board_")
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("board_")
     }
 
 
