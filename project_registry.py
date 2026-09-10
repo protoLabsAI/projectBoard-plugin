@@ -404,6 +404,9 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             return
         raise ProjectRegistryError(f"gate command could not run: {exc}") from exc
     if proc.returncode == 0:
+        # Log the OUTCOME, not just the start (#393). A PUT whose client has timed out gets
+        # no access-log line from uvicorn, so this is the only record of what the call did.
+        log.info("[project_board] register[%s]: gate smoke passed on the clean base", name)
         return
     if proc.returncode is not None and proc.returncode < 0:
         # Killed by a signal (shutdown / external kill / OOM) — the gate never reached
@@ -440,10 +443,39 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             text,
         )
         return
+    log.warning(
+        "[project_board] register[%s]: gate FAILED on the clean base (exit %d) — refusing; nothing persisted",
+        name,
+        proc.returncode,
+    )
     raise ProjectRegistryError(
         f"the gate failed on the clean base checkout (exit {proc.returncode}) — "
         f"fix the gate or the repo before registering it; output tail:\n{text}"
     )
+
+
+def _gate_already_proven(prior: Any, gate_cmd: str, repo: Path, base: str) -> bool:
+    """Whether ``gate_cmd`` is the gate ``prior`` already persists, for the same checkout and
+    base — i.e. this call carries nothing new for the smoke to prove (#393).
+
+    The Projects editor round-trips EVERY field on save, so the configured gate always came
+    back as "gate text this call carries" and was smoked again. For protoAgent that is ruff +
+    lint-imports + the whole pytest suite, synchronously, under the registry lock: a
+    conventions-only save took minutes, outlived its client, and a red suite refused an edit
+    that had nothing to do with it. A gate is proven against a checkout, so the smoke re-runs
+    only when one of those changes — the command, the repo, or the base. Anything unreadable
+    reads as changed (smoke it), never as proven."""
+    if not isinstance(prior, dict):
+        return False
+    prior_repo = str(prior.get("repo") or "").strip()
+    if not prior_repo or str(prior.get("local_gate_cmd") or "").strip() != gate_cmd:
+        return False
+    if str(prior.get("base_branch") or "").strip() != base:
+        return False
+    try:
+        return Path(prior_repo).expanduser().resolve() == repo
+    except OSError:
+        return False
 
 
 async def _apply_registry(
@@ -520,15 +552,21 @@ async def upsert_project(
 ) -> dict[str, Any]:
     """Add/update one project while preserving siblings and unowned entry fields.
 
-    An incoming EXPLICIT gate command is smoke-run once on the repo's base checkout
-    before anything persists (#261) — see ``_smoke_gate_on_clean_base``. ``force_gate``
-    downgrades a red smoke to a loud warning."""
+    An EXPLICIT gate command this call changes — new text, or the same gate moved to a
+    different repo/base — is smoke-run once on the repo's base checkout before anything
+    persists (#261) — see ``_smoke_gate_on_clean_base``; an unchanged one is not re-run
+    (#393, ``_gate_already_proven``). ``force_gate`` downgrades a red smoke to a loud
+    warning."""
     project = _validate_name(name)
     repo = _bounded_text(repo, "repo", 4096, required=True)
     if make_default and clear_default:
         raise ProjectRegistryError("default action is ambiguous — set and clear cannot both be requested")
     branch = await asyncio.to_thread(_validate_base_branch, base_branch)
 
+    if _MUTATION_LOCK.locked():
+        # Say so before waiting (#393): a change queued behind a running gate smoke used to
+        # wait in silence and then run its own — a retry is exactly the wrong move there.
+        log.info("[project_board] register[%s]: waiting for another project change to finish", project)
     async with _MUTATION_LOCK:
         # Consent and its root are live policy, so validate them after acquiring the
         # mutation lock. A request queued behind another config write must not retain
@@ -559,14 +597,16 @@ async def upsert_project(
                 entry[key] = value
             elif replace_optional:
                 entry.pop(key, None)
-        # Smoke only the gate text THIS call carries: blank keeps/clears (nothing new
-        # to prove), and the "auto" sentinel is resolved by the loop at dispatch time,
-        # not a command — shelling the literal word would manufacture a failure. A
-        # preserved prior gate was proven when it was set (or is the loop preflight's
-        # job for YAML-authored ones); re-running it here would let a red suite refuse
-        # an unrelated conventions update.
+        # Smoke only a gate THIS call changes: blank keeps/clears (nothing new to prove),
+        # and the "auto" sentinel is resolved by the loop at dispatch time, not a command —
+        # shelling the literal word would manufacture a failure. A gate echoed back
+        # unchanged (the editor round-trips every field) was proven when it was set, or is
+        # the loop preflight's job for YAML-authored ones — and a registry change resets
+        # the preflight, so it re-smokes the gate before the project's ready work is
+        # dispatched anyway. Re-running it here made a conventions-only save run the whole
+        # suite and let a red one refuse it (#393).
         gate_cmd = optional["local_gate_cmd"]
-        if gate_cmd and gate_cmd != _AGENT_GATE_SENTINEL:
+        if gate_cmd and gate_cmd != _AGENT_GATE_SENTINEL and not _gate_already_proven(prior, gate_cmd, repo_p, branch):
             await _smoke_gate_on_clean_base(project, gate_cmd, str(repo_p), branch, force=force_gate)
         merged = dict(existing)
         merged[project] = entry
@@ -587,6 +627,13 @@ async def upsert_project(
             # automatic sole default and report/persist it truthfully.
             default = current_default or _effective_default({}, merged)
         await _apply_registry(merged, expected={project: entry}, default_project=default)
+        log.info(
+            "[project_board] register[%s]: %s — repo %s, base %s",
+            project,
+            "created" if project not in existing else "updated",
+            entry["repo"],
+            branch,
+        )
         return {
             "project": project,
             # Do not leak preserved file-only values through the PUT response after

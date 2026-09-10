@@ -379,7 +379,11 @@ Every scalar is explicit about apply behavior. `coder`, `br_autofetch`,
 apply to the running loop; fields marked **restart** are persisted immediately but
 do not change the already-constructed loop/router until the member restarts. Project
 map/default changes apply live as one validated routing policy and do not produce a
-false restart warning.
+false restart warning. A save that sets a NEW local gate command (or moves an existing
+one to a different repo or base branch) smoke-runs that gate once on the clean base
+before anything persists, and a red gate refuses the save; a save that leaves the gate
+unchanged does not re-run it — a registry change resets the loop's gate preflight, which
+re-smokes the gate before that project's ready work is dispatched.
 
 The console intentionally does not expose every manifest default. Structural legacy
 single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)
