@@ -50,11 +50,19 @@ import time
 import types
 
 from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
-from ..failures import PRE_MODEL_DISPATCH_CLASS, STRANDED_WORK_CLASS, classify, is_pre_model_dispatch_failure
+from ..failures import (
+    PRE_MODEL_DISPATCH_CLASS,
+    STRANDED_WORK_CLASS,
+    TOO_WIDE_CLASS,
+    classify,
+    is_pre_model_dispatch_failure,
+)
 from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
 from ..store import (
+    BR_FAILURES,
+    AlreadyDelivered,
     BoardError,
     LABEL_CHANGES_REQUESTED,
     LABEL_MERGED_VERIFIED_PREFIX,
@@ -62,6 +70,8 @@ from ..store import (
     LABEL_REVIEW_PENDING,
     LABEL_REVIEWED_HEAD_PREFIX,
     LABEL_TASK,
+    _REQ_HEADING_RE,
+    _REQ_LINE_RE,
     _all_items_disposed,
     apply_requirement_dispositions,
     budgets_from_labels,
@@ -69,6 +79,7 @@ from ..store import (
     get_store,
     knob_bool,
     merge_posture,
+    parse_requirement_dispositions,
     reconfigure_cached_store,
 )
 
@@ -399,42 +410,11 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str]:
 # of the phrase mid-narration doesn't truncate the real section (#56).
 _SUMMARY_HEADING_RE = re.compile(r"^##\s*Summary\b", re.MULTILINE)
 
-# The requirement-ledger disposition section (#113) — the `## Summary` pattern's
-# sibling: the coder reports one line per item id (`- r2: done`, `- r3: declined —
-# <reason>`). Same last-occurrence discipline as the summary; the section ends at
-# the next `## ` heading. Only the CLOSED statuses parse — silence (or an explicit
-# `open`) is not a disposition, so an unreported item stays open on the ledger.
-_REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
-_REQ_LINE_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
-    r"(?P<status>done|declined)\b\s*(?:[:\-—–]\s*)?(?P<reason>.*)$",
-    re.IGNORECASE,
-)
-
-
-def _parse_requirements_reply(text: str) -> list[dict]:
-    """Parse the coder reply's ``## Requirements`` section into disposition dicts
-    (`{id, status, decline_reason?}`) for ``apply_requirement_dispositions``. Keeps
-    the LAST such heading (a mid-narration mention must not shadow the real section,
-    the #56 lesson), reads until the next heading, and skips any line that isn't a
-    well-formed `<id>: done|declined [— reason]` row — a malformed row is silence,
-    and silence is not disposition. No section → no dispositions."""
-    headings = list(_REQ_HEADING_RE.finditer(text or ""))
-    if not headings:
-        return []
-    out: list[dict] = []
-    for line in text[headings[-1].end() :].splitlines():
-        if line.strip().startswith("##"):
-            break  # the next section — the ledger block ended
-        m = _REQ_LINE_RE.match(line)
-        if not m:
-            continue
-        d = {"id": m.group("id"), "status": m.group("status").lower()}
-        reason = m.group("reason").strip()
-        if d["status"] == "declined" and reason:
-            d["decline_reason"] = reason
-        out.append(d)
-    return out
+# The requirement-ledger disposition section (#113) — parsed by the STORE now
+# (`store.parse_requirement_dispositions`, with its two regexes), because task delivery
+# applies the same section (#399) and the store can't reach up into the loop. Kept under
+# its historical name so the coder drive and every existing import read it unchanged.
+_parse_requirements_reply = parse_requirement_dispositions
 
 
 # ── grounding a review finding against the diff (#381) ────────────────────────
@@ -835,6 +815,56 @@ def _next_rung_cursor() -> int:
 _ROTATABLE_CATEGORIES = frozenset({"rate_limit", "provider_unavailable"})
 
 
+def provider_failure_category(exc: BaseException) -> str | None:
+    """The provider class (``rate_limit`` / ``provider_unavailable``) of a coder DISPATCH
+    failure, or ``None`` when ``exc`` is anything else — the one definition of "the
+    provider failed, not the model". The drive rotates on it; max-mode asks it of every
+    candidate before it decides what the drive is told (#425)."""
+    text = str(exc)
+    if not text.startswith("coder dispatch failed"):
+        return None
+    category = classify(text).category
+    return category if category in _ROTATABLE_CATEGORIES else None
+
+
+def representative_failure(errors: list[Exception]) -> Exception | None:
+    """The ONE error that speaks for a max-mode fan-out in which EVERY candidate raised
+    (#425). No candidate returned anything to judge, so the drive is handed this instead
+    of a "no diff" and its own handling applies, as for a single dispatch. The most
+    specific edge wins:
+
+    0. a provider that refused its model — beside a quota too: the provider is at least
+       partly broken, and a capability climb is wrong either way;
+    1. a spent quota — rotate within the rung, or back off;
+    2. a timeout — so #378's timeout counter, and its decompose ask, see it;
+    3. a dispatch failure the drive does not retry — #339 blocks it as pre-model unless a
+       candidate reached the model;
+    4. any other dispatch failure (a retryable one: back off and re-run);
+    5. any other ``WorktreeError``, as it was raised.
+
+    Ties go to the earliest candidate. Only a ``WorktreeError`` can speak: anything else
+    (a raw ``BrokenPipeError`` from an untapped host, say) returns None, and the caller
+    keeps its old "no diff" verdict — which the drive's shutdown and cancel checks see
+    first, where a raw error would skip them and block the card as `unexpected`. Pure,
+    like ``rotation_target``, so the order is testable without driving a card."""
+
+    def rank(exc: Exception) -> int:
+        category = provider_failure_category(exc)
+        if category == "provider_unavailable":
+            return 0
+        if category == "rate_limit":
+            return 1
+        if isinstance(exc, worktree.CoderTimeout):
+            return 2
+        text = str(exc)
+        if text.startswith("coder dispatch failed"):
+            return 4 if classify(text).retryable else 3
+        return 5
+
+    speakers = [e for e in errors if isinstance(e, worktree.WorktreeError)]
+    return min(speakers, key=rank) if speakers else None
+
+
 # ── #420: remember a provider that can't serve its model ────────────────────────────
 # Rotation alone rediscovers a dead provider card by card: the rung cursor spreads cards
 # across a rung's siblings, so every card that happens to open on it pays one failed
@@ -1129,6 +1159,21 @@ def reset_merged_verify_budget(fid: str, store) -> bool:
     return True
 
 
+def forget_timeout_count(fid: str) -> bool:
+    """Drop the live loop's cached timeout count for ``fid`` after an operator unblock
+    (#378), so the next ``_budget_get`` re-reads it from the bead. ``clear_blocked`` resets
+    the persisted count when it releases a card parked as `too-wide`, but the loop's cache
+    wins over the labels (#259): without this, a retry after raising `coder_timeout_s`
+    would re-park on its very first timeout. Forgetting — not pinning 0 — is right for any
+    unblock: the cache simply re-syncs with whatever the bead now says. No lock needed: a
+    blocked card has no drive in flight to race. Returns False when no loop is running."""
+    loop = live_loop()
+    if loop is None:
+        return False
+    loop._budget_cache("timeout").pop(fid, None)
+    return True
+
+
 def cancel_pr_comment(fid: str) -> str:
     return f"cancelled by operator — see card {fid}"
 
@@ -1263,6 +1308,8 @@ __all__ = [
     "rotation_target",
     "prefer_live_sibling",
     "_ROTATABLE_CATEGORIES",
+    "provider_failure_category",
+    "representative_failure",
     "_next_rung_cursor",
     "_PROVIDER_DOWN_TTL_S",
     "_PROVIDER_DOWN",
@@ -1290,11 +1337,14 @@ __all__ = [
     "worktree",
     "PRE_MODEL_DISPATCH_CLASS",
     "STRANDED_WORK_CLASS",
+    "TOO_WIDE_CLASS",
     "classify",
     "is_pre_model_dispatch_failure",
     "resolve_default_project",
     "resolve_projects",
     "store_mod",
+    "BR_FAILURES",
+    "AlreadyDelivered",
     "BoardError",
     "LABEL_CHANGES_REQUESTED",
     "LABEL_MERGED_VERIFIED_PREFIX",
@@ -1371,6 +1421,7 @@ __all__ = [
     "_unregister_loop",
     "live_loop",
     "reset_merged_verify_budget",
+    "forget_timeout_count",
     "cancel_pr_comment",
     "cancel_side_effects",
     "_MAX_MODE_JUDGE_SYS",

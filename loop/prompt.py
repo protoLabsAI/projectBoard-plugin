@@ -17,34 +17,85 @@ from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
 
+def _ledger_lines(reqs) -> str:
+    """The requirement ledger (#113) as the prompt shows it — one `` - `r1` [open] text``
+    row per item, WITH its current status (a re-dispatch re-injects what is still open).
+    Shared by the coder and task prompts so the ids they are asked to report against,
+    and the row shape, can never drift apart."""
+    return "\n".join(
+        f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
+        + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
+        + (f" (reopened by the rejection — was {r['reopened_from']})" if r.get("reopened_from") else "")
+        for r in reqs
+    )
+
+
 class PromptMixin:
     def _build_task_prompt(self, feature: dict) -> str:
         """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
         criteria, framed as a request for a DELIVERABLE (a doc, a decision, an artifact
         ref), NOT a code change — a task has no worktree or PR, and the delegate's reply
-        IS the deliverable ``record_delivery`` records."""
+        IS the deliverable ``record_delivery`` records.
+
+        With a requirement ledger (#399) it also asks for the SAME ``## Requirements``
+        disposition section a coder writes, so ``record_delivery`` can close the items
+        the deliverable addressed. Unlike the coder path nothing gates on it: an item left
+        unreported stays open, and the verifier is told so.
+
+        A task sent back from review is re-dispatched LEADING with why (#432 review) — the
+        projected ``rejection_feedback`` (a verifier's rejection, or a requeue's findings),
+        the adverse-review shape the coder prompt already uses. Without it the next round
+        got the same spec and nothing else, and could only repeat the rejected work."""
         title = feature.get("title", "")
         spec = feature.get("spec", "")
         criteria = feature.get("acceptance_criteria", "")
+        rejected = str(feature.get("rejection_feedback") or "").strip()
+        rejected_block = (
+            "## ⚠ Your previous delivery was REJECTED — address this in the new one\n"
+            f"{rejected}\n\n"
+            "Deliver the complete, corrected deliverable — not a note about what changed.\n\n"
+            if rejected
+            else ""
+        )
         criteria_block = f"\n## Acceptance criteria (definition of done)\n{criteria}\n" if criteria.strip() else ""
+        reqs = feature.get("requirements") or []
+        req_block = (
+            "\n## Requirements ledger (address EVERY item)\n"
+            f"{_ledger_lines(reqs)}\n\n"
+            "Each item above is tracked on the board. END your deliverable with a "
+            "`## Requirements` section: ONE line per item — `- <id>: done` or "
+            "`- <id>: declined — <concrete reason>`. Declining with a real reason is a "
+            "valid closed state; an item you don't report stays open, and the verifier "
+            "is shown it as still open.\n"
+            if reqs
+            else ""
+        )
         return (
             f"You have been assigned ONE task. Complete it and reply with the "
             f"deliverable — a document, a decision, or a reference to the artifact you "
             f"produced. There is no code change, worktree, or PR: your reply IS the "
             f"deliverable, so make it self-contained.\n\n"
             f"# {title}\n\n"
+            f"{rejected_block}"
             f"## Task\n{spec}\n"
             f"{criteria_block}"
+            f"{req_block}"
         )
 
-    def _build_prompt(self, feature: dict, lessons: str = "") -> str:
+    def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "") -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
         nothing; naming the files + a direct 'make the edits now' makes it act.
 
         ``lessons`` (distilled gotchas from the knowledge graph, fetched async in
         ``_drive``) is injected so a coder gets this area's known failure modes on
-        attempt 1 — the read half of the flywheel (retro grounds → coder heeds)."""
+        attempt 1 — the read half of the flywheel (retro grounds → coder heeds).
+
+        ``timeout_note`` is the drive's note that a PRIOR attempt timed out (#146). It
+        rides the same rejected-attempt block as CI/fix feedback, but it is NOT that
+        feedback: ``_ci_feedback`` persists across drives and marks a carried-forward
+        FIX (which disables max-mode/solve fan-out), while a timeout climb is a fresh
+        build — so the note lives only in the drive that climbed (#425 review)."""
         files = feature.get("files_to_modify") or []
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
@@ -119,7 +170,7 @@ class PromptMixin:
         pending = _PENDING_FEEDBACK.pop(fid, None)
         if pending:
             self._ci_feedback[fid] = pending
-        ci = self._ci_feedback.get(fid)
+        ci = self._ci_feedback.get(fid) or timeout_note
         prior = self._ci_prior_diff.get(fid)
         prior_block = (
             f"\n### The diff that failed (your previous attempt — fix it, don't restart from scratch)\n"
@@ -148,14 +199,9 @@ class PromptMixin:
         # (done, or declined with a reason). Silence is not disposition: an
         # unreported item stays open and the completion gate refuses the PR.
         reqs = feature.get("requirements") or []
-        req_lines = "\n".join(
-            f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
-            + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
-            for r in reqs
-        )
         req_block = (
             "\n## Requirements ledger (dispose of EVERY item)\n"
-            f"{req_lines}\n\n"
+            f"{_ledger_lines(reqs)}\n\n"
             "Each item above is tracked on the board. Address every `open` item this "
             "round, and report a per-item disposition: include a `## Requirements` "
             "section in your final message (before the `## Summary`) with ONE line "

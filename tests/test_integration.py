@@ -685,9 +685,12 @@ def test_request_decomposition_files_a_real_task_and_marks_the_card(board):
     assert fid in got["title"]
     assert "build the whole subsystem" in got["spec"]  # the original intent rode along
 
-    # The original is marked, so the ask cannot re-fire on the next timeout.
+    # The original is marked, so the ask cannot re-fire on the next timeout: a repeat hands
+    # back the SAME open task (#378 — idempotent on the task, so a re-park can name it) and
+    # files no second one.
     assert "decompose-asked" in (board.get_feature(fid).get("labels") or [])
-    assert board.request_decomposition(fid, timeouts=3) is None
+    assert board.request_decomposition(fid, timeouts=3)["id"] == task["id"]
+    assert [t["id"] for t in board.list_features() if t.get("issue_type") == "task"] == [task["id"]]
 
 
 # ── structured setup-gap actions: the register() wiring, end to end ───────────────────

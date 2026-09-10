@@ -2470,6 +2470,9 @@ async def test_the_timeout_counter_survives_a_restart(monkeypatch):
     that reset to zero on every reload would never reach the threshold."""
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        # the model worked before the clock ran out — a pre-first-token timeout is infra
+        # and never counts (#378 review)
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {"path": "a.py"}})
         raise worktree.CoderTimeout("coder timed out after 1800s")
 
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
@@ -2613,9 +2616,10 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     assert "produced NO diff" in escalated
     assert "Read" in escalated and "loop.py" in escalated
     assert "still mapping the dispatch flow" in escalated
-    # r3: it arrived via `_ci_feedback`, so it rides the standard rejected-attempt block.
+    # r3: it rides the standard rejected-attempt block — but as the drive's own note, NOT
+    # `_ci_feedback`, which persists and would switch fan-out off for the card (#425 review).
     assert "previous attempt was REJECTED" in escalated
-    assert "still mapping the dispatch flow" in loop._ci_feedback.get("bd-1", "")
+    assert "bd-1" not in loop._ci_feedback
 
 
 async def test_drive_tier_climb_grants_a_fresh_window_despite_stale_budget_labels(monkeypatch):
