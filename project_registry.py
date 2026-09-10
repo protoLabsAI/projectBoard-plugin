@@ -39,6 +39,7 @@ that gets expanded before it reaches here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import os
@@ -353,6 +354,7 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=repo,
+            stdin=asyncio.subprocess.DEVNULL,  # #423: never the server's stdin
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             # Own process group, so a timeout can kill the whole gate tree — not just
@@ -383,6 +385,14 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
                 _SMOKE_TIMEOUT_S,
             )
             return
+        except asyncio.CancelledError:
+            # A cancelled PUT (client gone, shutdown) must not leave the gate running in
+            # the operator's base checkout (#423) — the timeout path above always killed
+            # the tree; a cancel left it untouched.
+            _kill_gate_tree(proc)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=_SMOKE_REAP_TIMEOUT_S))
+            raise
     except (OSError, subprocess.SubprocessError) as exc:
         if force:
             log.warning(

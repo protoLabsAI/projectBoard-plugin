@@ -193,6 +193,26 @@ Ambiguity resolves toward "killed" on purpose: the two errors are not symmetric.
 killed gate red states something false about the code and stops the board; calling a red
 gate killed only re-runs it, and the genuine failure is still there on the next run.
 
+### A gate is a process tree, and it dies as one
+
+The board runs every repo command — the pre-PR and merged-state gates, the preflight,
+`coder.solve()`'s acceptance tests and the fixups — with **no stdin** and in its **own
+process group**. A timeout or a cancel SIGKILLs the whole group, then reaps it on a bound.
+The board's `git` and `gh` helpers get the same no-stdin, own-group treatment and kill the
+tree on a timeout or cancel (#423).
+
+Both halves are load-bearing. `pnpm install && pnpm run ci` is three processes, not one, and
+killing only the shell used to orphan the rest. In the desktop app, every gate child also
+inherited the server's stdin: one pipe, shared by every sidecar, that never closes. Hung
+`pnpm install`s piled up across two boards, the oldest for 19 hours. One drive went silent
+for 8 hours, because on Python ≥ 3.11 `await proc.wait()` does not return until the orphan
+closes the stdout pipe it inherited.
+
+This is the host's own contract for process trees it owns (protoAgent ADR 0098), and it
+carries the host's trade-off: a member stopped by a signal to its process group no longer
+takes a running gate with it. The drive's cancel path kills the tree if shutdown reaches it.
+On Windows `killpg` does not exist, so a timeout there still kills only the shell.
+
 ## Blocked cards — self-heal, then page a human
 
 `blocked` carries a **class**, on a `blocked-class:<cls>` label, and the class decides what

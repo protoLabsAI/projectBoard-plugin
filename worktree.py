@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 from collections.abc import Iterable
 
@@ -54,29 +55,113 @@ async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, st
         "-C",
         repo,
         *args,
+        # No stdin, own process group (#423): `git commit` runs the repo's hooks, and a
+        # hook is a shell tree (husky → pnpm → lint-staged) that must neither read the
+        # server's stdin nor outlive a kill.
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        kill_tree(proc)
         raise WorktreeError(f"git {' '.join(args)} timed out after {timeout}s")
     except asyncio.CancelledError:
         # #211: a task cancel (the operator's cancel verb) while the child runs —
         # wait_for re-raises it but does NOT kill the child, so a `git push` would
         # finish anyway and the branch land on the remote. Kill, then propagate.
-        _kill_quietly(proc)
+        kill_tree(proc)
         raise
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
-def _kill_quietly(proc) -> None:
-    """``proc.kill()`` that tolerates a child that already exited."""
+# ── repo-command children: the gate, the acceptance tests, the fixups (#423) ──────────
+# A repo-defined shell command (`pnpm install && pnpm run ci`, `make check`) is a TREE,
+# not a process: the shell forks the package manager, which forks the test runner. Three
+# things went wrong when these were spawned as a bare `create_subprocess_shell`:
+#
+# * They inherited the SERVER's stdin. In the desktop app that is one never-closing pipe
+#   shared by every sidecar, so anything in the tree that reads stdin blocks forever —
+#   and could swallow bytes meant for the server. `stdin=DEVNULL` gives it EOF instead.
+# * A timeout killed only `/bin/sh`. Its children were orphaned, kept running, and kept
+#   our stdout pipe open; ~15 hung `pnpm install`s piled up across two boards.
+# * On Python >= 3.11 `await proc.wait()` does not return until every pipe closes, so
+#   after that shell-only kill it waited on the orphan — a drive went silent for 8h.
+#
+# So every such child leads its OWN session (one process group we can kill whole), and
+# every timeout or cancel SIGKILLs the group and reaps it on a bound — the host's own
+# contract for trees it owns (protoAgent ADR 0098, `infra.proc.group_kwargs`), and what the
+# registry's gate smoke already did. The price, the same one the host pays for its shell
+# tool and ACP delegates: a member stopped by a signal to its process group no longer takes
+# a running gate with it — the drive's cancel path does that, if shutdown reaches it.
+# POSIX only: on Windows `killpg` does not exist and this degrades to killing the shell.
+_REAP_TIMEOUT_S = 10.0
+
+
+async def spawn_shell(cmd: str, *, cwd: str, env: dict | None = None, stdout=None, stderr=None):
+    """``create_subprocess_shell`` for a repo command: no stdin, its own process group.
+
+    ``stdout``/``stderr`` pass straight through (``PIPE`` / ``STDOUT`` / ``DEVNULL``).
+    Pair it with :func:`communicate_or_kill` (or :func:`kill_tree` + :func:`reap`) so a
+    timeout or cancel takes the whole tree down, not just the shell."""
+    return await asyncio.create_subprocess_shell(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    )
+
+
+def kill_tree(proc) -> None:
+    """SIGKILL ``proc``'s whole process group — the shell AND everything it forked.
+
+    ``spawn_shell`` makes the shell a session leader, so its pgid is its pid. Falls back
+    to killing the shell alone when the group is already gone or ``killpg`` is missing."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except (AttributeError, OSError):
+        pass
     try:
         proc.kill()
-    except ProcessLookupError:
+    except (ProcessLookupError, OSError):
         pass
+
+
+async def reap(proc, *, timeout: float | None = None) -> None:
+    """Wait for a killed tree to exit — on a bound (``_REAP_TIMEOUT_S`` by default). A
+    descendant that left the group (daemonised itself into its own session) survives the
+    group kill and can hold our pipe open; after the bound it is abandoned rather than
+    allowed to hang the caller."""
+    bound = _REAP_TIMEOUT_S if timeout is None else timeout
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=bound)
+    except asyncio.TimeoutError:
+        pid = getattr(proc, "pid", "?")
+        log.warning(
+            "[project_board] killed child pid %s: its pipe is still held (a descendant escaped the "
+            "process group) after %ss — abandoning it",
+            pid,
+            bound,
+        )
+
+
+async def communicate_or_kill(proc, *, timeout: float | None) -> tuple[bytes | None, bytes | None]:
+    """``proc.communicate()`` on a hard ``timeout``. On timeout OR cancel, kill the whole
+    tree and reap it before re-raising (``asyncio.TimeoutError`` / ``CancelledError``),
+    so no caller can leave a gate running behind it. A cancel used to leave the tree
+    running untouched — every drive cancel and shutdown mid-gate leaked one."""
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        kill_tree(proc)
+        await asyncio.shield(reap(proc))
+        raise
 
 
 # Paths the coder writes as its OWN session scratch — the ACP/`proto` coder's private
@@ -525,19 +610,21 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
         "gh",
         *args,
         cwd=cwd,
+        stdin=asyncio.subprocess.DEVNULL,  # #423: never the server's stdin
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        kill_tree(proc)
         raise WorktreeError(f"gh {' '.join(args)} timed out after {timeout}s")
     except asyncio.CancelledError:
         # #211: same as _git — a cancel mid-`gh pr create` must not let the child
         # finish and open a PR nobody owns. (If it already did, the drive's cancel
         # path finds it by branch — pr_url_for_branch — and closes it.)
-        _kill_quietly(proc)
+        kill_tree(proc)
         raise
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
