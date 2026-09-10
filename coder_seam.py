@@ -591,9 +591,23 @@ def progress_snapshot(fid: str) -> dict:
 
 
 def dispatch_reached_model(fid: str) -> bool:
-    """Did the CURRENT coder dispatch reach the model — produce any first-token
-    evidence (a tool call, a thought, streamed answer text, or token usage) — mined
-    from the live-monitor ring buffer?
+    """Did the CURRENT coder dispatch reach the model — produce first-token evidence
+    only a model produces (a tool call, a thought, or token usage) — mined from the
+    live-monitor ring buffer?
+
+    Streamed answer text is deliberately NOT evidence (#422). An ACP adapter speaks on
+    the same ``agent_message_chunk`` channel as its model, and can do so before the
+    model is ever called: codex-acp announces ``Model metadata for `<model>` not
+    found. Defaulting to fallback metadata…`` there, then fails the prompt. Counting
+    that text read a failure seconds after session start as model work, so the #339
+    guard stood aside and the card climbed a tier on a failure no stronger model can
+    fix (bd-ojsd, 2026-08-31: refused 3.5s after the adapter came up, then escalated
+    smart→reasoning on a board already running the guard). Who sent a text chunk can't
+    be told apart here, so text alone is ambiguous, and ambiguity must block rather
+    than climb — the same fail-safe as below. A coding turn that got anywhere leaves a
+    tool call or a thought behind, and ``usage_update`` only arrives after a real reply;
+    a turn that produced nothing but text and then died is the ambiguous case, and it
+    goes to triage.
 
     Scoped to the LATEST run epoch (``progress_begin``) so a stale gen an EARLIER
     dispatch left in this feature's buffer can NOT answer for the current one: a
@@ -615,13 +629,8 @@ def dispatch_reached_model(fid: str) -> bool:
         for b in gens.values():
             if getattr(b, "run", 0) != current:
                 continue  # a stale earlier-dispatch gen — not evidence for THIS dispatch
-            if (
-                b.recent_tools
-                or b.current_tool
-                or (b.thought_tail or "").strip()
-                or (b.answer_tail or "").strip()
-                or b.usage
-            ):
+            # No `answer_tail` here: it holds adapter chatter as readily as a reply (#422).
+            if b.recent_tools or b.current_tool or (b.thought_tail or "").strip() or b.usage:
                 return True
         return False
     except Exception:  # noqa: BLE001 — a monitor read must never break the drive

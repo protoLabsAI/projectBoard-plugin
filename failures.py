@@ -127,7 +127,8 @@ def is_pre_model_dispatch_failure(error: str, *, model_reached: bool) -> bool:
     next real build (bd-cwpv). Such a failure must block DIRECTLY for triage.
 
     ``model_reached`` is the loop's dispatch-lifecycle evidence: any tool call,
-    thought, streamed answer, or token usage recorded for the attempt. If the model
+    thought, or token usage recorded for the attempt (not streamed answer text — an
+    ACP adapter can emit that itself before the model runs, #422). If the model
     reached first token the failure is model-reachable no matter the message — this
     returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
     signature is pre-model → ``True`` (block, no tier climb).

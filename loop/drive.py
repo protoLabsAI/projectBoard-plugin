@@ -1686,11 +1686,12 @@ class DriveMixin:
                     # used to escalate on it anyway, burning smart→reasoning→opus in seconds
                     # with no model work and leaving a `tier:opus` label that misrouted the
                     # card's next real build (bd-cwpv). Decide it from the classifier's seam
-                    # signature AND the dispatch-lifecycle evidence (did any tool/thought/
-                    # answer/token reach the ring buffer): a recognised seam failure with no
-                    # model activity is pre-model. Fail-safe — an unreadable snapshot reads
-                    # as "model not reached", so an ambiguous dispatch failure blocks for
-                    # triage rather than climbing an expensive ladder (#339).
+                    # signature AND the dispatch-lifecycle evidence (did a tool call, thought
+                    # or token usage reach the ring buffer — streamed text alone does not
+                    # count, an adapter talks on that channel too, #422): a recognised seam
+                    # failure with no model activity is pre-model. Fail-safe — an unreadable
+                    # snapshot reads as "model not reached", so an ambiguous dispatch failure
+                    # blocks for triage rather than climbing an expensive ladder (#339).
                     pre_model = capability and is_pre_model_dispatch_failure(
                         str(exc), model_reached=self._dispatch_reached_model(fid)
                     )
@@ -2341,10 +2342,12 @@ class DriveMixin:
     @staticmethod
     def _dispatch_reached_model(fid: str) -> bool:
         """Did the coder dispatch that just failed REACH the model — i.e. produce any
-        first-token evidence (a tool call, a thought, streamed answer text, or token
-        usage)? A dispatch that failed with NONE of these never got past the seam /
-        adapter, so the model could not have influenced the result and a stronger model
-        cannot clear it (it must block for infra triage, not climb the tier ladder).
+        first-token evidence only a model produces (a tool call, a thought, or token
+        usage; NOT streamed answer text, which an ACP adapter can emit itself before the
+        model is called, #422)? A dispatch that failed with NONE of these never got past
+        the seam / adapter, so the model could not have influenced the result and a
+        stronger model cannot clear it (it must block for infra triage, not climb the
+        tier ladder).
 
         Delegates to ``coder_seam.dispatch_reached_model``, which scopes the check to
         the CURRENT dispatch's run epoch so a stale gen an earlier dispatch left in the
