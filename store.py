@@ -2180,6 +2180,9 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # Under the card's lock (#432's `_task_edge`): the attach is a read-validate-write across
+    # several `br` calls, and a concurrent requeue of the same card must not land in between.
+    @_task_edge
     def attach_pr(
         self,
         fid: str,
