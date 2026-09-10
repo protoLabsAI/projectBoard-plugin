@@ -269,13 +269,25 @@ class DriveMixin:
                         projects=projects,
                         default_project=default,
                     )
-                    # A repo that previously failed preflight gets a clean evaluation
-                    # under its new routing. Retain `_preflight_held`: it records cards
+                    # Every project whose routing CHANGED gets a fresh preflight, a held one
+                    # included: `_maybe_preflight` re-checks projects it holds cards for, so
+                    # clearing a held project's verdict can no longer strand its holds (#393).
+                    # An unchanged project keeps its verdict, so a save to one project doesn't
+                    # re-run every other project's suite. A new default re-homes every unlabeled
+                    # card, so then all verdicts go. Retain `_preflight_held`: it records cards
                     # the loop itself blocked and is needed to release them on recovery.
-                    self._preflight_state.clear()
-                    self._last_preflight.clear()
-                    self._preflight_dirty.clear()
-                    self._preflight_failed_at.clear()
+                    if old_default != default:
+                        stale = set(old_projects) | set(projects)
+                    else:
+                        stale = {n for n in set(old_projects) | set(projects) if old_projects.get(n) != projects.get(n)}
+                    for verdicts in (
+                        self._preflight_state,
+                        self._last_preflight,
+                        self._preflight_dirty,
+                        self._preflight_failed_at,
+                    ):
+                        for stale_name in stale:
+                            verdicts.pop(stale_name, None)
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)
@@ -1152,16 +1164,13 @@ class DriveMixin:
             if self._shutting_down:
                 log.info("[project_board] %s self task dispatch aborted by shutdown — no block", fid)
                 return
-            policy = classify(str(exc))
-            log.warning("[project_board] %s self task blocked (%s): %s", fid, policy.category, exc)
-            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+            await self._task_dispatch_failed(store, fid, "self task", f"{classify(str(exc)).category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s self task dispatch unexpected failure", fid)
-            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await self._task_dispatch_failed(store, fid, "self task", f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s self task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "self task")
 
     async def _drive_task(self, feature: dict, delegate) -> None:
         """Drive a ``task`` bead with a sister-agent assignee — an ACP coder OR an A2A
@@ -1184,16 +1193,87 @@ class DriveMixin:
             if self._shutting_down:
                 log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
                 return
-            policy = classify(str(exc))
-            log.warning("[project_board] %s task blocked (%s): %s", fid, policy.category, exc)
-            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+            await self._task_dispatch_failed(store, fid, "task", f"{classify(str(exc)).category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s task dispatch unexpected failure", fid)
-            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await self._task_dispatch_failed(store, fid, "task", f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "task")
+
+    async def _task_dispatch_failed(self, store, fid: str, kind: str, reason: str) -> None:
+        """Block a task whose dispatch failed — or answered with nothing — for triage,
+        UNLESS the card was delivered under the drive (#432 review).
+
+        A self task's agent has its board tools live during the turn, so it can
+        board_deliver and THEN time out or error. Blocking that card stamped `blocked` over
+        a delivered deliverable, and the verifier could no longer approve it
+        (`record_verification expects in_review, got 'blocked'`). So the card is re-read
+        first: in review (or already done), the delivery stands and the failure is only
+        logged. If the re-read itself fails, the block goes ahead as it always did. Neither
+        a failed read nor a failed block escapes the drive task."""
+        try:
+            current = await asyncio.to_thread(store.get_feature, fid)
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s could not re-read the card before blocking it: %s", fid, exc)
+            current = None
+        state = (current or {}).get("board_state")
+        if state in ("in_review", "done"):
+            log.info(
+                "[project_board] %s %s failed after the card was delivered (%s) — the delivery stands, not blocking: %s",
+                fid,
+                kind,
+                state,
+                reason,
+            )
+            return
+        log.warning("[project_board] %s %s blocked: %s", fid, kind, reason)
+        try:
+            await asyncio.to_thread(store.flag_blocked, fid, reason)
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s %s could not be blocked: %s", fid, kind, exc)
+
+    async def _record_task_reply(self, store, fid: str, reply: str, kind: str) -> None:
+        """Record a task drive's reply as the card's deliverable (``record_delivery`` →
+        in_review) — the shared tail of ``_drive_task`` and ``_drive_self_task``.
+
+        The card can leave in_progress while the delegate works, and the store then
+        refuses the write. That is an outcome of the race, not a failure of the drive, so
+        it must not escape the drive task — it used to, as an unretrieved-task-exception
+        traceback on every such run (#403):
+
+        - ``AlreadyDelivered`` — a DIFFERENT deliverable was recorded first. For a self
+          task that is typically the agent itself: its board tools are live during the
+          turn, and it called board_deliver in-turn before replying. That explicit
+          delivery stands; the reply is not written over it. (An IDENTICAL repeat never
+          reaches here — the store takes it as a no-op.)
+        - any other refusal — the card was requeued, blocked or cancelled under the
+          drive, or the write itself failed (a `br` timeout included, #432 review).
+          Whoever moved the card owns it now, so the reply is logged and dropped rather
+          than forced back in; not blocked either, which would stamp a state onto a card
+          the drive no longer holds. A card still in_progress with no live drive is the
+          sweep's to re-dispatch.
+
+        An EMPTY reply is not a delivery (#432 review): it goes down the failed-dispatch
+        path — blocked for triage, unless the agent delivered in-turn — rather than being
+        recorded as a task in review with nothing in it."""
+        chars = len(reply or "")
+        if not (reply or "").strip():
+            why = "empty reply: the assignee returned no deliverable, so there is nothing to record"
+            await self._task_dispatch_failed(store, fid, kind, f"{classify(why).category}: {why}")
+            return
+        try:
+            await asyncio.to_thread(store.record_delivery, fid, text=reply)
+        except AlreadyDelivered as exc:
+            log.info("[project_board] %s %s reply (%d chars) not recorded — %s", fid, kind, chars, exc)
+            return
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s %s reply (%d chars) not recorded: %s", fid, kind, chars, exc)
+            return
+        except Exception:  # noqa: BLE001 — unexpected; log it, never an unretrieved task exception
+            log.exception("[project_board] %s %s reply (%d chars) not recorded (unexpected failure)", fid, kind, chars)
+            return
+        log.info("[project_board] %s %s delivered (%d chars) → in_review", fid, kind, chars)
 
     def _record_bg(self, fid: str, label: str, fn, *args, **kwargs) -> None:
         """Run one store write-back on a worker thread WITHOUT awaiting it (#258) —
@@ -1248,6 +1328,12 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
+        # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
+        # across drives and marks a carried-forward FIX — so one all-timeout fan-out
+        # switched max-mode off for that card for good, and every later drive still
+        # opened with "a PREVIOUS attempt TIMED OUT". A timeout climb is a fresh build.
+        timeout_note = ""
         try:
             while True:
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
@@ -1255,7 +1341,7 @@ class DriveMixin:
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
-                prompt = self._build_prompt(feature, lessons=lessons)
+                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
                 # (below) or round-robin across dispatches, never on a capability failure —
@@ -1410,6 +1496,7 @@ class DriveMixin:
                     # dispatch scheduled on worker threads land before the drive
                     # proceeds toward open_pr (the pre-offload ordering).
                     await self._await_bg_records(fid)
+                    timeout_note = ""  # the dispatch that carried it has run — consumed
                     # The provider served this dispatch, so a down mark on it (#420) — set
                     # by another card, or one that was stale when every sibling was marked
                     # and this one got the rung's last attempt — no longer holds.
@@ -1699,7 +1786,7 @@ class DriveMixin:
                     dispatch_error = str(exc).startswith("coder dispatch failed")
                     if policy.category == "provider_unavailable" and not dispatch_error:
                         policy = classify(str(exc), provider_rules=False)
-                    provider_failure = dispatch_error and policy.category in _ROTATABLE_CATEGORIES
+                    provider_failure = provider_failure_category(exc) is not None
                     # A dispatch that failed on a fix round's KEPT worktree left it untouched:
                     # its files hold the implementation and the feedback says so. Whatever
                     # re-dispatches next — a sibling, or the same provider after a backoff —
@@ -1773,6 +1860,7 @@ class DriveMixin:
                                     )
                                     tier = nxt
                                     retries = 0
+                                    timeout_note = ""  # a new rung: an older timeout note is stale
                                     spent_here.clear()  # a NEW rung has its own providers (#362)
                                     refused_here.clear()
                                     # Fresh per-tier budgets on the climb — mirrors the
@@ -1798,12 +1886,6 @@ class DriveMixin:
                     # it burned the whole tier ladder in ten seconds (three attempts,
                     # three tiers, a block; 2026-08-28, bd-cwpv.12/.16) and left `tier:`
                     # labels that misrouted the card when it was requeued after the reset.
-                    # #378: count timeouts durably, BEFORE the retry/escalate/block fork —
-                    # bd-sxxf timed out, escalated a tier, timed out again and only then
-                    # blocked, so a counter bumped at the block alone would have read 1.
-                    if isinstance(exc, worktree.CoderTimeout):
-                        timeouts = await self._budget_get(store, fid, "timeout") + 1
-                        await self._budget_set(store, fid, "timeout", timeouts)
                     dispatch_failed = str(exc).startswith("coder dispatch failed") and not policy.retryable
                     capability = (
                         isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
@@ -1818,11 +1900,12 @@ class DriveMixin:
                     # used to escalate on it anyway, burning smart→reasoning→opus in seconds
                     # with no model work and leaving a `tier:opus` label that misrouted the
                     # card's next real build (bd-cwpv). Decide it from the classifier's seam
-                    # signature AND the dispatch-lifecycle evidence (did any tool/thought/
-                    # answer/token reach the ring buffer): a recognised seam failure with no
-                    # model activity is pre-model. Fail-safe — an unreadable snapshot reads
-                    # as "model not reached", so an ambiguous dispatch failure blocks for
-                    # triage rather than climbing an expensive ladder (#339).
+                    # signature AND the dispatch-lifecycle evidence (did a tool call, thought
+                    # or non-zero token usage reach the ring buffer — streamed text alone does
+                    # not count, an adapter talks on that channel too, #422): a recognised seam
+                    # failure with no model activity is pre-model. Fail-safe — an unreadable
+                    # snapshot reads as "model not reached", so an ambiguous dispatch failure
+                    # blocks for triage rather than climbing an expensive ladder (#339).
                     pre_model = capability and is_pre_model_dispatch_failure(
                         str(exc), model_reached=self._dispatch_reached_model(fid)
                     )
@@ -1952,6 +2035,34 @@ class DriveMixin:
                             await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
                         return
+                    # 1.7 A card whose FRESH builds keep timing out → PARK it, and hand its split to
+                    #     the board's own agent (#378). A repeated timeout is a SIZE signal: no diff,
+                    #     no CI output, so neither a stronger rung nor a rebuild has anything new to
+                    #     work with (on a ladder, the first timeout's climb already carried #146's
+                    #     timeout context). Only a timeout that IS that signal counts:
+                    #     • one that reached the model — a pre-first-token timeout is infra, and 1.5
+                    #       above has already blocked it, uncounted;
+                    #     • on a fresh build — a fix round (a kept worktree, or a card whose PR is
+                    #       open) is fixing a card that already BUILT in one dispatch, so it is not
+                    #       too wide. It takes the ordinary path below. Parked, it would ask to split
+                    #       a card with an open PR, and the split's cancel would close that PR.
+                    #     The count is durable (a `budget:` label, so a restart can't reset it) and
+                    #     is cleared when a build reaches review or an operator unblocks the park.
+                    #     Counting it here, before the climb/block fork, is what lets bd-sxxf's shape
+                    #     — timed out, climbed, timed out again — reach the threshold at all. The ask
+                    #     used to wait for the ladder to run out, beside a self-healing `transient`
+                    #     block: a three-rung ladder timed out three times before it asked, and the
+                    #     sweep then rebuilt the card twice more, racing its own split.
+                    if isinstance(exc, worktree.CoderTimeout) and not reusing and not feature.get("pr_url"):
+                        timeouts = await self._budget_get(store, fid, "timeout") + 1
+                        await self._budget_set(store, fid, "timeout", timeouts)
+                        threshold = self.decompose_after_timeouts  # 0 = never park (block as before)
+                        if threshold and timeouts >= threshold:
+                            await self._park_for_split(store, fid, timeouts, exc)
+                            if wt:
+                                await worktree.remove_worktree(repo, wt, branch or "")
+                            self._inflight.pop(fid, None)
+                            return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
@@ -1967,15 +2078,18 @@ class DriveMixin:
                             # about a worktree that no longer exists, so clear it (+ the prior diff)
                             # to keep prompt and worktree consistent.
                             keep_wt_class = str(exc).startswith(("goal verification failed", "requirements unresolved"))
+                            timeout_note = ""  # a new rung: an older timeout note is stale
                             if keep_wt_class and wt is not None:
                                 keep_wt = True  # reuse the verified worktree; _ci_feedback is truthful
                             elif isinstance(exc, worktree.CoderTimeout):
                                 # A timeout carries NO diff and NO CI output, so the stronger tier
                                 # would otherwise get a BYTE-IDENTICAL prompt — blind to the fact a
                                 # prior attempt ran out of time and what it was doing when killed
-                                # (#146). Seed the CI/review-bounce feedback lever with the ring
-                                # buffer's timeout context so the escalated dispatch leads with it.
-                                self._ci_feedback[fid] = self._timeout_escalation_context(fid)
+                                # (#146). Lead the escalated dispatch with the ring buffer's timeout
+                                # context — as a drive-local note, NOT `_ci_feedback`: this is a fresh
+                                # build, so a max-mode/solve board fans out again at the new rung.
+                                timeout_note = self._timeout_escalation_context(fid)
+                                self._ci_feedback.pop(fid, None)  # fresh worktree ahead: no fix to carry
                                 self._ci_prior_diff.pop(fid, None)  # a timeout produced no diff to echo back
                             else:
                                 # Fresh worktree ahead — drop any gate-fix feedback describing the
@@ -2001,23 +2115,6 @@ class DriveMixin:
                     await asyncio.to_thread(
                         store.flag_blocked, fid, f"{policy.category}: {exc}", category=policy.category
                     )
-                    # #378: a card that has now timed out repeatedly is not model-limited, it
-                    # is too wide — and nothing in the block path says so, which is how one
-                    # sat parked while an operator guessed. Ask the board's own agent to split
-                    # it (once; `request_decomposition` no-ops on a repeat or on a task).
-                    if isinstance(exc, worktree.CoderTimeout) and self.decompose_after_timeouts:
-                        spent = await self._budget_get(store, fid, "timeout")
-                        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
-                        if spent >= self.decompose_after_timeouts and callable(ask):
-                            asked = await asyncio.to_thread(ask, fid, timeouts=spent)
-                            if asked:
-                                log.warning(
-                                    "[project_board] %s timed out %dx — filed %s to decompose it "
-                                    "(a timeout is a SIZE signal, not a capability one)",
-                                    fid,
-                                    spent,
-                                    asked.get("id", "?"),
-                                )
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
@@ -2027,8 +2124,11 @@ class DriveMixin:
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
                 await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
-                # requirement ledger #113, and the empty-result count #198).
-                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
+                # requirement ledger #113, and the empty-result count #198), and the timeout
+                # count (#378): a card that built in one dispatch is demonstrably not too wide.
+                await self._budget_reset(
+                    store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only", "timeout"
+                )
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.
@@ -2065,6 +2165,62 @@ class DriveMixin:
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
             self._inflight.pop(fid, None)
+
+    async def _park_for_split(self, store, fid: str, timeouts: int, exc: Exception) -> None:
+        """Park a card whose fresh builds keep timing out, and hand its split to the board's
+        own agent (#378) — in the one order that is safe:
+
+        1. FILE the decompose task. ``request_decomposition`` leaves it in backlog, where the
+           puller cannot see it, and returns the task still open for this card (new, or filed
+           earlier), or None.
+        2. PARK the card under ``too-wide`` — never auto-healed; an operator unblock resets the
+           count — with a reason built from what step 1 returned: it names the task, or says
+           plainly that none was filed and what to do instead. (Building the reason before the
+           ask told a card re-parked after an operator requeue that a split was on its way
+           when none had been filed.)
+        3. RELEASE the task, only now: the agent that picks it up ends by cancelling this card,
+           which must never be found still in flight."""
+        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
+        task = await asyncio.to_thread(ask, fid, timeouts=timeouts) if callable(ask) else None
+        task_id = str((task or {}).get("id") or "")
+        retry = "raise coder_timeout_s and unblock it (unblocking resets its timeout count)"
+        if task_id:
+            reason = (
+                f"too wide to build in one dispatch — timed out {timeouts}x; parked while this agent splits "
+                f"it into slices ({task_id}). No tier climb and no auto-retry; to retry it whole instead, "
+                f"{retry}: {exc}"
+            )
+        else:
+            reason = (
+                f"too wide to build in one dispatch — timed out {timeouts}x, and NO split task was filed (one "
+                f"was requested for this card before, or the store refused): split it by hand, or {retry}: {exc}"
+            )
+        log.warning(
+            "[project_board] %s timed out %dx on fresh builds — parked as too wide (%s)",
+            fid,
+            timeouts,
+            f"split task {task_id}" if task_id else "no split task filed",
+        )
+        await asyncio.to_thread(store.flag_blocked, fid, reason, category=TOO_WIDE_CLASS)
+        release = getattr(store, "mark_ready", None)
+        if task_id and str(task.get("board_state") or "backlog") == "backlog" and callable(release):
+            try:
+                await asyncio.to_thread(release, task_id)
+            except Exception:  # noqa: BLE001 — the park stands; a human can promote the task
+                log.warning(
+                    "[project_board] %s split task %s is filed but the Ready gate refused it — it waits in backlog",
+                    fid,
+                    task_id,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.to_thread(
+                        store.comment,
+                        fid,
+                        f"split task {task_id} is filed but NOT ready — the Ready gate refused it; promote it by hand",
+                    )
+                except Exception:  # noqa: BLE001 — the trail is best-effort
+                    log.debug("[project_board] %s split-task comment failed", fid, exc_info=True)
 
     # ── operator cancel during a drive (#211) ────────────────────────────────
     @staticmethod
@@ -2373,7 +2529,10 @@ class DriveMixin:
         pass; ADR 0064), else the best-of-N LLM judge; the winner is PROMOTED into the canonical
         ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
         unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
-        ``_drive`` escalates/blocks exactly like a single coder that produced nothing.
+        ``_drive`` escalates/blocks exactly like a single coder that produced nothing —
+        unless EVERY candidate raised, when the one error that speaks for them
+        (``representative_failure``) is re-raised instead, so the drive handles it as it
+        would a single dispatch's (#425).
 
         Returns (canonical_wt, canonical_branch, winner_reply). The fan-out is bounded by
         ``max_concurrent`` × ``max_mode_n`` coders; size those to the host."""
@@ -2403,6 +2562,26 @@ class DriveMixin:
         if idx is None:
             for cid in cand_ids:
                 await worktree.reap_feature_worktree(repo, self.root, cid)
+            # #425: "no diff" is a CAPABILITY verdict, and the drive climbs a rung on it. That is
+            # only true when a candidate RETURNED — ran, and came back with nothing. When EVERY
+            # candidate raised there is nothing to judge, and swallowing the errors hid what
+            # actually happened: a quota (#362) or a refused model (#420) climbed instead of
+            # rotating, a timeout never reached #378's counter, a pre-model seam failure never
+            # reached #339's block. So hand the drive ONE of those errors — the most specific
+            # edge, `representative_failure` — and its own handling applies exactly as for a
+            # single dispatch. A CancelledError child neither returned nor raised, and a raw
+            # (non-WorktreeError) error can't speak for the fan-out: both keep the old verdict.
+            raised = [r for r in results if isinstance(r, Exception)]
+            rep = representative_failure(raised) if len(raised) == len(results) else None
+            if rep is not None:
+                log.info(
+                    "[project_board] %s max-mode: all %d candidates raised — handing the drive the "
+                    "failure that speaks for them, not a no-diff: %s",
+                    fid,
+                    n,
+                    str(rep)[:160],
+                )
+                raise rep
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]
@@ -2473,10 +2652,13 @@ class DriveMixin:
     @staticmethod
     def _dispatch_reached_model(fid: str) -> bool:
         """Did the coder dispatch that just failed REACH the model — i.e. produce any
-        first-token evidence (a tool call, a thought, streamed answer text, or token
-        usage)? A dispatch that failed with NONE of these never got past the seam /
-        adapter, so the model could not have influenced the result and a stronger model
-        cannot clear it (it must block for infra triage, not climb the tier ladder).
+        first-token evidence only a model produces (a tool call, a thought, or non-zero
+        token usage; NOT streamed answer text, which an ACP adapter can emit itself before
+        the model is called, #422 — and a failed dispatch records no usage, so on a
+        failure it is tool calls and thoughts)? A dispatch that failed with NONE of these
+        never got past the seam / adapter, so the model could not have influenced the
+        result and a stronger model cannot clear it (it must block for infra triage, not
+        climb the tier ladder).
 
         Delegates to ``coder_seam.dispatch_reached_model``, which scopes the check to
         the CURRENT dispatch's run epoch so a stale gen an earlier dispatch left in the
@@ -2493,16 +2675,22 @@ class DriveMixin:
         attempt ran out of time, how long it ran, or what it was doing when killed.
         Mine the progress ring buffer (``coder_seam.progress_snapshot``) for the
         timed-out gen's elapsed time, the last tool in flight, and the thought tail,
-        and lead the re-dispatch with them. Returned for injection into
-        ``_ci_feedback`` so it rides the exact same prompt path a CI/review bounce
-        uses — no new plumbing. Best-effort: a missing/empty snapshot still yields a
-        usable "prior attempt timed out, produced no diff" note — a monitor read must
-        never break escalation."""
+        and lead the re-dispatch with them. Returned as the drive's timeout note, which
+        rides the same rejected-attempt block a CI/review bounce uses. Best-effort: a
+        missing/empty snapshot still yields a usable "prior attempt timed out, produced
+        no diff" note — a monitor read must never break escalation.
+
+        Mined from the gen that TIMED OUT — the seam stamps its stop reason — not simply
+        the last one: in a max-mode fan-out that is just the last candidate, which may
+        have failed fast on something else, and the note then described the wrong
+        attempt ("ran ~0.0s", no tool; #425 review). The last gen is only the fallback
+        for a buffer that carries no stamp (an older gen, an untapped host)."""
         try:
             gens = coder_seam.progress_snapshot(fid).get("gens") or []
         except Exception:  # noqa: BLE001 — a monitor read must never break escalation
             gens = []
-        gen = gens[-1] if gens else {}
+        timed_out = [g for g in gens if str(g.get("stop_reason") or "").startswith(coder_seam.TIMED_OUT_REASON)]
+        gen = (timed_out or gens or [{}])[-1]
         elapsed = gen.get("elapsed_s")
         ran_for = f"ran ~{elapsed}s and " if elapsed is not None else ""
         lines = [

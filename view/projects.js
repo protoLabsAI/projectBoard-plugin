@@ -15,14 +15,51 @@ let mutating = false;
 
 async function request(path, init){
   const response = await kit.apiFetch(path, init);
-  const data = await response.json().catch(() => { throw new Error(`HTTP ${response.status} (non-JSON response)`); });
-  if (!response.ok){
-    const detail = Array.isArray(data.detail)
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data === null){
+    const detail = data && (Array.isArray(data.detail)
       ? data.detail.map((item) => item?.msg || String(item)).join(" · ")
-      : data.detail;
-    throw new Error(detail || `HTTP ${response.status}`);
+      : data.detail);
+    const error = new Error(detail || `HTTP ${response.status}${data === null ? " (non-JSON response)" : ""}`);
+    error.status = response.status;  // lets a save tell "refused" from "the proxy gave up"
+    throw error;
   }
   return data;
+}
+
+// A save that sets a new gate command, or moves the project to another repo, answers only
+// after that gate has run once on the clean base: minutes, for a full suite (#393). The
+// fleet proxy gives a plugin API call 20s and then answers 504, although the member keeps
+// running the gate. So a 502/504 or a dropped connection is not a failure here. The save's
+// outcome is read back from GET /projects (`saves.<name>`, matched by our request id).
+const SAVE_POLL_MS = 3000;
+const SAVE_WAIT_MS = 20 * 60 * 1000;
+const newRequestId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+function gateWillRun(body, current){
+  const gate = body.local_gate_cmd;
+  if (!gate || gate === "auto") return false;
+  return !current || gate !== (current.local_gate_cmd || "") || body.repo !== (current.repo || "");
+}
+const proxyGaveUp = (error) => !error.status || error.status === 502 || error.status === 504;
+async function awaitSaveOutcome(name, requestId){
+  const deadline = Date.now() + SAVE_WAIT_MS;
+  let unseen = 0;
+  message(`The connection gave up before ${name}'s gate finished, but the agent is still running it. Waiting for the result…`);
+  while (Date.now() < deadline){
+    await new Promise((resolve) => setTimeout(resolve, SAVE_POLL_MS));
+    let data;
+    try { data = await request(API, {cache:"no-store"}); } catch { continue; }
+    const save = data.saves?.[name];
+    if (!save || save.id !== requestId){
+      if (save?.id && save.state !== "running") throw new Error(`Another save of ${name} replaced this one — reload to see what was saved.`);
+      if (++unseen >= 5) throw new Error(`The save of ${name} never reached the agent — try again.`);
+      continue;
+    }
+    if (save.state === "running") continue;
+    if (save.state === "saved") return {entry: data.projects.find((project) => project.name === name) || {}, default_project: data.default_project};
+    throw new Error(save.detail || `${name} was not saved.`);
+  }
+  throw new Error(`${name}'s gate is still running after ${SAVE_WAIT_MS / 60000} minutes — reload the list later to see whether it was saved.`);
 }
 function normalized(data){
   return {
@@ -170,12 +207,21 @@ $("form").addEventListener("submit", async (event) => {
   const original = $("original-name").value;
   const name = original || $("name").value.trim();
   const defaultAction = $("default").checked ? "set" : original === state.default_project ? "clear" : "keep";
-  const body = {repo:$("repo").value.trim(), base_branch:$("base").value.trim(), local_gate_cmd:$("gate").value.trim(), repo_conventions:$("conventions").value.trim(), default_action:defaultAction};
-  mutating = true; $("save").textContent = "Saving…"; $("form").setAttribute("aria-busy", "true"); syncControls();
+  const requestId = newRequestId();
+  const body = {repo:$("repo").value.trim(), base_branch:$("base").value.trim(), local_gate_cmd:$("gate").value.trim(), repo_conventions:$("conventions").value.trim(), default_action:defaultAction, request_id:requestId};
+  const runsGate = gateWillRun(body, original ? state.projects.find((project) => project.name === original) : null);
+  mutating = true; $("save").textContent = runsGate ? "Running the gate…" : "Saving…"; $("form").setAttribute("aria-busy", "true"); syncControls();
+  if (runsGate) message(`Saving ${name} runs its gate once on the clean base before anything is saved. For a full test suite that takes minutes; the result appears here.`);
   let applied = false;
   let refreshed = false;
   try {
-    const result = await request(`${API}/${encodeURIComponent(name)}`, {method:"PUT", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
+    let result;
+    try {
+      result = await request(`${API}/${encodeURIComponent(name)}`, {method:"PUT", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
+    } catch (error) {
+      if (!proxyGaveUp(error)) throw error;
+      result = await awaitSaveOutcome(name, requestId);
+    }
     applied = true;
     const row = {name, ...result.entry};
     state.projects = [...state.projects.filter((project) => project.name !== name), row]
@@ -185,7 +231,7 @@ $("form").addEventListener("submit", async (event) => {
     refreshed = await load({clear:false});
     if (refreshed) message(`Saved ${name}. The running board is already using this project.`);
     else message(`Saved ${name}, but the project list could not be refreshed. The change applied; Retry to reload live state.`, true);
-  } catch (error) { message(errorText(error), true); }
+  } catch (error) { $("notice").hidden = true; message(errorText(error), true); }
   finally {
     mutating = false; $("save").textContent = "Save project"; $("form").removeAttribute("aria-busy");
     if (applied) render(); else syncControls();

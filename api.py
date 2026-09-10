@@ -31,7 +31,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
-from .store import MANUAL_BLOCK_CLASS, BoardError, annotate_next_action, escalation_enabled, get_store
+from .store import (
+    MANUAL_BLOCK_CLASS,
+    BoardError,
+    annotate_next_action,
+    escalation_enabled,
+    get_store,
+    open_requirements_note,
+)
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -46,6 +53,10 @@ class ProjectUpsertBody(BaseModel):
     local_gate_cmd: str = Field(default="", max_length=8192)
     repo_conventions: str = Field(default="", max_length=32768)
     default_action: Literal["keep", "set", "clear"] = "keep"
+    # The caller's own id for this save (#393). GET /projects reports each project's latest
+    # save under `saves.<name>` with this id, so a client whose request an intermediary gave
+    # up on (the fleet proxy's 20s API lane) can still learn how its gate-changing save ended.
+    request_id: str = Field(default="", max_length=64)
 
 
 def _store_kw(cfg: dict) -> dict:
@@ -401,8 +412,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.put("/projects/{name}")
     async def _put_project(name: str, body: ProjectUpsertBody):
-        """Add/update one boarded repo through the same bounded seam as the agent tool."""
-        from .project_registry import ProjectRegistryError, upsert_project
+        """Add/update one boarded repo through the same bounded seam as the agent tool. A save
+        that sets a new gate command, or moves the project to another repo, answers only after
+        that gate has run once on the clean base (minutes, for a full suite); a red gate is a
+        400 naming the failure. 409 means another save changed the project meanwhile: reload
+        and save again. When an intermediary times out first, GET /projects reports the outcome
+        under ``saves.<name>`` (matched by ``request_id``)."""
+        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, upsert_project
 
         try:
             result = await upsert_project(
@@ -414,7 +430,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 make_default=body.default_action == "set",
                 clear_default=body.default_action == "clear",
                 replace_optional=True,
+                request_id=body.request_id,
             )
+        except ProjectRegistryConflict as exc:
+            raise HTTPException(409, str(exc))
         except ProjectRegistryError as exc:
             raise HTTPException(400, str(exc))
         return {"ok": True, **result}
@@ -679,7 +698,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str):
-        return await _guard(lambda: store().clear_blocked(fid))
+        f = await _guard(lambda: store().clear_blocked(fid))
+        # The running loop's cached timeout count wins over the label the store just reset
+        # (#259) — drop it too, so a card parked `too-wide` gets a real retry (#378).
+        from .loop import forget_timeout_count
+
+        forget_timeout_count(fid)
+        return f
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):
@@ -735,7 +760,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `deliverable` reads the latest back), ``ref`` (a doc URL / artifact path)
         lands on `external_ref` — the slot a coding feature's pr_url occupies.
         TASK-ONLY: ``record_delivery`` 400s a coding feature (entering review with no
-        pr_url would strand the merge reconciler) or one not in_progress."""
+        pr_url would strand the merge reconciler) or one not in_progress. A repeat of the
+        delivery an in_review task already carries returns it unchanged; a DIFFERENT one
+        for an in_review task 400s without writing (#403). A ``## Requirements`` section
+        in ``text`` closes the ledger items it disposes of (best-effort, #399). An empty
+        delivery — no text, no ref — 400s."""
         body = body or {}
         return await _guard(
             lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))
@@ -754,13 +783,19 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         by construction, so an omitted ``by`` defaults to ``"operator"`` — NOT the store
         actor (record_verification's own fallback): defaulting to the actor would falsely
         flag an agent-delivered task, verified in the console, as self-verified. An
-        explicit ``by`` is forwarded unchanged (S3c owns the agent-tool default seam)."""
+        explicit ``by`` is forwarded unchanged (S3c owns the agent-tool default seam).
+
+        Still-open requirement-ledger items ride back as ``note`` — "2 requirement(s)
+        still open: r2, r4" — beside the feature (#399). Surfaced, never enforced: the
+        approval stands and the human decides, the same as board_verify."""
         body = body or {}
         approved = bool(body.get("approved", True))
         by = str(body.get("by") or "operator")
-        return await _guard(
+        f = await _guard(
             lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")), by=by)
         )
+        note = open_requirements_note((f or {}).get("requirements"))
+        return {**f, "note": note} if note else f
 
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):

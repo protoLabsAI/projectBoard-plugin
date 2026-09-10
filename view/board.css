@@ -160,5 +160,16 @@
   .tdlbl:first-child{margin-top:0}
   .tdsec{font-size:12px;color:var(--pl-color-fg);white-space:pre-wrap;word-break:break-word}
   .tdsec--empty{color:var(--pl-color-fg-muted)}
+  /* The task's requirement ledger (#399), above Approve/Reject: a status chip per item.
+     OPEN rows are the verifier's cue — full-strength text beside the warning chip — and
+     done/declined rows recede to muted. Kit badge classes for the chips; the one token
+     this page did not already use carries a fallback, so an older host without /_ds
+     still renders it. */
+  .treq{list-style:none;margin:0;padding:0}
+  .treq li{font-size:12px;padding:2px 0;color:var(--pl-color-fg-muted);word-break:break-word}
+  .treq li.treq--open{color:var(--pl-color-fg);font-weight:var(--pl-font-weight-medium, 500)}
+  .treq .pl-badge{margin-right:6px}
+  .treq .id{margin-right:4px}
+  .treq .why{font-style:italic}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }

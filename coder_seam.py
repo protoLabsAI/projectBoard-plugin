@@ -495,6 +495,16 @@ def progress_stop_reason(fid: str | None, gen: int, reason) -> None:
         b.stop_reason = str(reason)[:200]
 
 
+# The stop reason the dispatch stamps on a gen its watchdog killed. The loop's timeout
+# note (#146) is mined from THAT gen — in a max-mode fan-out the last gen may be a
+# sibling that failed fast on something else (#425 review).
+TIMED_OUT_REASON = "timed out"
+
+
+def _stamp_timeout(fid: str | None, gen: int, timeout) -> None:
+    progress_stop_reason(fid, gen, f"{TIMED_OUT_REASON} after {timeout}s")
+
+
 # ── Persist finished gens to the bead (#226) ────────────────────────────────────
 # The WRITE side of the coder-monitor history (#226): when a gen finishes, its live
 # snapshot is serialized to a `coder-monitor: {…}` JSON bead comment so the drawer
@@ -590,10 +600,40 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
+def _used_tokens(usage) -> bool:
+    """A usage record that shows tokens actually spent. ``{used: 0}`` is not one — an
+    adapter can report it at turn end when no model ran (#422)."""
+    try:
+        return int((usage or {}).get("used") or 0) > 0
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def dispatch_reached_model(fid: str) -> bool:
-    """Did the CURRENT coder dispatch reach the model — produce any first-token
-    evidence (a tool call, a thought, streamed answer text, or token usage) — mined
-    from the live-monitor ring buffer?
+    """Did the CURRENT coder dispatch reach the model — produce first-token evidence
+    only a model produces (a tool call, a thought, or non-zero token usage) — mined from
+    the live-monitor ring buffer?
+
+    Streamed answer text is deliberately NOT evidence (#422). An ACP adapter speaks on
+    the same ``agent_message_chunk`` channel as its model, and can do so before the
+    model is ever called: codex-acp announces ``Model metadata for `<model>` not
+    found. Defaulting to fallback metadata…`` there, then fails the prompt. Counting
+    that text read a failure seconds after session start as model work, so the #339
+    guard stood aside and the card climbed a tier on a failure no stronger model can
+    fix (bd-ojsd, 2026-08-31, on a board already running the guard — a refusal #421 now
+    catches by its message, but any other pre-model failure after such chatter, an
+    expired credential or a session that never answers, still rode this evidence). Who
+    sent a text chunk can't be told apart here, so text alone is ambiguous, and
+    ambiguity must block rather than climb — the same fail-safe as below. A coding turn
+    that got anywhere leaves a tool call or a thought behind; one that produced nothing
+    but text and then died is the ambiguous case, and it goes to triage.
+
+    Usage is weaker than it looks, so it counts only when ``used > 0``. A FAILED dispatch
+    records none: usage is read off a successful dispatch's result (or sampled in the
+    legacy tap's tool callback, where the tool call already counts). And adapters differ
+    on when they send it — claude-agent-acp 0.47.0 sends one at message start, on
+    rate-limit events, and ``{used: 0}`` at turn end even when no model ran; proto 0.71.1
+    sends none. So on a failure the evidence is, in practice, tool calls and thoughts.
 
     Scoped to the LATEST run epoch (``progress_begin``) so a stale gen an EARLIER
     dispatch left in this feature's buffer can NOT answer for the current one: a
@@ -615,13 +655,8 @@ def dispatch_reached_model(fid: str) -> bool:
         for b in gens.values():
             if getattr(b, "run", 0) != current:
                 continue  # a stale earlier-dispatch gen — not evidence for THIS dispatch
-            if (
-                b.recent_tools
-                or b.current_tool
-                or (b.thought_tail or "").strip()
-                or (b.answer_tail or "").strip()
-                or b.usage
-            ):
+            # No `answer_tail` here: it holds adapter chatter as readily as a reply (#422).
+            if b.recent_tools or b.current_tool or (b.thought_tail or "").strip() or _used_tokens(b.usage):
                 return True
         return False
     except Exception:  # noqa: BLE001 — a monitor read must never break the drive
@@ -751,6 +786,7 @@ async def dispatch_coder_tapped(
         # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
         raise
     except asyncio.TimeoutError:
+        _stamp_timeout(fid, gen, timeout)
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
     except Exception as exc:  # noqa: BLE001 — normalise every below-seam failure to the
         # adapter path's contract: nothing propagates raw; a dispatch failure surfaces as
@@ -843,6 +879,9 @@ async def _dispatch_coder_tapped_legacy(
             return await worktree.dispatch_coder(
                 coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
             )
+        except worktree.CoderTimeout:
+            _stamp_timeout(fid, gen, timeout)
+            raise
         finally:
             progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
 
@@ -881,6 +920,7 @@ async def _dispatch_coder_tapped_legacy(
     # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
     # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
     prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    timed_out = False
     try:
         coro = client.prompt(
             prompt,
@@ -902,6 +942,7 @@ async def _dispatch_coder_tapped_legacy(
             pass
         raise
     except asyncio.TimeoutError:
+        timed_out = True
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
     except (AcpError, DelegateError) as exc:
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
@@ -913,9 +954,12 @@ async def _dispatch_coder_tapped_legacy(
         # Stash whatever stop-reason / dead-end signal the ACP client reports (#198)
         # — sampled on EVERY exit so an empty reply still records WHY the coder
         # stopped. Best-effort getattr: a host without the attribute yields None.
-        progress_stop_reason(
-            fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
-        )
+        if timed_out:
+            _stamp_timeout(fid, gen, timeout)  # the pooled client's last reason is not THIS turn's
+        else:
+            progress_stop_reason(
+                fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
+            )
         progress_end(fid, gen)
         try:
             await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess

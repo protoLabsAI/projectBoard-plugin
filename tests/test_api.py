@@ -280,6 +280,7 @@ def test_project_put_uses_shared_registry_mutation(monkeypatch):
         "make_default": True,
         "clear_default": False,
         "replace_optional": True,
+        "request_id": "",  # #393: keys the save's outcome for a client an intermediary gave up on
     }
 
 
