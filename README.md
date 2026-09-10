@@ -319,8 +319,10 @@ gets. A deliverable that ends with a `## Requirements` section — one `- r2: do
 `- r3: declined — <why>` line per item, the rows a coder reports — closes those items.
 What is left open is **surfaced, never enforced**: `board_get_feature` lists a task's
 `open_requirements`, and a verification's result carries a `note`
-("2 requirement(s) still open: r2, r4"). Neither the delivery nor the approval is
-refused on open items; the verifier decides.
+("2 requirement(s) still open: r2, r4"). In the **Board** view, the task drawer lists
+the ledger above Approve/Reject with each item's status, open ones flagged, and an
+approval past open items shows that note in the drawer. Neither the delivery nor the
+approval is refused on open items; the verifier decides.
 
 The board listing (`GET /features`) keeps each task row small: `delivered`,
 `deliverable_chars`, `delivered_by` and a short whitespace-collapsed

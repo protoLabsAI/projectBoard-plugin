@@ -200,15 +200,38 @@ function taskExtra(f){
   }
   return "";
 }
+// The task's requirement ledger (#399) — the acceptance criteria decomposed into items a
+// delivery's `## Requirements` section closes. The human verifier is who the ledger is
+// surfaced FOR, so it sits right above Approve/Reject: one row per item with its status
+// chip, and an OPEN row reads at full strength beside a warning chip while done/declined
+// rows recede. A cue, never a gate — Approve still works with items open. Every field
+// esc()'d (server-authored text).
+function taskRequirements(f){
+  const reqs = f.requirements || [];
+  if (!reqs.length) return "";
+  let open = 0, rows = "";
+  for (const r of reqs){
+    const st = String(r.status || "open").toLowerCase();
+    const closed = st === "done" || st === "declined";
+    if (!closed) open++;
+    const chip = closed ? (st === "done" ? " pl-badge--success" : "") : " pl-badge--warning";
+    rows += '<li'+(closed ? '' : ' class="treq--open"')+'><span class="pl-badge'+chip+'">'+esc(st)+'</span>'
+      + '<span class="id">'+esc(String(r.id || ""))+'</span> '+esc(String(r.text || ""))
+      + (r.decline_reason ? ' <span class="why">— '+esc(String(r.decline_reason))+'</span>' : '')+'</li>';
+  }
+  return '<div class="tdlbl">requirements'+(open ? ' — '+open+' open' : '')+'</div><ul class="treq">'+rows+'</ul>';
+}
 // The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
 // #drawer instead of inline on the Kanban card / list row. Renders the spec, the
-// acceptance criteria, any recorded deliverable, then the state-appropriate controls
-// (taskExtra). Everything is esc()'d — server-authored text, never raw HTML.
+// acceptance criteria, any recorded deliverable, the requirement ledger, then the
+// state-appropriate controls (taskExtra). Everything is esc()'d — server-authored text,
+// never raw HTML.
 function taskDetail(f){
   const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
   let h = '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
+  h += taskRequirements(f);
   h += selfVerifiedProvenance(f);
   return h + taskExtra(f);
 }
@@ -225,8 +248,18 @@ async function submitDeliver(fid){
   try { await apiPost(FEAT+encodeURIComponent(fid)+"/deliver", {text: text, ref: ref}); await load(); await fetchTaskDetail(fid); }
   catch (e) { taskErr(fid, e); }
 }
+// An approval that went through with requirements still open (#399): the verify response
+// carries a `note` ("2 requirement(s) still open: r2, r4"). The approval STANDS — the human
+// decided — but they are shown what they approved past, in the drawer, until it closes or
+// switches task. Module-scoped so the reload + detail re-fetch right after Approve (and
+// every 10s poll re-render) keeps it. Shape: {fid, note}; null when there is nothing to say.
+let VERIFY_NOTE = null;
 async function approveTask(fid){
-  try { await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true}); await load(); await fetchTaskDetail(fid); }
+  try {
+    const r = await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true});
+    VERIFY_NOTE = r && r.note ? {fid: fid, note: String(r.note)} : null;
+    await load(); await fetchTaskDetail(fid);
+  }
   catch (e) { taskErr(fid, e); }
 }
 async function rejectTask(fid){
@@ -669,6 +702,7 @@ function openTask(fid){
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   TASK_FID = fid;
   TASK_DETAIL = null;                                            // drop the prior task's fetched detail
+  VERIFY_NOTE = null;                                            // …and any approval note it carried
   $("drawer-title").textContent = "Task — " + fid;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
   document.body.classList.add("drawer-open");
@@ -712,17 +746,22 @@ function syncTaskDrawer(){
   // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
   // action re-render still tracks in_progress → in_review → done; the comment-derived
   // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it
-  // has landed for THIS task (#312). A failed single-fetch surfaces as an error callout
-  // ABOVE the detail rather than leaving the deliverable silently blank.
+  // has landed for THIS task (#312), and so is the requirement ledger (#399) — the
+  // verifier reads the same card read the deliverable came from. A failed single-fetch
+  // surfaces as an error callout ABOVE the detail rather than leaving the deliverable
+  // silently blank; an approval past open requirements (VERIFY_NOTE) rides the same slot.
   const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;
-  const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable} : f;
+  const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;
   const err = d && d.error
     ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load task detail: " + d.error)+'</div>'
     : "";
-  $("drawer-body").innerHTML = err + taskDetail(merged);
+  const note = VERIFY_NOTE && VERIFY_NOTE.fid === TASK_FID
+    ? '<div class="pl-callout pl-callout--warning"><b>Approved</b> with '+esc(VERIFY_NOTE.note)+'</div>'
+    : "";
+  $("drawer-body").innerHTML = err + note + taskDetail(merged);
 }
 function closeMonitor(){
-  MON_FID = null; TASK_FID = null; TASK_DETAIL = null;
+  MON_FID = null; TASK_FID = null; TASK_DETAIL = null; VERIFY_NOTE = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
   document.body.classList.remove("drawer-open");
