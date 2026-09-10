@@ -519,6 +519,87 @@ def apply_requirement_dispositions(items, dispositions) -> list[dict]:
     return out
 
 
+# The requirement-ledger disposition section (#113) — the `## Summary` pattern's
+# sibling: the assignee reports one line per item id (`- r2: done`, `- r3: declined —
+# <reason>`). Same last-occurrence discipline as the summary; the section ends at
+# the next `## ` heading. Only the CLOSED statuses parse — silence (or an explicit
+# `open`) is not a disposition, so an unreported item stays open on the ledger.
+# Lives HERE, beside the ledger it feeds, because two edges read it: the loop's coder
+# drive (re-exported there as `_parse_requirements_reply`) and record_delivery (#399),
+# which the store owns and which must not reach up into the loop.
+_REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
+_REQ_LINE_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
+    r"(?P<status>done|declined)\b\s*(?:[:\-—–]\s*)?(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_requirement_dispositions(text: str) -> list[dict]:
+    """Parse a reply's ``## Requirements`` section into disposition dicts
+    (`{id, status, decline_reason?}`) for ``apply_requirement_dispositions``. Keeps
+    the LAST such heading (a mid-narration mention must not shadow the real section,
+    the #56 lesson), reads until the next heading, and skips any line that isn't a
+    well-formed `<id>: done|declined [— reason]` row — a malformed row is silence,
+    and silence is not disposition. No section → no dispositions."""
+    headings = list(_REQ_HEADING_RE.finditer(text or ""))
+    if not headings:
+        return []
+    out: list[dict] = []
+    for line in text[headings[-1].end() :].splitlines():
+        if line.strip().startswith("##"):
+            break  # the next section — the ledger block ended
+        m = _REQ_LINE_RE.match(line)
+        if not m:
+            continue
+        d = {"id": m.group("id"), "status": m.group("status").lower()}
+        reason = m.group("reason").strip()
+        if d["status"] == "declined" and reason:
+            d["decline_reason"] = reason
+        out.append(d)
+    return out
+
+
+def open_requirement_ids(items) -> list[str]:
+    """The ids of the ledger items still OPEN (not `done`/`declined`), in ledger order —
+    the complement of ``_all_items_disposed``."""
+    return [
+        str(i.get("id", "")) for i in items or () if str(i.get("status", "")).strip().lower() not in REQ_CLOSED_STATUSES
+    ]
+
+
+def open_requirements_note(items) -> str:
+    """``"2 requirement(s) still open: r2, r4"``, or "" when every item is closed — the
+    line a task verifier is shown (#399). A NOTE, never a gate: the verifier decides."""
+    ids = open_requirement_ids(items)
+    return f"{len(ids)} requirement(s) still open: {', '.join(ids)}" if ids else ""
+
+
+# How much of a task's deliverable a LISTING row carries (#399) — enough to recognise it,
+# not enough to matter at poll rate. The full text is one single-card read away.
+DELIVERABLE_PREVIEW_CHARS = 280
+
+
+def _listing_task_signal(f: dict) -> None:
+    """Swap a projected task row's full ``deliverable`` for the small signal a listing
+    carries (#399), in place: ``delivered`` / ``delivered_by`` stay, and the body becomes
+    ``deliverable_chars`` plus a whitespace-collapsed ``deliverable_preview``.
+
+    The listing is polled every 10s (#312), and a delivered task's body runs to kilobytes
+    — every task's, on every poll, for a view that shows none of them. But the row must
+    never READ as undelivered either: an empty `deliverable` on a delivered card is what
+    got #399 filed as data loss. So it says delivered, how much, and what it opens with;
+    the full text stays on the single-card reads (``get_feature`` / ``GET
+    /features/{fid}`` / board_get_feature). The key is DROPPED, not blanked — "" would be
+    the same false "empty" all over again."""
+    body = str(f.pop("deliverable", "") or "")
+    flat = " ".join(body.split())
+    if len(flat) > DELIVERABLE_PREVIEW_CHARS:
+        flat = flat[: DELIVERABLE_PREVIEW_CHARS - 1].rstrip() + "…"
+    f["deliverable_chars"] = len(body)
+    f["deliverable_preview"] = flat
+
+
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
 DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
 TIER_LADDER = ["smart", "reasoning", "opus"]
@@ -1950,7 +2031,9 @@ class BeadsBoard:
         second competing record with no verdict between them.
 
         The deliverable and its stamp are written STRICTLY (#399): a failed write raises
-        while the card is still in_progress, so the caller can retry."""
+        while the card is still in_progress, so the caller can retry. Any `## Requirements`
+        dispositions the deliverable carries are applied to the ledger BEST-EFFORT — a
+        failed ledger write never costs the delivery, and open items never refuse it."""
         f = self._require(fid)
         if f.get("issue_type") != LABEL_TASK:
             raise BoardError(
@@ -1964,6 +2047,9 @@ class BeadsBoard:
         # Stripped because that is how `_project` reads it back — the replay check below
         # compares against the read-back, so both sides must be in the same form.
         text = str(text or "").strip()
+        # Read off the deliverable AS WRITTEN, before a path ref is folded onto its end
+        # (where it would ride into the last row's decline reason).
+        dispositions = parse_requirement_dispositions(text)
         ref = str(ref or "").strip()
         parts = urlparse(ref)
         if parts.scheme or parts.netloc:
@@ -2002,6 +2088,21 @@ class BeadsBoard:
         # self-verification check reads that — so it is part of the record, not a note.
         delivered_by = str(f.get("assignee") or "").strip() or self.actor
         self._run("comments", "add", fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
+        # The requirement ledger (#399): a deliverable carrying a `## Requirements`
+        # section — the same `- r2: done` / `- r3: declined — why` rows a coder reports —
+        # has its dispositions applied, whichever door it came through (the loop's
+        # recorded reply, board_deliver, the API). Without this a task's ledger could
+        # never close: every item stayed `open` through a delivery that addressed them.
+        # BEST-EFFORT, the opposite of the writes above, on purpose: the ledger is what a
+        # verifier checks the deliverable against, not the deliverable itself, and the
+        # dispositions still sit in the recorded text — so a failed ledger write is logged
+        # and never costs the delivery. Nothing here gates it on open items either: that
+        # is the verifier's call, and board_verify says what is still open (#399).
+        if dispositions and f.get("requirements"):
+            try:
+                self.set_requirements(fid, apply_requirement_dispositions(f["requirements"], dispositions))
+            except BoardError as exc:
+                log.warning("[project_board] %s requirement dispositions not applied (delivery kept): %s", fid, exc)
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if external_ref:
             args += ["--external-ref", external_ref]
@@ -2758,13 +2859,14 @@ class BeadsBoard:
                     # visible reason is unfixable by design: there is no claim to check,
                     # so no coder can clear it and the card parks forever.
                     #
-                    # TASK rows too (#399), for the same reason: a task's `deliverable`
-                    # and `delivered_by` are read out of its `deliverable:` /
-                    # `delivered-by:` comments, so the listing showed EVERY delivered
-                    # task with an empty deliverable (and the assignee as its deliverer).
-                    # That is not cosmetic — a card whose whole work product is its
-                    # deliverable read as "moved to review, content lost", and was filed
-                    # as a data-loss bug while the text sat intact on the bead.
+                    # TASK rows too (#399): whether a task is delivered, and by whom, is
+                    # read out of its `deliverable:` / `delivered-by:` comments, so the
+                    # listing showed EVERY delivered task with an empty deliverable (and
+                    # the assignee as its deliverer). That is not cosmetic — a card whose
+                    # whole work product is its deliverable read as "moved to review,
+                    # content lost", and was filed as a data-loss bug while the text sat
+                    # intact on the bead. The row gets a small signal, not the body — see
+                    # `_listing_task_signal` below.
                     #
                     # Only those rows, and only from the batch already fetched: this is
                     # a poll-rate endpoint, and the comment thread is the largest field on
@@ -2774,6 +2876,9 @@ class BeadsBoard:
                     if rid and rid in show_by_id and (LABEL_BLOCKED in labels or r.get("issue_type") == LABEL_TASK):
                         r["comments"] = show_by_id[rid].get("comments")
         out = [self._project(r) for r in rows]
+        for f in out:
+            if f.get("issue_type") == LABEL_TASK:
+                _listing_task_signal(f)
         if not include_archived:
             out = [f for f in out if not f["archived"]]
         # Cross-reference the puller's ready queue: a `ready` feature the puller won't
@@ -3076,6 +3181,7 @@ class BeadsBoard:
         # scans never cross-match.)
         delivered_by = bead.get("assignee", "")
         blocked_reason = ""
+        stamped = False
         for c in bead.get("comments") or []:
             txt = _comment_text(c)
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
@@ -3087,6 +3193,7 @@ class BeadsBoard:
                 blocked_reason = txt[len(BLOCKED_REASON_PREFIX) :].strip()
             elif txt.startswith(DELIVERED_BY_PREFIX):
                 delivered_by = txt[len(DELIVERED_BY_PREFIX) :].strip()
+                stamped = True
         # Who verified the task (#316 S3a): the `<by>` from the `verified: <by>` close
         # reason record_verification writes on approval (br exposes it as `close_reason`).
         # Strip the ` (self-verified)` suffix — that flag rides the label, projected as
@@ -3156,6 +3263,11 @@ class BeadsBoard:
             # Operator-notification markers (#341): the alert kinds already delivered to a
             "verified_sha": verified_sha,
             "deliverable": deliverable,
+            # A delivery is ON RECORD (#399): a deliverable, or the `delivered-by:` stamp
+            # every record_delivery writes — the stamp alone covers a ref-only delivery,
+            # which records no text. Like `deliverable` it survives a rejection/requeue,
+            # so pair it with `board_state` to tell "delivered, awaiting verdict" apart.
+            "delivered": bool(deliverable) or stamped,
             "blocked_class": blocked_class,
             "blocked_reason": blocked_reason,
             "delivered_by": delivered_by,

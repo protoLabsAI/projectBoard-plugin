@@ -314,6 +314,19 @@ be retried; repeating a delivery the card already carries is a no-op, and a
 **different** deliverable for a task already in review is refused rather than written
 over the one awaiting verification.
 
+A task's acceptance criteria become the same **requirement ledger** a coding feature
+gets. A deliverable that ends with a `## Requirements` section — one `- r2: done` or
+`- r3: declined — <why>` line per item, the rows a coder reports — closes those items.
+What is left open is **surfaced, never enforced**: `board_get_feature` lists a task's
+`open_requirements`, and a verification's result carries a `note`
+("2 requirement(s) still open: r2, r4"). Neither the delivery nor the approval is
+refused on open items; the verifier decides.
+
+The board listing (`GET /features`) keeps each task row small: `delivered`,
+`deliverable_chars`, `delivered_by` and a short whitespace-collapsed
+`deliverable_preview`, never the full text. The single-card reads
+(`GET /features/{id}`, `board_get_feature`) carry the whole deliverable.
+
 Because a task has no PR to merge, its **Done edge is a verifier's approval**, not
 `record_merge`: `board_verify` (the agent tool) / `POST …/features/{id}/verify` (the
 HTTP API) / `record_verification` (the store) close an approved task with an auditable

@@ -17,16 +17,45 @@ from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
 
+def _ledger_lines(reqs) -> str:
+    """The requirement ledger (#113) as the prompt shows it — one `` - `r1` [open] text``
+    row per item, WITH its current status (a re-dispatch re-injects what is still open).
+    Shared by the coder and task prompts so the ids they are asked to report against,
+    and the row shape, can never drift apart."""
+    return "\n".join(
+        f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
+        + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
+        for r in reqs
+    )
+
+
 class PromptMixin:
     def _build_task_prompt(self, feature: dict) -> str:
         """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
         criteria, framed as a request for a DELIVERABLE (a doc, a decision, an artifact
         ref), NOT a code change — a task has no worktree or PR, and the delegate's reply
-        IS the deliverable ``record_delivery`` records."""
+        IS the deliverable ``record_delivery`` records.
+
+        With a requirement ledger (#399) it also asks for the SAME ``## Requirements``
+        disposition section a coder writes, so ``record_delivery`` can close the items
+        the deliverable addressed. Unlike the coder path nothing gates on it: an item left
+        unreported stays open, and the verifier is told so."""
         title = feature.get("title", "")
         spec = feature.get("spec", "")
         criteria = feature.get("acceptance_criteria", "")
         criteria_block = f"\n## Acceptance criteria (definition of done)\n{criteria}\n" if criteria.strip() else ""
+        reqs = feature.get("requirements") or []
+        req_block = (
+            "\n## Requirements ledger (address EVERY item)\n"
+            f"{_ledger_lines(reqs)}\n\n"
+            "Each item above is tracked on the board. END your deliverable with a "
+            "`## Requirements` section: ONE line per item — `- <id>: done` or "
+            "`- <id>: declined — <concrete reason>`. Declining with a real reason is a "
+            "valid closed state; an item you don't report stays open, and the verifier "
+            "is shown it as still open.\n"
+            if reqs
+            else ""
+        )
         return (
             f"You have been assigned ONE task. Complete it and reply with the "
             f"deliverable — a document, a decision, or a reference to the artifact you "
@@ -35,6 +64,7 @@ class PromptMixin:
             f"# {title}\n\n"
             f"## Task\n{spec}\n"
             f"{criteria_block}"
+            f"{req_block}"
         )
 
     def _build_prompt(self, feature: dict, lessons: str = "") -> str:
@@ -141,14 +171,9 @@ class PromptMixin:
         # (done, or declined with a reason). Silence is not disposition: an
         # unreported item stays open and the completion gate refuses the PR.
         reqs = feature.get("requirements") or []
-        req_lines = "\n".join(
-            f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
-            + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
-            for r in reqs
-        )
         req_block = (
             "\n## Requirements ledger (dispose of EVERY item)\n"
-            f"{req_lines}\n\n"
+            f"{_ledger_lines(reqs)}\n\n"
             "Each item above is tracked on the board. Address every `open` item this "
             "round, and report a per-item disposition: include a `## Requirements` "
             "section in your final message (before the `## Summary`) with ONE line "
