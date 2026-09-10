@@ -1085,6 +1085,17 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     return removed
 
 
+async def commits_ahead(path: str, base: str) -> int:
+    """How many commits the tree at ``path`` has that ``origin/<base>`` does not — the
+    local ``<base>`` when there is no remote ref — i.e. what a PR from it would carry
+    besides uncommitted work. 0 when neither ref resolves (nothing to measure against)."""
+    for ref in (f"origin/{base}", base):
+        rc, out, _err = await _git(path, "rev-list", "--count", f"{ref}..HEAD")
+        if rc == 0:
+            return int(out.strip()) if out.strip().isdigit() else 0
+    return 0
+
+
 def feature_worktrees(repo: str, worktrees_root: str, fid: str) -> list[tuple[str, str]]:
     """``(path, branch)`` for every worktree the CARD ``fid`` owns on disk — its canonical
     ``feat-<id>[-<slug>]`` first, then every candidate ``feat-<id>.<suffix>`` — by the
@@ -1323,7 +1334,14 @@ async def commit_worktree(worktree: str, message: str) -> None:
 
 
 async def open_pr(
-    worktree: str, branch: str, *, base: str = "main", title: str, body: str = "", promote_draft: bool = True
+    worktree: str,
+    branch: str,
+    *,
+    base: str = "main",
+    title: str,
+    body: str = "",
+    promote_draft: bool = True,
+    draft: bool = False,
 ) -> str:
     """Commit + push the worktree's branch and open (or reuse) a PR; return its URL.
 
@@ -1337,7 +1355,11 @@ async def open_pr(
     for the FIRST adoption only (the card has no ``pr_url`` yet, so the draft is the
     coder's, not the operator's). The loop passes ``False`` on a re-dispatch of a card
     that already owns a PR: an operator who converted the loop's own PR to draft as a
-    hold must not have it silently un-drafted by the next CI-fail bounce."""
+    hold must not have it silently un-drafted by the next CI-fail bounce.
+
+    ``draft`` opens a NEW PR as a draft — the operator's forced salvage of a tree whose
+    pre-PR gate is red (#427), which must never read as a green, mergeable PR. (An
+    existing PR for the branch is reused as it is; pass ``promote_draft=False`` with it.)"""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     _rc, out, _err = await _git(worktree, "rev-list", "--count", f"{base}..HEAD")
@@ -1356,8 +1378,20 @@ async def open_pr(
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
+    as_draft = ("--draft",) if draft else ()
     rc, out, err = await _gh(
-        "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body or title, cwd=worktree
+        "pr",
+        "create",
+        "--head",
+        branch,
+        "--base",
+        base,
+        "--title",
+        title,
+        "--body",
+        body or title,
+        *as_draft,
+        cwd=worktree,
     )
     if rc == 0:
         return out.strip()

@@ -310,6 +310,28 @@ Where a failure happens decides what it stops:
 - **`create_worktree` / `promote_worktree`** refuse with `StrandedWorkError` before anything
   moves.
 
+### Publishing a stranded tree without a coder
+
+`board_salvage_feature` / `POST /features/{fid}/salvage` publishes a stranded card's
+worktree on the board's own machinery, with no coder dispatched (#427). It commits what the
+tree holds, runs the pre-PR gate, pushes the branch, opens the PR and moves the card to
+`in_review`. Without it, recovering bd-ezs7's finished work needed a coder, and that day
+the coder delegate was down for an unrelated reason.
+
+- **Only a stranded card:** `in_progress` with no live drive, or `blocked`. A `ready`
+  card could be claimed by the loop mid-publish, so block it first.
+- **Refuses, changing nothing,** while a drive or another salvage owns the card, or when no
+  worktree has changes against base. It also refuses when several worktrees do and `tree`
+  (a `feat-…` directory name or a path) does not pick one.
+- **The gate runs where the tree stands.** A red gate publishes nothing and returns
+  `gate-red` with the output's tail. `force=true` opens the PR anyway, as a **draft** whose
+  body carries that output, and auto-merge never merges a draft.
+- A candidate tree is promoted to the card's own branch first, so every edge after it
+  works as it would for a drive's PR. With `review_gate` on, the card enters review as
+  `review-pending`, so the reconcile runs the gate before anything can merge it.
+- While it runs, the card is reserved like a drive's claim. No sweep requeues it, reaps
+  its trees or auto-unblocks it mid-publish.
+
 ## Blocked cards — self-heal, then page a human
 
 `blocked` carries a **class**, on a `blocked-class:<cls>` label, and the class decides what

@@ -728,6 +728,23 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         await _reap_worktree(fid, f)
         return f
 
+    @router.post("/features/{fid}/salvage")
+    async def _salvage(fid: str, body: dict = Body(default={})):
+        """Publish a stranded card's worktree WITHOUT dispatching a coder (#427): commit what
+        the tree holds, run the pre-PR gate, push, open the PR, move the card to in_review.
+        Body: ``{force?: bool, tree?: str}``. Refuses (409) while a live drive owns the card,
+        for a card that is not stranded (in_progress with no drive, or blocked), or when no
+        worktree — or more than one, unless ``tree`` names one — has changes vs base. A red
+        gate publishes nothing (409, ``gate-red``, with the output's tail) unless
+        ``force: true``, which opens a DRAFT PR whose body carries that output. 200 on
+        ``published``; 404 ``not-found``; 503 ``loop-not-running``; 502 ``error``."""
+        from .loop import request_salvage
+
+        body = body or {}
+        rec = await request_salvage(fid, force=body.get("force") is True, tree=str(body.get("tree") or ""))
+        status = {"published": 200, "not-found": 404, "loop-not-running": 503, "error": 502}.get(rec["outcome"], 409)
+        return JSONResponse(rec, status_code=status)
+
     # ── task-type review lane (#217): deliver → verify, the coder-PR-free siblings
     #    of open_review → record_merge. deliver moves in_progress → in_review;
     #    verify is the task Done edge (approve closes, reject requeues to ready).

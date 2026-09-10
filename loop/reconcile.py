@@ -16,6 +16,31 @@ from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
+# How much of a red gate's output an operator salvage hands back — in its record, and in
+# the body of a forced draft (#427). The tail: that is where a test runner's summary is.
+_SALVAGE_GATE_TAIL_CHARS = 3000
+
+
+async def request_salvage(fid: str, *, force: bool = False, tree: str = "") -> dict:
+    """The seam the salvage route and ``board_salvage_feature`` call (#427): the RUNNING
+    loop's :meth:`ReconcileMixin.salvage`, reached through the process-stable registry
+    exactly as ``request_dispatch`` reaches ``dispatch_now``. A salvage runs the loop's own
+    gate and publish steps under its own claim, so with no loop surface live in this
+    process there is nothing to run it: ``loop-not-running``. (A DISABLED loop is
+    registered, and salvages — publishing needs the loop's config, not its ticking.)"""
+    loop = _loop.live_loop()
+    if loop is None:
+        return {
+            "feature_id": fid,
+            "outcome": "loop-not-running",
+            "detail": "no board loop surface is running in this process — nothing to run the salvage with",
+            "worktree": "",
+            "pr_url": "",
+            "draft": False,
+            "gate_output": "",
+        }
+    return await loop.salvage(fid, force=force, tree=tree)
+
 
 class ReconcileMixin:
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
@@ -172,7 +197,6 @@ class ReconcileMixin:
             if not sha:
                 return False
             repo = self._repo_for(f)
-            base = self._base_branch_for(f)
             title_raw = f.get("title") or ""
             branch = worktree.branch_name(fid, title_raw)
             wt = os.path.join(repo, self.root, worktree.worktree_dir(fid, title_raw))
@@ -199,18 +223,13 @@ class ReconcileMixin:
             # record is written post-promote, so the candidate already holds the
             # canonical name) → fixups → gate → open_pr. The gate re-runs NOW: a
             # candidate that verified before the crash but fails today (base moved,
-            # env changed) is a doubt, not a ship.
+            # env changed) is a doubt, not a ship — so this never forces.
             wt, branch = await worktree.promote_worktree(repo, wt, branch, fid, self.root, title=title_raw)
-            await self._run_fixups(wt, f)
-            if await self._run_local_gate(wt, f) is not None:
+            if await self._gate_tree(f, wt) is not None:
                 log.info("[project_board] %s salvage: gate fails on the candidate now — rebuild fresh", fid)
                 await asyncio.to_thread(self._clear_verified, store, fid)
                 return False
-            title = f"feat: {f.get('title') or fid}"
-            body = await self._with_source_issue_ref(f, wt, _pr_body("", f))
-            pr_url = await worktree.open_pr(
-                wt, branch, base=base, title=title, body=body, promote_draft=not f.get("pr_url")
-            )
+            pr_url = await self._open_tree_pr(f, wt, branch)
             await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
             await asyncio.to_thread(self._clear_verified, store, fid)
             log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
@@ -218,6 +237,162 @@ class ReconcileMixin:
         except Exception:  # noqa: BLE001 — ANY doubt/error → today's rebuild-fresh path
             log.warning("[project_board] %s salvage attempt failed — rebuild fresh", fid, exc_info=True)
             return False
+
+    # ── publishing a tree whose coder is gone (#91 crash salvage, #427 operator salvage) ──
+    # The tail of a drive, for a tree whose coder is gone — shared by the crash salvage of
+    # a verified candidate and the operator's salvage, in two halves so a caller can stop
+    # between them: a red gate must be able to refuse before the tree is touched further.
+    async def _gate_tree(self, f: dict, wt: str) -> str | None:
+        """Fixups, then the pre-PR gate, in ``wt``: ``None`` when green (or when no gate is
+        configured, or it could not run — the drive's own fail-open), else its output."""
+        await self._run_fixups(wt, f)
+        return await self._run_local_gate(wt, f)
+
+    async def _open_tree_pr(self, f: dict, wt: str, branch: str, *, gate_out: str | None = None, note: str = "") -> str:
+        """``open_pr`` for a tree whose coder is gone. ``note`` is appended to the body: how
+        this tree came to be published. ``gate_out`` — a RED gate an operator overrode —
+        opens it as a DRAFT whose body carries that output, so nobody takes it for a green
+        PR and the auto-merge edge (which never merges a draft) leaves it for a human."""
+        fid = f.get("id") or ""
+        body = _pr_body("", f) + (f"\n\n{note}" if note else "")
+        if gate_out is not None:
+            body += (
+                "\n\n## ⚠ The pre-PR gate FAILED on this tree\n\n"
+                "Opened as a draft by an operator override. Fix what the gate reports before "
+                f"marking it ready:\n\n```\n{gate_out[-_SALVAGE_GATE_TAIL_CHARS:]}\n```"
+            )
+        body = await self._with_source_issue_ref(f, wt, body)
+        as_draft = {"draft": True} if gate_out is not None else {}
+        return await worktree.open_pr(
+            wt,
+            branch,
+            base=self._base_branch_for(f),
+            title=f"feat: {f.get('title') or fid}",
+            body=body,
+            promote_draft=not f.get("pr_url") and not as_draft,
+            **as_draft,
+        )
+
+    async def salvage(self, fid: str, *, force: bool = False, tree: str = "") -> dict:
+        """Publish a stranded card's worktree WITHOUT a coder (#427): commit what it holds,
+        run the pre-PR gate, push, open the PR and move the card to ``in_review``.
+        bd-ezs7's finished 170 lines could only be published by dispatching a coder — the
+        one thing that was down that day — so recovery waited on an outage that had
+        nothing to do with the work.
+
+        Refuses, touching nothing, when a live drive (or another salvage) owns the card;
+        when the card is not stranded (only ``in_progress`` with no drive, or ``blocked``
+        — a ``ready`` card could be claimed by the loop mid-publish); when none of its
+        trees has changes vs base; or when several do and ``tree`` (a path, or a
+        ``feat-…`` directory name) does not pick one. A candidate tree is promoted to the
+        canonical name first, so the PR and every edge after it key off ``feat/<id>``
+        exactly as a drive's would. A RED gate publishes nothing (``gate-red``, with the
+        output's tail) unless ``force``, which opens it as a draft carrying that output.
+
+        While it runs the card is reserved in ``_inflight_files`` — the claim a drive holds —
+        so no sweep requeues it, reaps its trees or auto-unblocks it mid-publish, and a
+        second salvage refuses; released on every exit. With ``review_gate`` on, the card
+        enters review ``review-pending``, so the reconcile runs the gate before anything can
+        merge it. Returns ``{outcome, detail, feature_id, worktree, pr_url, draft,
+        gate_output}`` — ``outcome`` one of ``published`` / ``gate-red`` / ``refused`` /
+        ``not-found`` / ``error``."""
+        rec = {
+            "feature_id": fid,
+            "outcome": "refused",
+            "detail": "",
+            "worktree": "",
+            "pr_url": "",
+            "draft": False,
+            "gate_output": "",
+        }
+        if fid in self._inflight_files or _loop.live_drive(fid) is not None:
+            return {**rec, "detail": f"a live drive or another salvage owns {fid} — let it finish, or stop it first"}
+        self._inflight_files[fid] = set()  # reserved before the first await: no other edge gets in
+        try:
+            return await self._salvage(fid, force=force, tree=tree, rec=rec)
+        finally:
+            self._inflight_files.pop(fid, None)
+
+    async def _salvage(self, fid: str, *, force: bool, tree: str, rec: dict) -> dict:
+        store = self._store()
+        f = await asyncio.to_thread(store.get_feature, fid)
+        if not f:
+            return {**rec, "outcome": "not-found", "detail": f"no feature {fid}"}
+        if f.get("issue_type") == LABEL_TASK:
+            return {**rec, "detail": f"{fid} is a task — it ships a deliverable, not a worktree; deliver it instead"}
+        state = str(f.get("board_state") or "")
+        if state not in ("in_progress", "blocked"):
+            hint = " — block it first, or the loop may claim it mid-publish" if state == "ready" else ""
+            return {
+                **rec,
+                "detail": f"only a stranded card can be salvaged (in_progress with no drive, or blocked); "
+                f"{fid} is {state}{hint}",
+            }
+        repo, base = self._repo_for(f), self._base_branch_for(f)
+        trees = []
+        for path, branch in worktree.feature_worktrees(repo, self.root, fid):
+            held = [await worktree.unpublished_work(path, branch=branch)]
+            ahead = await worktree.commits_ahead(path, base)
+            held.append(f"{ahead} commit(s) ahead of {base}" if ahead else "")
+            if any(held):
+                trees.append((path, branch, "; ".join(h for h in held if h)))
+        if tree:
+            trees = [t for t in trees if tree in (t[0], os.path.basename(t[0]))]
+        if not trees:
+            named = f" named {tree!r}" if tree else ""
+            return {**rec, "detail": f"no worktree of {fid}{named} has changes vs {base} — nothing to publish"}
+        if len(trees) > 1:
+            listing = "; ".join(f"{os.path.basename(p)}: {held}" for p, _b, held in trees)
+            return {**rec, "detail": f"{len(trees)} worktrees of {fid} have changes — pick one with `tree`: {listing}"}
+        path, branch, held = trees[0]
+        rec = {**rec, "worktree": path}
+        # The gate runs where the tree IS, before anything moves: a red gate refuses with the
+        # tree exactly where the dead coder left it (bar the formatter's fixups).
+        gate_out = await self._gate_tree(f, path)
+        if gate_out is not None:
+            rec = {**rec, "gate_output": gate_out[-_SALVAGE_GATE_TAIL_CHARS:]}
+            if not force:
+                return {
+                    **rec,
+                    "outcome": "gate-red",
+                    "detail": "the pre-PR gate failed on this tree, so nothing was published — fix it, or "
+                    "pass force=true to open it as a draft carrying the gate output",
+                }
+        try:
+            wt, branch = await worktree.promote_worktree(repo, path, branch, fid, self.root, title=f.get("title") or "")
+            note = (
+                f"Salvaged from `{os.path.basename(path)}` by the operator — no coder was dispatched "
+                f"(#427). It held: {held}"
+            )
+            pr_url = await self._open_tree_pr(f, wt, branch, gate_out=gate_out, note=note)
+        except worktree.NoChangesError as exc:
+            return {**rec, "detail": f"nothing to publish: {exc}"}
+        except worktree.WorktreeError as exc:
+            return {**rec, "outcome": "error", "detail": str(exc)}
+        rec = {**rec, "worktree": wt, "pr_url": pr_url, "draft": gate_out is not None}
+        try:
+            # Under the claim lock, so the ready-queue scan cannot claim the card in the
+            # moment between clearing its block and moving it on.
+            async with self._claim_guard():
+                cur = await asyncio.to_thread(store.get_feature, fid) or {}
+                if cur.get("blocked"):
+                    cur = await asyncio.to_thread(store.clear_blocked, fid) or {}
+                if cur.get("board_state") == "ready":  # blocked after a requeue: take it back
+                    await asyncio.to_thread(store.claim, fid, assignee=self.coder_name)
+                await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+            if self.review_gate:
+                await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
+        except Exception as exc:  # noqa: BLE001 — the PR is open; say so rather than raise
+            return {**rec, "outcome": "error", "detail": f"opened {pr_url}, but could not move {fid} to review: {exc}"}
+        done = f"salvaged by operator: {os.path.basename(path)} → {pr_url}, no coder dispatched" + (
+            " — as a DRAFT: the pre-PR gate failed, and the PR body carries its output" if gate_out is not None else ""
+        )
+        try:
+            await asyncio.to_thread(store.comment, fid, done)
+        except Exception:  # noqa: BLE001 — the trail is best-effort; the PR is the record
+            log.warning("[project_board] %s salvage comment failed", fid, exc_info=True)
+        log.info("[project_board] %s %s", fid, done)
+        return {**rec, "outcome": "published", "detail": done}
 
     async def _recover(self):
         """On boot, reconcile every ``in_progress`` feature the previous run left
@@ -349,6 +524,8 @@ class ReconcileMixin:
             return
         for f in blocked:
             fid = f["id"]
+            if fid in self._inflight_files:
+                continue  # reserved — an operator salvage is publishing it (#427); leave it be
             try:
                 cls = str(f.get("blocked_class") or "").strip()
                 # The reason rides a COMMENT, and `br list` carries none — a list row

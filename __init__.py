@@ -1195,6 +1195,31 @@ def _board_tools(cfg: dict):
         except Exception as exc:  # noqa: BLE001 — never raise into the agent loop (mirror the store verbs)
             return f"Error: {type(exc).__name__}: {exc}"
 
+    @tool
+    async def board_salvage_feature(feature_id: str, force: bool = False, tree: str = "") -> str:
+        """Publish a stranded card's finished work WITHOUT dispatching a coder (#427) — for a
+        card whose worktree already holds the implementation when no coder can (or should)
+        be sent to redo it. Commits what the tree holds, runs the repo's pre-PR gate, pushes
+        the branch, opens the PR and moves the card to in_review, all on the board's own
+        machinery; a candidate tree (`feat-<id>.g1`) is promoted to the card's branch first.
+
+        Only for a STRANDED card: `in_progress` with no live drive, or `blocked`. It
+        refuses, changing nothing, while a drive owns the card, when no worktree of the card
+        has changes vs base, or when several do and `tree` (a `feat-…` directory name or a
+        path) does not pick one. If the pre-PR gate is RED it publishes nothing and returns
+        `outcome: gate-red` with the gate output's tail; `force=true` opens the PR anyway,
+        as a DRAFT whose body carries that output.
+
+        Returns a JSON record: `outcome` (`published` / `gate-red` / `refused` /
+        `not-found` / `error` / `loop-not-running`), `detail`, `worktree`, `pr_url`,
+        `draft`, `gate_output`."""
+        from .loop import request_salvage
+
+        try:
+            return json.dumps(await request_salvage(feature_id, force=bool(force), tree=str(tree or "")))
+        except Exception as exc:  # noqa: BLE001 — never raise into the agent loop (mirror the store verbs)
+            return f"Error: {type(exc).__name__}: {exc}"
+
     tools = [
         board_create_epic,
         board_create_feature,
@@ -1215,6 +1240,7 @@ def _board_tools(cfg: dict):
         board_list,
         board_retro,
         board_dispatch,
+        board_salvage_feature,
     ]
 
     # Runtime project registration (#167). Appended rather than folded in above because
