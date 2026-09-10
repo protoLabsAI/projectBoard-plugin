@@ -1129,12 +1129,17 @@ def _board_tools(cfg: dict):
 
         Returns a JSON decision record. `outcome` is one of: `dispatched` (a card was
         claimed and a drive started — its feature id is in `dispatched`); `empty-queue`
-        (nothing is ready); `at-capacity` (all `max_concurrent` drive slots are full);
+        (nothing is ready, and nothing is held); `held` (nothing is claimable, but cards are
+        held: `held` maps each reason — `dependencies-closed-promote`,
+        `blocked-dependencies-closed`, `ready-waiting-on-dependencies`,
+        `backlog-waiting-on-dependencies`, `blocked:<class>` — to its count, first few ids,
+        and the step that moves it); `at-capacity` (all `max_concurrent` drive slots are full);
         `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
         task-type card was claimed to in_progress awaiting async delivery, holding no
         slot); `all-candidates-held` (every ready card was blocked/held, deferred by the
         hot-file guard, held by a per-project preflight, or lost a claim race — see
-        `skipped`); `loop-disabled` (project_board.loop_enabled=false); or
+        `skipped`, plus `held` for the rest of the board); `loop-disabled`
+        (project_board.loop_enabled=false); or
         `loop-not-running` (no loop surface is live in this process); or `error` (a
         dispatch stage crashed — the fail-closed preflight or the claim scan raised, and
         the record carries the stage and exception rather than raising into the agent

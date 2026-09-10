@@ -231,6 +231,16 @@ a PM's "waiting on the network team" matched `network`, came out `transient`, an
 cleared the hold and requeued the card to `ready`, straight past the Ready gate. A human's
 block is a decision. Only its author knows when it is over (#406).
 
+**The reason is on every read.** It lives in a bead *comment*, and `br list` omits
+comments. Until #416 every list row therefore showed an empty `blocked_reason`: in
+`GET /features`, in `board_list`, and in the sweep's own read. Cards read as terminal with
+no reason while the reason sat one `br show` away. The listing now carries the comment
+thread across for blocked rows, from the batch `br show` it already makes for dependencies,
+so a blocked card's reason shows wherever the card does. The escalation path still re-reads
+a card through `br show` if its reason is somehow empty, because "no reason recorded" tells
+the operator nothing. A terminal block can no longer be written without a reason at all
+(#414).
+
 ### Cards stranded outside the ready lane (#406)
 
 The loop claims only `ready` cards, and only `ready` + `depends_on` is re-checked when a
@@ -250,11 +260,16 @@ and one sweep log line when the card first becomes stranded:
 
 Nothing is promoted or unblocked for you. A card with no recorded `depends_on` is never
 called stranded, because without a recorded edge there is nothing to say has cleared.
+Auto-promoting a stranded backlog card is deliberately out of scope: a backlog card may
+sit there on purpose, and the Ready gate is a decision point, not a formality.
 
-The reason lives in a bead *comment*, and `br list` carries none — so a list row always
-projects an empty reason. The escalating card is deliberately re-read through `br show`
-first, because "no reason recorded" tells the operator nothing and sends them digging,
-which is the thing the alert exists to prevent.
+`board_dispatch` uses the same classification. When nothing is claimable, it no longer
+answers a bare `empty-queue` while cards are held. The outcome is `held`, and the record's
+`held` field maps each reason to its count, first few ids, and the step that moves it.
+The reasons are: `dependencies-closed-promote` and `blocked-dependencies-closed` (the two
+stranded shapes); `ready-waiting-on-dependencies` (the dag gate will release these by
+itself); `backlog-waiting-on-dependencies`; and `blocked:<class>` for every other blocked
+card. `empty-queue` now means nothing is held either.
 
 ### Why the alert doesn't repeat, and when it should
 

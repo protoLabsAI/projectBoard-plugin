@@ -314,3 +314,127 @@ def test_the_snapshot_ranks_a_stranded_backlog_card_right_after_blocked():
     )
     assert [i["id"] for i in work_snapshot.provider()] == ["bd-x", "bd-b", "bd-r"]
     work_snapshot.reset()
+
+
+# ── board_dispatch: when nothing is claimable, say what IS held and what moves it ────
+#
+# `empty-queue` was the whole answer whenever the claim scan found nothing — said on a live
+# board while a ready card waited on an open dependency (#398's thread) and while backlog
+# cards sat stranded (#406). The queue was empty; the board was not.
+
+
+def _dispatch_loop(board, monkeypatch):
+    monkeypatch.setattr(loop_mod, "get_store", lambda **_kw: board)
+    # preflight off: this is about the claim scan's answer, not a gate smoke of tmp_path
+    return BoardLoop({"coder": "proto", "repo": board.repo, "loop_enabled": True, "preflight": False})
+
+
+@requires_br
+async def test_board_dispatch_names_what_is_held_instead_of_a_bare_empty_queue(board, tmp_path, monkeypatch):
+    open_dep = board.create_feature("Still being built", spec="s")["id"]
+    closed_dep = board.create_feature("Already merged", spec="s")["id"]
+    (tmp_path / "target.py").write_text("x = 1\n")
+    ready_waiting = board.create_feature(
+        "Ready, dag-held", spec="s", acceptance_criteria="- WHEN x THE SYSTEM SHALL y", files_to_modify=["target.py"]
+    )["id"]
+    board.add_dependency(ready_waiting, open_dep)
+    board.mark_ready(ready_waiting)
+    backlog_waiting = board.create_feature("Backlog, dependency open", spec="s", depends_on=[open_dep])["id"]
+    stranded = board.create_feature("Backlog, dependency merged", spec="s", depends_on=[closed_dep])["id"]
+    stranded_blocked = board.create_feature("Blocked to wait", spec="s", depends_on=[closed_dep])["id"]
+    held_by_hand = board.create_feature("Vendor hold", spec="s")["id"]
+    _close(board, closed_dep)
+    _tool("board_block_feature").invoke({"feature_id": stranded_blocked, "reason": "wait for the dependency"})
+    _tool("board_block_feature").invoke({"feature_id": held_by_hand, "reason": "vendor API access is pending"})
+
+    out = await _dispatch_loop(board, monkeypatch).dispatch_now()
+
+    assert out["dispatched"] == [] and out["outcome"] == "held"
+    held = out["held"]
+    assert {key: group["ids"] for key, group in held.items()} == {
+        "dependencies-closed-promote": [stranded],
+        "blocked-dependencies-closed": [stranded_blocked],
+        "ready-waiting-on-dependencies": [ready_waiting],
+        "backlog-waiting-on-dependencies": [backlog_waiting],
+        "blocked:terminal": [held_by_hand],
+    }
+    assert "board_mark_ready" in held["dependencies-closed-promote"]["next"]
+    assert "board_unblock_feature" in held["blocked-dependencies-closed"]["next"]
+    assert "by itself" in held["ready-waiting-on-dependencies"]["next"]
+    assert out["detail"].startswith("nothing is claimable, but 5 card(s) are held")
+    assert stranded in out["detail"] and ready_waiting in out["detail"]
+    # a diagnostic: nothing moved
+    assert board.get_feature(ready_waiting)["board_state"] == "ready"
+    assert board.get_feature(stranded)["board_state"] == "backlog"
+
+
+@requires_br
+async def test_board_dispatch_says_empty_queue_only_when_nothing_is_held(board, monkeypatch):
+    board.create_feature("Plain backlog, nothing to wait for", spec="s")
+
+    out = await _dispatch_loop(board, monkeypatch).dispatch_now()
+
+    assert out["outcome"] == "empty-queue" and out["held"] == {}
+    assert out["detail"] == "the ready queue is empty — no card is ready to dispatch"
+
+
+def test_the_held_breakdown_is_bounded():
+    from project_board.loop import drive as drive_mod
+
+    rows = [{"id": f"bd-{n}", "board_state": "blocked", "blocked": True, "blocked_class": "terminal"} for n in range(9)]
+    rows.append({"id": "bd-t", "board_state": "blocked", "blocked": True, "blocked_class": "transient"})
+
+    held = drive_mod._held_summary(rows)
+
+    assert held["blocked:terminal"]["count"] == 9 and held["blocked:terminal"]["ids"] == [f"bd-{n}" for n in range(5)]
+    assert "retries" in held["blocked:transient"]["next"]  # a self-healing class says so
+    sentence = drive_mod._held_sentence(held)
+    assert "9 blocked (terminal) (bd-0, bd-1, bd-2, bd-3, bd-4, …)" in sentence and "bd-8" not in sentence
+
+
+class _Rows:
+    def __init__(self, rows=None, error=None):
+        self.rows, self.error = rows or [], error
+
+    def list_features(self):
+        if self.error:
+            raise self.error
+        return self.rows
+
+
+async def test_all_candidates_held_keeps_its_outcome_and_gains_the_rest_of_the_board(monkeypatch):
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
+    stranded = {
+        "id": "bd-s",
+        "board_state": "backlog",
+        "bead_status": "open",
+        "depends_on": ["bd-d"],
+        "open_depends_on": [],
+    }
+    monkeypatch.setattr(loop, "_store", lambda: _Rows([stranded]))
+    record = {
+        "outcome": "all-candidates-held",
+        "detail": "every ready candidate was passed over (hot-file)",
+        "held": {},
+    }
+
+    await loop._explain_held(record)
+
+    assert record["outcome"] == "all-candidates-held"
+    assert record["held"]["dependencies-closed-promote"]["ids"] == ["bd-s"]
+    assert record["detail"].endswith(". Held across the board: 1 backlog with every dependency closed (bd-s)")
+
+
+async def test_an_unreadable_board_leaves_the_record_as_the_scan_made_it(monkeypatch):
+    """The explanation is extra; a failed read must never turn the diagnostic into an error."""
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
+    monkeypatch.setattr(loop, "_store", lambda: _Rows(error=store_mod.BoardError("`br list` failed: locked")))
+    record = {"outcome": "empty-queue", "detail": "the ready queue is empty — no card is ready to dispatch", "held": {}}
+
+    await loop._explain_held(record)
+
+    assert record == {
+        "outcome": "empty-queue",
+        "detail": "the ready queue is empty — no card is ready to dispatch",
+        "held": {},
+    }

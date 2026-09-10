@@ -44,10 +44,13 @@ def _routes() -> set[tuple[str, str]]:
 
 
 def _tools() -> set[str]:
+    # ASYNC tools too: `board_dispatch` is an `async def`, and an `ast.FunctionDef`-only
+    # match walked straight past it — the one tool whose record changed shape (#406) was
+    # the one this guard could not see.
     return {
         n.name
         for n in ast.walk(ast.parse((_ROOT / "__init__.py").read_text()))
-        if isinstance(n, ast.FunctionDef) and n.name.startswith("board_")
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("board_")
     }
 
 

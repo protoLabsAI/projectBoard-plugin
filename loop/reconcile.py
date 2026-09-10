@@ -379,12 +379,13 @@ class ReconcileMixin:
             fid = f["id"]
             try:
                 cls = str(f.get("blocked_class") or "").strip()
-                # The reason rides a COMMENT, and `br list` carries none — a list row
-                # always projects "". Escalating "no reason recorded" tells the operator
-                # nothing and makes them go digging, which is the thing this alert exists
-                # to prevent, so the one card being escalated is re-read through
-                # get_feature (`br show`). Only on the escalation path: rare, once per
-                # card, never a per-row probe across the whole blocked lane.
+                # The reason rides a COMMENT. `br list` carries none, but since #416 the
+                # listing copies the thread across for blocked rows, so it is normally
+                # here already. If it is still empty, the one card being escalated is
+                # re-read through get_feature (`br show`): escalating "no reason recorded"
+                # tells the operator nothing and sends them digging, which is the thing
+                # this alert exists to prevent. Escalation path only, once per card, never
+                # a per-row probe across the whole blocked lane.
                 reason = str(f.get("blocked_reason") or "").strip()
                 spent = await self._budget_get(store, fid, "unblock-retry", f)
                 if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:

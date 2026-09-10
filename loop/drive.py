@@ -53,6 +53,98 @@ def _is_livelock_skip_reason(reason: str) -> bool:
     return bool(r) and r not in _NON_LIVELOCK_SKIP_REASONS and not r.startswith("state=")
 
 
+# ── what is holding the board when nothing is claimable (board_dispatch, #406) ──────
+# `empty-queue` used to be the whole answer whenever the claim scan found nothing, and on
+# a live board it was said while a ready card sat waiting on an open dependency (#398's
+# thread) and while backlog cards sat stranded with every dependency closed (#406). The
+# queue WAS empty; the board was not. This names what is held and what moves it — using
+# the same classification the listing and the sweep use (store.stranded_posture), so the
+# three surfaces cannot disagree. Bounded: a count per reason and its first few ids.
+_HELD_IDS_MAX = 5
+# (key, label for the detail sentence, the step that moves it). Order is the order they
+# are reported in: the ones owed a step first, then the ones that will move by themselves.
+_HELD_REASONS = (
+    (
+        "dependencies-closed-promote",
+        "backlog with every dependency closed",
+        "board_mark_ready — nothing else promotes it; the Ready gate still applies",
+    ),
+    (
+        "blocked-dependencies-closed",
+        "blocked in backlog, every dependency closed",
+        "read its block reason; if the dependencies were why, board_unblock_feature then board_mark_ready",
+    ),
+    (
+        "ready-waiting-on-dependencies",
+        "ready, waiting on open dependencies",
+        "none — claimable by itself the moment its last dependency closes",
+    ),
+    (
+        "backlog-waiting-on-dependencies",
+        "backlog, waiting on open dependencies",
+        "none yet — once they close it still needs board_mark_ready",
+    ),
+)
+
+
+def _held_summary(feats) -> dict:
+    """``{reason: {count, ids, next}}`` for every open card that is held rather than
+    claimable (#406) — the stranded shapes, dependency waits, and blocked cards by class
+    (``blocked:<class>``). A card lands in ONE reason, the most specific: a blocked card
+    whose dependencies closed is reported as that, not also under its class. Ready cards
+    that are simply claimable, backlog cards with nothing recorded to wait for, and
+    in-flight cards are not "held" and are left out. Pure over projected rows."""
+    groups: dict[str, list[str]] = {}
+    for f in feats or []:
+        fid = str(f.get("id") or "")
+        if not fid:
+            continue
+        state = f.get("board_state")
+        stranded = store_mod.stranded_posture(f)["next_action"]
+        if stranded == store_mod.NEXT_ACTION_DEPS_CLEARED:
+            key = "dependencies-closed-promote"
+        elif stranded == store_mod.NEXT_ACTION_BLOCKED_DEPS_CLEARED:
+            key = "blocked-dependencies-closed"
+        elif f.get("blocked"):
+            key = f"blocked:{f.get('blocked_class') or 'unclassified'}"
+        elif state == "ready" and (f.get("dag_blocked") or f.get("open_depends_on")):
+            key = "ready-waiting-on-dependencies"
+        elif state == "backlog" and f.get("open_depends_on"):
+            key = "backlog-waiting-on-dependencies"
+        else:
+            continue
+        groups.setdefault(key, []).append(fid)
+    steps = {key: step for key, _label, step in _HELD_REASONS}
+    order = [key for key, _label, _step in _HELD_REASONS] + sorted(k for k in groups if k.startswith("blocked:"))
+    held = {}
+    for key in order:
+        ids = groups.get(key)
+        if not ids:
+            continue
+        if key.startswith("blocked:"):
+            cls = key.split(":", 1)[1]
+            step = (
+                f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
+                if cls in _SELF_HEALING_BLOCKS
+                else "read its block reason; a human decides, then board_unblock_feature"
+            )
+        else:
+            step = steps[key]
+        held[key] = {"count": len(ids), "ids": ids[:_HELD_IDS_MAX], "next": step}
+    return held
+
+
+def _held_sentence(held: dict) -> str:
+    """``held`` as one bounded clause for a dispatch record's ``detail``."""
+    labels = {key: label for key, label, _step in _HELD_REASONS}
+    parts = []
+    for key, group in held.items():
+        label = labels.get(key) or f"blocked ({key.split(':', 1)[1]})"
+        more = ", …" if group["count"] > len(group["ids"]) else ""
+        parts.append(f"{group['count']} {label} ({', '.join(group['ids'])}{more})")
+    return "; ".join(parts)
+
+
 # ── on-demand queue dispatch diagnostic (board_dispatch, #390) ────────────────────
 async def request_dispatch() -> dict:
     """Ask the RUNNING board loop to evaluate its ready queue immediately and return its
@@ -77,6 +169,7 @@ async def request_dispatch() -> dict:
             ),
             "skipped": [],
             "parked": [],
+            "held": {},
         }
     return await loop.dispatch_now()
 
@@ -696,6 +789,7 @@ class DriveMixin:
             "max_concurrent": self.max_concurrent,
             "skipped": [],
             "parked": [],
+            "held": {},
         }
 
     def _dispatch_error_record(self, stage: str, exc: Exception, dispatched=None) -> dict:
@@ -717,6 +811,7 @@ class DriveMixin:
             "max_concurrent": self.max_concurrent,
             "skipped": [],
             "parked": [],
+            "held": {},
         }
 
     def _drive_fids(self, tasks) -> list:
@@ -751,11 +846,13 @@ class DriveMixin:
         slot / WIP ceiling / preflight hold holds the scan (r3/r4).
 
         Returns a decision record — ``{dispatched, outcome, detail, running,
-        max_concurrent, skipped, parked}`` — whose ``outcome`` tells the principal cases
-        apart: ``dispatched`` (with the claimed feature id[s] in ``dispatched``),
-        ``empty-queue``, ``at-capacity``, ``review-wip-limit``, ``all-candidates-held``
-        (every ready card was blocked/held/hot-file-deferred or lost a claim race — see
-        ``skipped``), ``parked`` (a task claimed to in_progress awaiting async delivery),
+        max_concurrent, skipped, parked, held}`` — whose ``outcome`` tells the principal
+        cases apart: ``dispatched`` (with the claimed feature id[s] in ``dispatched``),
+        ``empty-queue`` (nothing is claimable AND nothing is held), ``held`` (nothing is
+        claimable, but cards are held — see ``held``, #406), ``at-capacity``,
+        ``review-wip-limit``, ``all-candidates-held`` (every ready card was
+        blocked/held/hot-file-deferred or lost a claim race — see ``skipped``), ``parked``
+        (a task claimed to in_progress awaiting async delivery),
         ``loop-disabled``, or ``error`` (a dispatch stage — the preflight or the claim scan
         — raised unexpectedly; it is captured as a record, never re-raised into the agent
         loop, and any drive already started before the crash is still named in
@@ -785,7 +882,41 @@ class DriveMixin:
                 started = self._drive_fids(set(getattr(self, "_drives", ()) or ()) - drives_before)
                 return self._dispatch_error_record("ready-queue evaluation", exc, dispatched=started)
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
-        return self._dispatch_decision_record(decision)
+        record = self._dispatch_decision_record(decision)
+        if record["outcome"] in ("empty-queue", "all-candidates-held"):
+            await self._explain_held(record)
+        return record
+
+    async def _explain_held(self, record: dict) -> None:
+        """Nothing was claimable — say what IS on the board and what moves it (#406).
+
+        A bare ``empty-queue`` told the PM the board was idle while a ready card waited on
+        an open dependency and a backlog card sat stranded with every dependency closed.
+        When anything is held, the outcome becomes ``held``, ``detail`` names each reason
+        with its count and first ids, and ``held`` carries the same breakdown with the step
+        that moves each (``_held_summary``). ``all-candidates-held`` keeps its outcome, since
+        its ``skipped`` already explains the ready candidates, and gains the board-wide breakdown.
+
+        One fresh board read, on the no-dispatch path only. Best-effort: if the read fails,
+        the record is returned exactly as the scan produced it — the explanation is extra,
+        and must never turn a diagnostic into an error."""
+        try:
+            feats = await asyncio.to_thread(self._store().list_features)
+        except Exception:  # noqa: BLE001 — never fail the diagnostic over its explanation
+            log.warning(
+                "[project_board] board_dispatch: could not read the board to explain what is held", exc_info=True
+            )
+            return
+        held = _held_summary(feats)
+        record["held"] = held
+        if not held:
+            return  # genuinely nothing waiting — a bare empty queue is the honest answer
+        total = sum(group["count"] for group in held.values())
+        if record["outcome"] == "empty-queue":
+            record["outcome"] = "held"
+            record["detail"] = f"nothing is claimable, but {total} card(s) are held: {_held_sentence(held)}"
+        else:
+            record["detail"] += f". Held across the board: {_held_sentence(held)}"
 
     def _dispatch_decision_record(self, decision: dict) -> dict:
         """Turn a ``_spawn_ready`` scan decision into the human-readable dispatch record.
@@ -838,6 +969,7 @@ class DriveMixin:
             "max_concurrent": self.max_concurrent,
             "skipped": skipped,
             "parked": parked,
+            "held": {},
         }
 
     def _make_drive_done_cb(self, fid: str):
