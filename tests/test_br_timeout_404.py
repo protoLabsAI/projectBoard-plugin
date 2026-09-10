@@ -198,6 +198,10 @@ async def test_a_stalled_reconcile_read_does_not_cost_the_claim_scan(
             "loop_enabled": True,
             "loop_interval_s": 60,
             "merge_poll": True,
+            # Due on the first tick whatever the clock says: the poll is gated on
+            # `time.monotonic()`, which on Linux counts from BOOT, and a fresh CI VM can be
+            # younger than the default 60s interval, so the reconcile silently never ran.
+            "merge_poll_interval_s": 0,
             "health_sweep_interval_s": 0,
             "preflight": False,
             "max_pending_reviews": 0,
