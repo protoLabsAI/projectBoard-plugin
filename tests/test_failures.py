@@ -93,6 +93,15 @@ def test_ordinary_not_found_text_is_not_provider_unavailable(msg):
     assert classify(msg).category != "provider_unavailable"
 
 
+def test_without_the_provider_rules_text_falls_through_to_its_real_class():
+    # For text that is NOT a coder dispatch failure (a `gh` error, a reviewer's gap): the
+    # refusal phrase must not hide a transient blip that would otherwise be retried.
+    msg = "gh api failed: 502 — the model `x` does not exist or you do not have access (timeout)"
+    assert classify(msg).category == "provider_unavailable"
+    assert classify(msg, provider_rules=False).category == "transient"
+    assert classify("the model_not_found branch has no test", provider_rules=False) is TERMINAL
+
+
 def test_unknown_falls_back_to_terminal():
     p = classify("???")
     assert p is TERMINAL

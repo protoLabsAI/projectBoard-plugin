@@ -231,10 +231,11 @@ Only a coder DISPATCH failure counts; the same words in a reviewer's gap or a te
 do not.
 
 A provider that refuses its model is remembered for 30 minutes. Later cards start on a live
-sibling instead of each paying a failed dispatch to rediscover it, and a quota rotation
-never lands on it. The mark is a preference, not a verdict: when no live sibling is left, a
-marked provider still gets its real attempt (the operator may have repointed it), and a
-dispatch it serves clears the mark. If every provider on the rung refused its model on this
+sibling instead of each paying a failed dispatch to rediscover it, and a quota failure on
+the live sibling takes its ordinary backoff rather than rotating onto it. The mark is a
+preference, not a verdict: once no live option is left — every other sibling has failed, or
+the quota backoff is spent — a marked provider still gets its one real attempt before the
+card blocks (the operator may have repointed it), and a dispatch it serves clears the mark. If every provider on the rung refused its model on this
 card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
 config problem, and a stronger rung would only hide it. If some were only rate-limited, it
 blocks as `rate_limit`, which the sweep heals on its own. Max-mode swallows each candidate's

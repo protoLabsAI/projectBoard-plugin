@@ -199,7 +199,8 @@ LABEL_READY = "ready"
 LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
 # WHY a feature is blocked, as the failure classifier's category (failures.classify):
-# `blocked-class:transient` / `-rate-limit` / `-merge-conflict` / `-auth` / `-terminal`.
+# `blocked-class:transient` / `-rate-limit` / `-merge-conflict` / `-auth` / `-terminal` /
+# `-provider-unavailable` (#420), plus the loop's own `-dispatch-infra` (#339).
 # A single REPLACED label (the `gens:` pattern) so the projection can tell a block that
 # will clear itself from one that needs a human — WITHOUT a `br show` per card to read
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label

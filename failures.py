@@ -69,10 +69,17 @@ _RULES: tuple[tuple[str, Policy], ...] = (
 TERMINAL = Policy("terminal", False, 0.0, 1)
 
 
-def classify(error: str) -> Policy:
-    """Classify an error message → a retry :class:`Policy`. Unknown → ``TERMINAL``."""
+def classify(error: str, *, provider_rules: bool = True) -> Policy:
+    """Classify an error message → a retry :class:`Policy`. Unknown → ``TERMINAL``.
+
+    ``provider_rules=False`` skips the ``provider_unavailable`` rule, for text that is not
+    a coder dispatch failure: a reviewer's gap or a `gh` error that happens to quote a
+    refusal phrase says nothing about the coder's provider, and must fall through to the
+    class it would otherwise have (a `502 … timeout` is still transient)."""
     text = (error or "").lower()
     for pattern, policy in _RULES:
+        if not provider_rules and policy.category == "provider_unavailable":
+            continue
         if re.search(pattern, text):
             return policy
     return TERMINAL

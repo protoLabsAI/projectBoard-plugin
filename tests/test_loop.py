@@ -10446,12 +10446,13 @@ async def test_the_next_card_skips_a_provider_the_last_one_found_dead(monkeypatc
 
 
 @pytest.mark.parametrize("cursor", [0, 1])
-async def test_a_quota_on_the_only_live_sibling_backs_off_instead_of_dispatching_the_dead_one(monkeypatch, cursor):
+async def test_a_quota_on_the_only_live_sibling_backs_off_before_touching_the_marked_one(monkeypatch, cursor):
     """The two policies must not feed each other. codex is marked dead and sonnet hits its
-    quota. A quota rotation onto codex would re-dispatch a provider known to refuse, and
-    then block the card as "no live provider" when all the rung needed was a backoff — and
-    it did exactly that for every card whose cursor opened on sonnet (review of #421).
-    Whichever sibling the card opens on, sonnet takes the ordinary backoff."""
+    quota. A quota ROTATION onto codex would re-dispatch a provider known to refuse and
+    then block the card as "no live provider" when the rung needed a backoff — the first
+    cut did exactly that for every card whose cursor opened on sonnet. So sonnet takes its
+    full backoff first, whichever sibling the card opens on; only once that is spent does
+    marked codex get its ONE real attempt (the mark may be stale) before the card blocks."""
     loop_mod.mark_provider_down("codex")
     seen: list[str] = []
 
@@ -10462,9 +10463,36 @@ async def test_a_quota_on_the_only_live_sibling_backs_off_instead_of_dispatching
     loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=cursor)
     await loop._drive({"id": "bd-q", "title": "t", "spec": "s"})
 
-    assert set(seen) == {"sonnet"} and len(seen) == classify(_SESSION_LIMIT).max_attempts
+    backoff = classify(_SESSION_LIMIT).max_attempts
+    assert seen == ["sonnet"] * backoff + ["codex"], seen
     blocked = _blocks(store)
     assert len(blocked) == 1 and blocked[0][2].startswith("rate_limit:")
+
+
+async def test_a_stale_mark_is_tried_before_a_quota_blocks_the_card(monkeypatch):
+    """The other side of the same rule: codex was marked, the operator has since repointed
+    it at a live model, and sonnet is out of quota. Once sonnet's backoff is spent, codex
+    gets its real attempt — and ships — instead of the card blocking with a working
+    provider sitting untried for the rest of the mark (review of #421's rework)."""
+    loop_mod.mark_provider_down("codex")
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        if coder == "sonnet":
+            raise worktree.WorktreeError(_SESSION_LIMIT)
+        return "done"  # repaired codex serves
+
+    async def _no_commits(*_a, **_kw):
+        raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=1)
+    monkeypatch.setattr(worktree, "open_pr", _no_commits)  # end the drive after the dispatch
+    await loop._drive({"id": "bd-s", "title": "t", "spec": "s"})
+
+    assert seen[-1] == "codex" and set(seen[:-1]) == {"sonnet"}
+    assert not loop_mod.provider_is_down("codex")  # it served — the stale mark is gone
+    assert all(not c[2].startswith("rate_limit:") for c in _blocks(store))
 
 
 async def test_a_repaired_provider_is_dispatched_despite_its_mark_and_the_mark_clears(monkeypatch):
@@ -10546,6 +10574,89 @@ async def test_a_fix_round_rotated_by_a_provider_failure_keeps_its_worktree(monk
     assert [c for c, _ in calls[:3]] == ["codex", "codex", "sonnet"]
     assert calls[2][1] == calls[0][1], f"the sibling rebuilt instead of continuing the fix round: {calls}"
     assert len(creates) == 1
+
+
+@pytest.mark.parametrize(
+    "cfg,rotates",
+    [({"coder": "codex"}, False), ({"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}, True)],
+    ids=["single-provider-retry", "rotate-then-retry"],
+)
+async def test_a_fix_round_keeps_its_worktree_across_a_quota_retry(monkeypatch, cfg, rotates):
+    """The rotation path kept a fix round's worktree, but the RETRY path beside it did not:
+    a fix-round dispatch that hit a quota, backed off and re-dispatched rebuilt from scratch
+    over the implementation, with feedback still saying "your work is ALREADY in this
+    worktree" (review of #421's rework — on a single-provider rung this predates #420)."""
+    calls: list[tuple[str, str]] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        calls.append((coder, wt))
+        if len(calls) == 1:
+            return "built it"  # the build; the goal check then finds a gap
+        if len(calls) <= (3 if rotates else 2):
+            raise worktree.WorktreeError(_SESSION_LIMIT)  # the fix round is rate-limited
+        raise worktree.NoChangesError("coder produced no commits")  # ends the drive
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=cfg)
+    creates: list[str] = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        creates.append(fid)
+        return (f"/wt/feat-{fid}-{len(creates)}", f"feat/{fid}")
+
+    gaps = iter(["missing tests"])
+
+    async def _gap(feature, wt, base, reply=""):
+        return next(gaps, None)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(loop, "_verify_goal", _gap)
+    loop.goal_verify = True
+    await loop._drive({"id": "bd-k", "title": "t", "spec": "s"})
+
+    assert len(creates) == 1, f"a quota retry rebuilt the fix round's worktree: {calls}"
+    assert {w for _, w in calls} == {calls[0][1]}
+
+
+async def test_a_refusal_phrase_in_a_goal_gap_blocks_under_its_real_class(monkeypatch):
+    """The downgrade has to reach the LABEL, not just the reason prefix: the store used to
+    re-classify the reason text, reading `model_not_found` in a reviewer's gap straight back
+    into `blocked-class:provider-unavailable` (review of #421's rework)."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        raise worktree.WorktreeError("goal verification failed: no test covers the model_not_found branch")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER)  # no climbs left → it blocks
+    await loop._drive({"id": "bd-t", "title": "t", "spec": "s"})
+
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][3] == "terminal", blocked
+
+
+async def test_the_coder_solve_path_rotates_a_refusal_without_climbing(monkeypatch):
+    """#420's production failure came through coder.solve ("coder.solve raised mid-ladder",
+    bd-56dr): solve() re-raises the dispatch's own error, so the same rotation must apply."""
+    seen: list[str] = []
+
+    async def _never(*_a, **_kw):
+        raise AssertionError("the plain dispatch must not run on the solve path")
+
+    async def _solve_dispatch(*, coder, fid, **_kw):
+        seen.append(coder)
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        return (f"/wt/feat-{fid}", f"feat/{fid}", "solved")
+
+    async def _pr(*_a, **_kw):
+        return "https://example/pr/1"
+
+    loop, store = _rung_env(monkeypatch, _never, cfg=_LADDER, tiers=["reasoning"])
+    monkeypatch.setattr(loop, "_use_coder_solve", lambda feature: True)
+    monkeypatch.setattr(coder_seam, "dispatch", _solve_dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _pr)
+    await loop._drive({"id": "bd-56dr", "title": "t", "spec": "s"})
+
+    assert seen == ["codex", "sonnet"] and store.escalated == []
+    assert any(c[0] == "open_review" for c in store.calls)
 
 
 def test_a_down_mark_only_ever_reorders_the_rung():

@@ -50,7 +50,7 @@ import time
 import types
 
 from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
-from ..failures import PRE_MODEL_DISPATCH_CLASS, TERMINAL, classify, is_pre_model_dispatch_failure
+from ..failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
 from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
@@ -877,7 +877,13 @@ def provider_is_down(name: str, *, now: float | None = None) -> bool:
 
 
 def rotation_target(
-    category: str, siblings: list[str], current: int, spent: set[str], *, now: float | None = None
+    category: str,
+    siblings: list[str],
+    current: int,
+    spent: set[str],
+    *,
+    now: float | None = None,
+    ignore_marks: bool = False,
 ) -> int | None:
     """Which sibling at this rung a PROVIDER failure should move to — or ``None`` to stay
     (#362, #420). The next sibling after ``current``, in rung order, that has not already
@@ -899,6 +905,10 @@ def rotation_target(
     * a REFUSAL does. The mark is evidence, not a verdict: a delegate the operator has
       since repointed at a live model must get its real attempt before the card blocks.
 
+    ``ignore_marks`` is the quota path's LAST resort: once its backoff on the live sibling
+    is spent, a marked sibling gets that real attempt too, rather than the card blocking
+    while a possibly-repaired provider sits untried.
+
     Kept pure and separate from the drive loop so the POLICY is testable on its own — the
     decision is the whole feature, and it was previously buried in a 565-line function
     where the only way to exercise it was to drive an entire card."""
@@ -909,7 +919,7 @@ def rotation_target(
         i = (current + step) % n
         if siblings[i] in spent:
             continue
-        if category == "rate_limit" and provider_is_down(siblings[i], now=now):
+        if category == "rate_limit" and not ignore_marks and provider_is_down(siblings[i], now=now):
             continue
         return i
     return None
@@ -1279,7 +1289,6 @@ __all__ = [
     "work_snapshot",
     "worktree",
     "PRE_MODEL_DISPATCH_CLASS",
-    "TERMINAL",
     "classify",
     "is_pre_model_dispatch_failure",
     "resolve_default_project",

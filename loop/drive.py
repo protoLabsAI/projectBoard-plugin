@@ -1552,11 +1552,17 @@ class DriveMixin:
                     # reviewer's gap, a failing test's output or a `gh` error say nothing
                     # about the coder's provider — a gap quoting `model_not_found` would
                     # otherwise mark a working provider down and block the card (#420 review).
-                    provider_failure = policy.category in _ROTATABLE_CATEGORIES and str(exc).startswith(
-                        "coder dispatch failed"
-                    )
-                    if policy.category == "provider_unavailable" and not provider_failure:
-                        policy = TERMINAL
+                    # Such text is re-classified WITHOUT the provider rule, so it lands in the
+                    # class it would otherwise have had (a `502 … timeout` stays transient).
+                    dispatch_error = str(exc).startswith("coder dispatch failed")
+                    if policy.category == "provider_unavailable" and not dispatch_error:
+                        policy = classify(str(exc), provider_rules=False)
+                    provider_failure = dispatch_error and policy.category in _ROTATABLE_CATEGORIES
+                    # A dispatch that failed on a fix round's KEPT worktree left it untouched:
+                    # its files hold the implementation and the feedback says so. Whatever
+                    # re-dispatches next — a sibling, or the same provider after a backoff —
+                    # continues THAT round on THAT worktree, never a rebuild over it.
+                    keep_for_retry = reusing and wt is not None and dispatch_error
                     # Empty result (#198, retry policy #2991): a dispatch that COMPLETED
                     # with no worktree diff AND no tool-call activity is its own failure
                     # class — the coder connected but never executed. That is often a
@@ -1697,10 +1703,7 @@ class DriveMixin:
                             mark_provider_down(coder_name)
                         target = rotation_target(policy.category, siblings, sib, spent_here)
                         if target is not None:
-                            # A fix round's worktree holds the implementation and the feedback
-                            # says so; the sibling continues THAT round, on THAT worktree. A
-                            # provider failure left it untouched — nothing to rebuild.
-                            if reusing and wt is not None:
+                            if keep_for_retry:
                                 keep_wt = True
                             log.info(
                                 "[project_board] %s %s on %s — switching to %s at the same rung "
@@ -1715,6 +1718,8 @@ class DriveMixin:
                             continue
                     if policy.retryable and not capability and retries < policy.max_attempts - 1:
                         retries += 1
+                        if keep_for_retry:
+                            keep_wt = True
                         log.info(
                             "[project_board] %s %s — retry %d/%d in %ss: %s",
                             fid,
@@ -1726,6 +1731,27 @@ class DriveMixin:
                         )
                         await asyncio.sleep(policy.base_delay_s)
                         continue
+                    # 1.2 A QUOTA failure whose backoff is spent, with a sibling it skipped only
+                    #     because that one is MARKED as refusing its model (#420) → give the
+                    #     marked one its real attempt before blocking. The mark may be stale
+                    #     (the operator repointed that delegate), and the card was about to
+                    #     block anyway, so this can only help: it either serves, refuses (and
+                    #     1.4 says so truthfully), or rate-limits too.
+                    if provider_failure and policy.category == "rate_limit":
+                        target = rotation_target(policy.category, siblings, sib, spent_here, ignore_marks=True)
+                        if target is not None:
+                            if keep_for_retry:
+                                keep_wt = True
+                            log.info(
+                                "[project_board] %s rate_limit backoff spent on %s — trying %s, marked as "
+                                "refusing its model, before blocking: %s",
+                                fid,
+                                coder_name,
+                                siblings[target],
+                                str(exc)[:120],
+                            )
+                            sib = target
+                            continue
                     # 1.4 No provider at this rung can take the card, and the last one REFUSED
                     #     its model (#420) → block, no tier climb. Every sibling has now
                     #     failed this card with a provider failure (rotation above ran out),
@@ -1827,7 +1853,12 @@ class DriveMixin:
                             continue
                     # 3. Terminal, or retries/ladder exhausted → Blocked.
                     log.warning("[project_board] %s blocked (%s): %s", fid, policy.category, exc)
-                    await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+                    # The class is passed, not re-derived from the reason text: the store's own
+                    # classify() would read a refusal phrase quoted in a goal gap back into
+                    # `provider-unavailable`, undoing the re-classification above.
+                    await asyncio.to_thread(
+                        store.flag_blocked, fid, f"{policy.category}: {exc}", category=policy.category
+                    )
                     # #378: a card that has now timed out repeatedly is not model-limited, it
                     # is too wide — and nothing in the block path says so, which is how one
                     # sat parked while an operator guessed. Ask the board's own agent to split
