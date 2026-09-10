@@ -226,13 +226,21 @@ coders:
 
 Climbing a rung means "a stronger model may succeed". Rotating within one means "this
 model is fine, its provider is not" — a spent quota, or a provider that refuses the model
-outright (retired, not offered on the account's plan, or needing a newer client; #420). A
-provider that refuses its model is also remembered for 30 minutes, so later cards skip it
-rather than each paying a failed dispatch to rediscover it; a dispatch it serves clears the
-mark. When every provider on a rung refuses its model, the card blocks under
-`dispatch-infra` naming the delegates, and does not climb: that is a config problem, and a
-stronger rung would only hide it. A card's STARTING rung comes from its difficulty, so a
-`medium` card never touches rung 1.
+outright (retired, not offered on the account's plan, or needing a newer client; #420).
+Only a coder DISPATCH failure counts; the same words in a reviewer's gap or a test's output
+do not.
+
+A provider that refuses its model is remembered for 30 minutes. Later cards start on a live
+sibling instead of each paying a failed dispatch to rediscover it, and a quota rotation
+never lands on it. The mark is a preference, not a verdict: when no live sibling is left, a
+marked provider still gets its real attempt (the operator may have repointed it), and a
+dispatch it serves clears the mark. If every provider on the rung refused its model on this
+card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
+config problem, and a stronger rung would only hide it. If some were only rate-limited, it
+blocks as `rate_limit`, which the sweep heals on its own. Max-mode swallows each candidate's
+error, so neither rotation applies there.
+
+A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 
 Rotation needs escalation on, and escalation needs at least two DISTINCT rungs — a map with
 a single rung (`coders: {smart: [codex, sonnet]}`) runs as a one-coder board using `coder`.
