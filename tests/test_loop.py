@@ -10167,6 +10167,42 @@ async def test_the_same_incident_dedups_by_key_across_sweeps_and_restarts(monkey
     assert added[0]["window"] >= 24 * 3600
 
 
+async def test_the_log_says_notified_only_when_the_inbox_took_the_alert(monkeypatch, tmp_path, caplog):
+    """The inbox dedups a stayed-blocked card to ONE item, but the sweep logged
+    "operator notified" on every pass: twelve WARNINGs an hour for one alert, which read
+    as an alert storm while diagnosing a board (bd-3ya8, 2026-09-10). `InboxStore.add`
+    returns None when it dedups — say "notified" only when it returned a row."""
+    import sys
+    import types as _types
+
+    seen_keys: set[str] = set()
+
+    class _RealShapedInbox:  # the host contract: the row on insert, None when deduped
+        def __init__(self, db_path, *, dedup_window_s=300):
+            pass
+
+        def add(self, text, *, priority="next", source="", dedup_key=""):
+            if dedup_key in seen_keys:
+                return None
+            seen_keys.add(dedup_key)
+            return {"id": len(seen_keys), "text": text}
+
+    fake = _types.ModuleType("inbox")
+    fake.InboxStore = _RealShapedInbox
+    monkeypatch.setitem(sys.modules, "inbox", fake)
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: tmp_path / "agent.db")
+    store = _BlockedStore([_blocked("bd-3ya8", "terminal", reason="coder dispatch failed: delegate refused")])
+
+    with caplog.at_level("DEBUG", logger="protoagent.plugins.project_board"):
+        for _ in range(3):
+            await BoardLoop({"coder": "proto"})._recover_blocked(store)
+
+    notified = [r for r in caplog.records if "operator notified" in r.getMessage()]
+    assert len(notified) == 1 and notified[0].levelname == "WARNING"
+    already = [r for r in caplog.records if "already notified" in r.getMessage()]
+    assert len(already) == 2 and all(r.levelname == "DEBUG" for r in already)
+
+
 async def test_a_different_failure_on_the_same_card_is_a_new_incident(monkeypatch, tmp_path):
     """The point of keying on the incident: a card that recovers and blocks again for a
     DIFFERENT reason is news, and must alert even though the card id is unchanged."""
