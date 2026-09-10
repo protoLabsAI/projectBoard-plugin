@@ -287,10 +287,16 @@ class DriveMixin:
             db = _loop._inbox_db_path()
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
-            InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S).add(
+            row = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S).add(
                 text, priority="now", source="project_board", dedup_key=key
             )
-            log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
+            if row is None:
+                # Deduped (`add` returns None): the operator already has THIS incident. The
+                # sweep re-runs every few minutes, and logging "operator notified" on each
+                # pass read as an alert storm — twelve WARNINGs an hour for one inbox item.
+                log.debug("[project_board] %s still blocked — operator already notified of this incident", fid)
+            else:
+                log.warning("[project_board] %s blocked — operator notified: %s", fid, text[:160])
         except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
             log.warning(
                 "[project_board] %s blocked and NOT self-healing (no operator inbox reachable): %s",
