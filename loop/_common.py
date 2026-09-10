@@ -1108,6 +1108,39 @@ def live_loop():
     return _loop_slot().loop
 
 
+def worked_by_the_loop(fid: str) -> str:
+    """What the loop is doing with ``fid`` right now, or ``""`` when nothing (#398). Three
+    signals span a card's time in the loop's hands: a live drive task (the process-stable
+    registry the cancel verbs read), a claimed build's file hold, and a running review gate.
+    The review reconcile applies this same liveness guard before it touches a card (#340,
+    #323), and so does #437's attach."""
+    if _loop.live_drive(fid) is not None:
+        return "a coder drive is still building it"
+    loop = _loop.live_loop()
+    if loop is not None and (fid in loop._inflight_files or fid in loop._review_inflight):
+        return "the loop is still working it (a claimed build or a running review gate)"
+    return ""
+
+
+def requeue_refusal(fid: str) -> str:
+    """Why ``fid`` must not be requeued right now, or ``""`` (#398). Every edge that puts a
+    card back to ready from outside the loop — board_requeue_feature, board_requeue_ci_fix,
+    POST /features/{fid}/ci and /review — refuses while the loop is still working it. A
+    requeue pulled `bd-p8ft` out from under its own live CI-fix round. The round's hand-off
+    then failed and the card went terminal with an open PR, and a first build requeued the
+    same way loses its finished work to the rebuild. Refused, not overridden: the round
+    moves the card on by itself when it ends."""
+    doing = worked_by_the_loop(fid)
+    if not doing:
+        return ""
+    return (
+        f"{fid} can't be requeued while {doing} — a requeue now would pull the card out from "
+        "under a round that has not finished. Wait for the round to end (it moves the card on by "
+        "itself, and you can requeue from there), or cancel the card (board_cancel_feature) if the "
+        "build must stop"
+    )
+
+
 def reset_merged_verify_budget(fid: str, store) -> bool:
     """Invalidate the live loop's in-process merged-verify budget for ``fid`` so an
     operator's budget reset takes effect on the NEXT reconcile without a host restart
@@ -1363,6 +1396,8 @@ __all__ = [
     "_register_drive",
     "_unregister_drive",
     "live_drive",
+    "worked_by_the_loop",
+    "requeue_refusal",
     "request_drive_cancel",
     "_LOOP_SLOT_PREFIX",
     "_loop_slot",

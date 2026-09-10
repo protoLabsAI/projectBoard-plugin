@@ -240,6 +240,12 @@ def build_router(cfg: dict):
         reason = str(body.get("reason", ""))
 
         def _handle():
+            # Never under a live round (#398) — both branches below move the card.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(fid)
+            if refusal:
+                raise BoardError(refusal)
             s = store()
             if not escalate_on:
                 return {"requeued": False, "escalated": False, "feature": s.bounce_ci_fail(fid, reason)}
@@ -273,6 +279,13 @@ def build_router(cfg: dict):
         escalate = bool(body.get("escalate", False))
 
         def _handle():
+            # Never under a live round (#398): the review gate runs inside the drive, so a
+            # bounce landing then would requeue the card out from under it.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(fid)
+            if refusal:
+                raise BoardError(refusal)
             s = store()
             # Distinct review-bounce comment on the bead (enforces in_review), then hand
             # the findings to the loop so its next dispatch prompt LEADS with them — the
