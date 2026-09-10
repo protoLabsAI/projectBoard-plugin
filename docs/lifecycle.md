@@ -224,6 +224,33 @@ happens next. Every sweep, the loop walks the blocked lane:
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
+A block set **by hand** (`board_block_feature`, `POST …/block`) is always `terminal`, so it
+is never cleared automatically. The class of a loop-set block is inferred from its reason
+by the coder-failure classifier. That classifier reads prose as if it were an error message:
+a PM's "waiting on the network team" matched `network`, came out `transient`, and the sweep
+cleared the hold and requeued the card to `ready`, straight past the Ready gate. A human's
+block is a decision. Only its author knows when it is over (#406).
+
+### Cards stranded outside the ready lane (#406)
+
+The loop claims only `ready` cards, and only `ready` + `depends_on` is re-checked when a
+dependency closes (the dag gate releases it by itself). A card left in **backlog** to wait
+for its dependencies, or **blocked** in backlog for the same reason, is never looked at
+again once they close. It is not a claim candidate and it shows up in no skip diagnostic.
+So the board now names it, wherever a card's next action is shown: the listing, the
+console chip, the agent's working state (which names a backlog card only when it owes a step),
+and one sweep log line when the card first becomes stranded:
+
+- **backlog, every dependency closed** → `dependencies closed — promote`. The step is
+  `board_mark_ready`, and the Ready gate still decides. A `deferred` or `designing` card is
+  excluded because it is parked for another reason.
+- **blocked in backlog, every dependency closed** → `blocked — dependencies closed`. The
+  block may have been only that wait, or it may be unrelated, so it is **surfaced, never
+  cleared**. The operator gets one more alert when the last dependency closes.
+
+Nothing is promoted or unblocked for you. A card with no recorded `depends_on` is never
+called stranded, because without a recorded edge there is nothing to say has cleared.
+
 The reason lives in a bead *comment*, and `br list` carries none — so a list row always
 projects an empty reason. The escalating card is deliberately re-read through `br show`
 first, because "no reason recorded" tells the operator nothing and sends them digging,

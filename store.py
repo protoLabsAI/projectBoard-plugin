@@ -206,6 +206,15 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
+# The class a block set BY HAND always carries (#406): the board_block_feature tool and
+# POST /features/{fid}/block, a person or the PM parking a card on something outside the
+# board. `flag_blocked` otherwise infers a class from the reason with the coder-failure
+# classifier, and that classifier reads prose as an error message: "waiting on the network
+# team" matched `network` → transient, and the blocked sweep cleared the hold and REQUEUED
+# the card to ready — promoting a backlog card straight past the Ready gate. A human's
+# block is a decision, not a failure; only its author knows when it is over, so it is
+# never self-healing.
+MANUAL_BLOCK_CLASS = "terminal"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -3157,6 +3166,13 @@ NEXT_ACTION_CI_FAILING = "ci failing"
 # requeue (set_review_substate never dropped it) — it is cleared only when the re-review
 # re-arms to `review-pending`, so this fires precisely while the fix round is live.
 NEXT_ACTION_FIXING_REVIEW = "fixing review findings"
+# #406: a card OUTSIDE the ready lane whose every dependency has closed. The loop claims
+# only `ready` cards and re-evaluates only `ready` + `depends_on` (the dag gate), so a card
+# left in backlog — or blocked there — to wait for its dependencies is never looked at
+# again once they close: it is not a claim candidate, it is in no skip diagnostic, and it
+# sat waiting on a `mark_ready` nobody knew was owed. These name the verb that moves it.
+NEXT_ACTION_DEPS_CLEARED = "dependencies closed — promote"
+NEXT_ACTION_BLOCKED_DEPS_CLEARED = "blocked — dependencies closed"
 
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
 
@@ -3427,16 +3443,64 @@ def review_fix_posture(feature: dict) -> dict:
     return out
 
 
+def stranded_posture(feature: dict) -> dict:
+    """The stranded-card sibling of ``review_fix_posture`` (#406): a card outside the
+    ready lane whose recorded dependencies have ALL closed, so nothing on the board is
+    left waiting except a verb only the PM or a human can run. Same ``{"next_action",
+    "awaiting_merge", "next_action_hint"}`` shape; labels, state and the row's own
+    ``depends_on`` / ``open_depends_on`` only, no per-row network.
+
+    Two shapes, told apart because only one of them is safe to act on blind:
+
+    * **backlog** → ``dependencies closed — promote``: never promoted, and every card it
+      waited on is done. Promoting it is the whole remaining step, and the Ready gate still
+      decides whether it is fit to build. A ``deferred`` or ``designing`` backlog card is
+      excluded — it is parked on purpose, for something other than its dependencies.
+    * **blocked in backlog** (never promoted, so never the loop's to block — the loop only
+      blocks ready and in-flight cards, and those are not included) →
+      ``blocked — dependencies closed``: every dependency closed, but the block is someone's
+      decision with its own reason, and that reason may be unrelated. It is surfaced, and
+      NEVER cleared on anyone's behalf.
+
+    Empty for everything else, and for a card with no dependencies at all: without a
+    recorded edge there is nothing to say has cleared. ``ready`` + ``depends_on`` is not
+    here either — that one the dag gate already releases on its own."""
+    out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    deps = [str(d) for d in feature.get("depends_on") or [] if str(d)]
+    if not deps or feature.get("open_depends_on"):
+        return out
+    fid = feature.get("id", "")
+    labels = set(feature.get("labels") or [])
+    closed = ", ".join(deps)
+    state = feature.get("board_state")
+    if state == "backlog":
+        if feature.get("bead_status") == "deferred" or LABEL_DESIGNING in labels:
+            return out
+        out["next_action"] = NEXT_ACTION_DEPS_CLEARED
+        out["next_action_hint"] = (
+            f"every card it depends on has closed ({closed}) — promote it with board_mark_ready({fid}); "
+            "the Ready gate still applies"
+        )
+    elif state == "blocked" and feature.get("bead_status") == "open" and LABEL_READY not in labels:
+        out["next_action"] = NEXT_ACTION_BLOCKED_DEPS_CLEARED
+        out["next_action_hint"] = (
+            f"every card it depends on has closed ({closed}), but a block is never cleared for you — "
+            f"if they were why it was blocked, board_unblock_feature({fid}) then board_mark_ready({fid})"
+        )
+    return out
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — a coding ``in_review`` card from the board's config
     (``auto_merge``, ``review_gate``, via ``merge_posture``) and a task-type bead via
     ``task_posture``: ``awaiting verification`` for a delivered ``in_review`` task (its
     record_verification Done edge, ADR 0078) and ``awaiting deliverable`` for a parked
-    ``in_progress`` one (#305). A task is routed to ``task_posture`` first, so the coding
-    review-gate wording never lands on it. Labels + config only, no per-row network. Rows in
-    any other state are left untouched (the payload shape for them is unchanged). Mutates and
-    returns ``feats``.
+    ``in_progress`` one (#305); and a backlog or backlog-blocked card whose every
+    dependency has closed, via ``stranded_posture`` (#406). A task is routed to
+    ``task_posture`` first, so the coding review-gate wording never lands on it. Labels +
+    config only, no per-row network. Rows in any other state are left untouched (the
+    payload shape for them is unchanged). Mutates and returns ``feats``.
 
     ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
     routers and the tools alike; ``BoardLoop.reload`` writes every changed live knob
@@ -3475,6 +3539,8 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         # merge_posture's precedence unchanged (ADR 0078: task verification is a SEPARATE edge).
         if f.get("issue_type") == LABEL_TASK:
             posture = task_posture(f, is_driven=is_driven)
+            if not posture["next_action"]:
+                posture = stranded_posture(f)  # #406: a task waits on dependencies the same way
             if posture["next_action"]:
                 f["next_action"] = posture["next_action"]
                 f["awaiting_merge"] = posture["awaiting_merge"]
@@ -3483,8 +3549,11 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate, merged_verify_max=merged_verify_max)
         if not posture["next_action"]:
             # #347: a coding card in an active review-fix round (bounced + requeued,
-            # changes-requested riding the requeue) — re-driving a fix.
+            # changes-requested riding the requeue) — re-driving a fix. Else #406: a card
+            # outside the ready lane whose every dependency has closed.
             posture = review_fix_posture(f)
+            if not posture["next_action"]:
+                posture = stranded_posture(f)
             if not posture["next_action"]:
                 continue
         elif f.get("ci_status") == "failing" and posture["next_action"] in (

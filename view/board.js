@@ -84,6 +84,10 @@ const NEXT_ACTION_CHIP = {
   // instead of only in the loop log.
   "auto-merge held: merged-verify budget exhausted": ["pl-badge--warning", "merge held (verify budget)"],
   "awaiting deliverable": ["pl-badge--info", "awaiting deliverable"],
+  // #406: a card outside the ready lane whose every dependency has closed — nothing
+  // re-checks it, so the chip (and its board_mark_ready / unblock hint) is the only tell.
+  "dependencies closed — promote": ["pl-badge--warning", "deps closed: promote"],
+  "blocked — dependencies closed": ["pl-badge--warning", "deps closed"],
 };
 function nextActionChip(f){
   if (!f.next_action || f.next_action === "blocked") return "";  // blocked has its own chip

@@ -279,7 +279,9 @@ class ReconcileMixin:
         ``feat-<id>`` worktrees whose feature is gone or already terminal —
         ``done``/``cancelled`` (a missed reap); (c) label terminal features past the
         archive window ``archived``
-        (#115) — the board's growth valve; archival only, nothing is ever deleted.
+        (#115) — the board's growth valve; archival only, nothing is ever deleted. First,
+        it publishes the agent's working-state snapshot, and names any card stranded
+        outside the ready lane with every dependency closed (#406) — surfaced, never moved.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
         # Publish the board's live projection for the host's <working_state> block (ADR
@@ -287,8 +289,15 @@ class ReconcileMixin:
         # call per sweep, and the provider that reads it must never touch the store
         # itself — it runs inline on every agent turn. Best-effort, like the rest of the
         # sweep.
+        #
+        # Annotated first: the snapshot's per-card hint IS the board's `next_action_hint`,
+        # which only `annotate_next_action` writes — a bare listing published every hint
+        # empty. It is also what names a card stranded outside the ready lane (#406), and
+        # the agent this snapshot feeds is the one who can promote it.
         try:
-            await asyncio.to_thread(lambda: work_snapshot.publish(store.list_features()))
+            feats = store_mod.annotate_next_action(await asyncio.to_thread(store.list_features), self.cfg)
+            work_snapshot.publish(feats)
+            self._report_stranded(feats)
         except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the sweep
             log.warning("[project_board] work snapshot refresh failed (ignored)", exc_info=True)
         for f in await asyncio.to_thread(store.list_features, state="in_progress"):
@@ -321,6 +330,25 @@ class ReconcileMixin:
                 )
         except Exception:  # noqa: BLE001
             log.warning("[project_board] sweep archive pass failed", exc_info=True)
+
+    def _report_stranded(self, feats: list[dict]) -> None:
+        """Log each card that has just become stranded outside the ready lane, with every
+        dependency closed (#406). ``store.stranded_posture`` found them, and they read so
+        on every listing and in the agent's working state. This line is the loop's own
+        record of WHEN it first saw each one: once per card, not once per sweep, and again
+        only if the card leaves that state and comes back. Nothing is changed on the card.
+        A backlog card is promoted by the PM, and a block is lifted by whoever set it."""
+        stranded = {
+            f["id"]: f
+            for f in feats
+            if f.get("id")
+            and f.get("next_action") in (store_mod.NEXT_ACTION_DEPS_CLEARED, store_mod.NEXT_ACTION_BLOCKED_DEPS_CLEARED)
+        }
+        seen = getattr(self, "_stranded_seen", set())
+        for fid in sorted(set(stranded) - seen):
+            f = stranded[fid]
+            log.info("[project_board] sweep: %s stranded (%s): %s", fid, f["board_state"], f.get("next_action_hint"))
+        self._stranded_seen = set(stranded)
 
     async def _recover_blocked(self, store) -> None:
         """The blocked lane's self-heal + escalation pass.
@@ -384,18 +412,26 @@ class ReconcileMixin:
                     except Exception:  # noqa: BLE001 — the alert matters more than its detail
                         pass
                 title = str(f.get("title") or "").strip()
+                # #406: a card blocked in backlog whose every dependency has since closed.
+                # Its block may have been nothing BUT that wait, and nothing clears a block
+                # for you, so this is the moment whoever set it needs to hear about it.
+                stranded = store_mod.stranded_posture(f)["next_action_hint"]
                 self._notify_operator(
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
-                    f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    f"{reason or 'no reason recorded'}"
+                    + (f" — {title}" if title else "")
+                    + (f". Note: {stranded}" if stranded else ""),
                     # The recovery CYCLE is part of the incident's identity (#346 r7): a
                     # card that auto-healed, rebuilt and failed the SAME way again is a new
                     # failed cycle and IS news — the self-heal did not work. Keying on
                     # class+reason alone suppressed exactly that for the whole window.
                     # `spent` is the unblock-retry budget the self-heal already tracks, so
                     # this costs no new state: it increments on every auto-unblock and is
-                    # therefore different on each side of a recovery.
-                    incident=f"{cls}|{reason}|{spent}",
+                    # therefore different on each side of a recovery. Dependencies closing
+                    # under a block is news in the same way (#406), so it is part of the
+                    # identity too — ONE more alert, when the last one closes.
+                    incident=f"{cls}|{reason}|{spent}" + ("|deps-closed" if stranded else ""),
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
