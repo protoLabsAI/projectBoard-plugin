@@ -1111,12 +1111,25 @@ class DriveMixin:
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons)
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
-                # the same capability tier (#362); `sib` advances only on a quota failure
+                # the same capability tier (#362); `sib` advances only on a provider failure
                 # (below) or round-robin across dispatches, never on a capability failure —
-                # that is what climbing a rung is for.
+                # that is what climbing a rung is for. A sibling another card already found
+                # unable to serve its model is skipped rather than rediscovered (#420).
                 siblings = coders.get(tier) if self.escalation_on else None
                 if not siblings:
                     siblings = [self.coder_name]
+                picked, tried_before = sib, tried_here
+                sib, tried_here = skip_down_providers(siblings, sib, tried_here)
+                if tried_here != tried_before:
+                    log.info(
+                        "[project_board] %s skipping %s at the %s rung — marked unavailable "
+                        "(it refused its model within the last %ds); using %s",
+                        fid,
+                        ", ".join(siblings[i % len(siblings)] for i in range(picked, sib)),
+                        tier or "default",
+                        int(_PROVIDER_DOWN_TTL_S),
+                        siblings[sib % len(siblings)],
+                    )
                 coder_name = siblings[sib % len(siblings)]
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
@@ -1248,6 +1261,10 @@ class DriveMixin:
                     # dispatch scheduled on worker threads land before the drive
                     # proceeds toward open_pr (the pre-offload ordering).
                     await self._await_bg_records(fid)
+                    # The provider served this dispatch, so a down mark on it (#420) — set
+                    # by another card, or one that was stale when every sibling was marked
+                    # and this one got the rung's last attempt — no longer holds.
+                    clear_provider_down(coder_name)
                     # Requirement-ledger write-back (#113): merge the reply's
                     # `## Requirements` dispositions into the ledger and persist it on
                     # the bead — the LOOP writes dispositions, never the coder, and the
@@ -1646,13 +1663,18 @@ class DriveMixin:
                     )
                     # 1. Transient infra → back off and retry the SAME tier (a re-dispatch
                     #    off the latest base also clears a merge conflict).
-                    # 0.5 QUOTA failure with an untried sibling at this rung → switch
-                    #     provider IMMEDIATELY (#362). Sleeping 60s to re-dispatch the same
-                    #     exhausted provider, five times, then blocking the card, is what
-                    #     this replaces — a rate limit says nothing about the model's
-                    #     ability, only about its quota, so it must not spend the retry
-                    #     budget or the capability ladder. Only when every sibling is
-                    #     exhausted does the ordinary backoff below apply.
+                    # 0.5 PROVIDER failure with an untried sibling at this rung → switch
+                    #     provider IMMEDIATELY. For a spent quota (#362): sleeping 60s to
+                    #     re-dispatch the same exhausted provider, five times, then blocking
+                    #     the card, is what this replaces. For a provider that can't serve
+                    #     its model at all (#420): climbing a rung is what this replaces — a
+                    #     retired model burned the whole ladder, re-picked at every rung it
+                    #     was listed on, while a working sibling sat one entry over. Neither
+                    #     says anything about the model's ability, so neither may spend the
+                    #     retry budget or the capability ladder. A dead provider is also
+                    #     MARKED so the next card's pick skips it instead of rediscovering it.
+                    if policy.category == "provider_unavailable":
+                        mark_provider_down(coder_name)
                     if should_rotate_provider(policy.category, siblings, tried_here):
                         tried_here += 1
                         sib += 1
@@ -1681,6 +1703,37 @@ class DriveMixin:
                         )
                         await asyncio.sleep(policy.base_delay_s)
                         continue
+                    # 1.4 EVERY provider at this rung can't serve its model (#420) → block
+                    #     for the operator, no tier climb. The rotation above has already
+                    #     tried each sibling, so what is left is a config problem — a
+                    #     delegate pinned to a retired model, a plan that refuses it, a
+                    #     client too old to speak it — and a stronger rung can't fix that,
+                    #     only hide it (a silent climb to a pricier model the operator never
+                    #     learns about). Decided from the message alone, never from the
+                    #     model-reached evidence #339 reads: the provider refusing the model
+                    #     IS the proof it never ran. Blocks under the `dispatch-infra` class
+                    #     for the same reasons that path does — notify, don't auto-heal, and
+                    #     leave the tier posture as real model work left it.
+                    if policy.category == "provider_unavailable":
+                        tried = ", ".join(dict.fromkeys(siblings))
+                        reason = (
+                            f"provider unavailable — no coder at the {tier or 'default'} rung ({tried}) "
+                            f"can serve its model; repoint the delegate at a live model or add a "
+                            f"working sibling to the rung (no tier climb): {exc}"
+                        )
+                        log.warning(
+                            "[project_board] %s blocked (provider unavailable at the %s rung — tried %s, "
+                            "tier untouched): %s",
+                            fid,
+                            tier or "default",
+                            tried,
+                            exc,
+                        )
+                        await asyncio.to_thread(store.flag_blocked, fid, reason, category=PRE_MODEL_DISPATCH_CLASS)
+                        if wt:
+                            await worktree.remove_worktree(repo, wt, branch or "")
+                        self._inflight.pop(fid, None)
+                        return
                     # 1.5 Pre-model dispatch/infra failure → block DIRECTLY for triage, no
                     #     tier climb. This is not an escalation: `store.escalate` is never
                     #     called, so no `tier:`/`attempt:` label is added and no ladder

@@ -31,6 +31,21 @@ class Policy:
 # merge conflict, but an auth error or an unknown failure needs a human.
 _RULES: tuple[tuple[str, Policy], ...] = (
     (
+        # The provider can't serve its model AT ALL (#420): the model was retired, the
+        # account's plan refuses it, or the client is too old to speak it. Not a quota
+        # (it won't reset), not a capability ceiling (a stronger model won't bring it
+        # back), not card-terminal (a sibling provider can do the work) — so it is not
+        # retryable, and the loop rotates past it within the rung instead. First, and
+        # deliberately narrow: the full refusal phrasings, so an incidental "not found"
+        # or "unavailable" elsewhere never lands here, and a dead-model message that
+        # happens to contain "unavailable" or "capacity" is never backed off and retried.
+        r"does not exist or you do not have access"
+        r"|\bmodel_not_found\b"
+        r"|model is not supported when using"
+        r"|model requires a newer version of",
+        Policy("provider_unavailable", False, 0.0, 1),
+    ),
+    (
         r"rate.?limit|\b429\b|quota|overloaded|too many requests|capacity",
         Policy("rate_limit", True, 60.0, 5),
     ),

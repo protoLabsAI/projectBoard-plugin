@@ -215,7 +215,7 @@ named here is passed through — keep it as short as the build actually requires
 
 **`coders`** — the capability ladder, tier → delegate. A rung may hold SEVERAL
 interchangeable providers, and the board round-robins across them and fails over on a rate
-limit:
+limit or on a provider that can't serve its model:
 
 ```yaml
 coders:
@@ -225,8 +225,17 @@ coders:
 ```
 
 Climbing a rung means "a stronger model may succeed". Rotating within one means "this
-model is fine, its quota is not". A card's STARTING rung comes from its difficulty, so a
+model is fine, its provider is not" — a spent quota, or a provider that refuses the model
+outright (retired, not offered on the account's plan, or needing a newer client; #420). A
+provider that refuses its model is also remembered for 30 minutes, so later cards skip it
+rather than each paying a failed dispatch to rediscover it; a dispatch it serves clears the
+mark. When every provider on a rung refuses its model, the card blocks under
+`dispatch-infra` naming the delegates, and does not climb: that is a config problem, and a
+stronger rung would only hide it. A card's STARTING rung comes from its difficulty, so a
 `medium` card never touches rung 1.
+
+Rotation needs escalation on, and escalation needs at least two DISTINCT rungs — a map with
+a single rung (`coders: {smart: [codex, sonnet]}`) runs as a one-coder board using `coder`.
 
 **`projects`** — one board, several repos. Each entry carries that repo's own `repo`,
 `base_branch`, `local_gate_cmd` and `coders`, so a card is built and gated against the

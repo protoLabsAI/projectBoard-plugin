@@ -826,20 +826,83 @@ def _next_rung_cursor() -> int:
     return next(_RUNG_CURSOR)
 
 
+# The failure classes that say "this PROVIDER can't serve the rung right now" rather
+# than anything about the model's ability or the card — the two cases rotation exists
+# for. A quota is spent (#362); a provider that can't serve its model at all — retired,
+# refused for the account, client too old — is the same shape one level down (#420).
+_ROTATABLE_CATEGORIES = frozenset({"rate_limit", "provider_unavailable"})
+
+
 def should_rotate_provider(category: str, siblings: list[str], tried: int) -> bool:
     """Should this failure move to the NEXT provider at the same rung, rather than
-    sleeping to retry the same one (#362)?
+    sleeping to retry the same one (#362) or climbing a rung (#420)?
 
-    Only for a QUOTA failure, and only while an untried sibling remains. A rate limit
-    says nothing about the model's ability — only that this provider is spent — so it
-    must not consume the transient-retry budget (60s × 5, all on the exhausted provider)
-    nor the capability ladder. Every other class keeps the existing behaviour exactly:
-    transient infra backs off, capability climbs a rung, terminal blocks.
+    Only for a PROVIDER failure — a spent quota, or a provider that can't serve its model
+    at all — and only while an untried sibling remains. Neither says anything about the
+    model's ability: a rate limit must not consume the transient-retry budget (60s × 5,
+    all on the exhausted provider), and a retired model must not consume the capability
+    ladder (a stronger model won't bring it back, and when the dead provider is listed at
+    every rung, climbing doesn't escape it either). Every other class keeps the existing
+    behaviour exactly: transient infra backs off, capability climbs a rung, terminal blocks.
 
     Kept pure and separate from the drive loop so the POLICY is testable on its own —
     the decision is the whole feature, and it was previously buried in a 565-line
     function where the only way to exercise it was to drive an entire card."""
-    return category == "rate_limit" and len(siblings) > 1 and tried < len(siblings) - 1
+    return category in _ROTATABLE_CATEGORIES and len(siblings) > 1 and tried < len(siblings) - 1
+
+
+# ── #420: remember a provider that can't serve its model ────────────────────────────
+# Rotation alone rediscovers a dead provider card by card: the rung cursor spreads cards
+# across a rung's siblings, so every card that happens to open on it pays one failed
+# dispatch before rotating. A retired model is not coming back in a minute, so the loop
+# marks it and later picks skip it — for a while, not forever, because the operator can
+# repoint a delegate at a live model without a restart (`PUT /api/delegates/{name}`).
+#
+# Per-process and in memory, like the rung cursor: a restart forgetting the marks costs
+# one failed dispatch per dead provider. Keyed by delegate NAME, which is what a rung
+# lists. A mark only ever REORDERS the siblings it is asked about — it never removes the
+# last one — so a stale mark can cost a skip, never a block.
+_PROVIDER_DOWN_TTL_S = 30 * 60.0
+_PROVIDER_DOWN: dict[str, float] = {}  # delegate name → monotonic time the mark lapses
+
+
+def mark_provider_down(name: str, *, now: float | None = None) -> None:
+    """Record that ``name`` just refused to serve its model (#420)."""
+    if name:
+        _PROVIDER_DOWN[name] = (time.monotonic() if now is None else now) + _PROVIDER_DOWN_TTL_S
+
+
+def clear_provider_down(name: str) -> None:
+    """``name`` just served a dispatch — whatever marked it down no longer holds."""
+    _PROVIDER_DOWN.pop(name, None)
+
+
+def provider_is_down(name: str, *, now: float | None = None) -> bool:
+    """Is ``name`` inside an unexpired down mark? A lapsed mark is dropped on read."""
+    until = _PROVIDER_DOWN.get(name)
+    if until is None:
+        return False
+    if (time.monotonic() if now is None else now) >= until:
+        _PROVIDER_DOWN.pop(name, None)
+        return False
+    return True
+
+
+def skip_down_providers(siblings: list[str], sib: int, tried: int, *, now: float | None = None) -> tuple[int, int]:
+    """Advance a rung's ``(sib, tried)`` cursor past siblings marked down (#420).
+
+    Moves on only while an untried sibling remains — the same bound rotation obeys — and
+    counts each skip as a sibling tried. That accounting is what keeps the two policies
+    from feeding each other: without it, a quota failure on the one healthy provider
+    rotates onto the dead one, re-dispatches it, and blocks the card as "no live
+    provider" when the rung only needed a backoff. With it, the healthy provider is the
+    LAST untried sibling, so its quota failure takes the ordinary backoff. When every
+    sibling is marked, the last one is dispatched anyway: a mark is evidence, not a
+    verdict, and the rung must still get its one real attempt before the card blocks."""
+    while len(siblings) > 1 and tried < len(siblings) - 1 and provider_is_down(siblings[sib % len(siblings)], now=now):
+        sib += 1
+        tried += 1
+    return sib, tried
 
 
 def rung_delegates(value) -> list[str]:
@@ -1158,7 +1221,14 @@ __all__ = [
     "_LEDGER_ONLY_MAX",
     "rung_delegates",
     "should_rotate_provider",
+    "_ROTATABLE_CATEGORIES",
     "_next_rung_cursor",
+    "_PROVIDER_DOWN_TTL_S",
+    "_PROVIDER_DOWN",
+    "mark_provider_down",
+    "clear_provider_down",
+    "provider_is_down",
+    "skip_down_providers",
     "asyncio",
     "Path",
     "hashlib",

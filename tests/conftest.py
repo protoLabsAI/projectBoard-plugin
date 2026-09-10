@@ -98,6 +98,19 @@ def _no_real_br_version(monkeypatch, tmp_path_factory):
     br_fetch.reset_state()
 
 
+@pytest.fixture(autouse=True)
+def _no_provider_down_marks():
+    """The loop remembers a provider that refused its model (#420) in process-stable
+    state, keyed by delegate name — and this suite reuses the same few names ("codex",
+    "sonnet") everywhere. Start and end every test with no marks, so one test's dead
+    provider is never skipped in another's ladder."""
+    from project_board.loop import _common
+
+    _common._PROVIDER_DOWN.clear()
+    yield
+    _common._PROVIDER_DOWN.clear()
+
+
 @pytest.fixture
 def make_board(monkeypatch):
     """Build a ``BeadsBoard`` with the ``br`` PATH check stubbed and ``_run``

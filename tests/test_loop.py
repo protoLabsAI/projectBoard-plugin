@@ -10251,23 +10251,25 @@ def test_a_string_rung_is_unchanged_and_a_list_rung_opts_in():
     assert loop_mod.rung_delegates("") == []
 
 
-def test_a_quota_failure_rotates_provider_and_nothing_else_does():
+def test_a_provider_failure_rotates_and_nothing_else_does():
     """The policy this feature IS, tested directly rather than by driving a whole card.
 
     A rate limit says nothing about the model's ability — only that this provider's quota
     is spent. Before #362 it consumed the transient-retry budget: sleep 60s, re-dispatch
     the SAME exhausted provider, five times, then block the card, while other declared
-    coders sat idle. 644 rate-limit lines in one agent's log.
+    coders sat idle. 644 rate-limit lines in one agent's log. A provider that can't serve
+    its model at all is the same shape one level down (#420).
 
     Every other class must keep its existing behaviour exactly — that separation is what
     makes this safe, and it is the same category error #339 fixed for infra failures."""
     pair = ["codex", "sonnet"]
-    # a quota failure with an untried sibling → rotate
-    assert loop_mod.should_rotate_provider("rate_limit", pair, 0) is True
-    # …but only while one remains: the last sibling falls through to the ordinary ladder
-    assert loop_mod.should_rotate_provider("rate_limit", pair, 1) is False
-    # a single-provider rung is unchanged — no sibling to rotate to
-    assert loop_mod.should_rotate_provider("rate_limit", ["sonnet"], 0) is False
+    for provider_failure in ("rate_limit", "provider_unavailable"):
+        # a provider failure with an untried sibling → rotate
+        assert loop_mod.should_rotate_provider(provider_failure, pair, 0) is True, provider_failure
+        # …but only while one remains: the last sibling falls through to the ordinary ladder
+        assert loop_mod.should_rotate_provider(provider_failure, pair, 1) is False, provider_failure
+        # a single-provider rung is unchanged — no sibling to rotate to
+        assert loop_mod.should_rotate_provider(provider_failure, ["sonnet"], 0) is False, provider_failure
     # and NOTHING else rotates: capability climbs a rung, infra backs off, terminal blocks
     for other in ("transient", "merge_conflict", "auth", "terminal", "dispatch-infra"):
         assert loop_mod.should_rotate_provider(other, pair, 0) is False, other
@@ -10291,6 +10293,173 @@ async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeyp
     monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _dispatch)
     await loop._drive({"id": "bd-2", "title": "t", "spec": "s"})
     assert "opus" in seen, f"a capability failure must reach the stronger rung, got {seen}"
+
+
+# ── #420: a provider that can't serve its model is rotated past, and remembered ──────
+
+# What codex-acp surfaced all of 2026-09-09 (protoEngineer, bd-56dr / bd-zrfv): a 404 for
+# a model the account could no longer reach. Verbatim shape, request ids trimmed.
+_DEAD_MODEL = (
+    'coder dispatch failed: Internal error (JSON-RPC -32603): {"message": "unexpected status '
+    "404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it., "
+    'url: https://chatgpt.com/backend-api/codex/responses, cf-ray: a3898bbe7fa2ad6a-SEA"}'
+)
+
+
+def _rung_env(monkeypatch, dispatch, *, cfg, start_tier="smart", tiers=()):
+    """A `_drive` harness over an explicit ladder: `cfg` builds the loop (its `coders`
+    map is the ladder — the project config, not a reassigned `loop.coders`, is what the
+    drive reads), the card starts at `start_tier`, `tiers` are the climbs `escalate`
+    hands out, and the rung cursor is pinned to 0 so the FIRST sibling is always the one
+    a card opens on. Rotation needs escalation on, i.e. at least two distinct rungs."""
+    _unused, store = _ladder_drive_env(monkeypatch, dispatch, tiers=list(tiers))
+    loop = BoardLoop(cfg)
+    monkeypatch.setattr(store, "current_tier", lambda fid: start_tier, raising=False)
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", dispatch)
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: 0)
+    return loop, store
+
+
+async def test_a_dead_provider_rotates_to_its_sibling_instead_of_climbing(monkeypatch):
+    """The #420 trace, reproduced: the card opens on the dead provider. Before the fix it
+    escalated a TIER on a provider failure and the next rung re-picked the same corpse;
+    now it moves to the sibling at the SAME rung, with the ladder untouched."""
+    seen: list[tuple[str, int]] = []  # (coder, climbs so far) at each dispatch
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append((coder, len(store.escalated)))
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        raise worktree.NoChangesError("coder produced no commits")  # ends the drive
+
+    loop, store = _rung_env(
+        monkeypatch, _dispatch, cfg={"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}
+    )
+    await loop._drive({"id": "bd-56dr", "title": "t", "spec": "s"})
+
+    assert seen[:2] == [("codex", 0), ("sonnet", 0)], f"expected a same-rung switch, got {seen}"
+    assert classify(_DEAD_MODEL).category == "provider_unavailable"
+
+
+async def test_a_rung_with_no_live_provider_blocks_for_the_operator_without_climbing(monkeypatch):
+    """Every sibling refuses its model → a config problem, not a capability one. It blocks
+    under `dispatch-infra` (notify, never auto-heal) saying what to fix, and does NOT
+    climb: a silent jump to a pricier rung would hide the broken delegate from the
+    operator, and the dead provider was listed at every rung on protoEngineer anyway."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError(_DEAD_MODEL)
+
+    loop, store = _rung_env(
+        monkeypatch,
+        _dispatch,
+        cfg={"coders": {"smart": ["codex", "codex-mini"], "reasoning": ["opus"]}},
+        tiers=["reasoning"],
+    )
+    await loop._drive({"id": "bd-9", "title": "t", "spec": "s"})
+
+    assert seen == ["codex", "codex-mini"]  # one real attempt per sibling, nothing more
+    assert store.escalated == []  # the ladder was never consulted
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+    reason = blocked[0][2]
+    assert reason.startswith("provider unavailable") and "codex, codex-mini" in reason
+    assert "does not exist or you do not have access" in reason  # the evidence rides along
+    assert loop._inflight == {}
+
+
+async def test_a_single_coder_board_blocks_a_dead_provider_as_infra_not_terminal(monkeypatch):
+    """No ladder at all (the default one-coder board): nothing to rotate to, so it blocks
+    — but as the actionable infra class naming the fix, not an unexplained `terminal`."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        raise worktree.WorktreeError(_DEAD_MODEL)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg={"coder": "codex"})
+    await loop._drive({"id": "bd-9", "title": "t", "spec": "s"})
+
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+    assert blocked[0][2].startswith("provider unavailable")
+    assert store.escalated == []
+
+
+async def test_the_next_card_skips_a_provider_the_last_one_found_dead(monkeypatch):
+    """Rotation alone rediscovers a dead provider card by card — the rung cursor spreads
+    cards across siblings, so each one that opens on it pays a failed dispatch. The mark
+    means only the FIRST card pays."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        raise worktree.NoChangesError("coder produced no commits")
+
+    loop, store = _rung_env(
+        monkeypatch, _dispatch, cfg={"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}
+    )
+    await loop._drive({"id": "bd-a", "title": "t", "spec": "s"})
+    assert seen[0] == "codex" and loop_mod.provider_is_down("codex")
+
+    seen.clear()
+    await loop._drive({"id": "bd-b", "title": "t", "spec": "s"})
+    assert "codex" not in seen, f"the second card re-dispatched the known-dead provider: {seen}"
+    assert seen and seen[0] == "sonnet"
+
+
+async def test_a_quota_on_the_only_live_sibling_backs_off_instead_of_ping_ponging(monkeypatch):
+    """The two policies must not feed each other. codex is marked dead and sonnet hits its
+    quota. If a skip were not counted, rotation would move off sonnet onto codex,
+    re-dispatch the dead provider, and block the card as "no live provider" when all the
+    rung needed was a backoff. A skip COUNTS as a sibling tried, so sonnet is the rung's
+    last untried provider and its quota failure takes the ordinary backoff."""
+    loop_mod.mark_provider_down("codex")
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError(_SESSION_LIMIT)
+
+    loop, store = _rung_env(
+        monkeypatch, _dispatch, cfg={"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}
+    )
+    await loop._drive({"id": "bd-q", "title": "t", "spec": "s"})
+
+    assert set(seen) == {"sonnet"} and len(seen) == classify(_SESSION_LIMIT).max_attempts
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1 and blocked[0][2].startswith("rate_limit:")
+
+
+def test_a_down_mark_only_ever_reorders_the_rung():
+    """A mark is evidence, not a verdict: it skips a sibling while a live one remains, and
+    never removes the rung's last attempt — a stale mark costs a skip, never a block."""
+    now = 1000.0
+    loop_mod.mark_provider_down("codex", now=now)
+    pair = ["codex", "sonnet"]
+    # the dead one is skipped, and the skip is counted as a sibling tried
+    assert loop_mod.skip_down_providers(pair, 0, 0, now=now) == (1, 1)
+    # a healthy pick is left alone
+    assert loop_mod.skip_down_providers(pair, 1, 0, now=now) == (1, 0)
+    # every sibling marked → the cursor stops on the last, which still gets dispatched
+    loop_mod.mark_provider_down("sonnet", now=now)
+    assert loop_mod.skip_down_providers(pair, 0, 0, now=now) == (1, 1)
+    # a lone provider is never skipped — there is nothing to skip to
+    assert loop_mod.skip_down_providers(["codex"], 0, 0, now=now) == (0, 0)
+
+
+def test_a_down_mark_lapses_and_a_served_dispatch_clears_it():
+    """Not forever: the operator can repoint a delegate at a live model without a restart,
+    and the 2026-09-09 "retired" model was answering again the next day."""
+    loop_mod.mark_provider_down("codex", now=0.0)
+    assert loop_mod.provider_is_down("codex", now=loop_mod._PROVIDER_DOWN_TTL_S - 1)
+    assert not loop_mod.provider_is_down("codex", now=loop_mod._PROVIDER_DOWN_TTL_S)
+    loop_mod.mark_provider_down("codex")
+    loop_mod.clear_provider_down("codex")
+    assert not loop_mod.provider_is_down("codex")
 
 
 # ── #381: a blocking finding must quote the diff it claims to have read ───────
