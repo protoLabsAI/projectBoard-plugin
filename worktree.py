@@ -915,15 +915,40 @@ def _is_blocking_check(c: dict) -> bool:
     here is worth bouncing the feature back to the coder.
 
     Required checks (branch protection) and GitHub Actions runs are blocking; a
-    third-party ADVISORY status — CodeRabbit, coverage bots, etc., which post through
-    the legacy commit-status API and so arrive as a ``StatusContext`` — is NOT, so its
-    red must never burn a coder run on a signal we can't fix (bd-1zp). ``isRequired``
-    (when ``gh`` surfaces it) overrides the type: a status the repo marks required is
-    always blocking. Conservative default: an unknown shape (an older ``gh`` that omits
-    ``__typename``) is treated as blocking so a real failure is never silently dropped."""
+    third-party ADVISORY signal — CodeRabbit, coverage bots, the QA panel — is NOT, so
+    its red must never burn a coder run on a signal we can't fix (bd-1zp).
+
+    **Advisory does not imply the commit-status API.** The original rule was
+    ``__typename != "StatusContext"``, i.e. every check RUN gates. That assumed
+    third parties all publish through the legacy status API, and GitHub Apps do not:
+    an App publishes through the Checks API, so its advisory verdict arrives as a
+    ``CheckRun`` and gated the board. That is how the ``QA panel`` run from the
+    ``protoreview`` App — not required on ``main``, and unfixable by a coder because it
+    reports UNRESOLVED REVIEW THREADS rather than anything in the diff — bounced cards
+    into escalation and terminal blocks (bd-zrfv burned 5 attempts, bd-sldt 2).
+
+    The discriminator is ``workflowName``: a GitHub Actions run always carries the
+    workflow it came from, and an App's check run carries an empty one. Verified against
+    a live rollup — all 20 Actions runs populated it; the App's ``QA panel`` was the lone
+    ``""``.
+
+    ``isRequired`` still overrides everything: a check the repo marks required gates
+    whatever published it. (Note ``gh`` frequently reports ``isRequired: null`` even for
+    genuinely required checks, so it can promote but never demote.)
+
+    Conservative default: any shape we do not positively recognise — an older ``gh`` that
+    omits ``__typename`` or ``workflowName`` — stays blocking, so a real failure is never
+    silently dropped."""
     if c.get("isRequired") is True:
         return True
-    return str(c.get("__typename") or "") != "StatusContext"
+    typename = str(c.get("__typename") or "")
+    if typename == "StatusContext":
+        return False
+    # Only demote a check run we can positively identify as non-Actions: the key must be
+    # present AND empty. A missing key means an older `gh` we cannot judge — stay blocking.
+    if typename == "CheckRun" and "workflowName" in c:
+        return bool(str(c.get("workflowName") or "").strip())
+    return True
 
 
 async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) -> tuple[str, str]:

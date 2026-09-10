@@ -846,6 +846,79 @@ async def test_pr_ci_status_advisory_failure_is_ignored(monkeypatch):
     assert status == "passing" and summary == ""
 
 
+# ── a GitHub App's advisory check run is advisory too (the `QA panel` incident) ───
+#
+# Every fixture below is the SHAPE `gh pr view --json statusCheckRollup` actually returned
+# for protoLabsAI/protoAgent#3415 on 2026-09-10, not an invented one: 20 Actions runs each
+# carrying a `workflowName`, and the `protoreview` App's `QA panel` as the lone `""`.
+
+
+def test_an_apps_check_run_is_advisory_not_blocking():
+    """The defect this guards: the old rule was `__typename != "StatusContext"`, so EVERY
+    check run gated. GitHub Apps publish through the Checks API, so the `protoreview`
+    App's non-required `QA panel` verdict gated the board — and a coder can never fix it,
+    because it reports unresolved REVIEW THREADS, not anything in the diff."""
+    qa_panel = {
+        "__typename": "CheckRun",
+        "name": "QA panel",
+        "conclusion": "FAILURE",
+        "isRequired": None,
+        "workflowName": "",
+        "detailsUrl": "https://protolabs.studio",
+    }
+    assert not worktree._is_blocking_check(qa_panel)
+
+
+def test_an_actions_run_is_still_blocking_because_it_names_its_workflow():
+    # The other side of the same discriminator — this must not become collateral damage.
+    assert worktree._is_blocking_check(
+        {"__typename": "CheckRun", "name": "Python tests", "conclusion": "FAILURE", "workflowName": "Checks"}
+    )
+
+
+def test_a_required_app_check_run_still_blocks():
+    # `isRequired` outranks the type: if the repo marks the App's check required, a red
+    # one genuinely does gate the merge, so it must gate the board too.
+    assert worktree._is_blocking_check(
+        {"__typename": "CheckRun", "name": "QA panel", "workflowName": "", "isRequired": True}
+    )
+
+
+def test_a_check_run_from_an_older_gh_stays_blocking():
+    """Conservative default. `gh` versions before `workflowName` existed omit the key
+    entirely, and an absent key is not evidence of an App — demoting on it would silently
+    drop real Actions failures. Only a PRESENT-and-empty value demotes."""
+    assert worktree._is_blocking_check({"__typename": "CheckRun", "name": "Tests", "conclusion": "FAILURE"})
+
+
+async def test_pr_ci_status_ignores_a_red_app_check_run(monkeypatch):
+    """The live #3415 rollup, reduced: every Actions run green, the App's `QA panel` red.
+    Before the fix this read `failing`, so the loop bounced the card to the coder with
+    "QA panel: FAILURE" as the brief. bd-zrfv burned 5 attempts that way and blocked."""
+    rollup = (
+        '[{"__typename":"CheckRun","name":"Python tests","conclusion":"SUCCESS","workflowName":"Checks"},'
+        '{"__typename":"CheckRun","name":"Lint (ruff + import contracts)","conclusion":"SUCCESS","workflowName":"Checks"},'
+        '{"__typename":"CheckRun","name":"QA panel","conclusion":"FAILURE","workflowName":"",'
+        '"detailsUrl":"https://protolabs.studio"}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, summary = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "passing" and summary == ""
+
+
+async def test_pr_ci_status_ignores_an_app_check_run_stuck_pending(monkeypatch):
+    """#3395 and #3420 carry `QA panel` check runs stuck at status=None since 09-09 — the
+    App posts an in-progress run and never completes it. An advisory signal must not hold
+    the rollup `pending` forever either, or the card never reaches review at all."""
+    rollup = (
+        '[{"__typename":"CheckRun","name":"Python tests","conclusion":"SUCCESS","workflowName":"Checks"},'
+        '{"__typename":"CheckRun","name":"QA panel","conclusion":null,"status":"IN_PROGRESS","workflowName":""}]'
+    )
+    monkeypatch.setattr(worktree, "_gh", _ci_gh(rollup))
+    status, _ = await worktree.pr_ci_status("https://example/pr/1", cwd="/repo")
+    assert status == "passing"
+
+
 async def test_pr_ci_status_advisory_pending_does_not_hold_rollup(monkeypatch):
     """An advisory status still IN_PROGRESS can't hold the rollup pending — once every
     blocking check is green the rollup passes regardless of the advisory one."""
