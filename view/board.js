@@ -220,8 +220,8 @@ function taskErr(fid, e){
 async function submitDeliver(fid){
   const text = ($("tdtext-"+fid) || {}).value || "";
   const ref = ($("tdref-"+fid) || {}).value || "";
-  // …then re-fetch the single-card detail so the drawer picks up the just-recorded
-  // deliverable (the list reload above can't — /features omits comments; see #312).
+  // …then re-fetch the single-card detail too: the drawer prefers it over the list row for
+  // the open card (#312), so without a fresh one it would keep the pre-delivery detail.
   try { await apiPost(FEAT+encodeURIComponent(fid)+"/deliver", {text: text, ref: ref}); await load(); await fetchTaskDetail(fid); }
   catch (e) { taskErr(fid, e); }
 }
@@ -502,14 +502,14 @@ const MON_POLL_MS = 3000;
 // clears the other — and both fence writes to the shared #drawer-body (see pollMonitor
 // / syncTaskDrawer) so a stale async can't clobber a re-purposed drawer.
 let MON_FID = null, MON_TIMER = null, TASK_FID = null;
-// The single-card detail behind the OPEN task drawer (#312): the list projection the 10s
-// poll pulls (/features → br list) intentionally OMITS bead comments, so its comment-
-// derived `deliverable` field is always "" — the drawer would render blank for a delivered
-// task. So the drawer fetches the single-feature route (/features/{fid} → get_feature → br
-// show, which carries comments) ON OPEN and after each action, caching the result here so
-// the 10s poll's syncTaskDrawer re-render reuses it (no per-task br show every tick, the
-// monitor's on-open /progress posture). Shape: {fid, feature} on success, {fid, error} on
-// a failed fetch (surfaced in the drawer); null when no task is open / not yet fetched.
+// The single-card detail behind the OPEN task drawer (#312): fetched from the single-
+// feature route (/features/{fid} → get_feature → br show) ON OPEN and after each action,
+// and cached here so the 10s poll's syncTaskDrawer re-render reuses it (no per-task br
+// show every tick, the monitor's on-open /progress posture). It exists because the list
+// poll (/features) then read every task's `deliverable` as ""; since #399 the list row
+// carries it too, so the drawer no longer depends on this fetch to show one. Shape:
+// {fid, feature} on success, {fid, error} on a failed fetch (surfaced in the drawer);
+// null when no task is open / not yet fetched.
 let TASK_DETAIL = null;
 // Monotonic ticket for fetchTaskDetail — see its comment: fences two in-flight
 // fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
@@ -674,10 +674,10 @@ function openTask(fid){
   syncTaskDrawer();                                              // paint the list-driven summary at once…
   fetchTaskDetail(fid);                                          // …then fetch the comment-derived deliverable (on open, like the monitor's /progress fetch)
 }
-// Fetch the single-feature detail (/features/{fid} → get_feature → br show, which carries
-// the comment-derived deliverable the list projection omits) for the open task and re-
-// render the drawer with it (#312). This is the ONLY source of the drawer's deliverable —
-// the 10s /features poll never carries one. Fenced on TASK_FID exactly like pollMonitor:
+// Fetch the single-feature detail (/features/{fid} → get_feature → br show) for the open
+// task and re-render the drawer with it (#312). The drawer prefers this deliverable over
+// the list row's (which the 10s /features poll carries too since #399): it is fetched
+// fresh on open and after every action. Fenced on TASK_FID exactly like pollMonitor:
 // a fetch that resolves AFTER the drawer is closed or switched to another task/the monitor
 // re-checks TASK_FID on BOTH the success and the error path and bails without writing, so
 // a late resolve can't clobber a re-purposed #drawer-body.
@@ -709,10 +709,10 @@ function syncTaskDrawer(){
   const f = FEATURES.find(x => x.id === TASK_FID);
   if (!f) { $("drawer-body").innerHTML = '<div class="pl-empty">Task not found.</div>'; return; }
   // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
-  // action re-render still tracks in_progress → in_review → done; the comment-derived
-  // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it
-  // has landed for THIS task (#312). A failed single-fetch surfaces as an error callout
-  // ABOVE the detail rather than leaving the deliverable silently blank.
+  // action re-render still tracks in_progress → in_review → done; the deliverable is
+  // spliced in from the single-fetch (TASK_DETAIL) once it has landed for THIS task (#312),
+  // the list row's own standing in until then (#399). A failed single-fetch surfaces as an
+  // error callout ABOVE the detail rather than failing silently.
   const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;
   const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable} : f;
   const err = d && d.error

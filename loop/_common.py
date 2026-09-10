@@ -55,6 +55,7 @@ from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
 from ..store import (
+    AlreadyDelivered,
     BoardError,
     LABEL_CHANGES_REQUESTED,
     LABEL_MERGED_VERIFIED_PREFIX,
@@ -1294,6 +1295,7 @@ __all__ = [
     "resolve_default_project",
     "resolve_projects",
     "store_mod",
+    "AlreadyDelivered",
     "BoardError",
     "LABEL_CHANGES_REQUESTED",
     "LABEL_MERGED_VERIFIED_PREFIX",

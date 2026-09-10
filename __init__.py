@@ -671,7 +671,9 @@ def _board_tools(cfg: dict):
         open), plus two dependency views: `depends_on` (EVERY blocking edge — the
         historical ledger, including already-merged blockers) and `open_depends_on`
         (only the edges whose blocker is still OPEN — the live, actionable "what's
-        blocking me now" signal). The READ half of a read-modify-write: fetch the
+        blocking me now" signal). A TASK (#217) also carries `deliverable` (the recorded
+        deliverable text — "" until board_deliver records one) and `delivered_by`, which
+        is what board_verify judges. The READ half of a read-modify-write: fetch the
         current criteria/spec, revise them, then `board_update_feature` — no
         operator round-trip. Returns `Error: unknown feature …` for an id that
         isn't on the board."""
@@ -702,6 +704,15 @@ def _board_tools(cfg: dict):
                 # Which project (#90) this feature builds in — "" for a pre-#90 feature
                 # or a single-repo board with no `projects:` map.
                 "project": f.get("project", ""),
+                # A task's work product (#399). Without it this "FULL detail" read showed a
+                # delivered task with no deliverable at all, and the PM agent reading it
+                # concluded the delivery was empty and set about "repairing" a card whose
+                # 4,989-char record was intact on the bead.
+                **(
+                    {"deliverable": f.get("deliverable", ""), "delivered_by": f.get("delivered_by", "")}
+                    if f.get("issue_type") == "task"
+                    else {}
+                ),
             }
         )
 
@@ -816,9 +827,13 @@ def _board_tools(cfg: dict):
         field); optional `ref` (a doc URL, an artifact path) lands on the same `external_ref`
         slot a coding feature's pr_url occupies, so link consumers just work. Then verify it
         with board_verify. TASK-ONLY and in_progress-ONLY: a coding feature (or a task not
-        yet claimed/in review) is refused with an `Error: …` — a coding feature entering
-        review with no pr_url would strand the merge reconciler. `text`/`ref` are stripped
-        of any literal wrapping double quotes first (same hygiene as board_create_feature)."""
+        yet claimed) is refused with an `Error: …` — a coding feature entering review with
+        no pr_url would strand the merge reconciler. Safe to retry: repeating the delivery a
+        task in review already carries returns its `in_review` state and writes nothing.
+        A DIFFERENT deliverable for a task already in review is refused (the recorded one
+        stands) — to replace it, board_verify(approved=false) first, then deliver again.
+        `text`/`ref` are stripped of any literal wrapping double quotes first (same hygiene
+        as board_create_feature)."""
         try:
             text = _strip_wrapping_quotes(text)
             ref = _strip_wrapping_quotes(ref)

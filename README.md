@@ -309,6 +309,10 @@ output is a **deliverable** (a doc, a decision, an artifact ref), not a PR.
 `record_delivery` (`board_deliver`) moves it to `in_review` with no `pr_url`, stamping
 the deliverable text plus a `delivered-by: <actor>` note — the assignee **at delivery
 time**, captured then so a later reassignment can't rewrite who actually delivered it.
+A failed write fails the delivery with the card still `in_progress`, so it can simply
+be retried; repeating a delivery the card already carries is a no-op, and a
+**different** deliverable for a task already in review is refused rather than written
+over the one awaiting verification.
 
 Because a task has no PR to merge, its **Done edge is a verifier's approval**, not
 `record_merge`: `board_verify` (the agent tool) / `POST …/features/{id}/verify` (the

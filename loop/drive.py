@@ -1028,8 +1028,7 @@ class DriveMixin:
             log.exception("[project_board] %s self task dispatch unexpected failure", fid)
             await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s self task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "self task")
 
     async def _drive_task(self, feature: dict, delegate) -> None:
         """Drive a ``task`` bead with a sister-agent assignee — an ACP coder OR an A2A
@@ -1060,8 +1059,37 @@ class DriveMixin:
             log.exception("[project_board] %s task dispatch unexpected failure", fid)
             await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "task")
+
+    async def _record_task_reply(self, store, fid: str, reply: str, kind: str) -> None:
+        """Record a task drive's reply as the card's deliverable (``record_delivery`` →
+        in_review) — the shared tail of ``_drive_task`` and ``_drive_self_task``.
+
+        The card can leave in_progress while the delegate works, and the store then
+        refuses the write. That is an outcome of the race, not a failure of the drive, so
+        it must not escape the drive task — it used to, as an unretrieved-task-exception
+        traceback on every such run (#403):
+
+        - ``AlreadyDelivered`` — a DIFFERENT deliverable was recorded first. For a self
+          task that is typically the agent itself: its board tools are live during the
+          turn, and it called board_deliver in-turn before replying. That explicit
+          delivery stands; the reply is not written over it. (An IDENTICAL repeat never
+          reaches here — the store takes it as a no-op.)
+        - any other refusal — the card was requeued, blocked or cancelled under the
+          drive, or the write itself failed. Whoever moved the card owns it now, so the
+          reply is logged and dropped rather than forced back in; not blocked either,
+          which would stamp a state onto a card the drive no longer holds. A card still
+          in_progress with no live drive is the sweep's to re-dispatch."""
+        chars = len(reply or "")
+        try:
+            await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
+        except AlreadyDelivered as exc:
+            log.info("[project_board] %s %s reply (%d chars) not recorded — %s", fid, kind, chars, exc)
+            return
+        except BoardError as exc:
+            log.warning("[project_board] %s %s reply (%d chars) not recorded: %s", fid, kind, chars, exc)
+            return
+        log.info("[project_board] %s %s delivered (%d chars) → in_review", fid, kind, chars)
 
     def _record_bg(self, fid: str, label: str, fn, *args, **kwargs) -> None:
         """Run one store write-back on a worker thread WITHOUT awaiting it (#258) —

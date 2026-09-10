@@ -733,7 +733,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `deliverable` reads the latest back), ``ref`` (a doc URL / artifact path)
         lands on `external_ref` — the slot a coding feature's pr_url occupies.
         TASK-ONLY: ``record_delivery`` 400s a coding feature (entering review with no
-        pr_url would strand the merge reconciler) or one not in_progress."""
+        pr_url would strand the merge reconciler) or one not in_progress. A repeat of the
+        delivery an in_review task already carries returns it unchanged; a DIFFERENT one
+        for an in_review task 400s without writing (#403)."""
         body = body or {}
         return await _guard(
             lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))

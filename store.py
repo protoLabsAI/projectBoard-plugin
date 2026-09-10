@@ -580,6 +580,16 @@ class BoardNotFound(BoardError):
     this narrower type instead of pattern-matching an error string."""
 
 
+class AlreadyDelivered(BoardError):
+    """``record_delivery`` refused a DIFFERENT deliverable for a task already in review
+    (#403) — nothing was written, and the recorded one still stands for board_verify.
+
+    A SUBCLASS of BoardError, so every caller that treats a refusal as a 4xx / tool error
+    keeps doing so. The loop's task drives catch this narrower type: a self task's agent
+    has its board tools live during the turn and may board_deliver in-turn, so a reply
+    that lands after its own explicit delivery is an expected outcome, not a failure."""
+
+
 def _br_json_error(out) -> dict:
     """The structured error `br --json` writes to STDOUT on a non-zero exit.
 
@@ -1928,17 +1938,32 @@ class BeadsBoard:
 
         TASK-ONLY: a coding feature taking this edge would enter review with no
         pr_url and strand the merge reconciler — the exact hole open_review's
-        pr_url requirement plugs — so anything else is refused here too."""
+        pr_url requirement plugs — so anything else is refused here too.
+
+        REPLAY-SAFE (#403): a card already ``in_review`` takes a REPEAT of its delivery
+        as a no-op — every field this call carries (the deliverable text, a link ref)
+        already matches what is recorded, so it returns the card and writes nothing. A
+        tool-call retry or a driver replay is not an error. A DIFFERENT deliverable for
+        an in_review card raises :class:`AlreadyDelivered`, again writing nothing: the
+        recorded one stands for board_verify, and replacing it goes through a rejection
+        (board_verify approved=false) or a requeue first, so the trail never gains a
+        second competing record with no verdict between them.
+
+        The deliverable and its stamp are written STRICTLY (#399): a failed write raises
+        while the card is still in_progress, so the caller can retry."""
         f = self._require(fid)
         if f.get("issue_type") != LABEL_TASK:
             raise BoardError(
                 f"record_delivery is task-only — issue_type {f.get('issue_type')!r} enters review via open_review(pr_url=...)"
             )
-        if f["board_state"] != "in_progress":
+        if f["board_state"] not in ("in_progress", "in_review"):
             raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
         # Classify the ref by shape BEFORE any write lands: link-shaped (a scheme, or
         # a protocol-relative //host) must pass the strict http(s) gate to reach
         # external_ref; a scheme-less artifact path folds into the deliverable record.
+        # Stripped because that is how `_project` reads it back — the replay check below
+        # compares against the read-back, so both sides must be in the same form.
+        text = str(text or "").strip()
         ref = str(ref or "").strip()
         parts = urlparse(ref)
         if parts.scheme or parts.netloc:
@@ -1947,15 +1972,36 @@ class BeadsBoard:
             external_ref = ""
             if ref:
                 text = f"{text} ({ref})" if text else ref
+        if f["board_state"] == "in_review":
+            # Already delivered. An empty field brings nothing to compare, so it cannot
+            # conflict — the same rule as an in_progress delivery, where an empty text
+            # writes no record and an empty ref leaves external_ref alone.
+            recorded = str(f.get("deliverable") or "")
+            if (not text or text == recorded) and (not external_ref or external_ref == f.get("pr_url")):
+                return f
+            by = str(f.get("delivered_by") or "").strip()
+            raise AlreadyDelivered(
+                f"record_delivery: {fid} is already delivered{f' by {by}' if by else ''} and in review — "
+                f"this delivery differs from the one on record ({len(recorded)} chars), so it was NOT "
+                "recorded; the recorded one stands for board_verify. To replace it, send the task back "
+                "first (board_verify approved=false with feedback, or requeue it), then deliver again."
+            )
+        # These writes ARE the delivery, so they go through `_run` and RAISE, not through
+        # the best-effort `comment()`: that helper swallows a failed write by contract (an
+        # audit note must never break its edge), which here would still move the card to
+        # in_review below — reporting a delivery whose deliverable was never written, and
+        # refusing the retry because the card had already left in_progress (#399). Raising
+        # leaves the card in_progress, so the same call can simply be made again.
         if text:
-            self.comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
+            self._run("comments", "add", fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
         # Actor provenance (#316): stamp WHO delivered, beside the deliverable record and
         # BEFORE the in_review move — the task's assignee at delivery time, falling back to
         # the store actor when unassigned. Captured now (not read off the bead later) so a
         # reassignment after delivery can't rewrite the deliverer; _project reads the latest
-        # `delivered-by:` comment back into `delivered_by`.
+        # `delivered-by:` comment back into `delivered_by`, and record_verification's
+        # self-verification check reads that — so it is part of the record, not a note.
         delivered_by = str(f.get("assignee") or "").strip() or self.actor
-        self.comment(fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
+        self._run("comments", "add", fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if external_ref:
             args += ["--external-ref", external_ref]
@@ -2712,11 +2758,20 @@ class BeadsBoard:
                     # visible reason is unfixable by design: there is no claim to check,
                     # so no coder can clear it and the card parks forever.
                     #
-                    # Only blocked rows, and only from the batch already fetched: this is
+                    # TASK rows too (#399), for the same reason: a task's `deliverable`
+                    # and `delivered_by` are read out of its `deliverable:` /
+                    # `delivered-by:` comments, so the listing showed EVERY delivered
+                    # task with an empty deliverable (and the assignee as its deliverer).
+                    # That is not cosmetic — a card whose whole work product is its
+                    # deliverable read as "moved to review, content lost", and was filed
+                    # as a data-loss bug while the text sat intact on the bead.
+                    #
+                    # Only those rows, and only from the batch already fetched: this is
                     # a poll-rate endpoint, and the comment thread is the largest field on
-                    # a bead. Copying it for all 35 cards to serve the 3 that need it
-                    # would trade a real regression for a cosmetic one.
-                    if rid and rid in show_by_id and LABEL_BLOCKED in (r.get("labels") or []):
+                    # a bead. Copying it for every coding card, whose projection reads
+                    # nothing from it unless blocked, would buy nothing.
+                    labels = r.get("labels") or []
+                    if rid and rid in show_by_id and (LABEL_BLOCKED in labels or r.get("issue_type") == LABEL_TASK):
                         r["comments"] = show_by_id[rid].get("comments")
         out = [self._project(r) for r in rows]
         if not include_archived:
