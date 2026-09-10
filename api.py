@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
-from .store import BoardError, annotate_next_action, escalation_enabled, get_store, open_requirements_note
+from .store import BoardError, annotate_next_action, escalation_enabled, get_store, knob_bool, open_requirements_note
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -46,6 +46,10 @@ class ProjectUpsertBody(BaseModel):
     local_gate_cmd: str = Field(default="", max_length=8192)
     repo_conventions: str = Field(default="", max_length=32768)
     default_action: Literal["keep", "set", "clear"] = "keep"
+    # The caller's own id for this save (#393). GET /projects reports each project's latest
+    # save under `saves.<name>` with this id, so a client whose request an intermediary gave
+    # up on (the fleet proxy's 20s API lane) can still learn how its gate-changing save ended.
+    request_id: str = Field(default="", max_length=64)
 
 
 def _store_kw(cfg: dict) -> dict:
@@ -414,8 +418,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.put("/projects/{name}")
     async def _put_project(name: str, body: ProjectUpsertBody):
-        """Add/update one boarded repo through the same bounded seam as the agent tool."""
-        from .project_registry import ProjectRegistryError, upsert_project
+        """Add/update one boarded repo through the same bounded seam as the agent tool. A save
+        that sets a new gate command, or moves the project to another repo, answers only after
+        that gate has run once on the clean base (minutes, for a full suite); a red gate is a
+        400 naming the failure. 409 means another save changed the project meanwhile: reload
+        and save again. When an intermediary times out first, GET /projects reports the outcome
+        under ``saves.<name>`` (matched by ``request_id``)."""
+        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, upsert_project
 
         try:
             result = await upsert_project(
@@ -427,7 +436,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 make_default=body.default_action == "set",
                 clear_default=body.default_action == "clear",
                 replace_optional=True,
+                request_id=body.request_id,
             )
+        except ProjectRegistryConflict as exc:
+            raise HTTPException(409, str(exc))
         except ProjectRegistryError as exc:
             raise HTTPException(400, str(exc))
         return {"ok": True, **result}
@@ -740,6 +752,36 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
         await _reap_worktree(fid, f)
         return f
+
+    @router.post("/features/{fid}/attach-pr")
+    async def _attach_pr(fid: str, body: dict = Body(default={})):
+        """Attach an externally opened PR to the existing coding card it belongs to (#402).
+        The card moves to in_review with that PR, and the normal reconcile drives it from there
+        (CI, the review gate, merge → done). Body: ``{pr_url, reason?, by?}``. Returns 400,
+        changing nothing, unless the PR is OPEN, in the card's project repo, on the card's own
+        branch and targeting its base, and the card is an in-flight coding card with no PR of
+        its own, no open dependency and no live drive. ``by`` defaults to ``"operator"``: an
+        HTTP attach is out-of-band by construction (the ``/verify`` precedent)."""
+        from .loop import attach_external_pr
+
+        body = body or {}
+        board = await _guard(store)
+        f = await _guard(lambda: board.get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        try:
+            return await attach_external_pr(
+                board,
+                f,
+                str(body.get("pr_url") or ""),
+                repo=repo_for_feature(f, store_kw),
+                base=base_branch_for_feature(f, store_kw),
+                review_gate=knob_bool(cfg or {}, "review_gate", False, strict=False),
+                reason=str(body.get("reason") or ""),
+                by=str(body.get("by") or "operator"),
+            )
+        except BoardError as exc:
+            raise HTTPException(400, str(exc))
 
     # ── task-type review lane (#217): deliver → verify, the coder-PR-free siblings
     #    of open_review → record_merge. deliver moves in_progress → in_review;
