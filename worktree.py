@@ -87,13 +87,16 @@ async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, st
 #   and could swallow bytes meant for the server. `stdin=DEVNULL` gives it EOF instead.
 # * A timeout killed only `/bin/sh`. Its children were orphaned, kept running, and kept
 #   our stdout pipe open; ~15 hung `pnpm install`s piled up across two boards.
-# * On Python >= 3.12 `await proc.wait()` does not return until every pipe closes, so
+# * On Python >= 3.11 `await proc.wait()` does not return until every pipe closes, so
 #   after that shell-only kill it waited on the orphan — a drive went silent for 8h.
 #
 # So every such child leads its OWN session (one process group we can kill whole), and
-# every timeout or cancel SIGKILLs the group and reaps it on a bound. The registry's
-# gate smoke already did this (`project_registry._kill_gate_tree`); these helpers are
-# that pattern made shared so no call site is left doing it the old way.
+# every timeout or cancel SIGKILLs the group and reaps it on a bound — the host's own
+# contract for trees it owns (protoAgent ADR 0098, `infra.proc.group_kwargs`), and what the
+# registry's gate smoke already did. The price, the same one the host pays for its shell
+# tool and ACP delegates: a member stopped by a signal to its process group no longer takes
+# a running gate with it — the drive's cancel path does that, if shutdown reaches it.
+# POSIX only: on Windows `killpg` does not exist and this degrades to killing the shell.
 _REAP_TIMEOUT_S = 10.0
 
 
@@ -130,15 +133,22 @@ def kill_tree(proc) -> None:
         pass
 
 
-async def reap(proc, *, timeout: float = _REAP_TIMEOUT_S) -> None:
-    """Wait for a killed tree to exit — on a bound. A descendant that left the group
-    (daemonised itself into its own session) can still hold a pipe; after ``timeout``
-    it is abandoned rather than allowed to hang the caller."""
+async def reap(proc, *, timeout: float | None = None) -> None:
+    """Wait for a killed tree to exit — on a bound (``_REAP_TIMEOUT_S`` by default). A
+    descendant that left the group (daemonised itself into its own session) survives the
+    group kill and can hold our pipe open; after the bound it is abandoned rather than
+    allowed to hang the caller."""
+    bound = _REAP_TIMEOUT_S if timeout is None else timeout
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        await asyncio.wait_for(proc.wait(), timeout=bound)
     except asyncio.TimeoutError:
         pid = getattr(proc, "pid", "?")
-        log.warning("[project_board] killed child pid %s did not exit within %ss — abandoning it", pid, timeout)
+        log.warning(
+            "[project_board] killed child pid %s: its pipe is still held (a descendant escaped the "
+            "process group) after %ss — abandoning it",
+            pid,
+            bound,
+        )
 
 
 async def communicate_or_kill(proc, *, timeout: float | None) -> tuple[bytes | None, bytes | None]:

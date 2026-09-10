@@ -9,7 +9,7 @@ leaked in production — is gone, not just the shell.
 The live incident (2026-09-10): ~15 `pnpm install`s hung across two boards, the oldest
 for 19.5h, all orphaned by a shell-only kill and all holding the desktop app's
 never-closing stdin pipe. A drive sat silent for 8h because `await proc.wait()` on
-Python >= 3.12 waits for the orphan to close its stdout.
+Python >= 3.11 waits for the orphan to close its stdout.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -51,10 +52,28 @@ async def _gone(pid: int, within: float = 3.0) -> bool:
     return not _alive(pid)
 
 
+# Every grandchild pid a test learns about, so teardown can kill whatever a FAILING test
+# left behind — a regression here would otherwise leak `sleep 300`s for five minutes.
+_SPAWNED: list[int] = []
+
+
+@pytest.fixture(autouse=True)
+def _kill_leftover_grandchildren():
+    yield
+    while _SPAWNED:
+        pid = _SPAWNED.pop()
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 async def _pid_from(pidfile) -> int:
     for _ in range(100):
         if pidfile.exists() and pidfile.read_text().strip():
-            return int(pidfile.read_text().strip())
+            pid = int(pidfile.read_text().strip())
+            _SPAWNED.append(pid)
+            return pid
         await asyncio.sleep(0.05)
     raise AssertionError("the command never recorded its grandchild's pid")
 
@@ -179,3 +198,76 @@ async def test_communicate_or_kill_passes_a_normal_exit_through(tmp_path):
     )
     out, _ = await worktree.communicate_or_kill(proc, timeout=10)
     assert out.decode().strip() == "out" and proc.returncode == 4
+
+
+async def test_a_timed_out_preflight_leaves_no_survivors(tmp_path):
+    """The preflight smokes the gate in the OPERATOR'S base checkout — the worst place to
+    leave an orphaned install behind."""
+    pidfile = tmp_path / "grandchild.pid"
+    loop = BoardLoop({"coder": "proto"})
+    loop.preflight_timeout = 0.5
+
+    await asyncio.wait_for(loop._preflight("p", _TREE.format(pidfile=pidfile), str(tmp_path)), timeout=15)
+
+    assert await _gone(await _pid_from(pidfile)), "the preflight gate's grandchild outlived its timeout"
+
+
+async def test_a_timed_out_fixups_command_is_killed_at_all(tmp_path, monkeypatch):
+    """The fixups timeout used to kill NOTHING: `wait_for` raised, `except Exception`
+    swallowed it, and the formatter kept running in a worktree about to be PR'd."""
+    monkeypatch.setattr("project_board.loop.drive._FIXUPS_TIMEOUT_S", 0.5)
+    pidfile = tmp_path / "grandchild.pid"
+    loop = BoardLoop({"coder": "proto"})
+    loop.format_cmd = _TREE.format(pidfile=pidfile)
+
+    await asyncio.wait_for(loop._run_fixups(str(tmp_path)), timeout=15)
+
+    assert await _gone(await _pid_from(pidfile)), "the fixups command's grandchild outlived its timeout"
+
+
+async def test_a_timed_out_gh_takes_its_tree_down(tmp_path, monkeypatch):
+    """`gh` shells out (auth helpers, extensions, a pager) — a timeout that kills only `gh`
+    orphans whatever it started."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pidfile = tmp_path / "grandchild.pid"
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text("#!/bin/sh\n" + _TREE.format(pidfile=pidfile) + "\n")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    with pytest.raises(worktree.WorktreeError, match="timed out"):
+        await asyncio.wait_for(worktree._gh("pr", "list", cwd=str(tmp_path), timeout=1), timeout=15)
+
+    assert await _gone(await _pid_from(pidfile)), "gh's grandchild outlived its timeout"
+
+
+async def test_communicate_or_kill_reaps_the_tree_before_it_raises(tmp_path):
+    """The reap is part of the contract: a caller that removes the worktree right after a
+    timeout must not race a shell that is still being torn down."""
+    proc = await worktree.spawn_shell(
+        "sleep 300; echo done", cwd=str(tmp_path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await worktree.communicate_or_kill(proc, timeout=0.5)
+    assert proc.returncode is not None, "communicate_or_kill raised before the killed shell was reaped"
+
+
+async def test_a_descendant_that_escapes_the_group_cannot_hang_the_caller(tmp_path, monkeypatch):
+    """The one case the reap BOUND exists for: a descendant that re-`setsid`s survives the
+    group kill and keeps our stdout pipe open. The caller must get its timeout anyway."""
+    monkeypatch.setattr(worktree, "_REAP_TIMEOUT_S", 1.0)
+    pidfile = tmp_path / "escaped.pid"
+    escape = f"{sys.executable} -c 'import os, time; os.setsid(); time.sleep(300)' & echo $! > \"{pidfile}\"; wait"
+    proc = await worktree.spawn_shell(
+        escape, cwd=str(tmp_path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    pid = await _pid_from(pidfile)
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(worktree.communicate_or_kill(proc, timeout=0.5), timeout=10)
+    # The outer wait_for would raise TimeoutError too — only the elapsed time proves the
+    # reap's own bound (1s here) cut the wait, rather than the test's safety net (10s).
+    assert time.monotonic() - started < 5, "the reap bound did not cap the wait on the escaped pipe"
+    assert _alive(pid), "the escaped descendant should have survived the group kill — the premise of this test"

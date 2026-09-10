@@ -1752,7 +1752,7 @@ class _WorktreeSolveAdapter:
             return Verdict(passed=False, total=1, failed=1, output=f"could not launch acceptance tests: {exc}")
         try:
             # The whole tree dies on a timeout (#423). This used to kill only the shell and
-            # then `await proc.wait()` — which on Python >= 3.12 waits for the orphaned
+            # then `await proc.wait()` — which on Python >= 3.11 waits for the orphaned
             # test runner to close its pipe, so a hung `pnpm install` froze the drive.
             out, _ = await worktree.communicate_or_kill(proc, timeout=self.test_timeout)
         except asyncio.TimeoutError:

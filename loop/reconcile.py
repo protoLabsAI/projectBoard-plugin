@@ -1806,9 +1806,12 @@ class ReconcileMixin:
                 return None
             sig = killed_by_signal(proc.returncode)
             if sig is not None:
-                # Killed by a signal — the member shutting down (SIGTERM reaches the
-                # child), an operator `kill`, the OOM killer — NOT the repo failing its
-                # own gate. Same posture as the timeout above: the gate couldn't run to
+                # Killed by a signal — an operator `kill`, the OOM killer, a wrapper whose
+                # child died on one — NOT the repo failing its own gate. (A member shutdown
+                # used to land here too, its SIGTERM reaching the gate through the shared
+                # process group; since #423 the gate has its own group and a shutdown
+                # cancel kills the tree before any exit code is read.) Same posture as the
+                # timeout above: the gate couldn't run to
                 # a verdict, so it must not produce one. Seen 2026-08-20: a restart
                 # landed mid merged-state gate, pytest died at 13% with rc=-15, and the
                 # feature was flag_blocked "gate FAILED on the merged state" against a
