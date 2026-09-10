@@ -55,6 +55,8 @@ from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
 from ..store import (
+    BR_FAILURES,
+    AlreadyDelivered,
     BoardError,
     LABEL_CHANGES_REQUESTED,
     LABEL_MERGED_VERIFIED_PREFIX,
@@ -62,6 +64,8 @@ from ..store import (
     LABEL_REVIEW_PENDING,
     LABEL_REVIEWED_HEAD_PREFIX,
     LABEL_TASK,
+    _REQ_HEADING_RE,
+    _REQ_LINE_RE,
     _all_items_disposed,
     apply_requirement_dispositions,
     budgets_from_labels,
@@ -69,6 +73,7 @@ from ..store import (
     get_store,
     knob_bool,
     merge_posture,
+    parse_requirement_dispositions,
     reconfigure_cached_store,
 )
 
@@ -399,42 +404,11 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str]:
 # of the phrase mid-narration doesn't truncate the real section (#56).
 _SUMMARY_HEADING_RE = re.compile(r"^##\s*Summary\b", re.MULTILINE)
 
-# The requirement-ledger disposition section (#113) — the `## Summary` pattern's
-# sibling: the coder reports one line per item id (`- r2: done`, `- r3: declined —
-# <reason>`). Same last-occurrence discipline as the summary; the section ends at
-# the next `## ` heading. Only the CLOSED statuses parse — silence (or an explicit
-# `open`) is not a disposition, so an unreported item stays open on the ledger.
-_REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
-_REQ_LINE_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
-    r"(?P<status>done|declined)\b\s*(?:[:\-—–]\s*)?(?P<reason>.*)$",
-    re.IGNORECASE,
-)
-
-
-def _parse_requirements_reply(text: str) -> list[dict]:
-    """Parse the coder reply's ``## Requirements`` section into disposition dicts
-    (`{id, status, decline_reason?}`) for ``apply_requirement_dispositions``. Keeps
-    the LAST such heading (a mid-narration mention must not shadow the real section,
-    the #56 lesson), reads until the next heading, and skips any line that isn't a
-    well-formed `<id>: done|declined [— reason]` row — a malformed row is silence,
-    and silence is not disposition. No section → no dispositions."""
-    headings = list(_REQ_HEADING_RE.finditer(text or ""))
-    if not headings:
-        return []
-    out: list[dict] = []
-    for line in text[headings[-1].end() :].splitlines():
-        if line.strip().startswith("##"):
-            break  # the next section — the ledger block ended
-        m = _REQ_LINE_RE.match(line)
-        if not m:
-            continue
-        d = {"id": m.group("id"), "status": m.group("status").lower()}
-        reason = m.group("reason").strip()
-        if d["status"] == "declined" and reason:
-            d["decline_reason"] = reason
-        out.append(d)
-    return out
+# The requirement-ledger disposition section (#113) — parsed by the STORE now
+# (`store.parse_requirement_dispositions`, with its two regexes), because task delivery
+# applies the same section (#399) and the store can't reach up into the loop. Kept under
+# its historical name so the coder drive and every existing import read it unchanged.
+_parse_requirements_reply = parse_requirement_dispositions
 
 
 # ── grounding a review finding against the diff (#381) ────────────────────────
@@ -1294,6 +1268,8 @@ __all__ = [
     "resolve_default_project",
     "resolve_projects",
     "store_mod",
+    "BR_FAILURES",
+    "AlreadyDelivered",
     "BoardError",
     "LABEL_CHANGES_REQUESTED",
     "LABEL_MERGED_VERIFIED_PREFIX",

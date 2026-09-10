@@ -1020,16 +1020,13 @@ class DriveMixin:
             if self._shutting_down:
                 log.info("[project_board] %s self task dispatch aborted by shutdown — no block", fid)
                 return
-            policy = classify(str(exc))
-            log.warning("[project_board] %s self task blocked (%s): %s", fid, policy.category, exc)
-            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+            await self._task_dispatch_failed(store, fid, "self task", f"{classify(str(exc)).category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s self task dispatch unexpected failure", fid)
-            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await self._task_dispatch_failed(store, fid, "self task", f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s self task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "self task")
 
     async def _drive_task(self, feature: dict, delegate) -> None:
         """Drive a ``task`` bead with a sister-agent assignee — an ACP coder OR an A2A
@@ -1052,16 +1049,87 @@ class DriveMixin:
             if self._shutting_down:
                 log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
                 return
-            policy = classify(str(exc))
-            log.warning("[project_board] %s task blocked (%s): %s", fid, policy.category, exc)
-            await asyncio.to_thread(store.flag_blocked, fid, f"{policy.category}: {exc}")
+            await self._task_dispatch_failed(store, fid, "task", f"{classify(str(exc)).category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s task dispatch unexpected failure", fid)
-            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
+            await self._task_dispatch_failed(store, fid, "task", f"unexpected: {type(exc).__name__}: {exc}")
             return
-        await asyncio.to_thread(store.record_delivery, fid, text=reply or "")
-        log.info("[project_board] %s task delivered (%d chars) → in_review", fid, len(reply or ""))
+        await self._record_task_reply(store, fid, reply, "task")
+
+    async def _task_dispatch_failed(self, store, fid: str, kind: str, reason: str) -> None:
+        """Block a task whose dispatch failed — or answered with nothing — for triage,
+        UNLESS the card was delivered under the drive (#432 review).
+
+        A self task's agent has its board tools live during the turn, so it can
+        board_deliver and THEN time out or error. Blocking that card stamped `blocked` over
+        a delivered deliverable, and the verifier could no longer approve it
+        (`record_verification expects in_review, got 'blocked'`). So the card is re-read
+        first: in review (or already done), the delivery stands and the failure is only
+        logged. If the re-read itself fails, the block goes ahead as it always did. Neither
+        a failed read nor a failed block escapes the drive task."""
+        try:
+            current = await asyncio.to_thread(store.get_feature, fid)
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s could not re-read the card before blocking it: %s", fid, exc)
+            current = None
+        state = (current or {}).get("board_state")
+        if state in ("in_review", "done"):
+            log.info(
+                "[project_board] %s %s failed after the card was delivered (%s) — the delivery stands, not blocking: %s",
+                fid,
+                kind,
+                state,
+                reason,
+            )
+            return
+        log.warning("[project_board] %s %s blocked: %s", fid, kind, reason)
+        try:
+            await asyncio.to_thread(store.flag_blocked, fid, reason)
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s %s could not be blocked: %s", fid, kind, exc)
+
+    async def _record_task_reply(self, store, fid: str, reply: str, kind: str) -> None:
+        """Record a task drive's reply as the card's deliverable (``record_delivery`` →
+        in_review) — the shared tail of ``_drive_task`` and ``_drive_self_task``.
+
+        The card can leave in_progress while the delegate works, and the store then
+        refuses the write. That is an outcome of the race, not a failure of the drive, so
+        it must not escape the drive task — it used to, as an unretrieved-task-exception
+        traceback on every such run (#403):
+
+        - ``AlreadyDelivered`` — a DIFFERENT deliverable was recorded first. For a self
+          task that is typically the agent itself: its board tools are live during the
+          turn, and it called board_deliver in-turn before replying. That explicit
+          delivery stands; the reply is not written over it. (An IDENTICAL repeat never
+          reaches here — the store takes it as a no-op.)
+        - any other refusal — the card was requeued, blocked or cancelled under the
+          drive, or the write itself failed (a `br` timeout included, #432 review).
+          Whoever moved the card owns it now, so the reply is logged and dropped rather
+          than forced back in; not blocked either, which would stamp a state onto a card
+          the drive no longer holds. A card still in_progress with no live drive is the
+          sweep's to re-dispatch.
+
+        An EMPTY reply is not a delivery (#432 review): it goes down the failed-dispatch
+        path — blocked for triage, unless the agent delivered in-turn — rather than being
+        recorded as a task in review with nothing in it."""
+        chars = len(reply or "")
+        if not (reply or "").strip():
+            why = "empty reply: the assignee returned no deliverable, so there is nothing to record"
+            await self._task_dispatch_failed(store, fid, kind, f"{classify(why).category}: {why}")
+            return
+        try:
+            await asyncio.to_thread(store.record_delivery, fid, text=reply)
+        except AlreadyDelivered as exc:
+            log.info("[project_board] %s %s reply (%d chars) not recorded — %s", fid, kind, chars, exc)
+            return
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s %s reply (%d chars) not recorded: %s", fid, kind, chars, exc)
+            return
+        except Exception:  # noqa: BLE001 — unexpected; log it, never an unretrieved task exception
+            log.exception("[project_board] %s %s reply (%d chars) not recorded (unexpected failure)", fid, kind, chars)
+            return
+        log.info("[project_board] %s %s delivered (%d chars) → in_review", fid, kind, chars)
 
     def _record_bg(self, fid: str, label: str, fn, *args, **kwargs) -> None:
         """Run one store write-back on a worker thread WITHOUT awaiting it (#258) —
