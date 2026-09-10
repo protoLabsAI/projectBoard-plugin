@@ -49,6 +49,7 @@ import subprocess
 import sys
 import types
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,18 @@ if _lock_holder is None:
     _lock_holder.lock = asyncio.Lock()
     sys.modules[_LOCK_SLOT] = _lock_holder
 _MUTATION_LOCK = _lock_holder.lock
+# One gate smoke per CHECKOUT at a time (#393). The smoke runs outside the registry lock,
+# so saves to different projects don't wait on each other's gate. But two gates running in
+# one working tree trample each other's caches and build output, as the old global lock
+# prevented. Keyed by resolved repo path, in the same process-stable slot as the lock.
+_SMOKE_LOCKS: dict[str, asyncio.Lock] = _lock_holder.__dict__.setdefault("smoke_locks", {})
+# The latest save per project and how it ended: {id, state, stage, started_at,
+# finished_at, detail} (#393). A save that changes the gate answers only once the gate has
+# run, which takes minutes for a full suite. An intermediary may give up first: the fleet
+# proxy answers 504 after 20s on a plugin API call. So the outcome also lands here, where
+# GET /projects serves it and the editor polls for it by the request id it sent.
+_SAVES: dict[str, dict[str, Any]] = _lock_holder.__dict__.setdefault("saves", {})
+_APPLYING = "applying the change"
 
 
 class ProjectRegistryError(ValueError):
@@ -207,6 +220,9 @@ def project_registry_snapshot() -> dict[str, Any]:
         "projects": rows,
         "default_project": _effective_default(section, projects),
         "onboarding": {"enabled": enabled, "root": root},
+        # How each project's latest save went. This is what the editor polls when an
+        # intermediary gave up on a long gate-changing save before it answered (#393).
+        "saves": {name: dict(record) for name, record in _SAVES.items()},
     }
 
 
@@ -406,7 +422,21 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
     if proc.returncode == 0:
         # Log the OUTCOME, not just the start (#393). A PUT whose client has timed out gets
         # no access-log line from uvicorn, so this is the only record of what the call did.
-        log.info("[project_board] register[%s]: gate smoke passed on the clean base", name)
+        # A green run on a checkout that was NOT at base proves nothing about the base,
+        # exactly as the preflight treats it (#300): an operator's local fix can make a
+        # broken base pass. It persists either way, since there is no verdict to refuse
+        # on, but the log says which it was.
+        if dirt:
+            log.warning(
+                "[project_board] register[%s]: gate passed, but the checkout at %s was NOT at base when it "
+                "started (%s) — that is no verdict on the base; persisting (the loop's preflight still gates "
+                "dispatch)",
+                name,
+                repo,
+                dirt,
+            )
+        else:
+            log.info("[project_board] register[%s]: gate smoke passed on the clean base", name)
         return
     if proc.returncode is not None and proc.returncode < 0:
         # Killed by a signal (shutdown / external kill / OOM) — the gate never reached
@@ -443,39 +473,86 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
             text,
         )
         return
-    log.warning(
-        "[project_board] register[%s]: gate FAILED on the clean base (exit %d) — refusing; nothing persisted",
-        name,
-        proc.returncode,
-    )
     raise ProjectRegistryError(
         f"the gate failed on the clean base checkout (exit {proc.returncode}) — "
         f"fix the gate or the repo before registering it; output tail:\n{text}"
     )
 
 
-def _gate_already_proven(prior: Any, gate_cmd: str, repo: Path, base: str) -> bool:
-    """Whether ``gate_cmd`` is the gate ``prior`` already persists, for the same checkout and
-    base — i.e. this call carries nothing new for the smoke to prove (#393).
+def _gate_already_proven(prior: Any, gate_cmd: str, repo: Path) -> bool:
+    """Whether ``prior`` already carries ``gate_cmd`` in the same checkout, so a save that
+    keeps it has nothing new for the smoke to prove (#393).
 
-    The Projects editor round-trips EVERY field on save, so the configured gate always came
+    The Projects editor sends EVERY field back on save, so the configured gate always came
     back as "gate text this call carries" and was smoked again. For protoAgent that is ruff +
     lint-imports + the whole pytest suite, synchronously, under the registry lock: a
     conventions-only save took minutes, outlived its client, and a red suite refused an edit
     that had nothing to do with it. A gate is proven against a checkout, so the smoke re-runs
-    only when one of those changes — the command, the repo, or the base. Anything unreadable
-    reads as changed (smoke it), never as proven."""
+    only when the command or the repo changes.
+
+    NOT the base branch. The smoke runs in the operator's checkout, which a base-branch edit
+    does not switch. It would run the old branch's code, read as not-at-base, and yield no
+    verdict, only a minutes-long wait. A base change resets the loop's preflight instead, and
+    that re-smokes the gate against the new base before any work dispatches. Anything
+    unreadable reads as changed (smoke it), never as proven."""
     if not isinstance(prior, dict):
         return False
     prior_repo = str(prior.get("repo") or "").strip()
     if not prior_repo or str(prior.get("local_gate_cmd") or "").strip() != gate_cmd:
         return False
-    if str(prior.get("base_branch") or "").strip() != base:
-        return False
     try:
         return Path(prior_repo).expanduser().resolve() == repo
     except OSError:
         return False
+
+
+def _explicit_gate(entry: dict[str, Any]) -> str:
+    """The gate command ``entry`` will RUN, or ``""``. Blank means inherit, and the ``auto``
+    sentinel is resolved by the loop at dispatch time; neither is a command to smoke."""
+    gate = str(entry.get("local_gate_cmd") or "").strip()
+    return "" if gate in ("", _AGENT_GATE_SENTINEL) else gate
+
+
+def _consented_repo(repo: str) -> Path:
+    """``repo`` resolved and proven to sit inside the operator's onboarding space, read LIVE:
+    the operator can switch the space off, or move its root, between two calls."""
+    enabled, root = _host_onboarding()
+    if not enabled:
+        raise ProjectRegistryError(
+            "project onboarding is off — enable Settings ▸ Project onboarding before changing boarded repos"
+        )
+    repo_p, err = _resolve_under(root, repo)
+    if err:
+        raise ProjectRegistryError(err)
+    return repo_p
+
+
+def _prior_entry(existing: dict[str, Any], project: str) -> Any:
+    prior = existing.get(project)
+    if project in existing and not isinstance(prior, dict):
+        raise ProjectRegistryError(
+            f"project {project!r} is not a mapping — repair it in YAML or delete it before replacing it"
+        )
+    return prior
+
+
+def _merge_entry(
+    prior: Any, repo: Path, branch: str, optional: dict[str, str], replace_optional: bool
+) -> dict[str, Any]:
+    """The entry this save would persist: ``prior`` (file-only fields preserved) with the
+    editor-owned fields applied."""
+    entry = dict(prior) if isinstance(prior, dict) else {}
+    entry.update({"repo": str(repo), "base_branch": branch})
+    for key, value in optional.items():
+        if value:
+            entry[key] = value
+        elif replace_optional:
+            entry.pop(key, None)
+    return entry
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 async def _apply_registry(
@@ -549,65 +626,131 @@ async def upsert_project(
     clear_default: bool = False,
     replace_optional: bool = False,
     force_gate: bool = False,
+    request_id: str = "",
 ) -> dict[str, Any]:
     """Add/update one project while preserving siblings and unowned entry fields.
 
-    An EXPLICIT gate command this call changes — new text, or the same gate moved to a
-    different repo/base — is smoke-run once on the repo's base checkout before anything
-    persists (#261) — see ``_smoke_gate_on_clean_base``; an unchanged one is not re-run
-    (#393, ``_gate_already_proven``). ``force_gate`` downgrades a red smoke to a loud
-    warning."""
+    The gate the entry will RUN is smoke-run once on the repo's base checkout before
+    anything persists (#261, ``_smoke_gate_on_clean_base``) when this save changes it: new
+    command text, or the same command moved to another repo. A gate the entry already
+    carried in that repo is not re-run (#393, ``_gate_already_proven``). ``force_gate``
+    downgrades a red smoke to a loud warning.
+
+    The smoke runs OUTSIDE the registry lock (#393), so a save to another project never
+    waits minutes behind this one's gate. The lock covers only the read-merge-write, and
+    under it the project's entry is re-read. If it changed while the smoke ran, or while
+    this save waited, in a way that leaves the gate unproven, the save is refused with
+    ``ProjectRegistryConflict`` (409) to be retried, never applied over the change.
+    ``request_id`` (the editor's own) keys this save's outcome in ``_SAVES``."""
     project = _validate_name(name)
     repo = _bounded_text(repo, "repo", 4096, required=True)
     if make_default and clear_default:
         raise ProjectRegistryError("default action is ambiguous — set and clear cannot both be requested")
+    optional = {
+        "local_gate_cmd": _bounded_text(local_gate_cmd, "local gate command", 8192),
+        "repo_conventions": _bounded_text(repo_conventions, "repository conventions", 32768),
+    }
     branch = await asyncio.to_thread(_validate_base_branch, base_branch)
+    status = {
+        "id": str(request_id or "")[:64],
+        "state": "running",
+        "stage": "reading the registry",
+        "started_at": _now_iso(),
+        "finished_at": None,
+        "detail": "",
+    }
+    _SAVES[project] = status
+    try:
+        result = await _upsert(
+            project,
+            repo,
+            branch,
+            optional,
+            status,
+            make_default=make_default,
+            clear_default=clear_default,
+            replace_optional=replace_optional,
+            force_gate=force_gate,
+        )
+    except asyncio.CancelledError:
+        detail = (
+            "cancelled while the change was being applied — it may have landed; reload the project list"
+            if status["stage"] == _APPLYING
+            else f"cancelled while {status['stage']} — nothing was saved"
+        )
+        status.update(state="cancelled", finished_at=_now_iso(), detail=detail)
+        log.warning("[project_board] register[%s]: %s (client gone, or shutdown)", project, detail)
+        raise
+    except ProjectRegistryError as exc:
+        # Every refusal is logged here, once, with its full reason. The client may be gone
+        # (a timed-out curl, a proxy that gave up), and then this line and `_SAVES` are all
+        # that is left of the call.
+        status.update(state="refused", finished_at=_now_iso(), detail=str(exc))
+        log.warning("[project_board] register[%s]: not saved — %s", project, exc)
+        raise
+    status.update(state="saved", stage="", finished_at=_now_iso())
+    return result
 
+
+async def _upsert(
+    project: str,
+    repo: str,
+    branch: str,
+    optional: dict[str, str],
+    status: dict[str, Any],
+    *,
+    make_default: bool,
+    clear_default: bool,
+    replace_optional: bool,
+    force_gate: bool,
+) -> dict[str, Any]:
+    """``upsert_project``'s two phases: prove the gate, then the locked read-merge-write."""
+    # Phase 1, NO lock: decide whether the gate this save leaves needs proving, and prove it.
+    # Consent is checked first, because the smoke executes a command in that checkout.
+    repo_p = _consented_repo(repo)
+    existing = _projects_from_section(_live_section(required=True), required=True)
+    basis = copy.deepcopy(_prior_entry(existing, project))
+    gate = _explicit_gate(_merge_entry(basis, repo_p, branch, optional, replace_optional))
+    smoked = False
+    if gate and not _gate_already_proven(basis, gate, repo_p):
+        smoke_lock = _SMOKE_LOCKS.setdefault(str(repo_p), asyncio.Lock())
+        if smoke_lock.locked():
+            status["stage"] = f"waiting for another gate smoke in {repo_p}"
+            log.info("[project_board] register[%s]: %s", project, status["stage"])
+        async with smoke_lock:
+            status["stage"] = "running the gate on the clean base"
+            await _smoke_gate_on_clean_base(project, gate, str(repo_p), branch, force=force_gate)
+        smoked = True
+
+    # Phase 2, under the lock: the read-merge-write, on a FRESH read.
     if _MUTATION_LOCK.locked():
-        # Say so before waiting (#393): a change queued behind a running gate smoke used to
-        # wait in silence and then run its own — a retry is exactly the wrong move there.
+        # Say so before waiting (#393): a change queued behind another used to wait in
+        # silence, and a retry is exactly the wrong move there.
+        status["stage"] = "waiting for another project change"
         log.info("[project_board] register[%s]: waiting for another project change to finish", project)
     async with _MUTATION_LOCK:
-        # Consent and its root are live policy, so validate them after acquiring the
-        # mutation lock. A request queued behind another config write must not retain
-        # stale permission after onboarding is disabled or its root changes.
-        enabled, root = _host_onboarding()
-        if not enabled:
-            raise ProjectRegistryError(
-                "project onboarding is off — enable Settings ▸ Project onboarding before changing boarded repos"
+        status["stage"] = "saving"
+        # Consent and its root are live policy, so they are re-checked here too: a save
+        # queued behind another must not keep a permission the operator has since revoked.
+        if _consented_repo(repo) != repo_p:
+            raise ProjectRegistryConflict(
+                f"{repo} resolves to a different checkout than when this save started — save again"
             )
-        repo_p, err = _resolve_under(root, repo)
-        if err:
-            raise ProjectRegistryError(err)
         section = _live_section(required=True)
         existing = _projects_from_section(section, required=True)
-        prior = existing.get(project)
-        if project in existing and not isinstance(prior, dict):
-            raise ProjectRegistryError(
-                f"project {project!r} is not a mapping — repair it in YAML or delete it before replacing it"
+        prior = _prior_entry(existing, project)
+        if smoked and prior != basis:
+            raise ProjectRegistryConflict(
+                f"project {project!r} was changed by another save while this one ran its gate — reload the "
+                "project list and save again"
             )
-        entry = dict(prior) if isinstance(prior, dict) else {}
-        entry.update({"repo": str(repo_p), "base_branch": branch})
-        optional = {
-            "local_gate_cmd": _bounded_text(local_gate_cmd, "local gate command", 8192),
-            "repo_conventions": _bounded_text(repo_conventions, "repository conventions", 32768),
-        }
-        for key, value in optional.items():
-            if value:
-                entry[key] = value
-            elif replace_optional:
-                entry.pop(key, None)
-        # Smoke only a gate THIS call changes: blank keeps/clears (nothing new to prove),
-        # and the "auto" sentinel is resolved by the loop at dispatch time, not a command —
-        # shelling the literal word would manufacture a failure. A gate echoed back
-        # unchanged (the editor round-trips every field) was proven when it was set, or is
-        # the loop preflight's job for YAML-authored ones — and a registry change resets
-        # the preflight, so it re-smokes the gate before the project's ready work is
-        # dispatched anyway. Re-running it here made a conventions-only save run the whole
-        # suite and let a red one refuse it (#393).
-        gate_cmd = optional["local_gate_cmd"]
-        if gate_cmd and gate_cmd != _AGENT_GATE_SENTINEL and not _gate_already_proven(prior, gate_cmd, repo_p, branch):
-            await _smoke_gate_on_clean_base(project, gate_cmd, str(repo_p), branch, force=force_gate)
+        entry = _merge_entry(prior, repo_p, branch, optional, replace_optional)
+        gate = _explicit_gate(entry)
+        if gate and not smoked and not _gate_already_proven(prior, gate, repo_p):
+            raise ProjectRegistryConflict(
+                f"project {project!r} was changed by another save while this one waited, and its gate now "
+                "needs proving in this checkout — save again"
+            )
         merged = dict(existing)
         merged[project] = entry
         if not set(existing) <= set(merged):
@@ -626,6 +769,7 @@ async def upsert_project(
             # registry multi-project. For the first project, adopt the runtime's
             # automatic sole default and report/persist it truthfully.
             default = current_default or _effective_default({}, merged)
+        status["stage"] = _APPLYING
         await _apply_registry(merged, expected={project: entry}, default_project=default)
         log.info(
             "[project_board] register[%s]: %s — repo %s, base %s",
@@ -651,6 +795,8 @@ async def delete_project(
 ) -> dict[str, Any]:
     """Delete a project after a caller-supplied live safety check, under the lock."""
     project = _validate_name(name)
+    if _MUTATION_LOCK.locked():
+        log.info("[project_board] delete[%s]: waiting for another project change to finish", project)
     async with _MUTATION_LOCK:
         section = _live_section(required=True)
         existing = _projects_from_section(section, required=True)

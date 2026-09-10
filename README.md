@@ -379,11 +379,19 @@ Every scalar is explicit about apply behavior. `coder`, `br_autofetch`,
 apply to the running loop; fields marked **restart** are persisted immediately but
 do not change the already-constructed loop/router until the member restarts. Project
 map/default changes apply live as one validated routing policy and do not produce a
-false restart warning. A save that sets a NEW local gate command (or moves an existing
-one to a different repo or base branch) smoke-runs that gate once on the clean base
-before anything persists, and a red gate refuses the save; a save that leaves the gate
-unchanged does not re-run it — a registry change resets the loop's gate preflight, which
-re-smokes the gate before that project's ready work is dispatched.
+false restart warning.
+
+A save that sets a new local gate command, or moves the project (and its gate) to another
+repo, runs that gate once on the clean base before anything persists, and a red gate refuses
+the save. That save answers only after the gate has run, which takes minutes for a full test
+suite. Saves to other projects don't wait on it. A save that leaves the gate and repo alone
+doesn't re-run the gate. That includes a base-branch-only edit: the operator's checkout is
+still on the old branch, so a smoke there could give no verdict. Instead, a registry change
+resets that project's gate preflight in the loop. The preflight re-smokes the gate against
+the new routing before any of the project's work dispatches, and it re-checks cards the
+preflight is holding too. If another save changes the same project while a gate runs, the
+save is refused with a 409; save again. When a proxy gives up on a long save first (the
+fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
 
 The console intentionally does not expose every manifest default. Structural legacy
 single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)

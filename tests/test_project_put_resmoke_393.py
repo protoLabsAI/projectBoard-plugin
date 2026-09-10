@@ -169,7 +169,7 @@ def test_the_save_logs_its_outcome_not_just_its_start(monkeypatch, tmp_path, cap
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=_LOG):
         assert client.put(_ROUTE, json={**body, "local_gate_cmd": "exit 5"}).status_code == 400
-    assert "register[alpha]: gate FAILED on the clean base (exit 5) — refusing" in caplog.text
+    assert "register[alpha]: not saved — the gate failed on the clean base checkout (exit 5)" in caplog.text
     assert "register[alpha]: updated" not in caplog.text
 
 

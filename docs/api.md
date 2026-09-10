@@ -20,7 +20,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | Method | Path | What it does |
 |---|---|---|
 | `GET` | `/projects` | Live project config for the custom Configure tab (no router snapshot). |
-| `PUT` | `/projects/{name}` | Add/update one boarded repo through the same bounded seam as the agent tool. |
+| `PUT` | `/projects/{name}` | Add/update one boarded repo through the same bounded seam as the agent tool. A save that sets a new gate command, or moves the project to another repo, answers only after that gate has run once on the clean base (minutes for a full suite); a red gate is a 400 naming the failure, a 409 means another save changed the project meanwhile. See [Long saves](#long-saves). |
 | `DELETE` | `/projects/{name}` | Delete a project only after proving no active board card references it. |
 | `GET` | `/status` | Is this board BOUND yet? A pure config read — no `br` calls — so it answers even when the store can't, which is exactly when the view needs it. The shipped default (`repo: "."`, no db_path, no project… |
 | `POST` | `/epics` | — |
@@ -56,6 +56,27 @@ crosses a fail-closed HMAC boundary (`X-Hub-Signature-256`) before touching the 
 | `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… |
 | `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… |
 | `POST` | `/webhook/pr` | GitHub PR webhook — the SINGLE Done edge. On a `closed` event with `merged: true` it sets the matching feature `done` (nothing else does) and reaps its worktree. The raw body is HMAC-verified against… |
+
+## Long saves
+
+`PUT /projects/{name}` runs the project's gate once on the clean base before it saves a new
+gate command, or the same gate moved to another repo. The request answers only after that
+gate has finished, which takes minutes for a full test suite. Nothing else waits on it: saves
+to other projects proceed, and only the final read-merge-write is serialized. If another
+save changes the same project while the gate runs, this one is refused with `409`; save
+again.
+
+A client that can't hold a request open that long can still learn the outcome. The fleet
+proxy, for one, answers a plugin API call with `504` after 20s. Send a `request_id` in the
+body, then read `GET /projects` → `saves.<name>`:
+
+```json
+{"id": "<your request_id>", "state": "running|saved|refused|cancelled",
+ "stage": "running the gate on the clean base", "started_at": "…", "finished_at": "…",
+ "detail": "<why it was refused>"}
+```
+
+The Projects editor does exactly this when the connection gives up.
 
 ## Conventions
 
