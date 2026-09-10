@@ -262,6 +262,20 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001 — best-effort, per feature
                 log.warning("[project_board] boot preflight release: clear_blocked failed for %s", fid, exc_info=True)
 
+    async def _list_for_pass(self, store, state: str, pass_name: str) -> list[dict]:
+        """The ``state`` rows one pass of the reconcile/sweep acts on — or none, when the
+        read itself failed (#404). A pass drives several independent edges off separate
+        reads (the PR reconcile scans in_review AND blocked), and one read that stalled
+        must cost only the cards it would have returned: the pass carries on with the
+        rest, and the skipped cards are read again on its next turn. Only a BoardError
+        (a failed or timed-out `br` call) is absorbed; anything else is a bug and is left
+        to the tick's phase guard, traceback intact."""
+        try:
+            return await asyncio.to_thread(store.list_features, state=state)
+        except BoardError as exc:
+            log.warning("[project_board] %s: could not read the %s cards, skipped this pass: %s", pass_name, state, exc)
+            return []
+
     # ── periodic health sweep (self-heal during the run) ───────────────────────
     async def _maybe_sweep(self):
         """Run the health sweep at most once per ``health_sweep_interval`` (0 = off)."""
@@ -291,7 +305,7 @@ class ReconcileMixin:
             await asyncio.to_thread(lambda: work_snapshot.publish(store.list_features()))
         except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the sweep
             log.warning("[project_board] work snapshot refresh failed (ignored)", exc_info=True)
-        for f in await asyncio.to_thread(store.list_features, state="in_progress"):
+        for f in await self._list_for_pass(store, "in_progress", "health sweep"):
             fid = f["id"]
             if fid in self._inflight_files:
                 continue  # a live drive owns it
@@ -464,8 +478,8 @@ class ReconcileMixin:
         # and scanning only in_review left merged-but-blocked cards stuck forever. They
         # take ONLY the MERGED edge below: CLOSED would rewrite their blocked reason, and
         # the OPEN-branch gates (rebase/CI/review) must not run against held work.
-        in_review = await asyncio.to_thread(store.list_features, state="in_review")
-        blocked = await asyncio.to_thread(store.list_features, state="blocked")
+        in_review = await self._list_for_pass(store, "in_review", "PR reconcile")
+        blocked = await self._list_for_pass(store, "blocked", "PR reconcile")
         for f in [*in_review, *blocked]:
             fid = f["id"]
             pr_url = f.get("pr_url")

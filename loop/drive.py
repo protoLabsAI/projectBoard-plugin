@@ -386,17 +386,23 @@ class DriveMixin:
             if not await self._setup_gate():
                 return
             spawned = False
-            try:
-                await self._maybe_reconcile()
-                await self._maybe_sweep()
-                await self._maybe_preflight()  # fail-closed: hold work if the gate can't run
+            # Each phase runs on its OWN (#404): one stalled `br` read used to take the
+            # whole tick down, so a merge poll that timed out also skipped the sweep and
+            # every claim — four ticks in ten minutes did nothing at all. A failed phase is
+            # logged by name and runs again on its own next turn; the others go ahead.
+            await self._tick_phase("PR reconcile", self._maybe_reconcile)
+            await self._tick_phase("health sweep", self._maybe_sweep)
+            # EXCEPT the claim scan after a failed preflight: the preflight is fail-closed
+            # (it holds a project whose gate cannot run), and a project it never got to
+            # smoke reads as runnable to the scan — so claiming now would dispatch exactly
+            # the work the preflight exists to hold. `dispatch_now` stops at the same point.
+            ok, _ = await self._tick_phase("gate preflight", self._maybe_preflight)
+            if ok:
                 # Under the claim lock so an on-demand board_dispatch (#390) evaluating the
                 # SAME queue can never interleave with this tick into over-claiming past
                 # max_concurrent or double-dispatching a card.
                 async with self._claim_guard():
-                    spawned = await self._spawn_ready()
-            except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
-                log.exception("[project_board] loop tick failed")
+                    _, spawned = await self._tick_phase("claim scan", self._spawn_ready)
             # Idle (nothing started, nothing running) → sleep the full interval. Busy
             # → re-check soon so a freed concurrency slot refills and merges land
             # promptly (the poll itself stays rate-limited by merge_poll_interval).
@@ -406,6 +412,24 @@ class DriveMixin:
                 await asyncio.wait_for(self._stop.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
+
+    async def _tick_phase(self, phase: str, step) -> tuple[bool, object]:
+        """Run one phase of a tick, isolated from the rest (#404) — ``(ok, result)``.
+
+        A failure never escapes: a bad phase must not kill the loop, and must not skip the
+        phases after it either. A BoardError (a `br` call that failed or stalled — see
+        ``store.BoardTimeout``) is an understood, transient outcome, so it is one WARNING
+        naming the phase and the call. Anything else is a bug and keeps its traceback.
+        Nothing is retried here: each phase already runs on its own cadence (the merge
+        poll interval, the sweep interval, the next tick), and that cadence is the retry
+        — hammering a stalled store every tick would only hold its lock longer."""
+        try:
+            return True, await step()
+        except BoardError as exc:
+            log.warning("[project_board] loop tick: %s failed, the rest of the tick continues: %s", phase, exc)
+        except Exception:  # noqa: BLE001 — a bad phase must never kill the loop
+            log.exception("[project_board] loop tick: %s failed, the rest of the tick continues", phase)
+        return False, None
 
     async def _spawn_ready(self) -> bool:
         """Claim Ready features up to the concurrency cap and spawn a drive for each,
