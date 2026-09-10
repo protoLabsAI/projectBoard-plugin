@@ -1893,7 +1893,22 @@ class DriveMixin:
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
-                await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+                try:
+                    await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+                except BoardError as exc:
+                    # #398: the hand-off refused because the card is no longer this drive's
+                    # to hand off — something moved it out of in_progress while the coder
+                    # worked. Live: the PM requeued a card for another CI-fix round while
+                    # the loop's own round was still running; `open_review` then refused
+                    # (`expects in_progress, got 'ready'`) and the catch-all below blocked
+                    # it TERMINALLY — a card with an open PR, parked for a human, with no
+                    # new cause. The move is the newer decision, so it stands: the push is
+                    # already on the PR, and a requeued card's next round resumes that branch.
+                    moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                    if not moved_to:
+                        raise  # still ours (a real refusal), or cancelled — the handlers below own those
+                    await self._end_moved_drive(store, fid, moved_to, pr_url, exc)
+                    return
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
                 # requirement ledger #113, and the empty-result count #198).
                 await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
@@ -1944,6 +1959,37 @@ class DriveMixin:
         except Exception:  # noqa: BLE001 — BoardError, a fake store without the read
             return False
         return bool(f) and str(f.get("board_state") or "") == "cancelled"
+
+    # ── a card moved under a live drive (#398) ───────────────────────────────
+    @staticmethod
+    def _moved_under_drive(store, fid: str) -> str:
+        """The state a card was moved to while its drive ran, or "" if it wasn't moved.
+
+        "" for a card still ``in_progress`` (the drive still owns it, so a refusal is a real
+        one) and for ``cancelled``, which has its own edge: that one closes the PR. Fails
+        OPEN, like ``_cancelled``: an unreadable card reads as not moved, and the drive
+        takes the path it always took."""
+        try:
+            f = store.get_feature(fid)
+        except Exception:  # noqa: BLE001 — BoardError, a fake store without the read
+            return ""
+        state = str((f or {}).get("board_state") or "")
+        return "" if state in ("", "in_progress", "cancelled") else state
+
+    async def _end_moved_drive(self, store, fid: str, moved_to: str, pr_url: str, exc: Exception) -> None:
+        """End a drive whose card was moved to ``moved_to`` under it (#398). Not a failure
+        and not a block: blocking would overwrite the decision that moved it (a requeue's
+        fresh round, or a human's own block and reason) with a message about a hand-off.
+        Leaves the trail on the card, frees the slot, keeps the worktree (its commits are
+        already pushed, and a requeued card's next round resumes that branch)."""
+        log.info("[project_board] %s moved to %s under the drive — not handed to review: %s", fid, moved_to, exc)
+        await asyncio.to_thread(
+            store.comment,
+            fid,
+            f"a build finished after this card was moved to {moved_to}: its push is on {pr_url}, "
+            f"but it was not sent to review and the card was left {moved_to}",
+        )
+        self._inflight.pop(fid, None)
 
     async def _end_cancelled_drive(self, store, fid: str, repo: str, wt, branch, *, pr_url: str | None = None) -> None:
         """Finish a drive whose card was cancelled by the operator: close the PR if one
