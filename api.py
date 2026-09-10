@@ -46,6 +46,10 @@ class ProjectUpsertBody(BaseModel):
     local_gate_cmd: str = Field(default="", max_length=8192)
     repo_conventions: str = Field(default="", max_length=32768)
     default_action: Literal["keep", "set", "clear"] = "keep"
+    # The caller's own id for this save (#393). GET /projects reports each project's latest
+    # save under `saves.<name>` with this id, so a client whose request an intermediary gave
+    # up on (the fleet proxy's 20s API lane) can still learn how its gate-changing save ended.
+    request_id: str = Field(default="", max_length=64)
 
 
 def _store_kw(cfg: dict) -> dict:
@@ -401,8 +405,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.put("/projects/{name}")
     async def _put_project(name: str, body: ProjectUpsertBody):
-        """Add/update one boarded repo through the same bounded seam as the agent tool."""
-        from .project_registry import ProjectRegistryError, upsert_project
+        """Add/update one boarded repo through the same bounded seam as the agent tool. A save
+        that sets a new gate command, or moves the project to another repo, answers only after
+        that gate has run once on the clean base (minutes, for a full suite); a red gate is a
+        400 naming the failure. 409 means another save changed the project meanwhile: reload
+        and save again. When an intermediary times out first, GET /projects reports the outcome
+        under ``saves.<name>`` (matched by ``request_id``)."""
+        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, upsert_project
 
         try:
             result = await upsert_project(
@@ -414,7 +423,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 make_default=body.default_action == "set",
                 clear_default=body.default_action == "clear",
                 replace_optional=True,
+                request_id=body.request_id,
             )
+        except ProjectRegistryConflict as exc:
+            raise HTTPException(409, str(exc))
         except ProjectRegistryError as exc:
             raise HTTPException(400, str(exc))
         return {"ok": True, **result}

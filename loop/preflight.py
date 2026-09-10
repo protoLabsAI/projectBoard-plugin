@@ -22,22 +22,36 @@ class PreflightMixin:
         """Re-run each project's gate preflight while it hasn't passed, throttled per
         project (#90). Once a project passes it stays passed for the run (a healthy env
         doesn't spontaneously lose its toolchain; a per-PR gate failure is handled in the
-        drive, not here). Runs for every project with ready work AND every project still
-        marked failed — the latter so a project whose ready work got HELD (and so dropped
-        out of `ready`) still re-checks and can recover."""
+        drive, not here). Runs for every project with ready work, every project still
+        marked failed, AND every project this loop holds cards for. The last two cover a
+        project whose ready work got HELD (and so dropped out of `ready`): it still
+        re-checks and can recover."""
         if not self.preflight:
             return
         store = self._store()
         # Store-only scan — off the event loop (#258).
         names = list(await asyncio.to_thread(self._ready_projects, store))
         seen = set(names)
+        now = time.monotonic()
         # A failed project may have no ready work left (its cards got held) — keep
         # re-checking it so it can recover and release those holds.
         for name, st in self._preflight_state.items():
             if isinstance(st, str) and name not in seen:
                 seen.add(name)
                 names.append(name)
-        now = time.monotonic()
+        # …and so must a project whose FAILURE verdict is gone while its holds remain. A
+        # registry change resets a changed project's verdict (reload). Keyed on verdicts
+        # alone, that stranded its held cards: no ready work, no failed state, never
+        # re-checked, held until a restart (#393). Once it has been checked, it is throttled
+        # like a known failure, so a checkout that gives no verdict (not at base) is not
+        # re-smoked every tick.
+        for name, held in self._preflight_held.items():
+            if not held or name in seen:
+                continue
+            if name in self._last_preflight and (now - self._last_preflight[name]) < max(self.interval, 60.0):
+                continue
+            seen.add(name)
+            names.append(name)
         ran = False
         for name in names:
             cmd = self._local_gate_cmd_for({"project": name})

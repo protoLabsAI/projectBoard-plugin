@@ -521,6 +521,9 @@ async def test_queued_upsert_rechecks_live_onboarding_consent_inside_the_lock(mo
     _wire_host(monkeypatch, cfg, lambda patch: (applied.append(patch) or True, []))
 
     class ConsentChangesBeforeEntry:
+        def locked(self):  # asyncio.Lock's probe — upsert logs a queued wait (#393)
+            return False
+
         async def __aenter__(self):
             cfg.onboarding_enabled = False
 
