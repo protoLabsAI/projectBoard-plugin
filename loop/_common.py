@@ -847,6 +847,40 @@ def provider_failure_category(exc: BaseException) -> str | None:
     return category if category in _ROTATABLE_CATEGORIES else None
 
 
+def representative_failure(errors: list[Exception]) -> Exception:
+    """The ONE error that speaks for a max-mode fan-out in which EVERY candidate raised
+    (#425). No candidate returned anything to judge, so the drive is handed this instead
+    of a "no diff" and its own handling applies, as for a single dispatch. The most
+    specific edge wins:
+
+    0. a provider that refused its model — beside a quota too: the provider is at least
+       partly broken, and a capability climb is wrong either way;
+    1. a spent quota — rotate within the rung, or back off;
+    2. a timeout — so #378's timeout counter, and its decompose ask, see it;
+    3. a dispatch failure the drive does not retry — #339 blocks it as pre-model unless a
+       candidate reached the model;
+    4. any other dispatch failure (a retryable one: back off and re-run);
+    5. anything else, as it was raised.
+
+    Ties go to the earliest candidate. Pure, like ``rotation_target``, so the order is
+    testable without driving a card."""
+
+    def rank(exc: Exception) -> int:
+        category = provider_failure_category(exc)
+        if category == "provider_unavailable":
+            return 0
+        if category == "rate_limit":
+            return 1
+        if isinstance(exc, worktree.CoderTimeout):
+            return 2
+        text = str(exc)
+        if text.startswith("coder dispatch failed"):
+            return 4 if classify(text).retryable else 3
+        return 5
+
+    return min(errors, key=rank)
+
+
 # ── #420: remember a provider that can't serve its model ────────────────────────────
 # Rotation alone rediscovers a dead provider card by card: the rung cursor spreads cards
 # across a rung's siblings, so every card that happens to open on it pays one failed
@@ -1276,6 +1310,7 @@ __all__ = [
     "prefer_live_sibling",
     "_ROTATABLE_CATEGORIES",
     "provider_failure_category",
+    "representative_failure",
     "_next_rung_cursor",
     "_PROVIDER_DOWN_TTL_S",
     "_PROVIDER_DOWN",

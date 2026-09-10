@@ -2242,8 +2242,9 @@ class DriveMixin:
         ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
         unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
         ``_drive`` escalates/blocks exactly like a single coder that produced nothing —
-        unless every candidate failed on its PROVIDER the same way, which is re-raised as
-        that dispatch failure so the drive rotates/backs off as for a single dispatch (#425).
+        unless EVERY candidate raised, when the one error that speaks for them
+        (``representative_failure``) is re-raised instead, so the drive handles it as it
+        would a single dispatch's (#425).
 
         Returns (canonical_wt, canonical_branch, winner_reply). The fan-out is bounded by
         ``max_concurrent`` × ``max_mode_n`` coders; size those to the host."""
@@ -2273,26 +2274,25 @@ class DriveMixin:
         if idx is None:
             for cid in cand_ids:
                 await worktree.reap_feature_worktree(repo, self.root, cid)
-            # #425: "no diff" is a CAPABILITY verdict, and the drive climbs a rung on it. That
-            # is the wrong edge when no candidate ever reached the model because the PROVIDER
-            # refused them all — a spent quota (#362) or a model it can't serve (#420) says
-            # nothing about the model, and the single-dispatch path rotates within the rung on
-            # both. So when EVERY candidate failed on its provider, and the same way, hand the
-            # drive one of those errors: it then rotates, marks, backs off and blocks exactly
-            # as for a single dispatch. Only then does one error speak for all of them. A
-            # candidate that came back with nothing reached the model and failed it; a mix of
-            # provider classes has no one truthful edge (a mark vs. a backoff). Either stays
-            # the capability failure it always was.
-            kinds = {provider_failure_category(r) if isinstance(r, worktree.WorktreeError) else None for r in results}
-            if len(kinds) == 1 and None not in kinds:
+            # #425: "no diff" is a CAPABILITY verdict, and the drive climbs a rung on it. That is
+            # only true when a candidate RETURNED — ran, and came back with nothing. When EVERY
+            # candidate raised there is nothing to judge, and swallowing the errors hid what
+            # actually happened: a quota (#362) or a refused model (#420) climbed instead of
+            # rotating, a timeout never reached #378's counter, a pre-model seam failure never
+            # reached #339's block. So hand the drive ONE of those errors — the most specific
+            # edge, `representative_failure` — and its own handling applies exactly as for a
+            # single dispatch. (A CancelledError result is neither, and keeps the old verdict.)
+            raised = [r for r in results if isinstance(r, Exception)]
+            if len(raised) == len(results):
+                rep = representative_failure(raised)
                 log.info(
-                    "[project_board] %s max-mode: all %d candidates failed on the provider (%s) — "
-                    "handing the drive the dispatch failure, not a no-diff",
+                    "[project_board] %s max-mode: all %d candidates raised — handing the drive the "
+                    "failure that speaks for them, not a no-diff: %s",
                     fid,
                     n,
-                    next(iter(kinds)),
+                    str(rep)[:160],
                 )
-                raise results[0]
+                raise rep
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]

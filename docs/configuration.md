@@ -239,9 +239,10 @@ card blocks (the operator may have repointed it), and a dispatch it serves clear
 card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
 config problem, and a stronger rung would only hide it. If some were only rate-limited, it
 blocks as `rate_limit`, which the sweep heals on its own. Max-mode (`max_mode_n > 1`) follows
-the same rules when every candidate failed on its provider in the same way. If any candidate
-reached the model and came back with nothing, or the candidates failed in different ways, it
-is still a capability failure and climbs.
+the same rules. When every candidate fails, the loop handles the most specific of their failures
+exactly as it would a single dispatch's. In order, that is a refused model, a quota, a timeout,
+then any other dispatch failure. Only if at least one candidate ran and came back with nothing is
+it a capability failure that climbs.
 
 A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 
