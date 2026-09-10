@@ -164,21 +164,6 @@ def multi_project(cfg: dict) -> bool:
     return isinstance(raw, dict) and len(raw) > 1
 
 
-def blank_db_override(cfg: dict) -> bool:
-    """True when the config EXPLICITLY carries a blank ``db_path`` — the operator wrote
-    ``db_path: ""`` (the pre-D3 per-repo-discovery escape hatch) rather than leaving the
-    key out. The two are distinguishable because the host hands a plugin its config
-    section verbatim (whole-section fallback to the manifest defaults, not a per-key
-    merge), so a present-and-blank key is an operator's choice. Since D3 (#260) the
-    override is INERT everywhere — ``store_db_path`` resolves blank to the same
-    instance default as an absent key — so the board runs correctly regardless; on a
-    multi-entry ``projects:`` map the setup preflight surfaces the stale knob as a
-    non-blocking advisory (``setup_check.MULTI_PROJECT_DB_HINT``) rather than
-    letting it sit in the config implying a per-repo split that never happens."""
-    cfg = cfg or {}
-    return "db_path" in cfg and not str(cfg.get("db_path") or "").strip()
-
-
 def store_db_path(cfg: dict) -> str:
     """The beads db every board-store construction rides (D3, #260): the explicit
     ``db_path`` when set (passed through VERBATIM — the operator's hard pin, and the
