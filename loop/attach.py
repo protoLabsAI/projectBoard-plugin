@@ -92,9 +92,10 @@ async def _github_refusal(feature: dict, facts: dict, pr_url: str, *, repo: str,
     branch = worktree.branch_name(fid, feature.get("title") or "")
     if facts.get("head") != branch:
         return (
-            f"{facts['url']} is on branch {facts.get('head')!r}, not {fid}'s canonical branch {branch!r} — every "
-            f"later board edge (fix rounds, recovery, the reap) works on {branch!r}; push the work there and "
-            "open the PR from it, then attach"
+            f"{facts['url']} is on branch {facts.get('head')!r}, not {fid}'s canonical branch — push the work "
+            f"to branch {branch!r}, open the PR from it, and attach that PR. Every later board edge (fix rounds, "
+            "recovery, the reap) works on that branch, so a PR from any other would be abandoned by the first "
+            "fix round"
         )
     if facts.get("base") != base:
         return (

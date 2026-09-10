@@ -275,8 +275,9 @@ async def test_the_other_branch_refusal_names_the_branch_to_use(tmp_path, monkey
     with pytest.raises(BoardError) as exc:
         await _attach(board, card["id"])
 
-    assert worktree.branch_name(card["id"], card["title"]) in str(exc.value)
-    assert "fix/by-hand" in str(exc.value)
+    branch = worktree.branch_name(card["id"], card["title"])
+    assert f"push the work to branch {branch!r}" in str(exc.value)  # the exact branch, as an instruction
+    assert "fix/by-hand" in str(exc.value)  # and the branch the PR is actually on
 
 
 @requires_br
