@@ -2468,6 +2468,9 @@ async def test_the_timeout_counter_survives_a_restart(monkeypatch):
     that reset to zero on every reload would never reach the threshold."""
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        # the model worked before the clock ran out — a pre-first-token timeout is infra
+        # and never counts (#378 review)
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {"path": "a.py"}})
         raise worktree.CoderTimeout("coder timed out after 1800s")
 
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)

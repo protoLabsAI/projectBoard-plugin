@@ -1734,12 +1734,6 @@ class DriveMixin:
                     # it burned the whole tier ladder in ten seconds (three attempts,
                     # three tiers, a block; 2026-08-28, bd-cwpv.12/.16) and left `tier:`
                     # labels that misrouted the card when it was requeued after the reset.
-                    # #378: count timeouts durably, BEFORE the retry/escalate/block fork —
-                    # bd-sxxf timed out, escalated a tier, timed out again and only then
-                    # blocked, so a counter bumped at the block alone would have read 1.
-                    if isinstance(exc, worktree.CoderTimeout):
-                        timeouts = await self._budget_get(store, fid, "timeout") + 1
-                        await self._budget_set(store, fid, "timeout", timeouts)
                     dispatch_failed = str(exc).startswith("coder dispatch failed") and not policy.retryable
                     capability = (
                         isinstance(exc, (worktree.NoChangesError, worktree.CoderTimeout, coder_seam.SolveExhausted))
@@ -1888,6 +1882,34 @@ class DriveMixin:
                             await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
                         return
+                    # 1.7 A card whose FRESH builds keep timing out → PARK it, and hand its split to
+                    #     the board's own agent (#378). A repeated timeout is a SIZE signal: no diff,
+                    #     no CI output, so neither a stronger rung nor a rebuild has anything new to
+                    #     work with (on a ladder, the first timeout's climb already carried #146's
+                    #     timeout context). Only a timeout that IS that signal counts:
+                    #     • one that reached the model — a pre-first-token timeout is infra, and 1.5
+                    #       above has already blocked it, uncounted;
+                    #     • on a fresh build — a fix round (a kept worktree, or a card whose PR is
+                    #       open) is fixing a card that already BUILT in one dispatch, so it is not
+                    #       too wide. It takes the ordinary path below. Parked, it would ask to split
+                    #       a card with an open PR, and the split's cancel would close that PR.
+                    #     The count is durable (a `budget:` label, so a restart can't reset it) and
+                    #     is cleared when a build reaches review or an operator unblocks the park.
+                    #     Counting it here, before the climb/block fork, is what lets bd-sxxf's shape
+                    #     — timed out, climbed, timed out again — reach the threshold at all. The ask
+                    #     used to wait for the ladder to run out, beside a self-healing `transient`
+                    #     block: a three-rung ladder timed out three times before it asked, and the
+                    #     sweep then rebuilt the card twice more, racing its own split.
+                    if isinstance(exc, worktree.CoderTimeout) and not reusing and not feature.get("pr_url"):
+                        timeouts = await self._budget_get(store, fid, "timeout") + 1
+                        await self._budget_set(store, fid, "timeout", timeouts)
+                        threshold = self.decompose_after_timeouts  # 0 = never park (block as before)
+                        if threshold and timeouts >= threshold:
+                            await self._park_for_split(store, fid, timeouts, exc)
+                            if wt:
+                                await worktree.remove_worktree(repo, wt, branch or "")
+                            self._inflight.pop(fid, None)
+                            return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
@@ -1937,23 +1959,6 @@ class DriveMixin:
                     await asyncio.to_thread(
                         store.flag_blocked, fid, f"{policy.category}: {exc}", category=policy.category
                     )
-                    # #378: a card that has now timed out repeatedly is not model-limited, it
-                    # is too wide — and nothing in the block path says so, which is how one
-                    # sat parked while an operator guessed. Ask the board's own agent to split
-                    # it (once; `request_decomposition` no-ops on a repeat or on a task).
-                    if isinstance(exc, worktree.CoderTimeout) and self.decompose_after_timeouts:
-                        spent = await self._budget_get(store, fid, "timeout")
-                        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
-                        if spent >= self.decompose_after_timeouts and callable(ask):
-                            asked = await asyncio.to_thread(ask, fid, timeouts=spent)
-                            if asked:
-                                log.warning(
-                                    "[project_board] %s timed out %dx — filed %s to decompose it "
-                                    "(a timeout is a SIZE signal, not a capability one)",
-                                    fid,
-                                    spent,
-                                    asked.get("id", "?"),
-                                )
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
@@ -1963,8 +1968,11 @@ class DriveMixin:
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
                 await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
-                # requirement ledger #113, and the empty-result count #198).
-                await self._budget_reset(store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
+                # requirement ledger #113, and the empty-result count #198), and the timeout
+                # count (#378): a card that built in one dispatch is demonstrably not too wide.
+                await self._budget_reset(
+                    store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only", "timeout"
+                )
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
                     # findings injected — the next drive carries them in the prompt.
@@ -2001,6 +2009,62 @@ class DriveMixin:
             if wt:
                 await worktree.remove_worktree(repo, wt, branch or "")
             self._inflight.pop(fid, None)
+
+    async def _park_for_split(self, store, fid: str, timeouts: int, exc: Exception) -> None:
+        """Park a card whose fresh builds keep timing out, and hand its split to the board's
+        own agent (#378) — in the one order that is safe:
+
+        1. FILE the decompose task. ``request_decomposition`` leaves it in backlog, where the
+           puller cannot see it, and returns the task still open for this card (new, or filed
+           earlier), or None.
+        2. PARK the card under ``too-wide`` — never auto-healed; an operator unblock resets the
+           count — with a reason built from what step 1 returned: it names the task, or says
+           plainly that none was filed and what to do instead. (Building the reason before the
+           ask told a card re-parked after an operator requeue that a split was on its way
+           when none had been filed.)
+        3. RELEASE the task, only now: the agent that picks it up ends by cancelling this card,
+           which must never be found still in flight."""
+        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
+        task = await asyncio.to_thread(ask, fid, timeouts=timeouts) if callable(ask) else None
+        task_id = str((task or {}).get("id") or "")
+        retry = "raise coder_timeout_s and unblock it (unblocking resets its timeout count)"
+        if task_id:
+            reason = (
+                f"too wide to build in one dispatch — timed out {timeouts}x; parked while this agent splits "
+                f"it into slices ({task_id}). No tier climb and no auto-retry; to retry it whole instead, "
+                f"{retry}: {exc}"
+            )
+        else:
+            reason = (
+                f"too wide to build in one dispatch — timed out {timeouts}x, and NO split task was filed (one "
+                f"was requested for this card before, or the store refused): split it by hand, or {retry}: {exc}"
+            )
+        log.warning(
+            "[project_board] %s timed out %dx on fresh builds — parked as too wide (%s)",
+            fid,
+            timeouts,
+            f"split task {task_id}" if task_id else "no split task filed",
+        )
+        await asyncio.to_thread(store.flag_blocked, fid, reason, category=TOO_WIDE_CLASS)
+        release = getattr(store, "mark_ready", None)
+        if task_id and str(task.get("board_state") or "backlog") == "backlog" and callable(release):
+            try:
+                await asyncio.to_thread(release, task_id)
+            except Exception:  # noqa: BLE001 — the park stands; a human can promote the task
+                log.warning(
+                    "[project_board] %s split task %s is filed but the Ready gate refused it — it waits in backlog",
+                    fid,
+                    task_id,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.to_thread(
+                        store.comment,
+                        fid,
+                        f"split task {task_id} is filed but NOT ready — the Ready gate refused it; promote it by hand",
+                    )
+                except Exception:  # noqa: BLE001 — the trail is best-effort
+                    log.debug("[project_board] %s split-task comment failed", fid, exc_info=True)
 
     # ── operator cancel during a drive (#211) ────────────────────────────────
     @staticmethod

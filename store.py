@@ -242,7 +242,8 @@ LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
 # WHY a feature is blocked, as the failure classifier's category (failures.classify):
 # `blocked-class:transient` / `-rate-limit` / `-merge-conflict` / `-auth` / `-terminal` /
-# `-provider-unavailable` (#420), plus the loop's own `-dispatch-infra` (#339).
+# `-provider-unavailable` (#420), plus the loop's own `-dispatch-infra` (#339) and
+# `-too-wide` (#378: parked for a split after repeated timeouts).
 # A single REPLACED label (the `gens:` pattern) so the projection can tell a block that
 # will clear itself from one that needs a human — WITHOUT a `br show` per card to read
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
@@ -1921,24 +1922,54 @@ class BeadsBoard:
         Rather than decompose inline (the ``decompose`` subagent is a pure proposer driven
         by a skill, and an LLM call inside the drive loop can itself time out), file a
         TASK assigned to the board's own agent. The existing self-dispatch path (#311)
-        picks it up, the agent decomposes with the board tools it already has, and the
-        Ready gate enforces that the slices are actually well-formed — which is the part
-        an unattended splitter gets wrong.
+        picks it up once it is ``ready``, the agent decomposes with the board tools it
+        already has, and the Ready gate enforces that the slices are actually well-formed —
+        which is the part an unattended splitter gets wrong.
 
-        Returns the new task, or None when the ask was already made (idempotent) or the
-        card is itself a decomposition task (never recurse). Never raises: failing to ask
-        must not change how the timeout itself is handled."""
+        The task is filed in ``backlog``, where the puller cannot see it, and the CALLER
+        releases it with ``mark_ready``. That split is deliberate: the loop parks the card
+        between the two, so the park can name the task and the agent — whose job ends in
+        cancelling this card — can never find it still in flight.
+
+        Its steps are ordered so each one passes the gates the next depends on: slices in
+        backlog first (the card still claims its files, so a READY slice naming one is
+        refused by the shared-file gate), dependents re-pointed onto the slices next
+        (cancelling the card drops its edges, releasing every dependent at once), then the
+        cancel, and only then the slices marked ready.
+
+        Idempotent on the task itself, not only on the ``decompose-asked`` label: a label
+        write lost after the create must not file a duplicate at the next park. Returns
+        the task still open for this card — new, or filed earlier and not yet closed — or
+        None when its split was already requested and has closed, or the card is itself a
+        decomposition task (never recurse). Never raises: failing to ask must not change
+        how the timeout itself is handled."""
         try:
             f = self.get_feature(fid)
-            if not f:
+            if not f or f.get("issue_type") == LABEL_TASK:
                 return None
             labels = list(f.get("labels") or [])
-            if self.LABEL_DECOMPOSE_ASKED in labels or f.get("issue_type") == LABEL_TASK:
-                return None
+            rows = self.list_features()
+            filed = [
+                t
+                for t in rows
+                if t.get("issue_type") == LABEL_TASK and str(t.get("title") or "").startswith(f"Decompose {fid} ")
+            ]
+            if filed:
+                if self.LABEL_DECOMPOSE_ASKED not in labels:  # heal a label write the create outlived
+                    self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
+                return next((t for t in filed if t.get("board_state") not in _TERMINAL_STATES), None)
+            if self.LABEL_DECOMPOSE_ASKED in labels:
+                return None  # asked before; that task is archived or gone
             files = list(f.get("files_to_modify") or [])
+            dependents = sorted(
+                d["id"]
+                for d in rows
+                if fid in (d.get("depends_on") or []) and d.get("board_state") not in _TERMINAL_STATES
+            )
             spec = (
                 f"Card {fid} ({f.get('title') or 'untitled'}) has timed out {timeouts}x under the "
-                f"coder and is too wide to build in one dispatch. Split it into slices and retire it.\n\n"
+                f"coder and is too wide to build in one dispatch. The loop has PARKED it (blocked): "
+                f"split it into slices and retire it.\n\n"
                 f"A timeout is not a capability failure — it carries no diff and no CI output, so "
                 f"retrying or escalating the tier spends the clock again on a card that was never "
                 f"model-limited. It is a SIZE signal.\n\n"
@@ -1946,21 +1977,33 @@ class BeadsBoard:
                 f"ORIGINAL ACCEPTANCE CRITERIA\n{f.get('acceptance_criteria') or '(none)'}\n\n"
                 f"ORIGINAL files_to_modify ({len(files)})\n"
                 + ("\n".join(f"- {p}" for p in files) or "- (none)")
-                + "\n\nHOW TO SPLIT (the board's own gates will refuse a sloppy decomposition, so "
-                "satisfy them up front):\n"
-                "- Each slice must sit at or under the breadth cap for its difficulty, and must be "
+                + f"\n\nCARDS THAT DEPEND ON {fid}\n"
+                + ("\n".join(f"- {d}" for d in dependents) or "- (none)")
+                + "\n\nDO IT IN THIS ORDER — each step is what lets the next one pass the board's gates:\n\n"
+                "1. Create the slices with `board_create_feature` and LEAVE THEM IN BACKLOG. "
+                f"{fid} still claims its files until it is cancelled, so the shared-file gate "
+                "refuses a slice marked ready while it names one of them.\n"
+                "   - Each slice sits at or under the breadth cap for its difficulty, and is "
                 "independently buildable and gate-passing on its own — not a fragment that only "
                 "compiles once its siblings land.\n"
-                "- A slice naming a file that does not exist YET must mark it `(new)`, or the Ready "
-                "gate refuses it as a phantom path.\n"
-                "- Slices editing the SAME file need a depends_on edge so one waits for the other. "
-                "The edge counts in either direction, but only between the two cards that actually "
-                "share the file: in a chain A->B->C, the A/C pair needs its OWN edge.\n"
-                "- Order them so the first slice is independently useful and the rest gate behind it.\n\n"
-                f"Then cancel {fid} as superseded, naming the slice ids in the reason."
+                "   - A file that does not exist YET is marked `(new)`, or the Ready gate refuses "
+                "it as a phantom path.\n"
+                "   - Slices editing the SAME file need a depends_on edge between them. The edge "
+                "counts in either direction, but only between the two cards that share the file: "
+                "in a chain A->B->C, the A/C pair needs its OWN edge.\n"
+                "   - Order them so the first slice is independently useful and the rest gate behind it.\n"
+                f"2. Re-point every card that depends on {fid} (listed above; check again, the list "
+                "may have grown) onto the slice or slices that deliver what it needs: "
+                "`board_update_feature(feature_id=<dependent>, depends_on=[<slice ids>])`. Cancelling "
+                f"{fid} drops its edges, so a dependent you skip is released before anything it "
+                "needs has landed.\n"
+                f"3. Cancel {fid} with `board_cancel_feature`, naming the slice ids in the reason.\n"
+                "4. Mark every slice ready with `board_mark_ready`. The first becomes buildable; the "
+                "rest wait behind their depends_on edges."
             )
             criteria = (
                 f"- {fid} is cancelled with a reason naming the slices that replace it.\n"
+                f"- Every card that depended on {fid} now depends on the slice(s) it needs.\n"
                 "- Every slice is `ready` (or dag_blocked behind a sibling), so no slice needs a "
                 "second pass to become buildable.\n"
                 "- Together the slices cover the original acceptance criteria, with nothing dropped.\n"
@@ -1979,7 +2022,7 @@ class BeadsBoard:
             self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
             self.comment(fid, f"decompose requested after {timeouts} timeouts → {(task or {}).get('id', '?')}")
             return task
-        except Exception:  # noqa: BLE001 — the ask is best-effort; the block still happens
+        except Exception:  # noqa: BLE001 — the ask is best-effort; the park still happens
             log.warning("[project_board] %s decompose request failed (ignored)", fid, exc_info=True)
             return None
 
@@ -2712,8 +2755,14 @@ class BeadsBoard:
         A card that never escalated carries no ``tier:`` label, so it still starts at
         its difficulty-selected tier on the next build; the ladder stays a
         model-capability record, and the infra incident adds nothing to it. A
-        model-reachable block (or an unclassified one) is untouched, exactly as before."""
-        from .failures import PRE_MODEL_DISPATCH_CLASS
+        model-reachable block (or an unclassified one) is untouched, exactly as before.
+
+        A card the loop PARKED as ``too-wide`` (#378) also gets its timeout count reset:
+        unblocking one is a deliberate retry — after raising ``coder_timeout_s``, or
+        narrowing the card by hand — and with the count still at the threshold its very
+        next timeout would park it again at once. (The loop's in-process copy of the count
+        is dropped separately, by the unblock verbs: ``loop.forget_timeout_count``.)"""
+        from .failures import PRE_MODEL_DISPATCH_CLASS, TOO_WIDE_CLASS
 
         f = self._require(fid)
         labels = f.get("labels") or []
@@ -2723,6 +2772,11 @@ class BeadsBoard:
             # Drop only the stale infra class — NOT the tier labels, which predate the
             # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        elif cls == TOO_WIDE_CLASS:
+            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+            for label in labels:
+                if label.startswith(f"{LABEL_BUDGET_PREFIX}timeout:"):
+                    args += ["--remove-label", label]
         self._run(*args)
         return self.get_feature(fid)
 

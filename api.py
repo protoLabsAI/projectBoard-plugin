@@ -677,7 +677,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str):
-        return await _guard(lambda: store().clear_blocked(fid))
+        f = await _guard(lambda: store().clear_blocked(fid))
+        # The running loop's cached timeout count wins over the label the store just reset
+        # (#259) — drop it too, so a card parked `too-wide` gets a real retry (#378).
+        from .loop import forget_timeout_count
+
+        forget_timeout_count(fid)
+        return f
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):

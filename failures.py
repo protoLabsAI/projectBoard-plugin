@@ -85,6 +85,15 @@ def classify(error: str, *, provider_rules: bool = True) -> Policy:
     return TERMINAL
 
 
+# The `blocked-class:` of a card the loop PARKED because its fresh builds keep timing out
+# (#378): too wide to build in one dispatch, with a split handed to the board's own agent.
+# Like `dispatch-infra` below it is the loop's own class, not one of `classify()`'s: the
+# blocked sweep never re-runs it (it would only time out again, racing its own split), and
+# an operator unblock resets the card's timeout count, so a deliberate retry — after
+# raising `coder_timeout_s`, say — gets a real attempt instead of re-parking at once.
+TOO_WIDE_CLASS = "too-wide"
+
+
 # ── pre-model dispatch / infrastructure failures (#339) ──────────────────────────
 # The `blocked-class:` a pre-model dispatch/infra failure carries. It is deliberately
 # NOT one of `classify()`'s categories: it can't be decided from the message alone
