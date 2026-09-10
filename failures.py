@@ -85,6 +85,15 @@ def classify(error: str, *, provider_rules: bool = True) -> Policy:
     return TERMINAL
 
 
+# The `blocked-class:` of a card the loop PARKED because its fresh builds keep timing out
+# (#378): too wide to build in one dispatch, with a split handed to the board's own agent.
+# Like `dispatch-infra` below it is the loop's own class, not one of `classify()`'s: the
+# blocked sweep never re-runs it (it would only time out again, racing its own split), and
+# an operator unblock resets the card's timeout count, so a deliberate retry — after
+# raising `coder_timeout_s`, say — gets a real attempt instead of re-parking at once.
+TOO_WIDE_CLASS = "too-wide"
+
+
 # ── pre-model dispatch / infrastructure failures (#339) ──────────────────────────
 # The `blocked-class:` a pre-model dispatch/infra failure carries. It is deliberately
 # NOT one of `classify()`'s categories: it can't be decided from the message alone
@@ -95,16 +104,22 @@ def classify(error: str, *, provider_rules: bool = True) -> Policy:
 # genuine build inherits.
 PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 
-# Dispatch-seam / pre-first-token infrastructure signatures — a failure raised BELOW
-# the model call: the C1 tapped-seam contract (a kwarg mismatch, a non-TappedResult
-# reply), a missing / unresolved / unknown delegate, an adapter or session refusing
-# the call, or a timeout before the model produced a first token. `coder_seam`
-# normalises every below-seam throw to a `coder dispatch failed: …` WorktreeError, so
-# that prefix alone catches the common case; the rest are belt-and-braces for the
-# other pre-model shapes named in ADR 0064's dispatch contract.
-_PRE_MODEL_DISPATCH = re.compile(
-    r"coder dispatch failed"
-    r"|unexpected keyword argument"
+# The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
+# and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
+# WorktreeError and every watchdog kill to `coder timed out after …`, so a message that
+# STARTS that way is a seam failure whatever it goes on to quote.
+_SEAM_PREFIXES = ("coder dispatch failed", "coder timed out")
+
+# Belt-and-braces for a seam error that arrives un-normalised: the C1 tapped-seam contract
+# (a kwarg mismatch, a non-TappedResult reply), a missing / unresolved / unknown delegate,
+# an adapter or session refusing the call, a timeout before the first token. Looked for
+# ONLY in the message's head — the text before its first ": " — which names what failed.
+# Never in the rest, which is whatever that failure quotes: a reviewer's gap, a test's
+# output, a requirement id. Searching the whole message would read "goal verification
+# failed: no test covers the adapter timeout path" as a pre-model infra block, when a goal
+# gap is a model-reachable failure the ladder owns.
+_SEAM_SIGNATURES = re.compile(
+    r"unexpected keyword argument"
     r"|dispatch_tapped"
     r"|\bdelegate\b"
     r"|\badapter\b"
@@ -127,17 +142,26 @@ def is_pre_model_dispatch_failure(error: str, *, model_reached: bool) -> bool:
     next real build (bd-cwpv). Such a failure must block DIRECTLY for triage.
 
     ``model_reached`` is the loop's dispatch-lifecycle evidence: any tool call,
-    thought, streamed answer, or token usage recorded for the attempt. If the model
-    reached first token the failure is model-reachable no matter the message — this
-    returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
+    thought, or non-zero token usage recorded for the attempt. Not streamed answer text
+    — an ACP adapter can emit that itself before the model runs (#422) — and a failed
+    dispatch records no usage, so on a failure it is tool calls and thoughts. If the
+    model reached first token the failure is model-reachable no matter the message —
+    this returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
     signature is pre-model → ``True`` (block, no tier climb).
 
-    Message-gated on purpose: a build-gate failure (goal-verify, requirements
-    unresolved, ``solve()`` exhausted) proves the model produced diffs, so it never
-    matches here even if the monitor lost its lifecycle evidence — only a genuine
-    seam / adapter / delegate / timeout signature qualifies. The loop's own fail-safe
-    (an unreadable monitor snapshot ⇒ ``model_reached=False``) then routes an
-    ambiguous dispatch failure to a block rather than an expensive climb."""
+    Message-gated on purpose: the model-reachable failures the ladder owns (goal-verify,
+    requirements unresolved, ``solve()`` exhausted or its circuit breaker, no commits,
+    max-mode's no-diff) never match here, even when the monitor lost its lifecycle
+    evidence — they are the ladder's to climb on. Only a genuine seam SHAPE qualifies:
+    a message that starts as the seam normalises one (``_SEAM_PREFIXES``), or whose head
+    names a seam failure (``_SEAM_SIGNATURES``). Neither looks at the text a failure
+    quotes, so a gap that mentions an adapter or a timeout stays the capability failure
+    it is. The loop's own fail-safe (an unreadable monitor snapshot ⇒
+    ``model_reached=False``) then routes an ambiguous dispatch failure to a block rather
+    than an expensive climb."""
     if model_reached:
         return False
-    return bool(_PRE_MODEL_DISPATCH.search(error or ""))
+    text = (error or "").strip()
+    if text.lower().startswith(_SEAM_PREFIXES):
+        return True
+    return bool(_SEAM_SIGNATURES.search(text.split(": ", 1)[0]))

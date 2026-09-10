@@ -56,7 +56,7 @@ class _Round:
     the card while the round is still running. ``with_pr`` makes it a fix round on an
     existing PR; without, it is the card's first build."""
 
-    def __init__(self, tmp_path, monkeypatch, *, with_pr=True, open_pr_exc=None):
+    def __init__(self, tmp_path, monkeypatch, *, with_pr=True, open_pr_exc=None, dispatch_exc=None, cfg=None):
         self.board = BeadsBoard(repo=str(tmp_path), actor="test")
         (tmp_path / "target.py").write_text("x = 1\n")
         self.fid = self.board.create_feature(
@@ -82,6 +82,8 @@ class _Round:
             self.dispatches += 1
             self.started.set()
             await self.release.wait()  # the coder is still working
+            if dispatch_exc is not None:
+                raise dispatch_exc
             return "## Summary\n\n- propagated the originating session\n"
 
         async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
@@ -107,7 +109,7 @@ class _Round:
         monkeypatch.setattr(worktree, "remove_worktree", _remove)
         monkeypatch.setattr(worktree, "close_pr", _close)
         monkeypatch.setattr(worktree, "pr_url_for_branch", _no_pr)
-        self.loop = BoardLoop({"coder": "proto", "repo": str(tmp_path)})
+        self.loop = BoardLoop({"coder": "proto", "repo": str(tmp_path), **(cfg or {})})
         monkeypatch.setattr(self.loop, "_resolve_delegate", lambda name, expect: object())
 
     async def start(self):
@@ -261,6 +263,28 @@ async def test_a_held_card_is_not_retried_or_reblocked_after_a_transient_failure
     g = r.board.get_feature(r.fid)
     assert g["blocked"] and g["blocked_class"] == "terminal"
     assert g["blocked_reason"] == f["blocked_reason"] == "hold: do not ship until the vendor signs"
+
+
+async def test_a_held_card_whose_round_times_out_is_not_parked_for_a_split(tmp_path, monkeypatch):
+    """Parking a too-wide card (#378) blocks it and files its split. Over a card a human is
+    holding, that would replace the hold with `too-wide` and file a split nobody asked for."""
+    r = _Round(
+        tmp_path,
+        monkeypatch,
+        with_pr=False,
+        dispatch_exc=worktree.CoderTimeout("coder timed out after 1800s"),
+        cfg={"decompose_after_timeouts": 1},
+    )
+    # The model DID run (a real timeout, not a pre-model dispatch failure), so the timeout
+    # reaches the park, not the pre-model block path.
+    monkeypatch.setattr(r.loop, "_dispatch_reached_model", lambda fid: True)
+    await r.start()
+    await asyncio.to_thread(r.board.flag_blocked, r.fid, "hold: waiting on the design review", "terminal")
+
+    f = await r.finish()
+
+    assert f["blocked_class"] == "terminal" and f["blocked_reason"] == "hold: waiting on the design review"
+    assert [c["id"] for c in r.board.list_features() if c["id"] != r.fid] == []  # no split task filed
 
 
 async def test_the_stand_aside_note_failing_never_turns_into_a_block(tmp_path, monkeypatch):

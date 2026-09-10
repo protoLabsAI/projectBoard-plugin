@@ -387,7 +387,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
     from .projects import resolve_projects, store_db_path
-    from .store import BoardError, annotate_next_action, get_store
+    from .store import BoardError, annotate_next_action, get_store, open_requirement_ids, open_requirements_note
 
     # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
     # execution settings) + the default project a create falls back to. Threaded into
@@ -671,7 +671,11 @@ def _board_tools(cfg: dict):
         open), plus two dependency views: `depends_on` (EVERY blocking edge — the
         historical ledger, including already-merged blockers) and `open_depends_on`
         (only the edges whose blocker is still OPEN — the live, actionable "what's
-        blocking me now" signal). The READ half of a read-modify-write: fetch the
+        blocking me now" signal). A TASK (#217) also carries `deliverable` (the recorded
+        deliverable text — "" until board_deliver records one), `delivered_by`, and
+        `open_requirements` (the ids of ledger items no delivery has closed) — what
+        board_verify judges; open items are for the verifier to weigh, nothing refuses
+        on them. The READ half of a read-modify-write: fetch the
         current criteria/spec, revise them, then `board_update_feature` — no
         operator round-trip. Returns `Error: unknown feature …` for an id that
         isn't on the board."""
@@ -702,6 +706,20 @@ def _board_tools(cfg: dict):
                 # Which project (#90) this feature builds in — "" for a pre-#90 feature
                 # or a single-repo board with no `projects:` map.
                 "project": f.get("project", ""),
+                # A task's work product (#399). Without it this "FULL detail" read showed a
+                # delivered task with no deliverable at all, and the PM agent reading it
+                # concluded the delivery was empty and set about "repairing" a card whose
+                # 4,989-char record was intact on the bead. `open_requirements` is the
+                # ledger's still-open ids, named so a verifier need not scan `requirements`.
+                **(
+                    {
+                        "deliverable": f.get("deliverable", ""),
+                        "delivered_by": f.get("delivered_by", ""),
+                        "open_requirements": open_requirement_ids(f.get("requirements")),
+                    }
+                    if f.get("issue_type") == "task"
+                    else {}
+                ),
             }
         )
 
@@ -816,9 +834,19 @@ def _board_tools(cfg: dict):
         field); optional `ref` (a doc URL, an artifact path) lands on the same `external_ref`
         slot a coding feature's pr_url occupies, so link consumers just work. Then verify it
         with board_verify. TASK-ONLY and in_progress-ONLY: a coding feature (or a task not
-        yet claimed/in review) is refused with an `Error: …` — a coding feature entering
-        review with no pr_url would strand the merge reconciler. `text`/`ref` are stripped
-        of any literal wrapping double quotes first (same hygiene as board_create_feature)."""
+        yet claimed) is refused with an `Error: …` — a coding feature entering review with
+        no pr_url would strand the merge reconciler. Safe to retry: repeating the delivery a
+        task in review already carries returns its `in_review` state and writes nothing.
+        A DIFFERENT deliverable for a task already in review is refused (the recorded one
+        stands) — to replace it, board_verify(approved=false) first, then deliver again.
+        If the task has a requirement ledger, END `text` with a `## Requirements` section —
+        one `- <id>: done` or `- <id>: declined — <reason>` line per item, exactly that
+        (a hedge like `done?` or a reasonless decline closes nothing, and rows inside a
+        code fence are ignored) — and those items close on the ledger; unreported ones stay
+        open for the verifier to see (never a refusal). While the task awaits its verdict,
+        the rows of a refused or repeated delivery still land. An EMPTY delivery (no text,
+        no ref) is refused. `text`/`ref` are stripped of any literal wrapping double quotes
+        first (same hygiene as board_create_feature)."""
         try:
             text = _strip_wrapping_quotes(text)
             ref = _strip_wrapping_quotes(ref)
@@ -833,8 +861,9 @@ def _board_tools(cfg: dict):
         verify sibling. `approved=true` CLOSES the task `done` with an auditable
         `verified: <by>` reason (a task has no PR to merge, so a verifier's approval is
         what closes it). `approved=false` records `feedback` as a comment (the next dispatch
-        prompt leads with it, the adverse-review shape) and requeues the bead to `ready` for
-        another pass.
+        prompt leads with it, the adverse-review shape), reopens the requirement items the
+        rejected round closed (each keeps what it had claimed as `reopened_from`), and
+        requeues the bead to `ready` for another pass.
 
         `by` names the verifier written into that `verified: <by>` reason (#316), forwarded
         UNCHANGED. SELF-APPROVAL is NOT blocked: when the verifier matches the task's
@@ -845,6 +874,11 @@ def _board_tools(cfg: dict):
         own actor — it is NOT the HTTP API's `operator` default (the out-of-band API is a
         different caller and defaults differently on purpose).
 
+        OPEN REQUIREMENTS are surfaced, never enforced (#399): when ledger items are still
+        open the result carries a `note` — "2 requirement(s) still open: r2, r4" — and the
+        approval stands; the verifier decides. Read them BEFORE deciding via
+        board_get_feature's `open_requirements`.
+
         TASK-ONLY and in_review-ONLY: a coding feature (closed here it would dodge
         record_merge, the ONE Done edge for code) or a task not in review is refused with an
         `Error: …`. `feedback` is stripped of any literal wrapping double quotes first (same
@@ -852,9 +886,13 @@ def _board_tools(cfg: dict):
         try:
             feedback = _strip_wrapping_quotes(feedback)
             f = get_store(**store_kw).record_verification(feature_id, approved, feedback, by=by)
-            return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"
+        out = {"id": f["id"], "state": f["board_state"]}
+        note = open_requirements_note(f.get("requirements"))
+        if note:
+            out["note"] = note
+        return json.dumps(out)
 
     @tool
     def board_requeue_feature(feature_id: str, findings: str = "") -> str:
@@ -966,9 +1004,15 @@ def _board_tools(cfg: dict):
     def board_unblock_feature(feature_id: str) -> str:
         """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
         board_block_feature. Removes the blocked label; the puller can claim it again once
-        it's otherwise `ready`."""
+        it's otherwise `ready`. A card parked `too-wide` after repeated timeouts also gets
+        its timeout count reset, so the retry is a real attempt."""
         try:
             f = get_store(**store_kw).clear_blocked(feature_id)
+            # The running loop's cached timeout count wins over the label the store just
+            # reset (#259) — drop it too (#378). Lazy import: the loop imports from here.
+            from .loop import forget_timeout_count
+
+            forget_timeout_count(feature_id)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"

@@ -139,12 +139,33 @@ The gates between a green build and main.
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
 
 `decompose_after_timeouts` is the one that changes behaviour rather than tuning it. A coder
-timeout is a **size** signal, not a capability one: it produces no diff and no CI output, so a
-retry re-sends a near-identical prompt and climbing the model ladder spends a stronger model on
-a card that was never model-limited. After this many timeouts on one card, the loop files a task
-asking this agent to split it into buildable slices — once per card, and never for a
-pre-first-token timeout (that is an infra fault, and splitting would be the wrong remedy). Set
-`0` to switch the ask off and have the card simply block, as it did before.
+timeout on a fresh build is a **size** signal, not a capability one. It produces no diff and no
+CI output, so a retry re-sends a near-identical prompt, and climbing the model ladder spends a
+stronger model on a card that was never model-limited.
+
+Only those timeouts count:
+
+- A pre-first-token timeout is an infra fault that splitting would not fix. It never counts,
+  and never asks.
+- A timeout on a fix round doesn't count either: the card already has a PR, or the coder was
+  fixing a kept worktree. A card that built in one dispatch is not too wide.
+- The count clears when a build reaches review.
+
+On the timeout that reaches this count, the loop parks the card (blocked class `too-wide`) and
+files a `ready` task asking this agent to split it. The card does not climb another rung, and
+the blocked sweep does not rebuild it, since that would only time out again, racing the split.
+The operator is told once, and the block reason names the task, or says that none was filed.
+
+The task gives the agent a fixed order, each step passing the gates the next one relies on:
+
+1. Create the slices, left in backlog.
+2. Re-point the card's dependents onto the slices they need.
+3. Cancel the card.
+4. Mark the slices ready.
+
+The ask is made once per card. Unblocking a parked card resets its count, so a retry after
+raising `coder_timeout_s` is a real attempt. Set `0` to switch the ask off and have the card
+simply block, as it did before.
 
 ## Concurrency
 
@@ -238,8 +259,22 @@ the quota backoff is spent — a marked provider still gets its one real attempt
 card blocks (the operator may have repointed it), and a dispatch it serves clears the mark. If every provider on the rung refused its model on this
 card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
 config problem, and a stronger rung would only hide it. If some were only rate-limited, it
-blocks as `rate_limit`, which the sweep heals on its own. Max-mode swallows each candidate's
-error, so neither rotation applies there.
+blocks as `rate_limit`, which the sweep heals on its own.
+
+Max-mode (`max_mode_n > 1`) follows the same rules. If every candidate raised, the loop takes
+the edge of the most specific failure among them, exactly as it would for a single dispatch.
+The precedence is:
+
+1. a refused model, even beside a quota;
+2. a quota;
+3. a timeout;
+4. a dispatch failure the loop does not retry;
+5. a retryable one;
+6. any other board error, as raised.
+
+A raw error that is not a board error keeps the old "no diff" verdict. Only a fan-out where
+at least one candidate ran and came back with nothing is guaranteed to be a capability failure
+that climbs. A climb after a timeout is a fresh build, so the stronger rung fans out again.
 
 A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 
