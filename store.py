@@ -1704,10 +1704,16 @@ class BeadsBoard:
 
         Rather than decompose inline (the ``decompose`` subagent is a pure proposer driven
         by a skill, and an LLM call inside the drive loop can itself time out), file a
-        TASK assigned to the board's own agent. The existing self-dispatch path (#311)
-        picks it up, the agent decomposes with the board tools it already has, and the
-        Ready gate enforces that the slices are actually well-formed — which is the part
-        an unattended splitter gets wrong.
+        TASK assigned to the board's own agent, and promote it to ``ready``. The existing
+        self-dispatch path (#311) picks it up, the agent decomposes with the board tools it
+        already has, and the Ready gate enforces that the slices are actually well-formed —
+        which is the part an unattended splitter gets wrong.
+
+        The promotion is not optional. ``create_feature`` files every bead in ``backlog``,
+        and the puller only pulls ``ready``: the ask as first shipped sat in the backlog
+        until someone noticed it, so the loop that "asked its own agent" had in fact asked
+        nobody. It goes through the ordinary ``mark_ready`` gate; a refusal leaves the task
+        filed in backlog for a human rather than un-asking.
 
         Returns the new task, or None when the ask was already made (idempotent) or the
         card is itself a decomposition task (never recurse). Never raises: failing to ask
@@ -1762,6 +1768,18 @@ class BeadsBoard:
             )
             self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
             self.comment(fid, f"decompose requested after {timeouts} timeouts → {(task or {}).get('id', '?')}")
+            # After the once-per-card label, so a promotion failure can never re-arm the ask.
+            if (task or {}).get("id"):
+                try:
+                    task = self.mark_ready(task["id"]) or task
+                except Exception:  # noqa: BLE001 — filed is still asked; a human can promote it
+                    log.warning(
+                        "[project_board] %s decompose task %s filed but not promoted to ready — it waits "
+                        "in backlog until someone marks it ready",
+                        fid,
+                        task["id"],
+                        exc_info=True,
+                    )
             return task
         except Exception:  # noqa: BLE001 — the ask is best-effort; the block still happens
             log.warning("[project_board] %s decompose request failed (ignored)", fid, exc_info=True)

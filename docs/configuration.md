@@ -141,10 +141,13 @@ The gates between a green build and main.
 `decompose_after_timeouts` is the one that changes behaviour rather than tuning it. A coder
 timeout is a **size** signal, not a capability one: it produces no diff and no CI output, so a
 retry re-sends a near-identical prompt and climbing the model ladder spends a stronger model on
-a card that was never model-limited. After this many timeouts on one card, the loop files a task
-asking this agent to split it into buildable slices — once per card, and never for a
-pre-first-token timeout (that is an infra fault, and splitting would be the wrong remedy). Set
-`0` to switch the ask off and have the card simply block, as it did before.
+a card that was never model-limited. On the timeout that reaches this count, the loop files a
+`ready` task asking this agent to split the card into buildable slices, and parks the card for
+it. The card does not climb another rung, and the blocked sweep does not rebuild it (that would
+only time out again, racing the split). The operator is told once, and the agent cancels the
+card when the slices exist. The ask is made once per card, and never for a pre-first-token
+timeout, which is an infra fault that splitting would not fix. Set `0` to switch the ask off and
+have the card simply block, as it did before.
 
 ## Concurrency
 

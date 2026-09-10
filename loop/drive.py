@@ -1669,6 +1669,7 @@ class DriveMixin:
                     # #378: count timeouts durably, BEFORE the retry/escalate/block fork —
                     # bd-sxxf timed out, escalated a tier, timed out again and only then
                     # blocked, so a counter bumped at the block alone would have read 1.
+                    timeouts = 0  # this card's timeouts so far, THIS one included; 0 = not a timeout
                     if isinstance(exc, worktree.CoderTimeout):
                         timeouts = await self._budget_get(store, fid, "timeout") + 1
                         await self._budget_set(store, fid, "timeout", timeouts)
@@ -1820,6 +1821,52 @@ class DriveMixin:
                             await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
                         return
+                    # 1.7 The timeout that brings this card to `decompose_after_timeouts` → PARK it,
+                    #     and ask the board's own agent to split it (#378). A repeated
+                    #     timeout is a SIZE signal: no diff, no CI output, so neither a stronger
+                    #     rung nor a rebuild has anything new to work with (on a ladder, the first
+                    #     timeout's climb already carried #146's timeout context). The ask used to be
+                    #     made only once the ladder ran out, and the block beside it was the
+                    #     self-healing `transient` — so a card on a three-rung ladder timed out
+                    #     three times before it was asked, then the sweep requeued it and rebuilt
+                    #     it whole twice more, racing the very decomposition it had just filed.
+                    #     Now: no climb, and `terminal`, which the sweep never re-runs — it tells
+                    #     the operator once, and the task's agent retires the card when the slices
+                    #     land. Parked whatever the ask returns: that conclusion is about the card,
+                    #     not the filing (a card asked once and requeued by hand that times out
+                    #     again is just as wide). A pre-first-token timeout never gets here (1.5:
+                    #     infra, not size).
+                    threshold = self.decompose_after_timeouts  # 0 = never (a timeout blocks as before)
+                    if timeouts and threshold and timeouts >= threshold:
+                        reason = (
+                            f"too wide to build in one dispatch — timed out {timeouts}x, so it is parked for "
+                            f"a split into slices instead of climbing a tier or being rebuilt: {exc}"
+                        )
+                        log.warning(
+                            "[project_board] %s timed out %dx — parked for a split (a timeout is a SIZE signal, "
+                            "not a capability one)",
+                            fid,
+                            timeouts,
+                        )
+                        # Park BEFORE asking: the ask files its task `ready`, and the agent that
+                        # picks it up cancels this card — it must never find the card in flight.
+                        await asyncio.to_thread(store.flag_blocked, fid, reason, category="terminal")
+                        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
+                        asked = await asyncio.to_thread(ask, fid, timeouts=timeouts) if callable(ask) else None
+                        if asked:
+                            log.info(
+                                "[project_board] %s filed %s for this agent to split it", fid, asked.get("id", "?")
+                            )
+                        else:
+                            log.warning(
+                                "[project_board] %s no new decompose task filed (asked before, or the store "
+                                "refused) — it waits for the operator",
+                                fid,
+                            )
+                        if wt:
+                            await worktree.remove_worktree(repo, wt, branch or "")
+                        self._inflight.pop(fid, None)
+                        return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if self.escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
@@ -1869,23 +1916,6 @@ class DriveMixin:
                     await asyncio.to_thread(
                         store.flag_blocked, fid, f"{policy.category}: {exc}", category=policy.category
                     )
-                    # #378: a card that has now timed out repeatedly is not model-limited, it
-                    # is too wide — and nothing in the block path says so, which is how one
-                    # sat parked while an operator guessed. Ask the board's own agent to split
-                    # it (once; `request_decomposition` no-ops on a repeat or on a task).
-                    if isinstance(exc, worktree.CoderTimeout) and self.decompose_after_timeouts:
-                        spent = await self._budget_get(store, fid, "timeout")
-                        ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
-                        if spent >= self.decompose_after_timeouts and callable(ask):
-                            asked = await asyncio.to_thread(ask, fid, timeouts=spent)
-                            if asked:
-                                log.warning(
-                                    "[project_board] %s timed out %dx — filed %s to decompose it "
-                                    "(a timeout is a SIZE signal, not a capability one)",
-                                    fid,
-                                    spent,
-                                    asked.get("id", "?"),
-                                )
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
