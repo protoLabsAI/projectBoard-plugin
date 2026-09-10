@@ -949,9 +949,15 @@ def _board_tools(cfg: dict):
     def board_unblock_feature(feature_id: str) -> str:
         """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
         board_block_feature. Removes the blocked label; the puller can claim it again once
-        it's otherwise `ready`."""
+        it's otherwise `ready`. A card parked `too-wide` after repeated timeouts also gets
+        its timeout count reset, so the retry is a real attempt."""
         try:
             f = get_store(**store_kw).clear_blocked(feature_id)
+            # The running loop's cached timeout count wins over the label the store just
+            # reset (#259) — drop it too (#378). Lazy import: the loop imports from here.
+            from .loop import forget_timeout_count
+
+            forget_timeout_count(feature_id)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"

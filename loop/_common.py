@@ -50,7 +50,7 @@ import time
 import types
 
 from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
-from ..failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
+from ..failures import PRE_MODEL_DISPATCH_CLASS, TOO_WIDE_CLASS, classify, is_pre_model_dispatch_failure
 from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
@@ -1129,6 +1129,21 @@ def reset_merged_verify_budget(fid: str, store) -> bool:
     return True
 
 
+def forget_timeout_count(fid: str) -> bool:
+    """Drop the live loop's cached timeout count for ``fid`` after an operator unblock
+    (#378), so the next ``_budget_get`` re-reads it from the bead. ``clear_blocked`` resets
+    the persisted count when it releases a card parked as `too-wide`, but the loop's cache
+    wins over the labels (#259): without this, a retry after raising `coder_timeout_s`
+    would re-park on its very first timeout. Forgetting — not pinning 0 — is right for any
+    unblock: the cache simply re-syncs with whatever the bead now says. No lock needed: a
+    blocked card has no drive in flight to race. Returns False when no loop is running."""
+    loop = live_loop()
+    if loop is None:
+        return False
+    loop._budget_cache("timeout").pop(fid, None)
+    return True
+
+
 def cancel_pr_comment(fid: str) -> str:
     return f"cancelled by operator — see card {fid}"
 
@@ -1289,6 +1304,7 @@ __all__ = [
     "work_snapshot",
     "worktree",
     "PRE_MODEL_DISPATCH_CLASS",
+    "TOO_WIDE_CLASS",
     "classify",
     "is_pre_model_dispatch_failure",
     "resolve_default_project",
@@ -1370,6 +1386,7 @@ __all__ = [
     "_unregister_loop",
     "live_loop",
     "reset_merged_verify_budget",
+    "forget_timeout_count",
     "cancel_pr_comment",
     "cancel_side_effects",
     "_MAX_MODE_JUDGE_SYS",

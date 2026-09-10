@@ -210,9 +210,10 @@ config:
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
   # A repeated coder timeout is a SIZE signal, not a capability one: it carries no diff and
   # no CI output, so a retry gets a near-identical prompt and a tier climb spends a stronger
-  # model on a card that was never model-limited. After this many timeouts on one card, the
-  # loop files a task asking the board's own agent to split it (once per card) and parks the
-  # card for it — no further tier climb or rebuild. 0 = off.
+  # model on a card that was never model-limited. After this many timeouts on FRESH builds of
+  # one card (never a pre-first-token or fix-round timeout; the count clears when a build
+  # reaches review), the loop parks the card and files a task asking the board's own agent to
+  # split it (once per card) — no further tier climb or rebuild. Unblocking resets it. 0 = off.
   decompose_after_timeouts: 2
                             # (in_progress with no live drive → ready) + reap orphaned
                             # feat-<id> worktrees (feature gone/done). 0 disables it.
@@ -261,7 +262,7 @@ settings:
   - { key: loop_enabled, label: "Run orchestration loop", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Start the background puller after the member restarts. Off keeps the board and tools available without dispatching work." }
   - { key: decompose_after_timeouts, label: "Ask to split after N timeouts", type: number, minimum: 0, maximum: 10, group: "Project Board", tab: automation, restart: true,
-      description: "A repeated coder timeout means the card is too WIDE, not that the model is too weak: it produces no diff and no CI output, so a retry re-sends the same prompt and a tier climb spends a stronger model on the wrong problem. After this many timeouts on one card, file a task asking this agent to split it into buildable slices (once per card) and park the card for it, with no further tier climb or rebuild. 0 turns the ask off and the card simply blocks." }
+      description: "A repeated coder timeout means the card is too WIDE, not that the model is too weak: it produces no diff and no CI output, so a retry re-sends the same prompt and a tier climb spends a stronger model on the wrong problem. After this many timeouts on fresh builds of one card (a pre-first-token timeout, or one on a fix round, never counts), park the card and file a task asking this agent to split it into buildable slices (once per card), with no further tier climb or rebuild. Unblocking a parked card resets its count. 0 turns the ask off and the card simply blocks." }
   - { key: coder, label: "Coder delegate", type: string, group: "Project Board", tab: automation,
       description: "Name of the acp delegate (Settings ▸ Delegates) the loop dispatches builds to. No default. Applies live on save: a paused loop resumes on its next check." }
   - { key: br_autofetch, label: "Fetch br automatically", type: bool, group: "Project Board", tab: automation,
