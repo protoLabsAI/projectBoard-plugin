@@ -213,7 +213,7 @@ carries the host's trade-off: a member stopped by a signal to its process group 
 takes a running gate with it. The drive's cancel path kills the tree if shutdown reaches it.
 On Windows `killpg` does not exist, so a timeout there still kills only the shell.
 
-## A worktree holding work is never reaped automatically
+## A worktree holding work is saved before it is removed
 
 Worktrees are disposable by design: a re-dispatch cleans a prior run's leftovers with
 `git worktree remove --force` and `git branch -D`, and the terminal edges reap by feature
@@ -223,39 +223,56 @@ is promoted leaves the **only copy** of its work in that tree. `bd-ezs7`'s coder
 requeued, and the implementation survived only because the hung drive still held its file
 claim, so nothing re-dispatched it (#400, #405).
 
-So the board never destroys a tree holding **work that exists nowhere else**:
+So before the board removes a tree holding **work that exists nowhere else**, it saves that
+work to a new branch, `stranded/<tree id>/<UTC stamp>`:
 
 | Edge | What it does with such a tree |
 |---|---|
-| a fresh build of the card | blocks the card under `stranded-work`, naming every tree, its branch and what is in it. No coder is dispatched and nothing is reaped. |
-| `create_worktree` / `promote_worktree` | refuse (`StrandedWorkError`) before the forced cleanup, and before anything moves |
-| the by-id reap: merge, closed PR, cancel, done, health sweep | keeps it and logs the path, once; clean trees still reap |
-| shutdown | keeps the interrupted drive's tree; the card blocks on its next dispatch |
+| a fresh build of the card | saves every one the card owns, removes them, comments on the card, and builds on |
+| shutdown | saves the interrupted drive's tree, comments on the card, and reaps it. The next boot rebuilds as before. |
+| the by-id reap: merge, closed PR, cancel, done, health sweep | saves it, logs the branch, and reaps it |
+| `create_worktree` / `promote_worktree`, for any other caller | saves it, logs the branch, then clears it |
+
+The saved commit is the tree's own `HEAD` plus its working state, staged through the same
+exclusions a PR uses into a private index. The tree, its index and its branch are never
+touched. Hooks don't run, nothing is signed, and the identity is pinned. The branch is
+created only if it doesn't exist yet, so an existing one is never overwritten. It is then
+read back and compared with the tree state before the tree may go.
 
 "Work" is every uncommitted change git can see: modified, staged, deleted and untracked.
 On a **candidate** branch it also includes commits that no other branch, tag or remote
 holds. The brief says edit-only, but a coder with a shell can commit, and `branch -D`
-drops the commit. The board's own droppings are not work: the coder's session scratch
-(`.proto/`, `.cursor/`) and the `node_modules` links it adds to every tree. A `node_modules/`
-ignore pattern matches only a real directory, so git reports those links as untracked.
+drops the commit. For such a tree the `stranded/` branch points at its `HEAD`. The board's
+own droppings are not work and are never saved: the coder's session scratch (`.proto/`,
+`.cursor/`) and the `node_modules` links it adds to every tree. A `node_modules/` ignore
+pattern matches only a real directory, so git reports those links as untracked. For the
+same reason the staging step behind every PR commit now leaves the links out: before
+this, a repo with only that pattern got the board's symlink committed into its PR.
+
+The card comment names each branch, what it holds, and how to use it:
+`git diff origin/<base>...stranded/…` to inspect it, `git cherry-pick origin/<base>..stranded/…`
+or a PR from the branch to salvage it, and `git branch -D` once nobody needs it.
+`git branch --list 'stranded/*'` shows what has piled up.
 
 A drive still throws away what **it** built and judged: its own failed attempt before a
-retry, and the candidates `coder.solve` or Max-Mode rejected. It discards those by path.
-Only a tree some other run left behind is protected.
+retry, and the candidates `coder.solve` or Max-Mode rejected. It discards those by path,
+and saves nothing for them.
 
-**Getting the card moving again is a human's call.** `stranded-work` is not a self-healing
-class, so the blocked sweep tells the operator once. The block reason names both ways out:
+### When the work cannot be saved
 
-- **recover it**: switch the tree to a branch of your own and commit, or open a PR from it.
-  Committing on the board's own `feat/…` branch does not protect it, because the next
-  build deletes that branch.
-- **discard it**: `git worktree remove --force <path>`, then `git branch -D <branch>`.
+If the commit or the branch fails, the tree is **kept exactly as it is**. Work that could not
+be saved is never destroyed. Where that happens decides what it stops:
 
-Then unblock the card. If the work is still there, the card just blocks again.
-
-The price is that a restart mid-build now leaves one blocked card per interrupted drive.
-The board cannot tell a half-written tree from a finished one waiting on its gate, and
-losing the finished one is the worse mistake.
+- **a fresh build** blocks the card under `stranded-work`. That class is not self-healing, so
+  the blocked sweep tells the operator once. The reason names the tree, what is in it and
+  why saving failed, plus both ways out: recover it (switch the tree to a branch of your
+  own and commit, or open a PR from it) or discard it (`git worktree remove --force
+  <path>`, then `git branch -D <branch>`). Then unblock the card. A card unblocked with
+  the tree still unsavable just blocks again.
+- **the by-id reap** keeps the tree and logs it once.
+- **shutdown** keeps the tree, and the card's next dispatch tries again.
+- **`create_worktree` / `promote_worktree`** refuse with `StrandedWorkError` before anything
+  moves.
 
 ## Blocked cards — self-heal, then page a human
 

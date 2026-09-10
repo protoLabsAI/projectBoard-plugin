@@ -1,4 +1,4 @@
-"""A worktree holding work that exists nowhere else is never destroyed automatically (#405, #400).
+"""A worktree holding work that exists nowhere else is never destroyed without saving it (#405, #400).
 
 The incident (bd-ezs7, 2026-09-06): a `coder.solve` candidate finished — 170 lines across
 three files, uncommitted in `feat-bd-ezs7.g1` — and then its drive went silent (#423's
@@ -7,6 +7,10 @@ reason the implementation survived is that the silent drive still held the card'
 claim, so nothing re-dispatched it: a re-dispatch runs `create_worktree`, whose "clean a
 prior run's leftovers" step is `git worktree remove --force` plus `git branch -D` — on
 exactly the directory holding the only copy of that work.
+
+Now every edge that would remove such a tree first saves its work onto a NEW branch,
+`stranded/<tree id>/<UTC stamp>`, proves the branch holds it, and only then lets the tree
+go. It stops the card only when that save fails.
 
 Every test here runs REAL git against a bare origin plus a clone. The defect is what git
 does to a dirty tree under `--force`, which a faked `_git` cannot show — and this repo has
@@ -31,10 +35,6 @@ def _git(*args: str) -> str:
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def _git_rc(*args: str) -> int:
-    return subprocess.run(["git", *args], capture_output=True, text=True).returncode
-
-
 def _identity(repo: str) -> None:
     _git("-C", repo, "config", "user.email", "board-test@localhost")
     _git("-C", repo, "config", "user.name", "Board Test")
@@ -56,7 +56,7 @@ class _Origin:
         _identity(seed)
         # `node_modules/` (trailing slash) is the common spelling — and it does NOT match
         # the node_modules SYMLINK create_worktree links into every tree, which git then
-        # reports as untracked. The droppings test depends on that trap being present.
+        # reports as untracked. The droppings tests depend on that trap being present.
         Path(seed, ".gitignore").write_text("node_modules/\n")
         Path(seed, "README.md").write_text("base\n")
         _git("-C", seed, "add", "-A")
@@ -67,6 +67,12 @@ class _Origin:
         _git("clone", self.origin, self.clone)
         _identity(self.clone)
         self.base_sha = _git("-C", self.clone, "rev-parse", f"origin/{self.base}")
+
+    def stranded(self, tree_id: str = "") -> list[str]:
+        """The preservation branches that exist — for one tree id, or all of them."""
+        pattern = f"refs/heads/stranded/{tree_id}/*" if tree_id else "refs/heads/stranded/"
+        out = _git("-C", self.clone, "for-each-ref", "--format=%(refname:short)", pattern)
+        return [line for line in out.splitlines() if line]
 
 
 @pytest.fixture
@@ -89,9 +95,13 @@ def _strand(wt: str, kind: str) -> tuple[str, str]:
     return "changelog.d/3360.fixed.md", "- **Fixed (#3360).** poll timeout\n"
 
 
+def _show(origin: _Origin, ref: str, rel: str) -> str:
+    return _git("-C", origin.clone, "show", f"{ref}:{rel}") + "\n"
+
+
 async def _attempt(coro):
-    """Run a worktree call that SHOULD refuse, returning the exception (or None) — so the
-    test can check what survived on disk before it looks at how the call ended."""
+    """Run a worktree call that may refuse, returning the exception (or None) — so the test
+    can check what survived on disk before it looks at how the call ended."""
     try:
         await coro
     except worktree.WorktreeError as exc:
@@ -103,42 +113,41 @@ async def _attempt(coro):
 
 
 @pytest.mark.parametrize("kind", ["tracked", "staged", "untracked"])
-async def test_a_redispatch_will_not_rebuild_over_uncommitted_work(origin, kind):
+async def test_a_redispatch_saves_uncommitted_work_before_it_rebuilds(origin, kind):
     wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
     rel, text = _strand(wt, kind)
 
-    refused = await _attempt(worktree.create_worktree(origin.clone, origin.base, "bd-7.g1"))
+    rebuilt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
 
-    assert Path(wt, rel).is_file() and Path(wt, rel).read_text() == text, (
-        f"the re-dispatch destroyed the stranded {kind} change"
-    )
-    if kind == "staged":
-        assert _git("-C", wt, "diff", "--cached", "--name-only") == rel, "the index was reset"
-    assert isinstance(refused, worktree.StrandedWorkError)
-    assert [t.path for t in refused.trees] == [wt]
-    # The refusal names what it protected, so the block it becomes is actionable.
-    assert wt in str(refused) and rel in str(refused) and branch in str(refused)
+    saved = origin.stranded("bd-7.g1")
+    assert len(saved) == 1, f"the {kind} change was destroyed, not saved: no stranded/ branch"
+    assert _show(origin, saved[0], rel) == text
+    # Saved as one commit on top of the tree's own HEAD, so a cherry-pick replays exactly it.
+    assert _git("-C", origin.clone, "rev-parse", f"{saved[0]}~1") == origin.base_sha
+    # …and only then was the tree rebuilt, fresh off base, as a re-dispatch always has.
+    assert rebuilt == wt and _git("-C", wt, "rev-parse", "HEAD") == origin.base_sha
+    assert _git("-C", wt, "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)node_modules") == ""
 
 
-async def test_a_candidate_whose_coder_committed_is_not_rebuilt_over(origin):
+async def test_a_candidate_whose_coder_committed_keeps_its_commit(origin):
     """The brief says edit-only, but a coder with a shell can commit — and `branch -D`
     loses a commit exactly as surely as `worktree remove --force` loses a file."""
-    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    wt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
     Path(wt, "adapters.py").write_text("POLL = 1\n")
     _git("-C", wt, "add", "-A")
     _git("-C", wt, "commit", "-m", "coder's own commit")
     sha = _git("-C", wt, "rev-parse", "HEAD")
 
-    refused = await _attempt(worktree.create_worktree(origin.clone, origin.base, "bd-7.g1"))
+    await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
 
-    assert _git("-C", origin.clone, "rev-parse", f"refs/heads/{branch}") == sha, "the coder's commit was dropped"
-    assert isinstance(refused, worktree.StrandedWorkError)
-    assert "1 commit" in str(refused)
+    saved = origin.stranded("bd-7.g1")
+    assert len(saved) == 1, "the coder's commit was dropped with its branch"
+    assert _git("-C", origin.clone, "rev-parse", saved[0]) == sha  # the branch IS its commit — nothing new
 
 
-async def test_the_boards_own_droppings_are_not_work(origin):
+async def test_the_boards_own_droppings_are_neither_work_nor_saved(origin):
     """The coder's session scratch and the node_modules symlink the board links in are
-    the board's own — counting them would strand EVERY tree the board ever built."""
+    the board's own. Counting them would strand EVERY tree; saving them would carry them."""
     os.makedirs(os.path.join(origin.clone, "node_modules", "left-pad"))  # linked into each tree
     wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
     assert os.path.islink(os.path.join(wt, "node_modules"))
@@ -148,76 +157,99 @@ async def test_the_boards_own_droppings_are_not_work(origin):
         Path(wt, scratch, "session-notes.md").write_text("the coder's private notes\n")
 
     assert await worktree.unpublished_work(wt, branch=branch) == ""
-    rebuilt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
-    assert rebuilt == wt and not Path(wt, ".proto").exists()  # reaped and rebuilt, as before
+    await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    assert origin.stranded() == [], "a tree holding only the board's droppings was 'saved'"
+
+    # Beside real work, the droppings still stay out of what is saved.
+    for scratch in (".proto", ".cursor"):
+        Path(wt, scratch).mkdir()
+        Path(wt, scratch, "session-notes.md").write_text("notes\n")
+    rel, _text = _strand(wt, "untracked")
+    await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    (saved,) = origin.stranded("bd-7.g1")
+    carried = _git("-C", origin.clone, "ls-tree", "-r", "--name-only", saved).splitlines()
+    assert rel in carried
+    assert not [p for p in carried if p.startswith((".proto", ".cursor")) or p.endswith("node_modules")]
 
 
-# ── the other two destructive edges: promotion and the by-id reap ────────────────────
+async def test_an_existing_branch_is_never_overwritten_and_unsaved_work_is_kept(origin, monkeypatch):
+    """Saving goes to a NEW branch or not at all. When it cannot (the name is taken), the
+    tree is kept exactly as it is and the call refuses — work that could not be saved is
+    never destroyed. Once the way is clear, the same call saves it and proceeds."""
+    monkeypatch.setattr(worktree, "_stamp", lambda: "20260906T232550Z", raising=False)  # red-checkable
+    taken = "stranded/bd-7.g1/20260906T232550Z"
+    _git("-C", origin.clone, "branch", taken, origin.base_sha)
+    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    rel, text = _strand(wt, "untracked")
+
+    refused = await _attempt(worktree.create_worktree(origin.clone, origin.base, "bd-7.g1"))
+
+    assert Path(wt, rel).is_file() and Path(wt, rel).read_text() == text, "unsaved work was destroyed"
+    assert _git("-C", origin.clone, "rev-parse", taken) == origin.base_sha, "an existing branch was overwritten"
+    assert isinstance(refused, worktree.StrandedWorkError)
+    assert wt in str(refused) and "saving it to a branch failed" in str(refused)
+
+    _git("-C", origin.clone, "branch", "-D", taken)  # the operator clears the way
+    await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    assert _show(origin, taken, rel) == text and not Path(wt, rel).exists()
 
 
-async def test_promotion_will_not_overwrite_a_stranded_canonical_tree(origin):
+# ── the other edges: promotion and the by-id reap ────────────────────────────────────
+
+
+async def test_promotion_saves_a_stranded_canonical_tree_then_promotes(origin):
     canon, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7")
     Path(canon, "README.md").write_text("an earlier drive's finished work\n")
     cand, cand_branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g3")
     Path(cand, "winner.py").write_text("x = 1\n")
 
-    refused = await _attempt(worktree.promote_worktree(origin.clone, cand, cand_branch, "bd-7"))
+    promoted, _ = await worktree.promote_worktree(origin.clone, cand, cand_branch, "bd-7")
 
-    assert Path(canon, "README.md").read_text() == "an earlier drive's finished work\n"
-    assert Path(cand, "winner.py").is_file(), "the winner must not be half-moved either"
-    assert isinstance(refused, worktree.StrandedWorkError)
-    assert [t.path for t in refused.trees] == [canon]
+    (saved,) = origin.stranded("bd-7") or [None]
+    assert saved, "promotion destroyed the stranded canonical tree"
+    assert _show(origin, saved, "README.md") == "an earlier drive's finished work\n"
+    assert promoted == canon and Path(canon, "winner.py").is_file()
 
 
-async def test_the_reap_keeps_a_tree_holding_work_and_still_reaps_the_clean_ones(origin, caplog):
-    """The terminal edges and the health sweep reap by feature id. A clean stale
-    candidate still goes; one holding work stays, and the log says where it is."""
+async def test_the_reap_saves_a_tree_holding_work_and_still_reaps_everything(origin, caplog):
+    """The terminal edges and the health sweep reap by feature id. A clean stale tree
+    goes as before; one holding work goes too — once its work is on a branch the log names."""
     canon, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7")
     clean, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g2")
-    dirty, dirty_branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
+    dirty, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
     rel, text = _strand(dirty, "untracked")
 
     with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
         await worktree.reap_feature_worktree(origin.clone, ".worktrees", "bd-7")
 
-    assert not os.path.exists(canon) and not os.path.exists(clean)
-    assert Path(dirty, rel).read_text() == text, "the reap destroyed the stranded candidate"
-    assert _git_rc("-C", origin.clone, "rev-parse", "--verify", f"refs/heads/{dirty_branch}") == 0
-    assert dirty in caplog.text and rel in caplog.text
+    assert not os.path.exists(canon) and not os.path.exists(clean) and not os.path.exists(dirty)
+    saved = origin.stranded("bd-7.g1")
+    assert len(saved) == 1, "the reap destroyed the stranded candidate"
+    assert _show(origin, saved[0], rel) == text
+    assert saved[0] in caplog.text and origin.stranded("bd-7") == [] and origin.stranded("bd-7.g2") == []
 
 
-# ── the explicit override: once the operator has dealt with the work, it proceeds ────
+# ── #405's own find: the board's node_modules link must never ride into a PR ─────────
 
 
-@pytest.mark.parametrize("how", ["rescue", "discard"])
-async def test_once_the_operator_has_dealt_with_the_work_the_rebuild_proceeds(origin, how):
-    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
-    rel, text = _strand(wt, "untracked")
-    refused = await _attempt(worktree.create_worktree(origin.clone, origin.base, "bd-7.g1"))
-    assert Path(wt, rel).is_file(), "the work was destroyed before anyone could look at it"
-    assert isinstance(refused, worktree.StrandedWorkError)
+async def test_the_commit_leaves_the_boards_node_modules_link_out(origin):
+    """`add -A` committed the board's node_modules SYMLINK into the PR in any repo whose
+    ignore file spells it `node_modules/` — that pattern matches only a real directory."""
+    os.makedirs(os.path.join(origin.clone, "node_modules", "left-pad"))
+    wt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-8")
+    Path(wt, "feature.py").write_text("x = 1\n")
 
-    if how == "rescue":  # the recovery the block names: keep it on a branch of your own
-        _git("-C", wt, "switch", "-c", "rescue/bd-7")
-        _git("-C", wt, "add", "-A")
-        _git("-C", wt, "commit", "-m", "rescued")
-    else:  # the discard it names, for work the operator has looked at and does not want
-        _git("-C", origin.clone, "worktree", "remove", "--force", wt)
-        _git("-C", origin.clone, "branch", "-D", branch)
+    await worktree.commit_worktree(wt, "feat: the change")
 
-    rebuilt, rebuilt_branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7.g1")
-    assert (rebuilt, rebuilt_branch) == (wt, branch)
-    assert _git("-C", rebuilt, "rev-parse", "HEAD") == origin.base_sha  # a fresh tree off base
-    if how == "rescue":
-        assert _git("-C", origin.clone, "show", f"rescue/bd-7:{rel}") + "\n" == text
+    committed = _git("-C", wt, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert committed == ["feature.py"], f"the commit carried the board's link: {committed}"
 
 
-# ── the loop: a stranded card blocks and says where the work is ──────────────────────
+# ── the loop: a stranded card saves its work, says where, and builds on ──────────────
 
 
 class _Store:
-    """The few store verbs a drive reaches before (and, on the old code, after) the
-    stranded check. Records the transitions the test asserts on."""
+    """The few store verbs a drive reaches. Records the transitions the tests assert on."""
 
     def __init__(self, feature: dict):
         self.feature = feature
@@ -249,6 +281,9 @@ class _Store:
     def clear_budgets(self, fid, kinds=None):
         pass
 
+    def verbs(self, verb: str) -> list[tuple]:
+        return [c for c in self.calls if c[0] == verb]
+
 
 def _card(origin: _Origin) -> dict:
     return {
@@ -271,9 +306,13 @@ def _loop_for(monkeypatch, store: _Store, *, dispatch, open_pr) -> BoardLoop:
     return loop
 
 
-async def test_a_card_with_stranded_work_blocks_instead_of_rebuilding(origin, monkeypatch):
+async def _open_pr(tree, branch, **_kw):
+    return "https://github.com/o/r/pull/1"
+
+
+async def test_a_card_with_stranded_work_saves_it_says_where_and_builds_on(origin, monkeypatch):
     card = _card(origin)
-    # The dead drive's tree, exactly where this card's next build would go.
+    # The dead drive's tree, exactly where this card's next build goes.
     wt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7", title=card["title"])
     Path(wt, "README.md").write_text("finished, never published\n")
     dispatched: list[str] = []
@@ -282,27 +321,49 @@ async def test_a_card_with_stranded_work_blocks_instead_of_rebuilding(origin, mo
         dispatched.append(tree)
         return "reply"
 
-    async def _open_pr(tree, branch, **_kw):
-        return "https://github.com/o/r/pull/1"
+    store = _Store(card)
+    await _loop_for(monkeypatch, store, dispatch=_dispatch, open_pr=_open_pr)._drive(card)
+
+    saved = origin.stranded("bd-7")
+    assert len(saved) == 1, "the drive built over stranded work without saving it"
+    assert _show(origin, saved[0], "README.md") == "finished, never published\n"
+    # The card says where it went, what it held, and how to look at it.
+    notes = [c[2] for c in store.verbs("comment") if saved[0] in c[2]]
+    assert len(notes) == 1, store.calls
+    assert "1 file changed" in notes[0] and f"diff origin/{origin.base}...{saved[0]}" in notes[0]
+    # …and the card was not stopped for it: the build ran and the PR opened.
+    assert dispatched == [wt] and store.verbs("open_review") and not store.verbs("flag_blocked")
+
+
+async def test_a_card_blocks_only_when_its_stranded_work_cannot_be_saved(origin, monkeypatch):
+    monkeypatch.setattr(worktree, "_stamp", lambda: "20260906T232550Z", raising=False)  # red-checkable
+    _git("-C", origin.clone, "branch", "stranded/bd-7/20260906T232550Z", origin.base_sha)  # the name is taken
+    card = _card(origin)
+    wt, _ = await worktree.create_worktree(origin.clone, origin.base, "bd-7", title=card["title"])
+    Path(wt, "README.md").write_text("finished, never published\n")
+    dispatched: list[str] = []
+
+    async def _dispatch(coder, tree, prompt, *, timeout=None, env_passthrough=()):
+        dispatched.append(tree)
+        return "reply"
 
     store = _Store(card)
     await _loop_for(monkeypatch, store, dispatch=_dispatch, open_pr=_open_pr)._drive(card)
 
-    assert Path(wt, "README.md").read_text() == "finished, never published\n", "the drive built over the work"
-    assert dispatched == [], "a coder was dispatched to rebuild a card whose work is stranded"
-    blocks = [c for c in store.calls if c[0] == "flag_blocked"]
-    assert len(blocks) == 1, store.calls
-    _verb, fid, reason, category = blocks[0]
+    assert Path(wt, "README.md").read_text() == "finished, never published\n", "the drive built over unsaved work"
+    assert dispatched == [], "a coder was dispatched to rebuild over work that could not be saved"
+    ((_verb, fid, reason, category),) = store.verbs("flag_blocked")
     assert fid == "bd-7" and category == "stranded-work"
-    # Actionable where the operator reads it: the path, what is in it, and what to do.
-    assert wt in reason and "README.md" in reason and "unblock" in reason
+    # Actionable where the operator reads it: the path, what is in it, why, and what to do.
+    assert wt in reason and "README.md" in reason and "saving it to a branch failed" in reason
+    assert "unblock" in reason
 
 
 async def test_a_drive_still_discards_its_own_failed_attempt(origin, monkeypatch):
     """REGRESSION GUARD, not a red test: the drive's own earlier attempt is not someone
     else's stranded work. A transient push failure after the coder wrote its files used to
     be retried on a fresh tree — `create_worktree` wiped the old one implicitly. It still
-    must be, or every retry would block the card as stranded on its own leftovers."""
+    is: no stranded/ branch for it, no comment, no block."""
     card = _card(origin)
     dispatched: list[str] = []
 
@@ -313,7 +374,7 @@ async def test_a_drive_still_discards_its_own_failed_attempt(origin, monkeypatch
 
     pushes: list[str] = []
 
-    async def _open_pr(tree, branch, **_kw):
+    async def _flaky_open_pr(tree, branch, **_kw):
         pushes.append(tree)
         if len(pushes) == 1:  # before anything was committed — the tree is still dirty
             raise worktree.WorktreeError("git push failed: Connection reset by peer")
@@ -326,24 +387,29 @@ async def test_a_drive_still_discards_its_own_failed_attempt(origin, monkeypatch
 
     monkeypatch.setattr(asyncio, "sleep", _no_backoff)
     store = _Store(card)
-    await _loop_for(monkeypatch, store, dispatch=_dispatch, open_pr=_open_pr)._drive(card)
+    await _loop_for(monkeypatch, store, dispatch=_dispatch, open_pr=_flaky_open_pr)._drive(card)
 
     assert len(dispatched) == 2 and ("open_review", "bd-7", "https://github.com/o/r/pull/1") in store.calls
-    assert not [c for c in store.calls if c[0] == "flag_blocked"]
+    assert not store.verbs("flag_blocked") and not store.verbs("comment") and origin.stranded() == []
     assert Path(dispatched[-1], "README.md").read_text() == "attempt 2\n"
 
 
-async def test_shutdown_leaves_an_interrupted_tree_that_holds_work(origin):
+async def test_shutdown_saves_an_interrupted_tree_before_it_reaps_it(origin, monkeypatch):
     """A restart mid-drive used to reap the in-flight tree — a finished implementation
-    waiting on its gate went with it. It stays now; the card's next dispatch blocks on
-    it, naming the path. A clean in-flight tree is still reaped."""
+    waiting on its gate went with it. Its work is saved first now, and the card says where;
+    the next boot rebuilds as before. A clean in-flight tree is reaped as it always was."""
     busy, busy_branch = await worktree.create_worktree(origin.clone, origin.base, "bd-7", title="x")
     rel, text = _strand(busy, "tracked")
     idle, idle_branch = await worktree.create_worktree(origin.clone, origin.base, "bd-8", title="y")
+    store = _Store({"id": "bd-7"})
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     loop = BoardLoop({"coder": "proto"})
     loop._inflight = {"bd-7": (origin.clone, busy, busy_branch), "bd-8": (origin.clone, idle, idle_branch)}
 
     await loop.stop()
 
-    assert Path(busy, rel).read_text() == text, "shutdown reaped an in-flight tree holding work"
-    assert not os.path.exists(idle)
+    saved = origin.stranded("bd-7")
+    assert len(saved) == 1, "shutdown reaped an in-flight tree holding work without saving it"
+    assert _show(origin, saved[0], rel) == text
+    assert not os.path.exists(busy) and not os.path.exists(idle) and origin.stranded("bd-8") == []
+    assert [c[1] for c in store.verbs("comment") if saved[0] in c[2]] == ["bd-7"]

@@ -245,20 +245,25 @@ class DriveMixin:
         inflight, self._inflight = dict(self._inflight), {}
         for fid, (repo, wt, branch) in inflight.items():
             try:
-                # Unless the tree holds work (#405). A restart mid-drive used to reap it,
-                # and a finished implementation waiting on its gate went with it. Kept, the
-                # next boot requeues the card and its re-dispatch blocks on the tree,
-                # naming the path — the same edge a coder that died mid-build hits.
+                # Saving whatever the tree holds first (#405). A restart mid-drive used to
+                # reap it, and a finished implementation waiting on its gate went with it.
+                # Now its work lands on a `stranded/…` branch, the card says where, and the
+                # next boot rebuilds as before. If saving fails, the tree is kept and the
+                # card's next dispatch tries again — and blocks, naming it, if it still can't.
                 stranded = await worktree.unpublished_work(wt, branch=branch or "")
                 if stranded:
-                    log.warning(
-                        "[project_board] kept in-flight worktree on shutdown: %s holds work that exists "
-                        "nowhere else (%s) — %s blocks on its next dispatch until it is recovered or discarded",
-                        wt,
-                        stranded,
-                        fid,
-                    )
-                    continue
+                    try:
+                        saved = await worktree.preserve_worktree(repo, wt, branch or "", summary=stranded)
+                    except worktree.WorktreeError as exc:
+                        log.warning(
+                            "[project_board] kept in-flight worktree on shutdown: %s holds work that exists "
+                            "nowhere else (%s) and saving it failed: %s",
+                            wt,
+                            stranded,
+                            exc,
+                        )
+                        continue
+                    await self._note_preserved(fid, repo, [saved])
                 ok = await worktree.remove_worktree(repo, wt, branch or "")
                 if ok:
                     log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
@@ -266,6 +271,18 @@ class DriveMixin:
                     log.warning("[project_board] worktree reap on shutdown failed (directory remains): %s", wt)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
+
+    async def _note_preserved(self, fid: str, repo: str, saved: list, *, base: str = "", store=None) -> None:
+        """Tell the card where its stranded work went (#405): each ``stranded/…`` branch,
+        what it holds, and how to inspect or salvage it. Best-effort — the work is already
+        safe on its branch, so a failed comment costs only the pointer, and the WARNING
+        ``worktree`` logged when it saved the tree still names the branch."""
+        note = worktree.preserved_note(repo, saved, base=base)
+        log.info("[project_board] %s %s", fid, note.splitlines()[0])
+        try:
+            await asyncio.to_thread((store or self._store()).comment, fid, note)
+        except Exception:  # noqa: BLE001 — the branch holds the work; this is only the pointer
+            log.warning("[project_board] %s: could not comment where its stranded work went", fid, exc_info=True)
 
     def _notify_operator(self, fid: str, text: str, *, incident: str = "") -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
@@ -1193,15 +1210,18 @@ class DriveMixin:
                         # from scratch (`create_worktree` used to wipe it implicitly). Anything
                         # ELSE the card holds on disk, a run left without deciding — a coder
                         # that died before promotion, a drive a restart interrupted — and it
-                        # may be the only copy of a finished implementation. Block and name it,
-                        # rather than pay for a coder run that could only build over it.
+                        # may be the only copy of a finished implementation. Save each such
+                        # tree to a `stranded/…` branch, say so on the card, and build on;
+                        # only a tree whose work could NOT be saved stops the card.
                         if wt is not None:
                             await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
                             wt = branch = None
-                        stranded = await worktree.stranded_worktrees(repo, self.root, fid)
-                        if stranded:
-                            raise worktree.StrandedWorkError(repo, stranded)
+                        saved, unsaved = await worktree.set_aside_stranded_worktrees(repo, self.root, fid)
+                        if saved:
+                            await self._note_preserved(fid, repo, saved, base=base, store=store)
+                        if unsaved:
+                            raise worktree.StrandedWorkError(repo, unsaved)
                     if reusing:
                         keep_wt = False  # consume the reuse
                         self._inflight[fid] = (repo, wt, branch)
@@ -1588,10 +1608,11 @@ class DriveMixin:
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     if isinstance(exc, worktree.StrandedWorkError):
-                        # Not a failure of this build — it never started (#405). No retry,
-                        # no tier climb, and nothing reaped: the work on disk IS the point.
-                        # The loop's own non-healing class, so the blocked sweep tells the
-                        # operator once, with the paths the reason names.
+                        # Stranded work that could not be saved to a branch (#405). Not a
+                        # failure of this build — it never started — so no retry, no tier
+                        # climb, and nothing reaped: that tree is the only copy. The loop's
+                        # own non-healing class, so the blocked sweep tells the operator once,
+                        # with the paths and the reason saving failed.
                         log.warning("[project_board] %s blocked (%s): %s", fid, STRANDED_WORK_CLASS, exc)
                         await asyncio.to_thread(store.flag_blocked, fid, str(exc), category=STRANDED_WORK_CLASS)
                         self._inflight.pop(fid, None)

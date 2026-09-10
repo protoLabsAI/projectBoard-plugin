@@ -97,10 +97,11 @@ PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 
 # The `blocked-class:` of a card the loop would not rebuild because a worktree it would
 # build over holds work that exists nowhere else (#405) — a coder that died before its
-# candidate was promoted, a drive a restart interrupted mid-gate. The loop's own class,
+# candidate was promoted — AND saving that work to a `stranded/…` branch failed. (Saved
+# work never stops a card: the tree goes and the build proceeds.) The loop's own class,
 # like `dispatch-infra`: no message `classify()` sees can produce it. Deliberately absent
-# from the loop's self-healing set: waiting never decides what the stranded work is
-# worth, so the operator is told, with the paths, and the card stays put.
+# from the loop's self-healing set: waiting never makes the save succeed, so the operator
+# is told, with the paths, and the card stays put.
 STRANDED_WORK_CLASS = "stranded-work"
 
 # Dispatch-seam / pre-first-token infrastructure signatures — a failure raised BELOW
