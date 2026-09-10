@@ -22,7 +22,10 @@ evidence, and those are what these tests drive.
 
 from __future__ import annotations
 
+import pytest
+
 from project_board import coder_seam, worktree
+from project_board.failures import is_pre_model_dispatch_failure
 
 from test_loop import FEATURE, _ladder_drive_env
 
@@ -126,3 +129,62 @@ def test_only_model_produced_signals_count_as_reaching_the_model():
         coder_seam.progress_answer("f", 1, _CHATTER)
         signal()
         assert coder_seam.dispatch_reached_model("f") is True
+
+
+# ── the other half of the guard: the MESSAGE gate (#339's latent false positive) ──────
+# With text no longer counting as evidence, more model-reachable failures reach the
+# message check with `model_reached=False` — a ledger-only round (#382) is text-only by
+# design. The check searched the WHOLE message, so a failure that PROVES the model
+# produced a diff read as pre-model infra whenever the text it quoted said "adapter",
+# "delegate" or "timeout". It now matches only seam shapes, never the quoted rest.
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "goal verification failed: no test covers the adapter timeout path (code: loop/adapter.py)",
+        "requirements unresolved: 1 item(s) still open after 2 fix round(s): delegate-timeout",
+        "coder.solve exhausted after 6 generation(s) (rung=tree): TimeoutError: adapter timed out",
+        "circuit breaker tripped: 3 candidates failed on the IDENTICAL assertion — a spec problem, "
+        "not model capability. Repeated failure: test_adapter_timeout",
+        "coder produced no commits vs base — nothing to PR",
+    ],
+)
+def test_a_model_reachable_failure_never_reads_as_pre_model_whatever_it_quotes(msg):
+    assert is_pre_model_dispatch_failure(msg, model_reached=False) is False
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # the normalised seam shapes, whatever they go on to quote
+        "coder dispatch failed: goal verification failed upstream — the adapter hung up",
+        "coder timed out after 1800.0s",
+        # an un-normalised seam error, named by its head
+        "dispatch_tapped() got an unexpected keyword argument 'tool_callback'",
+        "session refused: over the concurrent limit",
+    ],
+)
+def test_a_seam_shape_still_reads_as_pre_model(msg):
+    assert is_pre_model_dispatch_failure(msg, model_reached=False) is True
+
+
+async def test_a_goal_gap_about_an_adapter_timeout_climbs_instead_of_blocking_as_infra(monkeypatch):
+    """Drive-level. The coder's last round left only text behind (no tool call, no
+    thought), and the goal gap that exhausted the fix budget happens to be about an
+    adapter timeout. That gap is proof the model built something — a capability failure
+    that climbs — not a `dispatch-infra` block the operator has to clear by hand."""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        return "## Summary\n\nDone."  # a reply, but nothing the monitor counts as model work
+
+    async def _gap(feature, wt, base, reply=""):
+        return "no test covers the adapter timeout path (code: loop/adapter.py)"
+
+    loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
+    loop.goal_verify, loop.goal_fix_max = True, 0  # the first gap exhausts the budget
+    monkeypatch.setattr(loop, "_verify_goal", _gap)
+    await loop._drive(FEATURE)
+
+    assert store.escalated, "a goal-verify failure must climb"
+    assert all(c[3] != "dispatch-infra" for c in _blocks(store)), _blocks(store)
