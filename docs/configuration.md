@@ -215,7 +215,7 @@ named here is passed through — keep it as short as the build actually requires
 
 **`coders`** — the capability ladder, tier → delegate. A rung may hold SEVERAL
 interchangeable providers, and the board round-robins across them and fails over on a rate
-limit:
+limit or on a provider that can't serve its model:
 
 ```yaml
 coders:
@@ -225,8 +225,26 @@ coders:
 ```
 
 Climbing a rung means "a stronger model may succeed". Rotating within one means "this
-model is fine, its quota is not". A card's STARTING rung comes from its difficulty, so a
-`medium` card never touches rung 1.
+model is fine, its provider is not" — a spent quota, or a provider that refuses the model
+outright (retired, not offered on the account's plan, or needing a newer client; #420).
+Only a coder DISPATCH failure counts; the same words in a reviewer's gap or a test's output
+do not.
+
+A provider that refuses its model is remembered for 30 minutes. Later cards start on a live
+sibling instead of each paying a failed dispatch to rediscover it, and a quota failure on
+the live sibling takes its ordinary backoff rather than rotating onto it. The mark is a
+preference, not a verdict: once no live option is left — every other sibling has failed, or
+the quota backoff is spent — a marked provider still gets its one real attempt before the
+card blocks (the operator may have repointed it), and a dispatch it serves clears the mark. If every provider on the rung refused its model on this
+card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
+config problem, and a stronger rung would only hide it. If some were only rate-limited, it
+blocks as `rate_limit`, which the sweep heals on its own. Max-mode swallows each candidate's
+error, so neither rotation applies there.
+
+A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
+
+Rotation needs escalation on, and escalation needs at least two DISTINCT rungs — a map with
+a single rung (`coders: {smart: [codex, sonnet]}`) runs as a one-coder board using `coder`.
 
 **`projects`** — one board, several repos. Each entry carries that repo's own `repo`,
 `base_branch`, `local_gate_cmd` and `coders`, so a card is built and gated against the

@@ -45,6 +45,63 @@ def test_classify_categories(msg, category, retryable):
     assert p.retryable is retryable
 
 
+# The three refusals codex-acp returned on 2026-09-09/10, probed directly against the
+# provider (#420) — each is a provider that can't serve the model, not a card failure.
+_RETIRED = (
+    'coder dispatch failed: Internal error (JSON-RPC -32603): {"message": "unexpected status '
+    "404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it., url: "
+    'https://chatgpt.com/backend-api/codex/responses, cf-ray: a3898bbe7fa2ad6a-SEA"}'
+)
+_PLAN_REFUSED = (
+    'coder dispatch failed: Internal error (JSON-RPC -32603): {"type":"error","status":400,'
+    '"error":{"type":"invalid_request_error","message":"The \'gpt-5.4\' model is not supported '
+    'when using Codex with a ChatGPT account."}}'
+)
+_CLIENT_TOO_OLD = (
+    'coder dispatch failed: Internal error (JSON-RPC -32603): {"type":"error","status":400,'
+    '"error":{"type":"invalid_request_error","message":"The \'gpt-5.6-sol\' model requires a '
+    'newer version of Codex. Please upgrade to the latest app or CLI"}}'
+)
+
+
+@pytest.mark.parametrize("msg", [_RETIRED, _PLAN_REFUSED, _CLIENT_TOO_OLD])
+def test_a_provider_that_cannot_serve_its_model_is_its_own_class(msg):
+    # Before #420 all three fell through to TERMINAL, so the loop climbed the capability
+    # ladder on them. Not retryable: the same provider will refuse again.
+    p = classify(msg)
+    assert p.category == "provider_unavailable"
+    assert p.retryable is False and p.max_attempts == 1
+
+
+def test_provider_unavailable_outranks_incidental_transient_words():
+    # A dead-model refusal that happens to mention capacity or an unavailable service must
+    # not be backed off and retried against the same dead provider.
+    msg = "The model `x` does not exist or you do not have access to it (service unavailable, capacity)"
+    assert classify(msg).category == "provider_unavailable"
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # the narrow phrasings only — ordinary "does not exist" / "not supported" stay put
+        "blocked: the gate command does not exist on this repo",
+        "requirements unresolved: r2 is not supported yet",
+        "delegate 'proto' not found",
+    ],
+)
+def test_ordinary_not_found_text_is_not_provider_unavailable(msg):
+    assert classify(msg).category != "provider_unavailable"
+
+
+def test_without_the_provider_rules_text_falls_through_to_its_real_class():
+    # For text that is NOT a coder dispatch failure (a `gh` error, a reviewer's gap): the
+    # refusal phrase must not hide a transient blip that would otherwise be retried.
+    msg = "gh api failed: 502 — the model `x` does not exist or you do not have access (timeout)"
+    assert classify(msg).category == "provider_unavailable"
+    assert classify(msg, provider_rules=False).category == "transient"
+    assert classify("the model_not_found branch has no test", provider_rules=False) is TERMINAL
+
+
 def test_unknown_falls_back_to_terminal():
     p = classify("???")
     assert p is TERMINAL

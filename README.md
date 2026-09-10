@@ -49,12 +49,14 @@ board to a PR — or fork it as a starting point.
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
-- **Escalation (opt-in)** — with a `coders` map of >1 distinct delegate, a capability
+- **Escalation (opt-in)** — with a `coders` map of >1 distinct rung, a capability
   failure climbs to a stronger model. A rung may also hold SEVERAL interchangeable
   providers (`smart: [codex, sonnet]`, #362): the board round-robins across them, and on
   a rate limit it switches to the sibling immediately instead of backing off on the
-  exhausted one. Climbing a rung means "a stronger model may succeed"; rotating within one
-  means "this model is fine, its quota is not" — the two never mix.
+  exhausted one. A provider that refuses its model outright (retired, not on the plan,
+  client too old; #420) rotates the same way, and later cards start on a live sibling
+  for 30 minutes. Climbing a rung means "a stronger model may succeed"; rotating within
+  one means "this model is fine, its provider is not" — the two never mix.
 - **coder.solve() board seam (ADR 0064 P2/P3)** — on a fresh build, when the
   [`coder`](https://github.com/protoLabsAI/protoAgent/tree/main/plugins/coder) plugin
   is enabled AND the feature has acceptance criteria AND `coder_solve_test_cmd` (or

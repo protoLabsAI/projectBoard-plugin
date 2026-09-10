@@ -10287,26 +10287,41 @@ def test_a_string_rung_is_unchanged_and_a_list_rung_opts_in():
     assert loop_mod.rung_delegates("") == []
 
 
-def test_a_quota_failure_rotates_provider_and_nothing_else_does():
+def test_a_provider_failure_rotates_and_nothing_else_does():
     """The policy this feature IS, tested directly rather than by driving a whole card.
 
     A rate limit says nothing about the model's ability — only that this provider's quota
     is spent. Before #362 it consumed the transient-retry budget: sleep 60s, re-dispatch
     the SAME exhausted provider, five times, then block the card, while other declared
-    coders sat idle. 644 rate-limit lines in one agent's log.
+    coders sat idle. 644 rate-limit lines in one agent's log. A provider that can't serve
+    its model at all is the same shape one level down (#420).
 
     Every other class must keep its existing behaviour exactly — that separation is what
     makes this safe, and it is the same category error #339 fixed for infra failures."""
     pair = ["codex", "sonnet"]
-    # a quota failure with an untried sibling → rotate
-    assert loop_mod.should_rotate_provider("rate_limit", pair, 0) is True
-    # …but only while one remains: the last sibling falls through to the ordinary ladder
-    assert loop_mod.should_rotate_provider("rate_limit", pair, 1) is False
-    # a single-provider rung is unchanged — no sibling to rotate to
-    assert loop_mod.should_rotate_provider("rate_limit", ["sonnet"], 0) is False
+    for provider_failure in ("rate_limit", "provider_unavailable"):
+        # a provider failure with a sibling left → rotate to it, from either end
+        assert loop_mod.rotation_target(provider_failure, pair, 0, {"codex"}) == 1, provider_failure
+        assert loop_mod.rotation_target(provider_failure, pair, 1, {"sonnet"}) == 0, provider_failure
+        # …but only while one remains: once both failed, it falls through to the ladder
+        assert loop_mod.rotation_target(provider_failure, pair, 1, {"codex", "sonnet"}) is None, provider_failure
+        # a single-provider rung is unchanged — no sibling to rotate to
+        assert loop_mod.rotation_target(provider_failure, ["sonnet"], 0, {"sonnet"}) is None, provider_failure
     # and NOTHING else rotates: capability climbs a rung, infra backs off, terminal blocks
     for other in ("transient", "merge_conflict", "auth", "terminal", "dispatch-infra"):
-        assert loop_mod.should_rotate_provider(other, pair, 0) is False, other
+        assert loop_mod.rotation_target(other, pair, 0, {"codex"}) is None, other
+
+
+def test_a_quota_never_rotates_onto_a_provider_marked_dead_but_a_refusal_does():
+    """The two provider failures part ways at a sibling marked as refusing its model. A
+    quota rotation onto it would only be refused, and the card would block as "no live
+    provider" when the rung needed a backoff. A refusal still gives it a real attempt: the
+    operator may have repointed that delegate since the mark was set."""
+    now = 1000.0
+    loop_mod.mark_provider_down("codex", now=now)
+    pair = ["codex", "sonnet"]
+    assert loop_mod.rotation_target("rate_limit", pair, 1, {"sonnet"}, now=now) is None
+    assert loop_mod.rotation_target("provider_unavailable", pair, 1, {"sonnet"}, now=now) == 0
 
 
 async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeypatch):
@@ -10327,6 +10342,388 @@ async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeyp
     monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _dispatch)
     await loop._drive({"id": "bd-2", "title": "t", "spec": "s"})
     assert "opus" in seen, f"a capability failure must reach the stronger rung, got {seen}"
+
+
+# ── #420: a provider that can't serve its model is rotated past, and remembered ──────
+
+# What codex-acp surfaced all of 2026-09-09 (protoEngineer, bd-56dr / bd-zrfv): a 404 for
+# a model the account could no longer reach. Verbatim shape, request ids trimmed.
+_DEAD_MODEL = (
+    'coder dispatch failed: Internal error (JSON-RPC -32603): {"message": "unexpected status '
+    "404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it., "
+    'url: https://chatgpt.com/backend-api/codex/responses, cf-ray: a3898bbe7fa2ad6a-SEA"}'
+)
+_LADDER = {"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}
+
+
+def _rung_env(monkeypatch, dispatch, *, cfg, start_tier="smart", tiers=(), cursor=0):
+    """A `_drive` harness over an explicit ladder: `cfg` builds the loop (its `coders`
+    map is the ladder — the project config, not a reassigned `loop.coders`, is what the
+    drive reads), the card starts at `start_tier`, `tiers` are the climbs `escalate`
+    hands out, and the rung cursor is pinned to `cursor` — which sibling a card opens on.
+    Rotation needs escalation on, i.e. at least two distinct rungs."""
+    _unused, store = _ladder_drive_env(monkeypatch, dispatch, tiers=list(tiers))
+    loop = BoardLoop(cfg)
+    monkeypatch.setattr(store, "current_tier", lambda fid: start_tier, raising=False)
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", dispatch)
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: cursor)
+    return loop, store
+
+
+def _blocks(store):
+    return [c for c in store.calls if c[0] == "flag_blocked"]
+
+
+async def test_a_dead_provider_rotates_to_its_sibling_instead_of_climbing(monkeypatch):
+    """The #420 trace: the card opens on the dead provider. In production the ladder
+    CLIMBED on it — codex-acp's own warnings reach the live monitor as answer text, so
+    #339's pre-model guard read the refusal as model work (#422) — and the next rung
+    re-picked the same corpse. Now it moves to the sibling at the SAME rung, ladder
+    untouched."""
+    seen: list[tuple[str, int]] = []  # (coder, climbs so far) at each dispatch
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append((coder, len(store.escalated)))
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        raise worktree.NoChangesError("coder produced no commits")  # ends the drive
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER)
+    await loop._drive({"id": "bd-56dr", "title": "t", "spec": "s"})
+
+    assert seen[:2] == [("codex", 0), ("sonnet", 0)], f"expected a same-rung switch, got {seen}"
+    assert classify(_DEAD_MODEL).category == "provider_unavailable"
+
+
+async def test_a_rung_where_every_provider_refused_blocks_for_the_operator_without_climbing(monkeypatch):
+    """Every sibling refused its model on THIS card → a config problem, not a capability
+    one. It blocks under `dispatch-infra` (notify, never auto-heal) naming what to fix, and
+    does not climb: a silent jump to a pricier rung would hide the broken delegate."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError(_DEAD_MODEL)
+
+    cfg = {"coders": {"smart": ["codex", "codex-mini"], "reasoning": ["opus"]}}
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=cfg, tiers=["reasoning"])
+    await loop._drive({"id": "bd-9", "title": "t", "spec": "s"})
+
+    assert seen == ["codex", "codex-mini"]  # one real attempt per sibling, nothing more
+    assert store.escalated == []  # the ladder was never consulted
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+    reason = blocked[0][2]
+    assert reason.startswith("provider unavailable") and "(codex, codex-mini) refused its model" in reason
+    assert "does not exist or you do not have access" in reason  # the evidence rides along
+    assert loop._inflight == {}
+
+
+async def test_a_rung_where_the_others_were_only_rate_limited_blocks_as_a_rate_limit(monkeypatch):
+    """A refusal on the LAST sibling does not make the whole rung dead. Here two were only
+    out of quota, so the rung will have capacity again: block as `rate_limit` — the class
+    the sweep heals on its own — and say exactly who did what."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError(_DEAD_MODEL if coder == "c" else _SESSION_LIMIT)
+
+    cfg = {"coders": {"smart": ["a", "b", "c"], "reasoning": ["opus"]}}
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=cfg)
+    await loop._drive({"id": "bd-mix", "title": "t", "spec": "s"})
+
+    assert seen == ["a", "b", "c"]
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][3] == "rate_limit"
+    assert "a, b rate-limited" in blocked[0][2] and "c refused its model" in blocked[0][2]
+    assert store.escalated == []
+
+
+async def test_a_single_coder_board_blocks_a_dead_provider_as_infra_not_terminal(monkeypatch):
+    """No ladder at all (the default one-coder board): nothing to rotate to, so it blocks
+    — but as the actionable infra class naming the fix, not an unexplained `terminal`."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        raise worktree.WorktreeError(_DEAD_MODEL)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg={"coder": "codex"})
+    await loop._drive({"id": "bd-9", "title": "t", "spec": "s"})
+
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][3] == "dispatch-infra"
+    assert blocked[0][2].startswith("provider unavailable")
+    assert store.escalated == []
+
+
+@pytest.mark.parametrize("cursor", [0, 1])
+async def test_the_next_card_skips_a_provider_the_last_one_found_dead(monkeypatch, cursor):
+    """Rotation alone rediscovers a dead provider card by card — the rung cursor spreads
+    cards across siblings, so each one that opens on it pays a failed dispatch. The mark
+    means only the FIRST card pays, whichever sibling the next card's cursor lands on."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        raise worktree.NoChangesError("coder produced no commits")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=0)
+    await loop._drive({"id": "bd-a", "title": "t", "spec": "s"})
+    assert seen[0] == "codex" and loop_mod.provider_is_down("codex")
+
+    seen.clear()
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: cursor)
+    await loop._drive({"id": "bd-b", "title": "t", "spec": "s"})
+    assert "codex" not in seen, f"the second card re-dispatched the known-dead provider: {seen}"
+    assert seen and seen[0] == "sonnet"
+
+
+@pytest.mark.parametrize("cursor", [0, 1])
+async def test_a_quota_on_the_only_live_sibling_backs_off_before_touching_the_marked_one(monkeypatch, cursor):
+    """The two policies must not feed each other. codex is marked dead and sonnet hits its
+    quota. A quota ROTATION onto codex would re-dispatch a provider known to refuse and
+    then block the card as "no live provider" when the rung needed a backoff — the first
+    cut did exactly that for every card whose cursor opened on sonnet. So sonnet takes its
+    full backoff first, whichever sibling the card opens on; only once that is spent does
+    marked codex get its ONE real attempt (the mark may be stale) before the card blocks."""
+    loop_mod.mark_provider_down("codex")
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError(_SESSION_LIMIT)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=cursor)
+    await loop._drive({"id": "bd-q", "title": "t", "spec": "s"})
+
+    backoff = classify(_SESSION_LIMIT).max_attempts
+    assert seen == ["sonnet"] * backoff + ["codex"], seen
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][2].startswith("rate_limit:")
+
+
+async def test_a_stale_mark_is_tried_before_a_quota_blocks_the_card(monkeypatch):
+    """The other side of the same rule: codex was marked, the operator has since repointed
+    it at a live model, and sonnet is out of quota. Once sonnet's backoff is spent, codex
+    gets its real attempt — and ships — instead of the card blocking with a working
+    provider sitting untried for the rest of the mark (review of #421's rework)."""
+    loop_mod.mark_provider_down("codex")
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        if coder == "sonnet":
+            raise worktree.WorktreeError(_SESSION_LIMIT)
+        return "done"  # repaired codex serves
+
+    async def _no_commits(*_a, **_kw):
+        raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=1)
+    monkeypatch.setattr(worktree, "open_pr", _no_commits)  # end the drive after the dispatch
+    await loop._drive({"id": "bd-s", "title": "t", "spec": "s"})
+
+    assert seen[-1] == "codex" and set(seen[:-1]) == {"sonnet"}
+    assert not loop_mod.provider_is_down("codex")  # it served — the stale mark is gone
+    assert all(not c[2].startswith("rate_limit:") for c in _blocks(store))
+
+
+async def test_a_repaired_provider_is_dispatched_despite_its_mark_and_the_mark_clears(monkeypatch):
+    """A stale mark must cost a place in the queue, never an attempt. Both siblings were
+    marked when the card last blocked; the operator repoints codex without a restart and
+    unblocks. codex must be dispatched (not skipped past because it is marked), and the
+    dispatch it serves clears its mark — through the drive, not just the helper."""
+    loop_mod.mark_provider_down("codex")
+    loop_mod.mark_provider_down("codex-mini")
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        return "done"  # codex serves the dispatch
+
+    async def _no_commits(*_a, **_kw):
+        raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
+
+    cfg = {"coders": {"smart": ["codex", "codex-mini"], "reasoning": ["opus"]}}
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=cfg)
+    monkeypatch.setattr(worktree, "open_pr", _no_commits)  # end the drive after the dispatch
+    await loop._drive({"id": "bd-r", "title": "t", "spec": "s"})
+
+    assert seen[0] == "codex"
+    assert not loop_mod.provider_is_down("codex")  # served → cleared
+    assert loop_mod.provider_is_down("codex-mini")  # untouched
+
+
+async def test_refusal_words_outside_a_dispatch_failure_are_not_a_provider_failure(monkeypatch):
+    """`goal verification failed: …` carries a reviewer's gap, and a failing acceptance
+    test prints its own output — either can quote `model_not_found`. Neither says anything
+    about the provider that produced the work, so neither may mark it or block the rung."""
+    seen: list[str] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.WorktreeError("goal verification failed: no test covers the model_not_found branch")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, tiers=["reasoning"])
+    await loop._drive({"id": "bd-g", "title": "t", "spec": "s"})
+
+    assert not loop_mod.provider_is_down("codex")
+    assert "opus" in seen, f"a capability failure must still climb, got {seen}"
+    assert all(c[3] != "dispatch-infra" for c in _blocks(store))
+
+
+async def test_a_fix_round_rotated_by_a_provider_failure_keeps_its_worktree(monkeypatch):
+    """A goal-fix round re-dispatches onto the KEPT worktree, whose files hold the
+    implementation — and the feedback says so. When that dispatch hits a provider failure,
+    the sibling must continue on the same worktree; rebuilding from scratch would delete
+    the work and leave the feedback lying about it."""
+    calls: list[tuple[str, str]] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        calls.append((coder, wt))
+        if len(calls) == 1:
+            return "built it"  # codex builds; the goal check then finds a gap
+        if len(calls) == 2:
+            raise worktree.WorktreeError(_DEAD_MODEL)  # the fix round's provider refuses
+        raise worktree.NoChangesError("coder produced no commits")  # ends the drive
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER)
+    creates: list[str] = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        creates.append(fid)
+        return (f"/wt/feat-{fid}-{len(creates)}", f"feat/{fid}")
+
+    gaps = iter(["missing tests"])
+
+    async def _gap(feature, wt, base, reply=""):
+        return next(gaps, None)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(loop, "_verify_goal", _gap)
+    loop.goal_verify = True
+    await loop._drive({"id": "bd-k", "title": "t", "spec": "s"})
+
+    assert [c for c, _ in calls[:3]] == ["codex", "codex", "sonnet"]
+    assert calls[2][1] == calls[0][1], f"the sibling rebuilt instead of continuing the fix round: {calls}"
+    assert len(creates) == 1
+
+
+@pytest.mark.parametrize(
+    "cfg,rotates",
+    [({"coder": "codex"}, False), ({"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}, True)],
+    ids=["single-provider-retry", "rotate-then-retry"],
+)
+async def test_a_fix_round_keeps_its_worktree_across_a_quota_retry(monkeypatch, cfg, rotates):
+    """The rotation path kept a fix round's worktree, but the RETRY path beside it did not:
+    a fix-round dispatch that hit a quota, backed off and re-dispatched rebuilt from scratch
+    over the implementation, with feedback still saying "your work is ALREADY in this
+    worktree" (review of #421's rework — on a single-provider rung this predates #420)."""
+    calls: list[tuple[str, str]] = []
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        calls.append((coder, wt))
+        if len(calls) == 1:
+            return "built it"  # the build; the goal check then finds a gap
+        if len(calls) <= (3 if rotates else 2):
+            raise worktree.WorktreeError(_SESSION_LIMIT)  # the fix round is rate-limited
+        raise worktree.NoChangesError("coder produced no commits")  # ends the drive
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=cfg)
+    creates: list[str] = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        creates.append(fid)
+        return (f"/wt/feat-{fid}-{len(creates)}", f"feat/{fid}")
+
+    gaps = iter(["missing tests"])
+
+    async def _gap(feature, wt, base, reply=""):
+        return next(gaps, None)
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(loop, "_verify_goal", _gap)
+    loop.goal_verify = True
+    await loop._drive({"id": "bd-k", "title": "t", "spec": "s"})
+
+    assert len(creates) == 1, f"a quota retry rebuilt the fix round's worktree: {calls}"
+    assert {w for _, w in calls} == {calls[0][1]}
+
+
+async def test_a_refusal_phrase_in_a_goal_gap_blocks_under_its_real_class(monkeypatch):
+    """The downgrade has to reach the LABEL, not just the reason prefix: the store used to
+    re-classify the reason text, reading `model_not_found` in a reviewer's gap straight back
+    into `blocked-class:provider-unavailable` (review of #421's rework)."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        raise worktree.WorktreeError("goal verification failed: no test covers the model_not_found branch")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER)  # no climbs left → it blocks
+    await loop._drive({"id": "bd-t", "title": "t", "spec": "s"})
+
+    blocked = _blocks(store)
+    assert len(blocked) == 1 and blocked[0][3] == "terminal", blocked
+
+
+async def test_the_coder_solve_path_rotates_a_refusal_without_climbing(monkeypatch):
+    """#420's production failure came through coder.solve ("coder.solve raised mid-ladder",
+    bd-56dr): solve() re-raises the dispatch's own error, so the same rotation must apply."""
+    seen: list[str] = []
+
+    async def _never(*_a, **_kw):
+        raise AssertionError("the plain dispatch must not run on the solve path")
+
+    async def _solve_dispatch(*, coder, fid, **_kw):
+        seen.append(coder)
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        return (f"/wt/feat-{fid}", f"feat/{fid}", "solved")
+
+    async def _pr(*_a, **_kw):
+        return "https://example/pr/1"
+
+    loop, store = _rung_env(monkeypatch, _never, cfg=_LADDER, tiers=["reasoning"])
+    monkeypatch.setattr(loop, "_use_coder_solve", lambda feature: True)
+    monkeypatch.setattr(coder_seam, "dispatch", _solve_dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _pr)
+    await loop._drive({"id": "bd-56dr", "title": "t", "spec": "s"})
+
+    assert seen == ["codex", "sonnet"] and store.escalated == []
+    assert any(c[0] == "open_review" for c in store.calls)
+
+
+def test_a_down_mark_only_ever_reorders_the_rung():
+    """A mark is a preference, not a verdict: it moves a pick from a marked sibling to an
+    unmarked one, and never from one marked sibling to another — so a stale mark costs a
+    place in the queue, never an attempt."""
+    now = 1000.0
+    loop_mod.mark_provider_down("codex", now=now)
+    pair = ["codex", "sonnet"]
+    # the dead one yields to its live sibling
+    assert loop_mod.prefer_live_sibling(pair, 0, set(), now=now) == 1
+    # a healthy pick is left alone
+    assert loop_mod.prefer_live_sibling(pair, 1, set(), now=now) == 1
+    # a live sibling that already failed this card is not an alternative
+    assert loop_mod.prefer_live_sibling(pair, 0, {"sonnet"}, now=now) == 0
+    # every sibling marked → stay put: the marked one still gets its real attempt
+    loop_mod.mark_provider_down("sonnet", now=now)
+    assert loop_mod.prefer_live_sibling(pair, 0, set(), now=now) == 0
+    # a lone provider is never moved — there is nothing to move to
+    assert loop_mod.prefer_live_sibling(["codex"], 0, set(), now=now) == 0
+
+
+def test_a_down_mark_lapses_and_a_served_dispatch_clears_it():
+    """Not forever: the operator can repoint a delegate at a live model without a restart,
+    and the 2026-09-09 "retired" model answered one probe in six the next day."""
+    loop_mod.mark_provider_down("codex", now=0.0)
+    assert loop_mod.provider_is_down("codex", now=loop_mod._PROVIDER_DOWN_TTL_S - 1)
+    assert not loop_mod.provider_is_down("codex", now=loop_mod._PROVIDER_DOWN_TTL_S)
+    loop_mod.mark_provider_down("codex")
+    loop_mod.clear_provider_down("codex")
+    assert not loop_mod.provider_is_down("codex")
 
 
 # ── #381: a blocking finding must quote the diff it claims to have read ───────

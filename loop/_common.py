@@ -826,20 +826,122 @@ def _next_rung_cursor() -> int:
     return next(_RUNG_CURSOR)
 
 
-def should_rotate_provider(category: str, siblings: list[str], tried: int) -> bool:
-    """Should this failure move to the NEXT provider at the same rung, rather than
-    sleeping to retry the same one (#362)?
+# The failure classes that say "this PROVIDER can't serve the rung right now" rather
+# than anything about the model's ability or the card — the two cases rotation exists
+# for. A quota is spent (#362); a provider that can't serve its model at all — retired,
+# refused for the account, client too old — is the same shape one level down (#420).
+# Only ever honoured for a DISPATCH failure: the same words quoted in a reviewer's gap or
+# a failing test's output say nothing about the provider that produced them.
+_ROTATABLE_CATEGORIES = frozenset({"rate_limit", "provider_unavailable"})
 
-    Only for a QUOTA failure, and only while an untried sibling remains. A rate limit
-    says nothing about the model's ability — only that this provider is spent — so it
-    must not consume the transient-retry budget (60s × 5, all on the exhausted provider)
-    nor the capability ladder. Every other class keeps the existing behaviour exactly:
-    transient infra backs off, capability climbs a rung, terminal blocks.
 
-    Kept pure and separate from the drive loop so the POLICY is testable on its own —
-    the decision is the whole feature, and it was previously buried in a 565-line
-    function where the only way to exercise it was to drive an entire card."""
-    return category == "rate_limit" and len(siblings) > 1 and tried < len(siblings) - 1
+# ── #420: remember a provider that can't serve its model ────────────────────────────
+# Rotation alone rediscovers a dead provider card by card: the rung cursor spreads cards
+# across a rung's siblings, so every card that happens to open on it pays one failed
+# dispatch before rotating. A retired model is not coming back in a minute, so the loop
+# marks it and later picks prefer its siblings — for a while, not forever, because the
+# operator can repoint a delegate at a live model without a restart
+# (`PUT /api/delegates/{name}`), and the 2026-09-09 "retired" model answered one probe in
+# six the next day.
+#
+# Per-process and in memory, like the rung cursor: a restart forgetting the marks costs
+# one failed dispatch per dead provider. Keyed by delegate NAME, which is what a rung
+# lists. A mark is a PREFERENCE, never a verdict: it reorders which sibling goes first and
+# keeps a quota rotation off a provider that would refuse anyway, but nothing is ever
+# skipped on a mark alone when skipping would leave the rung without a real attempt, and
+# no card blocks because of one.
+_PROVIDER_DOWN_TTL_S = 30 * 60.0
+_PROVIDER_DOWN: dict[str, float] = {}  # delegate name → monotonic time the mark lapses
+
+
+def mark_provider_down(name: str, *, now: float | None = None) -> None:
+    """Record that ``name`` just refused to serve its model (#420)."""
+    if name:
+        _PROVIDER_DOWN[name] = (time.monotonic() if now is None else now) + _PROVIDER_DOWN_TTL_S
+
+
+def clear_provider_down(name: str) -> None:
+    """``name`` just served a dispatch — whatever marked it down no longer holds."""
+    _PROVIDER_DOWN.pop(name, None)
+
+
+def provider_is_down(name: str, *, now: float | None = None) -> bool:
+    """Is ``name`` inside an unexpired down mark? A lapsed mark is dropped on read."""
+    until = _PROVIDER_DOWN.get(name)
+    if until is None:
+        return False
+    if (time.monotonic() if now is None else now) >= until:
+        _PROVIDER_DOWN.pop(name, None)
+        return False
+    return True
+
+
+def rotation_target(
+    category: str,
+    siblings: list[str],
+    current: int,
+    spent: set[str],
+    *,
+    now: float | None = None,
+    ignore_marks: bool = False,
+) -> int | None:
+    """Which sibling at this rung a PROVIDER failure should move to — or ``None`` to stay
+    (#362, #420). The next sibling after ``current``, in rung order, that has not already
+    failed for this card at this rung (``spent``, by name).
+
+    Rotating within a rung means "this model is fine, its provider is not", so only a
+    provider failure rotates: a spent quota must not burn the transient-retry budget on
+    the exhausted provider (60s × 5), and a refused model must not burn the capability
+    ladder (a stronger model won't bring it back, and when the dead provider is listed at
+    every rung, climbing doesn't escape it). Everything else returns ``None`` and keeps its
+    existing behaviour: transient infra backs off, capability climbs, terminal blocks.
+
+    The two provider failures treat a sibling MARKED as unable to serve its model
+    differently, and deliberately:
+
+    * a QUOTA failure never rotates onto one. It would refuse, and the card would block as
+      "no live provider" when all the rung needed was a backoff on the sibling that is
+      merely rate-limited — so it stays, and takes that backoff;
+    * a REFUSAL does. The mark is evidence, not a verdict: a delegate the operator has
+      since repointed at a live model must get its real attempt before the card blocks.
+
+    ``ignore_marks`` is the quota path's LAST resort: once its backoff on the live sibling
+    is spent, a marked sibling gets that real attempt too, rather than the card blocking
+    while a possibly-repaired provider sits untried.
+
+    Kept pure and separate from the drive loop so the POLICY is testable on its own — the
+    decision is the whole feature, and it was previously buried in a 565-line function
+    where the only way to exercise it was to drive an entire card."""
+    if category not in _ROTATABLE_CATEGORIES or len(siblings) < 2:
+        return None
+    n = len(siblings)
+    for step in range(1, n):
+        i = (current + step) % n
+        if siblings[i] in spent:
+            continue
+        if category == "rate_limit" and not ignore_marks and provider_is_down(siblings[i], now=now):
+            continue
+        return i
+    return None
+
+
+def prefer_live_sibling(siblings: list[str], current: int, spent: set[str], *, now: float | None = None) -> int:
+    """Where a dispatch at this rung should start: ``current``, unless that sibling is
+    marked down (#420) and one that is NOT marked — and has not already failed for this
+    card — exists, in which case the first such one after it.
+
+    It only ever moves from a marked sibling to an unmarked one. Between two marked
+    siblings it stays put, so a stale mark costs a place in the queue and never an attempt:
+    after an operator repoints a delegate and unblocks the card, the repaired provider is
+    dispatched, not skipped past."""
+    n = len(siblings)
+    if n < 2 or not provider_is_down(siblings[current % n], now=now):
+        return current
+    for step in range(1, n):
+        i = (current + step) % n
+        if siblings[i] not in spent and not provider_is_down(siblings[i], now=now):
+            return i
+    return current
 
 
 def rung_delegates(value) -> list[str]:
@@ -849,7 +951,8 @@ def rung_delegates(value) -> list[str]:
     PROVIDERS of that capability — that distinction is the whole point (#362):
 
     * climbing a rung means "a stronger model may succeed where a weaker one failed";
-    * rotating within a rung means "this model is fine, its QUOTA is not".
+    * rotating within a rung means "this model is fine, its PROVIDER is not" — a spent
+      quota (#362), or a provider that can't serve its model at all (#420).
 
     A rate limit is not a capability signal, and before this it consumed the capability
     ladder's budget as though it were — the same category error #339 fixed for infra
@@ -1157,8 +1260,15 @@ __all__ = [
     "partition_by_grounding",
     "_LEDGER_ONLY_MAX",
     "rung_delegates",
-    "should_rotate_provider",
+    "rotation_target",
+    "prefer_live_sibling",
+    "_ROTATABLE_CATEGORIES",
     "_next_rung_cursor",
+    "_PROVIDER_DOWN_TTL_S",
+    "_PROVIDER_DOWN",
+    "mark_provider_down",
+    "clear_provider_down",
+    "provider_is_down",
     "asyncio",
     "Path",
     "hashlib",
