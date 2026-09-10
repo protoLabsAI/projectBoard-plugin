@@ -217,7 +217,8 @@ function taskRequirements(f){
     const chip = closed ? (st === "done" ? " pl-badge--success" : "") : " pl-badge--warning";
     rows += '<li'+(closed ? '' : ' class="treq--open"')+'><span class="pl-badge'+chip+'">'+esc(st)+'</span>'
       + '<span class="id">'+esc(String(r.id || ""))+'</span> '+esc(String(r.text || ""))
-      + (r.decline_reason ? ' <span class="why">— '+esc(String(r.decline_reason))+'</span>' : '')+'</li>';
+      + (r.decline_reason ? ' <span class="why">— '+esc(String(r.decline_reason))+'</span>' : '')
+      + (r.reopened_from ? ' <span class="why">— reopened by a rejection (was '+esc(String(r.reopened_from))+')</span>' : '')+'</li>';
   }
   return '<div class="tdlbl">requirements'+(open ? ' — '+open+' open' : '')+'</div><ul class="treq">'+rows+'</ul>';
 }

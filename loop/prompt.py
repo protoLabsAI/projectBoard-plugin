@@ -25,6 +25,7 @@ def _ledger_lines(reqs) -> str:
     return "\n".join(
         f"- `{r.get('id')}` [{r.get('status', 'open')}] {r.get('text', '')}"
         + (f" (reason: {r['decline_reason']})" if r.get("decline_reason") else "")
+        + (f" (reopened by the rejection — was {r['reopened_from']})" if r.get("reopened_from") else "")
         for r in reqs
     )
 
@@ -39,10 +40,23 @@ class PromptMixin:
         With a requirement ledger (#399) it also asks for the SAME ``## Requirements``
         disposition section a coder writes, so ``record_delivery`` can close the items
         the deliverable addressed. Unlike the coder path nothing gates on it: an item left
-        unreported stays open, and the verifier is told so."""
+        unreported stays open, and the verifier is told so.
+
+        A task sent back from review is re-dispatched LEADING with why (#432 review) — the
+        projected ``rejection_feedback`` (a verifier's rejection, or a requeue's findings),
+        the adverse-review shape the coder prompt already uses. Without it the next round
+        got the same spec and nothing else, and could only repeat the rejected work."""
         title = feature.get("title", "")
         spec = feature.get("spec", "")
         criteria = feature.get("acceptance_criteria", "")
+        rejected = str(feature.get("rejection_feedback") or "").strip()
+        rejected_block = (
+            "## ⚠ Your previous delivery was REJECTED — address this in the new one\n"
+            f"{rejected}\n\n"
+            "Deliver the complete, corrected deliverable — not a note about what changed.\n\n"
+            if rejected
+            else ""
+        )
         criteria_block = f"\n## Acceptance criteria (definition of done)\n{criteria}\n" if criteria.strip() else ""
         reqs = feature.get("requirements") or []
         req_block = (
@@ -62,6 +76,7 @@ class PromptMixin:
             f"produced. There is no code change, worktree, or PR: your reply IS the "
             f"deliverable, so make it self-contained.\n\n"
             f"# {title}\n\n"
+            f"{rejected_block}"
             f"## Task\n{spec}\n"
             f"{criteria_block}"
             f"{req_block}"

@@ -49,6 +49,15 @@ def test_open_items_are_visually_distinct_and_every_field_is_escaped():
         assert field in reqs, field
 
 
+def test_an_item_a_rejection_reopened_says_what_it_had_claimed():
+    """A rejection reopens the items the refused round closed (#432 review), each keeping a
+    `reopened_from` trace; the drawer shows it, so the verifier of the NEXT round can see
+    the item was once claimed and refused — esc()'d like every other field."""
+    reqs = _fn("taskRequirements")
+    assert "r.reopened_from ?" in reqs
+    assert "— reopened by a rejection (was '+esc(String(r.reopened_from))+')" in reqs
+
+
 def test_approve_reads_the_verify_note_and_keeps_it_on_screen():
     """Approve used to discard the verify response. It now keeps the open-requirements
     `note`, and the drawer shows it in the page's existing notice idiom (a `pl-callout`,

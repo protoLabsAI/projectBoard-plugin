@@ -840,10 +840,13 @@ def _board_tools(cfg: dict):
         A DIFFERENT deliverable for a task already in review is refused (the recorded one
         stands) — to replace it, board_verify(approved=false) first, then deliver again.
         If the task has a requirement ledger, END `text` with a `## Requirements` section —
-        one `- <id>: done` or `- <id>: declined — <reason>` line per item — and those items
-        close on the ledger; unreported ones stay open for the verifier to see (never a
-        refusal). `text`/`ref` are stripped of any literal wrapping double quotes first
-        (same hygiene as board_create_feature)."""
+        one `- <id>: done` or `- <id>: declined — <reason>` line per item, exactly that
+        (a hedge like `done?` or a reasonless decline closes nothing, and rows inside a
+        code fence are ignored) — and those items close on the ledger; unreported ones stay
+        open for the verifier to see (never a refusal). While the task awaits its verdict,
+        the rows of a refused or repeated delivery still land. An EMPTY delivery (no text,
+        no ref) is refused. `text`/`ref` are stripped of any literal wrapping double quotes
+        first (same hygiene as board_create_feature)."""
         try:
             text = _strip_wrapping_quotes(text)
             ref = _strip_wrapping_quotes(ref)
@@ -858,8 +861,9 @@ def _board_tools(cfg: dict):
         verify sibling. `approved=true` CLOSES the task `done` with an auditable
         `verified: <by>` reason (a task has no PR to merge, so a verifier's approval is
         what closes it). `approved=false` records `feedback` as a comment (the next dispatch
-        prompt leads with it, the adverse-review shape) and requeues the bead to `ready` for
-        another pass.
+        prompt leads with it, the adverse-review shape), reopens the requirement items the
+        rejected round closed (each keeps what it had claimed as `reopened_from`), and
+        requeues the bead to `ready` for another pass.
 
         `by` names the verifier written into that `verified: <by>` reason (#316), forwarded
         UNCHANGED. SELF-APPROVAL is NOT blocked: when the verifier matches the task's

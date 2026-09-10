@@ -25,7 +25,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `GET` | `/status` | Is this board BOUND yet? A pure config read — no `br` calls — so it answers even when the store can't, which is exactly when the view needs it. The shipped default (`repo: "."`, no db_path, no project… |
 | `POST` | `/epics` | — |
 | `POST` | `/milestones` | — |
-| `GET` | `/features` | The board listing (`?state=`, `?project=`, `?include_archived=`). A task row carries a small delivery signal — `delivered`, `deliverable_chars`, `delivered_by`, a ≤280-char `deliverable_preview` — never the full deliverable (#399). |
+| `GET` | `/features` | The board listing (`?state=`, `?project=`, `?include_archived=`). A task row carries a small delivery signal — `delivered` (the current round: in review or done), `deliverable_chars`, `delivered_by`, a ≤280-char `deliverable_preview`, and `last_deliverable_preview` for a task sent back from review — never the full deliverable (#399). |
 | `GET` | `/features/{fid}` | One card's full projection, including a task's whole `deliverable` and its `requirements` ledger. |
 | `GET` | `/features/{fid}/progress` | Live coder-monitoring snapshot (#84) for the board view's monitor drawer. |
 | `PATCH` | `/features/{fid}` | In-place spec edit — the REST complement of `board_update_feature`. Accepts `title`, `spec`, `acceptance_criteria`, `design`, `files_to_modify`, `difficulty`, `source_issue`; only non-null fields are… |

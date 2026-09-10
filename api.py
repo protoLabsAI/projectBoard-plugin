@@ -736,7 +736,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         pr_url would strand the merge reconciler) or one not in_progress. A repeat of the
         delivery an in_review task already carries returns it unchanged; a DIFFERENT one
         for an in_review task 400s without writing (#403). A ``## Requirements`` section
-        in ``text`` closes the ledger items it disposes of (best-effort, #399)."""
+        in ``text`` closes the ledger items it disposes of (best-effort, #399). An empty
+        delivery — no text, no ref — 400s."""
         body = body or {}
         return await _guard(
             lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))

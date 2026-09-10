@@ -168,10 +168,10 @@ STORE_SEAMS: dict[str, str] = {
     "record_merged_verified": "REAL",
     "record_reviewed_head": "UNCOVERED",
     "request_decomposition": "REAL",
-    "record_verification": "UNCOVERED",
+    "record_verification": "REAL",
     "record_verified_candidate": "REAL",
     "remove_dependency": "UNCOVERED",
-    "requeue": "UNCOVERED",
+    "requeue": "REAL",
     "set_requirements": "UNCOVERED",
     "set_review_substate": "REAL",
     "update_feature": "REAL",
@@ -184,7 +184,7 @@ STORE_SEAMS: dict[str, str] = {
 # seam is now REAL or an honestly-recorded EXEMPT, so the worktree UNCOVERED floor is 0 and a
 # newly-added UNCOVERED worktree seam fails this file outright.
 MAX_UNCOVERED_WORKTREE = 0
-MAX_UNCOVERED_STORE = 20
+MAX_UNCOVERED_STORE = 18
 
 # The EXEMPT ratchet. An EXEMPT drops a seam from MAX_UNCOVERED_WORKTREE, so EXEMPT must itself be
 # bounded or the label would let real debt vanish (the review finding on the UNCOVERED → EXEMPT
