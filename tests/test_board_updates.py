@@ -533,3 +533,49 @@ def test_record_merge_clears_blocked_and_drops_open_edges_before_close(make_boar
     assert br.calls.index(("update", "bd-blk", "--remove-label", "blocked")) < br.calls.index(
         ("close", "bd-blk", "-r", "merged: https://example/pr/9")
     )
+
+
+# --- #414: a block a reader can act on --------------------------------------------------
+
+
+def test_a_terminal_block_needs_a_reason(make_board, monkeypatch):
+    """Terminal means the sweep never auto-clears it, so the card is human-only
+    recoverable — and with no reason there is nothing to check, nothing to disprove, and
+    no coder can clear it. Observed live: three cards parked terminal with an empty
+    reason, one for work that had already shipped, and the same work was re-implemented
+    from scratch because the card's own explanation was unreachable."""
+    br = _StatefulBr({})
+    board = make_board(br)
+    monkeypatch.setattr(board, "_require", lambda fid: {"id": fid, "labels": [], "issue_type": "feature"})
+
+    with pytest.raises(BoardError, match="terminal block needs a reason"):
+        board.flag_blocked("bd-x", "", category="terminal")
+
+    # Nothing was written — the card is not left half-blocked by the refusal.
+    assert not [c for c in br.calls if c[0] == "update"]
+
+
+def test_a_transient_block_stays_lenient_without_a_reason(make_board, monkeypatch):
+    """Deliberately asymmetric: the sweep clears a transient block on its own, so a
+    missing reason costs a retry rather than a permanent park."""
+    br = _StatefulBr({})
+    board = make_board(br)
+    monkeypatch.setattr(board, "_require", lambda fid: {"id": fid, "labels": [], "issue_type": "feature"})
+    monkeypatch.setattr(board, "get_feature", lambda fid: {"id": fid})
+
+    board.flag_blocked("bd-x", "", category="transient")
+
+    assert [c for c in br.calls if c[0] == "update"]
+
+
+def test_a_terminal_block_with_a_reason_is_recorded(make_board, monkeypatch):
+    br = _StatefulBr({})
+    board = make_board(br)
+    monkeypatch.setattr(board, "_require", lambda fid: {"id": fid, "labels": [], "issue_type": "feature"})
+    monkeypatch.setattr(board, "get_feature", lambda fid: {"id": fid})
+    said = []
+    monkeypatch.setattr(board, "comment", lambda fid, txt: said.append(txt))
+
+    board.flag_blocked("bd-x", "the gate command does not exist on this repo", category="terminal")
+
+    assert said == ["blocked: the gate command does not exist on this repo"]

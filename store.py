@@ -2344,6 +2344,21 @@ class BeadsBoard:
             args += ["--assignee", ""]
         cls = str(category or "").strip() or classify(reason).category
         cls = cls.lower().replace("_", "-")
+        # A TERMINAL block must say why (#414). Terminal means the sweep will never
+        # auto-clear it, so the card is human-only recoverable — and with no reason there
+        # is nothing to check, nothing to disprove, and no coder can clear it. Observed
+        # live: three cards sat terminal with an empty reason, one of them for work that
+        # had already shipped, and the same work was re-implemented from scratch because
+        # the card's own explanation was unreachable.
+        #
+        # A TRANSIENT block stays lenient on purpose: the sweep clears it on its own, so a
+        # missing reason costs a retry rather than a permanent park.
+        if cls == "terminal" and not str(reason or "").strip():
+            raise BoardError(
+                f"{fid}: a terminal block needs a reason — it is never auto-cleared, so "
+                "without one no coder can act on it and the card parks forever. Pass a "
+                "reason, or block it as transient if the sweep should retry."
+            )
         want = f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}" if cls else ""
         for prior in f.get("labels") or []:  # replace, never accumulate (the `gens:` pattern)
             # ONLY a prior class that differs. `br` applies --remove-label AFTER
@@ -2673,10 +2688,10 @@ class BeadsBoard:
                 "truncated, so the board projection would be incomplete (#114/#138). Check the "
                 "installed beads version's `--limit 0` semantics before trusting the board."
             )
-        # `br list` omits the `dependencies` array; `br show` carries it. Batch all IDs
-        # into ONE call so `_project` sees real edges — avoids N+1 subprocess spawns on
-        # this continuously-polled endpoint (#144). Guard the empty-rows case: `br show`
-        # with no arguments is an error.
+        # `br list` omits the `dependencies` array AND the `comments` thread; `br show`
+        # carries both. Batch all IDs into ONE call so `_project` sees real edges — avoids
+        # N+1 subprocess spawns on this continuously-polled endpoint (#144). Guard the
+        # empty-rows case: `br show` with no arguments is an error.
         if rows:
             ids = [r["id"] for r in rows if r.get("id")]
             if ids:
@@ -2688,6 +2703,20 @@ class BeadsBoard:
                     rid = r.get("id")
                     if rid and rid in show_by_id and "dependencies" not in r:
                         r["dependencies"] = show_by_id[rid].get("dependencies")
+                    # Carry the comment thread across for BLOCKED rows (#414). `_project`
+                    # reads `blocked_reason` out of the latest `blocked:` comment, but
+                    # `br list` omits comments — so the listing every operator and the
+                    # loop reads reported an EMPTY reason for every blocked card while the
+                    # reason itself sat one `br show` away. A terminal block with no
+                    # visible reason is unfixable by design: there is no claim to check,
+                    # so no coder can clear it and the card parks forever.
+                    #
+                    # Only blocked rows, and only from the batch already fetched: this is
+                    # a poll-rate endpoint, and the comment thread is the largest field on
+                    # a bead. Copying it for all 35 cards to serve the 3 that need it
+                    # would trade a real regression for a cosmetic one.
+                    if rid and rid in show_by_id and LABEL_BLOCKED in (r.get("labels") or []):
+                        r["comments"] = show_by_id[rid].get("comments")
         out = [self._project(r) for r in rows]
         if not include_archived:
             out = [f for f in out if not f["archived"]]

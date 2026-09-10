@@ -5171,3 +5171,59 @@ def test_an_unpinned_clean_verdict_is_grandfathered_not_stranded():
     it was yesterday; the exposure drains as cards cycle."""
     f = {"id": "bd-1", "board_state": "in_review", "labels": ["in-review", "review-clean"]}
     assert store.merge_posture(f, auto_merge=True, review_gate=True, head_sha="anything")["blockers"] == []
+
+
+def test_list_features_surfaces_the_blocked_reason(make_board):
+    """A blocked card's `blocked_reason` must reach the LISTING, not just a per-card read.
+
+    `_project` parses the reason out of the latest `blocked:` comment, but `br list` omits
+    comments — so `GET /features`, the projection every operator and the loop actually
+    reads, reported an EMPTY reason for every blocked card while the reason itself sat one
+    `br show` away (#414). A terminal block with no visible reason is unfixable by design:
+    there is no claim to check, so no coder can clear it and the card parks forever.
+    """
+    beads = [
+        {"id": "bd-blocked", "status": "open", "labels": ["blocked", "blocked-class:terminal"]},
+        {"id": "bd-fine", "status": "open", "labels": []},
+    ]
+    show_beads = [
+        {
+            "id": "bd-blocked",
+            "status": "open",
+            "labels": ["blocked", "blocked-class:terminal"],
+            "comments": [{"text": "blocked: the gate command does not exist on this repo"}],
+        },
+        {"id": "bd-fine", "status": "open", "labels": [], "comments": []},
+    ]
+    br = Br({"list": beads, "ready": [], "show": show_beads})
+    b = make_board(br)
+    features = b.list_features()
+
+    blocked = next(f for f in features if f["id"] == "bd-blocked")
+    assert blocked["blocked_reason"] == "the gate command does not exist on this repo"
+    assert blocked["blocked_class"] == "terminal"
+
+
+def test_list_features_carries_comments_only_for_blocked_rows(make_board):
+    """Scoped on purpose. This is a poll-rate endpoint and the comment thread is the
+    largest field on a bead, so copying it for every card to serve the few that are
+    blocked would trade a real regression for a cosmetic one — and it still costs no
+    extra subprocess, because the batch `br show` was already being made for
+    `dependencies`."""
+    beads = [
+        {"id": "bd-blocked", "status": "open", "labels": ["blocked"]},
+        {"id": "bd-fine", "status": "open", "labels": []},
+    ]
+    show_beads = [
+        {"id": "bd-blocked", "status": "open", "labels": ["blocked"], "comments": [{"text": "blocked: why"}]},
+        {"id": "bd-fine", "status": "open", "labels": [], "comments": [{"text": "attempt 1: something"}]},
+    ]
+    br = Br({"list": beads, "ready": [], "show": show_beads})
+    b = make_board(br)
+    b.list_features()
+
+    # Still exactly ONE show call — the fix rides the batch that already existed.
+    assert len(br.cmds("show")) == 1
+    # The unblocked row was not given a comment thread it does not need.
+    assert beads[1].get("comments") is None
+    assert beads[0].get("comments") is not None
