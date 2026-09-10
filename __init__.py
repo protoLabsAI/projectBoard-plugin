@@ -839,10 +839,15 @@ def _board_tools(cfg: dict):
         in the card's project repo (not a fork), on the card's own branch (`feat/<id>-<slug>`,
         the branch every fix round resumes), and targeting the project's base. The card must be
         a coding feature that is ready, in_progress or blocked, with no PR of its own in review,
-        no open dependency, and no live coder drive. A card whose earlier PR was CLOSED may take
-        the new one in its place. A MERGED PR is refused: record shipped work with
-        board_mark_done. Re-attaching the card's own PR is a no-op. `reason` is recorded in the
-        audit comment on the card."""
+        no open dependency, and no live coder drive. It must have passed the Ready gate (a
+        blocked backlog card has not). A card whose earlier PR was CLOSED may take the new one in
+        its place. A MERGED PR is refused: record shipped work with board_mark_done. Re-attaching
+        the card's own PR is a no-op in review and refused anywhere else: a blocked card stays
+        blocked until board_unblock_feature. A draft attaches, and auto-merge holds it until it is
+        marked ready. The attached code has NOT been through the board's pre-PR checks (fixups,
+        local gate, acceptance tests); CI and the review gate still apply. `reason` is recorded in
+        the audit comment on the card; if that comment fails, the attach stands and the result
+        carries a `warning`."""
         # Lazy imports: the loop imports from here, so a top-level import would cycle.
         from .api import base_branch_for_feature, repo_for_feature
         from .loop import attach_external_pr

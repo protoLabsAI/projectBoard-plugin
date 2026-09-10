@@ -263,22 +263,51 @@ than recovery.
 | on the card's own branch, `feat/<id>-<slug>` | every later edge keys on it: CI and review fix rounds resume `origin/<that branch>`, and so do recovery and the reap. A PR on any other branch would be abandoned by the first fix round, which opens a second PR |
 | targeting the project's base branch | the rebase and merge edges work against that base |
 
-The card must be a coding feature that is `ready`, `in_progress` or `blocked`, with no PR of
-its own in review and no open dependency. The board tracks one PR per card. A card whose
-earlier PR was closed (rejected, then reworked on the same branch) can take the new PR in
-its place. An earlier PR that is still open, or already merged, is refused. The loop must not
-be working the card: no live drive, no claimed build, no review gate running. Every refusal
-changes nothing and says what to do instead.
+A draft is fine. It attaches like any other PR, and the auto-merge edge holds it until it is
+marked ready.
 
-The write is one `br update` under the loop's claim lock, so a `ready` card cannot be claimed
-halfway through. It leaves the card where `open_review` would: `in_review` with the PR on
-`external_ref`. It drops `ready`, the `blocked` flag and its class, and any review verdict
-or head pin left from an earlier head. When `review_gate` is on it sets `review-pending`, so
-the gate reviews the attached head instead of the merge edge waiting forever for a verdict.
-From there the ordinary reconcile drives the card: CI, review, rebase, then merge → `done`.
-The attach is an `attached PR:` comment on the card, naming who attached it, the state it
-left, and why. Fix budgets the card already spent are not reset. A card whose automated fix
-rounds are exhausted still stops at the next failure, for a human.
+The card must be a coding **feature** (not a task, epic or milestone) that has passed the
+Ready gate. That is judged on its lane *underneath* any block: `ready` or `in_progress`,
+blocked or not. A backlog card that was merely blocked has not passed the gate. The card must
+have no open dependency, and the loop must not be working it: no live drive, no claimed
+build, no review gate running.
+
+The board tracks one PR per card:
+- A card already in review on *this* PR is a no-op.
+- A card that tracks this PR anywhere else is refused.
+  - A **blocked** card could be blocked by the review gate asking for a human, and
+    re-attaching would lift the block and re-arm the gate without one. Unblocking is a
+    deliberate `board_unblock_feature`.
+  - A card in a fix round is already being driven back to review.
+- A card whose earlier PR was **closed** (rejected, then reworked on the same branch) can take
+  the new PR in its place. An earlier PR that is still open or already merged is refused.
+
+Every refusal changes nothing and says what to do instead.
+
+**The write.** It is one `br update` under the loop's claim lock, so a `ready` card cannot be
+claimed halfway through.
+- It leaves the card where `open_review` would: `in_review` with the PR on `external_ref`.
+- It drops `ready`, the `blocked` flag and its class, and every verdict pinned to an earlier
+  head: the review verdict and its sha pin, the reviewed-head stamp, and the
+  `merged-verified` stamp. The board has never gated or reviewed the attached head, and no
+  stamp may say otherwise.
+- When `review_gate` is on it sets `review-pending`, so the gate reviews the attached head
+  instead of the merge edge waiting forever for a verdict.
+- The health sweep's own moves take the same lock and re-read the card first. A sweep that
+  read the card before the attach can't requeue it afterwards. If the sweep's recovery adopts
+  the same PR first, the attach still arms the gate and records itself.
+
+**The attached code has NOT been through the board's pre-PR checks.** The drive runs fixups,
+the local gate and the acceptance tests before it opens a PR; none of those ran on this code.
+What still applies is everything after the PR: CI, the review gate when it is on, rebase,
+merged-state verification, then merge → `done`.
+
+**Audit.** The attach is an `attached PR:` comment on the card, naming who attached it, the
+state it left, and why. That comment is written last. If it fails, the attach still stands
+and the result carries a `warning`.
+
+Fix budgets the card already spent are not reset. A card whose automated fix rounds are
+exhausted still stops at the next failure, for a human.
 
 ## Where to look next
 

@@ -60,25 +60,36 @@ def _worked_by_the_loop(fid: str) -> str:
     return ""
 
 
+async def _gh_read(what: str, read, *args, **kwargs):
+    """One ``gh`` read for the attach, with a failure that isn't a readable answer (a
+    timeout, a checkout that is gone, no ``gh`` at all) turned into an actionable
+    ``BoardError``. The tool and the route return that as a refusal. Raised as it was, it
+    failed the agent's turn or made the route answer 500."""
+    try:
+        return await read(*args, **kwargs)
+    except (worktree.WorktreeError, OSError) as exc:
+        raise BoardError(
+            f"could not read {what} with gh ({exc}) — check that the project checkout exists and that gh is "
+            "installed and authenticated, then attach again"
+        ) from exc
+
+
 async def _github_refusal(feature: dict, facts: dict, pr_url: str, *, repo: str, base: str) -> str:
     """The GitHub half of the attach checks: is ``facts`` (``worktree.pr_identity``) the PR
-    the board would find for ``feature`` itself? Returns ``""`` when it is."""
+    the board would find for ``feature`` itself? Returns ``""`` when it is. The state and
+    head checks come before the fork check. What an operator can act on first (a merged PR,
+    the wrong branch) is said first, and a fork refusal can't mask it."""
     fid = feature.get("id", "")
     if not facts:
         return (
             f"could not read {pr_url} with gh from {repo} — check the url, and that gh is installed and authenticated"
         )
-    project_slug = await worktree.repo_slug(cwd=repo)
+    project_slug = await _gh_read(f"the GitHub repo of {repo}", worktree.repo_slug, cwd=repo)
     if not project_slug:
         return f"could not resolve the GitHub repo of {fid}'s project checkout {repo} — nothing to check the PR against"
     _number, pr_slug = _parse_pr_url(facts["url"])
     if pr_slug.casefold() != project_slug.casefold():
         return f"{facts['url']} is in {pr_slug}, but {fid} builds in {project_slug} ({repo})"
-    if facts.get("cross_repo") is not False:
-        return (
-            f"{facts['url']} comes from a fork (or gh could not say) — fix rounds push to this repo's branch, "
-            "so the board can only adopt a PR opened from a branch in this repo"
-        )
     state = facts.get("state")
     if state == "MERGED":
         return (
@@ -96,6 +107,11 @@ async def _github_refusal(feature: dict, facts: dict, pr_url: str, *, repo: str,
             f"to branch {branch!r}, open the PR from it, and attach that PR. Every later board edge (fix rounds, "
             "recovery, the reap) works on that branch, so a PR from any other would be abandoned by the first "
             "fix round"
+        )
+    if facts.get("cross_repo") is not False:
+        return (
+            f"{facts['url']} comes from a fork (or gh could not say) — fix rounds push to this repo's branch, "
+            "so the board can only adopt a PR opened from a branch in this repo"
         )
     if facts.get("base") != base:
         return (
@@ -117,16 +133,18 @@ async def attach_external_pr(
     by: str = "",
 ) -> dict:
     """Attach ``pr_url`` to ``feature`` (a projection the caller just read) and return
-    ``{id, state, pr_url, review_pending, already_attached}``. ``repo`` and ``base`` are
-    the checkout and base branch the card builds against, resolved as every tool and route
-    edge resolves them (``api.repo_for_feature`` / ``base_branch_for_feature``).
-    ``review_gate`` is the board's live knob.
+    ``{id, state, pr_url, review_pending, already_attached}`` (+ ``warning`` when the audit
+    comment could not be written). ``repo`` and ``base`` are the checkout and base branch
+    the card builds against, resolved as every tool and route edge resolves them
+    (``api.repo_for_feature`` / ``base_branch_for_feature``). ``review_gate`` is the board's
+    live knob.
 
     The checks run in order of cost. The board's own shape comes first and is free. Next is
     the loop's liveness, in memory. Last are the ``gh`` reads. The write re-checks
     liveness under the claim lock, and the store re-checks the card's shape on a fresh read,
-    so nothing decided on a stale view is ever written. Every refusal raises ``BoardError``
-    naming what to do instead.
+    so nothing decided on a stale view is ever written. The health sweep's edges that move a
+    card take the same lock and re-read first, so a sweep can't requeue an attach it raced
+    away. Every refusal raises ``BoardError`` naming what to do instead.
 
     A card that already carries a DIFFERENT PR takes the new one only once ``gh`` says the
     old one is CLOSED: a PR rejected and reworked on the same branch. An open prior PR would
@@ -151,7 +169,7 @@ async def attach_external_pr(
     if busy:
         raise BoardError(busy)
     if replaces:
-        prior = await worktree.pr_state(replaces, cwd=repo)
+        prior = await _gh_read(replaces, worktree.pr_state, replaces, cwd=repo)
         if prior != "CLOSED":
             raise BoardError(
                 f"{fid} already carries PR {replaces}, which is "
@@ -160,7 +178,7 @@ async def attach_external_pr(
                     "MERGED": "already merged — the card is done; the PR reconcile closes it",
                 }.get(prior, "unreadable with gh — the board only replaces a PR it can see is closed")
             )
-    facts = await worktree.pr_identity(pr_url, cwd=repo)
+    facts = await _gh_read(pr_url, worktree.pr_identity, pr_url, cwd=repo)
     refusal = await _github_refusal(feature, facts, pr_url, repo=repo, base=base)
     if refusal:
         raise BoardError(refusal)
@@ -169,7 +187,7 @@ async def attach_external_pr(
         busy = _worked_by_the_loop(fid)  # re-checked where no claim can interleave
         if busy:
             raise BoardError(busy)
-        attached = await asyncio.to_thread(
+        attached, already, warning = await asyncio.to_thread(
             store.attach_pr,
             fid,
             facts["url"],
@@ -179,16 +197,20 @@ async def attach_external_pr(
             replaces=replaces,
         )
     log.info(
-        "[project_board] %s attached external PR %s (was %s) → in_review%s",
+        "[project_board] %s attached external PR %s (was %s) → in_review%s%s",
         fid,
         facts["url"],
         feature.get("board_state"),
-        " + review-pending" if review_gate else "",
+        " + review-pending" if LABEL_REVIEW_PENDING in (attached.get("labels") or []) else "",
+        " (it was already in review on it — adopted meanwhile)" if already else "",
     )
-    return {
+    result = {
         "id": attached["id"],
         "state": attached["board_state"],
         "pr_url": attached.get("pr_url", ""),
         "review_pending": LABEL_REVIEW_PENDING in (attached.get("labels") or []),
-        "already_attached": False,
+        "already_attached": already,
     }
+    if warning:
+        result["warning"] = warning
+    return result

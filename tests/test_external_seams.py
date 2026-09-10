@@ -114,7 +114,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_ci_status": "REAL",
     "pr_diff": "REAL",
     "pr_head_sha": "REAL",
-    "pr_identity": "REAL",  # #402: read against the pinned PR in tests/test_attach_pr_402.py
+    "pr_identity": "REAL",  # #402: the pinned PR, tests/test_attach_pr_gh_402.py (the real-gh CI job)
     "pr_merge_info": "REAL",
     "pr_state": "REAL",
     "pr_url_for_branch": "REAL",

@@ -13,7 +13,8 @@ the PR whose head is the card's canonical branch. This adopts the same PR on req
 in-flight coding card the loop is not working, under the loop's claim lock. The card then
 sits exactly where `open_review` leaves one, so the ordinary reconcile drives it. The board
 side runs through the real `br`. The two `gh` reads are faked at their seam here, and the
-seam itself is read against a real PR in the GitHub tier at the bottom.
+seam itself is read against a real PR in tests/test_attach_pr_gh_402.py, which the real-GitHub
+CI job runs.
 """
 
 from __future__ import annotations
@@ -371,38 +372,3 @@ async def test_the_agent_tool_attaches_and_reports_errors_as_text(tmp_path, monk
 
     out = json.loads(await tool.ainvoke({"feature_id": card["id"], "pr_url": _URL, "reason": "salvaged"}))
     assert out["state"] == "in_review" and out["pr_url"] == _URL and out["review_pending"] is False
-
-
-# ── the real-GitHub tier: the `gh` seam against a real, open PR ─────────────────────────
-
-
-async def test_pr_identity_reads_which_pr_this_is(gh_fixture):
-    """The facts the attach decides on, read from a REAL open PR: the canonical url (the
-    form the merge webhook reports, so record_merge matches it), state, head, base, fork."""
-    facts = await worktree.pr_identity(gh_fixture.url, cwd=gh_fixture.repo_dir)
-    assert facts["url"].rstrip("/") == gh_fixture.url.rstrip("/")
-    assert facts["state"] == "OPEN"
-    assert facts["head"] == gh_fixture.head_branch
-    assert isinstance(facts["base"], str) and facts["base"]
-    assert isinstance(facts["cross_repo"], bool)
-
-
-async def test_pr_identity_is_empty_for_a_pr_that_does_not_exist(gh_fixture):
-    missing = gh_fixture.url.rsplit("/", 1)[0] + "/999999999"
-    assert await worktree.pr_identity(missing, cwd=gh_fixture.repo_dir) == {}
-
-
-@requires_br
-async def test_a_real_pr_on_another_branch_is_refused(gh_fixture, tmp_path):
-    """No fakes at all: a real board card and the real fixture PR, whose head is not that
-    card's branch. The refusal comes from the facts `gh` actually returned."""
-    board = BeadsBoard(repo=str(tmp_path), actor="test")
-    card = _plain(board, tmp_path)
-
-    with pytest.raises(BoardError, match="canonical branch") as exc:
-        await attach_external_pr(
-            board, board.get_feature(card["id"]), gh_fixture.url, repo=gh_fixture.repo_dir, base="main"
-        )
-
-    assert gh_fixture.head_branch in str(exc.value)
-    assert board.get_feature(card["id"])["board_state"] == "ready"
