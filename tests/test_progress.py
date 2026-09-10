@@ -120,8 +120,9 @@ def test_dispatch_reached_model_false_on_an_empty_or_unknown_buffer():
 
 
 def test_dispatch_reached_model_true_when_the_current_run_streamed():
-    """Any first-token evidence on a current-run gen — a tool, thought, answer, or token
-    usage — is model-reachable; a solve/max-mode run tags all its gens with one epoch."""
+    """Any first-token evidence on a current-run gen — a tool, a thought, or token usage
+    (answer text alone is not, #422) — is model-reachable; a solve/max-mode run tags all
+    its gens with one epoch."""
     coder_seam._progress.clear()
     coder_seam.progress_new_run("f")
     coder_seam.progress_begin("f", 1, "smart")

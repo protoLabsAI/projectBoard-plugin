@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
-from .store import BoardError, annotate_next_action, escalation_enabled, get_store
+from .store import BoardError, annotate_next_action, escalation_enabled, get_store, open_requirements_note
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -685,7 +685,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str):
-        return await _guard(lambda: store().clear_blocked(fid))
+        f = await _guard(lambda: store().clear_blocked(fid))
+        # The running loop's cached timeout count wins over the label the store just reset
+        # (#259) — drop it too, so a card parked `too-wide` gets a real retry (#378).
+        from .loop import forget_timeout_count
+
+        forget_timeout_count(fid)
+        return f
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):
@@ -740,7 +746,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `deliverable` reads the latest back), ``ref`` (a doc URL / artifact path)
         lands on `external_ref` — the slot a coding feature's pr_url occupies.
         TASK-ONLY: ``record_delivery`` 400s a coding feature (entering review with no
-        pr_url would strand the merge reconciler) or one not in_progress."""
+        pr_url would strand the merge reconciler) or one not in_progress. A repeat of the
+        delivery an in_review task already carries returns it unchanged; a DIFFERENT one
+        for an in_review task 400s without writing (#403). A ``## Requirements`` section
+        in ``text`` closes the ledger items it disposes of (best-effort, #399). An empty
+        delivery — no text, no ref — 400s."""
         body = body or {}
         return await _guard(
             lambda: store().record_delivery(fid, text=str(body.get("text", "")), ref=str(body.get("ref", "")))
@@ -759,13 +769,19 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         by construction, so an omitted ``by`` defaults to ``"operator"`` — NOT the store
         actor (record_verification's own fallback): defaulting to the actor would falsely
         flag an agent-delivered task, verified in the console, as self-verified. An
-        explicit ``by`` is forwarded unchanged (S3c owns the agent-tool default seam)."""
+        explicit ``by`` is forwarded unchanged (S3c owns the agent-tool default seam).
+
+        Still-open requirement-ledger items ride back as ``note`` — "2 requirement(s)
+        still open: r2, r4" — beside the feature (#399). Surfaced, never enforced: the
+        approval stands and the human decides, the same as board_verify."""
         body = body or {}
         approved = bool(body.get("approved", True))
         by = str(body.get("by") or "operator")
-        return await _guard(
+        f = await _guard(
             lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")), by=by)
         )
+        note = open_requirements_note((f or {}).get("requirements"))
+        return {**f, "note": note} if note else f
 
     @router.delete("/features/{fid}")
     async def _delete(fid: str, body: dict = Body(default={})):

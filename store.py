@@ -34,6 +34,7 @@ Notes on `br` quirks pinned down empirically (br 0.1.x):
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -123,6 +124,47 @@ def _br_lock() -> threading.Lock:
         holder.lock = threading.Lock()
         holder = sys.modules.setdefault(_BR_LOCK_SLOT, holder)
     return holder.lock
+
+
+# ONE task delivery/verification at a time per CARD, per process (#432 review). The task
+# edges are check-then-act across several `br` calls — read the state, then write the
+# deliverable, the stamp, the label, the ledger — and `_br_lock` single-flights each CALL,
+# not the sequence. So two deliveries of one card from two threads (the #399 timeline: the
+# self-drive's board_deliver and a PM "repair" three seconds apart, one process) both read
+# in_progress and BOTH landed, the second silently becoming the deliverable of record.
+# Held across the whole edge, the read and its writes are one step: the second caller sees
+# in_review and is no-op'd or refused. Same process-stable slot as `_br_lock`, for the same
+# reason. RE-entrant: a rejection in record_verification runs requeue, which takes it too.
+# It does not serialize two PROCESSES sharing one store; beads offers nothing to CAS on.
+_CARD_LOCK_SLOT = "project_board.card_locks::" + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
+
+
+def _card_lock_for(key: tuple[str, str]) -> threading.RLock:
+    """The process-wide lock for one card (``key`` = (board store, fid)), created on first
+    use. Installed like ``_br_lock`` — `setdefault` on the slot and on the map settles a
+    first-call race so every caller gets the SAME lock."""
+    holder = sys.modules.get(_CARD_LOCK_SLOT)
+    if holder is None:
+        holder = types.ModuleType(_CARD_LOCK_SLOT)
+        holder.__doc__ = "Process-stable holder for project_board's per-card task-edge locks — data, not code."
+        holder.guard = threading.Lock()
+        holder.locks = {}
+        holder = sys.modules.setdefault(_CARD_LOCK_SLOT, holder)
+    with holder.guard:
+        return holder.locks.setdefault(key, threading.RLock())
+
+
+def _task_edge(method):
+    """Run a BeadsBoard task-edge method (``method(self, fid, …)``) under its card's lock
+    — see ``_card_lock_for``. A decorator rather than a wrapper method so each edge's
+    `br` calls stay in the method that owns them (tests/test_external_seams.py)."""
+
+    @functools.wraps(method)
+    def locked(self, fid, *args, **kwargs):
+        with self._card_lock(fid):
+            return method(self, fid, *args, **kwargs)
+
+    return locked
 
 
 # `br` plain-mode not-found text (stderr). The --json path is matched on the structured
@@ -224,7 +266,8 @@ LABEL_IN_REVIEW = "in-review"
 LABEL_BLOCKED = "blocked"
 # WHY a feature is blocked, as the failure classifier's category (failures.classify):
 # `blocked-class:transient` / `-rate-limit` / `-merge-conflict` / `-auth` / `-terminal` /
-# `-provider-unavailable` (#420), plus the loop's own `-dispatch-infra` (#339).
+# `-provider-unavailable` (#420), plus the loop's own `-dispatch-infra` (#339) and
+# `-too-wide` (#378: parked for a split after repeated timeouts).
 # A single REPLACED label (the `gens:` pattern) so the projection can tell a block that
 # will clear itself from one that needs a human — WITHOUT a `br show` per card to read
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
@@ -299,6 +342,13 @@ DELIVERED_BY_PREFIX = "delivered-by:"
 # (beads' validator, the #101 lesson), so it is a comment and `_project` reads the
 # LATEST one back into `blocked_reason`.
 BLOCKED_REASON_PREFIX = "blocked:"
+# The two ways a delivered TASK is sent back with something to say: a verifier's rejection
+# (`record_verification(approved=False)` writes `verification failed: <feedback>`) and a
+# requeue with findings (`record_review_bounce` writes `review requested changes: <why>`).
+# `_project` reads whichever came after the task's latest delivery into
+# `rejection_feedback`, which the next round's prompt leads with (#432 review).
+VERIFICATION_FAILED_PREFIX = "verification failed:"
+REVIEW_BOUNCE_PREFIX = "review requested changes"
 # Self-verification (#316 S2): when the verifier who approves a task is the same identity
 # that delivered it, `record_verification` FLAGS the close with this label rather than
 # refusing it — refusal is deliberately out of scope for this slice. Label-safe (a fixed
@@ -534,6 +584,7 @@ def apply_requirement_dispositions(items, dispositions) -> list[dict]:
         if status not in REQ_CLOSED_STATUSES:
             continue
         item["status"] = status
+        item.pop("reopened_from", None)  # re-disposed: the rejection's trace has done its job
         reason = str(d.get("decline_reason") or "").strip()
         if status == "declined":
             if reason:
@@ -541,6 +592,154 @@ def apply_requirement_dispositions(items, dispositions) -> list[dict]:
         else:
             item.pop("decline_reason", None)
     return out
+
+
+# The requirement-ledger disposition section (#113) — the `## Summary` pattern's
+# sibling: the assignee reports one line per item id (`- r2: done`, `- r3: declined —
+# <reason>`). Same last-occurrence discipline as the summary; the section ends at
+# the next `## ` heading. Only the CLOSED statuses parse — silence (or an explicit
+# `open`) is not a disposition, so an unreported item stays open on the ledger.
+# Lives HERE, beside the ledger it feeds, because two edges read it: the loop's coder
+# drive (re-exported there as `_parse_requirements_reply`) and record_delivery (#399),
+# which the store owns and which must not reach up into the loop.
+_REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
+# A row is `<id>: done` or `<id>: declined — <reason>`, and nothing looser (#432 review).
+# The status must be an EXACT token: the old `\b` after it read `done? not yet` and
+# `done-ish, partially` as done, closing an item on a row that says it isn't. So `done`
+# may be followed by a full stop and nothing else, and `declined` needs a real separator
+# (`:`, an em/en dash, or a hyphen with space around it — never `declined-ish`) and a
+# non-empty reason: a decline is the "won't do, and here is why" record, and a bare one
+# says nothing. An explicit `open` is well-formed but is not a disposition, so it, like
+# any other status, leaves the item as it was. (Real coder replies on the live boards
+# already write exactly this: every `done` row bare, every decline `— <reason>`.)
+_REQ_LINE_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
+    r"(?:(?P<done>done)\.?|(?P<declined>declined)(?:\s*[:—–]|\s+-)\s*(?P<reason>\S.*?))\s*$",
+    re.IGNORECASE,
+)
+# A fenced code block opener/closer (CommonMark: up to three spaces of indent, then three
+# or more backticks or tildes).
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _without_fenced_blocks(text: str) -> str:
+    """``text`` with every fenced code block dropped (#432 review). A deliverable that
+    documents the ledger format — an ADR about the board, a how-to — quotes a sample
+    `## Requirements` section inside a fence, and that sample is not the author's own
+    disposition: parsed, it closed real items. A fence closes on the same character at
+    least as long with nothing after it; an unclosed fence runs to the end, so everything
+    below it is treated as quoted."""
+    kept: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        m = _FENCE_RE.match(line)
+        if not fence:
+            if m:
+                fence = m.group(1)
+            else:
+                kept.append(line)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line.strip().strip(fence[0]):
+            fence = ""
+    return "\n".join(kept)
+
+
+def parse_requirement_dispositions(text: str) -> list[dict]:
+    """Parse a reply's ``## Requirements`` section into disposition dicts
+    (`{id, status, decline_reason?}`) for ``apply_requirement_dispositions``. Fenced
+    code blocks are ignored first (a quoted example is not a disposition). Keeps
+    the LAST such heading (a mid-narration mention must not shadow the real section,
+    the #56 lesson), reads until the next heading, and skips any line that isn't a
+    well-formed `<id>: done` / `<id>: declined — <reason>` row — a malformed row is
+    silence, and silence is not disposition. No section → no dispositions."""
+    text = _without_fenced_blocks(text or "")
+    headings = list(_REQ_HEADING_RE.finditer(text))
+    if not headings:
+        return []
+    out: list[dict] = []
+    for line in text[headings[-1].end() :].splitlines():
+        if line.strip().startswith("##"):
+            break  # the next section — the ledger block ended
+        m = _REQ_LINE_RE.match(line)
+        if not m:
+            continue
+        if m.group("done"):
+            out.append({"id": m.group("id"), "status": "done"})
+        else:
+            out.append({"id": m.group("id"), "status": "declined", "decline_reason": m.group("reason").strip()})
+    return out
+
+
+def open_requirement_ids(items) -> list[str]:
+    """The ids of the ledger items still OPEN (not `done`/`declined`), in ledger order —
+    the complement of ``_all_items_disposed``."""
+    return [
+        str(i.get("id", "")) for i in items or () if str(i.get("status", "")).strip().lower() not in REQ_CLOSED_STATUSES
+    ]
+
+
+def open_requirements_note(items) -> str:
+    """``"2 requirement(s) still open: r2, r4"``, or "" when every item is closed — the
+    line a task verifier is shown (#399). A NOTE, never a gate: the verifier decides."""
+    ids = open_requirement_ids(items)
+    return f"{len(ids)} requirement(s) still open: {', '.join(ids)}" if ids else ""
+
+
+def reopen_requirements(items) -> list[dict]:
+    """Every closed ledger item back to `open`, each keeping a trace of what it was — for a
+    task sent back from review (#432 review). A rejection says the delivery did not do what
+    it claimed, so the dispositions it made stand refuted; left closed, the next round's
+    prompt, the verifier and the note all read "done" on work the verifier just said is
+    not. The trace (``reopened_from``: `done`, or `declined — <reason>`) keeps the claim
+    visible while the item is open again; the next disposition clears it. Every closed item,
+    not just the last delivery's rows: in the task lane only a delivery closes an item and
+    every rejection reopens them all, so anything closed at review time was closed in the
+    round under review. Returns a NEW list; the input is never mutated."""
+    out: list[dict] = []
+    for i in items or ():
+        item = dict(i)
+        status = str(item.get("status", "")).strip().lower()
+        if status in REQ_CLOSED_STATUSES:
+            reason = str(item.pop("decline_reason", "") or "").strip()
+            item["status"] = "open"
+            item["reopened_from"] = f"{status} — {reason}" if reason else status
+        out.append(item)
+    return out
+
+
+# How much of a task's deliverable a LISTING row carries (#399) — enough to recognise it,
+# not enough to matter at poll rate. The full text is one single-card read away.
+DELIVERABLE_PREVIEW_CHARS = 280
+
+
+def _listing_task_signal(f: dict) -> None:
+    """Swap a projected task row's full ``deliverable`` for the small signal a listing
+    carries (#399), in place: ``delivered`` / ``delivered_by`` stay, and the body becomes
+    ``deliverable_chars`` plus a whitespace-collapsed ``deliverable_preview``.
+
+    The listing is polled every 10s (#312), and a delivered task's body runs to kilobytes
+    — every task's, on every poll, for a view that shows none of them. But the row must
+    never READ as undelivered either: an empty `deliverable` on a delivered card is what
+    got #399 filed as data loss. So it says delivered, how much, and what it opens with;
+    the full text stays on the single-card reads (``get_feature`` / ``GET
+    /features/{fid}`` / board_get_feature). The key is DROPPED, not blanked — "" would be
+    the same false "empty" all over again.
+
+    The count and preview describe the CURRENT round, like ``delivered`` (#432 review): a
+    task sent back from review still carries its rejected deliverable on the bead, but it
+    is not delivered, so it lists 0 chars and an empty preview — with that earlier text as
+    ``last_deliverable_preview``, so the operator can still see what was sent back."""
+    body = str(f.pop("deliverable", "") or "")
+    flat = " ".join(body.split())
+    if len(flat) > DELIVERABLE_PREVIEW_CHARS:
+        flat = flat[: DELIVERABLE_PREVIEW_CHARS - 1].rstrip() + "…"
+    if f.get("delivered"):
+        f["deliverable_chars"] = len(body)
+        f["deliverable_preview"] = flat
+        return
+    f["deliverable_chars"] = 0
+    f["deliverable_preview"] = ""
+    if flat:
+        f["last_deliverable_preview"] = flat
 
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
@@ -618,6 +817,24 @@ class BoardTimeout(BoardError):
     refusal into a decision re-raise this instead: a claim race, a cancel's undo, a
     create's dedup read, a pass that would otherwise try the next card against the same
     stalled store, and the HTTP guard, which maps it to 503."""
+
+
+class AlreadyDelivered(BoardError):
+    """``record_delivery`` refused a DIFFERENT deliverable for a task already in review
+    (#403) — nothing was written, and the recorded one still stands for board_verify.
+
+    A SUBCLASS of BoardError, so every caller that treats a refusal as a 4xx / tool error
+    keeps doing so. The loop's task drives catch this narrower type: a self task's agent
+    has its board tools live during the turn and may board_deliver in-turn, so a reply
+    that lands after its own explicit delivery is an expected outcome, not a failure."""
+
+
+# What a failed `br` call can raise out of `_run`: a BoardError, or — when the subprocess
+# outlives its timeout — `subprocess.TimeoutExpired`, which is no kind of BoardError and so
+# sails past every `except BoardError` (#404; #431 converts it to a BoardError inside
+# `_run`, and this tuple stays correct either way). For the few places that must survive
+# a failed call — a best-effort write, a drive task's tail — instead of dying on it.
+BR_FAILURES = (BoardError, subprocess.TimeoutExpired)
 
 
 def _stop_br_tree(proc: subprocess.Popen) -> None:
@@ -1822,24 +2039,54 @@ class BeadsBoard:
         Rather than decompose inline (the ``decompose`` subagent is a pure proposer driven
         by a skill, and an LLM call inside the drive loop can itself time out), file a
         TASK assigned to the board's own agent. The existing self-dispatch path (#311)
-        picks it up, the agent decomposes with the board tools it already has, and the
-        Ready gate enforces that the slices are actually well-formed — which is the part
-        an unattended splitter gets wrong.
+        picks it up once it is ``ready``, the agent decomposes with the board tools it
+        already has, and the Ready gate enforces that the slices are actually well-formed —
+        which is the part an unattended splitter gets wrong.
 
-        Returns the new task, or None when the ask was already made (idempotent) or the
-        card is itself a decomposition task (never recurse). Never raises: failing to ask
-        must not change how the timeout itself is handled."""
+        The task is filed in ``backlog``, where the puller cannot see it, and the CALLER
+        releases it with ``mark_ready``. That split is deliberate: the loop parks the card
+        between the two, so the park can name the task and the agent — whose job ends in
+        cancelling this card — can never find it still in flight.
+
+        Its steps are ordered so each one passes the gates the next depends on: slices in
+        backlog first (the card still claims its files, so a READY slice naming one is
+        refused by the shared-file gate), dependents re-pointed onto the slices next
+        (cancelling the card drops its edges, releasing every dependent at once), then the
+        cancel, and only then the slices marked ready.
+
+        Idempotent on the task itself, not only on the ``decompose-asked`` label: a label
+        write lost after the create must not file a duplicate at the next park. Returns
+        the task still open for this card — new, or filed earlier and not yet closed — or
+        None when its split was already requested and has closed, or the card is itself a
+        decomposition task (never recurse). Never raises: failing to ask must not change
+        how the timeout itself is handled."""
         try:
             f = self.get_feature(fid)
-            if not f:
+            if not f or f.get("issue_type") == LABEL_TASK:
                 return None
             labels = list(f.get("labels") or [])
-            if self.LABEL_DECOMPOSE_ASKED in labels or f.get("issue_type") == LABEL_TASK:
-                return None
+            rows = self.list_features()
+            filed = [
+                t
+                for t in rows
+                if t.get("issue_type") == LABEL_TASK and str(t.get("title") or "").startswith(f"Decompose {fid} ")
+            ]
+            if filed:
+                if self.LABEL_DECOMPOSE_ASKED not in labels:  # heal a label write the create outlived
+                    self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
+                return next((t for t in filed if t.get("board_state") not in _TERMINAL_STATES), None)
+            if self.LABEL_DECOMPOSE_ASKED in labels:
+                return None  # asked before; that task is archived or gone
             files = list(f.get("files_to_modify") or [])
+            dependents = sorted(
+                d["id"]
+                for d in rows
+                if fid in (d.get("depends_on") or []) and d.get("board_state") not in _TERMINAL_STATES
+            )
             spec = (
                 f"Card {fid} ({f.get('title') or 'untitled'}) has timed out {timeouts}x under the "
-                f"coder and is too wide to build in one dispatch. Split it into slices and retire it.\n\n"
+                f"coder and is too wide to build in one dispatch. The loop has PARKED it (blocked): "
+                f"split it into slices and retire it.\n\n"
                 f"A timeout is not a capability failure — it carries no diff and no CI output, so "
                 f"retrying or escalating the tier spends the clock again on a card that was never "
                 f"model-limited. It is a SIZE signal.\n\n"
@@ -1847,21 +2094,33 @@ class BeadsBoard:
                 f"ORIGINAL ACCEPTANCE CRITERIA\n{f.get('acceptance_criteria') or '(none)'}\n\n"
                 f"ORIGINAL files_to_modify ({len(files)})\n"
                 + ("\n".join(f"- {p}" for p in files) or "- (none)")
-                + "\n\nHOW TO SPLIT (the board's own gates will refuse a sloppy decomposition, so "
-                "satisfy them up front):\n"
-                "- Each slice must sit at or under the breadth cap for its difficulty, and must be "
+                + f"\n\nCARDS THAT DEPEND ON {fid}\n"
+                + ("\n".join(f"- {d}" for d in dependents) or "- (none)")
+                + "\n\nDO IT IN THIS ORDER — each step is what lets the next one pass the board's gates:\n\n"
+                "1. Create the slices with `board_create_feature` and LEAVE THEM IN BACKLOG. "
+                f"{fid} still claims its files until it is cancelled, so the shared-file gate "
+                "refuses a slice marked ready while it names one of them.\n"
+                "   - Each slice sits at or under the breadth cap for its difficulty, and is "
                 "independently buildable and gate-passing on its own — not a fragment that only "
                 "compiles once its siblings land.\n"
-                "- A slice naming a file that does not exist YET must mark it `(new)`, or the Ready "
-                "gate refuses it as a phantom path.\n"
-                "- Slices editing the SAME file need a depends_on edge so one waits for the other. "
-                "The edge counts in either direction, but only between the two cards that actually "
-                "share the file: in a chain A->B->C, the A/C pair needs its OWN edge.\n"
-                "- Order them so the first slice is independently useful and the rest gate behind it.\n\n"
-                f"Then cancel {fid} as superseded, naming the slice ids in the reason."
+                "   - A file that does not exist YET is marked `(new)`, or the Ready gate refuses "
+                "it as a phantom path.\n"
+                "   - Slices editing the SAME file need a depends_on edge between them. The edge "
+                "counts in either direction, but only between the two cards that share the file: "
+                "in a chain A->B->C, the A/C pair needs its OWN edge.\n"
+                "   - Order them so the first slice is independently useful and the rest gate behind it.\n"
+                f"2. Re-point every card that depends on {fid} (listed above; check again, the list "
+                "may have grown) onto the slice or slices that deliver what it needs: "
+                "`board_update_feature(feature_id=<dependent>, depends_on=[<slice ids>])`. Cancelling "
+                f"{fid} drops its edges, so a dependent you skip is released before anything it "
+                "needs has landed.\n"
+                f"3. Cancel {fid} with `board_cancel_feature`, naming the slice ids in the reason.\n"
+                "4. Mark every slice ready with `board_mark_ready`. The first becomes buildable; the "
+                "rest wait behind their depends_on edges."
             )
             criteria = (
                 f"- {fid} is cancelled with a reason naming the slices that replace it.\n"
+                f"- Every card that depended on {fid} now depends on the slice(s) it needs.\n"
                 "- Every slice is `ready` (or dag_blocked behind a sibling), so no slice needs a "
                 "second pass to become buildable.\n"
                 "- Together the slices cover the original acceptance criteria, with nothing dropped.\n"
@@ -1880,7 +2139,7 @@ class BeadsBoard:
             self._run("update", fid, "--add-label", self.LABEL_DECOMPOSE_ASKED)
             self.comment(fid, f"decompose requested after {timeouts} timeouts → {(task or {}).get('id', '?')}")
             return task
-        except Exception:  # noqa: BLE001 — the ask is best-effort; the block still happens
+        except Exception:  # noqa: BLE001 — the ask is best-effort; the park still happens
             log.warning("[project_board] %s decompose request failed (ignored)", fid, exc_info=True)
             return None
 
@@ -2038,6 +2297,7 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    @_task_edge
     def record_delivery(self, fid: str, text: str = "", ref: str = "") -> dict:
         """Record a task-type bead's DELIVERABLE (#217) — the task sibling of the
         coder's open_pr → open_review edge. ``text`` rides a `deliverable:` comment
@@ -2053,17 +2313,41 @@ class BeadsBoard:
 
         TASK-ONLY: a coding feature taking this edge would enter review with no
         pr_url and strand the merge reconciler — the exact hole open_review's
-        pr_url requirement plugs — so anything else is refused here too."""
+        pr_url requirement plugs — so anything else is refused here too.
+
+        REPLAY-SAFE (#403): a card already ``in_review`` takes a REPEAT of its delivery
+        as a no-op — every field this call carries (the deliverable text, a link ref)
+        already matches what is recorded, so it returns the card and writes nothing. A
+        tool-call retry or a driver replay is not an error. A DIFFERENT deliverable for
+        an in_review card raises :class:`AlreadyDelivered`, again writing nothing: the
+        recorded one stands for board_verify, and replacing it goes through a rejection
+        (board_verify approved=false) or a requeue first, so the trail never gains a
+        second competing record with no verdict between them.
+
+        The deliverable, its stamp and the transition are written STRICTLY (#399): a
+        failed write raises, so the caller can retry. Any `## Requirements` dispositions
+        the deliverable carries are applied to the ledger BEST-EFFORT and only AFTER the
+        card is in review — a failed ledger write never costs the delivery, and open items
+        never refuse it. An EMPTY delivery (no text, no ref) is refused.
+
+        SERIALIZED per card (#432 review): the state check and every write run under the
+        card's process-wide lock, so two deliveries racing on one card cannot both land."""
         f = self._require(fid)
         if f.get("issue_type") != LABEL_TASK:
             raise BoardError(
                 f"record_delivery is task-only — issue_type {f.get('issue_type')!r} enters review via open_review(pr_url=...)"
             )
-        if f["board_state"] != "in_progress":
+        if f["board_state"] not in ("in_progress", "in_review"):
             raise BoardError(f"record_delivery expects in_progress, got {f['board_state']!r}")
         # Classify the ref by shape BEFORE any write lands: link-shaped (a scheme, or
         # a protocol-relative //host) must pass the strict http(s) gate to reach
         # external_ref; a scheme-less artifact path folds into the deliverable record.
+        # Stripped because that is how `_project` reads it back — the replay check below
+        # compares against the read-back, so both sides must be in the same form.
+        text = str(text or "").strip()
+        # Read off the deliverable AS WRITTEN, before a path ref is folded onto its end
+        # (where it would ride into the last row's decline reason).
+        dispositions = parse_requirement_dispositions(text)
         ref = str(ref or "").strip()
         parts = urlparse(ref)
         if parts.scheme or parts.netloc:
@@ -2072,19 +2356,76 @@ class BeadsBoard:
             external_ref = ""
             if ref:
                 text = f"{text} ({ref})" if text else ref
+        if not text and not external_ref:
+            # Nothing to verify (#432 review): an empty text (a blank reply, "   ") used to
+            # move the card to review anyway, and the board then listed it as delivered.
+            raise BoardError(
+                f"record_delivery: nothing to deliver for {fid} — pass the deliverable as `text` (the "
+                "work product itself), or a `ref` to where it lives; an empty delivery would send the "
+                "task to review with nothing for the verifier to judge"
+            )
+        if f["board_state"] == "in_review":
+            # Already delivered and awaiting its verdict. Requirement rows this call carries
+            # still land (#432 review): the round under review is the one they describe, and
+            # the common case is a self task's agent board_delivering its document in-turn
+            # and then REPLYING with the `## Requirements` section the prompt asked for —
+            # refusing the reply alone left the ledger open with no way to close it short of
+            # a rejection. Never after the verdict: a done card is refused above.
+            applied = self._apply_dispositions(fid, f, dispositions)
+            if applied:
+                log.info(
+                    "[project_board] %s applied %d requirement row(s) from a delivery on the card already in review",
+                    fid,
+                    len(dispositions),
+                )
+            # A replay: nothing the call carries disagrees with the record. An empty field
+            # brings nothing to compare, so it cannot conflict — the same rule as an
+            # in_progress delivery, where an empty ref leaves external_ref alone.
+            recorded = str(f.get("deliverable") or "")
+            if (not text or text == recorded) and (not external_ref or external_ref == f.get("pr_url")):
+                return self.get_feature(fid) if applied else f
+            by = str(f.get("delivered_by") or "").strip()
+            raise AlreadyDelivered(
+                f"record_delivery: {fid} is already delivered{f' by {by}' if by else ''} and in review — "
+                f"this delivery differs from the one on record ({len(recorded)} chars), so it was NOT "
+                "recorded; the recorded one stands for board_verify"
+                + (" (its `## Requirements` rows were applied to the ledger)" if applied else "")
+                + ". To replace it, send the task back first (board_verify approved=false with "
+                "feedback, or requeue it), then deliver again."
+            )
+        # These writes ARE the delivery, so they go through `_run` and RAISE, not through
+        # the best-effort `comment()`: that helper swallows a failed write by contract (an
+        # audit note must never break its edge), which here would still move the card to
+        # in_review below — reporting a delivery whose deliverable was never written, and
+        # refusing the retry because the card had already left in_progress (#399). Raising
+        # leaves the card in_progress, so the same call can simply be made again.
         if text:
-            self.comment(fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
+            self._run("comments", "add", fid, f"{LABEL_DELIVERABLE_PREFIX} {text}")
         # Actor provenance (#316): stamp WHO delivered, beside the deliverable record and
         # BEFORE the in_review move — the task's assignee at delivery time, falling back to
         # the store actor when unassigned. Captured now (not read off the bead later) so a
         # reassignment after delivery can't rewrite the deliverer; _project reads the latest
-        # `delivered-by:` comment back into `delivered_by`.
+        # `delivered-by:` comment back into `delivered_by`, and record_verification's
+        # self-verification check reads that — so it is part of the record, not a note.
         delivered_by = str(f.get("assignee") or "").strip() or self.actor
-        self.comment(fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
+        self._run("comments", "add", fid, f"{DELIVERED_BY_PREFIX} {delivered_by}")
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if external_ref:
             args += ["--external-ref", external_ref]
         self._run(*args)
+        # The requirement ledger (#399): a deliverable carrying a `## Requirements`
+        # section — the same `- r2: done` / `- r3: declined — why` rows a coder reports —
+        # has its dispositions applied, whichever door it came through (the loop's
+        # recorded reply, board_deliver, the API). Without this a task's ledger could
+        # never close: every item stayed `open` through a delivery that addressed them.
+        # LAST, and BEST-EFFORT, on purpose (#432 review): only once the card is in review
+        # has a delivery happened for the rows to describe — written before the transition,
+        # a failed stamp or label write left an in_progress card with a CLOSED ledger. And
+        # the ledger is what a verifier checks the deliverable against, not the deliverable
+        # itself, whose text still carries the rows — so a failed ledger write is logged
+        # and never costs the delivery. Nothing gates on open items either: that is the
+        # verifier's call, and board_verify says what is still open.
+        self._apply_dispositions(fid, f, dispositions)
         return self.get_feature(fid)
 
     def set_review_substate(self, fid: str, label: str | None, note: str = "", head_sha: str = "") -> dict:
@@ -2148,7 +2489,7 @@ class BeadsBoard:
         f = self._require(fid)
         if f["board_state"] != "in_review":
             raise BoardError(f"review bounce expects in_review, got {f['board_state']!r}")
-        self.comment(fid, f"review requested changes: {findings}" if findings else "review requested changes")
+        self.comment(fid, f"{REVIEW_BOUNCE_PREFIX}: {findings}" if findings else REVIEW_BOUNCE_PREFIX)
         return f
 
     def record_ci_fix_feedback(self, fid: str, ci_failure: str = "") -> dict:
@@ -2172,11 +2513,24 @@ class BeadsBoard:
         self.comment(fid, f"CI fix requested: {text}")
         return f
 
+    @_task_edge
     def requeue(self, fid: str) -> dict:
         """Put a feature back to `ready` for re-dispatch (keeps its open PR via
         external_ref). The puller re-claims it and the loop re-dispatches — at the
-        higher tier if it was just escalated; open_pr pushes to the existing PR."""
+        higher tier if it was just escalated; open_pr pushes to the existing PR.
+
+        A TASK sent back from review — a verifier's rejection, or a requeue with findings —
+        reopens its requirement ledger first (``reopen_requirements``, #432 review), under
+        the card's task-edge lock so a delivery racing the send-back can't re-close it."""
         f = self._require(fid)
+        if f.get("issue_type") == LABEL_TASK and f["board_state"] == "in_review":
+            # STRICT, unlike a delivery's ledger write: the reopen is what the send-back
+            # MEANS for the ledger, and a failed one raises while the card is still in
+            # review, so the verdict can simply be given again.
+            items = f.get("requirements") or []
+            reopened = reopen_requirements(items)
+            if reopened != items:
+                self.set_requirements(fid, reopened)
         # Clear the assignee too — without it `br update --claim` on the re-pull
         # fails ("already assigned to <actor>") and the feature can't be re-dispatched.
         #
@@ -2285,6 +2639,7 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     # ── the task Done edge (#217): verify, not merge ──────────────────────────
+    @_task_edge
     def record_verification(self, fid: str, approved: bool = True, feedback: str = "", by: str = "") -> dict:
         """The task-type Done edge (#217) — record_merge's verify sibling, and
         DELIBERATELY a second `br close` edge beside it (the cancel_feature
@@ -2307,7 +2662,12 @@ class BeadsBoard:
 
         TASK-ONLY: a coding feature closed here would dodge record_merge — the ONE
         Done edge for code (invariant #2), with its idempotency, blocker cleanup,
-        and `merged: <pr_url>` audit reason — so anything else is refused."""
+        and `merged: <pr_url>` audit reason — so anything else is refused.
+
+        A REJECTION (#432 review) writes the feedback STRICTLY — it is what the next round
+        is driven by, as the task prompt's lead — and then requeues, which reopens the
+        requirement items the rejected round closed. Serialized with the card's deliveries
+        under its task-edge lock."""
         f = self._require(fid)
         if f.get("issue_type") != LABEL_TASK:
             raise BoardError(
@@ -2316,8 +2676,11 @@ class BeadsBoard:
         if f["board_state"] != "in_review":
             raise BoardError(f"record_verification expects in_review, got {f['board_state']!r}")
         if not approved:
+            # Through `_run`, not the best-effort `comment()`: a feedback line that silently
+            # failed to land would send the task back with nothing for the next round to
+            # address. Raising leaves the card in review, so the verdict can be given again.
             if feedback:
-                self.comment(fid, f"verification failed: {feedback}")
+                self._run("comments", "add", fid, f"{VERIFICATION_FAILED_PREFIX} {feedback}")
             return self.requeue(fid)
         by = by or self.actor
         # The deliverer of record: the projected `delivered_by` (a `delivered-by:` stamp,
@@ -2538,8 +2901,14 @@ class BeadsBoard:
         A card that never escalated carries no ``tier:`` label, so it still starts at
         its difficulty-selected tier on the next build; the ladder stays a
         model-capability record, and the infra incident adds nothing to it. A
-        model-reachable block (or an unclassified one) is untouched, exactly as before."""
-        from .failures import PRE_MODEL_DISPATCH_CLASS
+        model-reachable block (or an unclassified one) is untouched, exactly as before.
+
+        A card the loop PARKED as ``too-wide`` (#378) also gets its timeout count reset:
+        unblocking one is a deliberate retry — after raising ``coder_timeout_s``, or
+        narrowing the card by hand — and with the count still at the threshold its very
+        next timeout would park it again at once. (The loop's in-process copy of the count
+        is dropped separately, by the unblock verbs: ``loop.forget_timeout_count``.)"""
+        from .failures import PRE_MODEL_DISPATCH_CLASS, TOO_WIDE_CLASS
 
         f = self._require(fid)
         labels = f.get("labels") or []
@@ -2549,6 +2918,11 @@ class BeadsBoard:
             # Drop only the stale infra class — NOT the tier labels, which predate the
             # incident and record genuine model-capability escalation (#339).
             args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        elif cls == TOO_WIDE_CLASS:
+            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+            for label in labels:
+                if label.startswith(f"{LABEL_BUDGET_PREFIX}timeout:"):
+                    args += ["--remove-label", label]
         self._run(*args)
         return self.get_feature(fid)
 
@@ -2870,13 +3244,26 @@ class BeadsBoard:
                     # visible reason is unfixable by design: there is no claim to check,
                     # so no coder can clear it and the card parks forever.
                     #
-                    # Only blocked rows, and only from the batch already fetched: this is
+                    # TASK rows too (#399): whether a task is delivered, and by whom, is
+                    # read out of its `deliverable:` / `delivered-by:` comments, so the
+                    # listing showed EVERY delivered task with an empty deliverable (and
+                    # the assignee as its deliverer). That is not cosmetic — a card whose
+                    # whole work product is its deliverable read as "moved to review,
+                    # content lost", and was filed as a data-loss bug while the text sat
+                    # intact on the bead. The row gets a small signal, not the body — see
+                    # `_listing_task_signal` below.
+                    #
+                    # Only those rows, and only from the batch already fetched: this is
                     # a poll-rate endpoint, and the comment thread is the largest field on
-                    # a bead. Copying it for all 35 cards to serve the 3 that need it
-                    # would trade a real regression for a cosmetic one.
-                    if rid and rid in show_by_id and LABEL_BLOCKED in (r.get("labels") or []):
+                    # a bead. Copying it for every coding card, whose projection reads
+                    # nothing from it unless blocked, would buy nothing.
+                    labels = r.get("labels") or []
+                    if rid and rid in show_by_id and (LABEL_BLOCKED in labels or r.get("issue_type") == LABEL_TASK):
                         r["comments"] = show_by_id[rid].get("comments")
         out = [self._project(r) for r in rows]
+        for f in out:
+            if f.get("issue_type") == LABEL_TASK:
+                _listing_task_signal(f)
         # Cross-reference the puller's ready queue: a `ready` feature the puller won't
         # claim is dep-blocked even if the show batch missed its edges. Only when a
         # returned row IS ready — the loop's in_review / blocked / in_progress reads have
@@ -3102,6 +3489,29 @@ class BeadsBoard:
             raise BoardError(f"unknown feature {fid!r}")
         return f
 
+    def _card_lock(self, fid: str) -> threading.RLock:
+        """This card's task-edge lock (see ``_card_lock_for``), keyed by the store it lives
+        in as well as its id, so two boards that mint the same id never share one."""
+        return _card_lock_for((str(self.db or os.path.abspath(self.repo or ".")), fid))
+
+    def _apply_dispositions(self, fid: str, f: dict, dispositions: list[dict]) -> bool:
+        """Close the ledger items ``dispositions`` names — BEST-EFFORT: a failed write
+        (any failed `br` call, a timeout included) is logged and returns False, never
+        raises. True when the ledger CHANGED; rows it already reflects (a replay) write
+        nothing."""
+        items = f.get("requirements") or []
+        if not dispositions or not items:
+            return False
+        merged = apply_requirement_dispositions(items, dispositions)
+        if merged == items:
+            return False
+        try:
+            self.set_requirements(fid, merged)
+        except BR_FAILURES as exc:
+            log.warning("[project_board] %s requirement dispositions not applied (delivery kept): %s", fid, exc)
+            return False
+        return True
+
     def _find_by_external_ref(self, ref: str) -> dict | None:
         # `--limit 0` = unlimited: this scans EVERY feature for the merged PR's url, so a
         # 50-row cap would let record_merge silently miss (never close) a feature past
@@ -3178,10 +3588,17 @@ class BeadsBoard:
         # scans never cross-match.)
         delivered_by = bead.get("assignee", "")
         blocked_reason = ""
+        stamped = False
+        # Why the task's latest delivery was sent back, if it was (#432 review): the
+        # feedback from a rejection or a requeue-with-findings that comes AFTER the latest
+        # `deliverable:` record. A newer delivery supersedes the verdict on the one before,
+        # so it resets this — the next round is told about ITS predecessor only.
+        rejection = ""
         for c in bead.get("comments") or []:
             txt = _comment_text(c)
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
+                rejection = ""
             elif txt.startswith(BLOCKED_REASON_PREFIX):
                 # The LATEST `blocked: <reason>` comment — what the operator is told when
                 # a block is escalated, so the notification names the actual failure
@@ -3189,6 +3606,12 @@ class BeadsBoard:
                 blocked_reason = txt[len(BLOCKED_REASON_PREFIX) :].strip()
             elif txt.startswith(DELIVERED_BY_PREFIX):
                 delivered_by = txt[len(DELIVERED_BY_PREFIX) :].strip()
+                stamped = True
+            elif txt.startswith(VERIFICATION_FAILED_PREFIX) or txt.startswith(REVIEW_BOUNCE_PREFIX):
+                prefix = (
+                    VERIFICATION_FAILED_PREFIX if txt.startswith(VERIFICATION_FAILED_PREFIX) else REVIEW_BOUNCE_PREFIX
+                )
+                rejection = txt[len(prefix) :].lstrip(":").strip()
         # Who verified the task (#316 S3a): the `<by>` from the `verified: <by>` close
         # reason record_verification writes on approval (br exposes it as `close_reason`).
         # Strip the ` (self-verified)` suffix — that flag rides the label, projected as
@@ -3258,6 +3681,16 @@ class BeadsBoard:
             # Operator-notification markers (#341): the alert kinds already delivered to a
             "verified_sha": verified_sha,
             "deliverable": deliverable,
+            # Delivered IN THIS ROUND (#399, #432 review): a delivery is on record — a
+            # deliverable, or the `delivered-by:` stamp every record_delivery writes (the
+            # stamp alone covers a link-only delivery, which records no text) — AND the card
+            # is in review or done. A task sent back from review keeps its old deliverable
+            # on the bead (the single-card `deliverable` still shows it), but it is not
+            # delivered: the round it is in has produced nothing yet.
+            "delivered": (bool(deliverable) or stamped) and state in ("in_review", "done"),
+            # Why the latest delivery was sent back (tasks only; "" otherwise) — the next
+            # round's prompt leads with it (#432 review).
+            "rejection_feedback": rejection if bead.get("issue_type") == LABEL_TASK else "",
             "blocked_class": blocked_class,
             "blocked_reason": blocked_reason,
             "delivered_by": delivered_by,
