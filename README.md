@@ -45,7 +45,9 @@ board to a PR — or fork it as a starting point.
   by `coder_timeout_s`); **transient** failures (rate-limit / network / merge-conflict)
   retry with backoff while **capability** failures (no diff / timeout) escalate a tier
   or block; and on restart the loop **recovers** features stranded mid-build (adopt an
-  already-opened PR → `in_review`, else reset → `ready`).
+  already-opened PR → `in_review`, else reset → `ready`). It never rebuilds over, or
+  reaps, a worktree holding work that exists nowhere else: that card blocks as
+  `stranded-work`, naming the tree ([`docs/lifecycle.md`](docs/lifecycle.md), #405).
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
@@ -624,10 +626,11 @@ integration tier), **EXEMPT: `<reason>`** (real coverage genuinely not warranted
 stated), or **UNCOVERED** (honest debt) — and the UNCOVERED count is a ratchet that may
 fall, never rise.
 
-`worktree.py` reached its final contract over #361: **23 REAL / 3 EXEMPT / 0 UNCOVERED**
+`worktree.py` reached its final contract over #361: **24 REAL / 3 EXEMPT / 0 UNCOVERED**
 (`MAX_UNCOVERED_WORKTREE = 0`). The 11 local-git seams run against a real bare-origin +
-clone (slice 1); the 12 read-dominant `gh` seams run against a pinned, permanently-open PR
-with `PB_REQUIRE_GH=1` so an absent credential FAILS rather than skips (slice 2).
+clone (slice 1) — as does #405's `unpublished_work`, the 12th; the 12 read-dominant `gh`
+seams run against a pinned, permanently-open PR with `PB_REQUIRE_GH=1` so an absent
+credential FAILS rather than skips (slice 2).
 
 The remaining three are the **PR-lifecycle writes** — `open_pr`, `close_pr`,
 `_promote_adopted_draft` — classified **EXEMPT** (slice 3). Each mutates real PR lifecycle

@@ -48,6 +48,41 @@ class CoderTimeout(WorktreeError):
     on the same prompt would likely hang again)."""
 
 
+@dataclasses.dataclass(frozen=True)
+class StrandedTree:
+    """One worktree holding work that exists nowhere else (#405): where it is, the branch
+    it was built on, and what is in it (``unpublished_work``'s summary)."""
+
+    path: str
+    branch: str
+    summary: str
+
+
+class StrandedWorkError(WorktreeError):
+    """The board was about to build over — or promote onto — a worktree holding work that
+    exists nowhere else, and refused (#405). Carries the ``trees`` and the ``repo`` they
+    live in.
+
+    Not a failure of the build (it never started), so nothing retries, escalates or reaps
+    on it: the loop blocks the card under its own ``stranded-work`` class and the work stays
+    exactly where the dead coder left it until someone decides what it is worth. The message
+    becomes that block's reason — the one place the recovery is written down — so it names
+    every path, what is in each, and both ways out."""
+
+    def __init__(self, repo: str, trees: Iterable[StrandedTree]):
+        self.repo = repo
+        self.trees = list(trees)
+        where = "; ".join(f"{t.path} ({t.branch}): {t.summary}" for t in self.trees)
+        one = self.trees[0] if len(self.trees) == 1 else None
+        path, branch = (one.path, one.branch) if one else ("<path>", "<branch>")
+        super().__init__(
+            f"{len(self.trees)} worktree(s) hold work that exists nowhere else, so the board will not "
+            f"build over them — {where}. Recover it (switch the tree to a branch of your own and "
+            f"commit, or open a PR from it) or discard it (`git -C {repo} worktree remove --force "
+            f"{path} && git -C {repo} branch -D {branch}`{'' if one else ' for each'}), then unblock the card."
+        )
+
+
 async def _git(repo: str, *args: str, timeout: float = 60) -> tuple[int, str, str]:
     """Run a git command in ``repo``; return (rc, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -184,6 +219,86 @@ async def stage_all(worktree: str) -> tuple[int, str, str]:
     return await _git(worktree, "add", "-A", "--", ".", *excludes)
 
 
+def _is_board_link(tree: str, entry: str) -> bool:
+    """Is this untracked porcelain entry one of the ``node_modules`` links
+    ``link_node_modules`` made? A ``node_modules/`` ignore pattern — the trailing-slash
+    spelling most Node repos use — matches only a real directory, so git reports the
+    board's own symlink as untracked in exactly those repos."""
+    rel = entry.rstrip("/")
+    return os.path.basename(rel) == "node_modules" and os.path.islink(os.path.join(tree, rel))
+
+
+def _is_candidate_branch(branch: str) -> bool:
+    """``feat/<id>.g<n>`` / ``.c<n>`` / ``.test`` — a throwaway candidate's branch, which
+    the board never pushes, rebases or merges."""
+    wt_id = branch[len("feat/") :] if branch.startswith("feat/") else ""
+    return bool(wt_id) and parent_feature_id(wt_id) != wt_id
+
+
+async def unpublished_work(path: str, *, branch: str = "") -> str:
+    """What removing the worktree at ``path`` — and deleting ``branch`` with it — would
+    destroy, as a short summary; ``""`` when nothing would be lost (#405).
+
+    Counts every uncommitted change git can see: modified, staged, deleted and untracked
+    files. Not the board's own droppings: the coder's session scratch (``CODER_SCRATCH`` —
+    the exclusion ``stage_all`` applies, so "clean" here means exactly "nothing a PR would
+    carry") and the ``node_modules`` links ``create_worktree`` makes.
+
+    For a CANDIDATE branch it also counts commits no other branch, tag or remote holds.
+    The brief tells a coder it is edit-only, but one with a shell can commit, and ``git
+    branch -D`` drops that commit as surely as ``--force`` drops a file. Candidates only:
+    the board pushes, rebases and squash-merges a CANONICAL branch, so a canonical commit
+    missing from every other ref is routine — a force-pushed rebase leaves the pre-rebase
+    commits exactly there — and says nothing about stranded work.
+
+    ``""`` when ``path`` is not a worktree root (no ``.git`` in it): trees live inside the
+    main checkout, so git would answer for THAT repo instead. Fails toward keeping the
+    tree: on a real worktree, a git that errors or times out reports it as unreadable,
+    which every caller treats as work."""
+    if not os.path.exists(os.path.join(path, ".git")):
+        return ""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    try:
+        # --no-optional-locks: a probe must never take the index lock out from under a
+        # tree something may still be writing to (a hung drive's coder, bd-ezs7).
+        rc, out, err = await _git(
+            path, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--", ".", *excludes
+        )
+    except WorktreeError as exc:
+        return f"unreadable ({exc})"
+    if rc != 0:
+        return f"unreadable (git status failed: {(err or out).strip()[:160]})"
+    changes = []
+    for line in out.splitlines():
+        # "XY PATH" — slice the status columns off each RAW line (see base_checkout_dirt).
+        entry = line[3:]
+        if entry and not (line.startswith("?? ") and _is_board_link(path, entry)):
+            changes.append(f"{line[:2].strip()} {entry}")
+    parts = []
+    if changes:
+        more = f", … ({len(changes) - 5} more)" if len(changes) > 5 else ""
+        parts.append(f"{len(changes)} uncommitted file(s): {', '.join(changes[:5])}{more}")
+    if _is_candidate_branch(branch):
+        try:
+            rc, out, _err = await _git(
+                path,
+                "rev-list",
+                "--count",
+                f"refs/heads/{branch}",
+                "--not",
+                f"--exclude={branch}",
+                "--branches",
+                "--remotes",
+                "--tags",
+            )
+        except WorktreeError as exc:
+            return "; ".join([*parts, f"unreadable ({exc})"])
+        n = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0  # no branch → nothing to drop
+        if n:
+            parts.append(f"{n} commit(s) on {branch} that no other branch or remote holds")
+    return "; ".join(parts)
+
+
 def slugify(title: str, max_len: int = 40) -> str:
     """A filesystem/branch-safe slug of a feature title (#227): lowercased, every run of
     non-alphanumerics collapsed to a single hyphen, leading/trailing hyphens stripped,
@@ -273,7 +388,9 @@ async def create_worktree(
 
     Returns (absolute worktree path, branch). The branch is fresh off ``base`` so
     the blast radius is one throwaway tree. Cleans a stale worktree/branch of the
-    same name first (idempotent re-run after a crashed feature).
+    same name first (idempotent re-run after a crashed feature) — unless that tree
+    holds work that exists nowhere else (``unpublished_work``), which raises
+    ``StrandedWorkError`` and leaves it untouched (#405).
 
     ``resume`` (a FIX ROUND on a card that already has an open PR) starts from
     ``origin/<branch>`` instead — the PR head — when that ref resolves. Without it the
@@ -299,6 +416,14 @@ async def create_worktree(
     path = os.path.join(repo, rel)
     # Preventive: drop stale worktree admin entries before touching anything (#225).
     await prune_stale_worktrees(repo)
+    # The cleanup below is `remove --force` + `branch -D`. On a tree whose coder died
+    # before promotion, that is the only copy of the work — bd-ezs7's finished 170 lines
+    # survived only because a hung drive kept the card from re-dispatching (#405). So a
+    # tree holding work is refused, never cleaned. The drive discards its OWN earlier
+    # attempt before asking for a fresh tree, so anything found here, another run left.
+    stranded = await unpublished_work(path, branch=branch)
+    if stranded:
+        raise StrandedWorkError(repo, [StrandedTree(os.path.abspath(path), branch, stranded)])
     # Best-effort cleanup of a prior run's leftovers.
     await _git(repo, "worktree", "remove", "--force", rel)
     await _git(repo, "branch", "-D", branch)
@@ -407,10 +532,63 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     return removed
 
 
+def _feature_tree_names(base: str, fid: str) -> tuple[list[str], list[str]]:
+    """The on-disk worktree dirs under ``base`` that feature ``fid`` owns BY SCAN, as
+    ``(slugged canonical names, candidate names)``, sorted. The bare ``feat-<fid>`` is
+    not scanned for — its name is computable, and ``reap_feature_worktree`` attempts it
+    whether or not it exists.
+
+    Slugged canonical: ``feat-<fid>-<slug>`` (#227), a hyphen tail. Candidate:
+    ``feat-<fid>.<suffix>`` whose suffixes strip back to ``fid`` (the stacked
+    ``.test.g2`` shape included; ``feat-<fid>x`` prefix-collisions and non-candidate dots
+    like ``.gx`` excluded). A candidate uses a ``.`` separator, so neither scan can
+    mistake one kind for the other. Branches mirror the names (``feat-`` → ``feat/``)."""
+    try:
+        names = sorted(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
+    except OSError:
+        return [], []
+    slugged = [n for n in names if n.startswith(f"feat-{fid}-")]
+    candidates = [n for n in names if n.startswith(f"feat-{fid}.") and parent_feature_id(n[len("feat-") :]) == fid]
+    return slugged, candidates
+
+
+async def _reap_unless_stranded(repo: str, path: str, branch: str, kept: list[StrandedTree]) -> bool:
+    """``remove_worktree`` — unless the tree holds work that exists nowhere else (#405):
+    then it is left exactly as it is, recorded in ``kept``, and reported not-removed."""
+    stranded = await unpublished_work(path, branch=branch)
+    if stranded:
+        kept.append(StrandedTree(os.path.abspath(path), branch, stranded))
+        return False
+    return await remove_worktree(repo, path, branch)
+
+
+# (path, summary) pairs already reported by ``_warn_kept`` in this process. The health
+# sweep re-offers a kept tree every pass; the operator needs to hear about it once, and
+# again only if what is in it changes.
+_KEPT_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_kept(fid: str, kept: list[StrandedTree]) -> None:
+    for t in kept:
+        if (t.path, t.summary) in _KEPT_WARNED:
+            log.debug("[project_board] %s: still keeping %s — it holds unpublished work", fid, t.path)
+            continue
+        _KEPT_WARNED.add((t.path, t.summary))
+        log.warning(
+            "[project_board] %s: KEPT %s (%s) — it holds work that exists nowhere else: %s. The board "
+            "will not reap it; recover it, or discard it by hand once you have looked (#405)",
+            fid,
+            t.path,
+            t.branch,
+            t.summary,
+        )
+
+
 async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> bool:
     """Remove the worktree(s) + branch(es) a feature owns, by its id — the one place
     that knows the ``feat-<id>`` / ``feat/<id>`` naming. Shared by the merge webhook,
-    the merge poll (both reap once a feature reaches ``done``), and the cancel path.
+    the merge poll (both reap once a feature reaches ``done``), the cancel path, and the
+    health sweep.
 
     Reaps the canonical ``feat-<id>`` tree first, then sweeps any leftover CANDIDATE
     trees (``feat-<id>.g<n>`` / ``.c<n>`` / ``.test``…, the ``_CANDIDATE_SUFFIX_RE``
@@ -425,42 +603,56 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     whose slug isn't recomputable from ``fid`` alone here. The bare ``feat-<id>`` name is
     always ATTEMPTED (an idempotent no-op when only candidates or a slugged tree exist),
     then any on-disk ``feat-<id>-*`` slugged variant is discovered by scan and removed
-    with its matching ``feat/<id>-<slug>`` branch. A candidate uses a ``.`` separator, so
-    the ``-`` slug scan can never mistake one for a canonical tree."""
+    with its matching ``feat/<id>-<slug>`` branch.
+
+    Every caller is cleaning up after a run that is already over, so a tree still holding
+    work that exists nowhere else (``unpublished_work``) is KEPT, not reaped (#405): a
+    coder that died before promotion leaves its only copy exactly here, and a cancel or a
+    sweep that arrives next must not be what destroys it. Kept trees are logged by path,
+    once. A drive discarding the trees it just built itself — rejected candidates —
+    removes them by path with ``remove_worktree``, never through here."""
     base = os.path.join(repo, worktrees_root)
     canonical = os.path.join(base, f"feat-{fid}")
+    kept: list[StrandedTree] = []
     had_canonical = os.path.isdir(canonical)
-    removed = await remove_worktree(repo, canonical, f"feat/{fid}")
+    removed = await _reap_unless_stranded(repo, canonical, f"feat/{fid}", kept)
     cleaned: list[str] = [f"feat-{fid}"] if (removed and had_canonical) else []
-    try:
-        names = sorted(os.listdir(base))
-    except OSError:
-        names = []
-    # The slugged canonical variant(s): `feat-<fid>-<slug>` (a hyphen tail — a candidate
-    # uses a dot). Branch mirrors the dir name (`feat-` → `feat/`).
-    for name in names:
-        if not name.startswith(f"feat-{fid}-") or not os.path.isdir(os.path.join(base, name)):
-            continue
-        had_canonical = True
-        if await remove_worktree(repo, os.path.join(base, name), "feat/" + name[len("feat-") :]):
+    slugged, candidates = _feature_tree_names(base, fid)
+    for name in slugged:
+        if await _reap_unless_stranded(repo, os.path.join(base, name), "feat/" + name[len("feat-") :], kept):
             cleaned.append(name)
         else:
             removed = False
     reaped: list[str] = []
-    for name in names:
-        wt_id = name[len("feat-") :]
-        # Only THIS feature's candidates: `feat-<fid>.<suffix>` whose suffixes strip
-        # back to fid (handles the stacked `.test.g2` shape; skips `feat-<fid>x`
-        # prefix-collisions and non-candidate dots like `.gx`).
-        if not name.startswith(f"feat-{fid}.") or parent_feature_id(wt_id) != fid:
-            continue
-        if not os.path.isdir(os.path.join(base, name)):
-            continue
-        if await remove_worktree(repo, os.path.join(base, name), f"feat/{wt_id}"):
+    for name in candidates:
+        if await _reap_unless_stranded(repo, os.path.join(base, name), "feat/" + name[len("feat-") :], kept):
             reaped.append(name)
     if cleaned or reaped:
         log.info("[project_board] reaped worktrees for %s: %s", fid, ", ".join(cleaned + reaped))
+    if kept:
+        _warn_kept(fid, kept)
     return removed
+
+
+async def stranded_worktrees(repo: str, worktrees_root: str, fid: str) -> list[StrandedTree]:
+    """Every tree feature ``fid`` has on disk that holds work existing nowhere else (#405)
+    — its canonical ``feat-<id>[-<slug>]`` and every candidate ``feat-<id>.<suffix>``, by
+    the naming ``reap_feature_worktree`` sweeps. Empty when a rebuild destroys nothing.
+
+    The drive asks before every FRESH build, so a card whose last coder died with its
+    work on disk blocks and names the tree instead of paying for a coder run that would
+    only rebuild over it — and it checks every tree the card owns, not just the one this
+    build is about to reuse: a stale ``.g2`` would otherwise surface mid-ladder, after the
+    greedy rung was already spent."""
+    base = os.path.join(repo, worktrees_root)
+    slugged, candidates = _feature_tree_names(base, fid)
+    trees: list[StrandedTree] = []
+    for name in [f"feat-{fid}", *slugged, *candidates]:
+        path = os.path.join(base, name)
+        stranded = await unpublished_work(path, branch="feat/" + name[len("feat-") :])
+        if stranded:
+            trees.append(StrandedTree(os.path.abspath(path), "feat/" + name[len("feat-") :], stranded))
+    return trees
 
 
 async def promote_worktree(
@@ -478,13 +670,20 @@ async def promote_worktree(
     Moves the worktree dir and renames its branch IN PLACE, so the coder's still-
     uncommitted changes ride along (verified: ``git worktree move`` + ``branch -m``
     preserve the dirty tree). Idempotently clears a stale canonical worktree/branch
-    first so ``move`` has a free destination. A winner already at the canonical path is
-    a no-op. Returns (canonical_path, canonical_branch)."""
+    first so ``move`` has a free destination — unless that canonical tree holds work
+    that exists nowhere else, which raises ``StrandedWorkError`` before anything moves
+    (#405). A winner already at the canonical path is a no-op. Returns
+    (canonical_path, canonical_branch)."""
     canon_branch = branch_name(fid, title)
     canon_rel = os.path.join(root, worktree_dir(fid, title))
     canon_path = os.path.join(repo, canon_rel)
     if os.path.abspath(src_wt) == os.path.abspath(canon_path):
         return os.path.abspath(canon_path), canon_branch
+    # A canonical tree an earlier drive left mid-build is the same stranded work a dead
+    # candidate is (#405): refuse before the forced clear, and before the winner moves.
+    stranded = await unpublished_work(canon_path, branch=canon_branch)
+    if stranded:
+        raise StrandedWorkError(repo, [StrandedTree(os.path.abspath(canon_path), canon_branch, stranded)])
     # Free the destination: drop any stale canonical worktree/branch leftover.
     await _git(repo, "worktree", "remove", "--force", canon_rel)
     await _git(repo, "branch", "-D", canon_branch)

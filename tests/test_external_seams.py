@@ -61,7 +61,8 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # worktree.py — shells `gh` and `git`. The 11 LOCAL-git seams (no network, no credential)
 # are exercised against a real git repo in tests/test_worktree_git.py — a temporary bare origin
 # plus a clone, so `origin/<base>` and PR-branch resume resolve exactly as in production (#361,
-# slice 1). The 12 read-dominant `gh`/GitHub seams are now exercised against a PINNED,
+# slice 1); the 12th, #405's `unpublished_work`, the same way in tests/test_stranded_work_405.py.
+# The 12 read-dominant `gh`/GitHub seams are now exercised against a PINNED,
 # permanently-open PR in tests/test_worktree_gh.py (#361, slice 2): CI sets PB_REQUIRE_GH=1 so an
 # absent/unusable credential FAILS instead of skipping — the same posture that made the real-`br`
 # tier catch #353/#356, applied to the read seams a mocked `_gh` was blind to (how #354 shipped).
@@ -124,6 +125,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "remove_worktree": "REAL",
     "repo_slug": "REAL",
     "stage_all": "REAL",
+    "unpublished_work": "REAL",
 }
 
 # store.py — shells `br`. This is the strong tier: CI runs a real pinned binary across
@@ -301,8 +303,10 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
-    """The final worktree coverage contract after #361 S1/S2/S3: 23 REAL, 3 EXEMPT, 0 UNCOVERED.
+def test_worktree_coverage_contract_is_24_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 24 REAL, 3 EXEMPT, 0 UNCOVERED — the
+    24th being #405's ``unpublished_work``, exercised against real git in
+    tests/test_stranded_work_405.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -320,7 +324,7 @@ def test_worktree_coverage_contract_is_23_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 23, f"expected 23 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 24, f"expected 24 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

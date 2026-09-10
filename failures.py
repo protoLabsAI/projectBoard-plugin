@@ -95,6 +95,14 @@ def classify(error: str, *, provider_rules: bool = True) -> Policy:
 # genuine build inherits.
 PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 
+# The `blocked-class:` of a card the loop would not rebuild because a worktree it would
+# build over holds work that exists nowhere else (#405) — a coder that died before its
+# candidate was promoted, a drive a restart interrupted mid-gate. The loop's own class,
+# like `dispatch-infra`: no message `classify()` sees can produce it. Deliberately absent
+# from the loop's self-healing set: waiting never decides what the stranded work is
+# worth, so the operator is told, with the paths, and the card stays put.
+STRANDED_WORK_CLASS = "stranded-work"
+
 # Dispatch-seam / pre-first-token infrastructure signatures — a failure raised BELOW
 # the model call: the C1 tapped-seam contract (a kwarg mismatch, a non-TappedResult
 # reply), a missing / unresolved / unknown delegate, an adapter or session refusing

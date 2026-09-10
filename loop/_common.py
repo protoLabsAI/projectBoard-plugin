@@ -50,7 +50,7 @@ import time
 import types
 
 from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
-from ..failures import PRE_MODEL_DISPATCH_CLASS, classify, is_pre_model_dispatch_failure
+from ..failures import PRE_MODEL_DISPATCH_CLASS, STRANDED_WORK_CLASS, classify, is_pre_model_dispatch_failure
 from ..projects import default_project as resolve_default_project
 from ..projects import resolve_projects
 from .. import store as store_mod
@@ -1289,6 +1289,7 @@ __all__ = [
     "work_snapshot",
     "worktree",
     "PRE_MODEL_DISPATCH_CLASS",
+    "STRANDED_WORK_CLASS",
     "classify",
     "is_pre_model_dispatch_failure",
     "resolve_default_project",

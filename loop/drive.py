@@ -245,6 +245,20 @@ class DriveMixin:
         inflight, self._inflight = dict(self._inflight), {}
         for fid, (repo, wt, branch) in inflight.items():
             try:
+                # Unless the tree holds work (#405). A restart mid-drive used to reap it,
+                # and a finished implementation waiting on its gate went with it. Kept, the
+                # next boot requeues the card and its re-dispatch blocks on the tree,
+                # naming the path — the same edge a coder that died mid-build hits.
+                stranded = await worktree.unpublished_work(wt, branch=branch or "")
+                if stranded:
+                    log.warning(
+                        "[project_board] kept in-flight worktree on shutdown: %s holds work that exists "
+                        "nowhere else (%s) — %s blocks on its next dispatch until it is recovered or discarded",
+                        wt,
+                        stranded,
+                        fid,
+                    )
+                    continue
                 ok = await worktree.remove_worktree(repo, wt, branch or "")
                 if ok:
                     log.info("[project_board] reaped in-flight worktree on shutdown: %s", wt)
@@ -1172,6 +1186,22 @@ class DriveMixin:
                     #    the existing diff with one coder, so it must NOT re-fan-out N.
                     #  • otherwise → one fresh worktree, one dispatch.
                     reusing = keep_wt and wt is not None
+                    if not reusing:
+                        # A FRESH build first clears the ground, and the two halves are one
+                        # rule (#405). This drive's own earlier attempt is its to throw away:
+                        # the handler below already judged it, and a retry has always rebuilt
+                        # from scratch (`create_worktree` used to wipe it implicitly). Anything
+                        # ELSE the card holds on disk, a run left without deciding — a coder
+                        # that died before promotion, a drive a restart interrupted — and it
+                        # may be the only copy of a finished implementation. Block and name it,
+                        # rather than pay for a coder run that could only build over it.
+                        if wt is not None:
+                            await worktree.remove_worktree(repo, wt, branch or "")
+                            self._inflight.pop(fid, None)
+                            wt = branch = None
+                        stranded = await worktree.stranded_worktrees(repo, self.root, fid)
+                        if stranded:
+                            raise worktree.StrandedWorkError(repo, stranded)
                     if reusing:
                         keep_wt = False  # consume the reuse
                         self._inflight[fid] = (repo, wt, branch)
@@ -1556,6 +1586,15 @@ class DriveMixin:
                         # failure on a closed card.
                         log.info("[project_board] %s dispatch ended by operator cancel: %s", fid, exc)
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
+                        return
+                    if isinstance(exc, worktree.StrandedWorkError):
+                        # Not a failure of this build — it never started (#405). No retry,
+                        # no tier climb, and nothing reaped: the work on disk IS the point.
+                        # The loop's own non-healing class, so the blocked sweep tells the
+                        # operator once, with the paths the reason names.
+                        log.warning("[project_board] %s blocked (%s): %s", fid, STRANDED_WORK_CLASS, exc)
+                        await asyncio.to_thread(store.flag_blocked, fid, str(exc), category=STRANDED_WORK_CLASS)
+                        self._inflight.pop(fid, None)
                         return
                     policy = classify(str(exc))
                     # A PROVIDER failure is only ever the dispatch's own. The same words in a
@@ -2268,19 +2307,23 @@ class DriveMixin:
             if isinstance(r, Exception):
                 log.info("[project_board] %s max-mode candidate %d failed (skipped): %s", fid, i, r)
         idx = await self._select_candidate(feature, base, [wt for wt, _b in cands])
+        # The candidates are this drive's own, judged just above, so they are discarded by
+        # PATH — like the solve ladder's losers. Never through `reap_feature_worktree`: that
+        # is the sweep for trees a finished run left behind, and it keeps any holding work
+        # (#405) — which every losing candidate does.
         if idx is None:
-            for cid in cand_ids:
-                await worktree.reap_feature_worktree(repo, self.root, cid)
+            for wt, branch in cands:
+                await worktree.remove_worktree(repo, wt, branch)
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]
         canon_wt, canon_branch = await worktree.promote_worktree(
             repo, win_wt, win_branch, fid, self.root, title=feature.get("title") or ""
         )
-        # Reap the losers (the winner was moved out of its candidate name by promote).
-        for i, cid in enumerate(cand_ids):
+        # Discard the losers (the winner was moved out of its candidate name by promote).
+        for i, (wt, branch) in enumerate(cands):
             if i != idx:
-                await worktree.reap_feature_worktree(repo, self.root, cid)
+                await worktree.remove_worktree(repo, wt, branch)
         winner_reply = results[idx] if not isinstance(results[idx], Exception) else ""
         return canon_wt, canon_branch, winner_reply
 
