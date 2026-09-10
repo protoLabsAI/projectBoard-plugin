@@ -3071,7 +3071,10 @@ class _TaskStore:
         return []
 
     def get_feature(self, fid):
-        return next((dict(x) for x in self._features if x["id"] == fid), None)
+        f = next((dict(x) for x in self._features if x["id"] == fid), None)
+        if f is not None and fid in self.claimed:
+            f["board_state"] = "in_progress"  # what claim()/claim_task() did to it
+        return f
 
     def record_delivery(self, fid, text=""):
         self.calls.append(("record_delivery", fid, text))
@@ -9938,6 +9941,10 @@ class _BlockedStore:
 
     def list_features(self, state=None, **_kw):
         return list(self._rows) if state == "blocked" else []
+
+    def get_feature(self, fid):  # the sweep re-reads a card before it moves it (#402)
+        row = self._row(fid)
+        return dict(row) if row is not None else None
 
     def clear_blocked(self, fid):
         self.cleared.append(fid)

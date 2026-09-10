@@ -291,6 +291,66 @@ Delivery is **feature-detected**: the operator inbox is a host module the plugin
 hard-depend on. On a host without it — or if the inbox refuses — the block is still logged
 as a WARNING, which is strictly louder than the silence a block used to leave.
 
+## Attaching a PR the board didn't open
+
+The loop adopts PRs it did not see opened in exactly one place: crash recovery finds the PR
+whose head is a card's own branch and moves the card to `in_review`. A PR an operator opens
+by hand needs the same thing, for example recovered work pushed from a dead coder's worktree.
+`board_attach_pr` / `POST /features/{fid}/attach-pr` (#402) is that edge, and it is no wider
+than recovery.
+
+| The PR must be | Because |
+|---|---|
+| **open**, in the card's project repo, not from a fork | fix rounds push to this repo's branch; a merged PR has nothing left to review (use the manual Done edge) |
+| on the card's own branch, `feat/<id>-<slug>` | every later edge keys on it: CI and review fix rounds resume `origin/<that branch>`, and so do recovery and the reap. A PR on any other branch would be abandoned by the first fix round, which opens a second PR |
+| targeting the project's base branch | the rebase and merge edges work against that base |
+
+A draft is fine. It attaches like any other PR, and the auto-merge edge holds it until it is
+marked ready.
+
+The card must be a coding **feature** (not a task, epic or milestone) that has passed the
+Ready gate. That is judged on its lane *underneath* any block: `ready` or `in_progress`,
+blocked or not. A backlog card that was merely blocked has not passed the gate. The card must
+have no open dependency, and the loop must not be working it: no live drive, no claimed
+build, no review gate running.
+
+The board tracks one PR per card:
+- A card already in review on *this* PR is a no-op.
+- A card that tracks this PR anywhere else is refused.
+  - A **blocked** card could be blocked by the review gate asking for a human, and
+    re-attaching would lift the block and re-arm the gate without one. Unblocking is a
+    deliberate `board_unblock_feature`.
+  - A card in a fix round is already being driven back to review.
+- A card whose earlier PR was **closed** (rejected, then reworked on the same branch) can take
+  the new PR in its place. An earlier PR that is still open or already merged is refused.
+
+Every refusal changes nothing and says what to do instead.
+
+**The write.** It is one `br update` under the loop's claim lock, so a `ready` card cannot be
+claimed halfway through.
+- It leaves the card where `open_review` would: `in_review` with the PR on `external_ref`.
+- It drops `ready`, the `blocked` flag and its class, and every verdict pinned to an earlier
+  head: the review verdict and its sha pin, the reviewed-head stamp, and the
+  `merged-verified` stamp. The board has never gated or reviewed the attached head, and no
+  stamp may say otherwise.
+- When `review_gate` is on it sets `review-pending`, so the gate reviews the attached head
+  instead of the merge edge waiting forever for a verdict.
+- The health sweep's own moves take the same lock and re-read the card first. A sweep that
+  read the card before the attach can't requeue it afterwards. If the sweep's recovery adopts
+  the same PR first, the attach still arms the gate and records itself.
+
+**The attached code has NOT been through the board's pre-PR checks.** The drive runs fixups,
+the local gate and the acceptance tests before it opens a PR; none of those ran on this code.
+What still applies is everything after the PR: CI, the review gate when it is on, rebase,
+merged-state verification, then merge → `done`.
+
+**Audit.** The attach is an `attached PR:` comment on the card, naming who attached it, the
+state it left, and why. That comment is written last. If it fails, the attach still stands
+and the result carries a `warning`.
+
+Fix budgets the card already spent are not reset. A card whose automated fix rounds are
+exhausted still stops at the next failure, for a human.
+
 ## Where to look next
 
 - [`docs/configuration.md`](configuration.md) — `review_gate`, `review_dispatch`,

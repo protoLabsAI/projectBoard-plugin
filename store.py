@@ -358,6 +358,14 @@ PULLABLE_ISSUE_TYPES = ("feature", "task")
 # in flight can be hand-closed. backlog/ready have shipped nothing to record; done/
 # cancelled are already terminal (re-closing is a no-op or an unwanted state-flip).
 _MANUAL_DONE_SOURCE_STATES = ("in_progress", "in_review", "blocked")
+# The lanes a card must sit in, UNDERNEATH any block, to take an externally opened PR (#402,
+# attach_pr): lanes a card reaches only by passing the Ready gate. It is the lane, not the
+# board state: `blocked` is a flag on top of a lane, and deciding on the flag let a backlog
+# card that was merely blocked (the Ready gate never run) skip straight into review.
+# backlog has not passed the gate (there are no acceptance criteria to review against);
+# done/cancelled are terminal. A card IN review takes only its own PR again, as a no-op;
+# in_review underneath a block is a card whose earlier PR was closed.
+_ATTACH_SOURCE_LANES = ("ready", "in_progress", "in_review")
 # Which PROJECT a feature belongs to (#90): a `project:<name>` label naming the entry
 # in the board's `projects:` map (projects.py) that owns this feature — so one board
 # instance can serve multiple repos, the Ready gate validating each feature's paths
@@ -2181,6 +2189,89 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    # Under the card's lock (#432's `_task_edge`): the attach is a read-validate-write across
+    # several `br` calls, and a concurrent requeue of the same card must not land in between.
+    @_task_edge
+    def attach_pr(
+        self,
+        fid: str,
+        pr_url: str,
+        *,
+        reason: str = "",
+        by: str = "",
+        review_pending: bool = False,
+        replaces: str = "",
+    ) -> tuple[dict, bool, str]:
+        """Attach an externally opened PR to an in-flight coding card (#402). This is the
+        board edge of ``loop.attach_external_pr``, which proves the PR is the card's own
+        first. The card moves to in_review with ``pr_url`` on external_ref, which is exactly
+        where ``open_review`` leaves one, so the ordinary reconcile drives it from here: CI,
+        the review gate, rebase, merge → done. Returns ``(feature, already_attached,
+        audit_warning)``.
+
+        ONE ``br update``, so the card is never half-attached. It sets status in_progress
+        plus the in-review label and the ref. It drops what no longer holds: ``ready``, the
+        ``blocked`` flag and its class, and every verdict pinned to an earlier head: a review
+        verdict and its sha pin, the reviewed-head stamp, and the ``merged-verified`` stamp.
+        The board never gated or reviewed the attached head, so no stale stamp may let it
+        merge. ``review_pending`` arms the review gate for this head (pass it when the gate is
+        on). Otherwise a gated card would wait forever for a verdict nothing is producing.
+        ``replaces`` names a prior PR the caller proved is closed, which the new one may take
+        the place of (see ``attach_refusal``).
+
+        A card found ALREADY in review on this PR got there by another path since the caller
+        looked; the health sweep's recovery adopts the same PR. That still counts as an attach:
+        the gate is armed if the card carries no review state yet, the audit line is written,
+        and ``already_attached`` is True. The audit comment is written last and cannot undo the
+        attach. If it fails, the attach stands and ``audit_warning`` says so."""
+        f = self._require(fid)
+        pr_url = normalize_external_ref(pr_url, edge="attach_pr")
+        refusal = attach_refusal(f, pr_url, replaces=replaces)
+        if refusal:
+            raise BoardError(refusal)
+        labels = f.get("labels") or []
+        already = f["board_state"] == "in_review"  # this PR, adopted by another path meanwhile
+        if already:
+            review_state = (LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED, LABEL_REVIEW_CLEAN)
+            if review_pending and not any(label in labels for label in review_state):
+                self._run("update", fid, "--add-label", LABEL_REVIEW_PENDING)
+        else:
+            args = ["update", fid, "--status", "in_progress", "--add-label", LABEL_IN_REVIEW, "--external-ref", pr_url]
+            if review_pending:
+                args += ["--add-label", LABEL_REVIEW_PENDING]
+            # Remove only labels that are present, and never one this update adds: `br` applies
+            # --remove-label after --add-label, so emitting both for one value nets to removed.
+            stale_prefixes = (
+                LABEL_BLOCKED_CLASS_PREFIX,
+                LABEL_REVIEW_CLEAN_SHA_PREFIX,
+                LABEL_REVIEWED_HEAD_PREFIX,
+                LABEL_MERGED_VERIFIED_PREFIX,
+            )
+            for label in labels:
+                if (
+                    label in (LABEL_READY, LABEL_BLOCKED, LABEL_CHANGES_REQUESTED, LABEL_REVIEW_CLEAN)
+                    or str(label).startswith(stale_prefixes)
+                    or (label == LABEL_REVIEW_PENDING and not review_pending)
+                ):
+                    args += ["--remove-label", label]
+            self._run(*args)
+        was = "already in review on it (adopted by the board meanwhile)" if already else f["board_state"]
+        if f.get("blocked") and f.get("blocked_reason"):
+            was += f" ({f['blocked_reason'][:200]})"
+        note = f"attached PR: {pr_url} — by {str(by or '').strip() or self.actor}; was {was}"
+        prior = str(f.get("pr_url") or "").strip()
+        if prior and pr_key(prior) != pr_key(pr_url):
+            note += f"; replaces closed PR {prior}"
+        if str(reason or "").strip():
+            note += f"; reason: {reason.strip()}"
+        warning = ""
+        try:
+            self._run("comments", "add", fid, note)
+        except Exception as exc:  # noqa: BLE001 — the attach has landed; a lost audit line must not un-say it
+            warning = f"attached, but the audit comment could not be written: {exc}"
+            log.warning("[project_board] %s: %s", fid, warning)
+        return self.get_feature(fid), already, warning
+
     @_task_edge
     def record_delivery(self, fid: str, text: str = "", ref: str = "") -> dict:
         """Record a task-type bead's DELIVERABLE (#217) — the task sibling of the
@@ -3614,6 +3705,89 @@ def pr_number(pr_url: str) -> str:
     """``"42"`` for ``https://github.com/o/r/pull/42`` (or ``""``)."""
     m = _PR_NUMBER_RE.search(str(pr_url or ""))
     return m.group(1) if m else ""
+
+
+_PR_KEY_RE = re.compile(r"^https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)(?:[/?#]|$)", re.IGNORECASE)
+
+
+def pr_key(pr_url: str) -> tuple[str, str]:
+    """``("owner/repo", "42")`` (the slug casefolded) for a GitHub PR url, or ``("", "")``.
+    It is the identity two spellings of the same PR share: a trailing ``/files``, a
+    ``#discussion`` anchor, or different casing is still the same PR."""
+    m = _PR_KEY_RE.match(str(pr_url or "").strip())
+    return (f"{m.group(1)}/{m.group(2)}".casefold(), m.group(3)) if m else ("", "")
+
+
+def attach_refusal(feature: dict, pr_url: str, *, replaces: str = "") -> str:
+    """Why ``feature`` cannot take ``pr_url`` as its PR (#402), or ``""`` when it can: the
+    BOARD half of the attach edge's checks. Pure, with no I/O. The attach verb runs it
+    before spending any ``gh`` call, and ``attach_pr`` runs it again on the fresh projection
+    at write time.
+
+    - Only a coding ``feature``: a task enters review with its deliverable, and an epic or a
+      milestone never builds anything.
+    - Only a card that passed the Ready gate, judged on its lane UNDERNEATH any block (see
+      ``_ATTACH_SOURCE_LANES``).
+    - A card that already tracks this PR: in review, the attach is a no-op; anywhere else
+      the attach is refused. Re-attaching a blocked card's own PR would clear its block,
+      which may be the review gate asking for a human, and re-arm the gate without one.
+      Unblocking is a deliberate ``board_unblock_feature``. A card in a fix round on the
+      PR is already being driven back to review by the loop.
+    - One PR per card. A DIFFERENT PR takes the place of the card's own only when it is
+      ``replaces``, the one the caller proved is closed. A PR under live review is never
+      swapped out.
+    - No open dependency."""
+    fid = feature.get("id", "")
+    itype = str(feature.get("issue_type") or "")
+    if itype == LABEL_TASK:
+        return f"{fid} is a task — a task enters review with its deliverable (board_deliver), not a PR"
+    if itype != "feature":
+        return f"{fid} is {'an ' + itype if itype else 'an untyped bead'}, not a coding feature — only a feature takes a PR"
+    key = pr_key(pr_url)
+    if not key[0]:
+        return f"{pr_url!r} is not a GitHub pull request url (https://github.com/<owner>/<repo>/pull/<n>)"
+    current = str(feature.get("pr_url") or "").strip()
+    state = feature.get("board_state")
+    if current and pr_key(current) == key:
+        if state == "in_review":
+            return ""
+        if feature.get("blocked"):
+            why = str(feature.get("blocked_reason") or "").strip() or "no reason recorded"
+            return (
+                f"{fid} already tracks {current} and is blocked ({why}) — attaching it again would lift that "
+                f"block; unblocking is a deliberate decision: board_unblock_feature({fid})"
+            )
+        return (
+            f"{fid} already tracks {current} and is {state} — the loop is driving it back to review on that PR, "
+            "so there is nothing to attach"
+        )
+    if state == "in_review":
+        if not current:
+            return f"{fid} is in review with no PR recorded — repair the card before attaching one"
+        return (
+            f"{fid} is in review on {current} — the board will not swap the PR under a live review; close "
+            "that PR (the reconcile then blocks the card) and attach the new one"
+        )
+    if current and pr_key(current) != pr_key(replaces):
+        return (
+            f"{fid} already carries PR {current} — the board tracks one PR per card, so another can take its "
+            "place only once that one is closed"
+        )
+    labels = [label for label in feature.get("labels") or [] if label != LABEL_BLOCKED]
+    lane = BeadsBoard.board_state({"status": feature.get("bead_status"), "labels": labels})
+    if lane not in _ATTACH_SOURCE_LANES:
+        return (
+            f"{fid} is {lane}{' underneath its block' if feature.get('blocked') else ''} — attach_pr takes a card "
+            "that passed the Ready gate (ready or in_progress, blocked or not); a backlog card has not (mark it "
+            "ready first), and done and cancelled are terminal"
+        )
+    open_deps = list(feature.get("open_depends_on") or [])
+    if open_deps:
+        return (
+            f"{fid} depends on open card(s) {', '.join(open_deps)} — attaching would put it into review, and "
+            "possibly merge it, ahead of them; land those first or drop the dependency"
+        )
+    return ""
 
 
 def knob_bool(cfg: dict, key: str, default: bool, *, strict: bool = True) -> bool:
