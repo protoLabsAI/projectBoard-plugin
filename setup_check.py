@@ -29,21 +29,25 @@ to tick without (``br``, ``coder``, ``repo``): each of those turns every tick in
 traceback, while a missing ``gh`` only fails the PR edge of a build — reported, not
 paused on.
 
-Two ADVISORIES beyond the checks (D3, #260), both info-level: reported through the
-same gap seam, rendered as callouts on the board page, but never a failing check and
-never a pause. First, the stale-override advisory: a multi-entry ``projects:`` map
-combined with an EXPLICITLY blank ``db_path`` — the pre-D3 per-repo-discovery
-override. Since D3 that blank is INERT: ``projects.store_db_path`` (and ``get_store``
-itself) resolve it to the same single instance-default store as an absent key, so the
-board runs correctly on ONE shared db and nothing fragments. The finding is the stale
-override itself — the operator wrote a knob that no longer does anything — surfaced
-under its own ``db`` key (``MULTI_PROJECT_DB_HINT``). Second, the MIGRATION advisory:
-with no explicit ``db_path`` the board reads the instance store — but the SAME config
-on a pre-D3 board kept its cards inside the configured repo (`br` per-repo
-discovery), so a repo that still carries a ``.beads/`` workspace is the upgrade
-signature: any cards left there are invisible to this board until the operator pins
-``db_path`` back to that file or migrates them. Surfaced under its own ``db_legacy``
-key (``legacy_store_hint``), so the switch is never a silently empty board.
+One ADVISORY beyond the checks (D3, #260), info-level: reported through the same gap
+seam, rendered as a callout on the board page, but never a failing check and never a
+pause. The MIGRATION advisory: with no explicit ``db_path`` the board reads the
+instance store — but the SAME config on a pre-D3 board kept its cards inside the
+configured repo (`br` per-repo discovery), so a repo that still carries a ``.beads/``
+workspace is the upgrade signature: any cards left there are invisible to this board
+until the operator pins ``db_path`` back to that file or migrates them. Surfaced under
+its own ``db_legacy`` key (``legacy_store_hint``), so the switch is never a silently
+empty board.
+
+There used to be a second one — a "stale blank ``db_path`` override" warning — removed
+in #419. It fired on ``"db_path" in cfg``, on the reasoning that a present-and-blank key
+must be an operator's choice because the host passes a config section verbatim. This
+plugin's own manifest declares ``db_path: ""``, so the key is ALWAYS present: the
+advisory fired on every multi-project board and told operators to delete a line that was
+not in their config. It also had nothing to report — the manifest documents that a blank
+value is the same as leaving the key out, and ``store_db_path`` resolves both to the
+instance default. Its tests all built ``cfg`` by hand, which is the one shape where its
+premise holds, so nothing caught it.
 
 Everything the checks touch is injectable (``which``, ``delegates``, ``run``) so the
 suite exercises every pass/fail branch without a host, a PATH, or a subprocess.
@@ -62,7 +66,7 @@ import types
 
 from . import br_fetch
 from . import store as store_mod
-from .projects import blank_db_override, multi_project, resolve_projects
+from .projects import resolve_projects
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -72,13 +76,11 @@ log = logging.getLogger("protoagent.plugins.project_board")
 SETUP_KEYS: tuple[str, ...] = ("br", "gh", "coder", "repo")
 # The checks the puller will not tick without (see module docstring).
 LOOP_BLOCKING_KEYS: tuple[str, ...] = ("br", "coder", "repo")
-# Three extra host-gap keys beyond the checks: the running loop's config snapshot
-# lagging the live config on a restart-only knob (see ``loop_cfg_stale`` below), the
-# inert multi-project blank-``db_path`` override (see ``db_override_ignored``), and
-# the pre-D3 per-repo workspace migration advisory (see ``legacy_store_repos``) —
-# all advisories: reported through the seam, never a failing check, never a pause.
+# Two extra host-gap keys beyond the checks: the running loop's config snapshot lagging
+# the live config on a restart-only knob (see ``loop_cfg_stale`` below), and the pre-D3
+# per-repo workspace migration advisory (see ``legacy_store_repos``) — both advisories:
+# reported through the seam, never a failing check, never a pause.
 LOOP_STALE_KEY = "loop"
-DB_OVERRIDE_KEY = "db"
 LEGACY_STORE_KEY = "db_legacy"
 # The #354 review-status publication-capability advisory: with the review gate on, whether the
 # board's `gh` credential can publish the gate's `QA panel` verdict as a commit status. An
@@ -86,7 +88,7 @@ LEGACY_STORE_KEY = "db_legacy"
 # records its verdict on the bead; this only warns the operator when the PR-visible status can't
 # be written. A single startup probe, so the board never silently degrades on every card (r6).
 REVIEW_STATUS_KEY = "review_status"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, DB_OVERRIDE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY)
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -117,13 +119,6 @@ REPO_UNBOUND_HINT = (
     "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
     "this agent manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board "
     "is paused until then"
-)
-MULTI_PROJECT_DB_HINT = (
-    "projects: declares multiple repos and db_path is explicitly blank — that pre-D3 "
-    "per-repo-discovery override is now ignored: a blank db_path resolves to the one instance "
-    "store (same as leaving the key out), so every project shares one board and nothing "
-    "fragments. The board keeps running; remove the stale db_path override, or set db_path to "
-    "a single shared file in Settings ▸ Project Board"
 )
 
 
@@ -600,8 +595,6 @@ def setup_status(
           "loop_cfg_stale": bool,      # the RUNNING loop is on an older restart-only knob
           "loop_cfg_stale_keys": [k…], # which ones (coders/repo/base_branch/db_path/projects)
           "loop_cfg_stale_hint": str,  # operator copy, "" when not stale
-          "db_override_ignored": bool, # multi-entry projects: + explicit db_path: "" (inert, D3 #260)
-          "db_override_hint": str,     # operator copy, "" when the advisory is quiet
           "legacy_store_repos": [p…],  # repos still carrying a pre-D3 `.beads/` workspace (D3 #260)
           "legacy_store_hint": str,    # migration copy, "" when the advisory is quiet
           "review_status_ok": bool,    # the review gate can publish its QA-panel commit status (#354)
@@ -721,14 +714,17 @@ def setup_status(
         drifted = [k for k in stale_keys if k in _STALE_KEYS_PER_CHECK[key]]
         if drifted and not status[key]["ok"]:
             status[key]["hint"] = f"{status[key]['hint']} ({RESTART_NOTE}: {', '.join(drifted)})"
-    # The D3 advisory (#260): a multi-entry projects: map next to an EXPLICITLY blank
-    # db_path (the pre-D3 per-repo-discovery escape hatch). The override is inert —
-    # store_db_path resolves blank to the same instance default as an absent key, so
-    # the board runs correctly on ONE shared store — which is exactly why this is a
-    # warning (a knob that silently does nothing), not a failing check or a pause.
-    ignored = multi_project(cfg) and blank_db_override(cfg)
-    status["db_override_ignored"] = ignored
-    status["db_override_hint"] = MULTI_PROJECT_DB_HINT if ignored else ""
+    # The D3 "stale db_path override" advisory (#260) was REMOVED in #419. It could not
+    # be correct: it fired on `"db_path" in cfg`, justified by the claim that the host
+    # hands a plugin its config section verbatim so a present-and-blank key must be an
+    # operator's choice — but THIS PLUGIN'S OWN MANIFEST declares `db_path: ""`, so the
+    # key is always present and the advisory fired on every multi-project board, telling
+    # operators to delete a line that was not in their config. There was also nothing to
+    # warn about: the manifest itself documents that "a blank value is the same as
+    # leaving the key out", and `store_db_path` resolves both to the instance default.
+    # The real pre-D3 migration risk is covered precisely by `legacy_store_repos` below,
+    # which names actual repos still carrying a `.beads/` workspace instead of firing
+    # unconditionally.
     # The D3 MIGRATION advisory (#260): with no explicit db_path the board reads the
     # instance store — but the SAME config on a pre-D3 board kept its cards in the
     # repo's `.beads/` (per-repo discovery), so a repo still carrying one means any
@@ -911,8 +907,6 @@ class GapReporter:
         for key in REPORT_KEYS:
             if key == LOOP_STALE_KEY:
                 msg = str((status or {}).get("loop_cfg_stale_hint") or "") or None
-            elif key == DB_OVERRIDE_KEY:
-                msg = str((status or {}).get("db_override_hint") or "") or None
             elif key == LEGACY_STORE_KEY:
                 msg = str((status or {}).get("legacy_store_hint") or "") or None
             elif key == REVIEW_STATUS_KEY:
