@@ -193,7 +193,11 @@ def build_router(cfg: dict):
         try:
             return await asyncio.to_thread(fn)
         except BoardError as e:
-            raise HTTPException(400, str(e))
+            # A stall is not a refusal (#404): the board store did not answer and a write's
+            # outcome is unknown, so it is 503 (retry after checking), not 400 (don't retry).
+            from .store import BoardTimeout
+
+            raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
     def _verify_external(raw: bytes, signature: str) -> None:
         if not webhook_secret:
@@ -386,7 +390,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         try:
             return await asyncio.to_thread(fn)
         except BoardError as e:
-            raise HTTPException(400, str(e))
+            # A stall is not a refusal (#404): the board store did not answer and a write's
+            # outcome is unknown, so it is 503 (retry after checking), not 400 (don't retry).
+            from .store import BoardTimeout
+
+            raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
     @router.get("/projects")
     async def _projects():
@@ -692,13 +700,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `pr_url` (a cancel during the CI/review bounce) is closed with a comment pointing
         at the card, and an in-flight drive is stopped (its own cancel path closes a PR
         it opened meanwhile + reaps). Both best-effort: a gh failure logs, never 400s."""
-        pr_url = ""
-        before = None
-        try:
-            before = await asyncio.to_thread(lambda: store().get_feature(fid))
-            pr_url = str((before or {}).get("pr_url") or "").strip()
-        except BoardError:
-            pass  # the cancel below raises the named error for an unknown card
+        # The pre-read is what finds the card's open PR, so it is NOT best-effort (#404): a
+        # read that failed or stalled used to be swallowed, the cancel went on with no PR
+        # url, and the card's open PR was never closed (#211). An error here changes nothing.
+        # An unknown id reads as None, and the cancel below names it.
+        before = await _guard(lambda: store().get_feature(fid))
+        pr_url = str((before or {}).get("pr_url") or "").strip()
         f = await _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
         from .loop import cancel_side_effects
 

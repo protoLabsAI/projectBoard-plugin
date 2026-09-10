@@ -26,6 +26,20 @@ from project_board import store
 from project_board.store import BeadsBoard, BoardError, escalation_enabled
 
 
+@pytest.fixture(autouse=True)
+def _br_process_through_subprocess_run(monkeypatch):
+    """This file fakes `br` at ``subprocess.run`` to test ``_run``'s parsing, retries and
+    errors. Route the store's process seam through that call, so every such fake keeps
+    standing in for the process. How the real process is run — its own session, SIGTERM
+    then SIGKILL on a stall, BoardTimeout — is tested against REAL hung processes in
+    tests/test_br_timeout_404.py, not here (#404)."""
+
+    def _via_run(cmd, *, cwd, args):
+        return store.subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=store._BR_TIMEOUT_S)
+
+    monkeypatch.setattr(store, "_run_br_process", _via_run)
+
+
 class Br:
     """A fake ``_run``: records every ``br`` call and returns canned values keyed
     by the leading subcommand. A canned value may be a callable ``(args) -> value``.
@@ -1871,13 +1885,12 @@ def test_flag_blocked_stamps_the_explicit_dispatch_infra_class(make_board, monke
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(b, "_require", lambda fid: {"id": fid})
-    comments = []
-    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append(text))
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "blocked"})
     b.flag_blocked("bd-9", "coder dispatch failed: dispatch_tapped() unexpected keyword", category="dispatch-infra")
     (up,) = br.cmds("update")
     assert "blocked-class:dispatch-infra" in up
-    assert comments and "dispatch_tapped" in comments[0]  # the infra evidence rides the comment
+    (comment,) = br.cmds("comments")  # the infra evidence rides the `blocked:` comment
+    assert "dispatch_tapped" in comment[-1]
 
 
 def test_clear_blocked_preserves_earned_tiers_after_a_dispatch_infra_block(make_board, monkeypatch):

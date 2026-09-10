@@ -1,16 +1,20 @@
-"""A stalled `br` must cost one read, not the loop tick (#404).
+"""A stalled `br` must cost one read, not the loop (#404).
 
 Live incident (protoEngineer, 2026-09-07): four `loop tick failed` tracebacks in ten
 minutes, every one a `subprocess.TimeoutExpired` out of `store._run` — a `br list`, or
 the `br show` that `list_features` made with ~350 ids in one call — raised by the PR
 reconcile, the FIRST phase of the tick. `TimeoutExpired` is no kind of BoardError, so it
-went straight past every handler to the tick's catch-all, and the sweep, the preflight
-and the claim scan behind the reconcile never ran. A `br list` measured 0.058s straight
-afterwards: the store was contended, not slow.
+went straight past every handler to the tick's catch-all. A `br list` measured 0.058s
+straight afterwards: the store was contended, not slow.
 
-The seam is an external process, so the stall here is a REAL one — a `br` wrapper that
-execs the real binary until told to hang on one verb, when it `exec`s a `sleep` that
-outlives the timeout — never a mocked `_run` raising on cue.
+What holds now: a stall is a named `BoardTimeout` with the stalled tree stopped; the
+reads that stalled are bounded; a FAILED phase costs only itself; a STALL ends the tick
+after one call; and no handler reads a stall as a definite answer — not a claim race, a
+cancel's undo, a create's dedup, an HTTP 400, or a block whose reason was never written.
+
+The seam is an external process, so every stall here is a REAL one — a `br` wrapper that
+runs the real binary until told to stall (`PB_STALL=<mode>:<verb>`), never a mocked
+`_run` raising on cue.
 """
 
 from __future__ import annotations
@@ -25,7 +29,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import project_board as pb
 import project_board.loop as loop_mod
+from project_board import api
 from project_board import store as store_mod
 from project_board.loop import BoardLoop
 from project_board.store import BeadsBoard, BoardError
@@ -51,39 +57,59 @@ def _alive(pid: int) -> bool:
 
 @pytest.fixture
 def stallable_br(tmp_path, monkeypatch):
-    """The real `br`, until ``stall(verb)`` — then every call of that verb hangs (a real
-    process, blocked in `sleep`) and records its pid so a test can check it was killed.
-    Every invocation's argv is logged, read back per verb by ``lines(verb)``. The timeout
-    drops to 1s so a stall costs a second, not thirty; `raising=False` keeps the fixture
-    usable against a store without the knob (the red-check run on origin/main), and the
-    first test below fails if the knob is dead, because its message would then say 30s."""
+    """The real `br`, until told to stall. ``PB_STALL=<mode>:<verb>``:
+
+    - ``verb`` — every call of that verb hangs (``exec sleep``), recording its pid;
+    - ``once`` — only the first call of that verb hangs;
+    - ``claim`` — any ``--claim`` write hangs;
+    - ``all`` — every call hangs: a wedged store;
+    - ``after`` — the verb RUNS (its write commits), then the process hangs;
+    - ``tree`` — a shell that records a SIGTERM, with a TERM-immune grandchild.
+
+    Every invocation's argv is logged (``lines(verb)``). The timeout drops to 1s and the
+    TERM grace to 0.3s, so a stall costs a second, not 45; `raising=False` keeps the
+    fixture usable against a store without the knobs (the red-check run), and the first
+    test fails if the timeout knob is dead, because its message would then say 45s."""
     real = shutil.which(store_mod.BR)
-    calls = tmp_path / "br-calls.log"
-    pidfile = tmp_path / "stalled.pid"
+    calls, pidfile, once, termfile = (tmp_path / n for n in ("br-calls.log", "stalled.pid", "once", "term"))
     script = tmp_path / "br-stallable"
     script.write_text(
-        "#!/bin/sh\n"
-        f'echo "$*" >> "{calls}"\n'
-        'if [ -n "$PB_STALL_VERB" ] && [ "$1" = "$PB_STALL_VERB" ]; then\n'
-        f'  echo $$ > "{pidfile}"\n'
-        "  exec sleep 60\n"
-        "fi\n"
-        f'exec "{real}" "$@"\n'
+        f"""#!/bin/sh
+echo "$*" >> "{calls}"
+mode="${{PB_STALL%%:*}}"; verb="${{PB_STALL#*:}}"
+case "$mode" in
+  verb) if [ "$1" = "$verb" ]; then echo $$ > "{pidfile}"; exec sleep 60; fi ;;
+  once) if [ "$1" = "$verb" ] && [ ! -e "{once}" ]; then touch "{once}"; exec sleep 60; fi ;;
+  claim) case " $* " in *" --claim "*) exec sleep 60 ;; esac ;;
+  all) exec sleep 60 ;;
+  after) if [ "$1" = "$verb" ]; then "{real}" "$@" >/dev/null 2>&1; exec sleep 60; fi ;;
+  tree) if [ "$1" = "$verb" ]; then
+          trap 'echo term > "{termfile}"; exit 143' TERM
+          (trap '' TERM; exec sleep 60) & echo $! > "{pidfile}"
+          wait
+        fi ;;
+esac
+exec "{real}" "$@"
+"""
     )
     script.chmod(0o755)
     monkeypatch.setattr(store_mod, "BR", str(script))
     monkeypatch.setattr(store_mod, "_BR_TIMEOUT_S", 1.0, raising=False)
-    monkeypatch.delenv("PB_STALL_VERB", raising=False)
+    monkeypatch.setattr(store_mod, "_BR_TERM_GRACE_S", 0.3, raising=False)
+    monkeypatch.delenv("PB_STALL", raising=False)
 
     def lines(verb: str) -> list[list[str]]:
         text = calls.read_text() if calls.exists() else ""
         return [line.split() for line in text.splitlines() if line.split()[:1] == [verb]]
 
     return SimpleNamespace(
-        stall=lambda verb: monkeypatch.setenv("PB_STALL_VERB", verb),
+        stall=lambda verb, mode="verb": monkeypatch.setenv("PB_STALL", f"{mode}:{verb}"),
+        calm=lambda: monkeypatch.delenv("PB_STALL", raising=False),
         reset=lambda: calls.write_text(""),
+        count=lambda: len([ln for ln in (calls.read_text() if calls.exists() else "").splitlines() if ln.strip()]),
         lines=lines,
         pidfile=pidfile,
+        termfile=termfile,
     )
 
 
@@ -102,11 +128,9 @@ def _show_ids(argv: list[str]) -> list[str]:
     return ids
 
 
-def _ready_card(board, tmp_path, title="Ready card"):
-    (tmp_path / "target.py").write_text("x = 1\n")
-    f = board.create_feature(
-        title, spec="s", acceptance_criteria="- WHEN x THE SYSTEM SHALL y", files_to_modify=["target.py"]
-    )
+def _ready_card(board, tmp_path, title="Ready card", name="target.py"):
+    (tmp_path / name).write_text("x = 1\n")
+    f = board.create_feature(title, spec="s", acceptance_criteria="- WHEN x THE SYSTEM SHALL y", files_to_modify=[name])
     return board.mark_ready(f["id"])
 
 
@@ -180,23 +204,151 @@ def test_a_state_filtered_read_only_fetches_detail_for_that_state(board, stallab
     assert [_show_ids(argv) for argv in stallable_br.lines("show")] == [[blocked]]
 
 
-# ── the loop: a stalled read in one phase leaves the rest of the tick running ────────
+# ── the process: asked to stop, then killed — the whole tree ─────────────────────────
 
 
-async def test_a_stalled_reconcile_read_does_not_cost_the_claim_scan(
-    board, stallable_br, tmp_path, monkeypatch, caplog
-):
-    """The incident, end to end against real `br`: the PR reconcile's `br list` stalls,
-    and the ready card is still claimed IN THE SAME TICK. Before the fix the stall killed
-    the tick, and an idle loop then slept its whole interval (60s here) before trying
-    again — this waits 20s."""
-    ready = _ready_card(board, tmp_path)
+def test_a_stalled_br_is_asked_to_stop_then_killed_with_everything_it_forked(board, stallable_br):
+    """Only the direct child used to be killed: a `br` behind a shim that forks left its
+    child running. Now the whole group gets SIGTERM (br handles it, so a write is not cut
+    mid-frame), then SIGKILL after a grace — which a TERM-immune grandchild needs."""
+    stallable_br.stall("list", mode="tree")
+
+    with pytest.raises(store_mod.BoardTimeout):
+        board.list_features()
+
+    assert stallable_br.termfile.read_text().strip() == "term"  # asked first
+    grandchild = int(stallable_br.pidfile.read_text().strip())
+    for _ in range(40):  # SIGKILLed children are reaped by init asynchronously
+        if not _alive(grandchild):
+            break
+        time.sleep(0.05)
+    assert not _alive(grandchild)  # then the whole group was killed
+
+
+def test_the_store_outwaits_brs_own_lock_wait():
+    """At 30s the store stopped `br` milliseconds before br 0.2.16's own 30s write-lock
+    wait would have reported DATABASE_ERROR — which `_run` retries — so contention came
+    back as an opaque stall instead."""
+    assert store_mod._BR_TIMEOUT_S > 30
+
+
+def test_a_stalled_br_init_is_a_board_timeout_too(tmp_path, stallable_br):
+    stallable_br.stall("init")
+    board = BeadsBoard(repo=str(tmp_path / "fresh"), actor="test")
+    (tmp_path / "fresh").mkdir()
+
+    with pytest.raises(store_mod.BoardTimeout):
+        board.create_feature("First card on a fresh repo", spec="s")
+
+
+# ── a stall is not a definite answer ─────────────────────────────────────────────────
+
+
+async def test_a_stalled_claim_is_not_a_lost_race_and_the_scan_stops_at_it(board, stallable_br, tmp_path, monkeypatch):
+    """A claim that stalled was folded into "not claimable": each counted as a lost claim
+    race, five of them terminal-blocked a healthy card as a ready-queue livelock, and one
+    scan paid a full timeout per ready card while holding the claim lock."""
+    cards = [_ready_card(board, tmp_path, f"Ready {n}", f"t{n}.py")["id"] for n in range(4)]
+    loop = BoardLoop(
+        {"coder": "proto", "repo": str(tmp_path), "loop_enabled": True, "preflight": False, "max_pending_reviews": 0}
+    )
+    loop.max_concurrent = 4
+    monkeypatch.setattr(loop_mod, "get_store", lambda **_kw: board)
+    stallable_br.stall("", mode="claim")
+
+    for _ in range(6):  # more scans than the livelock bound (5)
+        stallable_br.reset()
+        with pytest.raises(store_mod.BoardTimeout):
+            await loop._spawn_ready()
+        assert len([argv for argv in stallable_br.lines("update") if "--claim" in argv]) == 1  # stopped at it
+
+    stallable_br.calm()
+    assert not any(board.get_feature(fid)["blocked"] for fid in cards)
+    assert getattr(loop, "_ready_skips", {}) == {}  # a stall is never counted toward a livelock
+
+
+def test_a_cancel_whose_close_landed_then_stalled_stays_cancelled(board, stallable_br):
+    """The close committed, then `br` hung. The undo used to run anyway and strip
+    `cancelled` from a CLOSED bead, which then read as `done` — shipped work."""
+    fid = board.create_feature("Duplicate card", spec="s")["id"]
+    stallable_br.stall("close", mode="after")
+
+    f = board.cancel_feature(fid, "duplicate of bd-1")
+
+    stallable_br.calm()
+    assert f["board_state"] == "cancelled" == board.get_feature(fid)["board_state"]
+
+
+def test_a_cancel_whose_close_stalled_before_landing_is_undone(board, stallable_br):
+    fid = board.create_feature("Card", spec="s")["id"]
+    stallable_br.stall("close")
+
+    with pytest.raises(store_mod.BoardTimeout):
+        board.cancel_feature(fid, "scope cut")
+
+    stallable_br.calm()
+    g = board.get_feature(fid)
+    assert g["board_state"] == "backlog" and "cancelled" not in g["labels"]  # exactly as before the cancel
+
+
+def test_the_cancel_route_changes_nothing_when_its_pre_read_stalls(board, stallable_br, monkeypatch):
+    """The pre-read is what finds the card's open PR. A stalled one was swallowed, the
+    cancel went on with no PR url, and the PR was never closed (#211)."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    fid = board.create_feature("Card with a PR", spec="s")["id"]
+    board._run("update", fid, "--external-ref", "https://github.com/o/r/pull/7")
+    monkeypatch.setattr(api, "get_store", lambda **_kw: board)
+    app = FastAPI()
+    app.include_router(api.build_data_router({}), prefix="/api/plugins/project_board")
+    stallable_br.stall("show", mode="once")
+
+    r = TestClient(app).post(f"/api/plugins/project_board/features/{fid}/cancel", json={"reason": "scope cut"})
+
+    assert r.status_code == 503 and "timed out" in r.text  # a stall is 503 — retry after checking — not 400
+    assert board.get_feature(fid)["board_state"] == "backlog"  # and nothing changed
+
+
+def test_create_does_not_go_ahead_blind_when_its_dedup_read_stalls(board, stallable_br, monkeypatch):
+    """The likeliest reason a caller creates again is that its last create timed out, and
+    that one may have committed. A stalled dedup read used to count as "nothing to dedup
+    against", and the create went ahead: a duplicate."""
+    monkeypatch.setattr(store_mod, "get_store", lambda **_kw: board)
+    stallable_br.stall("list")
+    stallable_br.reset()
+
+    reply = {t.name: t for t in pb._board_tools({})}["board_create_feature"].invoke(
+        {"title": "Regenerate THIRD_PARTY_LICENSES", "spec": "s"}
+    )
+
+    assert reply.startswith("Error: ") and "timed out" in reply and "re-read" in reply
+    assert stallable_br.lines("create") == []  # nothing created blind
+
+
+def test_a_block_is_never_recorded_without_its_reason(board, stallable_br):
+    """`flag_blocked` wrote its reason through the best-effort `comment()`, which swallows
+    a failed write — a stall included — so the label could land with no reason: the
+    reason-less terminal block #414 forbids. The reason now goes first and must land."""
+    fid = board.create_feature("Card", spec="s")["id"]
+    stallable_br.stall("comments")
+
+    with pytest.raises(store_mod.BoardTimeout):
+        board.flag_blocked(fid, "the gate command does not exist on this repo", "terminal")
+
+    stallable_br.calm()
+    assert not board.get_feature(fid)["blocked"]
+
+
+# ── the loop: a failed phase costs itself; a stall ends the tick ─────────────────────
+
+
+def _tick_loop(board, tmp_path, monkeypatch, **cfg):
     loop = BoardLoop(
         {
             "coder": "proto",
             "repo": str(tmp_path),
             "loop_enabled": True,
-            "loop_interval_s": 60,
             "merge_poll": True,
             # Due on the first tick whatever the clock says: the poll is gated on
             # `time.monotonic()`, which on Linux counts from BOOT, and a fresh CI VM can be
@@ -205,40 +357,59 @@ async def test_a_stalled_reconcile_read_does_not_cost_the_claim_scan(
             "health_sweep_interval_s": 0,
             "preflight": False,
             "max_pending_reviews": 0,
+            **cfg,
         }
     )
     monkeypatch.setattr(loop_mod, "get_store", lambda **_kw: board)
+    return loop
 
-    async def _setup_ok():
-        return True
 
-    async def _no_recovery():
-        return None
+async def test_a_wedged_store_costs_one_stalled_call_per_tick(board, stallable_br, tmp_path, monkeypatch):
+    """Every phase of a tick reads the store. Isolating phases let a wedged store stall
+    once PER CALL — seven stalled calls in one tick, each holding the single-flight lock
+    every other board read waits behind. The first stall now ends the tick."""
+    _ready_card(board, tmp_path)
+    loop = _tick_loop(
+        board, tmp_path, monkeypatch, health_sweep_interval_s=0.001, preflight=True, max_pending_reviews=3
+    )
+    stallable_br.reset()
+    stallable_br.stall("", mode="all")  # the store stops answering at all
 
+    started = time.monotonic()
+    spawned = await loop._tick()
+
+    assert spawned is False
+    assert stallable_br.count() == 1  # one stalled call, then the tick stopped
+    assert time.monotonic() - started < 5
+
+
+async def test_after_a_stall_the_next_tick_claims(board, stallable_br, tmp_path, monkeypatch, caplog):
+    """The incident, end to end against real `br`: the PR reconcile's read stalls once. That
+    tick ends with a logged stall, not a traceback, and the next tick claims the card."""
+    ready = _ready_card(board, tmp_path)
+    loop = _tick_loop(board, tmp_path, monkeypatch)
     dispatched: list[str] = []
 
     async def _drive(feature):
         dispatched.append(feature["id"])
-        loop._stop.set()
 
-    monkeypatch.setattr(loop, "_setup_gate", _setup_ok)
-    monkeypatch.setattr(loop, "_recover", _no_recovery)
     monkeypatch.setattr(loop, "_drive", _drive)
-    stallable_br.stall("list")  # the reconcile's reads; the claim scan reads `br ready`
+    stallable_br.stall("list", mode="once")
 
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        await asyncio.wait_for(loop._run(), timeout=20)
+        first = await loop._tick()
+        second = await loop._tick()
+        await asyncio.gather(*loop._drives)
 
-    assert dispatched == [ready["id"]]
-    assert (board.get_feature(ready["id"]) or {}).get("board_state") == "in_progress"
-    stalls = [r.message for r in caplog.records if "timed out after 1s" in r.message]
-    assert stalls and all("PR reconcile" in m for m in stalls)
+    assert (first, second) == (False, True) and dispatched == [ready["id"]]
+    [stall] = [r for r in caplog.records if "stalled on the board store" in r.message]
+    assert "PR reconcile" in stall.message and "timed out after 1s" in stall.message
     assert not any(r.exc_info for r in caplog.records)  # an understood stall, not a traceback
 
 
-def _one_tick(monkeypatch, loop, *, reconcile=None, sweep=None, preflight=None):
-    """Drive ``loop._run`` for ONE tick with every phase replaced by a recorder; a phase
-    given a callable runs it instead (to raise). The claim scan ends the tick."""
+def _fake_phases(monkeypatch, loop, *, reconcile=None, sweep=None, preflight=None):
+    """Every phase of ``loop._tick`` replaced by a recorder; a phase given a callable runs
+    it instead (to raise)."""
     calls: list[str] = []
 
     def phase(name, custom):
@@ -250,50 +421,55 @@ def _one_tick(monkeypatch, loop, *, reconcile=None, sweep=None, preflight=None):
 
         return _step
 
-    async def _ok():
-        return True
-
-    async def _spawn():
-        calls.append("claim scan")
-        loop._stop.set()
-        return False
-
-    monkeypatch.setattr(loop, "_setup_gate", _ok)
-    monkeypatch.setattr(loop, "_recover", phase("recover", None))
     monkeypatch.setattr(loop, "_maybe_reconcile", phase("reconcile", reconcile))
     monkeypatch.setattr(loop, "_maybe_sweep", phase("sweep", sweep))
     monkeypatch.setattr(loop, "_maybe_preflight", phase("preflight", preflight))
-    monkeypatch.setattr(loop, "_spawn_ready", _spawn)
+    monkeypatch.setattr(loop, "_spawn_ready", phase("claim scan", None))
     return calls
 
 
 async def test_a_failed_phase_is_logged_by_name_and_the_later_phases_still_run(monkeypatch, caplog):
-    loop = BoardLoop({"coder": "proto", "loop_enabled": True, "loop_interval_s": 60})
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
 
-    def _stall():
-        raise store_mod.BoardTimeout("`br list --limit 0` timed out after 30s and was killed")
+    def _refused():
+        raise BoardError("`br list --limit 0` failed: VALIDATION_FAILED")
 
-    calls = _one_tick(monkeypatch, loop, reconcile=_stall)
+    calls = _fake_phases(monkeypatch, loop, reconcile=_refused)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        await asyncio.wait_for(loop._run(), timeout=5)
+        await loop._tick()
 
-    assert calls == ["recover", "reconcile", "sweep", "preflight", "claim scan"]
+    assert calls == ["reconcile", "sweep", "preflight", "claim scan"]
     [warning] = [r for r in caplog.records if "loop tick:" in r.message]
-    assert "PR reconcile failed" in warning.message and "`br list --limit 0` timed out" in warning.message
+    assert "PR reconcile failed" in warning.message and "VALIDATION_FAILED" in warning.message
     assert warning.exc_info is None  # a BoardError is an understood outcome — no traceback
 
 
+async def test_a_stalled_phase_ends_the_tick(monkeypatch, caplog):
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
+
+    def _stall():
+        raise store_mod.BoardTimeout("`br list --limit 0` timed out after 45s and was stopped")
+
+    calls = _fake_phases(monkeypatch, loop, reconcile=_stall)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        await loop._tick()
+
+    assert calls == ["reconcile"]  # the sweep, preflight and claim scan wait for the next tick
+    [warning] = [r for r in caplog.records if "loop tick:" in r.message]
+    assert "PR reconcile stalled on the board store" in warning.message and warning.exc_info is None
+
+
 async def test_an_unexpected_phase_error_keeps_its_traceback_and_the_tick_goes_on(monkeypatch, caplog):
-    loop = BoardLoop({"coder": "proto", "loop_enabled": True, "loop_interval_s": 60})
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
 
     def _bug():
         raise KeyError("id")
 
-    calls = _one_tick(monkeypatch, loop, sweep=_bug)
+    calls = _fake_phases(monkeypatch, loop, sweep=_bug)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        await asyncio.wait_for(loop._run(), timeout=5)
+        await loop._tick()
 
-    assert calls == ["recover", "reconcile", "sweep", "preflight", "claim scan"]
+    assert calls == ["reconcile", "sweep", "preflight", "claim scan"]
     [error] = [r for r in caplog.records if "loop tick:" in r.message]
     assert "health sweep failed" in error.message and error.exc_info is not None
 
@@ -304,13 +480,12 @@ async def test_a_failed_preflight_still_holds_the_claim_scan(monkeypatch):
     dispatch exactly the work it exists to hold (dispatch_now stops at the same point).
     Pins behaviour origin/main already had — by accident, as part of the whole tick
     dying — so the isolation above cannot quietly open it."""
-    loop = BoardLoop({"coder": "proto", "loop_enabled": True, "loop_interval_s": 60})
+    loop = BoardLoop({"coder": "proto", "loop_enabled": True})
 
-    def _stall_then_stop():
-        loop._stop.set()  # no claim scan will run to end the tick
-        raise store_mod.BoardTimeout("`br list` timed out after 30s and was killed")
+    def _refused():
+        raise BoardError("`br list` failed: locked")
 
-    calls = _one_tick(monkeypatch, loop, preflight=_stall_then_stop)
-    await asyncio.wait_for(loop._run(), timeout=5)
+    calls = _fake_phases(monkeypatch, loop, preflight=_refused)
+    await loop._tick()
 
-    assert calls == ["recover", "reconcile", "sweep", "preflight"]  # no claim scan
+    assert calls == ["reconcile", "sweep", "preflight"]  # no claim scan

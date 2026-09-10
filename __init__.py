@@ -344,10 +344,15 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 
     BEST-EFFORT: a store read (or the gh probe inside `_find_open_pr_for_issue`) failing
     never blocks creation — a possible dup beats a stuck board."""
-    from .store import BoardError
+    from .store import BoardError, BoardTimeout
 
     try:
         existing = store.list_features()
+    except BoardTimeout:
+        # A STALL is not a read failure to shrug off (#404). The store is wedged, and the
+        # likeliest reason a caller is creating again is that its last create timed out —
+        # which may well have committed. Creating blind now is how that becomes a duplicate.
+        raise
     except BoardError:
         existing = []  # can't check → don't block creation on a read failure
     dup = _open_duplicate(existing, title, deps)
