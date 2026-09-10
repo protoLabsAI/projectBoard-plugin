@@ -17,6 +17,11 @@ ran, and came back with nothing — keeps the capability verdict.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+
+import pytest
+
 from project_board import coder_seam, worktree
 import project_board.loop as loop_mod
 
@@ -276,7 +281,7 @@ def test_the_representative_is_the_most_specific_failure():
     timeout = worktree.CoderTimeout(_TIMEOUT)
     seam = worktree.WorktreeError(_SEAM)
     blip = worktree.WorktreeError(_RESET)
-    other = RuntimeError("boom")
+    other = worktree.WorktreeError("worktree add failed: fatal: invalid reference")
     ladder = [refused, quota, timeout, seam, blip, other]
     for i, expected in enumerate(ladder):
         # each one beats everything after it, in any order
@@ -285,6 +290,10 @@ def test_the_representative_is_the_most_specific_failure():
     # ties go to the earliest candidate
     first, second = worktree.WorktreeError(_RESET), worktree.WorktreeError(_RESET)
     assert loop_mod.representative_failure([first, second]) is first
+    # only a WorktreeError can speak for the fan-out: a raw error never does
+    raw = BrokenPipeError("[Errno 32] Broken pipe")
+    assert loop_mod.representative_failure([raw, raw]) is None
+    assert loop_mod.representative_failure([raw, blip]) is blip
 
 
 def test_provider_failure_category_is_the_drives_own_definition():
@@ -297,3 +306,253 @@ def test_provider_failure_category_is_the_drives_own_definition():
     assert loop_mod.provider_failure_category(gap) is None
     assert loop_mod.provider_failure_category(worktree.WorktreeError(_SEAM)) is None
     assert loop_mod.provider_failure_category(worktree.CoderTimeout(_TIMEOUT)) is None
+
+
+# ── #425 review: the climb after a timeout, and what the fan-out leaves behind ───────
+
+
+def _tool(fid, gen, name="Edit"):
+    coder_seam.progress_begin(fid, gen)
+    coder_seam.progress_tool(fid, gen, {"phase": "start", "id": f"t{gen}", "name": name})
+
+
+async def test_a_climb_after_an_all_timeout_fan_out_still_fans_out(monkeypatch):
+    """The timeout climb used to put its note in `_ci_feedback` — the slot that marks a
+    carried-forward FIX, which switches fan-out off. So the climbed rung ran ONE opus
+    dispatch instead of N. A timeout climb is a fresh build: the stronger rung fans out."""
+    seen: list[tuple[str, int]] = []
+
+    async def _dispatch(coder, wt, prompt, *, fid=None, gen=1, **kw):
+        seen.append((coder, gen))
+        if coder == "codex":
+            _tool(fid, gen)
+            raise worktree.CoderTimeout(_TIMEOUT)
+        return ""
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_MAX_LADDER, tiers=["reasoning"])
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-fo", "title": "t", "spec": "s"})
+
+    assert seen == [("codex", 1), ("codex", 2), ("opus", 1), ("opus", 2)], seen
+
+
+async def test_a_later_drive_of_the_card_fans_out_again_without_a_stale_note(monkeypatch):
+    """`_ci_feedback` outlives the drive, so the note also switched fan-out off for every
+    LATER drive of the card (a sweep requeue, an operator unblock) and opened each prompt
+    with "a PREVIOUS attempt TIMED OUT". The note is the climbing drive's alone."""
+    seen: list[tuple[str, int, bool]] = []
+
+    async def _dispatch(coder, wt, prompt, *, fid=None, gen=1, **kw):
+        seen.append((coder, gen, "TIMED OUT" in prompt))
+        _tool(fid, gen)
+        if coder == "opus":
+            raise worktree.WorktreeError(_SEAM)  # the climbed rung dies another way
+        raise worktree.CoderTimeout(_TIMEOUT)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_MAX_LADDER, tiers=["reasoning"])
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-rd", "title": "t", "spec": "s"})
+    assert [s[2] for s in seen if s[0] == "opus"] == [True, True]  # the climb carried the note
+    first = len(seen)
+    await loop._drive({"id": "bd-rd", "title": "t", "spec": "s"})  # the requeue
+
+    assert seen[first : first + 2] == [("codex", 1, False), ("codex", 2, False)], seen[first:]
+
+
+async def test_the_timeout_note_is_spent_once_the_climbed_dispatch_has_run(monkeypatch):
+    """The note is for the dispatch right after the climb. Once that dispatch has run, a
+    retry of the same rung (here: its reply was empty) must not open with it again."""
+    prompts: list[tuple[str, str]] = []
+
+    async def _host_dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
+        prompts.append((coder, prompt))
+        if coder == "a":
+            coder_seam.progress_tool("bd-sp", 1, {"phase": "start", "id": "t1", "name": "Edit"})
+            raise worktree.CoderTimeout(_TIMEOUT)
+        return ""  # b runs and replies with nothing → the empty-reply same-tier retry
+
+    async def _no_commits(*_a, **_kw):
+        raise worktree.NoChangesError("coder produced no commits vs base — nothing to PR")
+
+    async def _unused(*_a, **_kw):
+        raise AssertionError("the real tap is under test")
+
+    real_tapped = coder_seam.dispatch_coder_tapped
+    loop, store = _rung_env(monkeypatch, _unused, cfg={"coders": {"smart": "a", "reasoning": "b"}}, tiers=["reasoning"])
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", real_tapped)
+    monkeypatch.setattr(worktree, "dispatch_coder", _host_dispatch)
+    monkeypatch.setattr(worktree, "open_pr", _no_commits)
+    await loop._drive({"id": "bd-sp", "title": "t", "spec": "s"})
+
+    b = [p for c, p in prompts if c == "b"]
+    assert len(b) >= 2, prompts
+    assert "TIMED OUT" in b[0] and "TIMED OUT" not in b[1]
+
+
+@dataclasses.dataclass
+class _Coder:
+    name: str
+    workdir: str = ""
+
+
+async def test_the_climb_note_describes_the_candidate_that_timed_out(monkeypatch):
+    """Through the REAL tap. The note was mined from the LAST gen — here the candidate that
+    failed fast on a seam error — so it told the stronger model "ran ~0.0s", no tool. The
+    seam now stamps the gen its watchdog killed, and the note comes from that one."""
+    real_tapped = coder_seam.dispatch_coder_tapped
+    prompts: list[tuple[str, str]] = []
+
+    async def _seam(coder, prompt, *, timeout=None, on_tool=None, on_thought=None, on_text=None):
+        prompts.append((coder.name, prompt))
+        if coder.name == "codex":
+            if coder.workdir.endswith(".c0"):
+                await on_tool({"phase": "start", "id": "t1", "name": "Edit", "input": {"path": "big_module.py"}})
+                await on_thought("refactoring big_module.py section by section")
+                await asyncio.Event().wait()  # hangs until the watchdog fires
+            raise RuntimeError("adapter rejected the session (unknown error)")
+        return "done"
+
+    async def _unused(*_a, **_kw):
+        raise AssertionError("the real tap is under test")
+
+    loop, store = _rung_env(monkeypatch, _unused, cfg=dict(_MAX_LADDER, coder_timeout_s=0.2), tiers=["reasoning"])
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", real_tapped)
+    monkeypatch.setattr(coder_seam, "_import_dispatch_tapped", lambda: _seam)
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: _Coder(name))
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-tn", "title": "t", "spec": "s"})
+
+    climbed = [p for c, p in prompts if c == "opus"]
+    assert climbed and "TIMED OUT" in climbed[0]
+    assert "Edit" in climbed[0] and "big_module.py" in climbed[0] and "refactoring big_module.py" in climbed[0]
+
+
+async def test_every_candidate_is_reaped_before_the_drive_sees_the_failure(monkeypatch):
+    """Re-raising must not leak a worktree: all N candidates are reaped, nothing promoted,
+    BEFORE the drive handles the representative (here: blocks the one-provider board)."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        raise worktree.WorktreeError(_DEAD_MODEL)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg={"coder": "codex", "max_mode_n": 3})
+    _no_diffs(monkeypatch, loop)
+    created: list[str] = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        created.append(fid)
+        return ("/wt/feat-" + fid, "feat/" + fid)
+
+    async def _reap(repo, root, fid):
+        store.calls.append(("reap", fid))
+
+    async def _promote(*_a, **_kw):
+        raise AssertionError("an all-raised fan-out promotes nothing")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    monkeypatch.setattr(worktree, "promote_worktree", _promote)
+    await loop._drive({"id": "bd-rp", "title": "t", "spec": "s"})
+
+    names = store.names()
+    reaps = [c[1] for c in store.calls if c[0] == "reap"]
+    assert sorted(reaps) == sorted(created) == ["bd-rp.c0", "bd-rp.c1", "bd-rp.c2"]
+    assert max(i for i, n in enumerate(names) if n == "reap") < names.index("flag_blocked")
+    assert loop._inflight == {}
+
+
+async def test_a_cancelled_child_is_neither_returned_nor_raised(monkeypatch):
+    """A CancelledError child did not fail: the fan-out keeps its old verdict rather than
+    letting the other candidate's refusal speak for both."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        if coder == "codex" and kw.get("gen") == 1:
+            raise asyncio.CancelledError()
+        if coder == "codex":
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        return ""
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_MAX_LADDER, tiers=["reasoning"])
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-cx", "title": "t", "spec": "s"})
+
+    assert store.escalated and not loop_mod.provider_is_down("codex")
+
+
+async def test_a_raw_error_on_every_candidate_keeps_the_shutdown_edge(monkeypatch):
+    """An untapped host can surface a raw error (not a WorktreeError). Re-raised, it skipped
+    the drive's shutdown and cancel checks and blocked the card as `unexpected` in the
+    middle of a shutdown. It keeps the old no-diff verdict, which those checks see first."""
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        loop._shutting_down = True
+        raise BrokenPipeError("[Errno 32] Broken pipe")
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_MAX_LADDER, tiers=["reasoning"])
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-sd", "title": "t", "spec": "s"})
+
+    assert _blocks(store) == [], "a shutdown mid-fan-out flagged the card blocked"
+
+
+async def test_a_candidate_that_returned_through_the_real_tap_keeps_it_a_capability_failure(monkeypatch):
+    """The fallback, through the REAL `dispatch_coder_tapped` (the untapped host path)
+    rather than a stand-in for it: one candidate refused, the other RAN and returned
+    nothing. The card climbs as a capability failure — never a rotation to the sibling."""
+    seen: list[str] = []
+
+    async def _host_dispatch(coder, wt, prompt, *, timeout=None, env_passthrough=()):
+        seen.append(coder)
+        if coder == "codex" and wt.endswith(".c0"):
+            raise worktree.WorktreeError(_DEAD_MODEL)
+        return ""
+
+    async def _unused(*_a, **_kw):
+        raise AssertionError("the real tap is under test")
+
+    real_tapped = coder_seam.dispatch_coder_tapped
+    loop, store = _rung_env(monkeypatch, _unused, cfg=_MAX_LADDER, tiers=["reasoning"])
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", real_tapped)
+    monkeypatch.setattr(worktree, "dispatch_coder", _host_dispatch)
+    _no_diffs(monkeypatch, loop)
+    await loop._drive({"id": "bd-rt", "title": "t", "spec": "s"})
+
+    assert "sonnet" not in seen, f"a fan-out where a candidate returned rotated instead of climbing: {seen}"
+    assert store.escalated and "opus" in seen
+    assert not loop_mod.provider_is_down("codex")
+
+
+# ── #429 × #435: every candidate times out, twice ─────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    not hasattr(loop_mod, "TOO_WIDE_CLASS"), reason="needs #435's too-wide park; runs once both are on the branch"
+)
+async def test_a_fan_out_that_keeps_timing_out_is_parked_for_its_split(monkeypatch):
+    """Merged behaviour. Alone, #425's fix hands the drive a CoderTimeout, and a card whose
+    fan-outs keep timing out blocks `transient` — the sweep then rebuilds it twice more, N
+    candidates each time. With #435, the second fresh timeout parks it for a split: the
+    first fan-out climbs (fanning out again at the new rung), the second parks."""
+    seen: list[tuple[str, int]] = []
+
+    async def _dispatch(coder, wt, prompt, *, fid=None, gen=1, **kw):
+        seen.append((coder, gen))
+        _tool(fid, gen)
+        raise worktree.CoderTimeout(_TIMEOUT)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_MAX_LADDER, tiers=["reasoning"])
+    _no_diffs(monkeypatch, loop)
+    asked: list[tuple[str, int]] = []
+    budgets: dict[str, int] = {}
+
+    def _ask(fid, *, timeouts):
+        asked.append((fid, timeouts))
+        return {"id": "bd-split", "board_state": "backlog"}
+
+    store.request_decomposition = _ask
+    store.record_budget = lambda fid, kind, n: budgets.__setitem__(f"{fid}:{kind}", n)
+    store.get_feature = lambda fid: {"id": fid, "labels": [], "board_state": "in_progress"}
+    await loop._drive({"id": "bd-tw", "title": "t", "spec": "s"})
+
+    assert seen == [("codex", 1), ("codex", 2), ("opus", 1), ("opus", 2)], seen
+    assert asked == [("bd-tw", 2)] and len(store.escalated) == 1
+    assert _blocks(store)[-1][3] == loop_mod.TOO_WIDE_CLASS

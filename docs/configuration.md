@@ -238,11 +238,22 @@ the quota backoff is spent — a marked provider still gets its one real attempt
 card blocks (the operator may have repointed it), and a dispatch it serves clears the mark. If every provider on the rung refused its model on this
 card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
 config problem, and a stronger rung would only hide it. If some were only rate-limited, it
-blocks as `rate_limit`, which the sweep heals on its own. Max-mode (`max_mode_n > 1`) follows
-the same rules. When every candidate fails, the loop handles the most specific of their failures
-exactly as it would a single dispatch's. In order, that is a refused model, a quota, a timeout,
-then any other dispatch failure. Only if at least one candidate ran and came back with nothing is
-it a capability failure that climbs.
+blocks as `rate_limit`, which the sweep heals on its own.
+
+Max-mode (`max_mode_n > 1`) follows the same rules. If every candidate raised, the loop takes
+the edge of the most specific failure among them, exactly as it would for a single dispatch.
+The precedence is:
+
+1. a refused model, even beside a quota;
+2. a quota;
+3. a timeout;
+4. a dispatch failure the loop does not retry;
+5. a retryable one;
+6. any other board error, as raised.
+
+A raw error that is not a board error keeps the old "no diff" verdict. Only a fan-out where
+at least one candidate ran and came back with nothing is guaranteed to be a capability failure
+that climbs. A climb after a timeout is a fresh build, so the stronger rung fans out again.
 
 A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 

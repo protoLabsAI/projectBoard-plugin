@@ -847,7 +847,7 @@ def provider_failure_category(exc: BaseException) -> str | None:
     return category if category in _ROTATABLE_CATEGORIES else None
 
 
-def representative_failure(errors: list[Exception]) -> Exception:
+def representative_failure(errors: list[Exception]) -> Exception | None:
     """The ONE error that speaks for a max-mode fan-out in which EVERY candidate raised
     (#425). No candidate returned anything to judge, so the drive is handed this instead
     of a "no diff" and its own handling applies, as for a single dispatch. The most
@@ -860,10 +860,13 @@ def representative_failure(errors: list[Exception]) -> Exception:
     3. a dispatch failure the drive does not retry — #339 blocks it as pre-model unless a
        candidate reached the model;
     4. any other dispatch failure (a retryable one: back off and re-run);
-    5. anything else, as it was raised.
+    5. any other ``WorktreeError``, as it was raised.
 
-    Ties go to the earliest candidate. Pure, like ``rotation_target``, so the order is
-    testable without driving a card."""
+    Ties go to the earliest candidate. Only a ``WorktreeError`` can speak: anything else
+    (a raw ``BrokenPipeError`` from an untapped host, say) returns None, and the caller
+    keeps its old "no diff" verdict — which the drive's shutdown and cancel checks see
+    first, where a raw error would skip them and block the card as `unexpected`. Pure,
+    like ``rotation_target``, so the order is testable without driving a card."""
 
     def rank(exc: Exception) -> int:
         category = provider_failure_category(exc)
@@ -878,7 +881,8 @@ def representative_failure(errors: list[Exception]) -> Exception:
             return 4 if classify(text).retryable else 3
         return 5
 
-    return min(errors, key=rank)
+    speakers = [e for e in errors if isinstance(e, worktree.WorktreeError)]
+    return min(speakers, key=rank) if speakers else None
 
 
 # ── #420: remember a provider that can't serve its model ────────────────────────────

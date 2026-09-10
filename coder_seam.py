@@ -495,6 +495,16 @@ def progress_stop_reason(fid: str | None, gen: int, reason) -> None:
         b.stop_reason = str(reason)[:200]
 
 
+# The stop reason the dispatch stamps on a gen its watchdog killed. The loop's timeout
+# note (#146) is mined from THAT gen — in a max-mode fan-out the last gen may be a
+# sibling that failed fast on something else (#425 review).
+TIMED_OUT_REASON = "timed out"
+
+
+def _stamp_timeout(fid: str | None, gen: int, timeout) -> None:
+    progress_stop_reason(fid, gen, f"{TIMED_OUT_REASON} after {timeout}s")
+
+
 # ── Persist finished gens to the bead (#226) ────────────────────────────────────
 # The WRITE side of the coder-monitor history (#226): when a gen finishes, its live
 # snapshot is serialized to a `coder-monitor: {…}` JSON bead comment so the drawer
@@ -751,6 +761,7 @@ async def dispatch_coder_tapped(
         # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
         raise
     except asyncio.TimeoutError:
+        _stamp_timeout(fid, gen, timeout)
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
     except Exception as exc:  # noqa: BLE001 — normalise every below-seam failure to the
         # adapter path's contract: nothing propagates raw; a dispatch failure surfaces as
@@ -843,6 +854,9 @@ async def _dispatch_coder_tapped_legacy(
             return await worktree.dispatch_coder(
                 coder, worktree_path, prompt, timeout=timeout, env_passthrough=env_passthrough
             )
+        except worktree.CoderTimeout:
+            _stamp_timeout(fid, gen, timeout)
+            raise
         finally:
             progress_end(fid, gen)  # the gen must close on EVERY exit path (panel: orphaned gens)
 
@@ -881,6 +895,7 @@ async def _dispatch_coder_tapped_legacy(
     # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
     # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
     prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    timed_out = False
     try:
         coro = client.prompt(
             prompt,
@@ -902,6 +917,7 @@ async def _dispatch_coder_tapped_legacy(
             pass
         raise
     except asyncio.TimeoutError:
+        timed_out = True
         raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
     except (AcpError, DelegateError) as exc:
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
@@ -913,9 +929,12 @@ async def _dispatch_coder_tapped_legacy(
         # Stash whatever stop-reason / dead-end signal the ACP client reports (#198)
         # — sampled on EVERY exit so an empty reply still records WHY the coder
         # stopped. Best-effort getattr: a host without the attribute yields None.
-        progress_stop_reason(
-            fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
-        )
+        if timed_out:
+            _stamp_timeout(fid, gen, timeout)  # the pooled client's last reason is not THIS turn's
+        else:
+            progress_stop_reason(
+                fid, gen, getattr(client, "last_stop_reason", None) or getattr(client, "last_dead_end", None)
+            )
         progress_end(fid, gen)
         try:
             await adapter.teardown(scoped)  # #1 lifecycle rule: reap the worktree-scoped subprocess
