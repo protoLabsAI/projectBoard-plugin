@@ -835,6 +835,18 @@ def _next_rung_cursor() -> int:
 _ROTATABLE_CATEGORIES = frozenset({"rate_limit", "provider_unavailable"})
 
 
+def provider_failure_category(exc: BaseException) -> str | None:
+    """The provider class (``rate_limit`` / ``provider_unavailable``) of a coder DISPATCH
+    failure, or ``None`` when ``exc`` is anything else — the one definition of "the
+    provider failed, not the model". The drive rotates on it; max-mode asks it of every
+    candidate before it decides what the drive is told (#425)."""
+    text = str(exc)
+    if not text.startswith("coder dispatch failed"):
+        return None
+    category = classify(text).category
+    return category if category in _ROTATABLE_CATEGORIES else None
+
+
 # ── #420: remember a provider that can't serve its model ────────────────────────────
 # Rotation alone rediscovers a dead provider card by card: the rung cursor spreads cards
 # across a rung's siblings, so every card that happens to open on it pays one failed
@@ -1263,6 +1275,7 @@ __all__ = [
     "rotation_target",
     "prefer_live_sibling",
     "_ROTATABLE_CATEGORIES",
+    "provider_failure_category",
     "_next_rung_cursor",
     "_PROVIDER_DOWN_TTL_S",
     "_PROVIDER_DOWN",

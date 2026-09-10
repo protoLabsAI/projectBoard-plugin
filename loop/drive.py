@@ -1567,7 +1567,7 @@ class DriveMixin:
                     dispatch_error = str(exc).startswith("coder dispatch failed")
                     if policy.category == "provider_unavailable" and not dispatch_error:
                         policy = classify(str(exc), provider_rules=False)
-                    provider_failure = dispatch_error and policy.category in _ROTATABLE_CATEGORIES
+                    provider_failure = provider_failure_category(exc) is not None
                     # A dispatch that failed on a fix round's KEPT worktree left it untouched:
                     # its files hold the implementation and the feedback says so. Whatever
                     # re-dispatches next — a sibling, or the same provider after a backoff —
@@ -2241,7 +2241,9 @@ class DriveMixin:
         pass; ADR 0064), else the best-of-N LLM judge; the winner is PROMOTED into the canonical
         ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
         unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
-        ``_drive`` escalates/blocks exactly like a single coder that produced nothing.
+        ``_drive`` escalates/blocks exactly like a single coder that produced nothing —
+        unless every candidate failed on its PROVIDER the same way, which is re-raised as
+        that dispatch failure so the drive rotates/backs off as for a single dispatch (#425).
 
         Returns (canonical_wt, canonical_branch, winner_reply). The fan-out is bounded by
         ``max_concurrent`` × ``max_mode_n`` coders; size those to the host."""
@@ -2271,6 +2273,26 @@ class DriveMixin:
         if idx is None:
             for cid in cand_ids:
                 await worktree.reap_feature_worktree(repo, self.root, cid)
+            # #425: "no diff" is a CAPABILITY verdict, and the drive climbs a rung on it. That
+            # is the wrong edge when no candidate ever reached the model because the PROVIDER
+            # refused them all — a spent quota (#362) or a model it can't serve (#420) says
+            # nothing about the model, and the single-dispatch path rotates within the rung on
+            # both. So when EVERY candidate failed on its provider, and the same way, hand the
+            # drive one of those errors: it then rotates, marks, backs off and blocks exactly
+            # as for a single dispatch. Only then does one error speak for all of them. A
+            # candidate that came back with nothing reached the model and failed it; a mix of
+            # provider classes has no one truthful edge (a mark vs. a backoff). Either stays
+            # the capability failure it always was.
+            kinds = {provider_failure_category(r) if isinstance(r, worktree.WorktreeError) else None for r in results}
+            if len(kinds) == 1 and None not in kinds:
+                log.info(
+                    "[project_board] %s max-mode: all %d candidates failed on the provider (%s) — "
+                    "handing the drive the dispatch failure, not a no-diff",
+                    fid,
+                    n,
+                    next(iter(kinds)),
+                )
+                raise results[0]
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]

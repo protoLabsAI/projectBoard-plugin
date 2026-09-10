@@ -238,8 +238,10 @@ the quota backoff is spent — a marked provider still gets its one real attempt
 card blocks (the operator may have repointed it), and a dispatch it serves clears the mark. If every provider on the rung refused its model on this
 card, the card blocks under `dispatch-infra` naming them, and does not climb: that is a
 config problem, and a stronger rung would only hide it. If some were only rate-limited, it
-blocks as `rate_limit`, which the sweep heals on its own. Max-mode swallows each candidate's
-error, so neither rotation applies there.
+blocks as `rate_limit`, which the sweep heals on its own. Max-mode (`max_mode_n > 1`) follows
+the same rules when every candidate failed on its provider in the same way. If any candidate
+reached the model and came back with nothing, or the candidates failed in different ways, it
+is still a capability failure and climbs.
 
 A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 
