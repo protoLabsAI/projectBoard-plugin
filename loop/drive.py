@@ -1184,6 +1184,12 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
+        # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
+        # across drives and marks a carried-forward FIX — so one all-timeout fan-out
+        # switched max-mode off for that card for good, and every later drive still
+        # opened with "a PREVIOUS attempt TIMED OUT". A timeout climb is a fresh build.
+        timeout_note = ""
         try:
             while True:
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
@@ -1191,7 +1197,7 @@ class DriveMixin:
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
-                prompt = self._build_prompt(feature, lessons=lessons)
+                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
                 # (below) or round-robin across dispatches, never on a capability failure —
@@ -1346,6 +1352,7 @@ class DriveMixin:
                     # dispatch scheduled on worker threads land before the drive
                     # proceeds toward open_pr (the pre-offload ordering).
                     await self._await_bg_records(fid)
+                    timeout_note = ""  # the dispatch that carried it has run — consumed
                     # The provider served this dispatch, so a down mark on it (#420) — set
                     # by another card, or one that was stale when every sibling was marked
                     # and this one got the rung's last attempt — no longer holds.
@@ -1635,7 +1642,7 @@ class DriveMixin:
                     dispatch_error = str(exc).startswith("coder dispatch failed")
                     if policy.category == "provider_unavailable" and not dispatch_error:
                         policy = classify(str(exc), provider_rules=False)
-                    provider_failure = dispatch_error and policy.category in _ROTATABLE_CATEGORIES
+                    provider_failure = provider_failure_category(exc) is not None
                     # A dispatch that failed on a fix round's KEPT worktree left it untouched:
                     # its files hold the implementation and the feedback says so. Whatever
                     # re-dispatches next — a sibling, or the same provider after a backoff —
@@ -1709,6 +1716,7 @@ class DriveMixin:
                                     )
                                     tier = nxt
                                     retries = 0
+                                    timeout_note = ""  # a new rung: an older timeout note is stale
                                     spent_here.clear()  # a NEW rung has its own providers (#362)
                                     refused_here.clear()
                                     # Fresh per-tier budgets on the climb — mirrors the
@@ -1926,15 +1934,18 @@ class DriveMixin:
                             # about a worktree that no longer exists, so clear it (+ the prior diff)
                             # to keep prompt and worktree consistent.
                             keep_wt_class = str(exc).startswith(("goal verification failed", "requirements unresolved"))
+                            timeout_note = ""  # a new rung: an older timeout note is stale
                             if keep_wt_class and wt is not None:
                                 keep_wt = True  # reuse the verified worktree; _ci_feedback is truthful
                             elif isinstance(exc, worktree.CoderTimeout):
                                 # A timeout carries NO diff and NO CI output, so the stronger tier
                                 # would otherwise get a BYTE-IDENTICAL prompt — blind to the fact a
                                 # prior attempt ran out of time and what it was doing when killed
-                                # (#146). Seed the CI/review-bounce feedback lever with the ring
-                                # buffer's timeout context so the escalated dispatch leads with it.
-                                self._ci_feedback[fid] = self._timeout_escalation_context(fid)
+                                # (#146). Lead the escalated dispatch with the ring buffer's timeout
+                                # context — as a drive-local note, NOT `_ci_feedback`: this is a fresh
+                                # build, so a max-mode/solve board fans out again at the new rung.
+                                timeout_note = self._timeout_escalation_context(fid)
+                                self._ci_feedback.pop(fid, None)  # fresh worktree ahead: no fix to carry
                                 self._ci_prior_diff.pop(fid, None)  # a timeout produced no diff to echo back
                             else:
                                 # Fresh worktree ahead — drop any gate-fix feedback describing the
@@ -2374,7 +2385,10 @@ class DriveMixin:
         pass; ADR 0064), else the best-of-N LLM judge; the winner is PROMOTED into the canonical
         ``feat-<id>`` worktree / ``feat/<id>`` branch (so the rest of the lifecycle is
         unchanged) and the losers are reaped. All-empty → ``NoChangesError``, which
-        ``_drive`` escalates/blocks exactly like a single coder that produced nothing.
+        ``_drive`` escalates/blocks exactly like a single coder that produced nothing —
+        unless EVERY candidate raised, when the one error that speaks for them
+        (``representative_failure``) is re-raised instead, so the drive handles it as it
+        would a single dispatch's (#425).
 
         Returns (canonical_wt, canonical_branch, winner_reply). The fan-out is bounded by
         ``max_concurrent`` × ``max_mode_n`` coders; size those to the host."""
@@ -2404,6 +2418,26 @@ class DriveMixin:
         if idx is None:
             for cid in cand_ids:
                 await worktree.reap_feature_worktree(repo, self.root, cid)
+            # #425: "no diff" is a CAPABILITY verdict, and the drive climbs a rung on it. That is
+            # only true when a candidate RETURNED — ran, and came back with nothing. When EVERY
+            # candidate raised there is nothing to judge, and swallowing the errors hid what
+            # actually happened: a quota (#362) or a refused model (#420) climbed instead of
+            # rotating, a timeout never reached #378's counter, a pre-model seam failure never
+            # reached #339's block. So hand the drive ONE of those errors — the most specific
+            # edge, `representative_failure` — and its own handling applies exactly as for a
+            # single dispatch. A CancelledError child neither returned nor raised, and a raw
+            # (non-WorktreeError) error can't speak for the fan-out: both keep the old verdict.
+            raised = [r for r in results if isinstance(r, Exception)]
+            rep = representative_failure(raised) if len(raised) == len(results) else None
+            if rep is not None:
+                log.info(
+                    "[project_board] %s max-mode: all %d candidates raised — handing the drive the "
+                    "failure that speaks for them, not a no-diff: %s",
+                    fid,
+                    n,
+                    str(rep)[:160],
+                )
+                raise rep
             raise worktree.NoChangesError(f"max-mode: all {n} candidates produced no diff")
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]
@@ -2497,16 +2531,22 @@ class DriveMixin:
         attempt ran out of time, how long it ran, or what it was doing when killed.
         Mine the progress ring buffer (``coder_seam.progress_snapshot``) for the
         timed-out gen's elapsed time, the last tool in flight, and the thought tail,
-        and lead the re-dispatch with them. Returned for injection into
-        ``_ci_feedback`` so it rides the exact same prompt path a CI/review bounce
-        uses — no new plumbing. Best-effort: a missing/empty snapshot still yields a
-        usable "prior attempt timed out, produced no diff" note — a monitor read must
-        never break escalation."""
+        and lead the re-dispatch with them. Returned as the drive's timeout note, which
+        rides the same rejected-attempt block a CI/review bounce uses. Best-effort: a
+        missing/empty snapshot still yields a usable "prior attempt timed out, produced
+        no diff" note — a monitor read must never break escalation.
+
+        Mined from the gen that TIMED OUT — the seam stamps its stop reason — not simply
+        the last one: in a max-mode fan-out that is just the last candidate, which may
+        have failed fast on something else, and the note then described the wrong
+        attempt ("ran ~0.0s", no tool; #425 review). The last gen is only the fallback
+        for a buffer that carries no stamp (an older gen, an untapped host)."""
         try:
             gens = coder_seam.progress_snapshot(fid).get("gens") or []
         except Exception:  # noqa: BLE001 — a monitor read must never break escalation
             gens = []
-        gen = gens[-1] if gens else {}
+        timed_out = [g for g in gens if str(g.get("stop_reason") or "").startswith(coder_seam.TIMED_OUT_REASON)]
+        gen = (timed_out or gens or [{}])[-1]
         elapsed = gen.get("elapsed_s")
         ran_for = f"ran ~{elapsed}s and " if elapsed is not None else ""
         lines = [

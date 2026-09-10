@@ -2614,9 +2614,10 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     assert "produced NO diff" in escalated
     assert "Read" in escalated and "loop.py" in escalated
     assert "still mapping the dispatch flow" in escalated
-    # r3: it arrived via `_ci_feedback`, so it rides the standard rejected-attempt block.
+    # r3: it rides the standard rejected-attempt block — but as the drive's own note, NOT
+    # `_ci_feedback`, which persists and would switch fan-out off for the card (#425 review).
     assert "previous attempt was REJECTED" in escalated
-    assert "still mapping the dispatch flow" in loop._ci_feedback.get("bd-1", "")
+    assert "bd-1" not in loop._ci_feedback
 
 
 async def test_drive_tier_climb_grants_a_fresh_window_despite_stale_budget_labels(monkeypatch):

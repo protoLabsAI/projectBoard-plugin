@@ -82,14 +82,20 @@ class PromptMixin:
             f"{req_block}"
         )
 
-    def _build_prompt(self, feature: dict, lessons: str = "") -> str:
+    def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "") -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
         nothing; naming the files + a direct 'make the edits now' makes it act.
 
         ``lessons`` (distilled gotchas from the knowledge graph, fetched async in
         ``_drive``) is injected so a coder gets this area's known failure modes on
-        attempt 1 — the read half of the flywheel (retro grounds → coder heeds)."""
+        attempt 1 — the read half of the flywheel (retro grounds → coder heeds).
+
+        ``timeout_note`` is the drive's note that a PRIOR attempt timed out (#146). It
+        rides the same rejected-attempt block as CI/fix feedback, but it is NOT that
+        feedback: ``_ci_feedback`` persists across drives and marks a carried-forward
+        FIX (which disables max-mode/solve fan-out), while a timeout climb is a fresh
+        build — so the note lives only in the drive that climbed (#425 review)."""
         files = feature.get("files_to_modify") or []
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
@@ -157,7 +163,7 @@ class PromptMixin:
         pending = _PENDING_FEEDBACK.pop(fid, None)
         if pending:
             self._ci_feedback[fid] = pending
-        ci = self._ci_feedback.get(fid)
+        ci = self._ci_feedback.get(fid) or timeout_note
         prior = self._ci_prior_diff.get(fid)
         prior_block = (
             f"\n### The diff that failed (your previous attempt — fix it, don't restart from scratch)\n"
