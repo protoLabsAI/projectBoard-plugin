@@ -1687,8 +1687,8 @@ class DriveMixin:
                     # with no model work and leaving a `tier:opus` label that misrouted the
                     # card's next real build (bd-cwpv). Decide it from the classifier's seam
                     # signature AND the dispatch-lifecycle evidence (did a tool call, thought
-                    # or token usage reach the ring buffer — streamed text alone does not
-                    # count, an adapter talks on that channel too, #422): a recognised seam
+                    # or non-zero token usage reach the ring buffer — streamed text alone does
+                    # not count, an adapter talks on that channel too, #422): a recognised seam
                     # failure with no model activity is pre-model. Fail-safe — an unreadable
                     # snapshot reads as "model not reached", so an ambiguous dispatch failure
                     # blocks for triage rather than climbing an expensive ladder (#339).
@@ -2342,12 +2342,13 @@ class DriveMixin:
     @staticmethod
     def _dispatch_reached_model(fid: str) -> bool:
         """Did the coder dispatch that just failed REACH the model — i.e. produce any
-        first-token evidence only a model produces (a tool call, a thought, or token
-        usage; NOT streamed answer text, which an ACP adapter can emit itself before the
-        model is called, #422)? A dispatch that failed with NONE of these never got past
-        the seam / adapter, so the model could not have influenced the result and a
-        stronger model cannot clear it (it must block for infra triage, not climb the
-        tier ladder).
+        first-token evidence only a model produces (a tool call, a thought, or non-zero
+        token usage; NOT streamed answer text, which an ACP adapter can emit itself before
+        the model is called, #422 — and a failed dispatch records no usage, so on a
+        failure it is tool calls and thoughts)? A dispatch that failed with NONE of these
+        never got past the seam / adapter, so the model could not have influenced the
+        result and a stronger model cannot clear it (it must block for infra triage, not
+        climb the tier ladder).
 
         Delegates to ``coder_seam.dispatch_reached_model``, which scopes the check to
         the CURRENT dispatch's run epoch so a stale gen an earlier dispatch left in the

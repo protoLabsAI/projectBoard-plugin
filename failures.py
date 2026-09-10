@@ -106,9 +106,9 @@ _SEAM_PREFIXES = ("coder dispatch failed", "coder timed out")
 # an adapter or session refusing the call, a timeout before the first token. Looked for
 # ONLY in the message's head — the text before its first ": " — which names what failed.
 # Never in the rest, which is whatever that failure quotes: a reviewer's gap, a test's
-# output, a requirement id. Searching the whole message read "goal verification failed: no
-# test covers the adapter timeout path" as a pre-model infra block, when a goal gap PROVES
-# the model produced a diff.
+# output, a requirement id. Searching the whole message would read "goal verification
+# failed: no test covers the adapter timeout path" as a pre-model infra block, when a goal
+# gap is a model-reachable failure the ladder owns.
 _SEAM_SIGNATURES = re.compile(
     r"unexpected keyword argument"
     r"|dispatch_tapped"
@@ -133,21 +133,23 @@ def is_pre_model_dispatch_failure(error: str, *, model_reached: bool) -> bool:
     next real build (bd-cwpv). Such a failure must block DIRECTLY for triage.
 
     ``model_reached`` is the loop's dispatch-lifecycle evidence: any tool call,
-    thought, or token usage recorded for the attempt (not streamed answer text — an
-    ACP adapter can emit that itself before the model runs, #422). If the model
-    reached first token the failure is model-reachable no matter the message — this
-    returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
+    thought, or non-zero token usage recorded for the attempt. Not streamed answer text
+    — an ACP adapter can emit that itself before the model runs (#422) — and a failed
+    dispatch records no usage, so on a failure it is tool calls and thoughts. If the
+    model reached first token the failure is model-reachable no matter the message —
+    this returns ``False`` (stay on the ladder). Otherwise a recognised dispatch-seam
     signature is pre-model → ``True`` (block, no tier climb).
 
-    Message-gated on purpose: a build-gate failure (goal-verify, requirements
-    unresolved, ``solve()`` exhausted or its circuit breaker, no commits) proves the
-    model produced diffs, so it never matches here even if the monitor lost its
-    lifecycle evidence — only a genuine seam SHAPE qualifies: a message that starts as
-    the seam normalises one (``_SEAM_PREFIXES``), or whose head names a seam failure
-    (``_SEAM_SIGNATURES``). Neither looks at the text a failure quotes, so a gap that
-    mentions an adapter or a timeout stays the capability failure it is. The loop's own
-    fail-safe (an unreadable monitor snapshot ⇒ ``model_reached=False``) then routes an
-    ambiguous dispatch failure to a block rather than an expensive climb."""
+    Message-gated on purpose: the model-reachable failures the ladder owns (goal-verify,
+    requirements unresolved, ``solve()`` exhausted or its circuit breaker, no commits,
+    max-mode's no-diff) never match here, even when the monitor lost its lifecycle
+    evidence — they are the ladder's to climb on. Only a genuine seam SHAPE qualifies:
+    a message that starts as the seam normalises one (``_SEAM_PREFIXES``), or whose head
+    names a seam failure (``_SEAM_SIGNATURES``). Neither looks at the text a failure
+    quotes, so a gap that mentions an adapter or a timeout stays the capability failure
+    it is. The loop's own fail-safe (an unreadable monitor snapshot ⇒
+    ``model_reached=False``) then routes an ambiguous dispatch failure to a block rather
+    than an expensive climb."""
     if model_reached:
         return False
     text = (error or "").strip()

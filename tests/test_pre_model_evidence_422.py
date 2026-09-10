@@ -11,13 +11,14 @@ against codex-acp on 2026-09-10:
                   → PROMPT ERROR 400 "… requires a newer version of Codex"
     gpt-5.5:      available_commands_update
                   agent_message_chunk "OK"
-                  usage_update {used: 20835, size: 258400}     ← only after a real reply
+                  usage_update {used: 20835, size: 258400}
 
 So a failure seconds after session start read as model work and the card climbed a tier
-(bd-ojsd, 2026-08-31: refused 3.5s after the adapter came up, then "escalating
-smart→reasoning" on a build that carried the guard). #421 now classifies provider
-REFUSALS from the message alone; every other pre-model failure still rides this
-evidence, and those are what these tests drive.
+(bd-ojsd, 2026-08-31, on a build that carried the guard). That particular failure was a
+provider REFUSAL, which #421 now classifies from the message alone; every other pre-model
+failure after such chatter still rides this evidence, and those are what these tests
+drive. Usage is no clean signal either — adapters send it at odd moments, `{used: 0}`
+included — so it counts only when tokens were actually spent.
 """
 
 from __future__ import annotations
@@ -117,6 +118,10 @@ def test_only_model_produced_signals_count_as_reaching_the_model():
     coder_seam.progress_answer("f", 1, _CHATTER)
     assert coder_seam.dispatch_reached_model("f") is False
 
+    # claude-agent-acp reports `{used: 0}` at turn end even when no model ran
+    coder_seam.progress_usage("f", 1, {"used": 0, "size": 200000})
+    assert coder_seam.dispatch_reached_model("f") is False
+
     coder_seam.progress_usage("f", 1, {"used": 20835, "size": 258400})
     assert coder_seam.dispatch_reached_model("f") is True
 
@@ -134,9 +139,10 @@ def test_only_model_produced_signals_count_as_reaching_the_model():
 # ── the other half of the guard: the MESSAGE gate (#339's latent false positive) ──────
 # With text no longer counting as evidence, more model-reachable failures reach the
 # message check with `model_reached=False` — a ledger-only round (#382) is text-only by
-# design. The check searched the WHOLE message, so a failure that PROVES the model
-# produced a diff read as pre-model infra whenever the text it quoted said "adapter",
-# "delegate" or "timeout". It now matches only seam shapes, never the quoted rest.
+# design. The check searched the WHOLE message, so a model-reachable failure the ladder
+# owns would read as pre-model infra whenever the text it quoted said "adapter",
+# "delegate" or "timeout" (latent — no incident seen). It now matches only seam shapes,
+# never the quoted rest.
 
 
 @pytest.mark.parametrize(
@@ -148,6 +154,7 @@ def test_only_model_produced_signals_count_as_reaching_the_model():
         "circuit breaker tripped: 3 candidates failed on the IDENTICAL assertion — a spec problem, "
         "not model capability. Repeated failure: test_adapter_timeout",
         "coder produced no commits vs base — nothing to PR",
+        "max-mode: all 2 candidates produced no diff",
     ],
 )
 def test_a_model_reachable_failure_never_reads_as_pre_model_whatever_it_quotes(msg):

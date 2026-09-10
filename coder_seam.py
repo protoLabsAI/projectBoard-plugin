@@ -590,10 +590,19 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
+def _used_tokens(usage) -> bool:
+    """A usage record that shows tokens actually spent. ``{used: 0}`` is not one — an
+    adapter can report it at turn end when no model ran (#422)."""
+    try:
+        return int((usage or {}).get("used") or 0) > 0
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def dispatch_reached_model(fid: str) -> bool:
     """Did the CURRENT coder dispatch reach the model — produce first-token evidence
-    only a model produces (a tool call, a thought, or token usage) — mined from the
-    live-monitor ring buffer?
+    only a model produces (a tool call, a thought, or non-zero token usage) — mined from
+    the live-monitor ring buffer?
 
     Streamed answer text is deliberately NOT evidence (#422). An ACP adapter speaks on
     the same ``agent_message_chunk`` channel as its model, and can do so before the
@@ -601,13 +610,20 @@ def dispatch_reached_model(fid: str) -> bool:
     found. Defaulting to fallback metadata…`` there, then fails the prompt. Counting
     that text read a failure seconds after session start as model work, so the #339
     guard stood aside and the card climbed a tier on a failure no stronger model can
-    fix (bd-ojsd, 2026-08-31: refused 3.5s after the adapter came up, then escalated
-    smart→reasoning on a board already running the guard). Who sent a text chunk can't
-    be told apart here, so text alone is ambiguous, and ambiguity must block rather
-    than climb — the same fail-safe as below. A coding turn that got anywhere leaves a
-    tool call or a thought behind, and ``usage_update`` only arrives after a real reply;
-    a turn that produced nothing but text and then died is the ambiguous case, and it
-    goes to triage.
+    fix (bd-ojsd, 2026-08-31, on a board already running the guard — a refusal #421 now
+    catches by its message, but any other pre-model failure after such chatter, an
+    expired credential or a session that never answers, still rode this evidence). Who
+    sent a text chunk can't be told apart here, so text alone is ambiguous, and
+    ambiguity must block rather than climb — the same fail-safe as below. A coding turn
+    that got anywhere leaves a tool call or a thought behind; one that produced nothing
+    but text and then died is the ambiguous case, and it goes to triage.
+
+    Usage is weaker than it looks, so it counts only when ``used > 0``. A FAILED dispatch
+    records none: usage is read off a successful dispatch's result (or sampled in the
+    legacy tap's tool callback, where the tool call already counts). And adapters differ
+    on when they send it — claude-agent-acp 0.47.0 sends one at message start, on
+    rate-limit events, and ``{used: 0}`` at turn end even when no model ran; proto 0.71.1
+    sends none. So on a failure the evidence is, in practice, tool calls and thoughts.
 
     Scoped to the LATEST run epoch (``progress_begin``) so a stale gen an EARLIER
     dispatch left in this feature's buffer can NOT answer for the current one: a
@@ -630,7 +646,7 @@ def dispatch_reached_model(fid: str) -> bool:
             if getattr(b, "run", 0) != current:
                 continue  # a stale earlier-dispatch gen — not evidence for THIS dispatch
             # No `answer_tail` here: it holds adapter chatter as readily as a reply (#422).
-            if b.recent_tools or b.current_tool or (b.thought_tail or "").strip() or b.usage:
+            if b.recent_tools or b.current_tool or (b.thought_tail or "").strip() or _used_tokens(b.usage):
                 return True
         return False
     except Exception:  # noqa: BLE001 — a monitor read must never break the drive
