@@ -984,8 +984,16 @@ def _board_tools(cfg: dict):
         re-claims it and the loop re-dispatches (at the higher tier if it was just
         escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
         literal wrapping double quotes before storage (same hygiene as
-        board_create_feature)."""
+        board_create_feature). Refused while the loop is still working the card (a live
+        drive or review gate): wait for the round to end, or cancel the card."""
         try:
+            # Never under a live round (#398): pulling the card out from under a build that
+            # is still running is how a requeued card went terminal. Refused, not overridden.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(feature_id)
+            if refusal:
+                raise BoardError(refusal)
             store = get_store(**store_kw)
             findings = _strip_wrapping_quotes(findings)
             if findings.strip():
@@ -1018,12 +1026,21 @@ def _board_tools(cfg: dict):
         preserved. It accepts only that bounced shape: a coding feature, `in_progress`,
         non-empty `ci_failure`, and an open `pr_url`. Use
         `board_requeue_feature(feature_id, findings=...)` for adverse HUMAN review
-        findings; that guard still requires `in_review`."""
+        findings; that guard still requires `in_review`. Refused while the loop is still
+        working the card: a card mid-round has this same shape, and a requeue would pull it
+        out from under a build that has not finished."""
         try:
+            # Never under a live round (#398): a card mid-round has exactly the in_progress +
+            # open-PR shape this verb accepts, and requeuing it pulled `bd-p8ft` out from
+            # under its own CI-fix build, which then went terminal at the hand-off.
+            from .loop import queue_ci_feedback, requeue_refusal
+
+            refusal = requeue_refusal(feature_id)
+            if refusal:
+                raise BoardError(refusal)
             store = get_store(**store_kw)
             ci_failure = _strip_wrapping_quotes(ci_failure)
             store.record_ci_fix_feedback(feature_id, ci_failure)
-            from .loop import queue_ci_feedback
 
             queue_ci_feedback(feature_id, ci_failure)
             f = store.requeue(feature_id)

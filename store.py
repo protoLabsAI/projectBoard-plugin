@@ -2314,6 +2314,17 @@ class BeadsBoard:
         self._run(*args)
         return self.get_feature(fid)
 
+    def record_pr_url(self, fid: str, pr_url: str) -> dict:
+        """Record ``pr_url`` on the card (``external_ref``, projected as ``pr_url``) WITHOUT
+        moving it (#398). For a build that pushed and opened its PR after the card was
+        moved on under it — requeued, held, marked done. The move stands, but the card must
+        still point at the work: a requeued card's next round resumes from ``pr_url``, and
+        one with none rebuilds off base and force-pushes over the branch the PR is on."""
+        ref = normalize_external_ref(pr_url, edge="record_pr_url")
+        if ref:
+            self._run("update", fid, "--external-ref", ref)
+        return self.get_feature(fid)
+
     # Under the card's lock (#432's `_task_edge`): the attach is a read-validate-write across
     # several `br` calls, and a concurrent requeue of the same card must not land in between.
     @_task_edge

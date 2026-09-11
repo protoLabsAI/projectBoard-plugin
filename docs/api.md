@@ -54,8 +54,8 @@ crosses a fail-closed HMAC boundary (`X-Hub-Signature-256`) before touching the 
 |---|---|---|
 | `GET` | `/board` | — |
 | `GET` | `/config/projects` | Public page chrome for the sandboxed Configure tab. |
-| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… |
-| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… |
+| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… 400 while the loop is still working the card, a live drive or review gate (#398). |
+| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… 400 while the loop is still working the card, a live drive or review gate (#398). |
 | `POST` | `/webhook/pr` | GitHub PR webhook — the SINGLE Done edge. On a `closed` event with `merged: true` it sets the matching feature `done` (nothing else does) and reaps its worktree. The raw body is HMAC-verified against… |
 
 ## Long saves

@@ -1267,28 +1267,46 @@ class DriveMixin:
         await self._record_task_reply(store, fid, reply, "task")
 
     async def _task_dispatch_failed(self, store, fid: str, kind: str, reason: str) -> None:
-        """Block a task whose dispatch failed — or answered with nothing — for triage,
-        UNLESS the card was delivered under the drive (#432 review).
+        """Block a task whose dispatch failed — or answered with nothing — for triage, but
+        ONLY while the card is still this drive's: in_progress, read fresh. The task-side
+        twin of ``_block_or_stand_aside`` (#398), and the same rule.
 
-        A self task's agent has its board tools live during the turn, so it can
-        board_deliver and THEN time out or error. Blocking that card stamped `blocked` over
-        a delivered deliverable, and the verifier could no longer approve it
-        (`record_verification expects in_review, got 'blocked'`). So the card is re-read
-        first: in review (or already done), the delivery stands and the failure is only
-        logged. If the re-read itself fails, the block goes ahead as it always did. Neither
-        a failed read nor a failed block escapes the drive task."""
-        try:
-            current = await asyncio.to_thread(store.get_feature, fid)
-        except BR_FAILURES as exc:
-            log.warning("[project_board] %s could not re-read the card before blocking it: %s", fid, exc)
-            current = None
-        state = (current or {}).get("board_state")
-        if state in ("in_review", "done"):
+        - Delivered under the drive (in_review / done): a self task's agent has its board
+          tools live during the turn, so it can board_deliver and THEN time out or error.
+          Blocking that card stamped `blocked` over a delivered deliverable, and the
+          verifier could no longer approve it (#432 review). The delivery stands.
+        - Moved on under the drive otherwise (held by a human, requeued, cancelled): the
+          move stands. A block would overwrite the hold's own reason and class.
+        - UNREADABLE: never assumed to be the drive's own. This used to block "as it always
+          did" — over whatever decision the drive could not see. It is logged instead, and
+          a card still in_progress with no drive is the sweep's to reconcile.
+
+        Neither a failed read nor a failed block escapes the drive task."""
+        moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+        if moved_to == "unknown":
+            log.warning(
+                "[project_board] %s %s failed and the card could not be re-read — not blocking a card the "
+                "drive cannot see (the health sweep reconciles it): %s",
+                fid,
+                kind,
+                reason,
+            )
+            return
+        if moved_to in ("in_review", "done"):
             log.info(
                 "[project_board] %s %s failed after the card was delivered (%s) — the delivery stands, not blocking: %s",
                 fid,
                 kind,
-                state,
+                moved_to,
+                reason,
+            )
+            return
+        if moved_to:
+            log.info(
+                "[project_board] %s %s failed after the card was moved to %s — the move stands, not blocking: %s",
+                fid,
+                kind,
+                moved_to,
                 reason,
             )
             return
@@ -1393,6 +1411,7 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
         # across drives and marks a carried-forward FIX — so one all-timeout fan-out
@@ -1401,6 +1420,25 @@ class DriveMixin:
         timeout_note = ""
         try:
             while True:
+                # Every attempt after the first is a RETRY of a card the drive may no longer
+                # own (#398): a human hold placed mid-round used to be retried under — the
+                # coder re-dispatched three times on the held card, which was then re-blocked
+                # `transient` and auto-cleared by the sweep, the hold lost. Ask first.
+                if attempt:
+                    moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                    if moved_to:
+                        await self._stand_aside(
+                            store,
+                            fid,
+                            moved_to,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                            why="its next attempt was due, and was not started",
+                        )
+                        return
+                attempt += 1
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -1432,8 +1470,14 @@ class DriveMixin:
                 coder_name = siblings[sib % len(siblings)]
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
-                    await asyncio.to_thread(
-                        store.flag_blocked, fid, f"coder delegate {coder_name!r} not configured/enabled"
+                    await self._block_or_stand_aside(
+                        store,
+                        fid,
+                        f"coder delegate {coder_name!r} not configured/enabled",
+                        repo=repo,
+                        wt=wt,
+                        branch=branch,
+                        pr_url=pr_url,
                     )
                     return
                 try:
@@ -1779,6 +1823,26 @@ class DriveMixin:
                             f"requirements unresolved: {len(open_items)} item(s) still open after "
                             f"{n} fix round(s): " + ", ".join(str(i.get("id")) for i in open_items)
                         )
+                    # Is the card still this drive's to publish for (#398, and the #211
+                    # operator cancel before it)? Re-read right before any edge that would act
+                    # on it. A card held, marked done, cancelled or taken into review elsewhere
+                    # while the coder finished gets NO PR from this build: the work stays in
+                    # the worktree, unpushed and intact, and the card gets the trail. A
+                    # requeued card is still published for — its next round resumes the PR,
+                    # which keeps the work instead of rebuilding off base over it.
+                    moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                    if moved_to and moved_to not in self._PUBLISH_THROUGH_MOVES:
+                        await self._stand_aside(
+                            store,
+                            fid,
+                            moved_to,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=None,
+                            why="it finished, and opened no PR for a card that is no longer its own",
+                        )
+                        return
                     # Source-issue closed guard (#166): re-check the issue before
                     # opening a PR. A closed source issue means another PR already
                     # resolved the ticket — opening a duplicate wastes reviewer/CI
@@ -1804,17 +1868,12 @@ class DriveMixin:
                                 fid,
                                 exc_info=True,
                             )
-                            await asyncio.to_thread(store.flag_blocked, fid, reason)
+                            if not await self._block_or_stand_aside(
+                                store, fid, reason, repo=repo, wt=wt, branch=branch
+                            ):
+                                return
                         await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
-                        return
-                    # Operator cancel (#211): re-read the card right before the PR edge.
-                    # A card cancelled while the coder was finishing must NOT get a PR —
-                    # the work is the operator's to salvage, not the loop's to publish
-                    # (the old path opened it, then open_review refused the cancelled
-                    # card and left an orphaned red PR nobody owned).
-                    if await asyncio.to_thread(self._cancelled, store, fid):
-                        await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
@@ -1824,10 +1883,21 @@ class DriveMixin:
                     pr_url = await worktree.open_pr(
                         wt, branch, base=base, title=title, body=body, promote_draft=not feature.get("pr_url")
                     )
-                    # …and again after: a cancel that lands during the push/create
-                    # closes the PR it just opened rather than handing it to open_review.
-                    if await asyncio.to_thread(self._cancelled, store, fid):
-                        await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
+                    # …and again after: a move that landed during the push/create. A cancel
+                    # closes the PR it just opened (#211); any other move keeps the PR and
+                    # records it on the card, rather than handing it to open_review (#398).
+                    moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                    if moved_to and moved_to != "unknown":
+                        await self._stand_aside(
+                            store,
+                            fid,
+                            moved_to,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                            why="it finished and published, but the card had moved on",
+                        )
                         return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     if self._shutting_down:
@@ -1935,7 +2005,10 @@ class DriveMixin:
                                     )
                                     continue
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
-                            await asyncio.to_thread(store.flag_blocked, fid, reason)
+                            if not await self._block_or_stand_aside(
+                                store, fid, reason, repo=repo, wt=wt, branch=branch, pr_url=pr_url
+                            ):
+                                return
                             if wt:
                                 await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
@@ -2075,7 +2148,10 @@ class DriveMixin:
                                 f"card right now (no tier climb): {exc}"
                             )
                         log.warning("[project_board] %s blocked (%s, tier untouched): %s", fid, category, reason)
-                        await asyncio.to_thread(store.flag_blocked, fid, reason, category=category)
+                        if not await self._block_or_stand_aside(
+                            store, fid, reason, category=category, repo=repo, wt=wt, branch=branch, pr_url=pr_url
+                        ):
+                            return
                         if wt:
                             await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
@@ -2095,7 +2171,17 @@ class DriveMixin:
                             fid,
                             exc,
                         )
-                        await asyncio.to_thread(store.flag_blocked, fid, reason, category=PRE_MODEL_DISPATCH_CLASS)
+                        if not await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            reason,
+                            category=PRE_MODEL_DISPATCH_CLASS,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                        ):
+                            return
                         if wt:
                             await worktree.remove_worktree(repo, wt, branch or "")
                         self._inflight.pop(fid, None)
@@ -2123,6 +2209,22 @@ class DriveMixin:
                         await self._budget_set(store, fid, "timeout", timeouts)
                         threshold = self.decompose_after_timeouts  # 0 = never park (block as before)
                         if threshold and timeouts >= threshold:
+                            # Parking blocks the card and files its split — never over a card
+                            # someone else has moved on (#398): a held card is not re-blocked
+                            # as too wide, and no split is filed for it.
+                            moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                            if moved_to:
+                                await self._stand_aside(
+                                    store,
+                                    fid,
+                                    moved_to,
+                                    repo=repo,
+                                    wt=wt,
+                                    branch=branch,
+                                    pr_url=pr_url,
+                                    why=f"it then timed out ({str(exc)[:200]}), and was not parked for a split",
+                                )
+                                return
                             await self._park_for_split(store, fid, timeouts, exc)
                             if wt:
                                 await worktree.remove_worktree(repo, wt, branch or "")
@@ -2177,9 +2279,17 @@ class DriveMixin:
                     # The class is passed, not re-derived from the reason text: the store's own
                     # classify() would read a refusal phrase quoted in a goal gap back into
                     # `provider-unavailable`, undoing the re-classification above.
-                    await asyncio.to_thread(
-                        store.flag_blocked, fid, f"{policy.category}: {exc}", category=policy.category
-                    )
+                    if not await self._block_or_stand_aside(
+                        store,
+                        fid,
+                        f"{policy.category}: {exc}",
+                        category=policy.category,
+                        repo=repo,
+                        wt=wt,
+                        branch=branch,
+                        pr_url=pr_url,
+                    ):
+                        return
                     if wt:
                         await worktree.remove_worktree(repo, wt, branch or "")
                     self._inflight.pop(fid, None)
@@ -2187,7 +2297,29 @@ class DriveMixin:
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
-                await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+                try:
+                    await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
+                except BoardError as exc:
+                    # #398: a hand-off refused because the card is no longer this drive's —
+                    # moved in the moment between the check above and this write. Live:
+                    # the PM requeued a card mid-round, `open_review` refused (`expects
+                    # in_progress, got 'ready'`), and the catch-all blocked it TERMINALLY,
+                    # a card with an open PR and no new cause. The refusal names the state
+                    # it found, so even an unreadable board cannot turn it back into a block.
+                    moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid, str(exc))
+                    if not moved_to:
+                        raise  # still this drive's card: a real refusal, blocked below
+                    await self._stand_aside(
+                        store,
+                        fid,
+                        moved_to,
+                        repo=repo,
+                        wt=wt,
+                        branch=branch,
+                        pr_url=pr_url,
+                        why="it finished and published, but the card had moved on",
+                    )
+                    return
                 # Gate passed — reset the pre-PR budgets (goal-fix, local-gate, the
                 # requirement ledger #113, and the empty-result count #198), and the timeout
                 # count (#378): a card that built in one dispatch is demonstrably not too wide.
@@ -2222,14 +2354,18 @@ class DriveMixin:
                 await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
                 return
             log.warning("[project_board] %s blocked (board): %s", fid, exc)
-            await asyncio.to_thread(store.flag_blocked, fid, str(exc))
-            self._inflight.pop(fid, None)
+            if await self._block_or_stand_aside(
+                store, fid, str(exc), refusal=str(exc), repo=repo, wt=wt, branch=branch, pr_url=pr_url
+            ):
+                self._inflight.pop(fid, None)
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
-            await asyncio.to_thread(store.flag_blocked, fid, f"unexpected: {type(exc).__name__}: {exc}")
-            if wt:
-                await worktree.remove_worktree(repo, wt, branch or "")
-            self._inflight.pop(fid, None)
+            if await self._block_or_stand_aside(
+                store, fid, f"unexpected: {type(exc).__name__}: {exc}", repo=repo, wt=wt, branch=branch, pr_url=pr_url
+            ):
+                if wt:
+                    await worktree.remove_worktree(repo, wt, branch or "")
+                self._inflight.pop(fid, None)
 
     async def _park_for_split(self, store, fid: str, timeouts: int, exc: Exception) -> None:
         """Park a card whose fresh builds keep timing out, and hand its split to the board's
@@ -2297,6 +2433,130 @@ class DriveMixin:
         except Exception:  # noqa: BLE001 — BoardError, a fake store without the read
             return False
         return bool(f) and str(f.get("board_state") or "") == "cancelled"
+
+    # ── a card moved under a live drive (#398) ───────────────────────────────
+    # A drive owns its card only while the card is in_progress. Anyone else can move it on
+    # while the coder works: a human hold (which projects as `blocked`), `mark_done`, a
+    # cancel, a requeue. The move is the NEWER decision, so every edge where the drive would
+    # change the card (block it, retry it, publish it, hand it to review) first asks whether
+    # the card is still its own, and a drive that has lost its card stands aside instead:
+    # it leaves the trail, keeps its work, and changes nothing. Live, the hand-off was the
+    # one place that did NOT ask — `bd-p8ft` was requeued mid-round, and the drive blocked
+    # it terminally on "open_review expects in_progress, got 'ready'", with an open PR.
+
+    # The state a refused `open_review` names — the drive's one move it learns of by being
+    # told no, and so the one it can still read when the board itself cannot be (#398).
+    _REFUSED_STATE_RE = re.compile(r"expects in_progress, got '([a-z_]+)'")
+    # A moved card the build still publishes for: a requeued card's next round resumes the
+    # PR (so the work is kept, not rebuilt over), and an unreadable card is left for the
+    # hand-off to settle. Any other move — held, done, cancelled, in review elsewhere —
+    # gets no PR from a build that is no longer its own.
+    _PUBLISH_THROUGH_MOVES = frozenset({"ready", "unknown"})
+    # The drive's own fix budgets. A drive that stands aside resets them: whoever moved the
+    # card decides the next round, and that round starts fresh rather than inheriting the
+    # attempts an interrupted build spent (#398).
+    _DRIVE_FIX_BUDGETS = ("goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only")
+
+    @staticmethod
+    def _moved_under_drive(store, fid: str, refusal: str = "") -> str:
+        """Where the card went, if this drive no longer owns it — ``""`` while it still does.
+
+        Owned means ``in_progress``: a hold on an in_progress card projects as ``blocked``,
+        so it reads as moved too. ``cancelled`` is returned like any move; the caller routes
+        it to the cancel edge, which also closes a PR.
+
+        FAILS TOWARD NOT OVERWRITING. An unreadable card is never assumed to be the drive's
+        own: blocking or retrying it could overwrite a decision the drive cannot see, which
+        is the original incident. A refused hand-off names the state it found, so that is
+        used; with nothing to go on the answer is ``unknown``, and the drive stands aside —
+        a card left in_progress with no drive is the sweep's to reconcile. Only a store with
+        NO read at all (a stub) or a row with no state reads as still owned."""
+        read = getattr(store, "get_feature", None)
+        if read is None:
+            return ""
+        try:
+            f = read(fid)
+        except Exception:  # noqa: BLE001 — BoardError, a timed-out `br`: the card is unknowable
+            m = DriveMixin._REFUSED_STATE_RE.search(refusal or "")
+            return m.group(1) if m else "unknown"
+        state = str((f or {}).get("board_state") or "")
+        return "" if state in ("", "in_progress") else state
+
+    async def _block_or_stand_aside(
+        self, store, fid: str, reason: str, *, repo: str, wt, branch, pr_url=None, category: str = "", refusal=""
+    ) -> bool:
+        """THE way a drive blocks its card (#398): block it for this drive's own failure —
+        unless it is no longer the drive's card, in which case the failure is recorded as a
+        comment and the drive stands aside. Every drive-side block goes through here, so a
+        human's hold is never overwritten, a requeue's fresh round is never turned into a
+        terminal block, and a card marked done is never re-blocked. Returns True when it
+        blocked (the caller finishes its cleanup), False when the drive stood aside (the
+        drive is over — the caller returns at once)."""
+        moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid, refusal)
+        if moved_to:
+            await self._stand_aside(
+                store,
+                fid,
+                moved_to,
+                repo=repo,
+                wt=wt,
+                branch=branch,
+                pr_url=pr_url,
+                why=f"it then failed ({reason[:300]}), and that was neither blocked nor retried",
+            )
+            return False
+        kwargs = {"category": category} if category else {}
+        await asyncio.to_thread(store.flag_blocked, fid, reason, **kwargs)
+        return True
+
+    async def _stand_aside(self, store, fid: str, moved_to: str, *, repo: str, wt, branch, pr_url, why: str) -> None:
+        """End a drive whose card was moved to ``moved_to`` under it (#398). Not a failure
+        and not a block: the move stands, and the drive changes nothing but the trail.
+
+        - ``cancelled`` takes the cancel edge (#211): it closes a PR this build opened.
+        - A PR this build opened is RECORDED on the card, state untouched, so a requeued
+          card's next round resumes that branch instead of rebuilding off base over it.
+        - The worktree is kept: any work not on a PR stays where it is, never destroyed.
+        - The drive's fix budgets reset, so the round that follows starts fresh.
+        - One comment says what happened. Every write here is best-effort — a failure of
+          the trail must never escape into a handler that blocks the card."""
+        if moved_to == "cancelled":
+            await self._end_cancelled_drive(store, fid, repo, wt, branch, pr_url=pr_url)
+            return
+        log.info("[project_board] %s moved to %s under its drive — standing aside: %s", fid, moved_to, why)
+        recorded = False
+        if pr_url:
+            try:
+                await asyncio.to_thread(store.record_pr_url, fid, pr_url)
+                recorded = True
+            except Exception:  # noqa: BLE001 — the PR is on GitHub either way; the card just won't point at it
+                log.warning("[project_board] %s: could not record %s on the moved card", fid, pr_url, exc_info=True)
+        await self._budget_reset(store, fid, *self._DRIVE_FIX_BUDGETS)
+        if pr_url:
+            where = f"its work is pushed and on {pr_url}" + (
+                ", recorded on this card, so the next round resumes from it"
+                if recorded
+                else " (recording it on this card failed — attach it by hand)"
+            )
+        elif wt:
+            where = f"it opened no PR; its work stays in worktree {wt} (branch {branch or '?'}), not pushed"
+        else:
+            where = "it had no work of its own to keep"
+        if moved_to == "unknown":
+            lead = (
+                "this card could not be read as its build ended, so the build stood aside rather than "
+                "risk overwriting a decision it could not see"
+            )
+            tail = "Nothing was blocked, retried or sent to review; the health sweep reconciles the card."
+        else:
+            lead = f"this card was moved to {moved_to} while its build was running, so the build stood aside"
+            tail = "The move stands — nothing was blocked, retried or sent to review."
+        note = f"{lead}: {why}. {where[0].upper()}{where[1:]}. {tail}"
+        try:
+            await asyncio.to_thread(store.comment, fid, note)
+        except Exception:  # noqa: BLE001 — the trail is best-effort, never a reason to block
+            log.warning("[project_board] %s: could not leave the stand-aside note", fid, exc_info=True)
+        self._inflight.pop(fid, None)
 
     async def _end_cancelled_drive(self, store, fid: str, repo: str, wt, branch, *, pr_url: str | None = None) -> None:
         """Finish a drive whose card was cancelled by the operator: close the PR if one
