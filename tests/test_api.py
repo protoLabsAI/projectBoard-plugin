@@ -92,8 +92,8 @@ class FakeStore:
             raise BoardError("Ready gate: missing spec")
         return self._rec("mark_ready", fid)
 
-    def flag_blocked(self, fid, reason):
-        return self._rec("flag_blocked", fid, reason)
+    def flag_blocked(self, fid, reason, category=""):
+        return self._rec("flag_blocked", fid, reason, category)
 
     def clear_blocked(self, fid):
         return self._rec("clear_blocked", fid)

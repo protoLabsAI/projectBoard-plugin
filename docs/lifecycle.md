@@ -224,10 +224,62 @@ happens next. Every sweep, the loop walks the blocked lane:
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
-The reason lives in a bead *comment*, and `br list` carries none — so a list row always
-projects an empty reason. The escalating card is deliberately re-read through `br show`
-first, because "no reason recorded" tells the operator nothing and sends them digging,
-which is the thing the alert exists to prevent.
+A block set **by hand** (`board_block_feature`, `POST …/block`) is always `terminal`, so it
+is never cleared automatically. The self-heal also **never moves a card blocked while still
+in backlog**, whatever its class, because its requeue would promote a card that never passed
+the Ready gate. Only people and agents block backlog cards (the loop blocks only ready and
+in-flight ones). A hand block written before this change still carries whatever class its
+wording guessed, and it goes to a human instead. The class of a loop-set block is inferred from its reason
+by the coder-failure classifier. That classifier reads prose as if it were an error message:
+a PM's "waiting on the network team" matched `network`, came out `transient`, and the sweep
+cleared the hold and requeued the card to `ready`, straight past the Ready gate. A human's
+block is a decision. Only its author knows when it is over (#406).
+
+**The reason is on every read.** It lives in a bead *comment*, and `br list` omits
+comments. Until #416 every list row therefore showed an empty `blocked_reason`: in
+`GET /features`, in `board_list`, and in the sweep's own read. Cards read as terminal with
+no reason while the reason sat one `br show` away. The listing now carries the comment
+thread across for blocked rows, from the batch `br show` it already makes for dependencies,
+so a blocked card's reason shows wherever the card does. The escalation path still re-reads
+a card through `br show` if its reason is somehow empty, because "no reason recorded" tells
+the operator nothing. A terminal block can no longer be written without a reason at all
+(#414).
+
+### Cards stranded outside the ready lane (#406)
+
+The loop claims only `ready` cards, and only `ready` + `depends_on` is re-checked when a
+dependency closes (the dag gate releases it by itself). A card left in **backlog** to wait
+for its dependencies, or **blocked** in backlog for the same reason, is never looked at
+again once they close. It is not a claim candidate and it shows up in no skip diagnostic.
+So the board now names it, wherever a card's next action is shown: the listing, the
+console chip, the agent's working state (which names a backlog card only when it owes a step,
+and ranks it after every in-flight card so a pile of stranded cards can't push a PR awaiting
+merge out of the capped list), and one sweep log line when the card first becomes stranded
+(held in memory, so a restart logs each stranded card once more):
+
+- **backlog, every dependency closed** → `dependencies closed — promote`. The step is
+  `board_mark_ready`, and the Ready gate still decides. A `deferred` or `designing` card is
+  excluded because it is parked for another reason. **`board_mark_designing`** is how the PM
+  says so: it parks the card on purpose, and `board_mark_ready` unparks it. "Closed" is
+  what beads' dependency gate counts, merged or cancelled. When a dependency was
+  **cancelled** (a scope cut, not a delivery), the hint names it and asks to confirm the
+  card still makes sense first.
+- **blocked in backlog, every dependency closed** → `blocked — dependencies closed`. The
+  block may have been only that wait, or it may be unrelated, so it is **surfaced, never
+  cleared**. The operator gets one more alert when the last dependency closes.
+
+Nothing is promoted or unblocked for you. A card with no recorded `depends_on` is never
+called stranded, because without a recorded edge there is nothing to say has cleared.
+Auto-promoting a stranded backlog card is deliberately out of scope: a backlog card may
+sit there on purpose, and the Ready gate is a decision point, not a formality.
+
+`board_dispatch` uses the same classification. When nothing is claimable, it no longer
+answers a bare `empty-queue` while cards are held. The outcome is `held`, and the record's
+`held` field maps each reason to its count, first few ids, and the step that moves it.
+The reasons are: `dependencies-closed-promote` and `blocked-dependencies-closed` (the two
+stranded shapes); `ready-waiting-on-dependencies` (the dag gate will release these by
+itself); `backlog-waiting-on-dependencies`; and `blocked:<class>` for every other blocked
+card. `empty-queue` now means nothing is held either.
 
 ### Why the alert doesn't repeat, and when it should
 

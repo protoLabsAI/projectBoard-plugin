@@ -273,6 +273,15 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
+# The class a block set BY HAND always carries (#406): the board_block_feature tool and
+# POST /features/{fid}/block, a person or the PM parking a card on something outside the
+# board. `flag_blocked` otherwise infers a class from the reason with the coder-failure
+# classifier, and that classifier reads prose as an error message: "waiting on the network
+# team" matched `network` → transient, and the blocked sweep cleared the hold and REQUEUED
+# the card to ready — promoting a backlog card straight past the Ready gate. A human's
+# block is a decision, not a failure; only its author knows when it is over, so it is
+# never self-healing.
+MANUAL_BLOCK_CLASS = "terminal"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -2952,8 +2961,8 @@ class BeadsBoard:
         if cls == "terminal" and not str(reason or "").strip():
             raise BoardError(
                 f"{fid}: a terminal block needs a reason — it is never auto-cleared, so "
-                "without one no coder can act on it and the card parks forever. Pass a "
-                "reason, or block it as transient if the sweep should retry."
+                "without one no coder can act on it and the card parks forever. Say what is "
+                "blocking it. (A block set by hand is always terminal: the sweep never lifts one.)"
             )
         want = f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}" if cls else ""
         for prior in f.get("labels") or []:  # replace, never accumulate (the `gens:` pattern)
@@ -3838,6 +3847,13 @@ NEXT_ACTION_CI_FAILING = "ci failing"
 # requeue (set_review_substate never dropped it) — it is cleared only when the re-review
 # re-arms to `review-pending`, so this fires precisely while the fix round is live.
 NEXT_ACTION_FIXING_REVIEW = "fixing review findings"
+# #406: a card OUTSIDE the ready lane whose every dependency has closed. The loop claims
+# only `ready` cards and re-evaluates only `ready` + `depends_on` (the dag gate), so a card
+# left in backlog — or blocked there — to wait for its dependencies is never looked at
+# again once they close: it is not a claim candidate, it is in no skip diagnostic, and it
+# sat waiting on a `mark_ready` nobody knew was owed. These name the verb that moves it.
+NEXT_ACTION_DEPS_CLEARED = "dependencies closed — promote"
+NEXT_ACTION_BLOCKED_DEPS_CLEARED = "blocked — dependencies closed"
 
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
 
@@ -4191,16 +4207,85 @@ def review_fix_posture(feature: dict) -> dict:
     return out
 
 
+def blocked_before_ready(feature: dict) -> bool:
+    """A card blocked while still in backlog — open, never promoted, no ``ready`` label
+    (#406). The loop only ever blocks ready and in-flight cards, so a block here was set by
+    a person or an agent. Nothing may move such a card on its own: the blocked sweep's
+    self-heal requeues to ``ready``, which for a card that never passed the Ready gate means
+    promoting it straight past it."""
+    labels = feature.get("labels") or []
+    return bool(feature.get("blocked")) and feature.get("bead_status") == "open" and LABEL_READY not in labels
+
+
+def stranded_posture(feature: dict, *, cancelled: frozenset | set = frozenset()) -> dict:
+    """The stranded-card sibling of ``review_fix_posture`` (#406): a card outside the
+    ready lane whose recorded dependencies have ALL closed, so nothing on the board is
+    left waiting except a verb only the PM or a human can run. Same ``{"next_action",
+    "awaiting_merge", "next_action_hint"}`` shape; labels, state and the row's own
+    ``depends_on`` / ``open_depends_on`` only, no per-row network.
+
+    Two shapes, told apart because only one of them is safe to act on blind:
+
+    * **backlog** → ``dependencies closed — promote``: never promoted, and every card it
+      waited on has closed. Promotion is the next step, and the Ready gate still decides
+      whether it is fit to build. A ``deferred`` or ``designing`` backlog card is excluded —
+      it is parked on purpose, for something other than its dependencies
+      (``board_mark_designing`` parks one, ``board_mark_ready`` unparks it).
+    * **blocked in backlog** (``blocked_before_ready`` — set by hand, never by the loop) →
+      ``blocked — dependencies closed``: every dependency closed, but the block is someone's
+      decision with its own reason, and that reason may be unrelated. It is surfaced, and
+      NEVER cleared on anyone's behalf.
+
+    "Closed" is what beads' own dependency gate counts, merged OR cancelled. A dependency
+    ``cancelled`` names (the ids of cancelled cards in the same listing) was a scope cut,
+    not a delivery, so its hint asks to confirm the card still makes sense first; a
+    dependency outside the listing reads as plainly closed.
+
+    Empty for everything else, and for a card with no dependencies at all: without a
+    recorded edge there is nothing to say has cleared. ``ready`` + ``depends_on`` is not
+    here either — that one the dag gate already releases on its own."""
+    out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    deps = [str(d) for d in feature.get("depends_on") or [] if str(d)]
+    if not deps or feature.get("open_depends_on"):
+        return out
+    fid = feature.get("id", "")
+    labels = set(feature.get("labels") or [])
+    dropped = [d for d in deps if d in cancelled]
+    closed = (
+        f"{', '.join(dropped)} {'was' if len(dropped) == 1 else 'were'} CANCELLED, not merged — confirm "
+        "this card still makes sense before it moves"
+        if dropped
+        else f"every card it depends on has closed ({', '.join(deps)})"
+    )
+    state = feature.get("board_state")
+    if state == "backlog":
+        if feature.get("bead_status") == "deferred" or LABEL_DESIGNING in labels:
+            return out
+        out["next_action"] = NEXT_ACTION_DEPS_CLEARED
+        out["next_action_hint"] = (
+            f"{closed} — promote it with board_mark_ready({fid}), the Ready gate still applies; or, parked "
+            f"on purpose, board_mark_designing({fid})"
+        )
+    elif state == "blocked" and blocked_before_ready(feature):
+        out["next_action"] = NEXT_ACTION_BLOCKED_DEPS_CLEARED
+        out["next_action_hint"] = (
+            f"{closed}, but a block is never cleared for you — if they were why it was blocked, "
+            f"board_unblock_feature({fid}) then board_mark_ready({fid})"
+        )
+    return out
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — a coding ``in_review`` card from the board's config
     (``auto_merge``, ``review_gate``, via ``merge_posture``) and a task-type bead via
     ``task_posture``: ``awaiting verification`` for a delivered ``in_review`` task (its
     record_verification Done edge, ADR 0078) and ``awaiting deliverable`` for a parked
-    ``in_progress`` one (#305). A task is routed to ``task_posture`` first, so the coding
-    review-gate wording never lands on it. Labels + config only, no per-row network. Rows in
-    any other state are left untouched (the payload shape for them is unchanged). Mutates and
-    returns ``feats``.
+    ``in_progress`` one (#305); and a backlog or backlog-blocked card whose every
+    dependency has closed, via ``stranded_posture`` (#406). A task is routed to
+    ``task_posture`` first, so the coding review-gate wording never lands on it. Labels +
+    config only, no per-row network. Rows in any other state are left untouched (the
+    payload shape for them is unchanged). Mutates and returns ``feats``.
 
     ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
     routers and the tools alike; ``BoardLoop.reload`` writes every changed live knob
@@ -4231,6 +4316,10 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         merged_verify_max = 0
     if is_driven is None:
         is_driven = _live_drive_predicate()
+    # Which of this listing's cards were cancelled, so a stranded card can say its
+    # dependency was a scope cut rather than a delivery (#406). A dependency outside the
+    # listing (archived, or a state-filtered read) simply reads as closed.
+    cancelled = frozenset(str(f.get("id")) for f in feats if f.get("board_state") == "cancelled")
     for f in feats:
         # A task-type bead (#217) never merges a PR: its in_review Done edge is
         # record_verification and its parked in_progress state awaits a deliverable — both owned
@@ -4239,6 +4328,8 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         # merge_posture's precedence unchanged (ADR 0078: task verification is a SEPARATE edge).
         if f.get("issue_type") == LABEL_TASK:
             posture = task_posture(f, is_driven=is_driven)
+            if not posture["next_action"]:
+                posture = stranded_posture(f, cancelled=cancelled)  # #406: a task waits on dependencies too
             if posture["next_action"]:
                 f["next_action"] = posture["next_action"]
                 f["awaiting_merge"] = posture["awaiting_merge"]
@@ -4247,8 +4338,11 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         posture = merge_posture(f, auto_merge=auto_merge, review_gate=review_gate, merged_verify_max=merged_verify_max)
         if not posture["next_action"]:
             # #347: a coding card in an active review-fix round (bounced + requeued,
-            # changes-requested riding the requeue) — re-driving a fix.
+            # changes-requested riding the requeue) — re-driving a fix. Else #406: a card
+            # outside the ready lane whose every dependency has closed.
             posture = review_fix_posture(f)
+            if not posture["next_action"]:
+                posture = stranded_posture(f, cancelled=cancelled)
             if not posture["next_action"]:
                 continue
         elif f.get("ci_status") == "failing" and posture["next_action"] in (

@@ -34,7 +34,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/features/{fid}/dep` | Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done. (Foundation gating is just a blocks-edge on the foundation feature.) |
 | `DELETE` | `/features/{fid}/dep` | Remove a `blocks` edge — inverse of POST …/dep. Body: `{"depends_on": "<id>"}`. |
 | `POST` | `/features/{fid}/ready` | The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing. |
-| `POST` | `/features/{fid}/block` | — |
+| `POST` | `/features/{fid}/block` | Block a card by hand. Body: `{"reason": "…"}` (required). A hand-set block is a hold, never a failure: it is never cleared automatically, whatever the reason says (#406). Lift it with `POST …/unblock`. |
 | `POST` | `/features/{fid}/unblock` | — |
 | `POST` | `/features/{fid}/cancel` | Cancel a feature created in error — the second terminal edge (#47). Closes the bead with an audit reason and tags it `cancelled` (a distinct state, not `done`), so a bad decomposition/duplicate leaves… |
 | `POST` | `/features/{fid}/done` | Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that shipped OUTSIDE the board's PR lifecycle (record_merge's pr_url→external_ref match never fires). Accepts only an in-flight ca… |
