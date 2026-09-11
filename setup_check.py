@@ -874,27 +874,33 @@ CONFIG_PLUGIN_LABEL = "Project Board"
 CONFIG_ACTION_KEYS: tuple[str, ...] = ("coder", "repo")
 
 
-def plugin_config_action() -> dict:
+def plugin_config_action(key: str) -> dict:
     """A declarative, host-allowlisted ``plugin_config`` action that opens THIS plugin's
     Configure dialog — the surface where a ``coder`` / ``repo`` gap is actually resolved.
 
     The plugin manufactures no coder and mutates no config: the action only *navigates*
-    the operator to the configuration surface (the host renders it as a button on the
-    operator warning). ``plugin`` is the stable configured id the host allowlists the
-    action against; ``label`` is what the operator sees."""
-    return {"kind": "plugin_config", "plugin": CONFIG_PLUGIN_ID, "label": CONFIG_PLUGIN_LABEL}
+    the operator to the configuration surface (the console renders it as a button on the
+    setup-gap banner). The shape is the host's CLOSED action schema
+    (protoAgent ``graph/plugins/setup_gaps.py``): ``kind``, plus optional plain-text
+    ``label`` (the button text) and ``fields`` (the config keys at fault — here the gap's
+    own key, which IS its config key). No target: the host force-targets a
+    ``plugin_config`` action at the plugin that reported it, and drops any key outside
+    that schema."""
+    return {"kind": "plugin_config", "label": f"Configure {CONFIG_PLUGIN_LABEL}", "fields": [key]}
 
 
-def _seam_accepts_actions(fn) -> bool:
-    """Does the host's ``report_setup_gap`` seam accept the structured ``actions=``
-    keyword (the extended contract), or is it the prior
-    ``report_setup_gap(key, message, *, label=None)`` seam?
+def _seam_accepts_action(fn) -> bool:
+    """Does the host's ``report_setup_gap`` seam take the structured ``action=`` keyword —
+    protoAgent ≥ v0.162.0: ``report_setup_gap(key, message, *, label=None, action=None)`` —
+    or is it the prior ``report_setup_gap(key, message, *, label=None)`` seam (v0.146–v0.161)?
 
-    True when the signature names an ``actions`` parameter OR accepts ``**kwargs`` (which
-    swallows any keyword). Anything that cannot be introspected — a C builtin, some mocks,
-    a signature-less callable — is treated as NOT accepting it, so the plugin degrades to
-    the plain two-argument call rather than risk a ``TypeError`` that would drop the
-    warning entirely (r3). Never raises."""
+    True when the signature names an ``action`` parameter OR accepts ``**kwargs`` (which
+    swallows any keyword). The keyword is SINGULAR: an earlier version of this adapter
+    probed for ``actions=``, which no host ever had, so it always took the plain call and
+    the Project Board gaps never carried their Configure button. Anything that cannot be
+    introspected — a C builtin, some mocks, a signature-less callable — is treated as NOT
+    accepting it, so the plugin degrades to the plain call rather than risk a
+    ``TypeError`` that would drop the warning entirely (r3). Never raises."""
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -902,7 +908,7 @@ def _seam_accepts_actions(fn) -> bool:
     for p in sig.parameters.values():
         if p.kind is p.VAR_KEYWORD:
             return True
-        if p.name == "actions" and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
+        if p.name == "action" and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
             return True
     return False
 
@@ -914,15 +920,14 @@ class GapReporter:
     (``getattr(registry, "report_setup_gap", None)`` — older hosts, the host-free
     suite), in which case every report is a recorded no-op.
 
-    Structured-action adapter: when the host exposes the EXTENDED seam (one that accepts
-    an ``actions=`` keyword — see :func:`_seam_accepts_actions`), an ACTIVE ``coder`` /
-    ``repo`` configuration blocker is forwarded with an allowlisted ``plugin_config``
-    action that opens Project Board's Configure dialog (:func:`plugin_config_action`).
-    On a host that exposes only the prior two-argument
+    Structured-action adapter: when the host's seam takes the ``action=`` keyword (see
+    :func:`_seam_accepts_action`), an ACTIVE ``coder`` / ``repo`` configuration blocker is
+    forwarded with an allowlisted ``plugin_config`` action that opens Project Board's
+    Configure dialog (:func:`plugin_config_action`). On a host that exposes only the prior
     ``report_setup_gap(key, message, *, label=None)`` seam the same gap degrades to its
     plain hint string — the message text, key identity and edge-triggering are identical
     either way. Feature-detected per instance, so the plugin never couples to a host
-    version; a host whose signature over-promises ``actions=`` but rejects the call is
+    version; a host whose signature over-promises ``action=`` but rejects the call is
     caught (``TypeError``) and downgraded in place so the warning still lands.
 
     Edge-triggered AFTER the first evaluation: ``report(status)`` calls the seam
@@ -937,7 +942,7 @@ class GapReporter:
     def __init__(self, registry=None):
         fn = getattr(registry, "report_setup_gap", None) if registry is not None else None
         self._fn = fn if callable(fn) else None
-        self._supports_actions = _seam_accepts_actions(self._fn) if self._fn is not None else False
+        self._supports_action = _seam_accepts_action(self._fn) if self._fn is not None else False
         self._reported: dict[str, str | None] = {}
         self._primed = False
 
@@ -947,9 +952,9 @@ class GapReporter:
         return self._fn is not None
 
     @property
-    def actions_supported(self) -> bool:
-        """True when the host's seam accepts the structured ``actions=`` extension."""
-        return self._supports_actions
+    def action_supported(self) -> bool:
+        """True when the host's seam takes the structured ``action=`` keyword."""
+        return self._supports_action
 
     @property
     def reported(self) -> dict[str, str | None]:
@@ -984,32 +989,31 @@ class GapReporter:
                 log.warning("[project_board] report_setup_gap(%r) failed", key, exc_info=True)
         return changes
 
-    def _actions_for(self, key: str, msg: str | None) -> list[dict] | None:
-        """The structured actions for one gap: the ``plugin_config`` CTA for an ACTIVE
+    def _action_for(self, key: str, msg: str | None) -> dict | None:
+        """The structured action for one gap: the ``plugin_config`` CTA for an ACTIVE
         ``coder`` / ``repo`` configuration blocker, else ``None`` — a cleared gap (``msg``
         None), or a gap Project Board's settings can't resolve (``br`` / ``gh`` /
-        advisories, r4). One action list per active blocker; no coder is manufactured and
-        no config is touched — the action only opens the config surface."""
+        advisories, r4). No coder is manufactured and no config is touched — the action
+        only opens the config surface."""
         if msg is None or key not in CONFIG_ACTION_KEYS:
             return None
-        return [plugin_config_action()]
+        return plugin_config_action(key)
 
     def _emit(self, key: str, msg: str | None) -> None:
         """Forward one ``(key, message)`` to the host seam, attaching the structured
-        action when the seam supports it AND this is an active configuration gap.
+        action when the seam takes one AND this is an active configuration gap.
 
-        Degrades to the plain two-argument call on a host without the extended seam, and
-        — if a seam whose signature promised ``actions=`` rejects it at call time
-        (``TypeError``) — falls back to the plain call and stops probing actions, so the
-        plain warning always lands (r3)."""
-        actions = self._actions_for(key, msg)
-        if self._supports_actions and actions:
+        Degrades to the plain call on a host without ``action=``, and — if a seam whose
+        signature promised ``action=`` rejects it at call time (``TypeError``) — falls back
+        to the plain call and stops probing, so the plain warning always lands (r3)."""
+        action = self._action_for(key, msg)
+        if self._supports_action and action:
             try:
-                self._fn(key, msg, actions=actions)
+                self._fn(key, msg, action=action)
                 return
             except TypeError:
-                # The signature advertised `actions=` but the call rejected it (a
+                # The signature advertised `action=` but the call rejected it (a
                 # decorated / mis-reported seam). Never drop the warning: fall through to
                 # the plain seam and stop probing actions for this reporter.
-                self._supports_actions = False
+                self._supports_action = False
         self._fn(key, msg)

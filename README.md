@@ -582,17 +582,24 @@ Where it surfaces:
   in `GET /api/runtime/status`. Edge-triggered after a first evaluation that sends every
   key unconditionally — so a reload's fresh reporter clears a warning the previous
   instance raised. Guarded: a host without the seam just gets the log lines.
-  **Structured actions (feature-detected):** on a host whose seam accepts an `actions=`
-  argument, the two *configuration* blockers — an unresolved `coder`, an unbound/invalid
-  `repo` — are forwarded with an allowlisted `plugin_config` action
-  (`{"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}`) so the
-  operator warning links straight to Project Board's Configure dialog, the surface where the
-  gap is actually resolved. The action only *navigates* there — it manufactures no coder and
-  mutates no config. `br`/`gh` (PATH/install faults, fixed on the shell) and the advisories
-  never carry that CTA, so it can't mislead. `GapReporter` detects the extended seam per
-  instance (signature introspection, with a runtime fallback if the call is rejected), so an
-  older host that exposes only `report_setup_gap(key, message, *, label=None)` degrades to
-  the plain hint string — same message text, key identity and edge-triggering either way.
+  **Structured actions (feature-detected):** on a host whose seam takes the `action=`
+  keyword (protoAgent ≥ v0.162.0:
+  `report_setup_gap(key, message, *, label=None, action=None)`), the two *configuration*
+  blockers — an unresolved `coder`, an unbound/invalid `repo` — are forwarded with an
+  allowlisted `plugin_config` action
+  (`{"kind": "plugin_config", "label": "Configure Project Board", "fields": ["coder"]}`, or
+  `["repo"]`) so the console's setup-gap banner gets a button straight to Project Board's
+  Configure dialog, the surface where the gap is actually resolved. The action only
+  *navigates* there — it manufactures no coder and mutates no config (the host force-targets
+  a `plugin_config` action at the reporting plugin). `br`/`gh` (PATH/install faults, fixed on
+  the shell) and the advisories never carry that CTA, so it can't mislead. `GapReporter`
+  detects the seam per instance (signature introspection, with a runtime fallback if the call
+  is rejected), so an older host that exposes only
+  `report_setup_gap(key, message, *, label=None)` (v0.146–v0.161) degrades to the plain hint
+  string — same message text, key identity and edge-triggering either way. The tests drive
+  the host's own `FakeRegistry` (`tests/_plugin_testkit.py`, protoAgent's testkit vendored
+  verbatim), whose seam signatures the host keeps identical to the real registry — refresh it
+  from `graph/plugins/testkit.py` when the host seam changes.
 - **The loop pauses, it doesn't traceback.** With `loop_enabled: true` and a blocker
   standing (`br`, `coder`, `repo` — a missing `gh` only fails the PR edge, so it is
   reported but not paused on) the puller logs ONE `loop paused: …` warning and
