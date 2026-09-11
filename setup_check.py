@@ -109,10 +109,10 @@ GH_HINT = (
     "GitHub CLI 'gh' not found on PATH — install it (brew install gh) and run `gh auth login`; "
     "builds can't push branches or open PRs until then"
 )
+_PROTO_DEFAULT_GONE = "(the former implicit default `proto` no longer applies — set `coder: proto` to keep it)"
 NO_CODER_HINT = (
     "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent "
-    "propose_delegate; the board is paused until then (the former implicit default `proto` "
-    "no longer applies — set `coder: proto` to keep it)"
+    f"propose_delegate; the board is paused until then {_PROTO_DEFAULT_GONE}"
 )
 # protoAgent#3405: the plain hint told an operator with ZERO delegates to "pick a delegate"
 # — an empty dropdown and no next step. When the roster is readable, say what's actually
@@ -558,7 +558,7 @@ def _no_coder_hint(acp_delegates) -> str:
     return (
         f"no coder configured — pick one of this agent's coding delegates ({listed}) in "
         "Settings ▸ Project Board or let the agent propose_delegate; the board is paused until "
-        "then (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)"
+        f"then {_PROTO_DEFAULT_GONE}"
     )
 
 
