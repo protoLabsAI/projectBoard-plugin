@@ -732,12 +732,16 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     async def _salvage(fid: str, body: dict = Body(default={})):
         """Publish a stranded card's worktree WITHOUT dispatching a coder (#427): commit what
         the tree holds, run the pre-PR gate, push, open the PR, move the card to in_review.
-        Body: ``{force?: bool, tree?: str}``. Refuses (409) while a live drive owns the card,
-        for a card that is not stranded (in_progress with no drive, or blocked), or when no
-        worktree — or more than one, unless ``tree`` names one — has changes vs base. A red
-        gate publishes nothing (409, ``gate-red``, with the output's tail) unless
-        ``force: true``, which opens a DRAFT PR whose body carries that output. 200 on
-        ``published``; 404 ``not-found``; 503 ``loop-not-running``; 502 ``error``."""
+        Body: ``{force?: bool, tree?: str}``. An operator override: skips the drive's goal,
+        requirement-ledger and source-issue checks (CI and the review gate still apply).
+        Refuses (409) while a live drive owns the card, for a card that is not stranded
+        (in_progress with no drive, or blocked), or when no worktree — or more than one,
+        unless ``tree`` names one — has changes vs base. A red gate publishes nothing (409,
+        ``gate-red``, with the output's tail) unless ``force: true``: then a new PR opens as a
+        DRAFT carrying that output, an existing one is converted and the output posted on it,
+        and ``draft`` is read back from GitHub. A cancel mid-publish is 409 ``cancelled``.
+        200 on ``published``; 404 ``not-found``; 503 ``loop-not-running``; 502 ``error``
+        (``branch`` names a branch it already pushed)."""
         from .loop import request_salvage
 
         body = body or {}

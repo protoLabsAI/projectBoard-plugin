@@ -1203,16 +1203,19 @@ def _board_tools(cfg: dict):
         the branch, opens the PR and moves the card to in_review, all on the board's own
         machinery; a candidate tree (`feat-<id>.g1`) is promoted to the card's branch first.
 
-        Only for a STRANDED card: `in_progress` with no live drive, or `blocked`. It
-        refuses, changing nothing, while a drive owns the card, when no worktree of the card
-        has changes vs base, or when several do and `tree` (a `feat-…` directory name or a
-        path) does not pick one. If the pre-PR gate is RED it publishes nothing and returns
-        `outcome: gate-red` with the gate output's tail; `force=true` opens the PR anyway,
-        as a DRAFT whose body carries that output.
+        An OPERATOR OVERRIDE: it skips the drive's goal, requirement-ledger and source-issue
+        checks; CI and the review gate still apply. Only for a STRANDED card: `in_progress`
+        with no live drive, or `blocked` (a card blocked out of review goes back to review on
+        its own PR). It refuses, changing nothing, while a drive owns the card, when no
+        worktree of the card has changes vs base, or when several do and `tree` (a `feat-…`
+        directory name or a path) does not pick one. If the pre-PR gate is RED it publishes
+        nothing and returns `outcome: gate-red` with the gate output's tail; `force=true`
+        publishes anyway as a DRAFT carrying that output (an existing PR is converted, and
+        the output posted on it). `draft` is read back from GitHub — trust it, not `force`.
 
         Returns a JSON record: `outcome` (`published` / `gate-red` / `refused` /
-        `not-found` / `error` / `loop-not-running`), `detail`, `worktree`, `pr_url`,
-        `draft`, `gate_output`."""
+        `cancelled` / `not-found` / `error` / `loop-not-running`), `detail`, `worktree`,
+        `branch`, `pr_url`, `draft`, `gate_output`."""
         from .loop import request_salvage
 
         try:
