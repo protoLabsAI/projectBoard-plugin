@@ -16,6 +16,10 @@ from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
+# How often the working-state refresher checks whether a read is due (an in-memory compare;
+# the reads themselves are bounded by work_snapshot.MIN_INTERVAL_S / MAX_AGE_S).
+_SNAPSHOT_POLL_S = 1.0
+
 # How much of a red gate's output an operator salvage hands back — in its record, and in
 # the body of a forced draft (#427). The tail: that is where a test runner's summary is.
 _SALVAGE_GATE_TAIL_CHARS = 3000
@@ -351,6 +355,12 @@ class ReconcileMixin:
         self._inflight_files[fid] = mine  # reserved before the first await: no other edge gets in
         try:
             return await self._salvage(fid, force=force, tree=tree, rec=rec)
+        except Exception as exc:  # noqa: BLE001 — a record for the route and the tool, never a raise
+            # A board read that fails or stalls (#431 bounds a `br` call, and says so by
+            # raising) lands here before anything was published: the steps after the push
+            # report their own failures in the record.
+            log.warning("[project_board] %s salvage failed", fid, exc_info=True)
+            return {**rec, "outcome": "error", "detail": f"the salvage failed: {type(exc).__name__}: {exc}"}
         finally:
             if self._inflight_files.get(fid) is mine:
                 self._inflight_files.pop(fid, None)
@@ -568,27 +578,12 @@ class ReconcileMixin:
         ``feat-<id>`` worktrees whose feature is gone or already terminal —
         ``done``/``cancelled`` (a missed reap); (c) label terminal features past the
         archive window ``archived``
-        (#115) — the board's growth valve; archival only, nothing is ever deleted. First,
-        it publishes the agent's working-state snapshot, and names any card stranded
+        (#115) — the board's growth valve; archival only, nothing is ever deleted. Last,
+        it publishes the agent's working-state snapshot, which names any card stranded
         outside the ready lane with every dependency closed (#406) — surfaced, never moved.
-        Best-effort; a per-item failure never stops the sweep or the loop."""
+        Best-effort; a per-item failure never stops the sweep or the loop. A stalled store
+        ends the sweep, and the tick with it (#404)."""
         store = self._store()
-        # Publish the board's live projection for the host's <working_state> block (ADR
-        # 0079 Observe). Done on the SWEEP cadence, not per tick: it is one extra `br`
-        # call per sweep, and the provider that reads it must never touch the store
-        # itself — it runs inline on every agent turn. Best-effort, like the rest of the
-        # sweep.
-        #
-        # Annotated first: the snapshot's per-card hint IS the board's `next_action_hint`,
-        # which only `annotate_next_action` writes — a bare listing published every hint
-        # empty. It is also what names a card stranded outside the ready lane (#406), and
-        # the agent this snapshot feeds is the one who can promote it.
-        try:
-            feats = store_mod.annotate_next_action(await asyncio.to_thread(store.list_features), self.cfg)
-            work_snapshot.publish(feats)
-            self._report_stranded(feats)
-        except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the sweep
-            log.warning("[project_board] work snapshot refresh failed (ignored)", exc_info=True)
         for f in await self._list_for_pass(store, "in_progress", "health sweep"):
             fid = f["id"]
             if fid in self._inflight_files:
@@ -623,14 +618,115 @@ class ReconcileMixin:
             raise
         except Exception:  # noqa: BLE001
             log.warning("[project_board] sweep archive pass failed", exc_info=True)
+        # (d) the host's <working_state> snapshot, LAST, so it carries this sweep's own
+        # reconciles and unblocks. Published first, as it used to be, it showed a card the
+        # sweep had just moved in the state it had left, for a whole interval (#401). The
+        # refresher would pick those writes up within seconds anyway; publishing here makes
+        # the sweep's result current the moment it ends. Its stall is the sweep's stall.
+        await self._publish_work_snapshot(stall_ends_tick=True)
+
+    # ── the host's <working_state> snapshot (ADR 0079 Observe, #401) ──────────
+    def _take_work_snapshot(self, store) -> None:
+        """Read the open cards and publish them for the host's working-state block.
+
+        The revision is read BEFORE the board, so a write that lands mid-read leaves the
+        snapshot marked stale (and re-read soon) rather than claiming a state its rows may
+        predate. The read is ``live_cards``, the light one: open statuses only, no
+        whole-board ``br show``. Rows are annotated as board_list's are, so a card's hint is
+        the board's own next action. A blocked card, ranked first, gets its block reason and
+        what moves it, which the posture hints leave blank. A card newly stranded outside
+        the ready lane is logged (``_report_stranded``)."""
+        revision = work_snapshot.board_revision()
+        features = store_mod.annotate_next_action(store.live_cards(), self.cfg)
+        for f in features:
+            if f.get("blocked") and not f.get("next_action_hint"):
+                cls = str(f.get("blocked_class") or "").strip()
+                reason = str(f.get("blocked_reason") or "").strip() or "no reason recorded"
+                who = (
+                    f"retries on its own ({cls})"
+                    if cls in _SELF_HEALING_BLOCKS
+                    else f"needs a human ({cls or 'unclassified'})"
+                )
+                f["next_action_hint"] = f"{who}: {reason}"
+        work_snapshot.publish(features, revision=revision)
+        self._report_stranded(features)
+
+    async def _publish_work_snapshot(self, *, stall_ends_tick: bool = False) -> bool:
+        """``_take_work_snapshot``, off the event loop and best-effort. Returns whether it
+        published. A failed read backs the refresher off (see ``_work_snapshot_due``), and
+        the provider keeps marking the old snapshot stale meanwhile.
+
+        A ``BoardError`` (a `br` call that failed, or stalled and was stopped) is an
+        understood, transient outcome, logged as ONE line like ``_tick_phase`` logs it;
+        anything else is a bug and keeps its traceback. The exception is a stall inside a
+        tick (``stall_ends_tick``, the sweep's publish): it goes up to ``_tick_phase``, which
+        ends the tick on it (#404). Swallowed there, the tick went on to the preflight and the
+        claim scan, and each stalled again on the same wedged store.
+
+        One read at a time: the refresher and the sweep can both get here, and a second read
+        while one is in flight is skipped. The one in flight publishes, and a write since it
+        began leaves that snapshot STALE for the refresher to re-read."""
+        if self._snapshot_reading:
+            return False
+        self._snapshot_reading = True
+        self._snapshot_attempted_at = time.monotonic()
+        try:
+            await asyncio.to_thread(self._take_work_snapshot, self._store())
+        except BoardError as exc:
+            self._snapshot_failures += 1
+            if stall_ends_tick and isinstance(exc, store_mod.BoardTimeout):
+                raise
+            log.warning("[project_board] work snapshot refresh failed (retrying with backoff): %s", exc)
+            return False
+        except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the loop
+            self._snapshot_failures += 1
+            log.warning("[project_board] work snapshot refresh failed (retrying with backoff)", exc_info=True)
+            return False
+        finally:
+            self._snapshot_reading = False
+        self._snapshot_failures = 0
+        return True
+
+    def _work_snapshot_due(self) -> bool:
+        """Whether the refresher should read now. In memory, no I/O.
+
+        - Never inside ``MIN_INTERVAL_S`` of the last attempt. A burst of writes (a claim,
+          its labels, a drive's budget stamps) costs ONE read, not one each.
+        - After failures, wait out an exponential backoff (``MIN_INTERVAL_S`` doubling, up to
+          ``MAX_AGE_S``). A store that is failing is not hammered.
+        - Otherwise read when the board changed since the snapshot, when there is none yet,
+          or when it is older than ``MAX_AGE_S``. The last case is what bounds a writer this
+          process can't see."""
+        since = time.monotonic() - self._snapshot_attempted_at
+        wait = work_snapshot.MIN_INTERVAL_S
+        if self._snapshot_failures:
+            wait = min(work_snapshot.MIN_INTERVAL_S * 2**self._snapshot_failures, work_snapshot.MAX_AGE_S)
+        if since < wait:
+            return False
+        taken = work_snapshot.taken_at()
+        return work_snapshot.needs_refresh() or taken is None or time.time() - taken >= work_snapshot.MAX_AGE_S
+
+    async def _keep_work_snapshot_current(self) -> None:
+        """The snapshot's refresher, a task of its own (started with the loop). It is NOT part
+        of the claim tick. A loop paused at its setup gate (a missing coder, say) runs no
+        ticks, and a snapshot refreshed only by ticks stayed STALE for as long as the pause
+        lasted. It polls an in-memory check every ``_SNAPSHOT_POLL_S`` and reads only when
+        ``_work_snapshot_due`` says so."""
+        while not self._stop.is_set() and not self._shutting_down:
+            if self._work_snapshot_due():
+                await self._publish_work_snapshot()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_SNAPSHOT_POLL_S)
+            except asyncio.TimeoutError:
+                pass
 
     def _report_stranded(self, feats: list[dict]) -> None:
         """Log each card that has just become stranded outside the ready lane, with every
         dependency closed (#406). ``store.stranded_posture`` found them, and they read so
         on every listing and in the agent's working state. This line is the loop's own
-        record of WHEN it first saw each one: once per card, not once per sweep, and again
-        only if the card leaves that state and comes back. Nothing is changed on the card.
-        A backlog card is promoted by the PM, and a block is lifted by whoever set it."""
+        record of WHEN it first saw each one: once per card, not once per snapshot read, and
+        again only if the card leaves that state and comes back. Nothing is changed on the
+        card. A backlog card is promoted by the PM, and a block is lifted by whoever set it."""
         stranded = {
             f["id"]: f
             for f in feats
@@ -640,7 +736,7 @@ class ReconcileMixin:
         seen = getattr(self, "_stranded_seen", set())
         for fid in sorted(set(stranded) - seen):
             f = stranded[fid]
-            log.info("[project_board] sweep: %s stranded (%s): %s", fid, f["board_state"], f.get("next_action_hint"))
+            log.info("[project_board] %s stranded (%s): %s", fid, f["board_state"], f.get("next_action_hint"))
         self._stranded_seen = set(stranded)
 
     async def _recover_blocked(self, store) -> None:

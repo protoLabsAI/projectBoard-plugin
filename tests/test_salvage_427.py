@@ -27,7 +27,7 @@ import pytest
 from project_board import store as store_mod
 from project_board import worktree
 from project_board.loop import BoardLoop, live_drive
-from project_board.store import LABEL_READY, BeadsBoard
+from project_board.store import LABEL_READY, BeadsBoard, BoardError
 
 _TITLE = "Make the poll timeout progress-based"
 _URL = "https://github.com/o/r/pull/9"
@@ -568,6 +568,22 @@ async def test_salvage_refuses_a_card_that_is_not_stranded(origin, monkeypatch):
     rec = await loop.salvage(fid)
 
     assert rec["outcome"] == "refused" and "block it first" in rec["detail"] and gh.calls == []
+
+
+async def test_a_board_that_cannot_be_read_is_an_error_record_not_a_raise(origin, monkeypatch):
+    """A stalled `br` raises (#431). The route and the tool get a record — and the card's
+    reservation is still released."""
+    board, gh, loop, fid, _ = _setup(origin, monkeypatch)
+    await _stranded_candidate(origin, fid)
+
+    def _stalled(_fid):
+        raise BoardError("`br show` timed out after 30s")
+
+    monkeypatch.setattr(board, "get_feature", _stalled)
+    rec = await loop.salvage(fid)
+
+    assert rec["outcome"] == "error" and "timed out" in rec["detail"]
+    assert loop._inflight_files == {} and gh.calls == []
 
 
 async def test_several_trees_with_work_need_the_operator_to_pick_one(origin, monkeypatch):

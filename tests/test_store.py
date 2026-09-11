@@ -1942,7 +1942,8 @@ def test_clear_blocked_dispatch_infra_on_a_never_escalated_card_leaves_difficult
 def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board, monkeypatch):
     """A model-reachable block (a real capability escalation) keeps its `tier:` labels
     on unblock — the ladder record is genuine, so the next build resumes at that tier.
-    Only a pre-model infra block resets the posture."""
+    Its block CLASS goes with the flag, like every class (#401): a class describes a block,
+    and one left on an unblocked card read as `blocked_class: terminal` on a ready card."""
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(
@@ -1955,7 +1956,7 @@ def test_clear_blocked_leaves_tier_labels_on_a_model_reachable_block(make_board,
     (up,) = br.cmds("update")
     assert "blocked" in up
     assert "tier:opus" not in up  # untouched — no tier reset for a model-reachable block
-    assert "blocked-class:terminal" not in up  # the class label is left as-is too
+    assert "blocked-class:terminal" in up  # the class goes with the flag (#401)
 
 
 def test_clear_blocked_unclassified_is_unchanged(make_board, monkeypatch):

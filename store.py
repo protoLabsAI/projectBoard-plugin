@@ -49,7 +49,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import _TERMINAL_STATES, br_fetch
+from . import _TERMINAL_STATES, br_fetch, work_snapshot
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -166,6 +166,12 @@ def _task_edge(method):
 
     return locked
 
+
+# The `br` subcommands that can change what a card PROJECTS as: its status, labels, title
+# or external ref. One outdates the agent's working-state snapshot (#401, see `_run`).
+# `comments` and `dep` cannot: the working-state line is id + state + title + next-action
+# hint, and none of those read either one.
+_PROJECTION_WRITES = frozenset({"create", "update", "close", "reopen", "delete"})
 
 # `br` plain-mode not-found text (stderr). The --json path is matched on the structured
 # ISSUE_NOT_FOUND code instead, so this only backstops a non-json `show`.
@@ -1339,7 +1345,26 @@ class BeadsBoard:
         actor). The task-claim path (#356) uses it to run ``--claim`` AS the dispatch
         target, so the atomic claim stamps that target as owner instead of the board actor
         — ``br`` REFUSES a duplicate ``--actor``, so a caller that needs a non-default actor
-        must pass it here rather than in ``args``. Every other caller keeps ``self.actor``."""
+        must pass it here rather than in ``args``. Every other caller keeps ``self.actor``.
+
+        A write that can change what a card projects as marks the agent's working-state
+        snapshot stale (#401). Every board write in this process comes through here. The
+        mark goes in a ``finally``, AFTER the call and whatever it did. A write that timed
+        out or errored may still have landed; a spurious mark costs one refresh, while a
+        missed one lets an outdated snapshot read as current. A stall (``BoardTimeout``)
+        reaches the ``finally`` only once ``_run_br_process`` has stopped and reaped the
+        `br` tree (#404), so nothing the write does can land after the mark. Never before
+        the call either: a snapshot read between an early mark and the write would pair the
+        new revision with the old rows."""
+        try:
+            return self._shell_br(*args, want_json=want_json, with_has_more=with_has_more, actor=actor)
+        finally:
+            if args and args[0] in _PROJECTION_WRITES:
+                work_snapshot.note_board_write()
+
+    def _shell_br(self, *args: str, want_json: bool = False, with_has_more: bool = False, actor: str = ""):
+        """``_run``'s body: the ``br`` subprocess, its contention retries, and the
+        payload normalization. Call ``_run``, never this."""
         _warn_blocking_on_event_loop(args[0] if args else "")
         self._ensure_workspace()  # pin to the repo's own .beads/ before any br op (#48)
         cmd = [BR, *args, "--actor", actor or self.actor]
@@ -2660,12 +2685,26 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     def block_from_review(self, fid: str, reason: str) -> dict:
-        """Drop the in-review label and flag Blocked — used when the escalation
-        ladder is exhausted on a CI failure."""
-        self._require(fid)
-        self._run("update", fid, "--remove-label", LABEL_IN_REVIEW, "--add-label", LABEL_BLOCKED)
-        if reason:
-            self.comment(fid, f"escalation exhausted: {reason}")
+        """Drop the in-review label and flag Blocked — used when the escalation ladder is
+        exhausted on a CI or review failure.
+
+        A block like any other (#401 review): it stamps its OWN class, ``terminal`` (only a
+        human moves a card whose automated fixes are spent), replacing any class a
+        previous block left. It records its reason as the card's latest ``blocked:``
+        comment, which is what ``blocked_reason``, the retro and the boot-time preflight
+        release all read as the CURRENT block. It used to add only the flag and an
+        ``escalation exhausted:`` note. An older class could resurface under it (a
+        ``transient`` made the sweep auto-heal a card that needs a human), and an older
+        ``blocked:`` reason still read as current. A card once held by the preflight was
+        then released at boot as an "orphaned preflight hold"."""
+        f = self._require(fid)
+        want = f"{LABEL_BLOCKED_CLASS_PREFIX}terminal"
+        args = ["update", fid, "--remove-label", LABEL_IN_REVIEW, "--add-label", LABEL_BLOCKED, "--add-label", want]
+        for prior in f.get("labels") or []:  # replace, never accumulate; never remove what we add
+            if str(prior).startswith(LABEL_BLOCKED_CLASS_PREFIX) and prior != want:
+                args += ["--remove-label", prior]
+        self._run(*args)
+        self.comment(fid, f"blocked: escalation exhausted: {reason}" if reason else "blocked: escalation exhausted")
         return self.get_feature(fid)
 
     # ── the ONE Done edge for coding features (invariant #2) ──────────────────
@@ -2998,43 +3037,50 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     def clear_blocked(self, fid: str) -> dict:
-        """Clear the ``blocked`` flag so a feature can be re-dispatched.
+        """Clear the ``blocked`` flag so a feature can be re-dispatched, and the block's
+        CLASS with it, whatever the class.
 
-        When the block was a NON-MODEL failure — a pre-model dispatch/adapter/infra
-        incident, ``blocked-class:dispatch-infra`` (#339) — also drop the now-stale
-        block class so a requeue starts clean. The card's escalation posture is left
-        UNTOUCHED, and deliberately so: the loop never climbs a tier on a pre-model
-        failure (``store.escalate`` is not called on that path), so every ``tier:``
-        label present at a dispatch-infra block was earned BEFORE the incident by real
-        model-capability work. Removing them would silently restart a card that had
-        legitimately escalated on its lower difficulty-selected model and repeat the
-        work that already failed there — the exact regression the first cut introduced.
-        A card that never escalated carries no ``tier:`` label, so it still starts at
-        its difficulty-selected tier on the next build; the ladder stays a
-        model-capability record, and the infra incident adds nothing to it. A
-        model-reachable block (or an unclassified one) is untouched, exactly as before.
+        A class describes a block. Only the ``dispatch-infra`` one (#339) and the
+        ``too-wide`` one (#378) used to be dropped. Every other class outlived its block
+        and read back as ``blocked_class: terminal`` on a card that was ready, a state that
+        does not exist; that was the false signal on bd-p8ft in #401. Nothing reads a class
+        off an unblocked card. The self-heal sweep and its unblock-retry budget read only
+        blocked cards, a re-block stamps its own class, and the retro mines comments, not
+        labels. So the class goes, and the one this block carried is kept where history
+        belongs: on this unblock's own audit comment.
+
+        The card's escalation posture is left UNTOUCHED, and deliberately so (#339): the
+        loop never climbs a tier on a pre-model failure (``store.escalate`` is not called
+        on that path), so every ``tier:`` label present at a dispatch-infra block was
+        earned BEFORE the incident by real model-capability work. Removing them would
+        silently restart a card that had legitimately escalated on its lower
+        difficulty-selected model and repeat the work that already failed there — the
+        exact regression the first cut introduced. A card that never escalated carries no
+        ``tier:`` label, so it still starts at its difficulty-selected tier on the next
+        build; the ladder stays a model-capability record, and no block class adds to it.
 
         A card the loop PARKED as ``too-wide`` (#378) also gets its timeout count reset:
         unblocking one is a deliberate retry — after raising ``coder_timeout_s``, or
         narrowing the card by hand — and with the count still at the threshold its very
-        next timeout would park it again at once. (The loop's in-process copy of the count
-        is dropped separately, by the unblock verbs: ``loop.forget_timeout_count``.)"""
-        from .failures import PRE_MODEL_DISPATCH_CLASS, TOO_WIDE_CLASS
+        next timeout would park it again at once. ONLY that class resets it: the blocked
+        sweep's self-heal clears blocks too, and resetting there would stop a one-coder
+        board's timeouts from ever adding up. (The loop's in-process copy of the count is
+        dropped separately, by the unblock verbs: ``loop.forget_timeout_count``.)"""
+        from .failures import TOO_WIDE_CLASS
 
         f = self._require(fid)
-        labels = f.get("labels") or []
+        labels = [str(label) for label in f.get("labels") or []]
+        classes = [label for label in labels if label.startswith(LABEL_BLOCKED_CLASS_PREFIX)]
         args = ["update", fid, "--remove-label", LABEL_BLOCKED]
-        cls = next((l.split(":", 1)[1] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)), "")
-        if cls == PRE_MODEL_DISPATCH_CLASS:
-            # Drop only the stale infra class — NOT the tier labels, which predate the
-            # incident and record genuine model-capability escalation (#339).
-            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
-        elif cls == TOO_WIDE_CLASS:
-            args += ["--remove-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
+        for label in classes:
+            args += ["--remove-label", label]
+        if f"{LABEL_BLOCKED_CLASS_PREFIX}{TOO_WIDE_CLASS}" in classes:
             for label in labels:
                 if label.startswith(f"{LABEL_BUDGET_PREFIX}timeout:"):
                     args += ["--remove-label", label]
         self._run(*args)
+        if classes:
+            self.comment(fid, "unblocked — cleared " + ", ".join(classes))
         return self.get_feature(fid)
 
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at
@@ -3253,6 +3299,83 @@ class BeadsBoard:
         if not rows:
             return None
         return self._project(rows[0] if isinstance(rows, list) else rows)
+
+    def live_cards(self) -> list[dict]:
+        """The rows the agent's working-state snapshot reads, from the lightest read that
+        serves it (#401 review): ONE ``br list`` of the open and in-progress statuses.
+        ``list_features`` also batches a ``br show`` of every id, closed history included,
+        plus a ``br ready`` scan. That was the ~350-id call #404 caught stalling, and the
+        snapshot needs none of it: id, title, state, labels, pr_url, issue_type and assignee
+        all ride the list rows. ``dag_blocked`` is not computed here.
+
+        ``br show`` is paid only for the rows whose hint reads what a list row lacks: a
+        blocked card's reason (a comment), and the dependency edges of a blocked or backlog
+        card, which say whether it is stranded with every dependency closed (#406). A
+        backlog row that reports no dependencies (``dependency_count`` 0) is skipped. When
+        such a card's dependencies are all closed they are fetched too, and a CANCELLED one
+        is returned with the open cards. ``annotate_next_action`` tells a scope cut from a
+        delivery by the cancelled cards in its listing, and a hint that took a cancelled
+        dependency for a merged one would tell the agent to promote work whose premise was
+        dropped. ``publish`` keeps only live states, so that row is never shown."""
+        type_args: list[str] = []
+        for itype in PULLABLE_ISSUE_TYPES:
+            type_args += ["--type", itype]
+        rows, has_more = self._run(
+            "list",
+            *type_args,
+            "--status",
+            "open",
+            "--status",
+            "in_progress",
+            "--limit",
+            "0",
+            want_json=True,
+            with_has_more=True,
+        )
+        rows = rows or []
+        if has_more:
+            raise BoardError(
+                "`br list --limit 0` reported has_more=true — the open-card query was truncated, so the "
+                "working-state snapshot would be incomplete (#114/#138)"
+            )
+
+        def wants_detail(row: dict) -> bool:
+            if LABEL_BLOCKED in (row.get("labels") or []):
+                return True
+            # An absent count (a `br` that does not report one) is read as "may have some".
+            return self.board_state(row) == "backlog" and row.get("dependency_count", 1) != 0
+
+        detail = self._show_by_id([r["id"] for r in rows if r.get("id") and wants_detail(r)])
+        for r in rows:
+            shown = detail.get(r.get("id"))
+            if shown is not None:
+                r["dependencies"] = shown.get("dependencies")
+                if LABEL_BLOCKED in (r.get("labels") or []):
+                    r["comments"] = shown.get("comments")
+        cards = [self._project(r) for r in rows]
+        closed_deps = {
+            dep
+            for f in cards
+            if f["board_state"] in ("backlog", "blocked") and f["depends_on"] and not f["open_depends_on"]
+            for dep in f["depends_on"]
+        } - {f["id"] for f in cards}
+        for row in self._show_by_id(sorted(closed_deps)).values():
+            dep = self._project(row)
+            if dep["board_state"] == "cancelled":
+                cards.append(dep)
+        return cards
+
+    def _show_by_id(self, ids: list[str]) -> dict[str, dict]:
+        """``br show`` rows for ``ids``, keyed by id, in calls of at most ``_SHOW_BATCH`` ids
+        (#404: no single read grows with the board). No ids, no call: `br show` with no
+        arguments is an error."""
+        shown: dict[str, dict] = {}
+        for start in range(0, len(ids), _SHOW_BATCH):
+            batch = self._run("show", *ids[start : start + _SHOW_BATCH], want_json=True) or []
+            if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
+                batch = [batch]
+            shown.update((r["id"], r) for r in batch if isinstance(r, dict) and r.get("id"))
+        return shown
 
     def list_features(self, state: str | None = None, include_archived: bool = False) -> list[dict]:
         """All feature rows for the board projection (every state, incl. the Done
@@ -3679,10 +3802,16 @@ class BeadsBoard:
         # off the single `blocked-class:` label, "" when the block predates it or the
         # caller never classified. Hyphenated on the label, hyphenated here — callers
         # compare against `failures.Policy.category` with the same normalisation.
+        # Reported ONLY while the card IS blocked (#401). A class left behind by a path
+        # that lifted the flag without it (an unblock before clear_blocked dropped every
+        # class, a merge) described no block at all, and read as `blocked: false,
+        # blocked_class: terminal`.
         blocked_class = next(
             (l[len(LABEL_BLOCKED_CLASS_PREFIX) :] for l in labels if l.startswith(LABEL_BLOCKED_CLASS_PREFIX)),
             "",
         )
+        if LABEL_BLOCKED not in labels:
+            blocked_class = ""
         # A task-type bead's deliverable (#217): the LATEST `deliverable:` comment
         # (record_delivery's record — only `br show` carries comments, so a `br list`
         # row projects "") wins over a `deliverable:<ref>` label (the fallback for
