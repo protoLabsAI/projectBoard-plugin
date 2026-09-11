@@ -5774,13 +5774,11 @@ async def test_sweep_publishes_the_work_snapshot_for_the_host_working_state(monk
     from project_board import work_snapshot
 
     class _Store(_SweepStore):
-        def list_features(self, state=None):
-            if state is None:  # the snapshot read: the whole live board
-                return [
-                    {"id": "bd-live", "board_state": "blocked", "title": "Stuck card"},
-                    {"id": "bd-done", "board_state": "done", "title": "Finished"},
-                ]
-            return super().list_features(state)
+        def live_cards(self):  # the snapshot read: the open cards (#401)
+            return [
+                {"id": "bd-live", "board_state": "blocked", "title": "Stuck card"},
+                {"id": "bd-done", "board_state": "done", "title": "Finished"},
+            ]
 
     work_snapshot.reset()
     store = _Store()

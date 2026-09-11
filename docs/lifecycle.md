@@ -285,8 +285,9 @@ again once they close. It is not a claim candidate and it shows up in no skip di
 So the board now names it, wherever a card's next action is shown: the listing, the
 console chip, the agent's working state (which names a backlog card only when it owes a step,
 and ranks it after every in-flight card so a pile of stranded cards can't push a PR awaiting
-merge out of the capped list), and one sweep log line when the card first becomes stranded
-(held in memory, so a restart logs each stranded card once more):
+merge out of the capped list), and one log line when the loop first sees the card stranded,
+on the working-state snapshot's read (held in memory, so a restart logs each stranded card
+once more):
 
 - **backlog, every dependency closed** → `dependencies closed — promote`. The step is
   `board_mark_ready`, and the Ready gate still decides. A `deferred` or `designing` card is
