@@ -35,6 +35,7 @@ import shutil
 from types import SimpleNamespace
 
 import pytest
+from _plugin_testkit import FakeRegistry  # protoAgent's own testkit, vendored verbatim (tests/ is on sys.path)
 
 import project_board as pb
 from project_board import setup_check
@@ -695,13 +696,19 @@ def test_request_decomposition_files_a_real_task_and_marks_the_card(board):
 
 # ── structured setup-gap actions: the register() wiring, end to end ───────────────────
 # NOT part of the real-`br` tier above — HOST-FREE (no binary needed, every probe pinned).
-# These drive the plugin's public register() entry point against a host that supports the
-# structured setup-gap `actions=` contract and against a legacy host that exposes only the
-# prior `report_setup_gap(key, message, *, label=None)` seam, proving the coder/repo
-# configuration blockers reach the operator with — and, on an older host, without — the
-# allowlisted `plugin_config` action that opens Project Board's Configure dialog.
+# These drive the plugin's public register() entry point against the host's own
+# FakeRegistry (its `report_setup_gap(key, message, *, label=None, action=None)` is the
+# shipped signature — tests/_plugin_testkit.py is protoAgent's testkit, vendored verbatim)
+# and against a legacy host that exposes only the prior
+# `report_setup_gap(key, message, *, label=None)` seam (protoAgent v0.146–v0.161), proving the
+# coder/repo configuration blockers reach the operator with — and, on an older host,
+# without — the allowlisted `plugin_config` action that opens Project Board's Configure
+# dialog. (These once drove a hand-written host taking `actions=`, a keyword no host ever
+# had; the plugin matched the fake, so no real host ever received the action.)
 
-CONFIGURE_CTA = {"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}
+
+def _cta(key):
+    return {"kind": "plugin_config", "label": "Configure Project Board", "fields": [key]}
 
 
 class _BaseRegistry:
@@ -726,19 +733,9 @@ class _BaseRegistry:
         self.skill_dirs.append(path)
 
 
-class _ActionRegistry(_BaseRegistry):
-    """A host on the EXTENDED seam — report_setup_gap accepts `actions=`."""
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.gaps = []
-
-    def report_setup_gap(self, key, message, *, label=None, actions=None):
-        self.gaps.append((key, message, actions))
-
-
 class _LegacyRegistry(_BaseRegistry):
-    """A host on the PRIOR seam — report_setup_gap(key, message, *, label=None)."""
+    """A host on the PRIOR seam — report_setup_gap(key, message, *, label=None), exactly as
+    protoAgent v0.146–v0.161 shipped it."""
 
     def __init__(self, config):
         super().__init__(config)
@@ -759,20 +756,20 @@ def _pin_setup_probes(monkeypatch, *, which, delegates):
 
 
 def test_register_attaches_the_configure_action_on_a_structured_host(monkeypatch):
-    """r1: register() on a structured-action host forwards the active `coder` and `repo`
-    configuration blockers with the allowlisted `plugin_config` CTA targeting Project Board."""
+    """r1: register() on the current host seam forwards the active `coder` and `repo`
+    configuration blockers with the allowlisted `plugin_config` CTA — and nothing else."""
     _pin_setup_probes(monkeypatch, which=lambda n: f"/usr/local/bin/{n}", delegates=lambda n: None)
-    reg = _ActionRegistry({"coder": "", "repo": "/nowhere"})
+    reg = FakeRegistry({"coder": "", "repo": "/nowhere"}, plugin_id="project_board")
     pb.register(reg)  # must not raise
-    by_key = {key: (msg, actions) for key, msg, actions in reg.gaps}
     # both blockers are active and carry the Configure-dialog action
-    assert by_key["coder"][0] == setup_check.NO_CODER_HINT and by_key["coder"][1] == [CONFIGURE_CTA]
-    assert "/nowhere" in by_key["repo"][0] and by_key["repo"][1] == [CONFIGURE_CTA]
-    # br/gh resolve here, so no misleading settings CTA rides a non-config key (r4)
-    assert by_key["br"][1] is None and by_key["gh"][1] is None
-    assert by_key["coder"][1] == [{"kind": "plugin_config", "plugin": "project_board", "label": "Project Board"}]
+    assert reg.setup_gaps["coder"] == setup_check.NO_CODER_HINT
+    assert "/nowhere" in reg.setup_gaps["repo"]
+    # br/gh resolve here (every binary on PATH), and no misleading settings CTA rides a
+    # non-config key (r4): the ONLY actions are the two blockers'
+    assert reg.setup_gap_actions == {"coder": _cta("coder"), "repo": _cta("repo")}
     # registration still mounts the board API + loop surface regardless of the seam
-    assert "/plugins/project_board" in reg.routers and "project-board-loop" in reg.surfaces
+    assert "/plugins/project_board" in [prefix for prefix, _router in reg.routers]
+    assert "project-board-loop" in reg.surfaces
 
 
 def test_register_degrades_to_plain_warnings_on_a_legacy_host(monkeypatch):
