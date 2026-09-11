@@ -20,7 +20,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | Method | Path | What it does |
 |---|---|---|
 | `GET` | `/projects` | Live project config for the custom Configure tab (no router snapshot). |
-| `PUT` | `/projects/{name}` | Add/update one boarded repo through the same bounded seam as the agent tool. |
+| `PUT` | `/projects/{name}` | Add/update one boarded repo through the same bounded seam as the agent tool. A save that sets a new gate command, or moves the project to another repo, answers only after that gate has run once on the clean base (minutes for a full suite); a red gate is a 400 naming the failure, a 409 means another save changed the project meanwhile. See [Long saves](#long-saves). |
 | `DELETE` | `/projects/{name}` | Delete a project only after proving no active board card references it. |
 | `GET` | `/status` | Is this board BOUND yet? A pure config read — no `br` calls — so it answers even when the store can't, which is exactly when the view needs it. The shipped default (`repo: "."`, no db_path, no project… |
 | `POST` | `/epics` | — |
@@ -38,6 +38,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/features/{fid}/unblock` | — |
 | `POST` | `/features/{fid}/cancel` | Cancel a feature created in error — the second terminal edge (#47). Closes the bead with an audit reason and tags it `cancelled` (a distinct state, not `done`), so a bad decomposition/duplicate leaves… |
 | `POST` | `/features/{fid}/done` | Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that shipped OUTSIDE the board's PR lifecycle (record_merge's pr_url→external_ref match never fires). Accepts only an in-flight ca… |
+| `POST` | `/features/{fid}/attach-pr` | Attach an externally opened PR to the existing coding card it belongs to (#402). The card moves to in_review with that PR, and the normal reconcile drives it from there (CI, the review gate, merge → done). Body: `{pr_url, reason?, by?}`. Returns 400… |
 | `POST` | `/features/{fid}/salvage` | Publish a stranded card's worktree WITHOUT dispatching a coder (#427): commit what the tree holds, run the pre-PR gate, push, open the PR (or push onto the card's existing one), move the card to `in_review`. Body: `{force?: bool, tree?: str}`. An operator override: skips the goal, requirement-ledger and source-issue checks; CI and the review gate still apply. Only for a stranded card (`in_progress` with no live drive, or `blocked`); refuses (409, nothing changed) while a drive owns it, or when no worktree — or more than one, unless `tree` names one — has changes vs base. A red gate publishes nothing (409 `gate-red`, with the output's tail) unless `force: true`, which publishes it as a DRAFT carrying that output (an existing PR is converted, with the output posted on it); `draft` is read back from GitHub. 200 `published` · 404 `not-found` · 409 `cancelled` (a cancel landed mid-publish) · 503 `loop-not-running` · 502 `error` (`branch` names a branch already pushed). |
 | `POST` | `/features/{fid}/deliver` | Record a task-type feature's DELIVERABLE (#217) — the task sibling of the coder's open_review edge, moving in_progress → in_review. Body: `{text?, ref?}`: `text` rides a `deliverable:` comment (the pr… |
 | `POST` | `/features/{fid}/verify` | The task-type Done edge (#217) — `record_merge`'s verify sibling. Body: `{approved?: bool=true, feedback?, by?}`. `approved=true` closes the task with a `verified: <by>` reason; `approved=false` recor… |
@@ -57,6 +58,27 @@ crosses a fail-closed HMAC boundary (`X-Hub-Signature-256`) before touching the 
 | `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… |
 | `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… |
 | `POST` | `/webhook/pr` | GitHub PR webhook — the SINGLE Done edge. On a `closed` event with `merged: true` it sets the matching feature `done` (nothing else does) and reaps its worktree. The raw body is HMAC-verified against… |
+
+## Long saves
+
+`PUT /projects/{name}` runs the project's gate once on the clean base before it saves a new
+gate command, or the same gate moved to another repo. The request answers only after that
+gate has finished, which takes minutes for a full test suite. Nothing else waits on it: saves
+to other projects proceed, and only the final read-merge-write is serialized. If another
+save changes the same project while the gate runs, this one is refused with `409`; save
+again.
+
+A client that can't hold a request open that long can still learn the outcome. The fleet
+proxy, for one, answers a plugin API call with `504` after 20s. Send a `request_id` in the
+body, then read `GET /projects` → `saves.<name>`:
+
+```json
+{"id": "<your request_id>", "state": "running|saved|refused|cancelled",
+ "stage": "running the gate on the clean base", "started_at": "…", "finished_at": "…",
+ "detail": "<why it was refused>"}
+```
+
+The Projects editor does exactly this when the connection gives up.
 
 ## Conventions
 

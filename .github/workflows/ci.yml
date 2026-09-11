@@ -160,4 +160,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PB_GH_FIXTURE_PR: ${{ vars.PB_GH_FIXTURE_PR || github.event.pull_request.html_url }}
           PB_GH_ALLOW_WRITES: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
-        run: pytest -q tests/test_worktree_gh.py
+        # tests/test_attach_pr_gh_402.py: the attach edge's `pr_identity` seam (#402), REAL in the
+        # seam ratchet. It needs no `br`, so it runs here, where the fixture is.
+        run: pytest -q tests/test_worktree_gh.py tests/test_attach_pr_gh_402.py

@@ -15,6 +15,7 @@ patched to supply the projection the method reads back — the same tool-level w
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -463,6 +464,17 @@ _MINIMAL_ARGS = {
     "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
     "board_list": {},
     "board_retro": {},
+    "board_attach_pr": {"feature_id": "bd-1", "pr_url": "https://github.com/o/r/pull/1"},
+}
+
+# Tools that never read the beads store: they answer with their own record (board_dispatch's
+# decision record; board_salvage_feature's, whose store reads happen inside the running loop)
+# or their own refusal (board_register_project works the host config seam). They are held to
+# the NEVER-RAISE half of the contract.
+_NO_STORE_ARGS = {
+    "board_dispatch": {},
+    "board_salvage_feature": {"feature_id": "bd-1"},
+    "board_register_project": {"name": "x", "repo": "/nope"},
 }
 
 
@@ -484,15 +496,17 @@ def test_every_tool_returns_boarderror_as_result_never_raises(monkeypatch):
     assert not missing, f"sweep args reference unknown tools: {missing}"
 
     for t in tools:
-        if t.coroutine is not None:
-            # Async tools (board_register_project) don't go through the beads store —
-            # they work the HOST config seam and build their own `Error: …` strings
-            # (the consent-gate refusal is one). The store sweep is a sync contract.
+        # Async tools too. Skipping them is how board_attach_pr shipped a path (a gh timeout on
+        # the replacement read) that raised into the agent turn instead of answering Error.
+        call = (lambda args, t=t: asyncio.run(t.ainvoke(args))) if t.coroutine is not None else t.invoke
+        if t.name in _NO_STORE_ARGS:
+            out = call(_NO_STORE_ARGS[t.name])
+            assert isinstance(out, str), f"{t.name} must answer with a string result, got {type(out).__name__}"
             continue
         assert t.name in _MINIMAL_ARGS, (
             f"new tool {t.name!r} has no minimal-args entry — add one so the no-raise contract covers it"
         )
-        out = t.invoke(_MINIMAL_ARGS[t.name])
+        out = call(_MINIMAL_ARGS[t.name])
         assert isinstance(out, str) and out.startswith("Error:"), (
             f"{t.name} must return the BoardError as an `Error: …` result, got: {out!r:.120}"
         )

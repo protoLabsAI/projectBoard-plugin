@@ -57,7 +57,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # blocking findings → bounce back to the coder with the findings injected into
         # the retry prompt, EXACTLY like the CI bounce, bounded by `review_fix_max`
         # (mirror of ci_fix_max); exhaustion → flag_blocked — never a silent merge.
-        self.review_gate = bool(self.cfg.get("review_gate", False))
+        # `knob_bool`, not `bool()`: a hand-edited "false" is a non-empty string, which `bool()`
+        # reads as ON. The listings and the attach verb read this knob with knob_bool, so the
+        # loop used to run a gate every other surface said was off (#402 review).
+        self.review_gate = knob_bool(self.cfg, "review_gate", False, strict=False)
         self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
         self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
         # Cap on consecutive UNRUNNABLE gate attempts (runner missing / workflow dying /

@@ -44,8 +44,9 @@ def _routes() -> set[tuple[str, str]]:
 
 
 def _tools() -> set[str]:
-    # Async tools too: `board_dispatch` (#390) is an `async def`, and a FunctionDef-only
-    # scan let it ship undocumented — the gap this guard claims to close.
+    # BOTH def and async def: an `async def board_…` tool is just as callable, and matching
+    # FunctionDef alone let board_dispatch ship undocumented and would have let the next
+    # async tool do the same (#402 added one).
     return {
         n.name
         for n in ast.walk(ast.parse((_ROOT / "__init__.py").read_text()))

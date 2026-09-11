@@ -432,6 +432,58 @@ async def test_boot_recovery_leaves_a_reserved_card_alone(origin, monkeypatch):
     assert board.get_feature(fid)["board_state"] == "ready"
 
 
+async def test_a_salvage_that_starts_during_the_orphan_checks_gh_read_owns_the_card(origin, monkeypatch):
+    """The sweep decides a card is an orphan, then reads gh for its PR before acting. A
+    salvage that reserves the card in that window owns it: no crash salvage of the same
+    tree, and no requeue on the stale decision."""
+    board, gh, loop, fid, _ = _setup(origin, monkeypatch)
+    board.claim(fid, assignee="proto")
+    crash_salvages: list[str] = []
+
+    async def _gh_while_a_salvage_starts(*args, cwd, timeout=60):
+        loop._inflight_files[fid] = set()
+        return 1, "", "no pull requests found"
+
+    async def _crash_salvage(store, f):
+        crash_salvages.append(f)
+        return False
+
+    monkeypatch.setattr(worktree, "_gh", _gh_while_a_salvage_starts)
+    monkeypatch.setattr(loop, "_salvage_verified_candidate", _crash_salvage)
+    await loop._reconcile_orphan(fid)
+
+    assert crash_salvages == [] and board.get_feature(fid)["board_state"] == "in_progress"
+
+
+async def test_a_salvage_that_starts_before_the_orphan_move_owns_the_card(origin, monkeypatch):
+    board, gh, loop, fid, _ = _setup(origin, monkeypatch)
+    board.claim(fid, assignee="proto")
+
+    async def _crash_salvage_while_a_salvage_starts(store, f):
+        loop._inflight_files[fid] = set()
+        return False
+
+    monkeypatch.setattr(loop, "_salvage_verified_candidate", _crash_salvage_while_a_salvage_starts)
+    await loop._reconcile_orphan(fid)
+
+    assert board.get_feature(fid)["board_state"] == "in_progress", "the orphan check requeued a reserved card"
+
+
+async def test_a_salvage_that_starts_during_the_blocked_sweep_owns_the_card(origin, monkeypatch):
+    board, gh, loop, fid, _ = _setup(origin, monkeypatch)
+    board.flag_blocked(fid, "rate limit: 429 too many requests")
+    real_budget = loop._budget_get
+
+    async def _budget_while_a_salvage_starts(store, f, kind, *a, **kw):
+        loop._inflight_files[fid] = set()
+        return await real_budget(store, f, kind, *a, **kw)
+
+    monkeypatch.setattr(loop, "_budget_get", _budget_while_a_salvage_starts)
+    await loop._recover_blocked(board)
+
+    assert board.get_feature(fid)["blocked"], "the blocked sweep auto-unblocked a card reserved mid-pass"
+
+
 # ── a leftover directory is not a worktree, and git must never be run in it ──────────
 
 

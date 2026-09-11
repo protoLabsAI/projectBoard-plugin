@@ -176,13 +176,25 @@ class DriveMixin:
                         projects=projects,
                         default_project=default,
                     )
-                    # A repo that previously failed preflight gets a clean evaluation
-                    # under its new routing. Retain `_preflight_held`: it records cards
+                    # Every project whose routing CHANGED gets a fresh preflight, a held one
+                    # included: `_maybe_preflight` re-checks projects it holds cards for, so
+                    # clearing a held project's verdict can no longer strand its holds (#393).
+                    # An unchanged project keeps its verdict, so a save to one project doesn't
+                    # re-run every other project's suite. A new default re-homes every unlabeled
+                    # card, so then all verdicts go. Retain `_preflight_held`: it records cards
                     # the loop itself blocked and is needed to release them on recovery.
-                    self._preflight_state.clear()
-                    self._last_preflight.clear()
-                    self._preflight_dirty.clear()
-                    self._preflight_failed_at.clear()
+                    if old_default != default:
+                        stale = set(old_projects) | set(projects)
+                    else:
+                        stale = {n for n in set(old_projects) | set(projects) if old_projects.get(n) != projects.get(n)}
+                    for verdicts in (
+                        self._preflight_state,
+                        self._last_preflight,
+                        self._preflight_dirty,
+                        self._preflight_failed_at,
+                    ):
+                        for stale_name in stale:
+                            verdicts.pop(stale_name, None)
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)

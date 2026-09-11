@@ -1536,6 +1536,39 @@ async def pr_head_sha(pr_url: str, *, cwd: str = ".") -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def pr_identity(pr_url: str, *, cwd: str = ".") -> dict:
+    """ONE ``gh pr view`` read of the facts that say WHICH PR this is (#402), for the
+    attach edge to judge whether the board may adopt it:
+    ``{"url", "state", "head", "base", "cross_repo"}``. These are the canonical url (the
+    form ``open_pr`` records and the merge webhook's ``html_url`` carries, so
+    ``record_merge`` matches it); ``OPEN`` / ``MERGED`` / ``CLOSED``; the head and base
+    branch names; and whether the head lives in a fork (``None`` when gh does not say).
+    Returns ``{}`` when gh fails, times out or isn't installed. It never raises, because a
+    PR the board cannot read is one it will not adopt."""
+    try:
+        rc, out, _err = await _gh(
+            "pr", "view", pr_url, "--json", "url,state,headRefName,baseRefName,isCrossRepository", cwd=cwd
+        )
+    except (WorktreeError, OSError):
+        return {}
+    if rc != 0:
+        return {}
+    try:
+        data = json.loads(out or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict) or not str(data.get("url") or "").strip():
+        return {}
+    cross = data.get("isCrossRepository")
+    return {
+        "url": str(data["url"]).strip(),
+        "state": str(data.get("state") or "").strip().upper(),
+        "head": str(data.get("headRefName") or "").strip(),
+        "base": str(data.get("baseRefName") or "").strip(),
+        "cross_repo": cross if isinstance(cross, bool) else None,
+    }
+
+
 async def pr_merge_info(pr_url: str, *, cwd: str = ".") -> dict:
     """ONE ``gh pr view`` read of the merge-relevant PR facts:
     ``{"mergeStateStatus": str, "isDraft": bool | None}``. ``mergeStateStatus`` is
