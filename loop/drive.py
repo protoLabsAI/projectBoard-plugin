@@ -1070,28 +1070,46 @@ class DriveMixin:
         await self._record_task_reply(store, fid, reply, "task")
 
     async def _task_dispatch_failed(self, store, fid: str, kind: str, reason: str) -> None:
-        """Block a task whose dispatch failed — or answered with nothing — for triage,
-        UNLESS the card was delivered under the drive (#432 review).
+        """Block a task whose dispatch failed — or answered with nothing — for triage, but
+        ONLY while the card is still this drive's: in_progress, read fresh. The task-side
+        twin of ``_block_or_stand_aside`` (#398), and the same rule.
 
-        A self task's agent has its board tools live during the turn, so it can
-        board_deliver and THEN time out or error. Blocking that card stamped `blocked` over
-        a delivered deliverable, and the verifier could no longer approve it
-        (`record_verification expects in_review, got 'blocked'`). So the card is re-read
-        first: in review (or already done), the delivery stands and the failure is only
-        logged. If the re-read itself fails, the block goes ahead as it always did. Neither
-        a failed read nor a failed block escapes the drive task."""
-        try:
-            current = await asyncio.to_thread(store.get_feature, fid)
-        except BR_FAILURES as exc:
-            log.warning("[project_board] %s could not re-read the card before blocking it: %s", fid, exc)
-            current = None
-        state = (current or {}).get("board_state")
-        if state in ("in_review", "done"):
+        - Delivered under the drive (in_review / done): a self task's agent has its board
+          tools live during the turn, so it can board_deliver and THEN time out or error.
+          Blocking that card stamped `blocked` over a delivered deliverable, and the
+          verifier could no longer approve it (#432 review). The delivery stands.
+        - Moved on under the drive otherwise (held by a human, requeued, cancelled): the
+          move stands. A block would overwrite the hold's own reason and class.
+        - UNREADABLE: never assumed to be the drive's own. This used to block "as it always
+          did" — over whatever decision the drive could not see. It is logged instead, and
+          a card still in_progress with no drive is the sweep's to reconcile.
+
+        Neither a failed read nor a failed block escapes the drive task."""
+        moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+        if moved_to == "unknown":
+            log.warning(
+                "[project_board] %s %s failed and the card could not be re-read — not blocking a card the "
+                "drive cannot see (the health sweep reconciles it): %s",
+                fid,
+                kind,
+                reason,
+            )
+            return
+        if moved_to in ("in_review", "done"):
             log.info(
                 "[project_board] %s %s failed after the card was delivered (%s) — the delivery stands, not blocking: %s",
                 fid,
                 kind,
-                state,
+                moved_to,
+                reason,
+            )
+            return
+        if moved_to:
+            log.info(
+                "[project_board] %s %s failed after the card was moved to %s — the move stands, not blocking: %s",
+                fid,
+                kind,
+                moved_to,
                 reason,
             )
             return
