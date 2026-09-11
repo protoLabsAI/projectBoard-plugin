@@ -397,18 +397,7 @@ class DriveMixin:
             # `which` + a roster read and changes nothing about the tick itself.
             if not await self._setup_gate():
                 return
-            spawned = False
-            try:
-                await self._maybe_reconcile()
-                await self._maybe_sweep()
-                await self._maybe_preflight()  # fail-closed: hold work if the gate can't run
-                # Under the claim lock so an on-demand board_dispatch (#390) evaluating the
-                # SAME queue can never interleave with this tick into over-claiming past
-                # max_concurrent or double-dispatching a card.
-                async with self._claim_guard():
-                    spawned = await self._spawn_ready()
-            except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
-                log.exception("[project_board] loop tick failed")
+            spawned = await self._tick()
             # Idle (nothing started, nothing running) → sleep the full interval. Busy
             # → re-check soon so a freed concurrency slot refills and merges land
             # promptly (the poll itself stays rate-limited by merge_poll_interval).
@@ -418,6 +407,63 @@ class DriveMixin:
                 await asyncio.wait_for(self._stop.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
+
+    async def _tick(self) -> bool:
+        """One tick's phases, in order — True if the claim scan started a drive."""
+        spawned = False
+        # Each phase runs on its OWN (#404). A phase that FAILS — a `br` call refused, a
+        # bug — is logged by name and runs again on its own next turn, and the others go
+        # ahead: before, any exception anywhere took the whole tick down with a traceback.
+        #
+        # A STALLED store is different: the next phase would only stall on it too, one
+        # full timeout per call, while holding the single-flight lock every board read
+        # queues behind (a wedged store made seven stalled calls in one tick). So the first
+        # stall ends the tick, logged as a stall, and the next tick tries again.
+        status = "ok"
+        for phase, step in (("PR reconcile", self._maybe_reconcile), ("health sweep", self._maybe_sweep)):
+            status, _ = await self._tick_phase(phase, step)
+            if status == "stalled":
+                break
+        # The claim scan also stops after a FAILED preflight: the preflight is fail-closed
+        # (it holds a project whose gate cannot run), and a project it never got to smoke
+        # reads as runnable to the scan — so claiming now would dispatch exactly the work
+        # the preflight exists to hold. `dispatch_now` stops at the same point.
+        if status != "stalled":
+            status, _ = await self._tick_phase("gate preflight", self._maybe_preflight)
+            if status == "ok":
+                # Under the claim lock so an on-demand board_dispatch (#390) evaluating the
+                # SAME queue can never interleave with this tick into over-claiming past
+                # max_concurrent or double-dispatching a card.
+                async with self._claim_guard():
+                    _, spawned = await self._tick_phase("claim scan", self._spawn_ready)
+        return bool(spawned)
+
+    async def _tick_phase(self, phase: str, step) -> tuple[str, object]:
+        """Run one phase of a tick, isolated from the rest (#404) — ``(status, result)``,
+        status ``ok``, ``failed`` or ``stalled``.
+
+        A failure never escapes: a bad phase must not kill the loop. A BoardError (a `br`
+        call that failed) is an understood outcome, so it is one WARNING naming the phase
+        and the call, and the tick goes on. A ``BoardTimeout`` is ``stalled``: the store
+        did not answer, and the caller skips the rest of the tick rather than queue more
+        calls behind it. Anything else is a bug and keeps its traceback. Nothing is retried
+        here: each phase already runs on its own cadence (the merge poll interval, the sweep
+        interval, the next tick), and that cadence is the retry."""
+        try:
+            return "ok", await step()
+        except store_mod.BoardTimeout as exc:
+            log.warning(
+                "[project_board] loop tick: %s stalled on the board store — the rest of this tick is skipped, "
+                "and the next tick tries again: %s",
+                phase,
+                exc,
+            )
+            return "stalled", None
+        except BoardError as exc:
+            log.warning("[project_board] loop tick: %s failed, the rest of the tick continues: %s", phase, exc)
+        except Exception:  # noqa: BLE001 — a bad phase must never kill the loop
+            log.exception("[project_board] loop tick: %s failed, the rest of the tick continues", phase)
+        return "failed", None
 
     async def _spawn_ready(self) -> bool:
         """Claim Ready features up to the concurrency cap and spawn a drive for each,

@@ -84,6 +84,9 @@ The Projects editor does exactly this when the connection gives up.
 - **`fid`** is a bead id (`bd-a1b2`), the board's primary key everywhere.
 - Errors surface as `{"detail": "<reason>"}` with a 4xx; a `BoardError` from the store
   becomes a `400` with the store's own message, so the reason is the `br` failure itself.
+- A **`503`** means the board store did not answer: a `br` call stalled past its timeout
+  (45s) and was stopped (#404). Unlike a `400` this is not a refusal, and a write's outcome
+  is unknown. It may have landed before the stall, so re-read the card before retrying.
 - Writes are **idempotent where it matters** — re-recording a merge, re-flagging a block
   and re-stamping a verdict are all safe to retry.
 - The board is a **projection over beads**. Every mutation shells `br`; nothing is cached

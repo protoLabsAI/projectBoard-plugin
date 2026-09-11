@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -73,6 +74,29 @@ BR = br_fetch.resolve_br_bin()
 _DB_RETRY_ATTEMPTS = 6
 _DB_RETRY_DELAY = 0.1  # seconds; doubles each retry (0.1 → 0.2 → 0.4 → 0.8 → 1.6 → 3.2, ~6.3s total)
 _DB_CONTENTION_RE = re.compile(r"DATABASE_ERROR|database is (?:locked|busy)", re.IGNORECASE)
+
+# How long ONE `br` subprocess may run before it is stopped (#404). `br` normally answers
+# in well under a second — a `br list` on a 16 MB production board measured 0.058s right
+# after four stalls — so a call that reaches this is stalled, not slow, and waiting longer
+# only holds the single-flight lock below while every other board read queues behind it.
+# It sits ABOVE br's own write-lock wait (30s on br 0.2.16): at exactly 30s the store
+# stopped br milliseconds before br would have reported the lock itself, turning a
+# diagnosable DATABASE_ERROR (which `_run` retries) into an opaque stall. A stall is NOT
+# retried here: the caller's own cadence (the next tick, the next poll) is the retry.
+_BR_TIMEOUT_S = 45.0
+# A stalled `br` is asked to stop before it is killed: SIGTERM to its process group, this
+# long to exit, then SIGKILL. br handles SIGTERM so it does not strand frames in the WAL,
+# which a SIGKILL mid-write could; the group (its own session) takes any child with it.
+_BR_TERM_GRACE_S = 2.0
+# A call that SUCCEEDED but took this long is logged, so the timeout above can be judged
+# against real latencies instead of guessed at — and a board creeping toward it is visible
+# before a tick fails, not after.
+_BR_SLOW_S = 10.0
+# The most ids one `br show` projection read carries (#404). `list_features` used to show
+# every row in ONE call — ~350 ids on a board with a long Done history — so a single
+# contended read ran past the timeout and took the whole loop tick down with it. Batches
+# bound each call's work and let other board reads take the lock between them.
+_SHOW_BATCH = 100
 
 # ONE `br` at a time per process (the DB-race issue). beads-rust readers can see a
 # short WAL read while another `br` process checkpoints ("WAL file is corrupt: short
@@ -219,7 +243,7 @@ def _issues_envelope(parsed):
 def _warn_blocking_on_event_loop(op: str) -> None:
     """Detect a blocking ``br`` invocation ON an asyncio event-loop thread (#258).
 
-    ``_run`` blocks in ``subprocess.run`` (30s timeout) and ``time.sleep`` (the
+    ``_run`` blocks on a `br` subprocess (``_BR_TIMEOUT_S``) and ``time.sleep`` (the
     contention backoff, ~6.3s worst case) — on the event-loop thread that stalls
     EVERY coroutine (the tick, all routes) for the duration. Async callers must
     offload store work via ``asyncio.to_thread``; this module-level seam is how
@@ -787,6 +811,22 @@ class BoardNotFound(BoardError):
     this narrower type instead of pattern-matching an error string."""
 
 
+class BoardTimeout(BoardError):
+    """A `br` subprocess did not answer within ``_BR_TIMEOUT_S`` and was stopped (#404).
+
+    A BoardError, not the raw ``subprocess.TimeoutExpired`` it replaces. That one is no
+    kind of BoardError, so it sailed past every ``except BoardError``: a single stalled read
+    killed the whole loop tick, a tool call crashed instead of returning its error, and the
+    traceback carried all ~350 ids of the show that stalled.
+
+    But a stall is NOT a refusal, and handlers must not read it as one. `br` refused →
+    nothing happened. `br` stalled → the outcome is UNKNOWN: a write may have committed
+    before the stall, and the store is likely still wedged. So the handlers that turn a
+    refusal into a decision re-raise this instead: a claim race, a cancel's undo, a
+    create's dedup read, a pass that would otherwise try the next card against the same
+    stalled store, and the HTTP guard, which maps it to 503."""
+
+
 class AlreadyDelivered(BoardError):
     """``record_delivery`` refused a DIFFERENT deliverable for a task already in review
     (#403) — nothing was written, and the recorded one still stands for board_verify.
@@ -803,6 +843,77 @@ class AlreadyDelivered(BoardError):
 # `_run`, and this tuple stays correct either way). For the few places that must survive
 # a failed call — a best-effort write, a drive task's tail — instead of dying on it.
 BR_FAILURES = (BoardError, subprocess.TimeoutExpired)
+
+
+def _stop_br_tree(proc: subprocess.Popen) -> None:
+    """Stop a stalled `br` and everything it forked (#404): SIGTERM to its process group,
+    ``_BR_TERM_GRACE_S`` to exit, then SIGKILL, then reap on a bound. br handles SIGTERM so
+    a write is not cut off mid-frame, and the group catches a child a wrapper or shim forked
+    (a direct-child kill left one running). Windows has no process groups; there the child
+    alone is terminated, then killed."""
+    group = getattr(os, "killpg", None)
+
+    def _signal(sig) -> None:
+        try:
+            if group is not None:
+                group(proc.pid, sig)
+            elif sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except (ProcessLookupError, OSError):
+            pass  # already gone
+
+    _signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=_BR_TERM_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal(getattr(signal, "SIGKILL", signal.SIGTERM))  # the group too: a child may have ignored TERM
+    try:
+        proc.communicate(timeout=_BR_TERM_GRACE_S)  # reap, and close our ends of the pipes
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+
+
+def _run_br_process(cmd: list[str], *, cwd: str, args: tuple[str, ...]) -> subprocess.CompletedProcess:
+    """Run ONE `br` process to completion, bounded by ``_BR_TIMEOUT_S`` (#404). No stdin
+    (#423: the desktop server's stdin is a pipe that never closes) and its own session, so
+    a stall stops the whole tree (``_stop_br_tree``) and raises ``BoardTimeout`` — never a
+    raw ``TimeoutExpired``, whose message is the entire command line."""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=_BR_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _stop_br_tree(proc)
+        raise BoardTimeout(
+            f"`br {_brief_cmd(args)}` timed out after {_BR_TIMEOUT_S:g}s and was stopped — the board "
+            "store did not answer (usually transient contention). If this was a write, it may or may "
+            "not have landed: re-read the card (for a create, the board) before retrying it"
+        ) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _brief_cmd(args: tuple[str, ...], limit: int = 120) -> str:
+    """``br <args>`` shortened for a message — a batched `br show` names hundreds of ids,
+    and the command is there to say WHICH call failed, not to list them all."""
+    shown: list[str] = []
+    used = 0
+    for arg in args:
+        if shown and used + 1 + len(arg) > limit:
+            break
+        used += len(arg) + (1 if shown else 0)
+        shown.append(arg)
+    rest = len(args) - len(shown)
+    return " ".join(shown) + (f" … (+{rest} more)" if rest else "")
 
 
 def _br_json_error(out) -> dict:
@@ -1171,9 +1282,7 @@ class BeadsBoard:
             )
             # NB: a direct subprocess, NOT self._run — that would recurse here, and we want
             # a precise error rather than the generic `br … failed` wrapper.
-            proc = subprocess.run(
-                [BR, "init", "--actor", self.actor], cwd=repo, capture_output=True, text=True, timeout=30
-            )
+            proc = _run_br_process([BR, "init", "--actor", self.actor], cwd=repo, args=("init",))
             if proc.returncode != 0 and not os.path.isdir(os.path.join(repo, ".beads")):
                 raise BoardError(
                     f"repo {repo!r} has no beads workspace and `br init` failed "
@@ -1201,9 +1310,7 @@ class BeadsBoard:
         )
         # NB: a direct subprocess, NOT self._run — that would recurse here (and carry
         # --db into an init that must key off cwd alone).
-        proc = subprocess.run(
-            [BR, "init", "--prefix", "bd", "--actor", self.actor], cwd=root, capture_output=True, text=True, timeout=30
-        )
+        proc = _run_br_process([BR, "init", "--prefix", "bd", "--actor", self.actor], cwd=root, args=("init",))
         if proc.returncode != 0 and not os.path.isfile(self.db):
             raise BoardError(
                 f"instance board store {root!r} could not be initialized (`br init` failed: "
@@ -1245,7 +1352,17 @@ class BeadsBoard:
         retries = 0
         for attempt in range(_DB_RETRY_ATTEMPTS):
             with _br_lock():  # single-flight per process — see _br_lock
-                proc = subprocess.run(cmd, cwd=self.repo or ".", capture_output=True, text=True, timeout=30)
+                started = time.monotonic()
+                # A stall raises BoardTimeout with the tree already stopped (#404).
+                proc = _run_br_process(cmd, cwd=self.repo or ".", args=args)
+                elapsed = time.monotonic() - started
+            if elapsed >= _BR_SLOW_S:
+                log.warning(
+                    "[project_board] `br %s` took %.1fs (the timeout is %gs)",
+                    _brief_cmd(args),
+                    elapsed,
+                    _BR_TIMEOUT_S,
+                )
             err = proc.stderr.strip()
             # Contention surfaces THREE ways: DATABASE_ERROR on stderr with a non-zero exit;
             # (br 0.1.x) an error object on STDOUT with a ZERO exit (#116); and — the
@@ -2088,6 +2205,12 @@ class BeadsBoard:
             return None
         try:
             self._run("update", fid, "--claim", "--remove-label", LABEL_READY)
+        except BoardTimeout:
+            # A stall is not a lost race (#404): the claim may even have landed, and the
+            # store is likely wedged. Folding it into None read as `claim-race`, which the
+            # scan counts toward the livelock bound — five stalled ticks terminal-blocked
+            # a healthy card, with a log blaming an assignee.
+            raise
         except BoardError as exc:
             # `br --claim` rejects an already-assigned bead. This was a SILENT skip (the
             # loop never claims + logs nothing — a nasty trap); log it so it's visible.
@@ -2149,6 +2272,8 @@ class BeadsBoard:
             # in_progress. `actor=target` keeps the dispatch target instead of the board
             # actor AND lets the claim pass (a target claiming its own bead is not refused).
             self._run("update", fid, "--claim", "--remove-label", LABEL_READY, actor=target)
+        except BoardTimeout:
+            raise  # a stall, not a lost race — see `claim` (#404)
         except BoardError as exc:
             # The bead was reassigned to a DIFFERENT owner (operator triage / requeue) or
             # otherwise moved under us, so `--claim` refused it: not claimable → retry. This
@@ -2714,18 +2839,34 @@ class BeadsBoard:
                     fid,
                     blocker_id,
                 )
+        undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
+        # Re-add the blocked label we dropped, so a blocked card rolls back to blocked —
+        # not a half-cancelled, now-silently-unblocked zombie.
+        if was_blocked:
+            undo += ["--add-label", LABEL_BLOCKED]
+        # Only rewrite the assignee if there was one — a bead that was already
+        # unassigned needs no restore (and `--assignee ""` would be a redundant write).
+        if prior_assignee:
+            undo += ["--assignee", prior_assignee]
         try:
             self._run("close", fid, "-r", f"cancelled: {reason}" if reason else "cancelled")
+        except BoardTimeout:
+            # A stalled close has an UNKNOWN outcome (#404): it may have committed and then
+            # hung. Undoing blind stripped `cancelled` from a bead that DID close, and a
+            # closed bead without it reads as `done` — shipped work. Look before undoing: a
+            # closed bead means the cancel landed, so it stands; an open one gets the undo.
+            # If even the look fails, touch nothing and say so.
+            try:
+                now = self.get_feature(fid)
+            except BoardError:
+                raise BoardTimeout(
+                    f"cancel {fid}: `br close` timed out and the card could not be re-read — it may or may "
+                    "not be cancelled; check it before retrying"
+                ) from None
+            if (now or {}).get("bead_status") != "closed":
+                self._run(*undo)
+                raise
         except BoardError:
-            undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
-            # Re-add the blocked label we dropped, so a blocked card rolls back to blocked —
-            # not a half-cancelled, now-silently-unblocked zombie.
-            if was_blocked:
-                undo += ["--add-label", LABEL_BLOCKED]
-            # Only rewrite the assignee if there was one — a bead that was already
-            # unassigned needs no restore (and `--assignee ""` would be a redundant write).
-            if prior_assignee:
-                undo += ["--assignee", prior_assignee]
             self._run(*undo)
             raise
         result = self.get_feature(fid) or {}
@@ -2826,9 +2967,14 @@ class BeadsBoard:
 
         if cls:
             args += ["--add-label", f"{LABEL_BLOCKED_CLASS_PREFIX}{cls}"]
-        self._run(*args)
+        # The REASON first, and not through the best-effort `comment()` (#404, #414). That
+        # one swallows a failed write — a stall included — so the label landed while its
+        # `blocked: <reason>` comment did not: a block with no reason, the exact state #414
+        # forbids. Written first and allowed to raise, a failure leaves the card UNblocked
+        # with the caller told, never blocked without saying why.
         if reason:
-            self.comment(fid, f"blocked: {reason}")
+            self._run("comments", "add", fid, f"blocked: {reason}")
+        self._run(*args)
         return self.get_feature(fid)
 
     def clear_blocked(self, fid: str) -> dict:
@@ -3154,17 +3300,29 @@ class BeadsBoard:
                 "truncated, so the board projection would be incomplete (#114/#138). Check the "
                 "installed beads version's `--limit 0` semantics before trusting the board."
             )
+        # Narrow to the rows this call RETURNS before paying for their detail (#404). The
+        # archived flag and the board state both project from `status` + `labels`, which a
+        # `br list` row already carries, so filtering here drops nothing a caller sees. It
+        # is the difference between the loop's `state="in_review"` read showing the few
+        # cards in review and showing all ~350 rows of a long Done history to keep three.
+        if not include_archived:
+            rows = [r for r in rows if LABEL_ARCHIVED not in (r.get("labels") or [])]
+        if state:
+            rows = [r for r in rows if self.board_state(r) == state]
         # `br list` omits the `dependencies` array AND the `comments` thread; `br show`
-        # carries both. Batch all IDs into ONE call so `_project` sees real edges — avoids
-        # N+1 subprocess spawns on this continuously-polled endpoint (#144). Guard the
+        # carries both. Batch the IDs so `_project` sees real edges — avoids N+1 subprocess
+        # spawns on this continuously-polled endpoint (#144) — in calls of at most
+        # `_SHOW_BATCH` ids, so no single read grows with the board (#404). Guard the
         # empty-rows case: `br show` with no arguments is an error.
         if rows:
             ids = [r["id"] for r in rows if r.get("id")]
             if ids:
-                batch = self._run("show", *ids, want_json=True) or []
-                if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
-                    batch = [batch]
-                show_by_id = {r["id"]: r for r in batch if isinstance(r, dict) and r.get("id")}
+                show_by_id: dict[str, dict] = {}
+                for start in range(0, len(ids), _SHOW_BATCH):
+                    batch = self._run("show", *ids[start : start + _SHOW_BATCH], want_json=True) or []
+                    if isinstance(batch, dict):  # 0.1.x bare-dict single-bead path
+                        batch = [batch]
+                    show_by_id.update((r["id"], r) for r in batch if isinstance(r, dict) and r.get("id"))
                 for r in rows:
                     rid = r.get("id")
                     if rid and rid in show_by_id and "dependencies" not in r:
@@ -3197,16 +3355,15 @@ class BeadsBoard:
         for f in out:
             if f.get("issue_type") == LABEL_TASK:
                 _listing_task_signal(f)
-        if not include_archived:
-            out = [f for f in out if not f["archived"]]
         # Cross-reference the puller's ready queue: a `ready` feature the puller won't
-        # claim is dep-blocked even if the show batch missed its edges.
-        claimable = {f["id"] for f in self.ready_queue()}
-        for f in out:
-            if f["board_state"] == "ready" and f["id"] not in claimable:
-                f["dag_blocked"] = True
-        if state:
-            out = [f for f in out if f["board_state"] == state]
+        # claim is dep-blocked even if the show batch missed its edges. Only when a
+        # returned row IS ready — the loop's in_review / blocked / in_progress reads have
+        # nothing to mark, and `br ready` is one more subprocess that can stall (#404).
+        if any(f["board_state"] == "ready" for f in out):
+            claimable = {f["id"] for f in self.ready_queue()}
+            for f in out:
+                if f["board_state"] == "ready" and f["id"] not in claimable:
+                    f["dag_blocked"] = True
         # Blocked features float to the top (#201): a blocked card is the board's
         # loudest "needs attention" signal, so it must never drown mid-list among
         # routine work. in_progress ranks second (#223) — what a coder is actively
