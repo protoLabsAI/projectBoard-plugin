@@ -791,7 +791,9 @@ async def test_drive_max_mode_fans_out_and_ships_the_winner(monkeypatch):
     assert len(dispatched) == 3  # all three coders ran
     # The winner (c2) is promoted to canonical; the two losers are reaped (winner is not).
     assert store.promotes == [("/wt/feat-bd-1.c2", "feat/bd-1.c2", "bd-1")]
-    assert set(store.reaps) == {"bd-1.c0", "bd-1.c1"}
+    # The losers are the drive's own trees, discarded by path — not the by-id reap, which
+    # keeps any tree holding work (#405).
+    assert set(store.removes) == {"/wt/feat-bd-1.c0", "/wt/feat-bd-1.c1"} and store.reaps == []
     # Only the winner's PR opens, on the canonical branch.
     assert opened == [("/wt/feat-bd-1", "feat/bd-1")]
     assert ("open_review", "bd-1", "https://example/pr/7") in store.calls
@@ -814,7 +816,7 @@ async def test_drive_max_mode_all_empty_reaps_all_and_blocks(monkeypatch):
         judge=_judge,
         cfg={"coder": "proto", "max_mode_n": 3},
     )
-    assert set(store.reaps) == {"bd-1.c0", "bd-1.c1", "bd-1.c2"}  # every candidate torn down
+    assert set(store.removes) == {f"/wt/feat-bd-1.c{i}" for i in range(3)}  # every candidate torn down
     assert store.promotes == []  # nothing promoted
     assert "flag_blocked" in store.names()
 

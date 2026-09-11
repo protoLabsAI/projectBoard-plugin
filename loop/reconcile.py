@@ -927,8 +927,11 @@ class ReconcileMixin:
             log.info(
                 "[project_board] %s auto-merged (%s, all gates green + current): %s", fid, self.merge_method, pr_url
             )
-            # Remote-branch cleanup, best-effort; the worktree (which still holds the
-            # local branch) is reaped when the reconcile reads MERGED.
+            # Reap the worktree BEFORE the remote branch goes. Deleting it drops our
+            # `origin/<branch>` tracking ref too, and that ref is how the reap knows the
+            # tree's commits are published — without it a squash-merged card's commits
+            # look like nobody's and get saved to a `stranded/` branch for nothing (#405).
+            await worktree.reap_feature_worktree(repo, self.root, fid)
             branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
             if not await worktree.delete_remote_branch(repo, branch):
                 log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)

@@ -104,6 +104,17 @@ TOO_WIDE_CLASS = "too-wide"
 # incident.
 PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 
+# The `blocked-class:` of a card the loop would not rebuild because a worktree it would
+# build over holds work that exists nowhere else (#405) — a coder that died before its
+# candidate was promoted — AND it could not be cleared safely: saving it to a `stranded/…`
+# branch failed (a nested repository, say), or it was saved but the tree would not come
+# off its path. (Saved work never stops a card: the tree goes and the build proceeds.)
+# The loop's own class,
+# like `dispatch-infra`: no message `classify()` sees can produce it. Deliberately absent
+# from the loop's self-healing set: waiting never makes the save succeed, so the operator
+# is told, with the paths, and the card stays put.
+STRANDED_WORK_CLASS = "stranded-work"
+
 # The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
 # and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
 # WorktreeError and every watchdog kill to `coder timed out after …`, so a message that

@@ -442,14 +442,16 @@ async def test_every_candidate_is_reaped_before_the_drive_sees_the_failure(monke
         created.append(fid)
         return ("/wt/feat-" + fid, "feat/" + fid)
 
-    async def _reap(repo, root, fid):
-        store.calls.append(("reap", fid))
+    async def _discard(repo, wt, branch=""):
+        # The candidates are the drive's own, so they are discarded by path (#405).
+        store.calls.append(("reap", wt[len("/wt/feat-") :]))
+        return True
 
     async def _promote(*_a, **_kw):
         raise AssertionError("an all-raised fan-out promotes nothing")
 
     monkeypatch.setattr(worktree, "create_worktree", _create)
-    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    monkeypatch.setattr(worktree, "remove_worktree", _discard)
     monkeypatch.setattr(worktree, "promote_worktree", _promote)
     await loop._drive({"id": "bd-rp", "title": "t", "spec": "s"})
 

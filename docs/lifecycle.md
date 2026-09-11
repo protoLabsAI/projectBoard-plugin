@@ -227,7 +227,9 @@ review. If the card is no longer its own, the drive **stands aside**:
   before the PR opens, the build opens none, and the work stays unpushed in its worktree. A
   requeued card is still published for. If a PR did open, it is recorded on the card with
   its state untouched, so the next round resumes that branch instead of rebuilding off base
-  over it.
+  over it. Nothing removes that tree without saving it first: when the reap or the card's
+  next fresh build ends it, the unpushed work goes to a `stranded/…` branch like any other
+  (see the next section). Shutdown leaves it alone, because the drive no longer holds it.
 - **The drive's fix budgets reset,** so whoever moved the card starts the next round fresh.
 - **Every write is best-effort,** the trail comment included. A failing comment can't turn
   into a block.
@@ -243,6 +245,105 @@ The commonest trigger is closed at the door. `board_requeue_feature`, `board_req
 claimed build, a running review gate), and say to wait for the round or cancel the card.
 Live, `bd-p8ft` was requeued under its own CI-fix round. The round's hand-off then failed,
 and the card went terminal with an open PR.
+
+## A worktree holding work is saved before it is removed
+
+Worktrees are disposable by design: a re-dispatch cleans a prior run's leftovers with
+`git worktree remove --force` and `git branch -D`, and the terminal edges reap by feature
+id. That is exactly wrong for one kind of leftover. A coder that dies before its candidate
+is promoted leaves the **only copy** of its work in that tree. `bd-ezs7`'s coder finished
+170 lines in `feat-bd-ezs7.g1` and its drive went silent (the #423 hang). The card was
+requeued, and the implementation survived only because the hung drive still held its file
+claim, so nothing re-dispatched it (#400, #405).
+
+So every edge that ends a tree first saves any **work that exists nowhere else** to a new
+branch, `stranded/<tree dir>/<UTC stamp>`, and removes the tree only after that. All of
+them go through one save-then-remove, locked per tree path, so two edges reaching the same
+tree at once (an operator cancel's reap and the cancelled drive, say) produce one save and
+one removal:
+
+| Edge | What it does with such a tree |
+|---|---|
+| a fresh build of the card | saves every one the card owns, removes them, comments on the card, and builds on |
+| a drive's terminal block, or an operator cancel | saves the drive's own tree, removes it, and says so on the card. A drive whose card moved on under it (#398) blocks nothing and removes nothing: the tree stays until another edge here ends it |
+| shutdown | saves the interrupted drive's tree, comments on the card, and reaps it. The next boot rebuilds as before. |
+| the by-id reap: merge, closed PR, cancel, done, health sweep | saves it, logs the branch, and reaps it |
+| `create_worktree` / `promote_worktree`, for any other caller | saves it, logs the branch, then clears it |
+
+**What counts as work:**
+
+- **Every uncommitted change git can see:** modified, staged, deleted and untracked.
+- **Every commit the tree's `HEAD` or its branch holds that no other branch, tag or remote
+  does.** That includes the card's own branch, where the verified candidate is committed
+  before `open_pr` pushes it, and a detached `HEAD`.
+- **Commits whose content is already published don't count.** A rebase force-pushes
+  rewritten commits and a squash-merge lands them under a new one, so git alone would call
+  both unique. The check is by content: if merging them into `origin/<branch>`,
+  `origin/<base>` or `origin/HEAD` would change nothing, they are published. Auto-merge
+  reaps the tree *before* it deletes the PR branch, while that ref still exists to prove it.
+- **The board's own droppings don't count, and are never saved:** the coder's session
+  scratch (`.proto/`, `.cursor/`) and the `node_modules` links it adds to every tree. A
+  `node_modules/` ignore pattern matches only a real directory, so git reports those links
+  as untracked. For the same reason, the staging step behind every PR commit now leaves the
+  links out. Before this, a repo with only that pattern got the board's symlink committed
+  into its PR.
+
+**How the save is made:**
+
+- The saved commit is the tree's own `HEAD` plus its working state, staged through the same
+  exclusions a PR uses into a private index. If the branch holds commits a detached `HEAD`
+  does not, the save gets a second parent, so both histories survive.
+- The tree, its index and its branch are never touched. Every step runs with the repo's
+  hooks off (`core.hooksPath=/dev/null`); `update-ref` would otherwise fire
+  `reference-transaction`. Nothing is signed, and the identity is pinned.
+- The branch name carries the tree's directory and a millisecond stamp. A taken name is
+  retried with a `-2`, `-3`… suffix, so an existing branch is never overwritten and a save
+  never fails on our own naming.
+- The branch is read back and compared with the tree state before the tree may go.
+- Once the work is on its branch, a tree git refuses to remove (a read-only directory, say)
+  is deleted anyway. A tree the operator **locked** is never deleted.
+
+The card comment names each branch, what it holds, whether the tree really left its path,
+and how to use it: `git diff origin/<base>...stranded/…` to inspect it,
+`git cherry-pick origin/<base>..stranded/…` or a PR from the branch to salvage it, and
+`git branch -D` once nobody needs it. `git branch --list 'stranded/*'` shows what has piled up.
+
+A drive still throws away what **it** built and judged, and saves nothing for it: its own
+failed attempt before a retry, and the candidates `coder.solve` or Max-Mode rejected. It
+throws away a failed attempt only while the card is still its own, re-read just before. A
+card moved on under the drive keeps that tree like any other stand-aside (#398). The
+operator-only test-rung diagnostic owns and reaps its own `feat-<id>.test…` trees, so a
+card's build never touches them.
+
+### When the work cannot be saved
+
+Most failures keep the tree **exactly as it is**, because work that could not be saved is
+never destroyed:
+
+- **A nested git repository.** A branch could hold it only as a pointer, not its files or
+  history.
+- **A commit or branch step that fails.**
+- **A saved tree that will not come off its path**, for example because it is locked.
+
+A **husk** is different: a tree whose admin entry is gone, usually because a removal was
+interrupted, so git cannot read it at all. It is moved aside, bytes intact, to
+`<worktrees root>/.stranded/<dir>-<stamp>`, and its branch's unique commits are saved. A
+husk never blocks a card forever.
+
+Where a failure happens decides what it stops:
+
+- **A fresh build** blocks the card under `stranded-work`. That class is not self-healing,
+  so the blocked sweep tells the operator once. The reason names the tree, what is in it
+  and what went wrong, plus both ways out: recover it (switch the tree to a branch of your
+  own and commit, or open a PR from it) or discard it (`chmod -R u+w <path> && rm -rf
+  <path> && git worktree prune`, then `git branch -D <branch>`). The discard works on a
+  husk too. Then unblock the card. A card unblocked with the tree still unsavable just
+  blocks again.
+- **The by-id reap** keeps the tree and logs it once.
+- **A drive's block, a cancel, or shutdown** keeps the tree and says so on the card. The
+  card's next dispatch tries again.
+- **`create_worktree` / `promote_worktree`** refuse with `StrandedWorkError` before anything
+  moves.
 
 ## Blocked cards — self-heal, then page a human
 
