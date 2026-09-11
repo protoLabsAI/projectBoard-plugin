@@ -1651,3 +1651,68 @@ def test_workspace_has_cards_fails_safe_on_an_unreadable_or_foreign_db(tmp_path)
     conn.commit()
     conn.close()
     assert _workspace_has_cards(str(tmp_path)) is True
+
+
+# ── a no-coder hint the operator can actually follow (protoAgent#3405) ─────────────────
+#
+# The plain hint said "pick a delegate in Settings ▸ Project Board". An agent with ZERO
+# delegates showed an empty dropdown and no next step, and the fix lived in core's
+# Settings ▸ Delegates, not the board's. When the roster is readable, say what's there.
+
+
+def _no_coder(tmp_path, **kw):
+    return setup_status({"repo": str(tmp_path)}, which=_which_all, run=_fake_run(), **kw)
+
+
+def test_no_coder_and_no_delegates_says_to_add_one_first(tmp_path):
+    s = _no_coder(tmp_path, delegates=lambda _n: None, acp_delegates=lambda: [])
+    hint = s["coder"]["hint"]
+    assert hint == setup_check.NO_DELEGATE_HINT
+    assert "Settings ▸ Delegates" in hint and "propose_delegate" in hint
+    assert "pick a delegate in Settings ▸ Project Board" not in hint  # the unfollowable advice
+    assert "coder" in s["loop_blockers"]
+
+
+def test_no_coder_with_delegates_names_what_there_is_to_pick(tmp_path):
+    s = _no_coder(tmp_path, delegates=lambda _n: object(), acp_delegates=lambda: ["opus", "sonnet"])
+    hint = s["coder"]["hint"]
+    assert "'opus'" in hint and "'sonnet'" in hint and "Settings ▸ Project Board" in hint
+    assert s["coder"]["ok"] is False
+
+
+def test_an_unreadable_roster_keeps_the_generic_hint_rather_than_claim_none(tmp_path):
+    def _broken():
+        raise RuntimeError("delegates plugin disabled")
+
+    assert _no_coder(tmp_path, delegates=lambda _n: None, acp_delegates=_broken)["coder"]["hint"] == (
+        setup_check.NO_CODER_HINT
+    )
+    assert _no_coder(tmp_path, delegates=lambda _n: None, acp_delegates=lambda: None)["coder"]["hint"] == (
+        setup_check.NO_CODER_HINT
+    )
+
+
+def test_the_live_path_reads_the_real_roster(tmp_path, monkeypatch):
+    # Neither seam injected ⇒ the live roster decides the hint.
+    monkeypatch.setattr(setup_check, "_default_delegates", lambda: lambda _n: None)
+    monkeypatch.setattr(setup_check, "_default_acp_delegate_names", lambda: [])
+    s = setup_status({"repo": str(tmp_path)}, which=_which_all, run=_fake_run())
+    assert s["coder"]["hint"] == setup_check.NO_DELEGATE_HINT
+
+
+def test_the_roster_listing_counts_only_named_acp_delegates(monkeypatch):
+    import sys
+    import types
+
+    store = types.ModuleType("plugins.delegates.store")
+    store.read_delegates_raw = lambda: [
+        {"name": "sonnet", "type": "acp"},
+        {"name": "hermes", "type": "a2a"},  # a peer, not a coder
+        {"name": "", "type": "acp"},
+        "not-a-dict",
+        {"name": "opus", "type": "acp"},
+    ]
+    monkeypatch.setitem(sys.modules, "plugins", types.ModuleType("plugins"))
+    monkeypatch.setitem(sys.modules, "plugins.delegates", types.ModuleType("plugins.delegates"))
+    monkeypatch.setitem(sys.modules, "plugins.delegates.store", store)
+    assert setup_check._default_acp_delegate_names() == ["opus", "sonnet"]

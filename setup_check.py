@@ -114,6 +114,15 @@ NO_CODER_HINT = (
     "propose_delegate; the board is paused until then (the former implicit default `proto` "
     "no longer applies — set `coder: proto` to keep it)"
 )
+# protoAgent#3405: the plain hint told an operator with ZERO delegates to "pick a delegate"
+# — an empty dropdown and no next step. When the roster is readable, say what's actually
+# there (or that nothing is, and where to add one).
+NO_DELEGATE_HINT = (
+    "no coder configured, and this agent has no coding delegate to pick — add one first in "
+    "Settings ▸ Delegates (an ACP coding agent, e.g. Claude Code via claude-agent-acp) or ask "
+    "the agent to propose_delegate, then choose it in Settings ▸ Project Board; the board is "
+    "paused until then"
+)
 RESTART_NOTE = "the running loop still has the previous value — restart the agent to apply"
 REPO_UNBOUND_HINT = (
     "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
@@ -518,6 +527,41 @@ def _default_delegates():
     return delegate_resolver("acp")
 
 
+def _default_acp_delegate_names() -> list[str] | None:
+    """The names of this agent's ACP delegates — what the operator can actually pick as a
+    coder — or None when the roster can't be read (delegates plugin disabled, host-free).
+    Raw roster, not the secret-overlaid one: only names and types are needed."""
+    try:
+        from plugins.delegates.store import read_delegates_raw
+
+        return sorted(
+            str(d.get("name"))
+            for d in read_delegates_raw()
+            if isinstance(d, dict) and d.get("type") == "acp" and str(d.get("name") or "").strip()
+        )
+    except Exception:  # noqa: BLE001 — no roster ⇒ unknown, not "none"
+        return None
+
+
+def _no_coder_hint(acp_delegates) -> str:
+    """The hint for a board with no coder: follow-able advice for the roster it has. An
+    unreadable roster keeps the generic hint rather than claim there's nothing to pick."""
+    try:
+        available = acp_delegates() if acp_delegates is not None else None
+    except Exception:  # noqa: BLE001
+        available = None
+    if available is None:
+        return NO_CODER_HINT
+    if not available:
+        return NO_DELEGATE_HINT
+    listed = ", ".join(repr(n) for n in available)
+    return (
+        f"no coder configured — pick one of this agent's coding delegates ({listed}) in "
+        "Settings ▸ Project Board or let the agent propose_delegate; the board is paused until "
+        "then (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)"
+    )
+
+
 def _br_version(path: str, run) -> str:
     """``br --version`` for the binary at ``path`` (first line, stripped), cached per
     path. Any failure — timeout, non-zero exit, OSError — yields ``""``; the version is
@@ -576,7 +620,15 @@ def _repo_check(cfg: dict, isdir) -> dict:
 
 
 def setup_status(
-    cfg: dict, *, which=None, delegates=None, run=None, isdir=None, loop_snapshot=None, status_probe=None
+    cfg: dict,
+    *,
+    which=None,
+    delegates=None,
+    acp_delegates=None,
+    run=None,
+    isdir=None,
+    loop_snapshot=None,
+    status_probe=None,
 ) -> dict:
     """The board's setup preflight as a plain dict — pure, never raises, never shells out to
     ``br`` for a board op (one cached ``--version`` at most). With the review gate on it ALSO
@@ -614,9 +666,14 @@ def setup_status(
     per call, ``_subprocess_run``, ``os.path.isdir``, ``live_loop_snapshot()`` —
     resolved at call time so a monkeypatch on the module globals takes);
     ``delegates(name)`` returns a truthy object for a resolvable acp delegate, else None.
+    ``acp_delegates()`` lists the ACP delegate names that exist (None = unknown), used only
+    to make the no-coder hint followable; it defaults to the live roster only when
+    ``delegates`` isn't injected either, so a test injecting one keeps the generic hint.
     """
     cfg = cfg or {}
     which = which or shutil.which
+    if acp_delegates is None and delegates is None:
+        acp_delegates = _default_acp_delegate_names
     if delegates is None:
         try:
             delegates = _default_delegates()
@@ -675,7 +732,7 @@ def setup_status(
     coder_name = str(cfg.get("coder") or "").strip()
     ladder_gap = _ladder_gap(cfg) if not coder_name else ""
     if not names:
-        coder_hint = NO_CODER_HINT
+        coder_hint = _no_coder_hint(acp_delegates)
     elif ladder_gap:
         coder_hint = ladder_gap
     elif missing:
