@@ -204,6 +204,12 @@ class DriveMixin:
             log.info("[project_board] loop disabled (project_board.loop_enabled=false) — board API still serves")
             return None
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
+        # The working-state snapshot has a refresher of its own, not a step of the tick: a
+        # loop paused at its setup gate runs no ticks, and the snapshot must not go stale
+        # for as long as the pause lasts (#401).
+        self._snapshot_task = asyncio.create_task(
+            self._keep_work_snapshot_current(), name="project-board-work-snapshot"
+        )
         # The RUNNING loop's config, in a process-stable slot: after a reload the
         # routers see the new config while this loop keeps its construction-time
         # `coders`/`repo`/…; /status compares the two and says "restart to apply".
@@ -339,6 +345,9 @@ class DriveMixin:
                 changed[key] = (cur, new)
         if changed:
             setup_check.publish_loop_snapshot(self.cfg)
+            # The working-state hints read these knobs (auto_merge, review_gate, …), so what
+            # the snapshot renders changed without a board write: mark it stale (#401).
+            work_snapshot.mark_stale()
             log.info(
                 "[project_board] reload applied live: %s (in-flight drives: %d)",
                 ", ".join(f"{k} {o}→{n}" for k, (o, n) in changed.items()),
@@ -352,12 +361,13 @@ class DriveMixin:
         _unregister_loop(self)  # drop the process-stable handle (ADR 0326)
         if self._task:
             setup_check.publish_loop_snapshot(None)  # no running loop → nothing to be stale against
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        for task in (self._task, self._snapshot_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
         # Cancel any in-flight drives and await them out. A drive cancelled mid-flight
         # can't run its own cleanup, so its worktree stays in self._inflight — reaped
         # below. (A completed/blocked drive already popped itself.)
@@ -2269,9 +2279,10 @@ class DriveMixin:
                     #     called, so no `tier:`/`attempt:` label is added and no ladder
                     #     budget is spent. It blocks under the `dispatch-infra` class the
                     #     blocked sweep never auto-heals, so the operator is notified with the
-                    #     original infra evidence — and an operator unblock resets the tier
-                    #     posture (store.clear_blocked) so the next genuine build starts at
-                    #     its difficulty-selected tier (#339).
+                    #     original infra evidence. An operator unblock (store.clear_blocked)
+                    #     drops the class and leaves the card's `tier:` labels alone: the
+                    #     incident added none, so the next build resumes the tier the card
+                    #     had earned, or its difficulty-selected one (#339).
                     if pre_model:
                         reason = f"pre-model dispatch failure — infra triage, no tier climb: {exc}"
                         log.warning(

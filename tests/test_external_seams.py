@@ -141,16 +141,17 @@ STORE_SEAMS: dict[str, str] = {
     "_find_by_external_ref": "UNCOVERED",
     "_open_blockers": "REAL",
     "_prepare_ready": "UNCOVERED",
+    "_show_by_id": "REAL",  # #401: live_cards' detail reads, real `br` (test_work_snapshot_review_401.py)
     "add_dependency": "REAL",
     "archive_stale": "UNCOVERED",
     "attach_pr": "REAL",  # #402: every shape through real `br` in tests/test_attach_pr_402.py
-    "block_from_review": "UNCOVERED",
+    "block_from_review": "REAL",  # #401 review: real `br` in tests/test_work_snapshot_review_401.py
     "bounce_ci_fail": "UNCOVERED",
     "cancel_feature": "REAL",
     "claim": "REAL",
     "claim_next_ready": "REAL",
     "claim_task": "REAL",
-    "clear_blocked": "UNCOVERED",
+    "clear_blocked": "REAL",  # #401: real `br` in tests/test_stale_blocked_class_401.py
     "clear_budgets": "REAL",
     "clear_verified_candidate": "UNCOVERED",
     "comment": "UNCOVERED",
@@ -162,6 +163,7 @@ STORE_SEAMS: dict[str, str] = {
     "flag_blocked": "REAL",
     "get_feature": "REAL",
     "list_features": "REAL",
+    "live_cards": "REAL",  # #401 review: the snapshot's light read, real `br` (test_work_snapshot_review_401.py)
     "mark_designing": "UNCOVERED",
     "mark_done": "UNCOVERED",
     "mark_ready": "REAL",
@@ -193,7 +195,7 @@ STORE_SEAMS: dict[str, str] = {
 # seam is now REAL or an honestly-recorded EXEMPT, so the worktree UNCOVERED floor is 0 and a
 # newly-added UNCOVERED worktree seam fails this file outright.
 MAX_UNCOVERED_WORKTREE = 0
-MAX_UNCOVERED_STORE = 18
+MAX_UNCOVERED_STORE = 16
 
 # The EXEMPT ratchet. An EXEMPT drops a seam from MAX_UNCOVERED_WORKTREE, so EXEMPT must itself be
 # bounded or the label would let real debt vanish (the review finding on the UNCOVERED → EXEMPT

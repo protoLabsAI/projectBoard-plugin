@@ -97,11 +97,11 @@ TOO_WIDE_CLASS = "too-wide"
 # ── pre-model dispatch / infrastructure failures (#339) ──────────────────────────
 # The `blocked-class:` a pre-model dispatch/infra failure carries. It is deliberately
 # NOT one of `classify()`'s categories: it can't be decided from the message alone
-# (it needs the loop's dispatch-lifecycle evidence too), and it drives two behaviours
-# the message-classes don't — the operator is NOTIFIED rather than auto-healed (it is
-# absent from the loop's self-healing set), and an operator unblock RESETS the card's
-# escalation tier so a host/adapter incident never leaves a `tier:` label the next
-# genuine build inherits.
+# (it needs the loop's dispatch-lifecycle evidence too), and the operator is NOTIFIED
+# rather than auto-healed (it is absent from the loop's self-healing set). The loop never
+# climbs a tier on such a failure, so an unblock (store.clear_blocked) drops the class like
+# any other and leaves the card's `tier:` labels alone: they were earned before the
+# incident.
 PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 
 # The `blocked-class:` of a card the loop would not rebuild because a worktree it would
