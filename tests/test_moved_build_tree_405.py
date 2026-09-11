@@ -28,8 +28,10 @@ from pathlib import Path
 import pytest
 
 import project_board.loop as loop_mod
+import project_board.loop.drive as drive_mod
 from project_board import store as store_mod
 from project_board import worktree
+from project_board.failures import Policy
 from project_board.loop import BoardLoop
 from project_board.store import BeadsBoard
 
@@ -209,3 +211,42 @@ async def test_a_held_builds_tree_is_saved_when_the_next_build_clears_the_ground
 
     await card.finish_round(drive)
     assert card.card()["board_state"] == "in_review"
+
+
+async def test_a_hold_landing_while_a_retry_is_prepared_keeps_the_failed_attempts_tree(tmp_path, monkeypatch):
+    """A retry throws the drive's own failed attempt away before it rebuilds: that is its own
+    judged work, and it is not saved (#405). A hold that lands after the retry's ownership
+    check, while its prompt is built, makes that tree a moved build's. It is kept, not
+    thrown away."""
+    card = _Card(tmp_path, monkeypatch)
+    dispatches: list[str] = []
+
+    async def _provider_falls_over(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(wt)
+        Path(wt, "target.py").write_text(f"x = 2  # attempt {len(dispatches)}, half done\n")
+        raise worktree.WorktreeError("coder dispatch failed: 502 Bad Gateway")
+
+    real_classify = drive_mod.classify
+
+    def _no_backoff(text, **kw):  # the transient retry, minus its 15s sleep
+        return Policy("transient", True, 0.0, 3) if "502" in text else real_classify(text, **kw)
+
+    prepared = 0
+
+    async def _lessons(feature):
+        nonlocal prepared
+        prepared += 1
+        if prepared == 2:  # the retry's prompt is being built: its ownership check has passed
+            card.board.flag_blocked(card.fid, _HOLD)
+        return ""
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _provider_falls_over)
+    monkeypatch.setattr(drive_mod, "classify", _no_backoff)
+    monkeypatch.setattr(card.loop, "_fetch_kg_lessons", _lessons)
+
+    assert await card.loop._spawn_ready()
+    await asyncio.wait_for(next(iter(card.loop._drives)), 60)
+
+    assert len(dispatches) == 1, "the retry was dispatched on a held card"
+    assert Path(card.tree, "target.py").read_text() == "x = 2  # attempt 1, half done\n", "the tree was thrown away"
+    assert _HOLD in card.card()["blocked_reason"]

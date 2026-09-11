@@ -309,7 +309,9 @@ and how to use it: `git diff origin/<base>...stranded/…` to inspect it,
 `git branch -D` once nobody needs it. `git branch --list 'stranded/*'` shows what has piled up.
 
 A drive still throws away what **it** built and judged, and saves nothing for it: its own
-failed attempt before a retry, and the candidates `coder.solve` or Max-Mode rejected. The
+failed attempt before a retry, and the candidates `coder.solve` or Max-Mode rejected. It
+throws away a failed attempt only while the card is still its own, re-read just before. A
+card moved on under the drive keeps that tree like any other stand-aside (#398). The
 operator-only test-rung diagnostic owns and reaps its own `feat-<id>.test…` trees, so a
 card's build never touches them.
 

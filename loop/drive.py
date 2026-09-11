@@ -1557,6 +1557,24 @@ class DriveMixin:
                         # tree to a `stranded/…` branch, say so on the card, and build on;
                         # only a tree whose work could NOT be saved stops the card.
                         if wt is not None:
+                            # …but only while the card is still its own, re-read right here
+                            # (#398). A hold that landed after this attempt's check at the top
+                            # of the loop (while its prompt was built) makes that tree a moved
+                            # build's, and a moved build keeps its tree: whatever ends it later
+                            # saves it first.
+                            moved_to = await asyncio.to_thread(self._moved_under_drive, store, fid)
+                            if moved_to:
+                                await self._stand_aside(
+                                    store,
+                                    fid,
+                                    moved_to,
+                                    repo=repo,
+                                    wt=wt,
+                                    branch=branch,
+                                    pr_url=pr_url,
+                                    why="its next attempt was due, and was not started",
+                                )
+                                return
                             await worktree.remove_worktree(repo, wt, branch or "")
                             self._inflight.pop(fid, None)
                             wt = branch = None
