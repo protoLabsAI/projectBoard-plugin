@@ -18,6 +18,7 @@ loop.py/worktree.py.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -827,6 +828,50 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    async def board_attach_pr(feature_id: str, pr_url: str, reason: str = "") -> str:
+        """Attach a PR the board did NOT open to the existing coding card it belongs to (#402)
+        — recovered work an operator pushed by hand, or a fix made outside the loop — so the
+        board tracks it like one of its own. The card moves to `in_review` with that PR, and
+        the normal reconcile takes it from there (CI, the review gate, rebase, merge → done).
+        No duplicate card, no re-dispatch, no hand-close after the merge.
+
+        Refused with the reason, and nothing changes, unless BOTH hold. The PR must be OPEN,
+        in the card's project repo (not a fork), on the card's own branch (`feat/<id>-<slug>`,
+        the branch every fix round resumes), and targeting the project's base. The card must be
+        a coding feature that is ready, in_progress or blocked, with no PR of its own in review,
+        no open dependency, and no live coder drive. It must have passed the Ready gate (a
+        blocked backlog card has not). A card whose earlier PR was CLOSED may take the new one in
+        its place. A MERGED PR is refused: record shipped work with board_mark_done. Re-attaching
+        the card's own PR is a no-op in review and refused anywhere else: a blocked card stays
+        blocked until board_unblock_feature. A draft attaches, and auto-merge holds it until it is
+        marked ready. The attached code has NOT been through the board's pre-PR checks (fixups,
+        local gate, acceptance tests); CI and the review gate still apply. `reason` is recorded in
+        the audit comment on the card; if that comment fails, the attach stands and the result
+        carries a `warning`."""
+        # Lazy imports: the loop imports from here, so a top-level import would cycle.
+        from .api import base_branch_for_feature, repo_for_feature
+        from .loop import attach_external_pr
+        from .store import knob_bool
+
+        try:
+            store = get_store(**store_kw)
+            feature = await asyncio.to_thread(store.get_feature, feature_id)
+            if feature is None:
+                return f"Error: unknown feature {feature_id!r}"
+            result = await attach_external_pr(
+                store,
+                feature,
+                _strip_wrapping_quotes(pr_url).strip(),
+                repo=repo_for_feature(feature, store_kw),
+                base=base_branch_for_feature(feature, store_kw),
+                review_gate=knob_bool(cfg, "review_gate", False, strict=False),
+                reason=_strip_wrapping_quotes(reason),
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+        return json.dumps(result)
+
+    @tool
     def board_deliver(feature_id: str, text: str = "", ref: str = "") -> str:
         """Record a TASK's deliverable (#217) — the task sibling of a coder's open_pr edge,
         moving the bead in_progress → in_review with NO PR. `text` is the deliverable itself
@@ -1205,6 +1250,7 @@ def _board_tools(cfg: dict):
         board_mark_ready,
         board_cancel_feature,
         board_mark_done,
+        board_attach_pr,
         board_deliver,
         board_verify,
         board_requeue_feature,

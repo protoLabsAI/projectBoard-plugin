@@ -126,23 +126,43 @@ class ReconcileMixin:
         if feature.get("issue_type") == LABEL_TASK:
             assignee = str(feature.get("assignee") or "").strip()
             if self._is_self_assignee(assignee):
-                await asyncio.to_thread(store.requeue, fid)
-                log.info("[project_board] %s self task reset to ready (no live drive — re-dispatch)", fid)
+                if await self._still_orphaned_then(store, fid, store.requeue):
+                    log.info("[project_board] %s self task reset to ready (no live drive — re-dispatch)", fid)
             elif self._resolve_task_delegate(assignee) is not None:
-                await asyncio.to_thread(store.requeue, fid)
-                log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
+                if await self._still_orphaned_then(store, fid, store.requeue):
+                    log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
             return
         pr_url = await worktree.pr_url_for_branch(
             worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
         )
         if pr_url:
-            await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
-            log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
+            if await self._still_orphaned_then(store, fid, lambda f: store.open_review(f, pr_url=pr_url)):
+                log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
         elif await self._salvage_verified_candidate(store, fid):
             pass  # resumed + PR opened → in_review (logged inside)
-        else:
-            await asyncio.to_thread(store.requeue, fid)
+        elif await self._still_orphaned_then(store, fid, store.requeue):
             log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
+
+    async def _still_orphaned_then(self, store, fid: str, move) -> bool:
+        """Apply ``move(fid)`` only if ``fid`` is STILL an orphan: in_progress with no drive
+        behind it. The re-read happens under the claim lock (#402). The decision above was
+        made on a read taken before a ``gh`` round-trip, and an operator's attach can move
+        the card to in_review in that window. Requeueing on the stale read undid the attach,
+        and the next claim put a coder back on the PR's branch. The attach and the claim scan
+        write under this same lock. Only positive evidence that the card moved skips the
+        move, never a read that says nothing. Returns whether the move ran."""
+        async with self._claim_guard():
+            fresh = await asyncio.to_thread(store.get_feature, fid) or {}
+            state = fresh.get("board_state")
+            if (state and state != "in_progress") or _loop.live_drive(fid) is not None:
+                log.info(
+                    "[project_board] %s is no longer an orphan (now %s) — leaving it alone",
+                    fid,
+                    fresh.get("board_state") or "gone",
+                )
+                return False
+            await asyncio.to_thread(move, fid)
+            return True
 
     @staticmethod
     def _clear_verified(store, fid: str) -> None:
@@ -360,9 +380,23 @@ class ReconcileMixin:
                 reason = str(f.get("blocked_reason") or "").strip()
                 spent = await self._budget_get(store, fid, "unblock-retry", f)
                 if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:
-                    await self._budget_set(store, fid, "unblock-retry", spent + 1)
-                    await asyncio.to_thread(store.clear_blocked, fid)
-                    await asyncio.to_thread(store.requeue, fid)
+                    # Re-read under the claim lock before moving the card (#402). The list is
+                    # from the start of the pass, and an attach (or an operator unblock) may
+                    # have moved the card since. Requeueing it then undid that move.
+                    async with self._claim_guard():
+                        fresh = await asyncio.to_thread(store.get_feature, fid) or {}
+                        if fresh.get("board_state") and (
+                            not fresh.get("blocked") or str(fresh.get("blocked_class") or "").strip() != cls
+                        ):
+                            log.info(
+                                "[project_board] blocked sweep: %s changed since the pass began (now %s) — left alone",
+                                fid,
+                                fresh.get("board_state") or "gone",
+                            )
+                            continue
+                        await self._budget_set(store, fid, "unblock-retry", spent + 1)
+                        await asyncio.to_thread(store.clear_blocked, fid)
+                        await asyncio.to_thread(store.requeue, fid)
                     log.info(
                         "[project_board] blocked sweep: %s auto-unblocked (%s, retry %d/%d): %s",
                         fid,

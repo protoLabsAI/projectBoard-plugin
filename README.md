@@ -418,6 +418,18 @@ do not change the already-constructed loop/router until the member restarts. Pro
 map/default changes apply live as one validated routing policy and do not produce a
 false restart warning.
 
+A save that sets a new local gate command, or moves the project (and its gate) to another
+repo, runs that gate once on the clean base before anything persists, and a red gate refuses
+the save. That save answers only after the gate has run, which takes minutes for a full test
+suite. Saves to other projects don't wait on it. A save that leaves the gate and repo alone
+doesn't re-run the gate. That includes a base-branch-only edit: the operator's checkout is
+still on the old branch, so a smoke there could give no verdict. Instead, a registry change
+resets that project's gate preflight in the loop. The preflight re-smokes the gate against
+the new routing before any of the project's work dispatches, and it re-checks cards the
+preflight is holding too. If another save changes the same project while a gate runs, the
+save is refused with a 409; save again. When a proxy gives up on a long save first (the
+fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
+
 The console intentionally does not expose every manifest default. Structural legacy
 single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)
 remain file-only; use the Projects editor for multi-repo routing. Low-level timing and
@@ -661,11 +673,11 @@ integration tier), **EXEMPT: `<reason>`** (real coverage genuinely not warranted
 stated), or **UNCOVERED** (honest debt) — and the UNCOVERED count is a ratchet that may
 fall, never rise.
 
-`worktree.py` reached its final contract over #361: **27 REAL / 3 EXEMPT / 0 UNCOVERED**
+`worktree.py` reached its final contract over #361: **28 REAL / 3 EXEMPT / 0 UNCOVERED**
 (`MAX_UNCOVERED_WORKTREE = 0`). The 11 local-git seams run against a real bare-origin +
 clone (slice 1), as do #405's stranded-work seams (`preserve_worktree` and three helpers). The 12
 read-dominant `gh` seams run against a pinned, permanently-open PR with `PB_REQUIRE_GH=1`
-so an absent credential FAILS rather than skips (slice 2).
+so an absent credential FAILS rather than skips (slice 2), as does #402's `pr_identity`.
 
 The remaining three are the **PR-lifecycle writes** — `open_pr`, `close_pr`,
 `_promote_adopted_draft` — classified **EXEMPT** (slice 3). Each mutates real PR lifecycle
