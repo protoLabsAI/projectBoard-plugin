@@ -34,7 +34,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/features/{fid}/dep` | Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done. (Foundation gating is just a blocks-edge on the foundation feature.) |
 | `DELETE` | `/features/{fid}/dep` | Remove a `blocks` edge — inverse of POST …/dep. Body: `{"depends_on": "<id>"}`. |
 | `POST` | `/features/{fid}/ready` | The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing. |
-| `POST` | `/features/{fid}/block` | — |
+| `POST` | `/features/{fid}/block` | Block a card by hand. Body: `{"reason": "…"}` (required). A hand-set block is a hold, never a failure: it is never cleared automatically, whatever the reason says (#406). Lift it with `POST …/unblock`. |
 | `POST` | `/features/{fid}/unblock` | — |
 | `POST` | `/features/{fid}/cancel` | Cancel a feature created in error — the second terminal edge (#47). Closes the bead with an audit reason and tags it `cancelled` (a distinct state, not `done`), so a bad decomposition/duplicate leaves… |
 | `POST` | `/features/{fid}/done` | Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that shipped OUTSIDE the board's PR lifecycle (record_merge's pr_url→external_ref match never fires). Accepts only an in-flight ca… |
@@ -55,8 +55,8 @@ crosses a fail-closed HMAC boundary (`X-Hub-Signature-256`) before touching the 
 |---|---|---|
 | `GET` | `/board` | — |
 | `GET` | `/config/projects` | Public page chrome for the sandboxed Configure tab. |
-| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… |
-| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… |
+| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… 400 while the loop is still working the card, a live drive or review gate (#398). |
+| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… 400 while the loop is still working the card, a live drive or review gate (#398). |
 | `POST` | `/webhook/pr` | GitHub PR webhook — the SINGLE Done edge. On a `closed` event with `merged: true` it sets the matching feature `done` (nothing else does) and reaps its worktree. The raw body is HMAC-verified against… |
 
 ## Long saves
@@ -85,6 +85,9 @@ The Projects editor does exactly this when the connection gives up.
 - **`fid`** is a bead id (`bd-a1b2`), the board's primary key everywhere.
 - Errors surface as `{"detail": "<reason>"}` with a 4xx; a `BoardError` from the store
   becomes a `400` with the store's own message, so the reason is the `br` failure itself.
+- A **`503`** means the board store did not answer: a `br` call stalled past its timeout
+  (45s) and was stopped (#404). Unlike a `400` this is not a refusal, and a write's outcome
+  is unknown. It may have landed before the stall, so re-read the card before retrying.
 - Writes are **idempotent where it matters** — re-recording a merge, re-flagging a block
   and re-stamping a verdict are all safe to retry.
 - The board is a **projection over beads**. Every mutation shells `br`; nothing is cached

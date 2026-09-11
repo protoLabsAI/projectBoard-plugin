@@ -533,6 +533,24 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001 — best-effort, per feature
                 log.warning("[project_board] boot preflight release: clear_blocked failed for %s", fid, exc_info=True)
 
+    async def _list_for_pass(self, store, state: str, pass_name: str) -> list[dict]:
+        """The ``state`` rows one pass of the reconcile/sweep acts on — or none, when the
+        read itself failed (#404). A pass drives several independent edges off separate
+        reads (the PR reconcile scans in_review AND blocked), and one read that stalled
+        must cost only the cards it would have returned: the pass carries on with the
+        rest, and the skipped cards are read again on its next turn. Only a BoardError
+        (a `br` call that failed) is absorbed. A STALL is not: the store did not answer,
+        and the next read would stall too, so a ``BoardTimeout`` goes up to the tick, which
+        skips the rest of that tick. Anything else is a bug and is left to the tick's phase
+        guard, traceback intact."""
+        try:
+            return await asyncio.to_thread(store.list_features, state=state)
+        except store_mod.BoardTimeout:
+            raise  # a STALLED store: the tick stops here, rather than stall on the next read too
+        except BoardError as exc:
+            log.warning("[project_board] %s: could not read the %s cards, skipped this pass: %s", pass_name, state, exc)
+            return []
+
     # ── periodic health sweep (self-heal during the run) ───────────────────────
     async def _maybe_sweep(self):
         """Run the health sweep at most once per ``health_sweep_interval`` (0 = off)."""
@@ -550,7 +568,9 @@ class ReconcileMixin:
         ``feat-<id>`` worktrees whose feature is gone or already terminal —
         ``done``/``cancelled`` (a missed reap); (c) label terminal features past the
         archive window ``archived``
-        (#115) — the board's growth valve; archival only, nothing is ever deleted.
+        (#115) — the board's growth valve; archival only, nothing is ever deleted. First,
+        it publishes the agent's working-state snapshot, and names any card stranded
+        outside the ready lane with every dependency closed (#406) — surfaced, never moved.
         Best-effort; a per-item failure never stops the sweep or the loop."""
         store = self._store()
         # Publish the board's live projection for the host's <working_state> block (ADR
@@ -558,17 +578,26 @@ class ReconcileMixin:
         # call per sweep, and the provider that reads it must never touch the store
         # itself — it runs inline on every agent turn. Best-effort, like the rest of the
         # sweep.
+        #
+        # Annotated first: the snapshot's per-card hint IS the board's `next_action_hint`,
+        # which only `annotate_next_action` writes — a bare listing published every hint
+        # empty. It is also what names a card stranded outside the ready lane (#406), and
+        # the agent this snapshot feeds is the one who can promote it.
         try:
-            await asyncio.to_thread(lambda: work_snapshot.publish(store.list_features()))
+            feats = store_mod.annotate_next_action(await asyncio.to_thread(store.list_features), self.cfg)
+            work_snapshot.publish(feats)
+            self._report_stranded(feats)
         except Exception:  # noqa: BLE001 — never let a snapshot refresh stop the sweep
             log.warning("[project_board] work snapshot refresh failed (ignored)", exc_info=True)
-        for f in await asyncio.to_thread(store.list_features, state="in_progress"):
+        for f in await self._list_for_pass(store, "in_progress", "health sweep"):
             fid = f["id"]
             if fid in self._inflight_files:
                 continue  # a live drive owns it
             try:
                 log.info("[project_board] sweep: %s in_progress with no live drive", fid)
                 await self._reconcile_orphan(fid)
+            except store_mod.BoardTimeout:
+                raise  # a stalled store, not one card's failure: stop, don't try the next card on it
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reconcile for %s failed", fid, exc_info=True)
         # #90: reap orphaned worktrees across EVERY project's checkout, not just the
@@ -590,8 +619,29 @@ class ReconcileMixin:
                 log.info(
                     "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
                 )
+        except store_mod.BoardTimeout:
+            raise
         except Exception:  # noqa: BLE001
             log.warning("[project_board] sweep archive pass failed", exc_info=True)
+
+    def _report_stranded(self, feats: list[dict]) -> None:
+        """Log each card that has just become stranded outside the ready lane, with every
+        dependency closed (#406). ``store.stranded_posture`` found them, and they read so
+        on every listing and in the agent's working state. This line is the loop's own
+        record of WHEN it first saw each one: once per card, not once per sweep, and again
+        only if the card leaves that state and comes back. Nothing is changed on the card.
+        A backlog card is promoted by the PM, and a block is lifted by whoever set it."""
+        stranded = {
+            f["id"]: f
+            for f in feats
+            if f.get("id")
+            and f.get("next_action") in (store_mod.NEXT_ACTION_DEPS_CLEARED, store_mod.NEXT_ACTION_BLOCKED_DEPS_CLEARED)
+        }
+        seen = getattr(self, "_stranded_seen", set())
+        for fid in sorted(set(stranded) - seen):
+            f = stranded[fid]
+            log.info("[project_board] sweep: %s stranded (%s): %s", fid, f["board_state"], f.get("next_action_hint"))
+        self._stranded_seen = set(stranded)
 
     async def _recover_blocked(self, store) -> None:
         """The blocked lane's self-heal + escalation pass.
@@ -615,6 +665,8 @@ class ReconcileMixin:
         recover must never stop the pass or the loop."""
         try:
             blocked = await asyncio.to_thread(store.list_features, state="blocked")
+        except store_mod.BoardTimeout:
+            raise  # a stalled store: the tick stops (#404)
         except Exception:  # noqa: BLE001
             log.warning("[project_board] blocked sweep: could not list blocked features", exc_info=True)
             return
@@ -624,15 +676,23 @@ class ReconcileMixin:
                 continue  # reserved — an operator salvage is publishing it (#427); leave it be
             try:
                 cls = str(f.get("blocked_class") or "").strip()
-                # The reason rides a COMMENT, and `br list` carries none — a list row
-                # always projects "". Escalating "no reason recorded" tells the operator
-                # nothing and makes them go digging, which is the thing this alert exists
-                # to prevent, so the one card being escalated is re-read through
-                # get_feature (`br show`). Only on the escalation path: rare, once per
-                # card, never a per-row probe across the whole blocked lane.
+                # The reason rides a COMMENT. `br list` carries none, but since #416 the
+                # listing copies the thread across for blocked rows, so it is normally
+                # here already. If it is still empty, the one card being escalated is
+                # re-read through get_feature (`br show`): escalating "no reason recorded"
+                # tells the operator nothing and sends them digging, which is the thing
+                # this alert exists to prevent. Escalation path only, once per card, never
+                # a per-row probe across the whole blocked lane.
                 reason = str(f.get("blocked_reason") or "").strip()
                 spent = await self._budget_get(store, fid, "unblock-retry", f)
-                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:
+                # Never for a card blocked before it was ever ready (#406): the self-heal
+                # REQUEUES, and for a card that never passed the Ready gate that promotes it
+                # straight past it. Such a block was set by hand (the loop blocks only ready
+                # and in-flight cards) — a hand block written before hand blocks were always
+                # terminal still carries the class its wording guessed, `transient` for
+                # "waiting on the network team". It goes to a human instead.
+                by_hand = store_mod.blocked_before_ready(f)
+                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX and not by_hand:
                     # Re-read under the claim lock before moving the card (#402). The list is
                     # from the start of the pass, and an attach (or an operator unblock) may
                     # have moved the card since. Requeueing it then undid that move. A salvage
@@ -662,7 +722,9 @@ class ReconcileMixin:
                     )
                     continue
                 why = (
-                    f"{cls or 'unclassified'} block"
+                    f"{cls} block set before the card was ever ready, so never auto-cleared"
+                    if by_hand and cls in _SELF_HEALING_BLOCKS
+                    else f"{cls or 'unclassified'} block"
                     if spent < _UNBLOCK_RETRY_MAX
                     else f"{cls} block, {spent} auto-retr{'y' if spent == 1 else 'ies'} spent"
                 )
@@ -673,18 +735,26 @@ class ReconcileMixin:
                     except Exception:  # noqa: BLE001 — the alert matters more than its detail
                         pass
                 title = str(f.get("title") or "").strip()
+                # #406: a card blocked in backlog whose every dependency has since closed.
+                # Its block may have been nothing BUT that wait, and nothing clears a block
+                # for you, so this is the moment whoever set it needs to hear about it.
+                stranded = store_mod.stranded_posture(f)["next_action_hint"]
                 self._notify_operator(
                     fid,
                     f"Board card {fid} is blocked and will not clear itself ({why}): "
-                    f"{reason or 'no reason recorded'}" + (f" — {title}" if title else ""),
+                    f"{reason or 'no reason recorded'}"
+                    + (f" — {title}" if title else "")
+                    + (f". Note: {stranded}" if stranded else ""),
                     # The recovery CYCLE is part of the incident's identity (#346 r7): a
                     # card that auto-healed, rebuilt and failed the SAME way again is a new
                     # failed cycle and IS news — the self-heal did not work. Keying on
                     # class+reason alone suppressed exactly that for the whole window.
                     # `spent` is the unblock-retry budget the self-heal already tracks, so
                     # this costs no new state: it increments on every auto-unblock and is
-                    # therefore different on each side of a recovery.
-                    incident=f"{cls}|{reason}|{spent}",
+                    # therefore different on each side of a recovery. Dependencies closing
+                    # under a block is news in the same way (#406), so it is part of the
+                    # identity too — ONE more alert, when the last one closes.
+                    incident=f"{cls}|{reason}|{spent}" + ("|deps-closed" if stranded else ""),
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
@@ -753,8 +823,8 @@ class ReconcileMixin:
         # and scanning only in_review left merged-but-blocked cards stuck forever. They
         # take ONLY the MERGED edge below: CLOSED would rewrite their blocked reason, and
         # the OPEN-branch gates (rebase/CI/review) must not run against held work.
-        in_review = await asyncio.to_thread(store.list_features, state="in_review")
-        blocked = await asyncio.to_thread(store.list_features, state="blocked")
+        in_review = await self._list_for_pass(store, "in_review", "PR reconcile")
+        blocked = await self._list_for_pass(store, "blocked", "PR reconcile")
         for f in [*in_review, *blocked]:
             fid = f["id"]
             pr_url = f.get("pr_url")
@@ -884,6 +954,8 @@ class ReconcileMixin:
                     # trusting the snapshot those gates may have changed.
                     if self.auto_merge:
                         await self._maybe_auto_merge(store, fid, pr_url, repo)
+            except store_mod.BoardTimeout:
+                raise  # a stalled store, not this PR's failure: stop the pass (#404)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
 

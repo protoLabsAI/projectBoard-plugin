@@ -33,7 +33,8 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 # Board states worth showing as "open work": everything the board still owes an outcome on.
 # Terminal states (done/cancelled) and backlog (not yet promoted through the Ready gate) are
-# deliberately excluded — the block is what the agent is ON THE HOOK FOR right now.
+# deliberately excluded — the block is what the agent is ON THE HOOK FOR right now. The one
+# backlog exception is a card the board names a step for (#406); see `publish`.
 LIVE_STATES = ("ready", "in_progress", "in_review", "blocked")
 
 # Hard cap on what the loop publishes, independent of the host's own per-provider cap. A
@@ -55,12 +56,18 @@ def publish(features) -> None:
     # `_SNAPSHOT` holding its PREVIOUS value — so the agent kept being shown a stale board
     # indefinitely, with nothing in the working state to say so. One bad card must cost that
     # card, not the whole view.
-    rank = {state: i for i, state in enumerate(("blocked", "in_review", "in_progress", "ready"))}
+    # A backlog card is normally not on the hook — except one the board says has a step
+    # owed (#406): every dependency it waited on has closed, and nothing promotes it but
+    # the agent reading this. It ranks LAST: the list is capped, and a dozen stranded cards
+    # must never push out the in-flight work (a PR awaiting merge, a build running) the
+    # agent is actually carrying. They fill whatever the live cards leave.
+    rank = {state: i for i, state in enumerate(("blocked", "in_review", "in_progress", "ready", "backlog"))}
     live = []
     skipped = 0
     for f in features or []:
         try:
-            if str(f.get("board_state") or "") in LIVE_STATES:
+            state = str(f.get("board_state") or "")
+            if state in LIVE_STATES or (state == "backlog" and str(f.get("next_action") or "").strip()):
                 live.append(f)
         except Exception:  # noqa: BLE001 — not a dict / no .get: drop this row only
             skipped += 1

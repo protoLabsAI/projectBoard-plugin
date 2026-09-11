@@ -177,6 +177,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_gens_spent": "REAL",
     "record_merge": "REAL",
     "record_merged_verified": "REAL",
+    "record_pr_url": "REAL",  # #398: through real `br` in tests/test_requeue_under_drive_398.py
     "record_reviewed_head": "UNCOVERED",
     "request_decomposition": "REAL",
     "record_verification": "REAL",

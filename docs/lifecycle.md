@@ -213,6 +213,39 @@ carries the host's trade-off: a member stopped by a signal to its process group 
 takes a running gate with it. The drive's cancel path kills the tree if shutdown reaches it.
 On Windows `killpg` does not exist, so a timeout there still kills only the shell.
 
+## A card moved under its build (#398)
+
+A drive owns its card only while the card is `in_progress`. Someone else can move it on
+while the coder works: a human hold (which shows as `blocked`), `mark_done`, a cancel, or a
+requeue. The move is the newer decision. So before every edge that would change the card,
+the drive re-reads it: blocking it, starting another attempt, opening the PR, handing it to
+review. If the card is no longer its own, the drive **stands aside**:
+
+- **Nothing is blocked, retried or sent to review.** A failure the build hit afterwards is
+  recorded in the trail comment, not in a block that would overwrite the hold or the requeue.
+- **The work is kept.** If the card is held, marked done or taken into review elsewhere
+  before the PR opens, the build opens none, and the work stays unpushed in its worktree. A
+  requeued card is still published for. If a PR did open, it is recorded on the card with
+  its state untouched, so the next round resumes that branch instead of rebuilding off base
+  over it. Nothing removes that tree without saving it first: when the reap or the card's
+  next fresh build ends it, the unpushed work goes to a `stranded/…` branch like any other
+  (see the next section). Shutdown leaves it alone, because the drive no longer holds it.
+- **The drive's fix budgets reset,** so whoever moved the card starts the next round fresh.
+- **Every write is best-effort,** the trail comment included. A failing comment can't turn
+  into a block.
+- **A cancel** takes the #211 edge, which also closes a PR the build opened.
+
+When the card can't be read, the drive does **not** assume it is still its own. A refused
+hand-off names the state it found (`expects in_progress, got 'ready'`), and that answer is
+used. With nothing to go on, the drive stands aside, and the health sweep reconciles the
+card as one with no live drive.
+
+The commonest trigger is closed at the door. `board_requeue_feature`, `board_requeue_ci_fix`,
+`POST …/ci` and `POST …/review` refuse a card the loop is still working (a live drive, a
+claimed build, a running review gate), and say to wait for the round or cancel the card.
+Live, `bd-p8ft` was requeued under its own CI-fix round. The round's hand-off then failed,
+and the card went terminal with an open PR.
+
 ## A worktree holding work is saved before it is removed
 
 Worktrees are disposable by design: a re-dispatch cleans a prior run's leftovers with
@@ -232,7 +265,7 @@ one removal:
 | Edge | What it does with such a tree |
 |---|---|
 | a fresh build of the card | saves every one the card owns, removes them, comments on the card, and builds on |
-| a drive's terminal block, or an operator cancel | saves the drive's own tree, removes it, and says so on the card |
+| a drive's terminal block, or an operator cancel | saves the drive's own tree, removes it, and says so on the card. A drive whose card moved on under it (#398) blocks nothing and removes nothing: the tree stays until another edge here ends it |
 | shutdown | saves the interrupted drive's tree, comments on the card, and reaps it. The next boot rebuilds as before. |
 | the by-id reap: merge, closed PR, cancel, done, health sweep | saves it, logs the branch, and reaps it |
 | `create_worktree` / `promote_worktree`, for any other caller | saves it, logs the branch, then clears it |
@@ -276,7 +309,9 @@ and how to use it: `git diff origin/<base>...stranded/…` to inspect it,
 `git branch -D` once nobody needs it. `git branch --list 'stranded/*'` shows what has piled up.
 
 A drive still throws away what **it** built and judged, and saves nothing for it: its own
-failed attempt before a retry, and the candidates `coder.solve` or Max-Mode rejected. The
+failed attempt before a retry, and the candidates `coder.solve` or Max-Mode rejected. It
+throws away a failed attempt only while the card is still its own, re-read just before. A
+card moved on under the drive keeps that tree like any other stand-aside (#398). The
 operator-only test-rung diagnostic owns and reaps its own `feat-<id>.test…` trees, so a
 card's build never touches them.
 
@@ -317,6 +352,11 @@ worktree on the board's own machinery, with no coder dispatched (#427). It commi
 tree holds, runs the pre-PR gate, pushes the branch, opens the PR and moves the card to
 `in_review`. Without it, recovering bd-ezs7's finished work needed a coder, and that day
 the coder delegate was down for an unrelated reason.
+
+A build that stood aside from a held card (#398) leaves exactly this shape: the card is
+blocked, and the finished work sits unpushed in its tree. The salvage publishes it as it
+stands. Lifting the hold instead hands the card back to the queue, and its next build
+saves that tree to a `stranded/…` branch and rebuilds from scratch.
 
 It is an **operator override**. It skips the checks a drive makes before its PR: the goal
 check, the requirement ledger and the source-issue check. CI still gates the PR, and so
@@ -374,10 +414,62 @@ happens next. Every sweep, the loop walks the blocked lane:
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
-The reason lives in a bead *comment*, and `br list` carries none — so a list row always
-projects an empty reason. The escalating card is deliberately re-read through `br show`
-first, because "no reason recorded" tells the operator nothing and sends them digging,
-which is the thing the alert exists to prevent.
+A block set **by hand** (`board_block_feature`, `POST …/block`) is always `terminal`, so it
+is never cleared automatically. The self-heal also **never moves a card blocked while still
+in backlog**, whatever its class, because its requeue would promote a card that never passed
+the Ready gate. Only people and agents block backlog cards (the loop blocks only ready and
+in-flight ones). A hand block written before this change still carries whatever class its
+wording guessed, and it goes to a human instead. The class of a loop-set block is inferred from its reason
+by the coder-failure classifier. That classifier reads prose as if it were an error message:
+a PM's "waiting on the network team" matched `network`, came out `transient`, and the sweep
+cleared the hold and requeued the card to `ready`, straight past the Ready gate. A human's
+block is a decision. Only its author knows when it is over (#406).
+
+**The reason is on every read.** It lives in a bead *comment*, and `br list` omits
+comments. Until #416 every list row therefore showed an empty `blocked_reason`: in
+`GET /features`, in `board_list`, and in the sweep's own read. Cards read as terminal with
+no reason while the reason sat one `br show` away. The listing now carries the comment
+thread across for blocked rows, from the batch `br show` it already makes for dependencies,
+so a blocked card's reason shows wherever the card does. The escalation path still re-reads
+a card through `br show` if its reason is somehow empty, because "no reason recorded" tells
+the operator nothing. A terminal block can no longer be written without a reason at all
+(#414).
+
+### Cards stranded outside the ready lane (#406)
+
+The loop claims only `ready` cards, and only `ready` + `depends_on` is re-checked when a
+dependency closes (the dag gate releases it by itself). A card left in **backlog** to wait
+for its dependencies, or **blocked** in backlog for the same reason, is never looked at
+again once they close. It is not a claim candidate and it shows up in no skip diagnostic.
+So the board now names it, wherever a card's next action is shown: the listing, the
+console chip, the agent's working state (which names a backlog card only when it owes a step,
+and ranks it after every in-flight card so a pile of stranded cards can't push a PR awaiting
+merge out of the capped list), and one sweep log line when the card first becomes stranded
+(held in memory, so a restart logs each stranded card once more):
+
+- **backlog, every dependency closed** → `dependencies closed — promote`. The step is
+  `board_mark_ready`, and the Ready gate still decides. A `deferred` or `designing` card is
+  excluded because it is parked for another reason. **`board_mark_designing`** is how the PM
+  says so: it parks the card on purpose, and `board_mark_ready` unparks it. "Closed" is
+  what beads' dependency gate counts, merged or cancelled. When a dependency was
+  **cancelled** (a scope cut, not a delivery), the hint names it and asks to confirm the
+  card still makes sense first.
+- **blocked in backlog, every dependency closed** → `blocked — dependencies closed`. The
+  block may have been only that wait, or it may be unrelated, so it is **surfaced, never
+  cleared**. The operator gets one more alert when the last dependency closes.
+
+Nothing is promoted or unblocked for you. A card with no recorded `depends_on` is never
+called stranded, because without a recorded edge there is nothing to say has cleared.
+Auto-promoting a stranded backlog card is deliberately out of scope: a backlog card may
+sit there on purpose, and the Ready gate is a decision point, not a formality.
+
+`board_dispatch` uses the same classification. When nothing is claimable, it no longer
+answers a bare `empty-queue` while cards are held. The outcome is `held`, and the record's
+`held` field maps each reason to its count, first few ids, and the step that moves it.
+The reasons are: `dependencies-closed-promote` and `blocked-dependencies-closed` (the two
+stranded shapes); `ready-waiting-on-dependencies` (the dag gate will release these by
+itself); `backlog-waiting-on-dependencies`; and `blocked:<class>` for every other blocked
+card. `empty-queue` now means nothing is held either.
 
 ### Why the alert doesn't repeat, and when it should
 
