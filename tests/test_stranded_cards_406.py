@@ -280,15 +280,15 @@ def _row(**kw):
     [
         (_row(), NEXT_ACTION_DEPS_CLEARED),
         (_row(issue_type="task"), NEXT_ACTION_DEPS_CLEARED),  # a task waits the same way
-        (_row(board_state="blocked", labels=["blocked"]), NEXT_ACTION_BLOCKED_DEPS_CLEARED),
+        (_row(board_state="blocked", blocked=True, labels=["blocked"]), NEXT_ACTION_BLOCKED_DEPS_CLEARED),
         (_row(open_depends_on=["bd-1"]), ""),  # still waiting
         (_row(depends_on=[]), ""),  # nothing recorded, nothing cleared
         (_row(bead_status="deferred"), ""),
         (_row(labels=["designing"]), ""),
         # blocked in the READY lane: a loop hold (preflight / livelock) or a dag-released card
-        (_row(board_state="blocked", labels=["blocked", "ready"]), ""),
+        (_row(board_state="blocked", blocked=True, labels=["blocked", "ready"]), ""),
         # blocked mid-build: its block is about the build, not the wait
-        (_row(board_state="blocked", bead_status="in_progress", labels=["blocked"]), ""),
+        (_row(board_state="blocked", blocked=True, bead_status="in_progress", labels=["blocked"]), ""),
         (_row(board_state="ready", labels=["ready"]), ""),  # the dag gate's case
     ],
 )
@@ -302,18 +302,29 @@ def test_the_console_has_a_chip_for_each_stranded_posture():
     assert f'"{NEXT_ACTION_BLOCKED_DEPS_CLEARED}": ["pl-badge--warning",' in page
 
 
-def test_the_snapshot_ranks_a_stranded_backlog_card_right_after_blocked():
+def test_stranded_backlog_cards_rank_after_in_flight_work_and_never_evict_it():
+    """The working state is capped at 12. Stranded cards ranked right after blocked, so a
+    dozen of them pushed out the PR awaiting merge and the build in flight: the work the
+    agent is actually carrying. They go last now, filling what the live cards leave."""
+    stranded = [
+        {"id": f"bd-s{n:02d}", "board_state": "backlog", "title": "t", "next_action": NEXT_ACTION_DEPS_CLEARED}
+        for n in range(12)
+    ]
+    live = [
+        {"id": "bd-x", "board_state": "blocked", "title": "t"},
+        {"id": "bd-rev", "board_state": "in_review", "title": "PR awaiting merge"},
+        {"id": "bd-wip", "board_state": "in_progress", "title": "building"},
+        {"id": "bd-r", "board_state": "ready", "title": "t"},
+        {"id": "bd-q", "board_state": "backlog", "title": "t"},  # owes nothing: never listed
+    ]
     work_snapshot.reset()
-    work_snapshot.publish(
-        [
-            {"id": "bd-r", "board_state": "ready", "title": "t"},
-            {"id": "bd-b", "board_state": "backlog", "title": "t", "next_action": NEXT_ACTION_DEPS_CLEARED},
-            {"id": "bd-x", "board_state": "blocked", "title": "t"},
-            {"id": "bd-q", "board_state": "backlog", "title": "t"},
-        ]
-    )
-    assert [i["id"] for i in work_snapshot.provider()] == ["bd-x", "bd-b", "bd-r"]
+    work_snapshot.publish(stranded + live)
+    ids = [i["id"] for i in work_snapshot.provider()]
     work_snapshot.reset()
+
+    assert ids[:4] == ["bd-x", "bd-rev", "bd-wip", "bd-r"]
+    assert len(ids) == work_snapshot.MAX_ITEMS and set(ids[4:]) <= {f["id"] for f in stranded}
+    assert "bd-q" not in ids
 
 
 # ── board_dispatch: when nothing is claimable, say what IS held and what moves it ────
@@ -438,3 +449,106 @@ async def test_an_unreadable_board_leaves_the_record_as_the_scan_made_it(monkeyp
         "detail": "the ready queue is empty — no card is ready to dispatch",
         "held": {},
     }
+
+
+# ── review fixes: nothing moves a hand-blocked backlog card, and no hint over-promises ─
+
+
+@requires_br
+async def test_the_sweep_never_self_heals_a_card_blocked_before_it_was_ready(board, monkeypatch):
+    """A hand block written BEFORE hand blocks were always terminal keeps the class its
+    wording guessed. "waiting on the network team" reads `transient`, the sweep cleared it
+    and requeued the card to `ready`, past a Ready gate this card never passed (no
+    acceptance criteria, no files). The self-heal now never moves a card that is not in the
+    ready or in-flight lanes, whatever its class."""
+    card = board.create_feature("Needs the VPN route", spec="s")["id"]
+    with pytest.raises(store_mod.BoardError):
+        board.mark_ready(card)  # the gate refuses it
+    board.flag_blocked(card, "waiting on the network team to open the VPN route")  # the legacy, guessed class
+    assert board.get_feature(card)["blocked_class"] == "transient"
+    alerts: list = []
+
+    for _ in range(3):
+        await _sweep(monkeypatch, board, alerts)
+
+    f = board.get_feature(card)
+    assert f["board_state"] == "blocked" and "ready" not in f["labels"]
+    assert alerts and "never auto-cleared" in alerts[0][1]  # told to a human instead
+
+
+@requires_br
+def test_a_cancelled_dependency_is_named_not_counted_as_delivered(board):
+    """beads' dependency gate counts a cancelled card as closed, and so does this, but a
+    scope cut is not a delivery: the hint names it and asks to confirm the card first."""
+    merged = board.create_feature("Merged foundation", spec="s")["id"]
+    dropped = board.create_feature("Foundation, later scope-cut", spec="s")["id"]
+    on_merged = board.create_feature("Builds on the merged one", spec="s", depends_on=[merged])["id"]
+    on_dropped = board.create_feature("Builds on the dropped one", spec="s", depends_on=[dropped])["id"]
+    _close(board, merged)
+    board.cancel_feature(dropped, "scope cut — foundation dropped")
+
+    rows = _rows(board)
+
+    assert rows[on_dropped]["next_action"] == NEXT_ACTION_DEPS_CLEARED
+    assert f"{dropped} was CANCELLED" in rows[on_dropped]["next_action_hint"]
+    assert "confirm this card still makes sense" in rows[on_dropped]["next_action_hint"]
+    assert "CANCELLED" not in rows[on_merged]["next_action_hint"]
+
+
+def test_held_never_promises_a_retry_the_sweep_will_not_make():
+    """The sweep retries a self-healing block only while its unblock-retry budget lasts,
+    and never for a card blocked before it was ready. The dispatch record told the PM "the
+    sweep retries it by itself" for both."""
+    from project_board.loop import drive as drive_mod
+
+    def _blocked(fid, *, spent=0, status="in_progress", labels=("blocked",)):
+        return {
+            "id": fid,
+            "board_state": "blocked",
+            "blocked": True,
+            "blocked_class": "transient",
+            "bead_status": status,
+            "labels": list(labels),
+            "budgets": {"unblock-retry": spent} if spent else {},
+            "depends_on": [],
+            "open_depends_on": [],
+        }
+
+    fresh = drive_mod._held_summary([_blocked("bd-a")])["blocked:transient"]["next"]
+    spent = drive_mod._held_summary([_blocked("bd-b", spent=2)])["blocked:transient"]["next"]
+    by_hand = drive_mod._held_summary([_blocked("bd-c", status="open")])["blocked:transient"]["next"]
+
+    assert "retries" in fresh and "by itself" in fresh
+    assert "by itself" not in spent and "a human decides" in spent
+    assert "by itself" not in by_hand and "a human decides" in by_hand
+
+
+@requires_br
+def test_a_stranded_task_card_reads_as_stranded_through_the_listing(board):
+    """A task waits on dependencies like a feature does, but it takes its OWN posture branch
+    in `annotate_next_action` — and the pure-posture test cannot see that branch, since
+    `stranded_posture` never reads `issue_type`. Through the real listing it can."""
+    dep = board.create_feature("Dependency", spec="s")["id"]
+    task = board.create_feature("Write the migration note", spec="s", depends_on=[dep], issue_type="task")["id"]
+    _close(board, dep)
+
+    row = _rows(board)[task]
+
+    assert row["issue_type"] == "task"
+    assert row["next_action"] == NEXT_ACTION_DEPS_CLEARED
+
+
+@requires_br
+def test_board_mark_designing_parks_a_stranded_card_on_purpose(board):
+    """The PM's way to say "this one waits on purpose": once parked, a card whose
+    dependencies have closed is no longer called stranded."""
+    dep = board.create_feature("Dependency", spec="s")["id"]
+    card = board.create_feature("Needs a design first", spec="s", depends_on=[dep])["id"]
+    _close(board, dep)
+    assert _rows(board)[card]["next_action"] == NEXT_ACTION_DEPS_CLEARED
+
+    reply = _tool("board_mark_designing").invoke({"feature_id": card, "note": "ADR 0101 pending"})
+
+    assert json.loads(reply)["designing"] is True
+    assert _rows(board)[card].get("next_action", "") == ""
+    assert any("ADR 0101 pending" in c for c in board.feature_comments(card))

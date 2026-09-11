@@ -225,7 +225,11 @@ happens next. Every sweep, the loop walks the blocked lane:
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
 A block set **by hand** (`board_block_feature`, `POST …/block`) is always `terminal`, so it
-is never cleared automatically. The class of a loop-set block is inferred from its reason
+is never cleared automatically. The self-heal also **never moves a card blocked while still
+in backlog**, whatever its class, because its requeue would promote a card that never passed
+the Ready gate. Only people and agents block backlog cards (the loop blocks only ready and
+in-flight ones). A hand block written before this change still carries whatever class its
+wording guessed, and it goes to a human instead. The class of a loop-set block is inferred from its reason
 by the coder-failure classifier. That classifier reads prose as if it were an error message:
 a PM's "waiting on the network team" matched `network`, came out `transient`, and the sweep
 cleared the hold and requeued the card to `ready`, straight past the Ready gate. A human's
@@ -248,12 +252,18 @@ dependency closes (the dag gate releases it by itself). A card left in **backlog
 for its dependencies, or **blocked** in backlog for the same reason, is never looked at
 again once they close. It is not a claim candidate and it shows up in no skip diagnostic.
 So the board now names it, wherever a card's next action is shown: the listing, the
-console chip, the agent's working state (which names a backlog card only when it owes a step),
-and one sweep log line when the card first becomes stranded:
+console chip, the agent's working state (which names a backlog card only when it owes a step,
+and ranks it after every in-flight card so a pile of stranded cards can't push a PR awaiting
+merge out of the capped list), and one sweep log line when the card first becomes stranded
+(held in memory, so a restart logs each stranded card once more):
 
 - **backlog, every dependency closed** → `dependencies closed — promote`. The step is
   `board_mark_ready`, and the Ready gate still decides. A `deferred` or `designing` card is
-  excluded because it is parked for another reason.
+  excluded because it is parked for another reason. **`board_mark_designing`** is how the PM
+  says so: it parks the card on purpose, and `board_mark_ready` unparks it. "Closed" is
+  what beads' dependency gate counts, merged or cancelled. When a dependency was
+  **cancelled** (a scope cut, not a delivery), the hint names it and asks to confirm the
+  card still makes sense first.
 - **blocked in backlog, every dependency closed** → `blocked — dependencies closed`. The
   block may have been only that wait, or it may be unrelated, so it is **surfaced, never
   cleared**. The operator gets one more alert when the last dependency closes.

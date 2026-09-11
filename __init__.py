@@ -786,6 +786,19 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_mark_designing(feature_id: str, note: str = "") -> str:
+        """Park a backlog (or ready) feature ON PURPOSE while its design is worked out —
+        the DESIGNING state (#406). A parked card is not "stranded": the board stops naming
+        it `dependencies closed — promote` once its dependencies close, and the puller never
+        claims it. `note` says why (recorded on the card). Unpark it with board_mark_ready,
+        which runs the Ready gate as usual."""
+        try:
+            f = get_store(**store_kw).mark_designing(feature_id, _strip_wrapping_quotes(note))
+            return json.dumps({"id": f["id"], "state": f["board_state"], "designing": True})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_cancel_feature(feature_id: str, reason: str = "") -> str:
         """Cancel a feature created in error (bad decomposition, duplicate, scope cut) —
         the verb that RETIRES a bad card. Tags the bead `cancelled` and closes it with an
@@ -1134,6 +1147,15 @@ def _board_tools(cfg: dict):
         With `with_ci=true`, a row whose rollup is red reads `ci failing` instead
         (never "merge #N" on a red PR).
 
+        A card STRANDED outside the ready lane carries one too (#406), with the verb in its
+        `next_action_hint`: `dependencies closed — promote` (a backlog card whose every
+        dependency has closed; nothing promotes it but you, so board_mark_ready it, or
+        board_mark_designing it if it is parked on purpose), and `blocked — dependencies
+        closed` (a card blocked in backlog whose dependencies have all closed; the block is
+        never cleared for you, so read its reason before board_unblock_feature). A
+        dependency that was CANCELLED rather than merged is named in the hint: confirm the
+        card still makes sense first.
+
         `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
         (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
         the failing check names in `ci_summary`. OPT-IN, never default — each
@@ -1263,6 +1285,7 @@ def _board_tools(cfg: dict):
         board_get_feature,
         board_comments,
         board_mark_ready,
+        board_mark_designing,
         board_cancel_feature,
         board_mark_done,
         board_attach_pr,

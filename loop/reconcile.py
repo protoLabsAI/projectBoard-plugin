@@ -408,7 +408,14 @@ class ReconcileMixin:
                 # a per-row probe across the whole blocked lane.
                 reason = str(f.get("blocked_reason") or "").strip()
                 spent = await self._budget_get(store, fid, "unblock-retry", f)
-                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX:
+                # Never for a card blocked before it was ever ready (#406): the self-heal
+                # REQUEUES, and for a card that never passed the Ready gate that promotes it
+                # straight past it. Such a block was set by hand (the loop blocks only ready
+                # and in-flight cards) — a hand block written before hand blocks were always
+                # terminal still carries the class its wording guessed, `transient` for
+                # "waiting on the network team". It goes to a human instead.
+                by_hand = store_mod.blocked_before_ready(f)
+                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX and not by_hand:
                     # Re-read under the claim lock before moving the card (#402). The list is
                     # from the start of the pass, and an attach (or an operator unblock) may
                     # have moved the card since. Requeueing it then undid that move.
@@ -436,7 +443,9 @@ class ReconcileMixin:
                     )
                     continue
                 why = (
-                    f"{cls or 'unclassified'} block"
+                    f"{cls} block set before the card was ever ready, so never auto-cleared"
+                    if by_hand and cls in _SELF_HEALING_BLOCKS
+                    else f"{cls or 'unclassified'} block"
                     if spent < _UNBLOCK_RETRY_MAX
                     else f"{cls} block, {spent} auto-retr{'y' if spent == 1 else 'ies'} spent"
                 )

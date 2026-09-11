@@ -67,7 +67,8 @@ _HELD_REASONS = (
     (
         "dependencies-closed-promote",
         "backlog with every dependency closed",
-        "board_mark_ready — nothing else promotes it; the Ready gate still applies",
+        "board_mark_ready — nothing else promotes it (if a dependency was cancelled rather than merged, "
+        "confirm the card still makes sense first); the Ready gate still applies",
     ),
     (
         "blocked-dependencies-closed",
@@ -95,12 +96,15 @@ def _held_summary(feats) -> dict:
     that are simply claimable, backlog cards with nothing recorded to wait for, and
     in-flight cards are not "held" and are left out. Pure over projected rows."""
     groups: dict[str, list[str]] = {}
+    rows: dict[str, dict] = {}
+    cancelled = frozenset(str(f.get("id")) for f in feats or [] if f.get("board_state") == "cancelled")
     for f in feats or []:
         fid = str(f.get("id") or "")
         if not fid:
             continue
+        rows[fid] = f
         state = f.get("board_state")
-        stranded = store_mod.stranded_posture(f)["next_action"]
+        stranded = store_mod.stranded_posture(f, cancelled=cancelled)["next_action"]
         if stranded == store_mod.NEXT_ACTION_DEPS_CLEARED:
             key = "dependencies-closed-promote"
         elif stranded == store_mod.NEXT_ACTION_BLOCKED_DEPS_CLEARED:
@@ -123,11 +127,26 @@ def _held_summary(feats) -> dict:
             continue
         if key.startswith("blocked:"):
             cls = key.split(":", 1)[1]
-            step = (
-                f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
+            # The sweep's own test, per card — never promised for a card it will not touch:
+            # one whose auto-retries are spent is escalated, and one blocked in backlog is
+            # never moved at all (store.blocked_before_ready).
+            healing = [
+                fid
+                for fid in ids
                 if cls in _SELF_HEALING_BLOCKS
-                else "read its block reason; a human decides, then board_unblock_feature"
-            )
+                and not store_mod.blocked_before_ready(rows[fid])
+                and (rows[fid].get("budgets") or {}).get("unblock-retry", 0) < _UNBLOCK_RETRY_MAX
+            ]
+            if healing and len(healing) == len(ids):
+                step = f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
+            elif healing:
+                step = (
+                    f"the health sweep retries {', '.join(healing[:_HELD_IDS_MAX])} by itself; the rest have spent "
+                    "their retries or were blocked by hand — read the block reason, a human decides, then "
+                    "board_unblock_feature"
+                )
+            else:
+                step = "read its block reason; a human decides, then board_unblock_feature"
         else:
             step = steps[key]
         held[key] = {"count": len(ids), "ids": ids[:_HELD_IDS_MAX], "next": step}

@@ -58,8 +58,10 @@ def publish(features) -> None:
     # card, not the whole view.
     # A backlog card is normally not on the hook — except one the board says has a step
     # owed (#406): every dependency it waited on has closed, and nothing promotes it but
-    # the agent reading this. It ranks right after blocked: both need someone to act.
-    rank = {state: i for i, state in enumerate(("blocked", "backlog", "in_review", "in_progress", "ready"))}
+    # the agent reading this. It ranks LAST: the list is capped, and a dozen stranded cards
+    # must never push out the in-flight work (a PR awaiting merge, a build running) the
+    # agent is actually carrying. They fill whatever the live cards leave.
+    rank = {state: i for i, state in enumerate(("blocked", "in_review", "in_progress", "ready", "backlog"))}
     live = []
     skipped = 0
     for f in features or []:
