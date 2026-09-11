@@ -529,8 +529,9 @@ def _default_delegates():
 
 def _default_acp_delegate_names() -> list[str] | None:
     """The names of this agent's ACP delegates — what the operator can actually pick as a
-    coder — or None when the roster can't be read (delegates plugin disabled, host-free).
-    Raw roster, not the secret-overlaid one: only names and types are needed."""
+    coder — or None when the roster can't be read (no host `plugins.delegates` to import,
+    or the read fails). Raw roster, not the secret-overlaid one: only names and types are
+    needed."""
     try:
         from plugins.delegates.store import read_delegates_raw
 
