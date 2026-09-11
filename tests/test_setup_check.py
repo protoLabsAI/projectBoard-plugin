@@ -891,7 +891,7 @@ async def test_loop_pauses_on_missing_br_then_resumes_when_it_appears(monkeypatc
         paused = [r for r in caplog.records if "loop paused:" in r.message]
         assert len(paused) == 1 and paused[0].levelno == logging.WARNING
         assert "br:" in paused[0].message and "cargo install beads_rust" in paused[0].message
-        assert not any("crash recovery failed" in r.message or "loop tick failed" in r.message for r in caplog.records)
+        assert not any("crash recovery failed" in r.message or "loop tick" in r.message for r in caplog.records)
         assert ("br", setup_check.BR_HINT) in host.calls and len(host.calls) == len(
             setup_check.REPORT_KEYS
         )  # first eval: all keys

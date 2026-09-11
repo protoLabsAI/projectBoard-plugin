@@ -31,7 +31,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
-from .store import BoardError, annotate_next_action, escalation_enabled, get_store, knob_bool, open_requirements_note
+from .store import (
+    MANUAL_BLOCK_CLASS,
+    BoardError,
+    annotate_next_action,
+    escalation_enabled,
+    get_store,
+    knob_bool,
+    open_requirements_note,
+)
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -197,7 +205,11 @@ def build_router(cfg: dict):
         try:
             return await asyncio.to_thread(fn)
         except BoardError as e:
-            raise HTTPException(400, str(e))
+            # A stall is not a refusal (#404): the board store did not answer and a write's
+            # outcome is unknown, so it is 503 (retry after checking), not 400 (don't retry).
+            from .store import BoardTimeout
+
+            raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
     def _verify_external(raw: bytes, signature: str) -> None:
         if not webhook_secret:
@@ -244,6 +256,12 @@ def build_router(cfg: dict):
         reason = str(body.get("reason", ""))
 
         def _handle():
+            # Never under a live round (#398) — both branches below move the card.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(fid)
+            if refusal:
+                raise BoardError(refusal)
             s = store()
             if not escalate_on:
                 return {"requeued": False, "escalated": False, "feature": s.bounce_ci_fail(fid, reason)}
@@ -277,6 +295,13 @@ def build_router(cfg: dict):
         escalate = bool(body.get("escalate", False))
 
         def _handle():
+            # Never under a live round (#398): the review gate runs inside the drive, so a
+            # bounce landing then would requeue the card out from under it.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(fid)
+            if refusal:
+                raise BoardError(refusal)
             s = store()
             # Distinct review-bounce comment on the bead (enforces in_review), then hand
             # the findings to the loop so its next dispatch prompt LEADS with them — the
@@ -390,7 +415,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         try:
             return await asyncio.to_thread(fn)
         except BoardError as e:
-            raise HTTPException(400, str(e))
+            # A stall is not a refusal (#404): the board store did not answer and a write's
+            # outcome is unknown, so it is 503 (retry after checking), not 400 (don't retry).
+            from .store import BoardTimeout
+
+            raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
     @router.get("/projects")
     async def _projects():
@@ -685,7 +714,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.post("/features/{fid}/block")
     async def _block(fid: str, body: dict = Body(...)):
-        return await _guard(lambda: store().flag_blocked(fid, str(body.get("reason", ""))))
+        """Block a card by hand — a hold that is never cleared automatically (#406): the
+        class is stated, not inferred from the reason's words. See store.MANUAL_BLOCK_CLASS."""
+        return await _guard(lambda: store().flag_blocked(fid, str(body.get("reason", "")), category=MANUAL_BLOCK_CLASS))
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str):
@@ -710,13 +741,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         `pr_url` (a cancel during the CI/review bounce) is closed with a comment pointing
         at the card, and an in-flight drive is stopped (its own cancel path closes a PR
         it opened meanwhile + reaps). Both best-effort: a gh failure logs, never 400s."""
-        pr_url = ""
-        before = None
-        try:
-            before = await asyncio.to_thread(lambda: store().get_feature(fid))
-            pr_url = str((before or {}).get("pr_url") or "").strip()
-        except BoardError:
-            pass  # the cancel below raises the named error for an unknown card
+        # The pre-read is what finds the card's open PR, so it is NOT best-effort (#404): a
+        # read that failed or stalled used to be swallowed, the cancel went on with no PR
+        # url, and the card's open PR was never closed (#211). An error here changes nothing.
+        # An unknown id reads as None, and the cancel below names it.
+        before = await _guard(lambda: store().get_feature(fid))
+        pr_url = str((before or {}).get("pr_url") or "").strip()
         f = await _guard(lambda: store().cancel_feature(fid, str((body or {}).get("reason", ""))))
         from .loop import cancel_side_effects
 

@@ -345,10 +345,15 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 
     BEST-EFFORT: a store read (or the gh probe inside `_find_open_pr_for_issue`) failing
     never blocks creation — a possible dup beats a stuck board."""
-    from .store import BoardError
+    from .store import BoardError, BoardTimeout
 
     try:
         existing = store.list_features()
+    except BoardTimeout:
+        # A STALL is not a read failure to shrug off (#404). The store is wedged, and the
+        # likeliest reason a caller is creating again is that its last create timed out —
+        # which may well have committed. Creating blind now is how that becomes a duplicate.
+        raise
     except BoardError:
         existing = []  # can't check → don't block creation on a read failure
     dup = _open_duplicate(existing, title, deps)
@@ -388,7 +393,14 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
     from .projects import resolve_projects, store_db_path
-    from .store import BoardError, annotate_next_action, get_store, open_requirement_ids, open_requirements_note
+    from .store import (
+        MANUAL_BLOCK_CLASS,
+        BoardError,
+        annotate_next_action,
+        get_store,
+        open_requirement_ids,
+        open_requirements_note,
+    )
 
     # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
     # execution settings) + the default project a create falls back to. Threaded into
@@ -779,6 +791,19 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
+    def board_mark_designing(feature_id: str, note: str = "") -> str:
+        """Park a backlog (or ready) feature ON PURPOSE while its design is worked out —
+        the DESIGNING state (#406). A parked card is not "stranded": the board stops naming
+        it `dependencies closed — promote` once its dependencies close, and the puller never
+        claims it. `note` says why (recorded on the card). Unpark it with board_mark_ready,
+        which runs the Ready gate as usual."""
+        try:
+            f = get_store(**store_kw).mark_designing(feature_id, _strip_wrapping_quotes(note))
+            return json.dumps({"id": f["id"], "state": f["board_state"], "designing": True})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_cancel_feature(feature_id: str, reason: str = "") -> str:
         """Cancel a feature created in error (bad decomposition, duplicate, scope cut) —
         the verb that RETIRES a bad card. Tags the bead `cancelled` and closes it with an
@@ -959,8 +984,16 @@ def _board_tools(cfg: dict):
         re-claims it and the loop re-dispatches (at the higher tier if it was just
         escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
         literal wrapping double quotes before storage (same hygiene as
-        board_create_feature)."""
+        board_create_feature). Refused while the loop is still working the card (a live
+        drive or review gate): wait for the round to end, or cancel the card."""
         try:
+            # Never under a live round (#398): pulling the card out from under a build that
+            # is still running is how a requeued card went terminal. Refused, not overridden.
+            from .loop import requeue_refusal
+
+            refusal = requeue_refusal(feature_id)
+            if refusal:
+                raise BoardError(refusal)
             store = get_store(**store_kw)
             findings = _strip_wrapping_quotes(findings)
             if findings.strip():
@@ -993,12 +1026,21 @@ def _board_tools(cfg: dict):
         preserved. It accepts only that bounced shape: a coding feature, `in_progress`,
         non-empty `ci_failure`, and an open `pr_url`. Use
         `board_requeue_feature(feature_id, findings=...)` for adverse HUMAN review
-        findings; that guard still requires `in_review`."""
+        findings; that guard still requires `in_review`. Refused while the loop is still
+        working the card: a card mid-round has this same shape, and a requeue would pull it
+        out from under a build that has not finished."""
         try:
+            # Never under a live round (#398): a card mid-round has exactly the in_progress +
+            # open-PR shape this verb accepts, and requeuing it pulled `bd-p8ft` out from
+            # under its own CI-fix build, which then went terminal at the hand-off.
+            from .loop import queue_ci_feedback, requeue_refusal
+
+            refusal = requeue_refusal(feature_id)
+            if refusal:
+                raise BoardError(refusal)
             store = get_store(**store_kw)
             ci_failure = _strip_wrapping_quotes(ci_failure)
             store.record_ci_fix_feedback(feature_id, ci_failure)
-            from .loop import queue_ci_feedback
 
             queue_ci_feedback(feature_id, ci_failure)
             f = store.requeue(feature_id)
@@ -1018,12 +1060,15 @@ def _board_tools(cfg: dict):
         flag, not a lane) with the reason visible, and is skipped by the puller until
         cleared. Complements the board_update_feature repair path: block when the feature
         is stuck on something external (a missing dep, an unanswered question) and you want
-        the card parked-and-visible; update when the spec itself needs fixing. `reason` is
-        stripped of any literal wrapping double quotes before storage (same hygiene as
-        board_create_feature)."""
+        the card parked-and-visible; update when the spec itself needs fixing. A block set
+        here is never cleared automatically, whatever the reason says — lift it with
+        board_unblock_feature. `reason` is required, and is stripped of any literal wrapping
+        double quotes before storage (same hygiene as board_create_feature)."""
         try:
             reason = _strip_wrapping_quotes(reason)
-            f = get_store(**store_kw).flag_blocked(feature_id, reason)
+            # A hand-set block is a hold, never a self-healing failure (#406) — the class is
+            # stated, not guessed from the reason's words. See store.MANUAL_BLOCK_CLASS.
+            f = get_store(**store_kw).flag_blocked(feature_id, reason, category=MANUAL_BLOCK_CLASS)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"
@@ -1124,6 +1169,15 @@ def _board_tools(cfg: dict):
         With `with_ci=true`, a row whose rollup is red reads `ci failing` instead
         (never "merge #N" on a red PR).
 
+        A card STRANDED outside the ready lane carries one too (#406), with the verb in its
+        `next_action_hint`: `dependencies closed — promote` (a backlog card whose every
+        dependency has closed; nothing promotes it but you, so board_mark_ready it, or
+        board_mark_designing it if it is parked on purpose), and `blocked — dependencies
+        closed` (a card blocked in backlog whose dependencies have all closed; the block is
+        never cleared for you, so read its reason before board_unblock_feature). A
+        dependency that was CANCELLED rather than merged is named in the hint: confirm the
+        card still makes sense first.
+
         `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
         (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
         the failing check names in `ci_summary`. OPT-IN, never default — each
@@ -1215,12 +1269,17 @@ def _board_tools(cfg: dict):
 
         Returns a JSON decision record. `outcome` is one of: `dispatched` (a card was
         claimed and a drive started — its feature id is in `dispatched`); `empty-queue`
-        (nothing is ready); `at-capacity` (all `max_concurrent` drive slots are full);
+        (nothing is ready, and nothing is held); `held` (nothing is claimable, but cards are
+        held: `held` maps each reason — `dependencies-closed-promote`,
+        `blocked-dependencies-closed`, `ready-waiting-on-dependencies`,
+        `backlog-waiting-on-dependencies`, `blocked:<class>` — to its count, first few ids,
+        and the step that moves it); `at-capacity` (all `max_concurrent` drive slots are full);
         `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
         task-type card was claimed to in_progress awaiting async delivery, holding no
         slot); `all-candidates-held` (every ready card was blocked/held, deferred by the
         hot-file guard, held by a per-project preflight, or lost a claim race — see
-        `skipped`); `loop-disabled` (project_board.loop_enabled=false); or
+        `skipped`, plus `held` for the rest of the board); `loop-disabled`
+        (project_board.loop_enabled=false); or
         `loop-not-running` (no loop surface is live in this process); or `error` (a
         dispatch stage crashed — the fail-closed preflight or the claim scan raised, and
         the record carries the stage and exception rather than raising into the agent
@@ -1248,6 +1307,7 @@ def _board_tools(cfg: dict):
         board_get_feature,
         board_comments,
         board_mark_ready,
+        board_mark_designing,
         board_cancel_feature,
         board_mark_done,
         board_attach_pr,
