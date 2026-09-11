@@ -573,9 +573,12 @@ def test_a_terminal_block_with_a_reason_is_recorded(make_board, monkeypatch):
     board = make_board(br)
     monkeypatch.setattr(board, "_require", lambda fid: {"id": fid, "labels": [], "issue_type": "feature"})
     monkeypatch.setattr(board, "get_feature", lambda fid: {"id": fid})
-    said = []
-    monkeypatch.setattr(board, "comment", lambda fid, txt: said.append(txt))
 
     board.flag_blocked("bd-x", "the gate command does not exist on this repo", category="terminal")
 
-    assert said == ["blocked: the gate command does not exist on this repo"]
+    # The reason is written straight through `br` — never the best-effort `comment()`,
+    # which swallows a failed write — and BEFORE the label (#404): a block is never
+    # recorded without its reason.
+    calls = [c[0] for c in br.calls]
+    assert ("comments", "add", "bd-x", "blocked: the gate command does not exist on this repo") in br.calls
+    assert calls.index("comments") < calls.index("update")
