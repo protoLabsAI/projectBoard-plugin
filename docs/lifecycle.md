@@ -345,6 +345,64 @@ Where a failure happens decides what it stops:
 - **`create_worktree` / `promote_worktree`** refuse with `StrandedWorkError` before anything
   moves.
 
+### Publishing a stranded tree without a coder
+
+`board_salvage_feature` / `POST /features/{fid}/salvage` publishes a stranded card's
+worktree on the board's own machinery, with no coder dispatched (#427). It commits what the
+tree holds, runs the pre-PR gate, pushes the branch, opens the PR and moves the card to
+`in_review`. Without it, recovering bd-ezs7's finished work needed a coder, and that day
+the coder delegate was down for an unrelated reason.
+
+A build that stood aside from a held card (#398) leaves exactly this shape: the card is
+blocked, and the finished work sits unpushed in its tree. The salvage publishes it as it
+stands. Lifting the hold instead hands the card back to the queue, and its next build
+saves that tree to a `stranded/…` branch and rebuilds from scratch.
+
+It is an **operator override**. It skips the checks a drive makes before its PR: the goal
+check, the requirement ledger and the source-issue check. CI still gates the PR, and so
+does the review gate when `review_gate` is on.
+
+- **Only a stranded card:** `in_progress` with no live drive, or `blocked`. A `ready`
+  card could be claimed by the loop mid-publish, so block it first. A card blocked out of
+  `in_review` (CI-fix rounds spent, or a review-gate block) keeps its PR: the salvage
+  pushes onto that PR and returns the card to `in_review`.
+- **Refuses, changing nothing,** while a drive or another salvage owns the card, or when no
+  worktree has changes against base. It also refuses when several worktrees do and `tree`
+  (a `feat-…` directory name or a path) does not pick one. A directory under the card's
+  tree names that the repo never registered as a worktree is left alone. That covers a
+  leftover with no `.git`, a husk, or a separate clone. Git run inside a leftover answers
+  for the main checkout.
+- **The gate runs where the tree stands.** The repo's `format_cmd` fixups run first, as
+  in a drive, so they may rewrite files in the tree even when the gate then refuses.
+- **A red gate publishes nothing** and returns `gate-red` with the output's tail.
+  `force=true` publishes anyway, marked as a draft:
+  - A new PR is opened as a **draft** whose body carries the output. Auto-merge never
+    merges a draft.
+  - A PR the card already has is converted to a draft (`gh pr ready --undo`), and the
+    output is posted on it as a comment.
+  - `draft` in the record is read back from GitHub. If GitHub refuses the conversion, the
+    record and the card comment say the PR is **not** a draft.
+  - In a repo without draft PRs, no PR is opened. The branch is already pushed, and the
+    record names it with the `gh pr create` command to open one by hand.
+- A candidate tree is promoted to the card's own branch first, so every edge after it
+  works as it would for a drive's PR. With `review_gate` on, the salvage runs the review
+  gate itself, as a drive does. The reconcile only picks up `review-pending` when
+  `merge_poll` is on.
+- **A cancel mid-publish** stops it before the PR, or closes the PR it has just opened.
+  The cancel's reap waits for the salvage to finish, then saves and removes the tree as
+  usual.
+- While it runs, the card is reserved like a drive's claim, and its trees are held. The
+  claim scan, boot recovery, the sweeps, auto-unblock and reaps all leave it alone. The
+  reservation is released only by the salvage that made it.
+
+**A hung drive cannot be salvaged in place.** The salvage refuses while a live drive owns
+the card. No verb stops a drive and leaves the card as it is. The only ways out are
+cancelling the card, which ends it, or restarting the host, after which boot recovery
+requeues it. Both save the tree to a `stranded/…` branch and remove it, and the card
+comment names that branch. The salvage then has no tree to publish, so publish the branch
+by hand: `git push origin stranded/…:<card branch>`, then open its PR. After a restart,
+block the card first, or a fresh drive may build over it.
+
 ## Blocked cards — self-heal, then page a human
 
 `blocked` carries a **class**, on a `blocked-class:<cls>` label, and the class decides what

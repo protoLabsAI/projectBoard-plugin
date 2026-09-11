@@ -37,7 +37,7 @@ _READY_SKIP_MAX_DEFAULT = 5
 #    coder_timeout) will free the file — a RESOLVING skip, transient by construction.
 #  - "blocked" / "preflight-hold": the card already sits in the visible blocked/held
 #    path — re-blocking is redundant and would clobber its real reason.
-_NON_LIVELOCK_SKIP_REASONS = frozenset({"hot-file", "blocked", "preflight-hold"})
+_NON_LIVELOCK_SKIP_REASONS = frozenset({"hot-file", "blocked", "preflight-hold", "reserved"})
 
 
 def _is_livelock_skip_reason(reason: str) -> bool:
@@ -701,6 +701,12 @@ class DriveMixin:
             if len(self._drives) >= self.max_concurrent:
                 break  # remaining candidates are lower priority than what we already selected
             cid = candidate["id"]
+            if cid in self._inflight_files:
+                # Already held in this process — a live drive, or an operator salvage mid-publish
+                # (#427). A second claim would race it; it resolves on its own, so this is not
+                # a livelock either.
+                skipped.append({"fid": cid, "reason": "reserved"})
+                continue
             if candidate.get("board_state") != "ready" or candidate.get("blocked"):
                 # a blocked-flagged feature can carry the `ready` label too
                 reason = "blocked" if candidate.get("blocked") else f"state={candidate.get('board_state')}"

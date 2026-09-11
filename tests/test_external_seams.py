@@ -62,7 +62,8 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # are exercised against a real git repo in tests/test_worktree_git.py — a temporary bare origin
 # plus a clone, so `origin/<base>` and PR-branch resume resolve exactly as in production (#361,
 # slice 1); #405's `unpublished_work`, `preserve_worktree` and their helpers the same way, in
-# tests/test_stranded_work_405.py.
+# tests/test_stranded_work_405.py, and #427's `commits_ahead` and `own_worktree` in
+# tests/test_salvage_427.py.
 # The 12 read-dominant `gh`/GitHub seams are now exercised against a PINNED,
 # permanently-open PR in tests/test_worktree_gh.py (#361, slice 2): CI sets PB_REQUIRE_GH=1 so an
 # absent/unusable credential FAILS instead of skipping — the same posture that made the real-`br`
@@ -102,6 +103,7 @@ WORKTREE_SEAMS: dict[str, str] = {
         "residual risk is delayed feedback via a blocked card / operator signal, not absent execution."
     ),
     "commit_worktree": "REAL",
+    "commits_ahead": "REAL",
     "create_worktree": "REAL",
     "delete_remote_branch": "REAL",
     "merge_pr": "REAL",
@@ -112,6 +114,7 @@ WORKTREE_SEAMS: dict[str, str] = {
         "residual risk is delayed feedback via a blocked card / operator signal, not absent execution."
     ),
     "origin_head_sha": "REAL",
+    "own_worktree": "REAL",
     "post_or_update_pr_comment": "REAL",
     "post_review_status": "REAL",
     "pr_ci_status": "REAL",
@@ -312,12 +315,13 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_28_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 28 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
-    #361; `pr_identity` joined REAL with #402, and the 25th to 28th are #405's stranded-work seams
+def test_worktree_coverage_contract_is_30_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 30 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+    #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
-    tests/test_stranded_work_405.py.
+    tests/test_stranded_work_405.py; and the 29th and 30th #427's ``commits_ahead`` and
+    ``own_worktree``, in tests/test_salvage_427.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -335,7 +339,7 @@ def test_worktree_coverage_contract_is_28_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 28, f"expected 28 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 30, f"expected 30 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

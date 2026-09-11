@@ -250,3 +250,21 @@ async def test_a_hold_landing_while_a_retry_is_prepared_keeps_the_failed_attempt
     assert len(dispatches) == 1, "the retry was dispatched on a held card"
     assert Path(card.tree, "target.py").read_text() == "x = 2  # attempt 1, half done\n", "the tree was thrown away"
     assert _HOLD in card.card()["blocked_reason"]
+
+
+# ── …and what a hold leaves behind is the operator salvage's to publish (#427) ─────────
+
+
+async def test_the_operator_salvage_publishes_a_held_builds_tree_as_it_stands(tmp_path, monkeypatch):
+    card = _Card(tmp_path, monkeypatch)
+    await _held_mid_build(card)
+
+    rec = await card.loop.salvage(card.fid)
+
+    assert rec["outcome"] == "published", rec
+    branch = worktree.branch_name(card.fid, _TITLE)
+    assert card.pushed() == [branch]
+    assert _git("-C", card.origin, "show", f"{branch}:target.py") == "x = 2  # the finished implementation"
+    after = card.card()
+    assert after["board_state"] == "in_review" and not after["blocked"] and after["pr_url"] == _URL
+    assert card.stranded() == []  # published from its tree: nothing needed setting aside

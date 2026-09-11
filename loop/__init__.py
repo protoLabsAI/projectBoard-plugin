@@ -24,5 +24,6 @@ from ._common import __all__ as _kernel_all
 from .attach import attach_external_pr  # the board_attach_pr tool + route seam (#402)
 from .core import BoardLoop
 from .drive import request_dispatch  # the board_dispatch tool seam (#390)
+from .reconcile import request_salvage  # the salvage route + board_salvage_feature seam (#427)
 
-__all__ = [*_kernel_all, "BoardLoop", "attach_external_pr", "request_dispatch"]
+__all__ = [*_kernel_all, "BoardLoop", "attach_external_pr", "request_dispatch", "request_salvage"]

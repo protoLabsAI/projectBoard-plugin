@@ -840,13 +840,53 @@ def _feature_tree_names(base: str, fid: str, *, test_rung: bool = True) -> tuple
 # once — an operator cancel's route reaps it while the cancelled drive clears it — and a
 # save must never run while another edge deletes the files it is reading (#405). Keyed by
 # loop too: an uncontended asyncio.Lock never binds to one, a contended one does.
-_TREE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+#
+# Reentrant for the task holding it: an operator salvage holds its trees for its whole
+# publish (#427), and the promotion it runs clears the same path under the same lock.
+class _TreeLock:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def acquire(self) -> None:
+        me = asyncio.current_task()
+        if self._owner is me and me is not None:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner, self._depth = me, 1
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
+_TREE_LOCKS: dict[tuple[int, str], _TreeLock] = {}
 
 
 @contextlib.asynccontextmanager
 async def _tree_lock(path: str):
-    key = (id(asyncio.get_running_loop()), os.path.abspath(path))
-    async with _TREE_LOCKS.setdefault(key, asyncio.Lock()):
+    lock = _TREE_LOCKS.setdefault((id(asyncio.get_running_loop()), os.path.abspath(path)), _TreeLock())
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextlib.asynccontextmanager
+async def hold_trees(*paths: str):
+    """Hold the trees at ``paths`` against every edge that would save-and-remove them
+    (the reap, a cancel, a fresh build's set-aside) until the block exits — for an
+    operator salvage (#427), which works in a tree for minutes: a cancel that lands during
+    its gate must wait for it rather than take the tree out from under it. Taken in a
+    fixed order, so two holders can never deadlock."""
+    async with contextlib.AsyncExitStack() as stack:
+        for path in sorted({os.path.abspath(p) for p in paths}):
+            await stack.enter_async_context(_tree_lock(path))
         yield
 
 
@@ -1083,6 +1123,42 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
     if kept:
         _warn_kept(fid, kept)
     return removed
+
+
+async def own_worktree(repo: str, path: str) -> bool:
+    """Is ``path`` a worktree of ``repo`` in its own right — the root of a checkout that
+    ``repo`` has registered? Every git command run IN a tree must first prove this: a leftover
+    directory with no ``.git`` of its own sits inside the main checkout, so git quietly
+    answers for THAT — an operator salvage (#427) once read the main checkout's commits as
+    the tree's "changes" and committed the card's title onto the operator's own branch."""
+    if not os.path.exists(os.path.join(path, ".git")):
+        return False
+    rc, top, _err = await _git(path, "rev-parse", "--show-toplevel")
+    if rc != 0 or os.path.realpath(top.strip()) != os.path.realpath(path):
+        return False
+    rc, out, _err = await _git(repo, "worktree", "list", "--porcelain")
+    return rc == 0 and any(
+        line.startswith("worktree ") and os.path.realpath(line[len("worktree ") :]) == os.path.realpath(path)
+        for line in out.splitlines()
+    )
+
+
+async def commits_ahead(path: str, base: str) -> int:
+    """How many commits the tree at ``path`` has that ``origin/<base>`` does not — the
+    local ``<base>`` when there is no remote ref — i.e. what a PR from it would carry
+    besides uncommitted work. 0 when neither ref resolves (nothing to measure against), and
+    0 for a directory that is not a checkout of its own: git would count the ENCLOSING
+    repo's commits instead (see ``own_worktree``)."""
+    if not os.path.exists(os.path.join(path, ".git")):
+        return 0
+    rc, top, _err = await _git(path, "rev-parse", "--show-toplevel")
+    if rc != 0 or os.path.realpath(top.strip()) != os.path.realpath(path):
+        return 0
+    for ref in (f"origin/{base}", base):
+        rc, out, _err = await _git(path, "rev-list", "--count", f"{ref}..HEAD")
+        if rc == 0:
+            return int(out.strip()) if out.strip().isdigit() else 0
+    return 0
 
 
 def feature_worktrees(repo: str, worktrees_root: str, fid: str) -> list[tuple[str, str]]:
@@ -1323,7 +1399,14 @@ async def commit_worktree(worktree: str, message: str) -> None:
 
 
 async def open_pr(
-    worktree: str, branch: str, *, base: str = "main", title: str, body: str = "", promote_draft: bool = True
+    worktree: str,
+    branch: str,
+    *,
+    base: str = "main",
+    title: str,
+    body: str = "",
+    promote_draft: bool = True,
+    draft: bool = False,
 ) -> str:
     """Commit + push the worktree's branch and open (or reuse) a PR; return its URL.
 
@@ -1337,7 +1420,12 @@ async def open_pr(
     for the FIRST adoption only (the card has no ``pr_url`` yet, so the draft is the
     coder's, not the operator's). The loop passes ``False`` on a re-dispatch of a card
     that already owns a PR: an operator who converted the loop's own PR to draft as a
-    hold must not have it silently un-drafted by the next CI-fail bounce."""
+    hold must not have it silently un-drafted by the next CI-fail bounce.
+
+    ``draft`` opens the PR as a draft — the operator's forced salvage of a tree whose
+    pre-PR gate is red (#427), which must never read as a green, mergeable PR. A PR that
+    already exists for the branch is converted (``gh pr ready --undo``, best-effort — a
+    repo without draft support refuses; the caller checks ``isDraft`` and says so)."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     _rc, out, _err = await _git(worktree, "rev-list", "--count", f"{base}..HEAD")
@@ -1356,8 +1444,20 @@ async def open_pr(
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
+    as_draft = ("--draft",) if draft else ()
     rc, out, err = await _gh(
-        "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body or title, cwd=worktree
+        "pr",
+        "create",
+        "--head",
+        branch,
+        "--base",
+        base,
+        "--title",
+        title,
+        "--body",
+        body or title,
+        *as_draft,
+        cwd=worktree,
     )
     if rc == 0:
         return out.strip()
@@ -1365,7 +1465,11 @@ async def open_pr(
         vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
             url = vout.strip()
-            if promote_draft:
+            if draft:
+                # The PR already exists, so `--draft` never applied: convert it, best-effort.
+                # The caller reads isDraft back rather than trusting this (#427).
+                await _gh("pr", "ready", url, "--undo", cwd=worktree)
+            elif promote_draft:
                 await _promote_adopted_draft(url, branch, cwd=worktree)
             return url
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")

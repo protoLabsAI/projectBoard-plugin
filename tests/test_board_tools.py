@@ -469,10 +469,12 @@ _MINIMAL_ARGS = {
 }
 
 # Tools that never read the beads store: they answer with their own record (board_dispatch's
-# decision record) or their own refusal (board_register_project works the host config seam).
-# They are held to the NEVER-RAISE half of the contract.
+# decision record; board_salvage_feature's, whose store reads happen inside the running loop)
+# or their own refusal (board_register_project works the host config seam). They are held to
+# the NEVER-RAISE half of the contract.
 _NO_STORE_ARGS = {
     "board_dispatch": {},
+    "board_salvage_feature": {"feature_id": "bd-1"},
     "board_register_project": {"name": "x", "repo": "/nope"},
 }
 

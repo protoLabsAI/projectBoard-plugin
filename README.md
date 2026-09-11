@@ -673,9 +673,10 @@ integration tier), **EXEMPT: `<reason>`** (real coverage genuinely not warranted
 stated), or **UNCOVERED** (honest debt) — and the UNCOVERED count is a ratchet that may
 fall, never rise.
 
-`worktree.py` reached its final contract over #361: **28 REAL / 3 EXEMPT / 0 UNCOVERED**
+`worktree.py` reached its final contract over #361: **30 REAL / 3 EXEMPT / 0 UNCOVERED**
 (`MAX_UNCOVERED_WORKTREE = 0`). The 11 local-git seams run against a real bare-origin +
-clone (slice 1), as do #405's stranded-work seams (`preserve_worktree` and three helpers). The 12
+clone (slice 1), as do #405's stranded-work seams (`preserve_worktree` and three helpers) and #427's
+`commits_ahead` and `own_worktree`. The 12
 read-dominant `gh` seams run against a pinned, permanently-open PR with `PB_REQUIRE_GH=1`
 so an absent credential FAILS rather than skips (slice 2), as does #402's `pr_identity`.
 
