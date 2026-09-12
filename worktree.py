@@ -252,7 +252,8 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
     Excludes via a pathspec (``:(exclude)…``) rather than ``.git/info/exclude``, so it
     mutates nothing in the repo and depends on no target-repo ``.gitignore`` entry: the
     exclusion is scoped to this one staging call. The leading ``.`` is the positive
-    pathspec the excludes subtract from.
+    pathspec the excludes subtract from. Scratch the repo already ignores gets no exclude
+    (``add -A`` skips it anyway, and naming an ignored path makes ``add`` exit 1).
 
     The links need their own lookup. A ``node_modules/`` ignore pattern — the trailing-
     slash spelling most Node repos use — matches only a real directory, so the board's
@@ -264,7 +265,16 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
     preservation's private index, which must never touch the tree's."""
     env = {"GIT_INDEX_FILE": index_file} if index_file else None
     kw = {"env": env} if env else {}
-    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    # Only scratch the repo does NOT already ignore needs an exclude: `add -A` skips ignored
+    # paths on its own, and an exclude that NAMES an ignored path makes git print "The
+    # following paths are ignored" and exit 1 — after staging everything else. In a repo
+    # that ignores `.proto` (protoAgent does) that failed every stranded-work save, so the
+    # board kept a finished tree it could have cleared (bd-9wh1).
+    # Plain (not `-z`) output: `-z` is only valid with `--stdin`, and the scratch names are
+    # fixed, unquoted ASCII. Exit 1 = none ignored; anything else keeps every exclude.
+    rc, out, _err = await _git(worktree, "check-ignore", "--", *CODER_SCRATCH, **kw)
+    ignored = {line.strip() for line in out.splitlines()} if rc == 0 else set()
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH if p not in ignored]
     rc, out, _err = await _git(
         worktree, "ls-files", "-z", "--others", "--exclude-standard", "--", ":(glob)**/node_modules", **kw
     )
