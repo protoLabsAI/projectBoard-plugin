@@ -158,6 +158,22 @@ def worktrees_root_for_feature(feature: dict | None, store_kw: dict, instance_ro
     return str((entry or {}).get("worktrees_root") or "").strip() or str(instance_root or "").strip() or ".worktrees"
 
 
+def setup_cmd_for_feature(feature: dict | None, store_kw: dict, instance_cmd: str = "") -> str:
+    """The worktree dependency install (``setup_cmd``) for ``feature``'s project — the
+    route sibling of the loop's ``_setup_cmd_for``: the labeled project's value when it
+    declares one (an empty string included — that turns it off), else the default
+    project's, else the flat instance value."""
+    feature = feature or {}
+    projects = store_kw.get("projects") or {}
+    default = str(store_kw.get("default_project") or "").strip()
+    entry = projects.get(str(feature.get("project") or "").strip() or default)
+    if entry is None:
+        entry = projects.get(default)
+    if entry is not None and "setup_cmd" in entry:
+        return str(entry.get("setup_cmd") or "").strip()
+    return str(instance_cmd or "").strip()
+
+
 def build_router(cfg: dict):
     from fastapi import APIRouter, HTTPException
     from fastapi.responses import HTMLResponse
@@ -989,6 +1005,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 fusion_k=max(1, int((cfg or {}).get("coder_solve_fusion_k", 2))),
                 files_to_modify=f.get("files_to_modify") or [],
                 fusion_max_file_chars=fusion_max_file_chars,
+                # The throwaway candidates get the same dependency install a real build's do.
+                setup_cmd=setup_cmd_for_feature(f, store_kw, str((cfg or {}).get("setup_cmd") or "")),
+                setup_timeout=float((cfg or {}).get("setup_timeout_s", 600) or 600),
             )
         except Exception as exc:  # noqa: BLE001 — surface as a 400, not a raw 500
             raise HTTPException(400, f"test-rung failed: {exc}") from exc

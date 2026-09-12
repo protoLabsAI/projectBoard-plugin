@@ -773,6 +773,62 @@ def link_node_modules(repo: str, worktree: str) -> int:
     return linked
 
 
+# ── a fresh worktree's own dependencies (a project's `setup_cmd`) ─────────────────────
+# `link_node_modules` hands a new tree whatever the repo CHECKOUT last installed. That is
+# cheap, and wrong when the checkout lags the base every worktree branches from (a board's
+# checkout can sit weeks behind `origin/<base>`) — or has nothing installed at all, which
+# left coders with no dependency source on disk: they searched `/` for it, and walking every
+# app's data made macOS prompt the operator in the agent's name. A project that names a
+# `setup_cmd` (`npm ci --prefer-offline`, `pnpm install --frozen-lockfile`, `uv sync`) gets
+# its own install instead, from the worktree's own lockfile.
+_SETUP_OUTPUT_CHARS = 600
+
+
+def _unlink_board_links(worktree: str) -> int:
+    """Remove the ``node_modules`` SYMLINKS ``link_node_modules`` put in ``worktree``, so an
+    install writes into this tree — never through the link into the checkout every other
+    tree shares. Only links: a real directory is the tree's own and is left alone."""
+    removed = 0
+    for root, dirs, _files in os.walk(worktree):
+        if "node_modules" in dirs:
+            path = os.path.join(root, "node_modules")
+            if os.path.islink(path):
+                try:
+                    os.unlink(path)
+                    removed += 1
+                except OSError:
+                    pass
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+    return removed
+
+
+async def prepare_worktree(worktree: str, cmd: str, *, env: dict | None, timeout: float) -> str:
+    """Install a fresh worktree's dependencies with the project's ``setup_cmd``.
+
+    Returns '' on success (or when there is no command), else a one-line reason. A failed
+    or hung install never raises: the coder can still work, and its brief tells it to
+    install what it needs. A CANCEL still propagates, after the tree is killed. The child
+    contract is the gate's (#423): its own process group, no stdin, and the WHOLE tree
+    killed and reaped on a timeout — the hung-install pile-up (#424) cannot recur here."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return ""
+    await asyncio.to_thread(_unlink_board_links, worktree)
+    try:
+        proc = await spawn_shell(
+            cmd, cwd=worktree, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _out, err = await communicate_or_kill(proc, timeout=timeout)
+    except asyncio.TimeoutError:
+        return f"setup_cmd timed out after {timeout:g}s (its process tree was killed)"
+    except OSError as exc:
+        return f"setup_cmd could not start: {exc}"
+    if proc.returncode:
+        tail = (err or b"").decode(errors="replace").strip()[-_SETUP_OUTPUT_CHARS:]
+        return f"setup_cmd exited {proc.returncode}" + (f": {tail}" if tail else "")
+    return ""
+
+
 async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     """Tear down the worktree (and its branch, once merged the branch is junk).
 

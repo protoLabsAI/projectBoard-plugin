@@ -1502,9 +1502,15 @@ class _WorktreeSolveAdapter:
         progress_fid: str | None = None,
         progress_tier: str = "",
         max_concurrent_sessions: int = 0,
+        setup_cmd: str = "",
+        setup_timeout: float = 600.0,
         _fusion_dispatch=None,
     ):
         self.repo = repo
+        # A candidate tree's own dependency install (the project's `setup_cmd`); empty =
+        # borrow the checkout's, as `create_worktree` links them.
+        self.setup_cmd = (setup_cmd or "").strip()
+        self.setup_timeout = setup_timeout
         self.base = base
         self.root = root
         self.fid = fid
@@ -1577,6 +1583,20 @@ class _WorktreeSolveAdapter:
         async with self._wt_lock:
             wt, branch = await worktree.create_worktree(self.repo, self.base, cid, self.root)
         self.candidates.append((wt, branch))
+        # Outside the lock: only `worktree add` must serialize; best-of-k siblings install
+        # in parallel. Best-effort, like the drive's own trees.
+        if self.setup_cmd:
+            try:
+                reason = await worktree.prepare_worktree(
+                    wt,
+                    self.setup_cmd,
+                    env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
+                    timeout=self.setup_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
+                reason = f"setup_cmd could not run: {exc}"
+            if reason:
+                log.warning("[project_board] %s: worktree setup failed, proceeding without it — %s", cid, reason)
         return wt, branch
 
     def _compose_feedback(self, feedback: str | None) -> str | None:
@@ -1867,6 +1887,8 @@ async def dispatch(
     commit_message: str = "",
     title: str = "",
     max_concurrent_sessions: int = 0,
+    setup_cmd: str = "",
+    setup_timeout: float = 600.0,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -1959,6 +1981,8 @@ async def dispatch(
         progress_fid=fid,
         progress_tier=tier,
         max_concurrent_sessions=max_concurrent_sessions,
+        setup_cmd=setup_cmd,
+        setup_timeout=setup_timeout,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:
@@ -2073,6 +2097,8 @@ async def test_rung(
     files_to_modify: list[str] | None = None,
     fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
     env_passthrough: Iterable[str] = (),
+    setup_cmd: str = "",
+    setup_timeout: float = 600.0,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -2111,6 +2137,8 @@ async def test_rung(
         files_to_modify=files_to_modify,
         fusion_max_file_chars=fusion_max_file_chars,
         env_passthrough=env_passthrough,
+        setup_cmd=setup_cmd,
+        setup_timeout=setup_timeout,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:

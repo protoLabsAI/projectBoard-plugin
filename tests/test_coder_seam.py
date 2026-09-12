@@ -2666,3 +2666,73 @@ def test_an_empty_pr_url_is_still_a_fresh_build():
     never opened one, and must keep the ladder."""
     for blank in ("", "   ", None):
         assert should_use_solve(dict(FEATURE_WITH_AC, pr_url=blank), test_cmd="pytest -q", _solve_mod=object())
+
+
+# ── a candidate tree's own dependency install (`setup_cmd`) ─────────────────────────
+
+
+async def _two_candidate_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+    await generate(task, feedback=None)
+    c2 = await generate(task, feedback=None)
+    return _FakeResult(solution=c2, passed=True, rung="best-of-k", gens_spent=2, candidates_tried=2)
+
+
+def _ladder_kwargs(**over):
+    kw = dict(
+        task="do the thing",
+        coder=object(),
+        repo="/repo",
+        base="main",
+        root=".worktrees",
+        fid="bd-7",
+        dispatch_timeout=None,
+        test_cmd="pytest -q",
+        test_timeout=60,
+        budget=4,
+        k=2,
+        tree_depth=0,
+        _solve=_two_candidate_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    kw.update(over)
+    return kw
+
+
+async def test_every_ladder_candidate_installs_its_own_deps(monkeypatch):
+    _stub_worktree(monkeypatch)
+    prepared = []
+
+    async def _prep(wt, cmd, *, env, timeout):
+        prepared.append((wt, cmd, timeout))
+        return ""
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    await dispatch(**_ladder_kwargs(setup_cmd="npm ci", setup_timeout=30))
+    assert prepared == [("/wt/feat-bd-7.g1", "npm ci", 30), ("/wt/feat-bd-7.g2", "npm ci", 30)]
+
+
+async def test_a_ladder_without_setup_cmd_installs_nothing(monkeypatch):
+    _stub_worktree(monkeypatch)
+    prepared = []
+
+    async def _prep(*a, **k):
+        prepared.append(1)
+        return ""
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    await dispatch(**_ladder_kwargs())
+    assert prepared == []
+
+
+async def test_a_failed_candidate_install_does_not_stop_the_ladder(monkeypatch, caplog):
+    created, _removed, promoted = _stub_worktree(monkeypatch)
+    monkeypatch.setattr(worktree, "prepare_worktree", lambda *a, **k: _async("setup_cmd exited 1: ERR!"))
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        await dispatch(**_ladder_kwargs(setup_cmd="npm ci"))
+    assert created == ["bd-7.g1", "bd-7.g2"] and promoted  # the build went on
+    assert "worktree setup failed" in caplog.text and "ERR!" in caplog.text
+
+
+async def _async(val):
+    return val

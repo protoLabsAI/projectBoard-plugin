@@ -1666,6 +1666,9 @@ class DriveMixin:
                             # #86: same host-env strip the gate/preflight/format spawns
                             # get — keep the whitelist consistent across every subprocess.
                             env_passthrough=self.env_passthrough,
+                            # Each ladder candidate installs its own deps too (`setup_cmd`).
+                            setup_cmd=self._setup_cmd_for(feature),
+                            setup_timeout=self.setup_timeout,
                             tier=tier,  # #84: label each solve gen with the current tier
                             # #91: persist the verified candidate on the bead at the
                             # verify boundary, so a crash before open_pr is salvageable.
@@ -1698,6 +1701,7 @@ class DriveMixin:
                             repo, base, fid, self.root, title=raw_title, resume=bool(feature.get("pr_url"))
                         )
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
+                        await self._prepare_tree(wt, feature)  # its own deps, before the coder
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
@@ -2795,6 +2799,24 @@ class DriveMixin:
             return None
         return self._resolve_delegate(assignee, "acp") or self._resolve_delegate(assignee, "a2a")
 
+    async def _prepare_tree(self, wt: str, feature: dict | None) -> None:
+        """Install a fresh worktree's dependencies (the project's ``setup_cmd``) before a
+        coder or a gate runs in it. Best-effort: a failed or timed-out install is logged and
+        the work proceeds — the coder can install what it needs itself."""
+        cmd = self._setup_cmd_for(feature) if feature is not None else self.setup_cmd
+        if not cmd:
+            return
+        try:
+            reason = await worktree.prepare_worktree(wt, cmd, env=self._child_env(), timeout=self.setup_timeout)
+        except Exception as exc:  # noqa: BLE001 — a setup hiccup must never fail the build
+            reason = f"setup_cmd could not run: {exc}"
+        if reason:
+            log.warning(
+                "[project_board] %s: worktree setup failed, proceeding without it — %s",
+                (feature or {}).get("id") or wt,
+                reason,
+            )
+
     async def _run_fixups(self, wt: str, feature: dict | None = None) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.
         ``ruff check --fix . && ruff format .``) in the worktree before opening the PR.
@@ -2999,6 +3021,8 @@ class DriveMixin:
         cands: list[tuple[str, str]] = []
         for cid in cand_ids:
             cands.append(await worktree.create_worktree(repo, base, cid, self.root))
+        # Each candidate's own deps (`setup_cmd`); the installs are independent, so in parallel.
+        await asyncio.gather(*(self._prepare_tree(wt, feature) for wt, _b in cands))
         log.info("[project_board] %s max-mode: dispatching %d parallel candidates", fid, n)
         # Tap each candidate into the live monitor as its own gen (#84) — the drawer
         # shows all N building in parallel; a tap that can't wire degrades per-candidate.

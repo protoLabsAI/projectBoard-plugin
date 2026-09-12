@@ -2270,3 +2270,75 @@ def test_every_data_and_ingress_route_offloads_its_store_calls(monkeypatch):
     assert on_loop == []  # …and no call saw a running loop on its own thread (#258)
     # The PATCH audit comment (`comment`) is a store write too — prove it was swept.
     assert any(call[0] == "comment" for call in store.calls)
+
+
+_SETUP_PROJECTS_CFG = {
+    "repo": "/default",
+    "setup_cmd": "uv sync",  # the board-wide value
+    "default_project": "web",
+    "projects": {
+        "web": {"repo": "/web", "setup_cmd": "npm ci"},
+        "docs": {"repo": "/docs", "setup_cmd": ""},  # explicitly OFF for this project
+        "py": {"repo": "/py"},  # names none → the board-wide value
+    },
+}
+
+
+def _setup_store_kw(cfg):
+    from project_board.projects import default_project as resolve_default_project
+    from project_board.projects import resolve_projects
+
+    return dict(projects=resolve_projects(cfg), default_project=resolve_default_project(cfg))
+
+
+def test_setup_cmd_for_feature_matches_the_loops_order():
+    """The route's `setup_cmd` resolver is pinned against a real BoardLoop's
+    `_setup_cmd_for`, so the test-rung diagnostic installs exactly what a real build
+    of the same card would — every rung of the fallback, and the explicit-empty off."""
+    from project_board.loop import BoardLoop
+
+    store_kw = _setup_store_kw(_SETUP_PROJECTS_CFG)
+    loop = BoardLoop(_SETUP_PROJECTS_CFG)
+    cases = [
+        {"id": "bd-1", "project": "web"},  # the labeled project's own value
+        {"id": "bd-2", "project": "docs"},  # an explicit "" turns it off
+        {"id": "bd-3", "project": "py"},  # names none → the board-wide value
+        {"id": "bd-4"},  # unlabeled → the default project's
+        {"id": "bd-5", "project": "ghost"},  # unknown label → the default project's
+    ]
+    expected = ["npm ci", "", "uv sync", "npm ci", "npm ci"]
+    instance = _SETUP_PROJECTS_CFG["setup_cmd"]
+    assert [api.setup_cmd_for_feature(f, store_kw, instance) for f in cases] == expected
+    assert [loop._setup_cmd_for(f) for f in cases] == expected
+    assert api.setup_cmd_for_feature(None, store_kw, instance) == "npm ci"
+
+
+def test_setup_cmd_for_feature_on_a_flat_single_project_board():
+    """No `projects:` map: the implicit project lifts the flat key, and a board that
+    sets none installs nothing."""
+    from project_board.loop import BoardLoop
+
+    flat = {"repo": "/repo", "setup_cmd": "npm ci"}
+    assert api.setup_cmd_for_feature({"id": "bd-1"}, _setup_store_kw(flat), "npm ci") == "npm ci"
+    assert BoardLoop(flat)._setup_cmd_for({"id": "bd-1"}) == "npm ci"
+    assert api.setup_cmd_for_feature({"id": "bd-1"}, _setup_store_kw({"repo": "/repo"}), "") == ""
+
+
+def test_test_rung_installs_the_features_project_deps_in_its_candidates(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "get_feature", lambda fid: {**_feature_with_ac(fid), "project": "web"})
+    monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
+    monkeypatch.setattr(coder_seam, "resolve_delegate", lambda name, expect_type: object())
+    seen = {}
+
+    async def _fake_test_rung(**kwargs):
+        seen.update(kwargs)
+        return {"rung": "greedy", "passed": True}
+
+    monkeypatch.setattr(coder_seam, "test_rung", _fake_test_rung)
+    cfg = {**_SETUP_PROJECTS_CFG, "coder_solve_test_cmd": "pytest -q", "coder": "proto", "setup_timeout_s": 90}
+    r = _client(monkeypatch, store, cfg=cfg).post(
+        "/api/plugins/project_board/features/bd-7/test-rung", json={"rung": "greedy"}
+    )
+    assert r.status_code == 200
+    assert seen["setup_cmd"] == "npm ci" and seen["setup_timeout"] == 90.0

@@ -1787,8 +1787,11 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         commit_message="",
         title="",
         max_concurrent_sessions=0,
+        setup_cmd="",
+        setup_timeout=600.0,
     ):
         seen["fid"] = fid
+        seen["setup_cmd"] = setup_cmd
         seen["test_cmd"] = test_cmd
         seen["task"] = task
         seen["env_passthrough"] = env_passthrough
@@ -1808,9 +1811,13 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         return "https://example/pr/42"
 
     loop, store = await _drive_with(
-        monkeypatch, open_pr=_open_pr, cfg={"coder": "proto", "local_gate_cmd": "pytest -q"}, gate=_pass_gate
+        monkeypatch,
+        open_pr=_open_pr,
+        cfg={"coder": "proto", "local_gate_cmd": "pytest -q", "setup_cmd": "npm ci"},
+        gate=_pass_gate,
     )
     assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
+    assert seen["setup_cmd"] == "npm ci"  # every ladder candidate installs its own deps
     assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
     assert seen["commit_message"] == "feat: Add a thing"  # the verified commit keeps the PR title
     assert seen["title"] == "Add a thing"  # #227: the RAW title is threaded for the canonical slug
@@ -11233,3 +11240,173 @@ def test_dispatch_says_restart_pending_when_config_already_enabled_it(monkeypatc
 def test_dispatch_falls_back_to_plain_copy_without_a_host(monkeypatch):
     rec = _disabled_loop(monkeypatch, None)._dispatch_disabled_record()
     assert rec["restart_pending"] is False and "loop_enabled=false" in rec["detail"]
+
+
+# ── a fresh worktree's own dependency install (`setup_cmd`) ─────────────────────────
+
+
+def test_setup_cmd_config_parsed():
+    loop = BoardLoop({})
+    assert loop.setup_cmd == "" and loop.setup_timeout == 600  # off by default
+    loop = BoardLoop({"setup_cmd": " npm ci ", "setup_timeout_s": 90})
+    assert loop.setup_cmd == "npm ci" and loop.setup_timeout == 90
+
+
+def test_setup_cmd_resolves_per_project():
+    """A project's own `setup_cmd` wins — an explicit empty one turns it OFF for that
+    project; a project that names none falls back to the board-wide value."""
+    loop = BoardLoop(
+        {
+            "setup_cmd": "uv sync",
+            "default_project": "web",
+            "projects": {
+                "web": {"repo": "/web", "setup_cmd": "npm ci"},
+                "docs": {"repo": "/docs", "setup_cmd": ""},
+                "py": {"repo": "/py"},
+            },
+        }
+    )
+    assert loop._setup_cmd_for({"id": "a", "project": "web"}) == "npm ci"
+    assert loop._setup_cmd_for({"id": "b", "project": "docs"}) == ""
+    assert loop._setup_cmd_for({"id": "c", "project": "py"}) == "uv sync"
+
+
+async def test_prepare_tree_noop_when_unset(monkeypatch):
+    called = []
+    monkeypatch.setattr(worktree, "prepare_worktree", lambda *a, **k: called.append(1))
+    await BoardLoop({})._prepare_tree("/wt", {"id": "bd-1"})
+    assert not called
+
+
+async def test_prepare_tree_hands_the_install_the_allowlist_env(monkeypatch):
+    seen = {}
+
+    async def _prep(wt, cmd, *, env, timeout):
+        seen.update(wt=wt, cmd=cmd, env=env, timeout=timeout)
+        return ""
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    loop = BoardLoop({"setup_cmd": "npm ci", "setup_timeout_s": 45})
+    await loop._prepare_tree("/wt", {"id": "bd-1"})
+    assert seen == {"wt": "/wt", "cmd": "npm ci", "env": loop._child_env(), "timeout": 45.0}
+
+
+async def test_prepare_tree_failure_is_logged_and_the_work_proceeds(monkeypatch, caplog):
+    monkeypatch.setattr(worktree, "prepare_worktree", _aret("setup_cmd timed out after 600s"))
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})
+    assert "bd-1" in caplog.text and "timed out" in caplog.text
+
+
+async def test_drive_installs_the_worktree_deps_before_the_coder(monkeypatch):
+    order = []
+
+    async def _prep(wt, cmd, *, env, timeout):
+        order.append(("setup", wt, cmd))
+        return ""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        order.append(("coder", wt))
+        return "the coder's reply"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/1"
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    await _drive_with(monkeypatch, open_pr=_open_pr, dispatch=_dispatch, cfg={"coder": "proto", "setup_cmd": "npm ci"})
+    assert order[:2] == [("setup", "/wt/feat-bd-1", "npm ci"), ("coder", "/wt/feat-bd-1")]
+
+
+async def test_drive_without_setup_cmd_never_installs(monkeypatch):
+    called = []
+    monkeypatch.setattr(worktree, "prepare_worktree", lambda *a, **k: called.append(1))
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/1"
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)
+    assert not called
+    assert ("open_review", "bd-1", "https://example/pr/1") in store.calls
+
+
+async def test_verify_merged_state_installs_deps_before_the_gate(monkeypatch):
+    """The merged-state tree is fresh too — its gate needs the deps a coder's tree gets."""
+    monkeypatch.setattr(worktree, "origin_head_sha", _aret("def456"))
+    monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt/.verify-feat-bd-1")))
+    removed = []
+
+    async def _remove(repo, wt, branch=""):
+        removed.append(wt)
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    order = []
+
+    async def _prep(wt, cmd, *, env, timeout):
+        order.append(("setup", wt))
+        return ""
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    store = _VerifyStore({"id": "bd-1"})
+    loop = _vloop(setup_cmd="npm ci")
+
+    async def _gate(wt, feature=None):
+        order.append(("gate", wt))
+        return None
+
+    monkeypatch.setattr(loop, "_run_local_gate", _gate)
+    feature = {"id": "bd-1", "labels": ["merged-verified:oldsha"]}
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
+    assert order == [("setup", "/wt/.verify-feat-bd-1"), ("gate", "/wt/.verify-feat-bd-1")]
+    assert removed == ["/wt/.verify-feat-bd-1"]
+
+
+async def test_drive_max_mode_installs_every_candidates_deps_before_any_coder(monkeypatch):
+    order = []
+
+    async def _prep(wt, cmd, *, env, timeout):
+        order.append(("setup", wt))
+        return ""
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        order.append(("coder", wt))
+        return f"reply from {wt}"
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/7"
+
+    async def _judge(feature, base, worktrees):
+        return 0
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _prep)
+    await _drive_with(
+        monkeypatch,
+        open_pr=_open_pr,
+        dispatch=_dispatch,
+        judge=_judge,
+        cfg={"coder": "proto", "max_mode_n": 3, "setup_cmd": "npm ci"},
+    )
+    cands = [f"/wt/feat-bd-1.c{i}" for i in range(3)]
+    assert sorted(wt for kind, wt in order[:3] if kind == "setup") == cands
+    assert sorted(wt for kind, wt in order[3:6] if kind == "coder") == cands
+
+
+async def test_prepare_tree_swallows_an_unexpected_error(monkeypatch, caplog):
+    """Best-effort means an error the helper didn't anticipate is logged too, never
+    raised into the drive — only a cancel propagates."""
+
+    async def _boom(*a, **k):
+        raise RuntimeError("spawn exploded")
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _boom)
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})
+    assert "could not run: spawn exploded" in caplog.text
+
+
+async def test_prepare_tree_lets_a_cancel_through(monkeypatch):
+    async def _cancelled(*a, **k):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})

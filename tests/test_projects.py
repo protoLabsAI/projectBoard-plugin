@@ -340,3 +340,14 @@ def test_api_blank_db_path_reads_the_same_store_get_store_already_resolved(monke
     before = store_mod.get_store(db=cfg.get("db_path") or None, repo=str(tmp_path))  # the pre-seam call
     after = store_mod.get_store(db=api._store_kw(cfg)["db"], repo=str(tmp_path))  # the resolved seam
     assert after is before and before.db == inst
+
+
+def test_setup_cmd_is_a_per_project_setting():
+    """A project's worktree install survives resolution, and the implicit single project
+    lifts the flat key — so both config shapes reach the loop."""
+    from project_board.projects import resolve_projects
+
+    explicit = resolve_projects({"projects": {"web": {"repo": "/web", "setup_cmd": "npm ci"}}})
+    assert explicit["web"]["setup_cmd"] == "npm ci"
+    implicit = resolve_projects({"repo": "/web", "setup_cmd": "uv sync"})
+    assert next(iter(implicit.values()))["setup_cmd"] == "uv sync"
