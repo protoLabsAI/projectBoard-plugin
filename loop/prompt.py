@@ -159,6 +159,24 @@ class PromptMixin:
             "— but name the removed behavior and the reason for it in your final "
             "`## Summary`, so review can judge the removal deliberately.\n"
         )
+        # Standing search-scope block: a coder that can't find a file in its worktree
+        # escalates to a filesystem-wide `find` / `bfs` from `/`. That can't succeed — a
+        # dependency's source is missing because `node_modules` is (a fresh worktree has
+        # none), not because it's somewhere else on the disk — and it costs minutes of the
+        # card's clock. It also reaches every app's data on the box: the coder is a child of
+        # the agent, so the OS asks the OPERATOR to approve "access data from other apps",
+        # naming the desktop app. Observed 2026-09-11: two coders scanning `/` for
+        # `@protolabsai/ui/src`. UNCONDITIONAL, like the scope block above, so no dispatch
+        # path can silently lose it.
+        search_scope_block = (
+            "\n## Search inside your worktree\n"
+            "Search under your worktree — never from `/` or `~`. A file you can't find "
+            "there isn't hiding elsewhere on the disk: a dependency's source is absent "
+            "because it was never installed (a fresh worktree has no `node_modules`). "
+            "Install it in the worktree, read the package's published docs, or say what "
+            "you need and why. A filesystem-wide search burns the card's clock and makes "
+            "the OS prompt your operator for access to other apps' data.\n"
+        )
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
         # CI; lead with the failure so the coder FIXES it this pass (it can't run the
         # checks itself — edit-only). Also widen scope: the fix may touch tests/files
@@ -226,6 +244,7 @@ class PromptMixin:
             f"{repo_conventions_block}"
             f"{design_block}\n"
             f"{preserve_scope_block}"
+            f"{search_scope_block}"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
             f"## Rules\n"

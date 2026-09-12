@@ -503,6 +503,48 @@ def test_scope_preservation_block_cannot_disappear_on_any_path():
     _assert_scope_block(retry)
 
 
+# ── the standing SEARCH-SCOPE block ────────────────────────────────────────────────
+#
+# A coder that can't find a file in its worktree escalates to a filesystem-wide search.
+# It never succeeds (a dependency's source is missing because it was never installed),
+# it costs minutes of the card's clock, and — the coder being a child of the agent — it
+# walks every app's data, so the OS asks the OPERATOR to approve access to other apps.
+
+_SEARCH_MARKERS = (
+    "never from `/`",  # the forbidden move
+    "no `node_modules`",  # why the file is genuinely absent
+    "published docs",  # what to do instead
+)
+
+
+def _assert_search_block(prompt: str):
+    assert "## Search inside your worktree" in prompt
+    for marker in _SEARCH_MARKERS:
+        assert marker in prompt, marker
+
+
+def test_build_prompt_always_tells_the_coder_where_to_search():
+    """Every coding dispatch carries the standing search-scope block — a bare feature
+    included, since a card with no files listed is exactly when a coder goes hunting."""
+    _assert_search_block(BoardLoop({})._build_prompt(FEATURE))
+    _assert_search_block(BoardLoop({})._build_prompt({"id": "x", "title": "T", "spec": "s"}))
+
+
+def test_search_scope_block_cannot_disappear_on_any_path():
+    """UNCONDITIONAL, like the scope block: every optional lever on, and the retry path
+    (where a coder chasing a CI failure is most likely to start searching wide)."""
+    loop = BoardLoop({"gate_files": ["CHANGELOG.md"], "repo_conventions": _CONVENTIONS})
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    _assert_search_block(loop._build_prompt(feature, lessons="- always update the golden map"))
+    loop._ci_feedback["bd-1"] = "REQUESTED CHANGES: drops the null guard"
+    loop._ci_prior_diff["bd-1"] = "diff --git a/x b/x\n+ bad"
+    retry = loop._build_prompt(feature, lessons="- heed me")
+    assert "REJECTED" in retry  # sanity: this really is the retry path
+    _assert_search_block(retry)
+    # and it keeps its own heading — not folded into the scope block above it
+    _assert_scope_block(retry)
+
+
 def test_scope_block_is_separated_from_and_does_not_disturb_existing_blocks():
     """AC r4: the new block is additive — the task, files, gate files, conventions,
     lessons, acceptance criteria and requirement ledger all remain under their own
