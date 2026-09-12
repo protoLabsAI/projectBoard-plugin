@@ -271,6 +271,23 @@ async def test_the_boards_own_droppings_are_neither_work_nor_saved(origin):
 # ── naming: a save can never fail on a collision of our own making ───────────────────
 
 
+async def test_a_repo_that_ignores_the_coder_scratch_can_still_save(origin):
+    """bd-9wh1: in a repo whose .gitignore lists `.proto`, staging named the ignored path in
+    its exclude, git exited 1, and the save failed — so `/done` KEPT a finished tree and told
+    the operator to clear it by hand. The save must land, scratch still left out."""
+    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-9.g1")
+    Path(wt, ".gitignore").write_text("node_modules/\n.proto\n")
+    Path(wt, ".proto").mkdir()
+    Path(wt, ".proto", "session.json").write_text("{}\n")
+    rel, text = _strand(wt, "untracked")
+
+    saved = await worktree.preserve_worktree(origin.clone, wt, branch, summary="test")
+
+    assert _show(origin, saved.ref, rel) == text
+    held = _git("-C", origin.clone, "ls-tree", "-r", "--name-only", saved.ref)
+    assert ".proto/session.json" not in held.splitlines()
+
+
 async def test_an_existing_branch_is_never_overwritten_and_the_save_still_lands(origin, monkeypatch):
     monkeypatch.setattr(worktree, "_stamp", lambda: "20260906T232550.000Z", raising=False)  # red-checkable
     taken = "stranded/feat-bd-7.g1/20260906T232550.000Z"

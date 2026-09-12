@@ -240,6 +240,32 @@ def test_the_parser_ignores_fenced_examples_and_hedged_rows():
     ]
 
 
+def test_a_done_row_may_cite_its_evidence_but_not_hedge():
+    """Coders cite evidence after the status (`- r1: done — <where>`). Reading that as
+    silence left all seven of bd-9wh1's items open through two fix rounds and blocked a
+    finished card; a note after a real separator is a disposition. A note that OPENS with
+    a hedge is still not one — the rule the exact-token parser exists to keep."""
+    evidence = (
+        "## Requirements\n"
+        "- r1: done — `ChatMessageView` (shared by main chat and `PaletteChat`) renders `<SentTimestamp>`\n"
+        "- r2: done: covered by `test_tooltip_label`\n"
+        "- r3: done - see the screenshot\n"
+        "- r4: Done — Notably, both consumers\n"
+    )
+    assert _parse_requirements_reply(evidence) == [{"id": f"r{i}", "status": "done"} for i in range(1, 5)]
+    hedged = (
+        "## Requirements\n"
+        "- r1: done — but only for user messages\n"
+        "- r2: done — partially\n"
+        "- r3: done: not yet wired\n"
+        "- r4: done - pending review\n"
+        "- r5: done — in progress\n"
+        "- r6: done, mostly\n"
+        "- r7: done —\n"
+    )
+    assert _parse_requirements_reply(hedged) == []
+
+
 @requires_br
 def test_a_document_that_quotes_the_format_closes_nothing(board):
     fid = _in_progress(board)

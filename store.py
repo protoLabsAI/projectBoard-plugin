@@ -628,16 +628,20 @@ def apply_requirement_dispositions(items, dispositions) -> list[dict]:
 _REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
 # A row is `<id>: done` or `<id>: declined — <reason>`, and nothing looser (#432 review).
 # The status must be an EXACT token: the old `\b` after it read `done? not yet` and
-# `done-ish, partially` as done, closing an item on a row that says it isn't. So `done`
-# may be followed by a full stop and nothing else, and `declined` needs a real separator
-# (`:`, an em/en dash, or a hyphen with space around it — never `declined-ish`) and a
-# non-empty reason: a decline is the "won't do, and here is why" record, and a bare one
-# says nothing. An explicit `open` is well-formed but is not a disposition, so it, like
-# any other status, leaves the item as it was. (Real coder replies on the live boards
-# already write exactly this: every `done` row bare, every decline `— <reason>`.)
+# `done-ish, partially` as done, closing an item on a row that says it isn't. So `done` may
+# be followed by a full stop, or by a real separator (`:`, an em/en dash, or a hyphen with
+# space around it — never `done-ish`) and a NOTE: coders cite their evidence
+# (`- r1: done — ChatMessageView renders it…`), and reading that as silence blocked a
+# finished card after two fix rounds (bd-9wh1). A note that opens with a hedge (`— but…`,
+# `— partially`, `— not yet`) is still no disposition. `declined` needs a real separator
+# and a non-empty reason: a decline is the "won't do, and here is why" record, and a bare
+# one says nothing. An explicit `open` is well-formed but is not a disposition, so it, like
+# any other status, leaves the item as it was.
+_REQ_HEDGE = r"(?:but|except|partial(?:ly)?|not|mostly|almost|pending|blocked|todo|wip|tbd|in\s+progress)\b"
 _REQ_LINE_RE = re.compile(
     r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
-    r"(?:(?P<done>done)\.?|(?P<declined>declined)(?:\s*[:—–]|\s+-)\s*(?P<reason>\S.*?))\s*$",
+    r"(?:(?P<done>done)(?:\.|(?:\s*[:—–]|\s+-)\s+(?!" + _REQ_HEDGE + r")\S.*?)?"
+    r"|(?P<declined>declined)(?:\s*[:—–]|\s+-)\s*(?P<reason>\S.*?))\s*$",
     re.IGNORECASE,
 )
 # A fenced code block opener/closer (CommonMark: up to three spaces of indent, then three

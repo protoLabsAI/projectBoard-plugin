@@ -152,6 +152,24 @@ async def test_stage_all_excludes_coder_scratch(origin):
     assert ".proto" not in staged
 
 
+async def test_stage_all_succeeds_in_a_repo_that_already_ignores_coder_scratch(origin):
+    """An exclude that NAMES an ignored path makes `git add` print "The following paths are
+    ignored" and exit 1 — after staging everything else. protoAgent ignores `.proto`, so every
+    stranded-work save there failed on that exit code and the board kept a finished tree
+    (bd-9wh1). Ignored scratch needs no exclude: `add -A` already skips it."""
+    wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-ignored")
+    Path(wt, ".gitignore").write_text(".proto\n.cursor\n")
+    for scratch in (".proto", ".cursor"):
+        Path(wt, scratch).mkdir()
+        Path(wt, scratch, "state").write_text("scratch\n")
+    Path(wt, "real.txt").write_text("real\n")
+    rc, _out, err = await worktree.stage_all(wt)
+    assert rc == 0, f"stage_all failed in a repo that ignores its scratch: {err}"
+    staged = _git_run("-C", wt, "diff", "--cached", "--name-only")
+    assert "real.txt" in staged
+    assert ".proto" not in staged and ".cursor" not in staged
+
+
 async def test_commit_worktree_commits_intended_files_only(origin):
     wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-commit")
     Path(wt, "real.txt").write_text("real\n")
