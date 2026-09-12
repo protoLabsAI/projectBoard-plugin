@@ -197,6 +197,12 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # CI and burn a whole bounce/escalation (bd-2fd: a full opus fix blocked on one
         # unused import). Best-effort; CI is still the real gate. Empty = off.
         self.format_cmd = str(self.cfg.get("format_cmd", "")).strip()
+        # A fresh worktree's OWN dependency install (`setup_cmd`, e.g. `npm ci
+        # --prefer-offline`), run before its coder starts. Empty = off: the tree borrows the
+        # repo checkout's installed deps (`worktree.link_node_modules`), as always. Bounded by
+        # `setup_timeout_s`; a failed or hung install is logged and the work proceeds.
+        self.setup_cmd = str(self.cfg.get("setup_cmd", "")).strip()
+        self.setup_timeout = float(self.cfg.get("setup_timeout_s", 600) or 600)
         # Pre-PR LOCAL GATE: the repo's real check command(s) run in the worktree
         # AFTER fixups and BEFORE open_pr (e.g. "ruff check . && uv run --no-sync pytest
         # tests/ -q"). The coder is edit-only — it can't run the suite — so a failure on
@@ -619,6 +625,14 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         if "format_cmd" in pc:
             return str(pc.get("format_cmd") or "").strip()
         return self.format_cmd
+
+    def _setup_cmd_for(self, feature: dict) -> str:
+        """The worktree dependency install (``setup_cmd``) for this feature's project
+        (#90), else the instance default."""
+        pc = self._project_cfg(feature)
+        if "setup_cmd" in pc:
+            return str(pc.get("setup_cmd") or "").strip()
+        return self.setup_cmd
 
     def _gate_files_for(self, feature: dict) -> list[str]:
         """The repo standing gate files (#108) for this feature's project (#90), else

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **21 of 66 keys are in this state, including `coders` and `projects`** —
+never renders it. **23 of 68 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -81,8 +81,18 @@ Run before a PR opens, so a failure costs a fix round instead of a CI round-trip
 | `local_gate_max` | `2` | reload |
 | `local_gate_output_chars` | `4000` | reload **· YAML only** |
 | `format_cmd` | `""` | reload **· YAML only** |
+| `setup_cmd` | `""` | reload **· YAML only** |
+| `setup_timeout_s` | `600` | reload **· YAML only** |
 | `preflight` | `True` | reload **· YAML only** |
 | `preflight_timeout_s` | `self.local_gate_timeout` | reload **· YAML only** |
+
+**`setup_cmd`** — installs a fresh worktree's own dependencies before its coder starts,
+e.g. `npm ci --no-audit --no-fund --prefer-offline`. Runs in every worktree the board makes
+for a build: the card's tree, each Max-Mode and ladder candidate, and the merged-state verify
+tree. Without it, a tree borrows the repo checkout's installed `node_modules` through
+symlinks, which is cheap but hands every card whatever that checkout last installed. Set it
+per project (a `projects:` entry) or board-wide. Bounded by `setup_timeout_s`: a failed or
+hung install is killed, logged, and the work goes ahead without it.
 
 ## Dispatch and escalation
 

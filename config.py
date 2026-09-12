@@ -152,5 +152,5 @@ def sanitized_env(
 # default instance and died). Never mutate the host env: sanitizing the CODER's
 # inherited environment needs an ``env=`` seam through the host ACP adapter instead
 # (tracked upstream). ``sanitized_env`` above stays — it covers every subprocess the
-# loop spawns directly (gate preflight, local_gate_cmd, format_cmd, and the
+# loop spawns directly (gate preflight, local_gate_cmd, format_cmd, setup_cmd, and the
 # coder.solve seam's acceptance-test verify subprocess — #86) without side effects.

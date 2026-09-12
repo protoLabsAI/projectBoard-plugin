@@ -528,7 +528,7 @@ flaky gate never blocks good work, but an *unrunnable* gate never starts bad wor
 
 Every subprocess the loop spawns to run repo-defined commands over coder-written
 code — the gate preflight, the pre-PR `local_gate_cmd`, the auto-fix `format_cmd`,
-and the `coder.solve()` acceptance-test (verify) run — receives a **narrow
+the worktree install `setup_cmd`, and the `coder.solve()` acceptance-test (verify) run — receives a **narrow
 allowlist** environment, not the host's. The child sees only the baseline a
 build/test toolchain needs — `PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `TERM`,
 `SHELL`, `USER`, `CI`, plus the Windows system mirror of the same (`SYSTEMROOT`

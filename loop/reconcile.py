@@ -1402,6 +1402,8 @@ class ReconcileMixin:
             )
             return False
         try:
+            # The merged tree is fresh too: its gate needs the same deps a coder's tree gets.
+            await self._prepare_tree(detail, feature)
             failure = await self._run_local_gate(detail, feature)
         finally:
             await worktree.remove_worktree(repo, detail)

@@ -271,3 +271,26 @@ async def test_a_descendant_that_escapes_the_group_cannot_hang_the_caller(tmp_pa
     # reap's own bound (1s here) cut the wait, rather than the test's safety net (10s).
     assert time.monotonic() - started < 5, "the reap bound did not cap the wait on the escaped pipe"
     assert _alive(pid), "the escaped descendant should have survived the group kill — the premise of this test"
+
+
+async def test_a_hung_worktree_install_is_killed_as_a_tree(tmp_path):
+    """`setup_cmd` is an install — the exact command (`pnpm install`) that hung for 19.5h
+    in #424. Its timeout must take the whole tree down and still return, not raise."""
+    pidfile = tmp_path / "grandchild.pid"
+
+    reason = await asyncio.wait_for(
+        worktree.prepare_worktree(str(tmp_path), _TREE.format(pidfile=pidfile), env=None, timeout=0.5), timeout=15
+    )
+
+    assert "timed out" in reason
+    assert await _gone(await _pid_from(pidfile)), "the install's grandchild outlived its timeout"
+
+
+async def test_a_worktree_install_never_reads_the_servers_stdin(tmp_path, server_stdin_that_never_closes):
+    """An install that prompts (`npx` asking to fetch a package) must see EOF, not block on
+    the desktop app's pipe until the timeout."""
+    reason = await asyncio.wait_for(
+        worktree.prepare_worktree(str(tmp_path), "cat > seen.txt", env=None, timeout=10), timeout=15
+    )
+    assert reason == ""
+    assert (tmp_path / "seen.txt").read_text() == ""
