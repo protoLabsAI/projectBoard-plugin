@@ -2806,7 +2806,10 @@ class DriveMixin:
         cmd = self._setup_cmd_for(feature) if feature is not None else self.setup_cmd
         if not cmd:
             return
-        reason = await worktree.prepare_worktree(wt, cmd, env=self._child_env(), timeout=self.setup_timeout)
+        try:
+            reason = await worktree.prepare_worktree(wt, cmd, env=self._child_env(), timeout=self.setup_timeout)
+        except Exception as exc:  # noqa: BLE001 — a setup hiccup must never fail the build
+            reason = f"setup_cmd could not run: {exc}"
         if reason:
             log.warning(
                 "[project_board] %s: worktree setup failed, proceeding without it — %s",

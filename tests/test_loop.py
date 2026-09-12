@@ -11388,3 +11388,25 @@ async def test_drive_max_mode_installs_every_candidates_deps_before_any_coder(mo
     cands = [f"/wt/feat-bd-1.c{i}" for i in range(3)]
     assert sorted(wt for kind, wt in order[:3] if kind == "setup") == cands
     assert sorted(wt for kind, wt in order[3:6] if kind == "coder") == cands
+
+
+async def test_prepare_tree_swallows_an_unexpected_error(monkeypatch, caplog):
+    """Best-effort means an error the helper didn't anticipate is logged too, never
+    raised into the drive — only a cancel propagates."""
+
+    async def _boom(*a, **k):
+        raise RuntimeError("spawn exploded")
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _boom)
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})
+    assert "could not run: spawn exploded" in caplog.text
+
+
+async def test_prepare_tree_lets_a_cancel_through(monkeypatch):
+    async def _cancelled(*a, **k):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(worktree, "prepare_worktree", _cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})

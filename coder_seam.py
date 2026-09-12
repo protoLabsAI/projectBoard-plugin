@@ -1586,12 +1586,15 @@ class _WorktreeSolveAdapter:
         # Outside the lock: only `worktree add` must serialize; best-of-k siblings install
         # in parallel. Best-effort, like the drive's own trees.
         if self.setup_cmd:
-            reason = await worktree.prepare_worktree(
-                wt,
-                self.setup_cmd,
-                env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
-                timeout=self.setup_timeout,
-            )
+            try:
+                reason = await worktree.prepare_worktree(
+                    wt,
+                    self.setup_cmd,
+                    env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
+                    timeout=self.setup_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
+                reason = f"setup_cmd could not run: {exc}"
             if reason:
                 log.warning("[project_board] %s: worktree setup failed, proceeding without it — %s", cid, reason)
         return wt, branch
