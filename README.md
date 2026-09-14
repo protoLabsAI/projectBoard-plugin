@@ -561,19 +561,22 @@ cached `br --version` at most):
 |---|---|---|
 | `br` | the beads CLI resolves (`BR_BIN` > the auto-fetched binary > `br` on PATH) | "fetching beads-rust vX for <platform> …" while the auto-fetch runs; the download error + the install hint if it failed; the install hint if `br_autofetch` is off / `BR_BIN` is set but unresolvable / the platform has no build (Windows, musl) |
 | `gh` | the GitHub CLI is on PATH | install it + `gh auth login`; builds can't open PRs until then |
-| `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure**. With `coder` **blank**, the ladder is the only dispatch path: escalation must be on (>1 distinct delegate) and the instance map *and* every project map must cover **every** tier (`smart`/`reasoning`/`opus`) — an unmapped rung dispatches to `''` and blocks the card | "no coder configured — pick a delegate in Settings ▸ Project Board or let the agent propose_delegate (the former implicit default `proto` no longer applies — set `coder: proto` to keep it)" / names the unresolvable delegate / names the uncovered tier(s) |
-| `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | set `project_board.repo` to the checkout's absolute path |
+| `coder` | **every** configured coder name (`coder`, the `coders` tier map, each `projects:` entry's `coders`) resolves to a live `acp` delegate — **no names configured is a failure**. With `coder` **blank**, the ladder is the only dispatch path: escalation must be on (>1 distinct delegate) and the instance map *and* every project map must cover **every** tier (`smart`/`reasoning`/`opus`) — an unmapped rung dispatches to `''` and blocks the card | roster-aware when no coder is set: with **zero** ACP delegates on the agent it says none can be selected yet and to declare one in core **Settings ▸ Capabilities ▸ Delegates** before naming it here (an empty board list is not a place to pick from); with some, it names them; with an unreadable roster it keeps the generic "pick a delegate in Settings ▸ Project Board or let the agent propose_delegate (the former implicit default `proto` no longer applies)". Also names the unresolvable delegate / the uncovered tier(s) |
+| `repo` | the board is bound (explicit `repo`/`db_path`/`projects:`) to a directory that exists — or the shipped `repo: "."` default and the cwd already has a `.beads/` | add a repo from the board panel's **Projects ▸ Add project** (needs core Project onboarding on with an **Onboarding root** the repo resolves under — Settings ▸ Capabilities ▸ Project onboarding), or bind one directly with `project_board.repo` (absolute checkout path) / `db_path` / a `projects:` map |
 
 Where it surfaces:
 
 - **`GET /api/plugins/project_board/status`** → `setup: {br, gh, coder, repo, loop_enabled,
-  loop_blockers, loop_cfg_stale, loop_cfg_stale_keys, loop_cfg_stale_hint, ready}` alongside
-  the v0.40.0 `bound` keys. `loop_cfg_stale` is the reload-drift tell: a config reload
-  rebuilds the routers on the NEW config while the running loop keeps its construction-time
+  loop_blockers, loop_cfg_stale, loop_cfg_stale_keys, loop_cfg_stale_hint, loop_restart_required,
+  ready}` alongside the v0.40.0 `bound` keys. `loop_cfg_stale` is the reload-drift tell: a config
+  reload rebuilds the routers on the NEW config while the running loop keeps its construction-time
   `coders` / `repo` / `base_branch` / `db_path` / `projects` — the status compares the two
   and says **"restart the agent to apply"** (on its own line, on the affected hint, and as
   the `loop` host warning) instead of reporting the new config as the loop's state.
-  `coder` is live (applied by `reload()`), so it never goes stale.
+  `coder` is live (applied by `reload()`), so it never goes stale. **`loop_restart_required`**
+  is that drift made actionable: `true` only when the loop is configured **on** *and* running on a
+  stale knob, so the "restart to apply" state is distinguished from a loop simply configured off
+  (which has nothing running to restart).
 - **The board page** renders each failing check with its hint (a warning card above the
   board, or in place of the raw error when the board can't be read at all).
 - **Host operator warnings** — each failing check is forwarded to the host's
