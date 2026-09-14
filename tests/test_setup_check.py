@@ -278,6 +278,24 @@ def test_unbound_default_repo_fails_unless_cwd_already_has_a_beads_workspace():
     assert s["repo"]["ok"] is True and s["repo"]["path"] == "."
 
 
+def test_unbound_repo_hint_names_the_add_project_path_its_prerequisite_and_the_direct_binding():
+    """r2 (protoAgent#3405): the unbound-repo guidance names the board panel's own Add-project
+    path AND its onboarding-root prerequisite (that path is dead without it), while RETAINING the
+    direct project_board.repo binding as the alternative that needs no onboarding root."""
+    common = dict(which=_which_all, delegates=_delegates("proto"), run=_fake_run())
+    s = setup_status({"coder": "proto"}, isdir=lambda p: False, **common)
+    hint = s["repo"]["hint"]
+    assert hint == setup_check.REPO_UNBOUND_HINT
+    # the board panel's Add-project path…
+    assert "Projects ▸ Add project" in hint
+    # …its onboarding-root prerequisite (enabled + a root the repo resolves under)…
+    assert "Project onboarding" in hint and "Onboarding root" in hint
+    assert "resolve under that root" in hint
+    # …and the direct binding is still offered as the alternative
+    assert "project_board.repo" in hint and "db_path" in hint and "projects: map" in hint
+    assert s["repo"]["ok"] is False and "repo" in s["loop_blockers"]
+
+
 def test_bound_repo_must_exist_on_disk(tmp_path):
     s = setup_status(
         {"coder": "proto", "repo": "/nowhere/at/all"},
@@ -1183,6 +1201,57 @@ def test_stale_loop_keys_compare_only_restart_knobs():
     assert setup_check.stale_loop_keys({"repo": "/b"}, None) == []
 
 
+# ── r3: a stale running loop is an ACTIONABLE preflight result (protoAgent#3405) ──────
+# The running loop being on a stale restart-only knob is only actionable while the loop is
+# configured ON — a board with `loop_enabled` off has nothing running to restart. `setup_status`
+# surfaces that as its own explicit `loop_restart_required` result so the restart-required case
+# is distinguished from a loop simply configured off, instead of riding only the buried
+# `loop_cfg_stale` advisory.
+
+
+def test_loop_restart_required_when_configured_on_and_running_loop_is_stale(tmp_path):
+    snap = setup_check.snapshot_of({"repo": "/old/checkout", "coder": "proto"})
+    s = setup_status(
+        {"repo": str(tmp_path), "coder": "proto", "loop_enabled": True},
+        which=_which_all,
+        delegates=_delegates("proto"),
+        run=_fake_run(),
+        loop_snapshot=snap,
+    )
+    assert s["loop_cfg_stale"] is True and s["loop_cfg_stale_keys"] == ["repo"]
+    assert s["loop_restart_required"] is True  # the actionable, distinguished result
+    assert "restart the agent to apply" in s["loop_cfg_stale_hint"]  # restart-required wording
+
+
+def test_loop_restart_not_required_when_configured_off_even_if_snapshot_is_stale(tmp_path):
+    """Configured OFF is distinguished from configured-on-but-stale — a `loop_enabled: false`
+    board has nothing running to restart, so `loop_restart_required` stays False even if a
+    lingering snapshot drifted. The raw `loop_cfg_stale` advisory is unchanged (additive)."""
+    snap = setup_check.snapshot_of({"repo": "/old/checkout", "coder": "proto"})
+    s = setup_status(
+        {"repo": str(tmp_path), "coder": "proto", "loop_enabled": False},
+        which=_which_all,
+        delegates=_delegates("proto"),
+        run=_fake_run(),
+        loop_snapshot=snap,
+    )
+    assert s["loop_enabled"] is False
+    assert s["loop_cfg_stale"] is True  # the drift advisory itself is not narrowed
+    assert s["loop_restart_required"] is False
+
+
+def test_loop_restart_not_required_when_enabled_but_fresh(tmp_path):
+    cfg = {"repo": str(tmp_path), "coder": "proto", "loop_enabled": True}
+    s = setup_status(
+        cfg,
+        which=_which_all,
+        delegates=_delegates("proto"),
+        run=_fake_run(),
+        loop_snapshot=setup_check.snapshot_of(cfg),
+    )
+    assert s["loop_cfg_stale"] is False and s["loop_restart_required"] is False
+
+
 def test_status_route_runs_the_preflight_off_the_event_loop(monkeypatch, tmp_path):
     import threading
 
@@ -1658,7 +1727,13 @@ def test_no_coder_and_no_delegates_says_to_add_one_first(tmp_path):
     s = _no_coder(tmp_path, delegates=lambda _n: None, acp_delegates=lambda: [])
     hint = s["coder"]["hint"]
     assert hint == setup_check.NO_DELEGATE_HINT
-    assert "Settings ▸ Delegates" in hint and "propose_delegate" in hint
+    # r1: it says plainly that no coder can be selected yet, names the EXACT core Delegates
+    # surface (Settings ▸ Capabilities ▸ Delegates), and that a delegate must be declared there
+    # before it can be named as the board's coder.
+    assert "none can be selected yet" in hint
+    assert "Settings ▸ Capabilities ▸ Delegates" in hint and "propose_delegate" in hint
+    assert "Declare one first" in hint and "name it as the coder in Settings ▸ Project Board" in hint
+    # it must NOT tell the operator to pick from the board's (empty) list
     assert "pick a delegate in Settings ▸ Project Board" not in hint  # the unfollowable advice
     assert "coder" in s["loop_blockers"]
 

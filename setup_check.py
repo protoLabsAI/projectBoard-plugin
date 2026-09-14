@@ -115,19 +115,30 @@ NO_CODER_HINT = (
     f"propose_delegate; the board is paused until then {_PROTO_DEFAULT_GONE}"
 )
 # protoAgent#3405: the plain hint told an operator with ZERO delegates to "pick a delegate"
-# — an empty dropdown and no next step. When the roster is readable, say what's actually
-# there (or that nothing is, and where to add one).
+# — an empty dropdown and no next step, and the fix lives in CORE's Settings ▸ Capabilities ▸
+# Delegates, not the board's own settings. When the roster is readable and empty, say plainly
+# that no coder can be selected yet, name the exact core Delegates surface, and that an ACP
+# delegate must be DECLARED there before it can be named as the board's coder.
 NO_DELEGATE_HINT = (
-    "no coder configured, and this agent has no coding delegate to pick — add one first in "
-    "Settings ▸ Delegates (an ACP coding agent, e.g. Claude Code via claude-agent-acp) or ask "
-    "the agent to propose_delegate, then choose it in Settings ▸ Project Board; the board is "
-    "paused until then"
+    "no coder configured, and none can be selected yet — this agent has no ACP coding delegate "
+    "to choose. Declare one first in core Settings ▸ Capabilities ▸ Delegates (an ACP coding "
+    "agent, e.g. Claude Code via claude-agent-acp) or ask the agent to propose_delegate, then "
+    "name it as the coder in Settings ▸ Project Board; the board is paused until then"
 )
 RESTART_NOTE = "the running loop still has the previous value — restart the agent to apply"
+# protoAgent#3405: name the board panel's own Add-project path (the Projects panel's
+# "Add project" editor) AND its onboarding-root prerequisite — that path is gated on core
+# Project onboarding being on with an Onboarding root the repo resolves under (view/projects.js
+# refuses the edit otherwise), so pointing an operator at it without the prerequisite is another
+# dead end. The direct project_board.repo / db_path / projects: binding stays as the alternative
+# that needs no onboarding root.
 REPO_UNBOUND_HINT = (
-    "board not bound to a repo — set project_board.repo to the absolute path of the git checkout "
-    "this agent manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board "
-    "is paused until then"
+    "board not bound to a repo — add one from the board panel's Projects ▸ Add project (this "
+    "needs core Project onboarding switched on with an Onboarding root set in Settings ▸ "
+    "Capabilities ▸ Project onboarding, and the repo must resolve under that root), or bind one "
+    "directly by setting project_board.repo to the absolute path of the git checkout this agent "
+    "manages (or db_path, or a projects: map) in Settings ▸ Project Board; the board is paused "
+    "until then"
 )
 
 
@@ -648,6 +659,9 @@ def setup_status(
           "loop_cfg_stale": bool,      # the RUNNING loop is on an older restart-only knob
           "loop_cfg_stale_keys": [k…], # which ones (coders/repo/base_branch/db_path/projects)
           "loop_cfg_stale_hint": str,  # operator copy, "" when not stale
+          "loop_restart_required": bool, # loop configured ON *and* running on a stale knob — a
+                                       # restart is needed to apply the change (distinct from
+                                       # loop configured OFF, which has nothing running to restart)
           "legacy_store_repos": [p…],  # repos still carrying a pre-D3 `.beads/` workspace (D3 #260)
           "legacy_store_hint": str,    # migration copy, "" when the advisory is quiet
           "review_status_ok": bool,    # the review gate can publish its QA-panel commit status (#354)
@@ -768,6 +782,11 @@ def setup_status(
     status["loop_cfg_stale_hint"] = (
         f"config changed since the loop started ({', '.join(stale_keys)}) — {RESTART_NOTE}" if stale_keys else ""
     )
+    # r3 (protoAgent#3405): the stale-knob drift is only ACTIONABLE while the loop is configured
+    # ON — a board with `loop_enabled` off has nothing running to restart. Surface that as its
+    # own explicit preflight result so the restart-required case is distinguished from a loop
+    # that is simply configured off, instead of being buried in the loop_cfg_stale advisory.
+    status["loop_restart_required"] = bool(status["loop_enabled"] and stale_keys)
     for key in ("coder", "repo"):
         drifted = [k for k in stale_keys if k in _STALE_KEYS_PER_CHECK[key]]
         if drifted and not status[key]["ok"]:
