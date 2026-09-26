@@ -137,7 +137,9 @@ def _held_summary(feats) -> dict:
                 and not store_mod.blocked_before_ready(rows[fid])
                 and (rows[fid].get("budgets") or {}).get("unblock-retry", 0) < _UNBLOCK_RETRY_MAX
             ]
-            if healing and len(healing) == len(ids):
+            if cls == PREFLIGHT_HOLD_CLASS:
+                step = PREFLIGHT_HOLD_STEP
+            elif healing and len(healing) == len(ids):
                 step = f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
             elif healing:
                 step = (
