@@ -153,6 +153,10 @@ class PreflightMixin:
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             text = text or f"gate exited {proc.returncode} with no output"
+            if proc.returncode in _GATE_NOT_FOUND_EXITS:
+                # The gate never ran (#3585). Say so on the LAST line — the one the hold
+                # stamps on each card — instead of leaving a bare shell error there.
+                text += "\n" + _missing_gate_command_hint(name, cmd, text)
             if self._record_preflight_failure(name, text):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
@@ -166,7 +170,12 @@ class PreflightMixin:
                 return
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
-            if self._record_preflight_failure(name, f"gate command could not run: {exc}"):
+            reason = f"gate command could not run: {exc}"
+            # A missing CHECKOUT raises the same FileNotFoundError (the cwd); only name the
+            # command when the checkout is there.
+            if isinstance(exc, FileNotFoundError) and repo and os.path.isdir(repo):
+                reason += "\n" + _missing_gate_command_hint(name, cmd, "")
+            if self._record_preflight_failure(name, reason):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
                     name,
@@ -212,7 +221,10 @@ class PreflightMixin:
             tail = reason.splitlines()[-1][:200]
             short = f"{PREFLIGHT_BLOCK_PREFIX} — the coder environment can't run the gate: {tail}"
             try:
-                store.flag_blocked(fid, short)
+                # Its own class (#3585), not whatever `classify()` makes of the gate's
+                # tail — that fell through to `terminal`, "needs a human, never clears",
+                # on a card this loop releases itself once the gate runs again.
+                store.flag_blocked(fid, short, category=PREFLIGHT_HOLD_CLASS)
                 held.add(fid)
                 log.info("[project_board] preflight hold: flagged %s blocked (project %s gate not runnable)", fid, name)
             except Exception:  # noqa: BLE001 — a hold that can't be recorded must not kill the tick

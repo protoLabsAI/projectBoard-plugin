@@ -115,6 +115,15 @@ PRE_MODEL_DISPATCH_CLASS = "dispatch-infra"
 # is told, with the paths, and the card stays put.
 STRANDED_WORK_CLASS = "stranded-work"
 
+# The `blocked-class:` of a ready card HELD because its project's gate preflight does not
+# pass on clean base (#90; protoLabsAI/protoAgent#3585). The loop's own class, like the two
+# above. It used to fall through `classify()` to `terminal`, which read as "needs a human,
+# never clears" on a card the loop itself releases the moment the project's gate runs again
+# (and at boot, #186). What needs fixing is the project's gate ENVIRONMENT, not the card.
+# Absent from the sweep's self-healing set on purpose: the preflight owns the release, and
+# a sweep requeue would only race it into an immediate re-hold.
+PREFLIGHT_HOLD_CLASS = "preflight-hold"
+
 # The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
 # and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
 # WorktreeError and every watchdog kill to `coder timed out after …`, so a message that

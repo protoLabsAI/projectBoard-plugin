@@ -645,6 +645,8 @@ class ReconcileMixin:
                 who = (
                     f"retries on its own ({cls})"
                     if cls in _SELF_HEALING_BLOCKS
+                    else f"held until {PREFLIGHT_HOLD_STEP} ({cls})"
+                    if cls == PREFLIGHT_HOLD_CLASS
                     else f"needs a human ({cls or 'unclassified'})"
                 )
                 f["next_action_hint"] = f"{who}: {reason}"
@@ -835,9 +837,17 @@ class ReconcileMixin:
                 # Its block may have been nothing BUT that wait, and nothing clears a block
                 # for you, so this is the moment whoever set it needs to hear about it.
                 stranded = store_mod.stranded_posture(f)["next_action_hint"]
+                # A preflight hold (#3585) DOES clear itself — once its project's gate runs.
+                # The operator still hears about it (the environment needs them), but not as
+                # a card that is stuck for good.
+                head = (
+                    f"Board card {fid} is held by its project's gate preflight ({PREFLIGHT_HOLD_STEP})"
+                    if cls == PREFLIGHT_HOLD_CLASS
+                    else f"Board card {fid} is blocked and will not clear itself ({why})"
+                )
                 self._notify_operator(
                     fid,
-                    f"Board card {fid} is blocked and will not clear itself ({why}): "
+                    f"{head}: "
                     f"{reason or 'no reason recorded'}"
                     + (f" — {title}" if title else "")
                     + (f". Note: {stranded}" if stranded else ""),
