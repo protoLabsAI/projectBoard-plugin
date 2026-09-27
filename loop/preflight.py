@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
+from ..projects import orphaned_cards
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
@@ -400,3 +401,71 @@ class PreflightMixin:
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] preflight release: clear_blocked failed for %s", fid, exc_info=True)
         self._preflight_held.pop(name, None)
+
+    # ── base-checkout freshness (#452) ───────────────────────────────────────────
+    async def _refresh_base_checkouts(self) -> None:
+        """Fetch each project's base and fast-forward its MAIN checkout when that is safe
+        (clean, on the base branch, nothing local the remote lacks) — the health sweep's
+        step (a2). Worktrees were always cut from ``origin/<base>``, but the checkout the
+        agent READS (and the gate preflight smokes) never moved: an agent read a v0.7.1
+        tree an hour after v0.9.0 shipped. A checkout that can't be moved safely is left
+        exactly as it is and reported ``stale`` on ``/status`` with the reason.
+
+        Skips a checkout whose registration-time gate smoke is running right now (the
+        registry's per-checkout smoke lock), so a fast-forward never lands under a gate."""
+        if not self.base_refresh:
+            return
+        from ..project_registry import _SMOKE_LOCKS
+
+        results: dict[str, dict] = {}
+        done: dict[tuple[str, str], dict] = {}
+        for name in list(self._projects):
+            repo = self._repo_for({"project": name})
+            base = self._base_branch_for({"project": name})
+            if not repo or not os.path.exists(os.path.join(repo, ".git")):
+                continue  # no checkout: the repo setup check owns that
+            key = (os.path.realpath(repo), base)
+            if key not in done:
+                lock = _SMOKE_LOCKS.get(str(Path(repo).expanduser().resolve()))
+                if lock is not None and lock.locked():
+                    continue  # a registration gate smoke is running in this checkout — next sweep
+                done[key] = await worktree.refresh_base_checkout(repo, base)
+                state = done[key]["state"]
+                # WARN once per distinct reason; the sweep re-checks every few minutes, and an
+                # unchanged stale checkout re-logged each time would bury the log.
+                seen = self.__dict__.setdefault("_base_stale_logged", {})
+                if state == "stale" and seen.get(key) != done[key]["detail"]:
+                    log.warning("[project_board] base checkout for %s is stale: %s", name, done[key]["detail"])
+                if state == "stale":
+                    seen[key] = done[key]["detail"]
+                else:
+                    seen.pop(key, None)
+                if state == "unknown":
+                    log.info("[project_board] base checkout for %s not refreshed: %s", name, done[key]["detail"])
+            results[name] = {
+                "repo": repo,
+                "base": base,
+                **done[key],
+                "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        health.publish_base_checkouts(results)
+
+    async def _publish_orphaned_cards(self, store) -> None:
+        """Publish the live cards whose project label no longer resolves (#454) for
+        ``/status`` — the health sweep's step (a3). Read-only: a card is never re-homed for
+        the operator, only named with the call that would do it."""
+        try:
+            feats = await asyncio.to_thread(store.list_features)
+        except store_mod.BoardTimeout:
+            raise
+        except BoardError as exc:
+            log.warning("[project_board] sweep: could not read cards for the orphaned-project check: %s", exc)
+            return
+        orphans = orphaned_cards(feats, self._projects, self._default_project)
+        if orphans:
+            log.warning(
+                "[project_board] %d card(s) carry a project that is not in project_board.projects: %s",
+                len(orphans),
+                ", ".join(f"{o['id']} ({o['project']})" for o in orphans[:10]),
+            )
+        health.publish_orphaned_cards(orphans)

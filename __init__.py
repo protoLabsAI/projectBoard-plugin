@@ -457,7 +457,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 
 def _board_tools(cfg: dict):
     from .projects import default_project as resolve_default_project
-    from .projects import resolve_projects, store_db_path
+    from .projects import rehome_hint, resolve_projects, store_db_path, unresolved_project
     from .store import (
         MANUAL_BLOCK_CLASS,
         BoardError,
@@ -721,6 +721,7 @@ def _board_tools(cfg: dict):
         source_issue: str = "",
         priority: int | None = None,
         waits_for: str = "",
+        project: str = "",
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
@@ -734,10 +735,13 @@ def _board_tools(cfg: dict):
         this tool never removes the flag). `source_issue` (a full GitHub issue URL or
         `owner/repo#N`, stored normalized off-label in the bead's notes metadata)
         sets/replaces the originating issue the feature's PR will reference as
-        `Fixes #N`. There is deliberately NO `project` argument: a feature's project
-        (#90) is immutable once stamped — it determines which repo the feature's
-        worktree/PR target, and re-homing an in-flight card mid-stream would strand its
-        branch; cancel and recreate to move a feature to another project. `priority`
+        `Fixes #N`. `project` RE-HOMES the card to another entry of the board's
+        `projects:` map (#454) — e.g. the cards left on `default` after a board moved from
+        the flat `repo:` binding to projects. A card's project decides which repo its
+        worktree/branch/PR target, so the move is allowed only while the card is backlog
+        or ready, has no PR and has never been dispatched; otherwise it is refused with
+        the reason (a ready card must also have its files_to_modify in the new repo — fix
+        them in the same call). Empty leaves the project as-is. `priority`
         changes the scheduling rank in place when supplied (0 = highest); omitted/None
         leaves the current priority untouched. `waits_for` REPLACES the card's publish
         gates (comma-separated npm:/release:/pr: specs, see board_create_feature); `none`
@@ -781,6 +785,9 @@ def _board_tools(cfg: dict):
             )
             if priority is not None:
                 update_kw["priority"] = priority
+            project = _strip_wrapping_quotes(project).strip()
+            if project:
+                update_kw["project"] = project
             waits_for = _strip_wrapping_quotes(waits_for).strip()
             if waits_for:
                 clear = waits_for.lower() in ("none", "clear", "-")
@@ -1308,6 +1315,10 @@ def _board_tools(cfg: dict):
         the features that build in that project — the multi-repo board's "just this
         repo's cards" view. Omitted (the default) lists every project; each row carries
         its `project` field so an unfiltered listing stays legible on a mixed board.
+        A live row whose `project` is NOT in the map (#454 — typically `default`, left
+        behind when the board moved from the flat `repo:` binding to projects) carries
+        `project_unresolved: true` and a `project_hint` naming the
+        board_update_feature(project=...) call that re-homes it.
 
         Every `in_review` row carries `next_action` — the ONE sentence that says what
         moves it (#208): `awaiting-merge (auto_merge off)` (reviewed, nothing
@@ -1379,6 +1390,10 @@ def _board_tools(cfg: dict):
             }
             if f.get("waits_for"):
                 row["waits_for"] = f["waits_for"]
+            orphan = unresolved_project(f, projects)
+            if orphan and f["board_state"] not in ("done", "cancelled"):
+                row["project_unresolved"] = True
+                row["project_hint"] = rehome_hint(f["id"], orphan, projects, default_proj)
             if f.get("next_action"):
                 row["next_action"] = f["next_action"]
                 row["awaiting_merge"] = bool(f.get("awaiting_merge"))

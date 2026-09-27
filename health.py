@@ -90,3 +90,27 @@ def advisory_hint() -> str:
     for name, why in sorted(snap["unwinnable_oracle"].items()):
         parts.append(f"project {name!r}: coder.solve() is off — {why}")
     return "; ".join(parts)
+
+
+def publish_base_checkouts(results: dict) -> None:
+    """Called by the health sweep with ``{project: {repo, base, state, behind, detail,
+    checked_at}}`` — how each project's MAIN checkout compares with ``origin/<base>`` after
+    the sweep's refresh (#452; see ``worktree.refresh_base_checkout``)."""
+    _health["base_checkouts"] = {n: dict(r) for n, r in (results or {}).items()}
+
+
+def base_checkouts_snapshot() -> dict:
+    """``{project: {repo, base, state, behind, detail, checked_at}}`` — empty before the
+    first sweep, on a board whose loop is off, or with ``base_refresh: false``."""
+    return {n: dict(r) for n, r in (_health.get("base_checkouts") or {}).items()}
+
+
+def publish_orphaned_cards(cards: list) -> None:
+    """Called by the health sweep with the live cards whose project label no longer
+    resolves (#454; see ``projects.orphaned_cards``)."""
+    _health["orphaned_cards"] = [dict(c) for c in cards or ()]
+
+
+def orphaned_cards_snapshot() -> list:
+    """The orphaned cards the last sweep found — ``[]`` before the first sweep."""
+    return [dict(c) for c in _health.get("orphaned_cards") or ()]

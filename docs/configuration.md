@@ -71,6 +71,39 @@ not have is a hard error, not a fallback.
 without a `project`. Leave it unset with exactly one project configured and that one is
 used; leave it unset with several and the caller must name one.
 
+**Registering a project also makes it a managed project (#452).** `board_register_project`
+and `PUT /projects/{name}` write the board entry AND, unless the repo is already one, a
+READ-ONLY entry in the host's managed-projects registry (top-level `projects:`, ADR 0095):
+`name`, `path`, `github` (from the checkout's `origin` remote), `default_branch` (the
+board's `base_branch`) and `write: false`. That registry is what the agent's own filesystem
+tools read through, so the agent can read the checkout its coders branch from. Both go in
+one `apply_settings` call. When the instance carries an explicit `filesystem.projects`
+override, the entry is mirrored there too, as `onboard_project` does. The board never turns
+`filesystem.enabled` on; the reply says so when it is off.
+
+The board entry records what it added as `managed_project: <name>` (plus `managed_fence:
+true` for a fence mirror). A later save keeps that entry's `path`/`github`/`default_branch`
+in step. Deleting the board project removes the managed entry **only** if the board added
+it and it still points at the board's repo. An entry that already existed (from
+`onboard_project` or the operator) is never changed or removed. A name another path already
+uses is skipped and reported, not overwritten.
+
+**Moving from the flat binding to `projects:` (#454).** A flat `repo` left set beside a
+`projects:` map is flagged as the `legacy_binding` advisory on `GET /status` (under
+`setup`), and the loudest case is a flat `repo` that is another clone of a project's own
+GitHub remote. The rule it states: a card labeled with a registered project builds, gates and
+passes the Ready gate in that project's repo (`projects.<name>.repo`). The flat `repo` is
+read only by the Ready gate's path check for unlabeled cards and cards whose project is not
+registered, while the loop builds those in the default project's repo. A flat
+`local_gate_cmd` is still the gate for every project whose entry sets none. Remove the flat
+`repo` once the projects are in place.
+
+Cards created before the move carry project `default`, which no longer resolves. They are
+flagged: `board_list` rows get `project_unresolved: true` and a `project_hint`, and the
+health sweep lists them under `orphaned_cards` on `GET /status`. Re-home each one with
+`board_update_feature(feature_id=…, project=<name>)`. That works while the card is backlog or
+ready, has no PR and has never been dispatched, and is refused with the reason otherwise.
+
 ## The gate — the coder's fast slice of CI
 
 Run before a PR opens, so a failure costs a fix round instead of a CI round-trip.
@@ -340,6 +373,7 @@ blank.
 | Key | Default | Applies |
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
+| `base_refresh` | `True` | **restart** |
 | `decompose_after_timeouts` | `2` | **restart** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
@@ -373,6 +407,15 @@ The task gives the agent a fixed order, each step passing the gates the next one
 The ask is made once per card. Unblocking a parked card resets its count, so a retry after
 raising `coder_timeout_s` is a real attempt. Set `0` to switch the ask off and have the card
 simply block, as it did before.
+
+`base_refresh` keeps each project's MAIN checkout current (#452). Worktrees are always cut
+from `origin/<base>`, but the checkout itself (the tree the agent reads, and the one the gate
+preflight runs in) used to stay at whatever it was cloned at. Each health sweep now fetches
+the base and runs `merge --ff-only` on the checkout, but only when it is clean, on the base
+branch, and has no local commits the remote lacks. The board never resets, stashes, rebases
+or switches branches. Any other checkout is left exactly as it is and listed under
+`stale_base_checkouts` on `GET /status`, with the reason (uncommitted changes, another branch,
+diverged). `false` turns off the fetch as well.
 
 ## Concurrency
 

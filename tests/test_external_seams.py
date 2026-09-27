@@ -117,6 +117,7 @@ WORKTREE_SEAMS: dict[str, str] = {
         "created PR (operator chose not to provision one now). Run on every delivery in production; "
         "residual risk is delayed feedback via a blocked card / operator signal, not absent execution."
     ),
+    "origin_github_slug": "REAL",  # #452: real git remotes in tests/test_managed_project_452.py
     "origin_head_sha": "REAL",
     "own_worktree": "REAL",
     "post_or_update_pr_comment": "REAL",
@@ -132,6 +133,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "prune_stale_worktrees": "REAL",
     "read_review_status": "REAL",
     "rebase_onto_base": "REAL",
+    "refresh_base_checkout": "REAL",  # #452: real bare origin + clone in tests/test_base_refresh_452.py
     "remove_worktree": "REAL",
     "repo_slug": "REAL",
     "preserve_worktree": "REAL",
@@ -162,6 +164,20 @@ GATES_SEAMS: dict[str, str] = {
     "eval_release": "REAL",
 }
 MAX_UNCOVERED_GATES = 0
+
+# project_registry.py — writes the host's config through `HOST.apply_settings` (the board's
+# own `project_board.projects` map and, since #452, the host's ADR 0095 `projects:` registry
+# in the same patch). The plugin suite is HOST-FREE, so there is no real host to write to in
+# CI: `_apply_registry` is exercised against `apply_like_host` (tests/test_project_registry.py),
+# a fake that reproduces `graph.config_io.apply_updates_to_yaml`'s merge rules (member maps
+# merge, `None` deletes, a top-level list is assigned wholesale) and is itself checked
+# against the real host function by tests/test_host_apply_conformance.py when protoAgent is
+# importable (skipped in CI). That is a fake at an external seam — the #408 shape — so it is
+# classified UNCOVERED, honestly, and ratcheted like the others.
+HOST_SEAMS: dict[str, str] = {
+    "_apply_registry": "UNCOVERED",
+}
+MAX_UNCOVERED_HOST = 1
 
 # store.py — shells `br`. This is the strong tier: CI runs a real pinned binary across
 # a version matrix (0.1.23 / 0.2.16 / 0.3.2) with PB_REQUIRE_BR=1 so an absent binary
@@ -325,6 +341,28 @@ def test_gates_seams_are_all_covered_and_the_real_tier_cannot_skip_in_ci():
     assert "tests/test_publish_gate_real.py" in ci and "PB_REQUIRE_NPM" in ci
 
 
+def _host_config_writers(path: str) -> set[str]:
+    """Every function in ``path`` that CALLS ``HOST.apply_settings`` — directly, or handed to
+    ``asyncio.to_thread`` (the seam is heavy, so that is how it is called). A guard such as
+    ``HOST.apply_settings is None`` is not a call and does not count."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse((_ROOT / path).read_text())):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            targets = [sub.func, *sub.args]
+            if any(isinstance(t, ast.Attribute) and t.attr == "apply_settings" for t in targets):
+                found.add(node.name)
+                break
+    return found
+
+
+def test_every_host_config_seam_is_classified():
+    _classify(HOST_SEAMS, _host_config_writers("project_registry.py"), "project_registry.py")
+
+
 def test_every_store_external_seam_is_classified():
     _classify(STORE_SEAMS, _external_seams("store.py", {"_run"}), "store.py")
 
@@ -342,6 +380,10 @@ def test_uncovered_seams_never_increase():
         "solely against a mock of that effect — the shape that shipped #353, #354 and #356."
     )
     assert s <= MAX_UNCOVERED_STORE, f"store.py uncovered external seams rose to {s} (ratchet: {MAX_UNCOVERED_STORE})"
+    h = sum(1 for v in HOST_SEAMS.values() if v == "UNCOVERED")
+    assert h <= MAX_UNCOVERED_HOST, (
+        f"project_registry.py uncovered host-config seams rose to {h} (ratchet: {MAX_UNCOVERED_HOST})"
+    )
 
 
 def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
@@ -361,8 +403,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_36_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 36 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_38_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 38 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -371,7 +413,9 @@ def test_worktree_coverage_contract_is_36_real_3_exempt_0_uncovered():
     (``remote_branches``, ``open_pr_heads``, ``active_workflow_runs``,
     ``untagged_release_head``), in tests/test_publish_gate_real.py; the 35th and 36th
     ``checkout_head_sha`` (#456) and ``changed_paths`` (#459), in
-    tests/test_preflight_oracle_456_459.py.
+    tests/test_preflight_oracle_456_459.py; the 37th and 38th #452's
+    ``origin_github_slug`` and ``refresh_base_checkout``, against real git remotes in
+    tests/test_managed_project_452.py and tests/test_base_refresh_452.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -389,7 +433,7 @@ def test_worktree_coverage_contract_is_36_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 36, f"expected 36 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 38, f"expected 38 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"
@@ -486,7 +530,7 @@ def test_no_real_worktree_seam_creates_closes_or_promotes_a_pr():
 
 
 def test_registry_values_are_wellformed():
-    for name, value in {**WORKTREE_SEAMS, **STORE_SEAMS, **GATES_SEAMS}.items():
+    for name, value in {**WORKTREE_SEAMS, **STORE_SEAMS, **GATES_SEAMS, **HOST_SEAMS}.items():
         assert value == "REAL" or value == "UNCOVERED" or value.startswith("EXEMPT: "), (
             f"{name}: {value!r} is not a valid classification. Use REAL, UNCOVERED, or "
             f"'EXEMPT: <reason>' — an exemption without a stated reason is not one."
@@ -529,3 +573,16 @@ def test_the_real_gh_tier_actually_runs_against_real_github():
         "CI must gate the write seams behind PB_GH_ALLOW_WRITES so the read seams run on every path "
         "(fork PRs / pushes) instead of the whole real-GitHub job being bypassed there"
     )
+
+
+def test_the_452_worktree_seams_are_exercised_against_real_git_by_name():
+    """``origin_github_slug`` and ``refresh_base_checkout`` are REAL because their tier files
+    drive them against real git (remotes; a bare origin + clone). Hollowing either file out
+    must fail here rather than leave the classification standing on nothing."""
+    for name, path in (
+        ("origin_github_slug", "tests/test_managed_project_452.py"),
+        ("refresh_base_checkout", "tests/test_base_refresh_452.py"),
+    ):
+        src = (_ROOT / path).read_text()
+        assert f"worktree.{name}(" in src, f"{name} is REAL but {path} never calls worktree.{name}("
+        assert "subprocess" in src and '"git"' in src, f"{path} must build its repos with real git"

@@ -121,6 +121,12 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # Health sweep: periodic self-heal (reclaim slots from dead drives, reap
         # orphaned worktrees). 0 disables it.
         self.sweep_interval = float(self.cfg.get("health_sweep_interval_s", 300))
+        # Base-checkout refresh (#452): each health sweep fetches every project's base and
+        # fast-forwards the MAIN checkout when it is clean and on the base branch, so the
+        # tree the agent reads (and the gate preflight smokes) is not the one it was cloned
+        # at. A checkout that can't be moved safely is left alone and reported stale on
+        # /status. `false` turns the fast-forward AND the fetch off.
+        self.base_refresh = _knob_bool(self.cfg, "base_refresh", True, strict=False)
         # Archive window (#115): terminal features (done/cancelled) whose closed_at is
         # older than this many days get the `archived` label during the health sweep —
         # out of the default board view, NEVER deleted (query back via

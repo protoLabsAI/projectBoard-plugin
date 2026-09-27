@@ -207,6 +207,11 @@ config:
   rebase_fix_max: 1         # cap on coder re-dispatches to resolve a real rebase CONFLICT
                             # before the feature is Blocked for a manual rebase. 0 = block on
                             # the first conflict (clean BEHIND rebases still run — they need no coder).
+  base_refresh: true        # each health sweep fetches every project's base and fast-forwards
+                            # its MAIN checkout when it is clean and on the base branch (#452),
+                            # so the tree the agent reads is not the one it was cloned at. A
+                            # checkout it can't move safely is left alone and reported stale on
+                            # /status. false = no fetch, no fast-forward.
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
   # A repeated coder timeout is a SIZE signal, not a capability one: it carries no diff and
   # no CI output, so a retry gets a near-identical prompt and a tier climb spends a stronger
@@ -278,6 +283,8 @@ settings:
       description: "Back-pressure: stop claiming new work while this many PRs already sit in review (0 = unlimited). Applies live on save. Raise it alongside Parallel builds or the extra slots idle behind the review queue." }
   - { key: goal_verify, label: "Verify acceptance goals", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Before opening a PR, ask an independent model to check the diff against the feature acceptance criteria, including test coverage." }
+  - { key: base_refresh, label: "Keep base checkouts current", type: bool, group: "Project Board", tab: automation, restart: true,
+      description: "Each health sweep fetches every project's base branch and fast-forwards its main checkout when it is clean and on the base branch, so the tree the agent reads is current. A checkout with local edits, on another branch or diverged is left alone and reported stale on the board status. Off = no fetch, no fast-forward." }
   - { key: local_gate_cmd, label: "Default local gate", type: string, group: "Project Board", tab: automation, restart: true,
       description: "Fast lint/typecheck/unit command run before a PR opens. Project-specific values in the Projects tab override it. Blank disables the default gate." }
   - { key: coder_solve, label: "Execution-grounded solve ladder", type: bool, group: "Project Board", tab: automation, restart: true,

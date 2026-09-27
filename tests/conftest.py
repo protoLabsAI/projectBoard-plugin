@@ -112,6 +112,7 @@ REAL_SEAMS = {
     "worktree.open_pr_heads": _worktree_mod.open_pr_heads,
     "worktree.active_workflow_runs": _worktree_mod.active_workflow_runs,
     "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
+    "worktree.refresh_base_checkout": _worktree_mod.refresh_base_checkout,
 }
 
 
@@ -333,3 +334,18 @@ def gh_fixture() -> GhFixture:
         proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, timeout=30)
         probe_sha = proc.stdout.strip() if proc.returncode == 0 else ""
     return GhFixture(GH_FIXTURE_PR_URL, slug, number, head_sha, head_branch, repo_dir, probe_sha)
+
+
+@pytest.fixture(autouse=True)
+def _no_base_checkout_refresh(monkeypatch):
+    """The health sweep fetches every project's base and fast-forwards its main checkout
+    (#452). In the unit tier a loop's repo is often ``"."`` — the developer's own checkout —
+    so a real refresh would `git fetch` from GitHub, and could move that checkout, from the
+    middle of an unrelated test. Stub it to "current"; tests/test_base_refresh_452.py puts
+    the real one back (``REAL_SEAMS``) and drives it against a throwaway origin."""
+
+    async def _current(_repo, _base):
+        return {"state": "current", "behind": 0, "detail": ""}
+
+    monkeypatch.setattr(_worktree_mod, "refresh_base_checkout", _current)
+    yield

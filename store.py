@@ -2141,6 +2141,7 @@ class BeadsBoard:
         source_issue: str | None = None,
         priority: int | None = None,
         waits_for=None,
+        project: str | None = None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -2157,8 +2158,19 @@ class BeadsBoard:
         ``Fixes #N`` (#97). ``priority`` changes the scheduling rank in place
         when supplied; None leaves the current priority untouched. ``waits_for``
         REPLACES the card's publish gates (a list or comma-separated text; an empty list
-        clears them); None leaves them untouched."""
+        clears them); None leaves them untouched. ``project`` RE-HOMES the card to another
+        entry of the board's `projects:` map (#454) — only while nothing is bound to the old
+        repo yet (see ``_rehome_refusal``); None or blank leaves it untouched."""
         f = self._require(fid)
+        rehome: tuple[str, str] | None = None
+        if project is not None and str(project).strip():
+            target = normalize_project(project)
+            current = str(f.get("project") or "")
+            if target != current:
+                refusal = self._rehome_refusal(f, target, files_to_modify)
+                if refusal:
+                    raise BoardError(f"can't move feature {fid!r} to project {target!r}: {refusal}")
+                rehome = (current, target)
         new_waits = _normalize_waits(waits_for) if waits_for is not None else None
         if files_to_modify is not None:
             _refuse_structured_paths(files_to_modify)
@@ -2210,8 +2222,16 @@ class BeadsBoard:
             # create can be restored here (QA panel on #88, round 4 — same undeliverable-
             # promise class as depends_on). None/False = leave the label untouched.
             args += ["--add-label", LABEL_FOUNDATION]
+        if rehome is not None:
+            # The single `project:` label, replaced (#454) — the same label create stamps.
+            args += replace_prefixed_label_args(f.get("labels"), LABEL_PROJECT_PREFIX, LABEL_PROJECT_PREFIX + rehome[1])
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
+        if rehome is not None:
+            try:
+                self.comment(fid, f"project re-homed: {rehome[0] or '(none)'} → {rehome[1]}")
+            except BoardError:
+                log.warning("[project_board] %s re-homed but the audit comment failed", fid, exc_info=True)
         # Same partial-failure contract as create_feature (panel round 7): one bad id
         # must not abort the batch after earlier edges landed — apply what applies,
         # name what failed, and let the tool boundary surface it for another repair.
@@ -2231,6 +2251,46 @@ class BeadsBoard:
                 f"depends_on=...)."
             )
         return f
+
+    def _rehome_refusal(self, f: dict, target: str, files_to_modify=None) -> str:
+        """Why ``f`` can't move to project ``target`` (#454), or ``""`` when it can.
+
+        A card's project decides which repo its worktree, branch and PR live in. So a move
+        is allowed only while nothing is bound to the OLD repo yet: the card is backlog or
+        ready, has no PR, and has never been dispatched (no attempt, so no branch and no
+        verified candidate). A ready card must also still pass the Ready gate's path check
+        in the NEW repo, or it would sit ready with paths that don't exist there."""
+        known = sorted(self.projects)
+        if target not in self.projects:
+            listed = ", ".join(repr(n) for n in known) or "(none)"
+            return f"{target!r} is not a project on this board (known: {listed})"
+        state = str(f.get("board_state") or "")
+        if state not in ("backlog", "ready"):
+            return (
+                f"it is {state} — only a backlog or ready card can move, because a live or finished "
+                "build is bound to its current project's repo"
+            )
+        if str(f.get("pr_url") or "").strip():
+            return f"it already has a PR ({f['pr_url']}) in its current project's repo"
+        if f.get("attempts") or str(f.get("verified_sha") or "").strip():
+            return (
+                "it has been dispatched before, so a branch may exist in its current project's repo — "
+                "cancel it and create a new card in the target project instead"
+            )
+        if state == "ready":
+            files = (
+                [str(p).strip() for p in files_to_modify if str(p).strip()]
+                if files_to_modify is not None
+                else list(f.get("files_to_modify") or [])
+            )
+            repo = str((self.projects.get(target) or {}).get("repo") or "").strip() or self.repo
+            phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+            if phantom:
+                return (
+                    f"it is ready, and these files_to_modify don't exist in {target!r} ({os.path.abspath(repo)}): "
+                    f"{', '.join(phantom)} — fix files_to_modify in the same call, or mark them `(new)`"
+                )
+        return ""
 
     # ── the Ready gate (invariant #1) ─────────────────────────────────────────
     def _repo_for(self, f: dict) -> str:
@@ -2325,7 +2385,7 @@ class BeadsBoard:
                     "gate": "phantom-paths",
                     "message": (
                         f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
-                        f"in the repo (bound root: {os.path.abspath(repo)!r}, set via project_board.repo): "
+                        f"in the repo (bound root: {os.path.abspath(repo)!r}, {self._repo_source(f)}): "
                         f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
                     ),
                     "fix": (
@@ -2598,6 +2658,19 @@ class BeadsBoard:
         if f["board_state"] not in ("backlog", "ready"):
             res["note"] = f"{fid} is {f['board_state']!r}; mark_ready only promotes a backlog card."
         return res
+
+    def _repo_source(self, f: dict) -> str:
+        """Where ``_repo_for(f)`` took the root from, as the config key to change (#454).
+        A multi-project board's root comes from ``project_board.projects.<name>.repo``;
+        naming the flat ``project_board.repo`` there sent an operator to the wrong key —
+        on a board where that flat key pointed at a DIFFERENT clone of the same repo."""
+        from .projects import orphan_note, repo_config_key
+
+        name = str(f.get("project") or "").strip()
+        key = repo_config_key(name, self.projects) if name else "project_board.repo"
+        if key == "project_board.repo" and name and name not in self.projects:
+            return f"set via {key}, because {orphan_note(name, self.projects)}"
+        return f"set via {key}"
 
     def _prepare_ready(self, fid: str) -> None:
         """Enforce the Ready gate and materialize the requirement ledger for ``fid``
