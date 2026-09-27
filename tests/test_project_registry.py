@@ -21,6 +21,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _host_apply import callable_aware
 
 from project_registry import (
     _drain_tail,
@@ -201,7 +202,7 @@ def _wire_host(monkeypatch, cfg, apply_settings):
     fake_plugins = types.ModuleType("graph.plugins")
     fake_plugins.__path__ = []
     fake_host = types.ModuleType("graph.plugins.host")
-    fake_host.HOST = types.SimpleNamespace(apply_settings=apply_settings)
+    fake_host.HOST = types.SimpleNamespace(apply_settings=callable_aware(apply_settings, cfg))
     monkeypatch.setitem(sys.modules, "graph.sdk", fake_sdk)
     monkeypatch.setitem(sys.modules, "graph.plugins", fake_plugins)
     monkeypatch.setitem(sys.modules, "graph.plugins.host", fake_host)

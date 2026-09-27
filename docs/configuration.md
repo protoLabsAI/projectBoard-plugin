@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **28 of 74 keys are in this state, including `coders` and `projects`** —
+never renders it. **28 of 75 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -70,6 +70,51 @@ not have is a hard error, not a fallback.
 `default_project` names the entry a card lands in when `board_create_feature` is called
 without a `project`. Leave it unset with exactly one project configured and that one is
 used; leave it unset with several and the caller must name one.
+
+**Registering a project also makes it a managed project (#452).** `board_register_project`
+and `PUT /projects/{name}` write the board entry AND, unless the repo is already one, a
+READ-ONLY entry in the host's managed-projects registry (top-level `projects:`, ADR 0095):
+`name`, `path`, `github` (from the checkout's `origin` remote), `default_branch` (the
+board's `base_branch`) and `write: false`. That registry is what the agent's own filesystem
+tools read through, so the agent can read the checkout its coders branch from. Both go in
+one `apply_settings` call. When the instance carries an explicit `filesystem.projects`
+override, the entry is mirrored there too, as `onboard_project` does. The board never turns
+`filesystem.enabled` on; the reply says so when it is off.
+
+The board entry records what it added as `managed_project: <name>` (plus `managed_fence:
+true` for a fence mirror). A later save keeps that entry's `path`/`github`/`default_branch`
+in step. Deleting the board project removes the managed entry **only** when all of these hold:
+the board added it, it still points at the board's repo, it is still `write: false`, and no
+other board project uses that checkout. When another board project does use it, ownership
+passes to that project. An entry that already existed (from `onboard_project`, the operator,
+or an explicit `filesystem.projects` entry for the same path) is never changed or removed, and
+no second name is added for it. A name another path already uses is skipped and reported, not
+overwritten. Running `onboard_project` on a checkout the board already registered changes
+nothing, because the path is already in the registry. To make that checkout writable, set
+`write: true` on its `projects:` entry; the board then leaves the entry in place when the
+project is deleted.
+
+The registry write is a read-modify-write of the host's whole `projects:` list. It runs
+inside the host's config write lock, through the callable form of `HOST.apply_settings`
+(protoAgent 0.164.0+, which is why that is the minimum). Before it writes, it checks that
+every existing entry is still in the new list, so a concurrent `onboard_project` can't be
+dropped.
+
+**Moving from the flat binding to `projects:` (#454).** A flat `repo` left set beside a
+`projects:` map is flagged as the `legacy_binding` advisory on `GET /status` (under
+`setup`), and the loudest case is a flat `repo` that is another clone of a project's own
+GitHub remote. The rule it states: a card labeled with a registered project builds, gates and
+passes the Ready gate in that project's repo (`projects.<name>.repo`). The flat `repo` is
+read only by the Ready gate's path check for unlabeled cards and cards whose project is not
+registered, while the loop builds those in the default project's repo. A flat
+`local_gate_cmd` is still the gate for every project whose entry sets none. Remove the flat
+`repo` once the projects are in place.
+
+Cards created before the move carry project `default`, which no longer resolves. They are
+flagged: `board_list` rows get `project_unresolved: true` and a `project_hint`, and the
+health sweep lists them under `orphaned_cards` on `GET /status`. Re-home each one with
+`board_update_feature(feature_id=…, project=<name>)`. That works while the card is backlog or
+ready, has no PR and has never been dispatched, and is refused with the reason otherwise.
 
 ## The gate — the coder's fast slice of CI
 
@@ -340,6 +385,7 @@ blank.
 | Key | Default | Applies |
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
+| `base_refresh` | `True` | **restart** |
 | `decompose_after_timeouts` | `2` | **restart** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
@@ -373,6 +419,26 @@ The task gives the agent a fixed order, each step passing the gates the next one
 The ask is made once per card. Unblocking a parked card resets its count, so a retry after
 raising `coder_timeout_s` is a real attempt. Set `0` to switch the ask off and have the card
 simply block, as it did before.
+
+`base_refresh` keeps each board-owned project's MAIN checkout current (#452). Worktrees are
+always cut from `origin/<base>`, but the checkout itself (the tree the agent reads, and the one
+the gate preflight runs in) used to stay at whatever it was cloned at. Each health sweep now
+starts a refresh pass as its own task, off the tick, so it never delays claims or
+reconciles. The pass fetches the base of every owned checkout concurrently, under one
+120-second budget for the whole pass, and runs `merge --ff-only --no-overwrite-ignore` on the
+checkout. It does this only when the checkout is clean, on the base branch, and has no local
+commits the remote lacks. The board never resets, stashes, rebases or switches branches, and
+never overwrites an ignored local file that upstream has started tracking. Any other checkout
+is left exactly as it is and listed under `stale_base_checkouts` on `GET /status`, with the
+reason. The refresh holds the checkout's registration gate-smoke lock, so the two never run
+together.
+
+**Only board-owned checkouts are moved.** A checkout is board-owned when it sits under the
+host's onboarding root (where onboarding and board registration clone), or when the board
+registered it as a managed project. An operator's own checkout elsewhere (`~/dev/<repo>`, the
+one they work in) is reported `skipped` and never touched. Set `base_refresh: true` on its
+`projects:` entry to include it, or `base_refresh: false` on any entry to leave it out. The
+top-level `base_refresh: false` turns off the whole pass, fetches included.
 
 ## Concurrency
 

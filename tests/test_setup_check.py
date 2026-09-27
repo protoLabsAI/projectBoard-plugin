@@ -564,6 +564,7 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("release_freeze", None),
         ("coder_rungs", None),
         ("preflight", None),
+        ("legacy_binding", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
@@ -816,7 +817,7 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
         pb.register(reg)
     msgs = dict(reg.gaps)
     # every key on the first evaluation (br + loop + db + db_legacy + review_status + release_freeze
-    # as clears), in render order
+    # + legacy_binding as clears), in render order
     assert [k for k, _ in reg.gaps] == [
         "br",
         "gh",
@@ -828,6 +829,7 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
         "release_freeze",
         "coder_rungs",
         "preflight",
+        "legacy_binding",
     ]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db_legacy"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT

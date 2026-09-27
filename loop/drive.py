@@ -382,7 +382,7 @@ class DriveMixin:
         _unregister_loop(self)  # drop the process-stable handle (ADR 0326)
         if self._task:
             setup_check.publish_loop_snapshot(None)  # no running loop → nothing to be stale against
-        for task in (self._task, self._snapshot_task):
+        for task in (self._task, self._snapshot_task, getattr(self, "_base_refresh_task", None)):
             if task:
                 task.cancel()
                 try:

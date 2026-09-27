@@ -555,6 +555,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         from . import health
 
         preflight = health.preflight_snapshot()
+        # #452: how each project's MAIN checkout compares with origin/<base> after the last
+        # sweep's refresh; `stale_base_checkouts` names the ones the sweep could not move.
+        # #454: live cards whose project label no longer resolves, with the re-home call.
+        # Both come from the loop's health sweep (this route never runs `br` or git).
+        base_checkouts = health.base_checkouts_snapshot()
         return {
             "bound": bound,
             "repo": store_kw.get("repo") or ".",
@@ -563,6 +568,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             "setup": setup,
             "preflight": preflight,
             "held_projects": sorted(preflight["held"]),
+            "base_checkouts": base_checkouts,
+            "stale_base_checkouts": {n: r["detail"] for n, r in base_checkouts.items() if r.get("state") == "stale"},
+            "orphaned_cards": health.orphaned_cards_snapshot(),
         }
 
     async def _reap_worktree(fid: str, feature: dict | None = None) -> None:
@@ -684,7 +692,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         """In-place spec edit — the REST complement of ``board_update_feature``.
         Accepts ``title``, ``spec``, ``acceptance_criteria``, ``design``,
         ``files_to_modify``, ``difficulty``, ``source_issue``, ``waits_for`` (replaces the
-        publish gates; ``[]`` clears); only non-null
+        publish gates; ``[]`` clears), ``project`` (re-homes the card, #454 — backlog/ready,
+        no PR, never dispatched; refused with the reason otherwise); only non-null
         fields are written. Refuses edits to an ``in_progress`` feature unless
         ``force=true`` is passed (a live drive owns it)."""
         body = body or {}
@@ -712,9 +721,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 "priority",
                 "source_issue",
                 "waits_for",
+                "project",
             }
         )
         kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
+        if "project" in kwargs and not str(kwargs["project"]).strip():
+            kwargs.pop("project")  # "" leaves the project alone, as on board_update_feature
         # `waits_for` means what it means on board_update_feature: "" leaves the gates
         # alone, "none" (or an explicit []) clears them, anything else REPLACES them.
         if "waits_for" in kwargs:
@@ -725,7 +737,20 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 kwargs["waits_for"] = []
         changed = sorted(kwargs)
 
-        updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+        if "project" in kwargs:
+            # A re-home (#454) runs under the loop's claim guard, as attach-pr does
+            # (loop/attach.py): no claim scan can interleave with the store's re-read of
+            # the card's state and its label rewrite.
+            from .loop import live_loop
+
+            loop = live_loop()
+            if loop is not None:
+                async with loop._claim_guard():
+                    updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+            else:
+                updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+        else:
+            updated = await _guard(lambda: s.update_feature(fid, **kwargs))
         if changed:
             await asyncio.to_thread(s.comment, fid, f"spec updated: {', '.join(changed)}")
 

@@ -118,8 +118,11 @@ spawn primitive — it does not reimplement it.
 
 ## Requirements
 
-- **protoAgent ≥ 0.153.2** (tabbed plugin Configure dialogs and sandboxed custom
-  Configure views; protoAgent #3179/#3180).
+- **protoAgent ≥ 0.164.0**: tabbed plugin Configure dialogs and sandboxed custom
+  Configure views (protoAgent #3179/#3180, 0.153.2), and the callable
+  `HOST.apply_settings` that runs a read-modify-write inside the host's config write lock
+  (#2743, 0.164.0). Registering a board project merges the host's `projects:` list, and
+  only that lock keeps the merge from dropping a concurrent writer's entry (#452).
 - **beads-rust** — the **`br`** CLI, the board's DAG/status store. **Fetched for you on
   first run (v0.43.0)**: with no `br` on `PATH` the plugin downloads the pinned release
   (`br_fetch.BR_VERSION`, sha256-verified per platform) into the instance's plugin-data

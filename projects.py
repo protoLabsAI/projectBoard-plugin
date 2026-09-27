@@ -28,6 +28,7 @@ entry says ``master`` — you'd get ``master``. Fix the registry entry, or leave
 from __future__ import annotations
 
 import os
+import re
 
 # The manifest's own defaults. A resolved config always carries these (the loader
 # falls back to `manifest.config`), so they double as "operator didn't choose".
@@ -47,6 +48,8 @@ _DEFAULT_BASE_BRANCH = "main"
 # Name of the single project synthesized from the flat keys when no `projects:` map
 # is declared (and no `default_project` names it) — the back-compat identity.
 IMPLICIT_PROJECT_NAME = "default"
+# The key set on the implicit project's entry (see ``_synthesize_implicit_project``).
+IMPLICIT_MARKER = "implicit"
 
 # The execution settings a project entry carries. Copied verbatim from the entry
 # (or, for the implicit project, lifted from the flat top-level keys); any key that
@@ -124,7 +127,22 @@ def _synthesize_implicit_project(name: str, cfg: dict) -> dict:
     entry["repo"] = str(entry.get("repo") or _DEFAULT_REPO).strip() or _DEFAULT_REPO
     entry = _expand_paths(entry)
     entry["name"] = name
+    # Marks the entry as synthesized from the flat keys, so a message about where a repo
+    # came from can name `project_board.repo` rather than a `projects:` key that the
+    # operator never wrote (#454).
+    entry[IMPLICIT_MARKER] = True
     return entry
+
+
+def repo_config_key(name: str, projects: dict) -> str:
+    """The config key a card's repo root is read from (#454): the project's own
+    ``project_board.projects.<name>.repo`` when ``name`` is an explicit entry, else the flat
+    ``project_board.repo`` (the implicit project, an unlabeled card, or an orphaned label
+    that falls back to it)."""
+    entry = (projects or {}).get(str(name or "").strip())
+    if isinstance(entry, dict) and not entry.get(IMPLICIT_MARKER) and str(entry.get("repo") or "").strip():
+        return f"project_board.projects.{name}.repo"
+    return "project_board.repo"
 
 
 def resolve_projects(cfg: dict) -> dict[str, dict]:
@@ -250,3 +268,78 @@ def resolve_project_cfg(cfg: dict) -> dict:
     if str(out.get("base_branch") or "").strip() in ("", _DEFAULT_BASE_BRANCH):
         out["base_branch"] = str(match.get("default_branch") or "").strip() or _DEFAULT_BASE_BRANCH
     return out
+
+
+# ── cards whose project no longer resolves (#454) ─────────────────────────────────
+# Moving a board from the legacy single-repo binding (flat `repo:`) to a `projects:` map
+# leaves every existing card stamped `project:default` (the implicit project's name) — and
+# `default` is no longer a key. Nothing said so: the loop quietly builds such a card in the
+# DEFAULT project's repo, while the Ready gate checks its paths against the flat `repo`.
+# These helpers name them, so status and board_list can flag them and offer the re-home.
+
+
+def unresolved_project(feature: dict, projects: dict) -> str:
+    """The card's ``project`` label when it names no project in ``projects`` (the resolved
+    map), else ``""``. An UNLABELED card is not orphaned — it takes the default project."""
+    name = str((feature or {}).get("project") or "").strip()
+    return name if name and name not in (projects or {}) else ""
+
+
+def rehome_hint(fid: str, label: str, projects: dict, default: str = "") -> str:
+    """Operator/agent copy for re-homing one orphaned card."""
+    known = sorted(projects or {})
+    target = default if default in (projects or {}) else (known[0] if len(known) == 1 else "")
+    listed = ", ".join(repr(n) for n in known) or "(none registered)"
+    verb = (
+        f"board_update_feature(feature_id={fid!r}, project={target!r})"
+        if target
+        else f"board_update_feature(feature_id={fid!r}, project=<one of {listed}>)"
+    )
+    return (
+        f"project {label!r} is not in project_board.projects (known: {listed}) — re-home it with {verb} "
+        "while it is backlog/ready with no branch or PR"
+    )
+
+
+def orphaned_cards(features, projects: dict, default: str = "") -> list[dict]:
+    """The non-terminal cards in ``features`` whose project label doesn't resolve, each
+    ``{id, title, state, project, hint}``."""
+    out = []
+    for f in features or ():
+        label = unresolved_project(f, projects)
+        state = str(f.get("board_state") or f.get("state") or "")
+        if not label or state in ("done", "cancelled"):
+            continue
+        fid = str(f.get("id") or "")
+        out.append(
+            {
+                "id": fid,
+                "title": str(f.get("title") or ""),
+                "state": state,
+                "project": label,
+                "hint": rehome_hint(fid, label, projects, default),
+            }
+        )
+    return out
+
+
+def orphan_note(label: str, projects: dict) -> str:
+    """Why a card labeled ``label`` fell back to the flat repo (it isn't a project)."""
+    known = ", ".join(repr(n) for n in sorted(projects or {})) or "(none)"
+    return (
+        f"this card's project {label!r} is not in project_board.projects (known: {known}) — "
+        "re-home it with board_update_feature(project=...)"
+    )
+
+
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def parse_github_remote(url: str) -> str:
+    """``owner/repo`` for a GitHub remote URL (https, ssh or scp form), else ``""``."""
+    m = _GITHUB_REMOTE.match(str(url or "").strip())
+    return f"{m.group('owner')}/{m.group('repo')}" if m else ""

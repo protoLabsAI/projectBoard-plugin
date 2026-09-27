@@ -62,11 +62,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 
 from . import br_fetch
 from . import store as store_mod
-from .projects import resolve_projects
+from .projects import default_project as resolve_default_project
+from .projects import parse_github_remote, resolve_projects
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -98,6 +100,11 @@ CODER_RUNGS_KEY = "coder_rungs"
 # #456 / #459: a gate preflight that can't finish inside its timeout, and a project whose
 # coder.solve() oracle is unwinnable. Both are published by the running loop. Advisory only.
 PREFLIGHT_KEY = "preflight"
+# The legacy-binding advisory (#454): a flat `repo` (and maybe `local_gate_cmd`) left over
+# from the single-repo binding, still set alongside a `projects:` map — ambiguous about which
+# checkout a card uses, worst when it is ANOTHER clone of a project's own GitHub remote.
+# Advisory only, never a pause.
+LEGACY_BINDING_KEY = "legacy_binding"
 REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
     LOOP_STALE_KEY,
     LEGACY_STORE_KEY,
@@ -105,6 +112,7 @@ REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
     RELEASE_FREEZE_KEY,
     CODER_RUNGS_KEY,
     PREFLIGHT_KEY,
+    LEGACY_BINDING_KEY,
 )
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
@@ -609,6 +617,118 @@ def _br_version(path: str, run) -> str:
     return version
 
 
+#: ``(path, runner) -> (monotonic ts, slug)`` — the legacy-binding advisory's remote reads,
+#: cached (#454 review m7): ``/status`` is polled every 10 s, and a remote URL doesn't change
+#: between polls. Keyed by the runner too, so an injected test runner never sees another's.
+_ORIGIN_CACHE: dict[tuple[str, int], tuple[float, str]] = {}
+_ORIGIN_TTL_S = 300.0
+
+
+def _origin_slug(path: str, run) -> str:
+    """``owner/repo`` of ``path``'s GitHub ``origin`` (a local ``git remote`` read, cached for
+    ``_ORIGIN_TTL_S``), or ``""``."""
+    key = (os.path.realpath(os.path.expanduser(path)), id(run))
+    hit = _ORIGIN_CACHE.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _ORIGIN_TTL_S:
+        return hit[1]
+    slug = _read_origin_slug(path, run)
+    _ORIGIN_CACHE[key] = (now, slug)
+    return slug
+
+
+def _read_origin_slug(path: str, run) -> str:
+    try:
+        proc = run(["git", "-C", path, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
+    except Exception:  # noqa: BLE001 — no git / no remote is "unknown", never a failure
+        return ""
+    if getattr(proc, "returncode", 1) != 0:
+        return ""
+    return parse_github_remote(str(getattr(proc, "stdout", "") or ""))
+
+
+def _same_dir(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(os.path.expanduser(a)) == os.path.realpath(os.path.expanduser(b))
+    except (OSError, ValueError):
+        return a == b
+
+
+def legacy_binding(cfg: dict, *, run=None, isdir=None) -> dict:
+    """The legacy single-repo binding still set alongside a ``projects:`` map (#454), or
+    ``{}`` when there is none.
+
+    ``{repo, github, same_path, same_remote, default_project, local_gate_cmd,
+    gate_fallback_projects}``: ``same_path`` names projects whose repo IS the flat repo
+    (a harmless duplicate), ``same_remote`` those registering the SAME GitHub remote at a
+    DIFFERENT path — two clones of one repo, the ambiguous case. ``gate_fallback_projects``
+    are the projects whose entry sets no ``local_gate_cmd`` and so still run the flat one."""
+    cfg = cfg or {}
+    raw = cfg.get("projects")
+    if not (isinstance(raw, dict) and raw):
+        return {}
+    flat = str(cfg.get("repo") or "").strip()
+    if flat in ("", "."):
+        return {}
+    run = run or _subprocess_run
+    isdir = isdir or os.path.isdir
+    try:
+        projects = resolve_projects(cfg)
+    except Exception:  # noqa: BLE001 — the repo check owns a malformed map
+        return {}
+    flat = os.path.expanduser(flat)
+    same_path = sorted(n for n, e in projects.items() if _same_dir(str(e.get("repo") or ""), flat))
+    github = _origin_slug(flat, run) if isdir(flat) else ""
+    same_remote = []
+    if github:
+        for name, entry in sorted(projects.items()):
+            path = str(entry.get("repo") or "")
+            if name not in same_path and path and isdir(path) and _origin_slug(path, run) == github:
+                same_remote.append(name)
+    gate = bool(str(cfg.get("local_gate_cmd") or "").strip())
+    return {
+        "repo": flat,
+        "github": github,
+        "same_path": same_path,
+        "same_remote": same_remote,
+        "default_project": resolve_default_project(cfg),
+        "local_gate_cmd": gate,
+        "gate_fallback_projects": sorted(n for n, e in projects.items() if "local_gate_cmd" not in e) if gate else [],
+    }
+
+
+def legacy_binding_hint(info: dict) -> str:
+    """Operator copy for the legacy-binding advisory — ``""`` when there is none."""
+    if not info:
+        return ""
+    repo = info["repo"]
+    parts = [f"project_board.repo ({repo}) is still set alongside a projects: map"]
+    if info.get("same_remote"):
+        names = ", ".join(repr(n) for n in info["same_remote"])
+        parts.append(
+            f" — and it is ANOTHER clone of {info['github']}, which project(s) {names} register at a different "
+            "path, so two checkouts of one repo are in play"
+        )
+    elif info.get("same_path"):
+        names = ", ".join(repr(n) for n in info["same_path"])
+        parts.append(f" (the same checkout as project(s) {names}, so it only duplicates it)")
+    default = info.get("default_project") or "(none — set default_project)"
+    parts.append(
+        ". Which one wins: a card labeled with a registered project builds, runs its gate and passes the Ready "
+        "gate in THAT project's repo (project_board.projects.<name>.repo). The flat project_board.repo is used "
+        "only by the Ready gate's path check for unlabeled cards and cards whose project isn't registered — "
+        f"and the loop builds those in the default project's repo ({default}), not in {repo}"
+    )
+    if info.get("gate_fallback_projects"):
+        names = ", ".join(repr(n) for n in info["gate_fallback_projects"])
+        parts.append(f". project_board.local_gate_cmd is still the gate for project(s) whose entry sets none: {names}")
+    parts.append(
+        ". Remove the legacy project_board.repo (and move local_gate_cmd into each project entry) so every card "
+        "resolves to one checkout"
+    )
+    return "".join(parts)
+
+
 def _is_bound(cfg: dict) -> bool:
     """The SAME binding rule the ``/status`` route has answered since v0.40.0: an
     explicit ``db_path``, an explicit ``projects:`` map, or a ``repo`` other than the
@@ -686,6 +806,8 @@ def setup_status(
           "release_freeze_hint": str,  # freeze signals the gh credential can't read (403), "" when none
           "coder_rungs_hint": str,     # coders rungs naming deleted delegates (skipped, not a pause)
           "preflight_hint": str,       # slow preflights / unwinnable solve oracles, "" when none
+          "legacy_binding": dict,      # flat repo/local_gate_cmd still set beside projects: (#454), {} when none
+          "legacy_binding_hint": str,  # which binding wins for which cards, "" when none
           "ready": bool,               # every check ok
         }
 
@@ -862,6 +984,10 @@ def setup_status(
     # #456 / #459: a preflight that can't finish in its timeout, and a project whose
     # coder.solve() oracle is unwinnable. The running loop publishes both. Advisory only.
     status["preflight_hint"] = health.advisory_hint()
+    # The legacy-binding advisory (#454): never a failing check, never a pause.
+    legacy_bind = legacy_binding(cfg, run=run, isdir=isdir)
+    status["legacy_binding"] = legacy_bind
+    status["legacy_binding_hint"] = legacy_binding_hint(legacy_bind)
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -1080,6 +1206,8 @@ class GapReporter:
                 msg = str((status or {}).get("coder_rungs_hint") or "") or None
             elif key == PREFLIGHT_KEY:
                 msg = str((status or {}).get("preflight_hint") or "") or None
+            elif key == LEGACY_BINDING_KEY:
+                msg = str((status or {}).get("legacy_binding_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")

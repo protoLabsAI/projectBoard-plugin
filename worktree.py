@@ -31,6 +31,7 @@ import time
 from collections.abc import Iterable
 
 from . import config
+from .projects import parse_github_remote
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -713,6 +714,80 @@ async def changed_paths(tree: str, base: str = "") -> list[str] | None:
             continue
         paths.append(rel)
     return paths
+
+
+async def origin_github_slug(repo: str) -> str:
+    """The ``owner/repo`` the checkout's ``origin`` remote points at on GitHub, or ``""``
+    (no origin, not GitHub, git unavailable). A LOCAL read (``git remote get-url``) — no
+    network and no credential, unlike ``repo_slug``, which asks ``gh`` for the repo a PR
+    would target. Registering a board project as a managed project (#452) records this
+    as the registry entry's ``github``. Never raises."""
+    try:
+        rc, out, _err = await _git(repo, "remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001 — an unknown remote is "", never an error
+        return ""
+    return parse_github_remote(out) if rc == 0 else ""
+
+
+async def refresh_base_checkout(repo: str, base: str) -> dict:
+    """Bring ``repo``'s MAIN checkout up to ``origin/<base>`` when that is safe (#452).
+
+    Worktrees are cut from ``origin/<base>``, but the checkout the agent READS (and the
+    one registered as a managed project) stayed at whatever HEAD it was cloned at: an
+    agent read a v0.7.1 tree an hour after v0.9.0 shipped. So this fetches the base and,
+    ONLY when the checkout is clean and on the base branch, fast-forwards it
+    (``merge --ff-only``). It never resets, rebases, stashes or switches branches: a
+    checkout with uncommitted edits, on another branch, or with local commits the remote
+    lacks is left exactly as it is and reported ``stale`` with the reason.
+
+    Returns ``{"state", "behind", "detail"}``. ``state`` is ``current`` (already at
+    ``origin/<base>``), ``fast_forwarded`` (moved; ``behind`` is how far), ``stale`` (behind
+    or diverged and NOT moved; ``detail`` says why) or ``unknown`` (the fetch or a read
+    failed; ``detail`` says which). Never raises."""
+    base = str(base or "").strip() or "main"
+    try:
+        rc, _out, err = await _git(repo, "fetch", "--quiet", "origin", base, timeout=90)
+        if rc != 0:
+            return {"state": "unknown", "behind": 0, "detail": f"git fetch origin {base} failed: {err.strip()[:200]}"}
+        remote = f"origin/{base}"
+        rc_b, behind_out, err_b = await _git(repo, "rev-list", "--count", f"HEAD..{remote}")
+        rc_a, ahead_out, _e = await _git(repo, "rev-list", "--count", f"{remote}..HEAD")
+        if rc_b != 0 or rc_a != 0:
+            return {
+                "state": "unknown",
+                "behind": 0,
+                "detail": f"could not compare HEAD with {remote}: {err_b.strip()[:200]}",
+            }
+        behind, ahead = int(behind_out.strip() or 0), int(ahead_out.strip() or 0)
+        if behind == 0:
+            return {"state": "current", "behind": 0, "detail": ""}
+        dirt = await base_checkout_dirt(repo, base)
+        if dirt:
+            return {
+                "state": "stale",
+                "behind": behind,
+                "detail": f"{behind} commit(s) behind {remote}, not fast-forwarded: {dirt}",
+            }
+        if ahead:
+            return {
+                "state": "stale",
+                "behind": behind,
+                "detail": f"{behind} commit(s) behind {remote} and {ahead} ahead (diverged) — not fast-forwarded",
+            }
+        # --no-overwrite-ignore (#452 review M1): an IGNORED local file that upstream starts
+        # tracking (an operator's secret.env vs a committed template) would otherwise be
+        # silently replaced. With it git refuses, and the checkout reads `stale`.
+        rc_m, _o, err_m = await _git(repo, "merge", "--ff-only", "--no-overwrite-ignore", "--quiet", remote)
+        if rc_m != 0:
+            return {
+                "state": "stale",
+                "behind": behind,
+                "detail": f"{behind} commit(s) behind {remote}; fast-forward refused: {err_m.strip()[:200]}",
+            }
+        log.info("[project_board] base checkout %s fast-forwarded %d commit(s) to %s", repo, behind, remote)
+        return {"state": "fast_forwarded", "behind": behind, "detail": ""}
+    except Exception as exc:  # noqa: BLE001 — a refresh problem is reported, never raised into the sweep
+        return {"state": "unknown", "behind": 0, "detail": f"base refresh failed: {exc}"}
 
 
 async def prune_stale_worktrees(repo: str) -> str:

@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.153.2"  # settings_tabs + sandboxed custom Configure views (#3179/#3180)
+min_protoagent_version: "0.164.0"  # callable HOST.apply_settings under the config write lock (#2743); settings_tabs (#3179/#3180)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
@@ -207,6 +207,12 @@ config:
   rebase_fix_max: 1         # cap on coder re-dispatches to resolve a real rebase CONFLICT
                             # before the feature is Blocked for a manual rebase. 0 = block on
                             # the first conflict (clean BEHIND rebases still run — they need no coder).
+  base_refresh: true        # each health sweep (off the tick) fetches every BOARD-OWNED
+                            # project's base and fast-forwards its MAIN checkout when it is clean
+                            # and on the base branch (#452). Board-owned = under the onboarding
+                            # root or registered by the board; a project entry's own
+                            # `base_refresh: true|false` overrides. A checkout it can't move
+                            # safely is left alone and reported stale on /status. false = off.
   health_sweep_interval_s: 300  # periodic self-heal: reclaim slots from dead drives
   # A repeated coder timeout is a SIZE signal, not a capability one: it carries no diff and
   # no CI output, so a retry gets a near-identical prompt and a tier climb spends a stronger
@@ -278,6 +284,8 @@ settings:
       description: "Back-pressure: stop claiming new work while this many PRs already sit in review (0 = unlimited). Applies live on save. Raise it alongside Parallel builds or the extra slots idle behind the review queue." }
   - { key: goal_verify, label: "Verify acceptance goals", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Before opening a PR, ask an independent model to check the diff against the feature acceptance criteria, including test coverage." }
+  - { key: base_refresh, label: "Keep base checkouts current", type: bool, group: "Project Board", tab: automation, restart: true,
+      description: "Each health sweep fetches the base branch of every board-owned checkout (under the onboarding root, or registered by the board) and fast-forwards it when it is clean and on the base branch, so the tree the agent reads is current. Your own checkouts elsewhere are never moved unless their project sets base_refresh: true. A checkout with local edits, on another branch or diverged is left alone and reported stale on the board status. Off = no fetch, no fast-forward." }
   - { key: local_gate_cmd, label: "Default local gate", type: string, group: "Project Board", tab: automation, restart: true,
       description: "Fast lint/typecheck/unit command run before a PR opens. Project-specific values in the Projects tab override it. Blank disables the default gate." }
   - { key: coder_solve, label: "Execution-grounded solve ladder", type: bool, group: "Project Board", tab: automation, restart: true,
