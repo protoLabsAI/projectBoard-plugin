@@ -540,3 +540,104 @@ def test_create_tool_reports_the_dry_run_through_real_br(real_board):
     )
     assert fixed["ready_check"]["ok"] is True
     assert json.loads(tools["board_check_ready"].invoke({"feature_id": out["id"]}))["ok"] is True
+
+
+# ── #466 review ─────────────────────────────────────────────────────────────────────
+
+
+def test_globs_follow_gitignore_anchoring_and_bare_directory_names():
+    assert path_matches_glob("dist/x.css", "/dist")  # a leading slash anchors at the root…
+    assert not path_matches_glob("pkg/dist/x.css", "/dist")  # …and only there
+    assert path_matches_glob("pkg/dist/y.js", "dist")  # a bare name is a file OR a directory
+    assert path_matches_glob("dist", "dist")
+    assert path_matches_glob("packages/ui/gen/a/b.ts", "packages/ui/gen")
+
+
+def test_a_mistyped_glob_list_falls_back_to_the_default(make_board, monkeypatch):
+    assert parse_glob_list(True, ("a",)) == ("a",)
+    assert parse_glob_list(3, ()) == ()
+    b = make_board(_Br())
+    b.projects = {"pc": {"repo": "/repo", "breadth_exclude": True, "hot_files": True}}
+    _wire(monkeypatch, b, [_card("ds-1", ["dist/a.css (new)", "src/a.ts (new)"], project="pc")])
+    check = b.ready_check("ds-1")  # no TypeError; the default excludes still apply
+    assert check["ok"] and check["breadth"]["counted"] == 1
+    assert b._chain_hot_files({"id": "ds-1", "project": "pc", "files_to_modify": ["x"], "depends_on": []}) == []
+
+
+def test_a_dot_slash_path_is_the_same_file(make_board, monkeypatch):
+    b = make_board(_Br())
+    _wire(monkeypatch, b, [_card("A", ["shared.py (new)"], state="in_progress"), _card("B", ["./shared.py (new)"])])
+    assert [r["gate"] for r in b.ready_check("B")["refusals"]] == ["shared-file"]
+
+
+def test_a_card_already_building_is_never_told_to_wait(make_board, monkeypatch):
+    """M2: creation order alone would have made the newer, IN-PROGRESS card depend on the
+    older backlog one — and a card with an open blocker can never close."""
+    b = make_board(_Br())
+    cards = [
+        _card("old-backlog", ["f.py (new)"], created="1"),
+        _card("new-building", ["f.py (new)"], created="2", state="in_progress", bead_status="in_progress"),
+        _card("newest-review", ["f.py (new)"], created="3", state="in_review", bead_status="in_progress"),
+    ]
+    _wire(monkeypatch, b, cards)
+    check = b.ready_check("old-backlog")
+    edges = {(e["feature_id"], e["depends_on"]) for e in check["suggested_edges"]}
+    assert edges == {("old-backlog", "new-building"), ("old-backlog", "newest-review")}
+    assert check["in_flight_pairs"] == [{"cards": ["newest-review", "new-building"], "files": ["f.py"]}]
+    assert "let one merge first" in check["refusals"][0]["fix"]
+
+
+@requires_br
+def test_cancelling_a_middle_card_keeps_the_ends_ordered_through_real_br(tmp_path):
+    """M1: A and C share a file and are ordered only through B (C → B → A). Cancelling B
+    used to drop its edges and release C to build beside A."""
+    for name in ("shared.py", "other.py"):
+        (tmp_path / name).write_text("x = 1\n")
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    a = _mk(board, "A", ["shared.py"])["id"]
+    b = _mk(board, "B", ["other.py"], depends_on=[a])["id"]
+    c = _mk(board, "C", ["shared.py"], depends_on=[b])["id"]
+    for fid in (a, b, c):
+        board.mark_ready(fid)
+
+    result = board.cancel_feature(b, reason="scope cut")
+
+    assert result["rewired_deps"] == [{"feature_id": c, "depends_on": a}]
+    assert a in board.get_feature(c)["depends_on"]
+    assert board.ready_check(c)["ok"]
+    assert c not in {f["id"] for f in board.ready_queue()}  # waits for A again
+    assert any("was cancelled" in n for n in board.feature_comments(c))
+
+
+@requires_br
+def test_a_suggested_edge_never_strands_a_building_card_through_real_br(tmp_path):
+    """M2 through real `br`: the older card is in backlog, the newer one already claimed.
+    The suggestion points the backlog card at the building one, and after applying it the
+    building card can still close."""
+    (tmp_path / "f.py").write_text("x = 1\n")
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    older = _mk(board, "older", ["f.py"])["id"]
+    newer = _mk(board, "newer", ["f.py"])["id"]
+    board._run("update", newer, "--add-label", "ready")  # set up past the gate on purpose
+    board.claim(newer)
+    assert board.get_feature(newer)["board_state"] == "in_progress"
+
+    check = board.ready_check(older)
+    assert [(e["feature_id"], e["depends_on"]) for e in check["suggested_edges"]] == [(older, newer)]
+    board.update_feature(older, depends_on=[newer])
+    board._run("close", newer, "-r", "merged")  # refused if newer had been told to wait on older
+    assert board.get_feature(newer)["bead_status"] == "closed"
+
+
+@requires_br
+def test_concurrent_creates_on_a_hot_file_form_one_chain_through_real_br(real_board):
+    """Minor 1: four creates racing on the hot package.json used to chain onto one tail,
+    and one hit `br`'s cycle refusal. Every pair must end up ordered, with no errors."""
+    import concurrent.futures
+
+    first = _mk(real_board, "first", ["package.json"])
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        made = list(pool.map(lambda n: _mk(real_board, f"racer {n}", ["package.json"]), range(4)))
+    assert not [e for f in made for e in f.get("hot_file_chain") or [] if "error" in e]
+    for card in (first, *made):
+        assert real_board.ready_check(card["id"])["ok"], real_board.ready_check(card["id"])["refusals"]

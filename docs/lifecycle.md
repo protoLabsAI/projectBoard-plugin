@@ -50,9 +50,20 @@ must not build in parallel off the same base, so one must wait for the other to 
 on down. Five cards on one `package.json` need four edges, not ten. A path through a
 `done` or `cancelled` card doesn't count, because that card's edge has already released.
 The refusal lists every unserialised pair on the contended files, the card's own and its
-neighbours', and `suggested_edges`: one chain per file in an order consistent with the
-existing edges (creation order breaks ties), adding only the edges that aren't implied
-already. A project can list `hot_files` that the board chains at create time, so the edges
+neighbours', and `suggested_edges`: one chain per file, adding only the edges that aren't
+implied already. The order respects the existing edges, then puts the furthest-along card
+first (in review, building, ready, backlog), then creation order. A card already past
+`ready` is never made the dependent: `br close` refuses a card with an open blocker, so it
+would sit in review with its PR merged. Two cards already building on the same file can't
+be ordered by an edge at all; they're reported as `in_flight_pairs`, to be resolved by
+letting one merge or blocking one.
+
+Because a path can run through a third card, **cancelling a card keeps the order it
+carried**. Before its edges drop, every open dependent that hasn't started building gets a
+direct edge onto each of the cancelled card's open blockers (`C → B → A` becomes `C → A`
+when B is cancelled), noted on the dependent and reported as `rewired_deps`. Removing an
+edge by hand (`DELETE /features/{fid}/dep`) has no such repair. Re-run `board_check_ready`
+on the cards involved. A project can list `hot_files` that the board chains at create time, so the edges
 never need writing by hand. Both settings are in [`configuration.md`](configuration.md).
 
 ## The review sub-state machine

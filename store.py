@@ -466,21 +466,27 @@ _NEW_MARKER_RE = re.compile(r"\s*\(new\)\s*", re.IGNORECASE)
 
 
 def strip_new_marker(path) -> str:
-    """``path`` without its ``(new)`` marker (#110), trimmed — the file itself."""
-    return _NEW_MARKER_RE.sub(" ", str(path or "")).strip()
+    """``path`` without its ``(new)`` marker (#110) or a leading ``./``, trimmed — the file
+    itself, so `./shared.py` and `shared.py (new)` compare as the same file."""
+    p = _NEW_MARKER_RE.sub(" ", str(path or "")).strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
 
 @functools.lru_cache(maxsize=512)
 def _glob_regex(pattern: str) -> re.Pattern:
-    """Compile a path glob: ``**`` spans any number of directories (including none), ``*``
-    and ``?`` stay inside one path segment. A pattern with no ``/`` matches the file name
-    at any depth, the way a `.gitignore` line does."""
+    """Compile a path glob, `.gitignore`-style: ``**`` spans any number of directories
+    (including none), ``*`` and ``?`` stay inside one path segment. A pattern with no ``/``
+    (other than a trailing one) matches at any depth; a leading ``/`` anchors it at the repo
+    root. A pattern that matches a directory matches everything under it, so a bare
+    ``dist`` covers `dist/x.css` and `pkg/dist/y.js`, as `dist/` does."""
     pat = pattern.strip()
     while pat.startswith("./"):
         pat = pat[2:]
-    if pat.endswith("/"):  # `dist/` names a directory: everything under it
-        pat += "**"
-    if "/" not in pat:
+    anchored = pat.startswith("/")
+    pat = pat.lstrip("/").rstrip("/")
+    if not anchored and "/" not in pat:
         pat = "**/" + pat
     out = []
     i = 0
@@ -500,15 +506,13 @@ def _glob_regex(pattern: str) -> re.Pattern:
         else:
             out.append(re.escape(pat[i]))
             i += 1
-    return re.compile("".join(out) + r"\Z")
+    return re.compile("".join(out) + r"(?:/.*)?\Z")
 
 
 def path_matches_glob(path, pattern) -> bool:
     """True when the files_to_modify entry ``path`` (marker stripped, leading ``./``
     dropped) matches ``pattern`` (see ``_glob_regex``)."""
     p = strip_new_marker(path)
-    while p.startswith("./"):
-        p = p[2:]
     pattern = str(pattern or "").strip()
     return bool(p and pattern and _glob_regex(pattern).match(p))
 
@@ -519,7 +523,15 @@ def parse_glob_list(raw, default: tuple = ()) -> tuple[str, ...]:
     project can add to the built-in list instead of restating it; ``[]`` is an empty list."""
     if raw is None:
         return tuple(default)
-    items = raw.replace("\n", ",").split(",") if isinstance(raw, str) else list(raw or ())
+    if isinstance(raw, str):
+        items = raw.replace("\n", ",").split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        # A typo'd value (`breadth_exclude: true`) must not break every Ready check: say so
+        # and keep the default policy.
+        log.warning("[project_board] ignoring a glob list of type %s (%r) — using the default", type(raw).__name__, raw)
+        return tuple(default)
     out: list[str] = []
     for item in items:
         s = str(item or "").strip()
@@ -1405,6 +1417,9 @@ class BeadsBoard:
         # mutate the policy under us.
         self.max_files_by_difficulty = dict(max_files_by_difficulty or MAX_FILES_BY_DIFFICULTY)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
+        # Serialises the hot-file chain's read-tail → add-edge (#458): two racing creates
+        # must not both chain onto the same tail, or onto each other.
+        self._chain_lock = threading.Lock()
 
     def reconfigure_projects(self, projects: dict | None, default_project: str = "") -> None:
         """Replace the live multi-project routing map without rebuilding the board.
@@ -1801,18 +1816,21 @@ class BeadsBoard:
         """Chain a just-created card behind the open card holding each of its hot files (#458).
 
         ``f`` is the new card as written (id, project, files_to_modify, depends_on). For
-        every files_to_modify entry that matches the project's `hot_files` globs, find
-        the open cards of the same project that already name that file, take the one at the
-        END of their chain (no other holder depends on it; the latest created breaks a tie)
-        and add ``fid depends_on <it>`` — unless ``fid`` already reaches it. A new card has
-        no dependents yet, so the edge can never close a cycle. Each edge is noted on the
-        card. Returns ``[{depends_on, files[, error]}]``. Never raises: a failed edge is
-        reported, and the Ready gate's shared-file check still stands behind it."""
+        every files_to_modify entry that matches the project's `hot_files` globs, find the
+        open cards of the same project that name that file and were created BEFORE this one,
+        take the one at the END of their chain (no other holder depends on it; the latest
+        created breaks a tie) and add ``fid depends_on <it>`` — unless the two are already
+        ordered, in either direction. Each edge is noted on the card.
+
+        Creates racing each other are serialised by a per-board lock around read-tail →
+        add-edge, and "created before" keeps two racing cards from each picking the other
+        as its tail. Across processes that isn't enough: `br` refuses an edge that would
+        close a cycle, and the edge is then reported with its ``error``. Returns
+        ``[{depends_on, files[, error]}]``. Never raises: a failed edge is reported, and the
+        Ready gate's shared-file check still stands behind it."""
         fid = f["id"]
-        hot = self.hot_files_for(f)
-        if not hot:
-            return []
         try:
+            hot = self.hot_files_for(f)
             mine = sorted(
                 {
                     strip_new_marker(p)
@@ -1820,23 +1838,36 @@ class BeadsBoard:
                     if str(p).strip() and any(path_matches_glob(p, g) for g in hot)
                 }
             )
-            if not mine:
-                return []
-            my_project = str(f.get("project") or "")
-            others = {
-                r["id"]: r
-                for r in self.list_features()
-                if r.get("id")
-                and r["id"] != fid
-                and r.get("board_state") not in _TERMINAL_STATES
-                and r.get("issue_type") != LABEL_TASK
-                and str(r.get("project") or "") == my_project
-            }
+        except Exception:  # noqa: BLE001 — a bad policy must not fail a create that landed
+            log.warning("[project_board] %s hot-file chaining could not read its policy (skipped)", fid, exc_info=True)
+            return []
+        if not mine:
+            return []
+        with self._chain_lock:
+            return self._chain_hot_files_locked(f, mine)
+
+    def _chain_hot_files_locked(self, f: dict, mine: list[str]) -> list[dict]:
+        fid = f["id"]
+        my_project = str(f.get("project") or "")
+        try:
+            rows = self.list_features()
         except Exception:  # noqa: BLE001 — chaining is a convenience; the gate still guards
             log.warning("[project_board] %s hot-file chaining could not read the board (skipped)", fid, exc_info=True)
             return []
-        graph = {i: set(r.get("depends_on") or []) & set(others) for i, r in others.items()}
-        graph[fid] = set(f.get("depends_on") or []) & set(others)
+        me = next((r for r in rows if r.get("id") == fid), {})
+        born = str(me.get("created_at") or "")
+        others = {
+            r["id"]: r
+            for r in rows
+            if r.get("id")
+            and r["id"] != fid
+            and r.get("board_state") not in _TERMINAL_STATES
+            and r.get("issue_type") != LABEL_TASK
+            and str(r.get("project") or "") == my_project
+        }
+        nodes = set(others) | {fid}
+        graph = {i: set(r.get("depends_on") or []) & nodes for i, r in others.items()}
+        graph[fid] = set(f.get("depends_on") or []) & nodes
 
         def reach(start: str) -> set[str]:
             seen: set[str] = set()
@@ -1848,10 +1879,16 @@ class BeadsBoard:
                     stack.extend(graph.get(n, ()))
             return seen
 
+        def earlier(i: str) -> bool:
+            theirs = str(others[i].get("created_at") or "")
+            return not born or not theirs or (theirs, i) < (born, fid)
+
         edges: dict[str, dict] = {}
         for path in mine:
             holders = [
-                i for i, r in others.items() if path in {strip_new_marker(p) for p in r.get("files_to_modify") or []}
+                i
+                for i, r in others.items()
+                if earlier(i) and path in {strip_new_marker(p) for p in r.get("files_to_modify") or []}
             ]
             if not holders:
                 continue
@@ -1860,7 +1897,7 @@ class BeadsBoard:
             if tail in edges:
                 edges[tail]["files"].append(path)
                 continue
-            if tail in reach(fid):
+            if tail in reach(fid) or fid in reach(tail):
                 continue
             edge = {"depends_on": tail, "files": [path]}
             try:
@@ -2242,7 +2279,13 @@ class BeadsBoard:
         files = [str(p) for p in f.get("files_to_modify") or [] if str(p).strip()]
         refusals: list[dict] = []
         advisories: list[dict] = []
-        out: dict = {"refusals": refusals, "advisories": advisories, "unserialised": [], "suggested_edges": []}
+        out: dict = {
+            "refusals": refusals,
+            "advisories": advisories,
+            "unserialised": [],
+            "suggested_edges": [],
+            "in_flight_pairs": [],
+        }
 
         # REQUIRED fields. files_to_modify is a CODING-feature requirement: a task-type bead
         # (#217) ships a deliverable (a doc, a decision, an artifact ref), not repo edits, so
@@ -2455,32 +2498,53 @@ class BeadsBoard:
         out["unserialised"] = pairs
 
         # The minimal fix: ONE order over the whole group — consistent with every existing
-        # path (a card after everything it already depends on), creation order otherwise —
-        # then per file, chain its holders in that order, adding only the edges not already
-        # implied. Every suggested edge points backwards in one global order, so the
-        # suggestion can never close a cycle, and each added edge is folded into the
-        # closure before the next pair is judged.
-        def created(i: str) -> tuple[str, str]:
-            return (str(by_id[i].get("created_at") or ""), i)
+        # path (a card after everything it already depends on); among the cards free to go
+        # next, the one FURTHEST ALONG first (in review, then building, then ready, then
+        # backlog), creation order after that — then per file, chain its holders in that
+        # order, adding only the edges not already implied. Every suggested edge points
+        # backwards in one global order, so the suggestion can never close a cycle, and each
+        # added edge is folded into the closure before the next pair is judged.
+        #
+        # Progress comes first because an edge is only safe on a card that hasn't started: a
+        # card in progress or in review told to wait on a backlog card could never close
+        # (`br close` refuses while a blocker is open) — stuck in review with its PR merged.
+        # So no suggestion ever makes a card past `ready` the dependent. Two in-flight cards
+        # on one file can't be ordered by an edge at all; they are reported instead.
+        def in_flight(i: str) -> bool:
+            row = by_id[i]
+            return row.get("board_state") in ("in_progress", "in_review") or row.get("bead_status") == "in_progress"
+
+        def placement(i: str) -> tuple[int, str, str]:
+            state = by_id[i].get("board_state")
+            progress = 0 if state == "in_review" else 1 if in_flight(i) else 2 if state == "ready" else 3
+            return (progress, str(by_id[i].get("created_at") or ""), i)
 
         order: list[str] = []
         remaining = set(group)
         while remaining:
             free = [i for i in remaining if not (reach(i) & (remaining - {i}))]
-            nxt = min(free or remaining, key=created)
+            nxt = min(free or remaining, key=placement)
             order.append(nxt)
             remaining.discard(nxt)
         rank = {i: n for n, i in enumerate(order)}
         edges: dict[tuple[str, str], list[str]] = {}
+        stuck: dict[tuple[str, str], list[str]] = {}  # two in-flight cards: no edge can order them
         for p in hot_paths:
             chain = sorted(holders[p], key=rank.__getitem__)
-            for prev, cur in zip(chain, chain[1:], strict=False):
-                if not serialised(prev, cur):
-                    edges.setdefault((cur, prev), []).append(p)
-                    graph.setdefault(cur, set()).add(prev)
-                    closure.clear()
-                elif (cur, prev) in edges:
-                    edges[(cur, prev)].append(p)
+            after = [chain[0]]  # what the next card must be ordered after
+            for cur in chain[1:]:
+                for prev in after:
+                    if serialised(prev, cur):
+                        if (cur, prev) in edges:
+                            edges[(cur, prev)].append(p)
+                    elif in_flight(cur):
+                        stuck.setdefault((prev, cur), []).append(p)
+                    else:
+                        edges.setdefault((cur, prev), []).append(p)
+                        graph.setdefault(cur, set()).add(prev)
+                        closure.clear()
+                after = [cur] if all(serialised(x, cur) for x in after) else [*after, cur]
+        out["in_flight_pairs"] = [{"cards": [a, b], "files": fs} for (a, b), fs in stuck.items()]
         out["suggested_edges"] = [{"feature_id": c, "depends_on": d, "files": fs} for (c, d), fs in edges.items()]
 
         detail = "; ".join(f"{oid} (shares {', '.join(ps)})" for oid, ps in sorted(conflicts.items()))
@@ -2499,6 +2563,11 @@ class BeadsBoard:
             f"board_update_feature(feature_id={e['feature_id']!r}, depends_on={e['depends_on']!r})"
             for e in out["suggested_edges"]
         )
+        if stuck:
+            adds += (
+                ". Already building together, so no edge can order them now — let one merge first "
+                "(or block one): " + "; ".join(f"{a} / {b} ({', '.join(fs)})" for (a, b), fs in stuck.items())
+            )
         refusals.append(
             {
                 "gate": "shared-file",
@@ -2511,7 +2580,7 @@ class BeadsBoard:
                     f"work so they don't overlap.{also}"
                 ),
                 "fix": (
-                    f"Chain them, earliest first — a path serialises every pair on it, so a chain of N "
+                    f"Chain them, furthest-along first — a path serialises every pair on it, so a chain of N "
                     f"cards needs N-1 edges, not one per pair: {chains}. Add: {adds}."
                 ),
             }
@@ -3387,8 +3456,14 @@ class BeadsBoard:
         # Drop open incoming `blocks` edges before closing (#145): `br close` refuses
         # when blockers are unresolved, but a cancel is a scope-cut — prerequisites
         # being unfinished is irrelevant. Log each dropped edge for the audit trail.
+        blockers = self._open_blockers(fid)
+        # …but first keep what those edges ORDERED (#466 review): with shared files
+        # serialised by any depends_on PATH, a chain C → B → A orders A and C only through
+        # B. Cancelling B releases its edges, and A and C — both already passed the Ready
+        # gate — would build in parallel on the same file with nothing re-checking them.
+        rewired = self._rewire_dependents(fid, blockers)
         dropped: list[str] = []
-        for blocker_id in self._open_blockers(fid):
+        for blocker_id in blockers:
             try:
                 self.remove_dependency(fid, blocker_id)
                 dropped.append(blocker_id)
@@ -3432,7 +3507,52 @@ class BeadsBoard:
         result = self.get_feature(fid) or {}
         if dropped:
             result["dropped_deps"] = dropped
+        if rewired:
+            result["rewired_deps"] = rewired
         return result
+
+    def _rewire_dependents(self, fid: str, blockers) -> list[dict]:
+        """Before ``fid`` is cancelled, give each OPEN card that depends on it a direct edge
+        onto each of ``fid``'s open blockers, so every order that ran through ``fid`` holds
+        without it (``D → fid → B`` becomes ``D → B``). A cycle is impossible: the path
+        already existed. A dependent already building is left alone: an edge onto an open
+        card would stop it from ever closing (`br close` refuses while a blocker is open). Each new edge is noted on the dependent. Best-effort: a failed edge
+        is logged and reported, never raised — the cancel itself must still go through."""
+        blockers = [b for b in blockers or () if b and b != fid]
+        if not blockers:
+            return []
+        try:
+            dependents = {
+                r["id"]: set(r.get("depends_on") or [])
+                for r in self.list_features()
+                if r.get("id")
+                and fid in (r.get("depends_on") or [])
+                and r.get("board_state") not in (*_TERMINAL_STATES, "in_progress", "in_review")
+                and r.get("bead_status") != "in_progress"
+            }
+        except Exception:  # noqa: BLE001 — best-effort: the cancel itself must still go through
+            log.warning("[project_board] cancel %s: could not read its dependents to rewire them", fid, exc_info=True)
+            return []
+        out: list[dict] = []
+        for dep in sorted(dependents):
+            added = []
+            for blocker in blockers:
+                if blocker in dependents[dep] or blocker == dep:
+                    continue
+                try:
+                    self.add_dependency(dep, blocker)
+                    added.append(blocker)
+                except BoardError as exc:
+                    log.warning("[project_board] cancel %s: could not rewire %s onto %s: %s", fid, dep, blocker, exc)
+                    out.append({"feature_id": dep, "depends_on": blocker, "error": str(exc)})
+            if added:
+                out.extend({"feature_id": dep, "depends_on": b} for b in added)
+                self.comment(
+                    dep,
+                    f"depends on {', '.join(added)} directly now: {fid}, which it waited on and which waited on "
+                    f"{'them' if len(added) > 1 else 'it'}, was cancelled — the order still holds without it.",
+                )
+        return out
 
     def delete_feature(self, fid: str, reason: str = "") -> dict:
         """Hard-delete a feature (a `br` tombstone) — the harder sibling of

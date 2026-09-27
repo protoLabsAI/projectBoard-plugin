@@ -121,9 +121,10 @@ files and already at the medium cap. The default list:
 Cargo.lock   **/dist/**   *.generated.*   CHANGELOG.md   changelog.d/**
 ```
 
-A glob with no `/` matches the file name at any depth, the way a `.gitignore` line does;
-`**` spans directories; a trailing `/` means everything under that directory; a `(new)`
-marker is ignored. A configured list REPLACES the default. Put the word `defaults` in it
+Globs read like `.gitignore` lines. A glob with no `/` (other than a trailing one) matches
+at any depth, and a leading `/` anchors it at the repo root. `**` spans directories. A glob
+that matches a directory covers everything under it, so a bare `dist` and `dist/` both
+match `pkg/dist/x.js`. A `(new)` marker and a leading `./` on a path are ignored. A configured list REPLACES the default. Put the word `defaults` in it
 to keep the built-in globs and add your own:
 
 ```yaml
@@ -139,8 +140,11 @@ project's fallback.
 **`hot_files`** — globs for files nearly every card in a repo touches (`package.json`, a
 barrel `index.ts`), which would otherwise need a `depends_on` edge on every new card. When
 `board_create_feature` creates a card naming a hot file, the board adds a `depends_on` edge
-onto the open card at the end of that file's chain (the one no other holder depends on;
-the latest created breaks a tie), notes it on the card, and reports it as `hot_file_chain`.
+onto the open card at the end of that file's chain: among the cards created before it,
+the one no other holder depends on, with the latest created breaking a tie. It notes the
+edge on the card and reports it as `hot_file_chain`. Creates racing in one process are
+serialised; a cycle across processes is refused by `br` and reported as the edge's
+`error`.
 Cards on one file then form a chain in creation order as they are written. Empty by default:
 nothing is chained you didn't ask for. A batch `POST /features/batch` plan states its own
 order and is not auto-chained. Per project, or top level as the fallback:
@@ -155,7 +159,8 @@ projects:
 The shared-file check itself needs no config. Two open cards of one project naming the same
 file must be ordered by a `depends_on` PATH, in either direction, through open cards: a
 chain `C → B → A` orders A and C as well (#458). The refusal names every unserialised pair
-and the fewest edges that fix them, a chain in creation order.
+and the fewest edges that fix them: a chain with the furthest-along card first, then
+creation order.
 
 ## Dispatch and escalation
 
