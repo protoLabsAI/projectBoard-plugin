@@ -1341,22 +1341,39 @@ def parent_feature_id(wt_id: str) -> str:
         out = stripped
 
 
-# The feature id at the FRONT of a `feat-<id>[-<slug>]` worktree dir (#227): a `bd-…`
-# bead id plus any `.<sub>`/`.g<n>`/`.c<n>`/`.test` dot-segments (sub-feature + candidate
-# suffixes), stopping at the human slug's leading `-`. The fid body never contains a bare
-# `-` (only the `bd-` prefix does) and the slug never contains a `.`, so the boundary is
-# unambiguous. `parent_feature_id` then strips the candidate suffixes off what this keeps.
-_FID_PREFIX_RE = re.compile(r"^(bd-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)")
+# The feature id at the FRONT of a `feat-<id>[-<slug>]` worktree dir (#227): a bead id
+# `<prefix>-<hash>` plus any `.<sub>`/`.g<n>`/`.c<n>`/`.test` dot-segments (sub-feature +
+# candidate suffixes), stopping at the human slug's leading `-`. ANY prefix, not only `bd-`
+# (#461): a board's prefix is whatever its beads store was initialised with (`ds-` on the
+# designSystem board), and a `bd-`-only pattern left every other board's slugged dir
+# unparsed. The id then read as the whole `ds-vvi-<slug>` remainder, the store had no such
+# card, and the health sweep reaped the tree as an orphan every pass — live drives
+# included. The prefix is one `[A-Za-z0-9_]` run (beads' shape), the hash never holds a
+# bare `-`, and the slug never holds a `.`, so the boundary is unambiguous for that shape.
+# A prefix that itself contains a `-` is NOT recoverable from the name alone; the sweep
+# treats such a dir as unknown and keeps it (see `wt_id_is_exact`).
+# `parent_feature_id` then strips the candidate suffixes off what this keeps.
+_FID_PREFIX_RE = re.compile(r"^([A-Za-z0-9_]+-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)")
 
 
 def _wt_id_from_dirname(name: str) -> str:
     """The slug-free worktree id (``<fid>`` or ``<fid>.<candidate-suffix>``) from a
     ``feat-<id>[-<slug>]`` dir name (#227) — the fid is the machine key at the front, the
-    ``-<slug>`` a human suffix that recovery/parsing must ignore. Falls back to the whole
-    post-``feat-`` remainder for a non-``bd`` id, preserving the pre-slug behavior."""
+    ``-<slug>`` a human suffix that recovery/parsing must ignore. Any ``<prefix>-<hash>``
+    bead id (#461). Falls back to the whole post-``feat-`` remainder for an id of no such
+    shape, preserving the pre-slug behavior."""
     tail = name[len("feat-") :]
     m = _FID_PREFIX_RE.match(tail)
     return m.group(1) if m else tail
+
+
+def wt_id_is_exact(repo: str, worktrees_root: str, wt_id: str) -> bool:
+    """Is there a worktree dir named exactly ``feat-<wt_id>`` — no slug tail stripped to
+    get the id? Only then does "the store has no card ``<parent id>``" prove the tree is an
+    orphan. A SLUGGED dir's id was parsed out of its name, and a parse that went wrong (a
+    prefix shape the pattern cannot split, #461) reads a live card as a missing one: the
+    sweep keeps such a tree instead of reaping on a guess."""
+    return os.path.isdir(os.path.join(repo, worktrees_root, f"feat-{wt_id}"))
 
 
 def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:

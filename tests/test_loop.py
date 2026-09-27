@@ -5863,9 +5863,12 @@ async def test_a_failing_snapshot_never_stops_the_sweep(monkeypatch):
     assert store.requeued == ["bd-1"]  # the sweep still did its real job
 
 
-async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
+async def test_sweep_reaps_orphaned_worktrees(monkeypatch, tmp_path):
     store = _SweepStore(features={"bd-done": "done", "bd-cancelled": "cancelled", "bd-rev": "in_review"})
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    # A card the store has never heard of is an orphan only when its dir is named EXACTLY
+    # `feat-<id>` (#461): an id parsed out of a slugged name is not proof enough.
+    (tmp_path / ".worktrees" / "feat-bd-gone").mkdir(parents=True)
     monkeypatch.setattr(
         worktree, "list_feature_worktrees", lambda repo, root: ["bd-done", "bd-cancelled", "bd-rev", "bd-gone"]
     )
@@ -5875,14 +5878,14 @@ async def test_sweep_reaps_orphaned_worktrees(monkeypatch):
         reaped.append(fid)
 
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
-    await BoardLoop({})._sweep()
+    await BoardLoop({"repo": str(tmp_path)})._sweep()
     # Terminal (done/cancelled) + missing feature → reaped; in_review keeps its worktree
     # (a CI-fail re-dispatch still pushes to the same PR). Cancelled is the crash backstop
     # for the terminal-edge reap in api._cancel (#109).
     assert set(reaped) == {"bd-done", "bd-cancelled", "bd-gone"}
 
 
-async def test_sweep_treats_candidate_worktrees_by_parent_feature(monkeypatch):
+async def test_sweep_treats_candidate_worktrees_by_parent_feature(monkeypatch, tmp_path):
     """A leftover `.gN`/`.cN` candidate worktree is NOT a feature id (bd-1cp.g1) — the
     sweep must resolve its PARENT feature's state (#91): parent done/gone → the
     candidate is reaped (by its FULL worktree id, so the right dir+branch go); parent
@@ -5907,7 +5910,8 @@ async def test_sweep_treats_candidate_worktrees_by_parent_feature(monkeypatch):
         reaped.append(fid)
 
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
-    loop = BoardLoop({})
+    (tmp_path / ".worktrees" / "feat-bd-gone.g3").mkdir(parents=True)  # exact name: a provable orphan (#461)
+    loop = BoardLoop({"repo": str(tmp_path)})
     loop._inflight_files = {"bd-live": {"a.py"}}  # bd-live's drive is live → its candidates stay
     await loop._sweep()
     assert set(reaped) == {"bd-done.g1", "bd-done.c2", "bd-gone.g3"}  # full worktree ids

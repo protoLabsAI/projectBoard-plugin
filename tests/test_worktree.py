@@ -608,7 +608,19 @@ def test_wt_id_from_dirname_extracts_the_fid_before_the_slug():
     assert worktree._wt_id_from_dirname("feat-bd-9") == "bd-9"  # no slug
     assert worktree._wt_id_from_dirname("feat-bd-9.c1") == "bd-9.c1"  # candidate suffix kept
     assert worktree._wt_id_from_dirname("feat-bd-9.g2-a-slug") == "bd-9.g2"  # defensive: suffix then slug
-    assert worktree._wt_id_from_dirname("feat-legacy") == "legacy"  # non-bd id → whole remainder
+    assert worktree._wt_id_from_dirname("feat-legacy") == "legacy"  # no `<prefix>-<id>` shape → whole remainder
+
+
+def test_wt_id_from_dirname_takes_any_bead_prefix():
+    """#461: the board's prefix is whatever its store was initialised with. A `bd-`-only
+    pattern read `feat-ds-vvi-<slug>` as the id `ds-vvi-<slug>`, the store had no such card,
+    and the sweep reaped the designSystem board's live trees every pass."""
+    assert worktree._wt_id_from_dirname("feat-ds-vvi-plugin-hardening-follow-ups") == "ds-vvi"
+    assert worktree._wt_id_from_dirname("feat-ds-4df-archetype-match-current-designsystem-age") == "ds-4df"
+    assert worktree._wt_id_from_dirname("feat-ds-vvi.g1") == "ds-vvi.g1"  # a solve candidate
+    assert worktree._wt_id_from_dirname("feat-ds-t7b.2-a-slug") == "ds-t7b.2"  # a sub-feature
+    assert worktree._wt_id_from_dirname("feat-proto_content-a1b-slug") == "proto_content-a1b"
+    assert worktree.parent_feature_id(worktree._wt_id_from_dirname("feat-ds-vvi.g3")) == "ds-vvi"
 
 
 # ── parent_feature_id: candidate worktrees resolve to their owning feature (#91) ──

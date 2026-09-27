@@ -881,6 +881,22 @@ class ReconcileMixin:
                 continue  # a live drive owns this worktree (or its candidates)
             try:
                 f = await asyncio.to_thread(store.get_feature, fid)
+                if f is None and not worktree.wt_id_is_exact(repo, self.root, wtid):
+                    # The id came out of a SLUGGED dir name, and the store has no such card.
+                    # That is a parse we cannot trust, not proof of an orphan (#461: every
+                    # `ds-` board's live trees were reaped this way). Keep it; say so once.
+                    unknown = getattr(self, "_sweep_unknown_trees", None)
+                    if unknown is None:
+                        unknown = self._sweep_unknown_trees = set()
+                    if (repo, wtid) not in unknown:
+                        unknown.add((repo, wtid))
+                        log.warning(
+                            "[project_board] sweep: kept worktree feat-%s… under %s — its card id could not be "
+                            "resolved from the directory name, so it is not treated as orphaned (#461)",
+                            wtid,
+                            repo,
+                        )
+                    continue
                 if f is None or f["board_state"] in ("done", "cancelled"):
                     reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
                     if reaped:
