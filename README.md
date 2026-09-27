@@ -53,14 +53,16 @@ board to a PR — or fork it as a starting point.
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
 - **Publish gates + release freeze (cross-repo chains)** — a card can also wait on
-  something OUTSIDE the board: `waits_for: npm:@protolabsai/ui@>0.62.0` (a version on
-  npm), `release:<owner>/<repo>@<tag-or-range>`, `pr:<owner>/<repo>#<n>` (merged). The
-  loop keeps it out of the claim, visibly (`waiting on publish: … (latest 0.62.0)`), until
-  every gate holds — `depends_on` releases at the blocker's MERGE, which is too early for
-  a consumer that must install the published package. And before auto-merging, the loop
-  checks the PR's repo for a release in flight (`prepare-release*` branch/PR or an active
-  `prepare-release.yml` run, per-project `release_freeze`) and holds the merge until it
-  lifts. [`docs/publish-gates.md`](docs/publish-gates.md) has the grammar and a worked
+  something OUTSIDE the board. `waits_for: npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`
+  holds only once a published version is PROVEN (via its changesets git tag + GitHub
+  compare) to contain card bd-a1's merge commit — `depends_on` releases at the MERGE, and
+  a version floor can be met by an unrelated publish, both too early for a consumer that
+  installs the package. Also `npm:<pkg>@<range>`, `release:<owner>/<repo>@[<package>@]<tag-or-range>`,
+  `pr:<owner>/<repo>#<n>` (merged). The loop keeps the card out of the claim, visibly
+  (`waiting on publish: …`), until every gate holds. And before auto-merging, the loop
+  checks the PR's repo for a release in flight (`prepare-release*` branch/PR, an active
+  `prepare-release.yml` run, or an untagged `chore: release v*` head; per-project
+  `release_freeze`) and holds the merge until it lifts. [`docs/publish-gates.md`](docs/publish-gates.md) has the grammar and a worked
   design-system → npm → consumer example.
 - **Escalation (opt-in)** — with a `coders` map of >1 distinct rung, a capability
   failure climbs to a stronger model. A rung may also hold SEVERAL interchangeable

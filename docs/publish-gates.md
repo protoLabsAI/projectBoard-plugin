@@ -3,20 +3,27 @@
 Two guards for work that crosses repos.
 
 - **Publish gates (`waits_for`)** keep a card out of the claim until something outside the
-  board has happened: a version is on npm, a GitHub release exists, a PR is merged.
+  board has happened: a version carrying a specific change is on npm, a GitHub release
+  exists, a PR is merged.
 - **The release freeze** keeps the auto-merge edge from merging into a repo that is in the
   middle of cutting a release.
 
-## Why `depends_on` is not enough
+## Why `depends_on` is not enough, and why a version floor is not either
 
 `depends_on` and `foundation` release a dependent card when its blocker **merges**. In a
-package chain that is too early. A design-system change in protoContent merges, then the
-changesets bot opens a "chore: release packages" PR, and only when *that* PR merges does
-the new `@protolabsai/ui` reach npm. A consumer card released at the first merge sends its
-coder to install a version that does not exist yet. The coder fails, or worse, pins a
-workaround.
+package chain that is too early. A design-system change in protoContent merges. The
+changesets bot then opens or refreshes the "chore: release packages" PR, and only when
+*that* PR merges does the new `@protolabsai/ui` reach npm.
 
-A publish gate names the fact the consumer actually needs, and the loop checks it.
+A **version floor** doesn't close the gap either. A card that waits for
+`npm:@protolabsai/ui@>0.62.0` can be released by the wrong publish. Say the Version PR is
+already open when the consumer card is written (protoContent#528 was, during the review
+of this feature). It can merge first and publish `0.62.1` **without** the design-system
+change. The floor is met and the consumer's coder installs a version that lacks the API
+it needs. Guessing the bump (`>=0.63.0`) fails the same way whenever the pending release
+already carries a minor.
+
+So the gate a consumer needs names the **change**, not a version: `contains:`.
 
 ## Spec grammar
 
@@ -24,89 +31,105 @@ A card carries a comma-separated list of specs. **All** of them must hold.
 
 | Spec | Holds when |
 |---|---|
-| `npm:<package>@<semver-range>` | the npm registry has a published version satisfying the range |
-| `npm:<package>` | any version is published |
-| `release:<owner>/<repo>@<tag>` | that git tag exists on GitHub |
-| `release:<owner>/<repo>@<semver-range>` | a published (non-draft) GitHub release's tag satisfies the range |
+| `npm:<package>@contains:<owner>/<repo>@<card-id>` | the newest published version is **proven** to contain that card's merge commit (unmet until the card's PR has merged) |
+| `npm:<package>@contains:<owner>/<repo>@<sha>` | the same, for a commit you name |
+| `npm:<package>@<semver-range>` | a published, non-deprecated version satisfies the range |
+| `npm:<package>` | any non-deprecated version is published (prereleases count) |
+| `release:<owner>/<repo>@<tag>` | that git tag exists |
+| `release:<owner>/<repo>@<package>@<semver-range>` | a published release tagged `<package>@x.y.z` satisfies the range (changesets monorepos) |
+| `release:<owner>/<repo>@<semver-range>` | a published release's tag (`v1.2.3` / `1.2.3`) satisfies the range, for repos that tag plain versions only |
 | `pr:<owner>/<repo>#<n>` | that PR is merged |
 
-- Scoped packages work as written: `npm:@protolabsai/ui@>=0.63.0`. The range starts after
-  the **last** `@`.
-- Ranges follow node-semver: `>=1.2.3`, `>1.2.3 <2.0.0-0`, `^0.63.0`, `~1.2`, `1.x`,
-  `1.2.3 - 2.0.0`, and `||` between alternatives. No commas inside a spec.
-- A **prerelease** satisfies a range only when the range names a prerelease on the same
-  `major.minor.patch`, as in npm. `>=0.63.0` is **not** satisfied by `0.64.0-next.1`, so a
-  snapshot publish never releases a consumer card.
-- After `release:…@`, text that starts with `< > = ^ ~`, is `*`, contains a space or
-  `||`, or has an `x` part is a range. Anything else is an exact tag name, so write the
-  tag exactly (`v0.63.0`, not `0.63.0`, when the repo's tags carry the `v`). Release tags
-  like `@protolabsai/ui@0.63.0` are read as `0.63.0` when matched against a range.
-- There is no `card:` kind. A card waiting on another card on this board is `depends_on`.
-- A spec that does not parse refuses the create or update, with the reason, so a card can
-  never carry a gate that could not be met.
+- Scoped packages work as written: `npm:@protolabsai/ui@>=0.63.0`,
+  `release:protoLabsAI/protoContent@@protolabsai/design@>=0.9.3`.
+- Ranges follow node-semver (`>=`, `<`, `^`, `~`, `1.x`, hyphen ranges, `||`), including
+  its prerelease rule. `>=0.63.0` is **not** satisfied by `0.64.0-next.1`. The matcher
+  was checked against node-semver itself on over 100k random version/range pairs, with
+  zero mismatches.
+- Release ranges skip drafts and GitHub **prereleases**, and read every page of releases.
+- A **bare** `release:` range on a repo that tags per package is never met, because any
+  package's version would satisfy it. `board_create_feature` / `board_update_feature`
+  refuse it and name the qualifier syntax.
+- There is no `card:` kind. A card waiting on another card's merge is `depends_on`.
+- A spec that doesn't parse is refused at create/update. One that reaches a card's notes
+  anyway (hand-edited) reads unmet with its error. It never stops the loop or a listing.
 
-Set them with `waits_for` on `board_create_feature`, `board_create_task` and
-`board_update_feature` (which **replaces** the list; `none` clears it), on the
-`POST /features` and `PATCH /features/{fid}` routes, and on a `create_from_plan` item.
+### How `contains:` proves it
+
+npm doesn't record which commit a pnpm/changesets publish came from. The packument has no
+`gitHead` for `@protolabsai/ui` or `@protolabsai/design`, which was checked while building
+this. What changesets does record is a git tag per version it publishes:
+`@protolabsai/ui@0.62.0`. So the gate:
+
+1. resolves the anchor. A sha is used as is. A card id is looked up on the board. Its PR
+   must be merged, and the PR's `merge_commit_sha` is the anchor. Until then the gate
+   reads `card bd-a1 not merged yet (#501)`.
+2. reads the packument and takes the newest non-deprecated stable version.
+3. finds its tag in the anchor repo (`<package>@<version>`, else `v<version>`, else
+   `<version>`) and dereferences an annotated tag to its commit.
+4. asks GitHub `compare/<anchor>...<tag commit>`. `ahead` or `identical` means the
+   published version contains the change.
+
+Releases are cut from one linear `main`, so if the newest publish lacks the change, no
+older one has it. The gate says what it saw:
+`npm @protolabsai/ui containing protoLabsAI/protoContent@bd-a1 (latest 0.62.1, tag @protolabsai/ui@0.62.1 at b7c3…, lacks 4f1e…)`.
+
+A published version without a tag reads unmet (`has no tag … to prove it`). The gate
+never guesses.
+
+Set gates with `waits_for` on `board_create_feature`, `board_create_task` and
+`board_update_feature` (which **replaces** the list; `none` clears it), on
+`POST /features` and `PATCH /features/{fid}` (`""` leaves them, `"none"` or `[]` clears),
+and on a `create_from_plan` item.
 
 ## What the loop does
 
 1. A card with gates goes `ready` like any other. The Ready gate does not look at them.
 2. In the claim scan, a ready, dependency-free candidate that carries gates is checked
    before it is claimed. If any gate is unmet, the card is skipped with reason
-   `waiting-on-publish`. This is not a livelock: the scan never flags the card blocked for
-   it, however long the wait.
-3. The card says so. `board_list`, `board_get_feature`, `GET /features` and the console
-   chip show
-
-   ```
-   waiting on publish: npm @protolabsai/ui >0.62.0 (latest 0.62.0)
-   ```
-
-   and each gate's last verdict (`gates: [{spec, met, detail, error, checked_at}]`).
-   `board_dispatch` reports it under `held.waiting-on-publish`.
-4. When every gate holds, the loop logs
-   `bd-xyz publish gates cleared (npm @protolabsai/ui >0.62.0 (0.63.0 published)) — claimable`,
-   comments the same on the card, and claims it in the same tick.
+   `waiting-on-publish`. That is never counted as a livelock, however long the wait.
+3. The card says so in `board_list`, `board_get_feature` (with each gate's last verdict),
+   `GET /features`, the console chip and `board_dispatch`
+   (`held.waiting-on-publish`).
+4. When every gate holds, the loop logs `publish gates cleared (…) — claimable`, comments
+   the same on the card, and claims it in the same tick.
 
 `board_check_gates` (or `POST /features/{fid}/gates/check`) runs the checks now.
 
+`board_attach_pr` does **not** check gates. It attaches a PR someone already opened by
+hand, and gates only govern whether the loop may *start* the work.
+
 ### Cost and failure
 
-- Results are cached **per spec**, shared by every card that names it. Twenty consumer
-  cards waiting on one package cost one registry read per interval.
-- An unmet gate is re-read at most every 120 s. A met one is re-read hourly.
-- A failed check (registry down, GitHub rate limit, no auth) is **unmet**. The card shows
-  `(check failed: <error>)`, and that spec backs off: 60 s, then 120 s, doubling to a cap
-  of 30 min.
-- An on-demand check skips the TTL but never re-asks a spec checked in the last 15 s.
-- Only cards the loop could claim right now are checked. A backlog card, or one still
-  waiting on `depends_on`, costs nothing until it gets there.
+- Results are cached per spec and shared by every card that names it. An unmet gate is
+  re-read at most every 120 s, a met one hourly, and an on-demand check never re-asks a
+  spec checked in the last 15 s. Scheduling uses the monotonic clock.
+- A `contains:` check costs about five reads: packument, PR, tag ref, tag object, compare.
+- A failed check (registry down, GitHub rate limit, no auth) is **unmet**, shows
+  `(check failed: <error>)`, and backs off from 60 s, doubling to a cap of 30 min.
+- Only cards the loop could claim right now are checked.
 
 ### Credentials
 
 - `npm:` reads the public registry anonymously. For a private package, set the
-  `npm_token` secret (Settings ▸ Project Board ▸ Security), or `PROJECT_BOARD_NPM_TOKEN`,
-  or `NPM_TOKEN`. A 401/403 names the token in the card's error.
-- `release:` and `pr:` go through `gh api`, with the same `gh` login the board uses for
-  every PR.
+  `npm_token` secret, or `PROJECT_BOARD_NPM_TOKEN`, or `NPM_TOKEN`. npm answers an
+  anonymous read of a private package with **404**, which looks like "never published".
+  So a scoped package's 404 without a token says `(not published yet — or private: set
+  project_board.npm_token)`.
+- `release:`, `pr:` and `contains:` go through `gh api`, with the board's own `gh` login.
 
 ### Where the specs live
 
-On the bead's `notes` field, one `waits-for: <spec>` line per gate, beside
-`files_to_modify`, the requirement ledger and the `source-issue:` line. Not in a label.
-Beads caps a label at 50 characters and refuses the whole `br update` past it (#353), and
-a real spec such as `npm:@protolabsai/ui@>=0.63.0 <1.0.0-0` is often longer and carries
-characters (`/ @ < space`) the label validator rejects anyway. Every writer of `notes`
-carries the gates forward. `tests/test_publish_gate_real.py` round-trips a 70-character
-spec through real `br` and shows the label route is refused.
+On the bead's `notes` field, one `waits-for: <spec>` line per gate. Not in a label, because
+beads caps labels at 50 characters (#353) and real specs are longer. Every writer of
+`notes` carries the gates forward. A `files_to_modify` entry that starts with
+`waits-for:` (or `req:` / `source-issue:`) is refused, so it can't turn into a gate.
+`tests/test_publish_gate_real.py` round-trips a 70-character spec through real `br`.
 
 ## Worked example: a design-system token, published, then adopted
 
-The design-system agent asks protoEngineer for a new `--pl-color-accent-subtle` token and
-a `subtle` Badge tone, adopted in protoAgent's console. `@protolabsai/ui` is at `0.62.0`.
-
-The board has both repos as projects:
+The design-system agent asks protoEngineer for a `--pl-color-accent-subtle` token and a
+`subtle` Badge tone, adopted in protoAgent's console.
 
 ```yaml
 project_board:
@@ -114,30 +137,24 @@ project_board:
   projects:
     protoContent:
       repo: ~/dev/protoContent
-      base_branch: main
       release_freeze: false        # changesets: the Version PR is nearly always open
     protoAgent:
-      repo: ~/dev/protoAgent
-      base_branch: main
-      # release_freeze unset: the default prepare-release patterns apply
+      repo: ~/dev/protoAgent       # release_freeze unset: the defaults apply
 ```
 
-**Card 1, the change** (protoContent):
+**Card 1, the change** (protoContent). It must ship a changeset, or nothing is published:
 
 ```
 board_create_feature(
   project="protoContent",
   title="Add accent-subtle token and Badge subtle tone",
-  spec="… add --pl-color-accent-subtle to packages/design tokens; add tone='subtle' to Badge …
-        Ship a changeset bumping @protolabsai/ui and @protolabsai/design (minor).",
-  acceptance_criteria="- WHEN a Badge renders with tone='subtle' THE SYSTEM SHALL use --pl-color-accent-subtle …",
+  spec="… add --pl-color-accent-subtle to packages/design; tone='subtle' on Badge …
+        Ship .changeset/accent-subtle.md: minor for @protolabsai/design and @protolabsai/ui.",
+  acceptance_criteria="- WHEN a Badge renders with tone='subtle' THE SYSTEM SHALL …",
   files_to_modify="packages/design/src/tokens.ts, packages/ui/src/Badge.tsx, .changeset/accent-subtle.md (new)",
 )
 → bd-a1
 ```
-
-Merging it does not publish. The changesets action opens or refreshes the
-"chore: release packages" PR, and merging that PR publishes to npm.
 
 **Card 2, the adoption** (protoAgent):
 
@@ -145,44 +162,34 @@ Merging it does not publish. The changesets action opens or refreshes the
 board_create_feature(
   project="protoAgent",
   title="Adopt the Badge subtle tone in the console",
-  spec="Bump @protolabsai/ui in apps/web and use tone='subtle' for …",
+  spec="Bump @protolabsai/ui in apps/web to the release that carries tone='subtle' …",
   acceptance_criteria="…",
   files_to_modify="apps/web/package.json, package-lock.json, apps/web/src/…/StatusBadge.tsx",
-  depends_on="bd-a1",
-  waits_for="npm:@protolabsai/ui@>0.62.0",
+  waits_for="npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1",
 )
 ```
 
-- `depends_on=bd-a1` keeps card 2 out of the claim until card 1 merges, and shows the order
-  on the board.
-- `waits_for=npm:@protolabsai/ui@>0.62.0` keeps it out until a version newer than today's
-  latest is on npm. Every publish after card 1 merges carries card 1's changeset, because
-  the Version PR is regenerated on every push to main. So "anything newer than 0.62.0,
-  after card 1 merged" means "card 1 is published". You don't have to predict the bump. If
-  you know it (a `minor` changeset), `>=0.63.0` says the same thing more precisely.
-- Optional: once the bot's release PR exists (say `protoContent#219`), you can add
-  `pr:protoLabsAI/protoContent#219` with `board_update_feature` to show the step on the
-  card. The npm gate is the one that matters. A merged release PR whose publish job failed
-  still leaves the card waiting, correctly.
+No version to predict and no `depends_on` needed. The gate is unmet until bd-a1's PR
+merges, then until a published `@protolabsai/ui` is tagged at a descendant of that merge
+commit. `depends_on="bd-a1"` is still fine to add for the ordering it shows on the board.
 
-What happens:
+What happens, including the race that a version floor loses:
 
 | Time | Card 2 reads |
 |---|---|
-| card 1 in review | (`depends_on` open; not yet checked) |
-| card 1 merged, release PR open | `waiting on publish: npm @protolabsai/ui >0.62.0 (latest 0.62.0)` |
-| release PR merged, publish job running | same, re-checked about every 2 min |
-| 0.63.0 on npm | claimed. `publish gates cleared (… (0.63.0 published))` |
-| card 2's PR green, protoAgent preparing v0.173.0 | `held: release freeze (PR #3565 (prepare-release/v0.173.0))` |
-| release PR merged | merged by the next merge poll |
+| bd-a1 in review, Version PR #528 already open | `… (card bd-a1 not merged yet (#501))` |
+| #528 merges first and publishes ui@0.62.1 **without** bd-a1 | same. A floor `>0.62.0` would have released it here |
+| bd-a1 merges; the bot regenerates the Version PR | `… (latest 0.62.1, tag … at b7c3…, lacks 4f1e…)` |
+| the Version PR merges; 0.63.0 published and tagged | claimed. `publish gates cleared (… (0.63.0 published, contains 4f1e…))` |
+| card 2's PR green while protoAgent is cutting v0.173.0 | `held: release freeze (PR #3565 (prepare-release/v0.173.0))` |
+| the release is tagged | merged by the next merge poll |
 
 ## The release freeze
 
 Before the auto-merge edge merges a PR that is otherwise ready, it checks whether the PR's
-repo is mid-release. If it is, the merge is held. The card stays `in_review`, reading
-`held: release freeze (<evidence>)`, with one comment on the card. No merge attempt is
-spent, and each merge poll checks again. When the freeze lifts, the loop logs
-`release freeze lifted` and merges.
+repo is mid-release. If it is, the merge is held. The card stays `in_review` reading
+`held: release freeze (<evidence>)`, with one comment on the card and no merge attempt
+spent, and every merge poll checks again.
 
 The signals, per project (`release_freeze`, see [configuration](configuration.md)):
 
@@ -190,17 +197,28 @@ The signals, per project (`release_freeze`, see [configuration](configuration.md
 |---|---|---|
 | a remote branch matches | `prepare-release*` | `git ls-remote --heads origin` |
 | an open PR's head matches | `prepare-release*` | `gh api repos/<o>/<r>/pulls?state=open` |
-| a workflow has an active run | `prepare-release.yml` | `gh api …/actions/workflows/<file>/runs` (a 404 means no such workflow, not frozen) |
+| a workflow has an active run | `prepare-release.yml` | `gh api …/actions/workflows/<file>/runs` (404 = no such workflow = not frozen) |
+| base's head is an untagged release commit | `chore: release v*` | `gh api …/commits/<base>`, then the tag named in the subject |
+
+The last signal covers the gap after the release PR merges and before its tag is pushed.
+protoAgent deletes the merged `prepare-release/*` branch at once, so the branch and PR
+signals are already quiet while the release workflow is still tagging.
+
+**Failure handling:**
+
+- A signal the credential **cannot read** (HTTP 403, e.g. a token without
+  `Actions: read`) is skipped, not treated as frozen. The other signals still decide. The
+  loop logs a named warning once, and the setup status carries a `release_freeze`
+  advisory ("partly blind: …") until the process restarts.
+- Any **other** failure (GitHub down, rate limited) holds the merge with the error as
+  evidence and retries next poll. A delayed merge costs one poll interval; a mid-release
+  merge costs the release's whole check run.
 
 Defaults per repo type:
 
 | Repo | `release_freeze` | Why |
 |---|---|---|
-| protoAgent-style: a `prepare-release.yml` that pushes `prepare-release/vX.Y.Z` and opens a PR | unset (default) | every merge during that window restarts the release checks, about 15 min |
-| changesets (protoContent): a bot "Version Packages" PR on `changeset-release/main`, publish on merge | `false` | the Version PR is open whenever any changeset is pending. Merging other PRs folds their changesets in, which is harmless, and freezing on it would hold nearly every merge |
-| a repo that keeps release branches after merging | `{pr_heads: [...], workflows: [...]}` | a branch glob would freeze forever |
+| protoAgent-style (`prepare-release.yml` → `prepare-release/vX.Y.Z` PR → tag) | unset (default) | every merge during that window restarts the release checks, about 15 min |
+| changesets (protoContent) | `false` | the Version PR is open whenever any changeset is pending, and merging other PRs just folds their changesets in |
+| keeps release branches after merging | `{pr_heads: [...], workflows: [...], release_commits: [...]}` | a branch glob would freeze forever |
 | no release process | unset | nothing matches, so nothing is held |
-
-A check that errors holds the merge, with the error as evidence, and retries next poll. A
-delayed merge costs one poll interval. A merge into a release in flight costs the
-release's whole check run.

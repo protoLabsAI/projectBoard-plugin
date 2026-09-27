@@ -111,6 +111,7 @@ REAL_SEAMS = {
     "worktree.remote_branches": _worktree_mod.remote_branches,
     "worktree.open_pr_heads": _worktree_mod.open_pr_heads,
     "worktree.active_workflow_runs": _worktree_mod.active_workflow_runs,
+    "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
 }
 
 
@@ -137,11 +138,15 @@ def _no_publish_gate_network(monkeypatch):
     async def _no_runs(_slug, _workflow, *, cwd="."):
         return []
 
+    async def _no_release_gap(_slug, _base, _patterns, *, cwd="."):
+        return ""
+
     monkeypatch.setattr(_gates_mod, "_http_get_json", _no_http)
     monkeypatch.setattr(_gates_mod, "_gh_json", _no_gh)
     monkeypatch.setattr(_worktree_mod, "remote_branches", _no_branches)
     monkeypatch.setattr(_worktree_mod, "open_pr_heads", _no_prs)
     monkeypatch.setattr(_worktree_mod, "active_workflow_runs", _no_runs)
+    monkeypatch.setattr(_worktree_mod, "untagged_release_head", _no_release_gap)
     _gates_mod.reset_cache()
     _freeze_mod.reset_state()
     yield

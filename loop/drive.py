@@ -828,7 +828,20 @@ class DriveMixin:
         waiting = getattr(self, "_gate_waiting", None)
         if waiting is None:
             waiting = self._gate_waiting = set()
-        results = await asyncio.to_thread(publish_gates.evaluate, candidate["waits_for"], token=self._npm_token())
+
+        def _resolve(card_id):
+            try:
+                return store.get_feature(card_id)
+            except Exception:  # noqa: BLE001 — unreadable = not found = unmet, never a crash
+                return None
+
+        try:
+            results = await asyncio.to_thread(
+                publish_gates.evaluate, candidate["waits_for"], token=self._npm_token(), resolve_card=_resolve
+            )
+        except Exception as exc:  # noqa: BLE001 — belt: a gate bug holds ONE card, never the scan
+            log.warning("[project_board] %s publish-gate evaluation crashed — held: %s", fid, exc, exc_info=True)
+            return False
         sentence = publish_gates.unmet_sentence(results)
         if sentence:
             if fid not in waiting:

@@ -11,9 +11,11 @@ and HOLDS the merge (the card stays ``in_review``, reading ``held: release freez
 Config — ``release_freeze``, per project entry (falling back to the flat top-level key):
 
 * absent / ``true`` — the DEFAULT patterns: a remote branch or an open PR head matching
-  ``prepare-release*``, or an active run of ``prepare-release.yml``. A repo with none of
-  those is never frozen, so the default is safe to leave on everywhere (it costs three
-  reads per otherwise-ready merge).
+  ``prepare-release*``, an active run of ``prepare-release.yml``, or base's head being a
+  ``chore: release v*`` commit whose tag is not pushed yet (the gap after the release PR
+  merges, when protoAgent has already deleted the branch). A repo with none of those is
+  never frozen, so the default is safe to leave on everywhere (four reads per
+  otherwise-ready merge).
 * ``false`` — off for that project. Recommended for a changesets repo (protoContent):
   its release is a bot-maintained "Version Packages" PR (``changeset-release/main``)
   that is open whenever ANY changeset is pending, i.e. most of the time; merging other
@@ -21,29 +23,38 @@ Config — ``release_freeze``, per project entry (falling back to the flat top-l
   every merge for nothing.
 * a list — shorthand: each item is a glob matched against remote branches AND open PR
   heads, except ``workflow:<file>`` items (or items ending ``.yml``/``.yaml``), which
-  name workflows whose active runs freeze.
-* a mapping ``{branches: [...], pr_heads: [...], workflows: [...]}`` — each signal
+  name workflows whose active runs freeze, and ``commit:<glob>`` items, which name
+  release-commit subjects.
+* a mapping ``{branches, pr_heads, workflows, release_commits}`` — each signal
   configured separately (an absent key = that signal off). Use it for a repo that KEEPS
   its release branches after merging (then a branch glob would freeze forever): check
   ``pr_heads`` and ``workflows`` only.
 
-Fail CLOSED: when the check itself errors (GitHub down, rate-limited, no auth) the merge
-is held with the error as evidence and retried next poll. A delayed merge costs one poll
+A signal the credential cannot read (403 — e.g. no ``Actions: read``) is skipped, warned
+once and named in the setup status; the others still decide. Any OTHER failure fails
+CLOSED: the merge is held with the error as evidence and retried next poll. A delayed merge costs one poll
 interval; a merge into a release in flight costs the release's whole check run.
 """
 
 from __future__ import annotations
 
 import sys
+import logging
 import threading
 import time
 import types
+
+log = logging.getLogger("protoagent.plugins.project_board")
 
 DEFAULT_PATTERNS = {
     "branches": ["prepare-release*"],
     "pr_heads": ["prepare-release*"],
     "workflows": ["prepare-release.yml"],
+    # The window after the release PR merges but before its tag is pushed: base's head is
+    # `chore: release vX.Y.Z` and tag vX.Y.Z does not exist yet (the branch is already gone).
+    "release_commits": ["chore: release v*"],
 }
+SIGNALS = ("branches", "pr_heads", "workflows", "release_commits")
 # Re-reading the same repo's freeze state within this window reuses the answer, so a
 # poll that finds five mergeable cards in one repo asks GitHub once, not five times.
 CHECK_TTL_S = 30.0
@@ -71,21 +82,19 @@ def parse_config(raw) -> dict | None:
     if raw is False:
         return None
     if isinstance(raw, dict):
-        out = {
-            "branches": _as_list(raw.get("branches")),
-            "pr_heads": _as_list(raw.get("pr_heads")),
-            "workflows": _as_list(raw.get("workflows")),
-        }
+        out = {k: _as_list(raw.get(k)) for k in SIGNALS}
         return out if any(out.values()) else None
-    globs, workflows = [], []
+    globs, workflows, commits = [], [], []
     for item in _as_list(raw):
         if item.lower().startswith("workflow:"):
             workflows.append(item.split(":", 1)[1].strip())
+        elif item.lower().startswith("commit:"):
+            commits.append(item.split(":", 1)[1].strip())
         elif item.lower().endswith((".yml", ".yaml")):
             workflows.append(item)
         else:
             globs.append(item)
-    out = {"branches": list(globs), "pr_heads": list(globs), "workflows": workflows}
+    out = {"branches": list(globs), "pr_heads": list(globs), "workflows": workflows, "release_commits": commits}
     return out if any(out.values()) else None
 
 
@@ -96,10 +105,12 @@ if _holder is None:
     _holder = types.ModuleType(_SLOT)
     _holder.holds = {}
     _holder.checks = {}
+    _holder.unavailable = {}
     _holder.lock = threading.Lock()
     sys.modules[_SLOT] = _holder
 _HOLDS: dict[str, dict] = _holder.holds
 _CHECKS: dict[tuple, dict] = _holder.checks
+_UNAVAILABLE: dict[str, str] = _holder.__dict__.setdefault("unavailable", {})
 _LOCK: threading.Lock = _holder.lock
 
 
@@ -107,6 +118,35 @@ def reset_state() -> None:
     with _LOCK:
         _HOLDS.clear()
         _CHECKS.clear()
+        _UNAVAILABLE.clear()
+
+
+def _mark_unavailable(key: str, reason: str) -> None:
+    """Record a signal this credential cannot read — WARNING once per (repo, signal)."""
+    with _LOCK:
+        new = key not in _UNAVAILABLE
+        _UNAVAILABLE[key] = reason
+    if new:
+        log.warning(
+            "[project_board] release freeze: %s — that signal is skipped; the others still decide "
+            "(grant the permission, or set release_freeze for this project to drop the signal)",
+            reason,
+        )
+
+
+def unavailable_hint() -> str:
+    """Operator copy naming every freeze signal the credential cannot read, "" when none —
+    surfaced by the setup status as a non-blocking advisory."""
+    with _LOCK:
+        reasons = sorted(set(_UNAVAILABLE.values()))
+    if not reasons:
+        return ""
+    return (
+        "Release-freeze check is partly blind: "
+        + "; ".join(reasons)
+        + ". Auto-merge still runs on the signals it can read. Grant the permission (e.g. Actions: read) "
+        "or narrow release_freeze for that project."
+    )
 
 
 def hold_for(fid: str) -> dict | None:
@@ -129,30 +169,51 @@ def clear_hold(fid: str) -> dict | None:
         return _HOLDS.pop(fid, None)
 
 
-async def check(slug: str, repo: str, patterns: dict, *, cwd: str = ".", now: float | None = None) -> str:
+async def check(
+    slug: str, repo: str, patterns: dict, *, cwd: str = ".", now: float | None = None, base: str = "main"
+) -> str:
     """``""`` when ``slug`` shows no release in flight, else the evidence sentence
     (``branch prepare-release/v0.173.0``, ``PR #3565 (prepare-release/v0.173.0)``,
     ``prepare-release.yml run in_progress``, or ``freeze check failed: …``)."""
     from . import worktree
 
-    t = time.time() if now is None else now
-    key = (slug, repo, tuple(sorted((k, tuple(v)) for k, v in patterns.items())))
+    t = time.monotonic() if now is None else now
+    key = (slug, repo, base, tuple(sorted((k, tuple(v)) for k, v in patterns.items())))
     with _LOCK:
         hit = _CHECKS.get(key)
         if hit and t - hit["at"] < CHECK_TTL_S:
             return hit["evidence"]
     evidence: list[str] = []
+
+    async def _signal(name: str, read):
+        """One signal. A 403 (SignalUnavailable) blinds only THIS signal — logged once,
+        shown in the setup status — and the rest still decide; any other failure is
+        "cannot tell", which fails the whole check CLOSED."""
+        try:
+            return await read()
+        except worktree.SignalUnavailable as exc:
+            _mark_unavailable(f"{slug or repo}:{name}", str(exc))
+            return None
+
     try:
         for name in await worktree.remote_branches(repo, patterns.get("branches")):
             evidence.append(f"branch {name}")
         if slug:
-            for number, head in await worktree.open_pr_heads(slug, patterns.get("pr_heads"), cwd=cwd):
+            hits = await _signal("pr_heads", lambda: worktree.open_pr_heads(slug, patterns.get("pr_heads"), cwd=cwd))
+            for number, head in hits or ():
                 evidence.append(f"PR #{number} ({head})")
             for wf in patterns.get("workflows") or ():
-                runs = await worktree.active_workflow_runs(slug, wf, cwd=cwd)
+                runs = await _signal(f"workflow {wf}", lambda wf=wf: worktree.active_workflow_runs(slug, wf, cwd=cwd))
                 if runs:
                     evidence.append(f"{wf} run {runs[0].get('status')}")
-        elif patterns.get("pr_heads") or patterns.get("workflows"):
+            if patterns.get("release_commits"):
+                gap = await _signal(
+                    "release_commits",
+                    lambda: worktree.untagged_release_head(slug, base, patterns.get("release_commits"), cwd=cwd),
+                )
+                if gap:
+                    evidence.append(gap)
+        elif patterns.get("pr_heads") or patterns.get("workflows") or patterns.get("release_commits"):
             raise worktree.WorktreeError("the PR's GitHub repo could not be resolved")
     except Exception as exc:  # noqa: BLE001 — fail CLOSED: an unanswerable check holds the merge
         evidence = [f"freeze check failed: {exc}"]

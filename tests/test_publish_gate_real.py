@@ -31,7 +31,7 @@ import subprocess
 
 import pytest
 
-from conftest import REAL_SEAMS, gh_tier_ready
+from conftest import GH_FIXTURE_PR_URL, REAL_SEAMS, gh_tier_ready
 from project_board import gates, worktree
 from project_board import store as store_mod
 from project_board.store import NOTES_WAITS_PREFIX, BeadsBoard, BoardError
@@ -67,6 +67,7 @@ def real_seams(monkeypatch):
     monkeypatch.setattr(worktree, "remote_branches", REAL_SEAMS["worktree.remote_branches"])
     monkeypatch.setattr(worktree, "open_pr_heads", REAL_SEAMS["worktree.open_pr_heads"])
     monkeypatch.setattr(worktree, "active_workflow_runs", REAL_SEAMS["worktree.active_workflow_runs"])
+    monkeypatch.setattr(worktree, "untagged_release_head", REAL_SEAMS["worktree.untagged_release_head"])
 
 
 # ── skip guards: an enforced tier never silently skips ──────────────────────────────
@@ -160,14 +161,24 @@ def test_a_bad_spec_refuses_the_create_before_any_bead_is_minted(board):
 
 @requires_npm
 def test_eval_npm_met_against_the_live_registry(real_seams):
-    out = gates.eval_npm(gates.parse_spec("npm:left-pad@>=1.0.0"))
-    assert out["met"] is True and out["version"] == "1.3.0"
+    status, doc = gates._packument(gates.parse_spec("npm:is-number"), "")
+    assert status == 200 and "7.0.0" in doc["versions"]
+    out = gates.eval_npm(gates.parse_spec("npm:is-number@>=7.0.0"))
+    assert out["met"] is True and out["version"] == "7.0.0"
 
 
 @requires_npm
 def test_eval_npm_unmet_names_the_latest_version(real_seams):
-    out = gates.eval_npm(gates.parse_spec("npm:left-pad@>=99.0.0"))
-    assert out["met"] is False and "latest 1.3.0" in out["detail"]
+    out = gates.eval_npm(gates.parse_spec("npm:is-number@>=99.0.0"))
+    assert out["met"] is False and "latest 7.0.0" in out["detail"]
+
+
+@requires_npm
+def test_eval_npm_a_fully_deprecated_package_never_satisfies(real_seams):
+    """left-pad deprecated every version it ever published — the live proof that the
+    registry's per-version `deprecated` field is read."""
+    out = gates.eval_npm(gates.parse_spec("npm:left-pad@>=1.0.0"))
+    assert out["met"] is False and "only deprecated versions satisfy" in out["detail"]
 
 
 @requires_npm
@@ -182,6 +193,7 @@ def test_eval_npm_encodes_a_scoped_name(real_seams):
 def test_eval_npm_never_published_is_unmet_not_an_error(real_seams):
     out = gates.eval_npm(gates.parse_spec("npm:@protolabsai/definitely-not-a-real-package-3f9c@>=1.0.0"))
     assert out["met"] is False and "not published yet" in out["detail"]
+    assert "npm_token" in out["detail"]  # a scoped 404 without a token may be a private package
 
 
 # ── real GitHub ──────────────────────────────────────────────────────────────────
@@ -243,3 +255,76 @@ async def test_remote_branches_matches_release_branches_on_a_real_origin(real_se
     (tmp_path / "not-a-repo").mkdir()
     with pytest.raises(worktree.WorktreeError):  # an unanswerable read RAISES (the freeze fails closed on it)
         await worktree.remote_branches(str(tmp_path / "not-a-repo"), ["x"])
+
+
+# ── contains: proven against real npm + GitHub (protoContent, the #457 review's case) ──
+
+DS_REPO = "protoLabsAI/protoContent"
+
+
+@requires_gh
+def test_tag_commit_and_contains_on_real_github(real_seams):
+    """The two reads the `contains:` gate stands on: an ANNOTATED changesets tag
+    dereferences to its commit, and compare reports descent in the right direction."""
+    new = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.62.0")
+    old = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.61.0")
+    assert len(new) == 40 and len(old) == 40 and new != old
+    assert gates._tag_commit(DS_REPO, "@protolabsai/ui@999.0.0") == ""
+    assert gates._contains(DS_REPO, old, new) is True  # 0.62.0 carries 0.61.0's commit
+    assert gates._contains(DS_REPO, new, old) is False  # …not the other way round
+    assert gates._contains(DS_REPO, new, new) is True  # identical
+
+
+@requires_gh
+def test_anchor_sha_resolves_a_card_to_its_merge_commit(real_seams):
+    card = {"id": "bd-x1", "pr_url": f"https://github.com/{PLUGIN_SLUG}/pull/{MERGED_PR}"}
+    spec = gates.parse_spec(f"npm:x@contains:{PLUGIN_SLUG}@bd-x1")
+    sha, why = gates._anchor_sha(spec, lambda fid: card)
+    assert why == "" and sha == "de8dfcfdb7d771543a9003beb9fe8098523b9770"
+    open_card = {"id": "bd-x1", "pr_url": GH_FIXTURE_PR_URL}
+    if GH_FIXTURE_PR_URL.startswith(f"https://github.com/{PLUGIN_SLUG}/pull/"):
+        assert gates._anchor_sha(spec, lambda fid: open_card)[1].startswith("card bd-x1 not merged yet")
+
+
+@requires_gh
+@requires_npm
+def test_contains_end_to_end_on_the_live_design_system(real_seams):
+    """`npm:@protolabsai/ui@contains:protoLabsAI/protoContent@<sha>` against the real
+    registry + repo: an anchor the latest publish carries is met; the latest publish's own
+    tag commit is met (identical); an anchor that is NEWER than the latest publish is not."""
+    status, doc = gates._packument(gates.parse_spec("npm:@protolabsai/ui"), "")
+    latest = doc["dist-tags"]["latest"]
+    tagged = gates._tag_commit(DS_REPO, f"@protolabsai/ui@{latest}")
+    older = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.61.0")
+    for anchor in (older, tagged):
+        out = gates.eval_npm(gates.parse_spec(f"npm:@protolabsai/ui@contains:{DS_REPO}@{anchor}"))
+        assert out["met"] is True, out
+    rc, head, _err = gates._gh_json(f"repos/{DS_REPO}/commits/main")
+    head_sha = head["sha"]
+    if head_sha != tagged and not gates._contains(DS_REPO, head_sha, tagged):
+        out = gates.eval_npm(gates.parse_spec(f"npm:@protolabsai/ui@contains:{DS_REPO}@{head_sha}"))
+        assert out["met"] is False and f"latest {latest}" in out["detail"]
+
+
+@requires_gh
+def test_release_ranges_on_the_live_changesets_monorepo(real_seams):
+    """The review's live reproduction of B1: `release:protoLabsAI/protoContent@>=0.9.3`,
+    meant for design (latest 0.9.2), was MET by `@protolabsai/ui@0.62.0`."""
+    bare = gates.parse_spec(f"release:{DS_REPO}@>=0.9.3")
+    versions, scoped = gates._release_versions(bare)
+    assert scoped, "protoContent tags releases per package"
+    out = gates.eval_release(bare)
+    assert out["met"] is False and "@<package>@" in out["detail"]
+    assert gates.remote_refusal(bare)
+    design = gates.parse_spec(f"release:{DS_REPO}@@protolabsai/design@>=0.9.2")
+    assert gates.eval_release(design)["met"] is True
+    assert gates.eval_release(gates.parse_spec(f"release:{DS_REPO}@@protolabsai/design@>=99.0.0"))["met"] is False
+
+
+@requires_gh
+async def test_untagged_release_head_on_a_real_tagged_release_commit(real_seams):
+    """`chore: release v0.58.0 (#451)` IS tagged v0.58.0, so the gap signal is quiet there;
+    a pattern that does not match the subject is quiet too."""
+    sha = "de8dfcfdb7d771543a9003beb9fe8098523b9770"
+    assert await worktree.untagged_release_head(PLUGIN_SLUG, sha, ["chore: release v*"]) == ""
+    assert await worktree.untagged_release_head(PLUGIN_SLUG, sha, ["never-matches*"]) == ""

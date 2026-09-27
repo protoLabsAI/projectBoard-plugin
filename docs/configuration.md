@@ -153,24 +153,29 @@ reading `held: release freeze (<evidence>)`) until the freeze lifts. Set it in a
 `projects:` entry (or top level, as every project's fallback):
 
 - unset / `true` — the default patterns: an `origin` branch or an open PR head matching
-  `prepare-release*`, or an active run of `prepare-release.yml` (protoAgent's release
-  flow). A repo with none of those is never frozen, so leaving it on costs three reads per
-  otherwise-ready merge and nothing else.
+  `prepare-release*`, an active run of `prepare-release.yml`, or base's head commit being
+  a `chore: release v*` commit whose tag is not pushed yet (the window after the release
+  PR merges — protoAgent deletes the branch at once). A repo with none of those is never
+  frozen, so leaving it on costs four reads per otherwise-ready merge and nothing else.
 - `false` — off. **Use it for a changesets repo such as protoContent**: its release is a
   bot-maintained "Version Packages" PR (`changeset-release/main`) that is open whenever any
   changeset is pending, and merging other PRs meanwhile just folds their changesets into
   it — a freeze on it would hold nearly every merge for nothing.
 - a list — each item is a glob matched against remote branches AND open PR heads, except
   `workflow:<file>` items (or items ending `.yml`/`.yaml`), which name workflows whose
-  active runs freeze: `[release/*, workflow:release.yml]`.
-- a mapping — `{branches: [...], pr_heads: [...], workflows: [...]}`, each signal set
-  separately (an absent key turns that signal off). Use it for a repo that KEEPS its
-  release branches after merging, where a branch glob would freeze forever:
-  `{pr_heads: [prepare-release*], workflows: [prepare-release.yml]}`.
+  active runs freeze, and `commit:<subject glob>` items, which name untagged release
+  commits: `[release/*, workflow:release.yml, "commit:release v*"]`.
+- a mapping — `{branches: [...], pr_heads: [...], workflows: [...], release_commits: [...]}`,
+  each signal set separately (an absent key turns that signal off). Use it for a repo that
+  KEEPS its release branches after merging, where a branch glob would freeze forever:
+  `{pr_heads: [prepare-release*], workflows: [prepare-release.yml], release_commits: ["chore: release v*"]}`.
 
-A freeze check that errors (GitHub down, rate limited) HOLDS the merge with the error as
-evidence and retries next merge poll: a delayed merge costs one poll interval, a merge into
-a release in flight costs the release's whole check run.
+A signal the `gh` credential cannot read (HTTP 403 — e.g. a token without `Actions: read`)
+is SKIPPED, not treated as frozen: the other signals still decide, the loop logs a named
+warning once, and the setup status carries a `release_freeze` advisory naming it. Any other
+freeze-check failure (GitHub down, rate limited) HOLDS the merge with the error as evidence
+and retries next merge poll: a delayed merge costs one poll interval, a merge into a release
+in flight costs the release's whole check run.
 
 **`npm_token`** — a read token for `npm:` publish gates on PRIVATE packages. Blank reads
 the public registry anonymously, which is all a public package (`@protolabsai/ui`) needs.

@@ -1113,6 +1113,20 @@ def _normalize_waits(raw) -> list[str]:
         raise BoardError(str(exc)) from None
 
 
+def _refuse_structured_paths(files) -> None:
+    """A files_to_modify entry that starts with a notes METADATA prefix would round-trip as
+    that metadata, not a path — a `waits-for:` one as a publish gate the author never
+    wrote (#457 review). Refuse it by name."""
+    for f in files or ():
+        s = str(f).strip()
+        for prefix in (NOTES_WAITS_PREFIX, NOTES_SOURCE_PREFIX, NOTES_REQ_PREFIX):
+            if s.startswith(prefix):
+                raise BoardError(
+                    f"files_to_modify entry {s!r} starts with {prefix!r}, which the board reserves for card "
+                    "metadata — it would not be read back as a path. Rename or drop it."
+                )
+
+
 def _parse_closed_at(raw) -> float | None:
     """A bead ``closed_at`` → epoch seconds, or None when absent/unparseable. The
     archive pass treats None as NOT archivable — a terminal feature with a missing or
@@ -1561,6 +1575,7 @@ class BeadsBoard:
         # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
         waits = _normalize_waits(waits_for)
+        _refuse_structured_paths(files_to_modify)
         proj = normalize_project(project or self.default_project)
         fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
@@ -1902,6 +1917,8 @@ class BeadsBoard:
         clears them); None leaves them untouched."""
         f = self._require(fid)
         new_waits = _normalize_waits(waits_for) if waits_for is not None else None
+        if files_to_modify is not None:
+            _refuse_structured_paths(files_to_modify)
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
         # markdown bullet, a leading-dash path) can't be mis-parsed as a CLI option and

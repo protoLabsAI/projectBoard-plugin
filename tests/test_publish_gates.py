@@ -205,7 +205,7 @@ def test_eval_npm_404_is_not_yet_and_401_is_an_error_naming_the_token(monkeypatc
 def _gh(monkeypatch, answers, calls=None):
     """``answers``: path → (rc, data, err)."""
 
-    def _fake(path, *, timeout=0.0):
+    def _fake(path, *, timeout=0.0, paginate=False):
         if calls is not None:
             calls.append(path)
         for key, val in answers.items():
@@ -230,12 +230,13 @@ def test_eval_pr_merged_open_closed_and_missing(monkeypatch):
         gates.eval_pr(parse_spec("pr:o/r#1"))
 
 
-def test_eval_release_tag_and_range(monkeypatch):
+def test_eval_release_tag_and_range_on_a_plain_tag_repo(monkeypatch):
     calls = []
     releases = [
         {"tag_name": "v0.62.0"},
-        {"tag_name": "@protolabsai/ui@0.63.0"},
+        {"tag_name": "v0.63.0"},
         {"tag_name": "v0.64.0", "draft": True},  # a draft is not released
+        {"tag_name": "v0.65.0-rc.1", "prerelease": True},  # nor is a GitHub prerelease
         {"tag_name": "nightly"},
     ]
     _gh(
@@ -253,6 +254,350 @@ def test_eval_release_tag_and_range(monkeypatch):
     unmet = gates.eval_release(parse_spec("release:o/r@>=0.64.0"))
     assert unmet["met"] is False and "latest release 0.63.0" in unmet["detail"]
     assert calls[0] == "repos/o/r/git/ref/tags/v0.63.0"
+
+
+# The live protoContent shape the review reproduced (B1): per-package changesets tags.
+_MONOREPO_RELEASES = [
+    {"tag_name": "@protolabsai/ui@0.62.0"},
+    {"tag_name": "@protolabsai/ui@0.61.0"},
+    {"tag_name": "@protolabsai/ui-css@0.62.0"},
+    {"tag_name": "@protolabsai/design@0.9.2"},
+    {"tag_name": "@protolabsai/vitepress-theme@0.3.12"},
+]
+
+
+def test_release_range_counts_only_the_named_packages_tags(monkeypatch):
+    _gh(monkeypatch, {"repos/o/r/releases": (0, _MONOREPO_RELEASES, "")})
+    spec = parse_spec("release:o/r@@protolabsai/design@>=0.9.3")
+    assert (spec.package, spec.constraint, spec.is_range) == ("@protolabsai/design", ">=0.9.3", True)
+    out = gates.eval_release(spec)
+    # Before the fix `@protolabsai/ui@0.62.0` satisfied this (0.62.0 >= 0.9.3).
+    assert out["met"] is False and "latest release 0.9.2" in out["detail"]
+    assert gates.eval_release(parse_spec("release:o/r@@protolabsai/design@>=0.9.2"))["met"] is True
+    assert gates.eval_release(parse_spec("release:o/r@@protolabsai/ui@^0.62.0"))["met"] is True
+    # An exact package tag is still just a tag.
+    exact = parse_spec("release:o/r@@protolabsai/ui@0.62.0")
+    assert exact.is_range is False and exact.constraint == "@protolabsai/ui@0.62.0"
+
+
+def test_a_bare_release_range_on_a_package_tagged_repo_is_never_met_and_is_refused_at_write(monkeypatch):
+    import project_board as pb
+
+    _gh(monkeypatch, {"repos/o/r/releases": (0, _MONOREPO_RELEASES + [{"tag_name": "v0.3.0"}], "")})
+    out = gates.eval_release(parse_spec("release:o/r@>=0.9.3"))
+    assert out["met"] is False and "release:o/r@<package>@>=0.9.3" in out["detail"]
+    assert "release:o/r@<package>@" in gates.remote_refusal(parse_spec("release:o/r@>=0.9.3"))
+    assert gates.remote_refusal(parse_spec("release:o/r@@protolabsai/design@>=0.9.3")) == ""
+
+    class _S:
+        def list_features(self, **_kw):
+            return []
+
+        def create_feature(self, *a, **k):
+            raise AssertionError("must be refused before the store is touched")
+
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
+    tools = {t.name: t for t in pb._board_tools({})}
+    out = tools["board_create_feature"].invoke({"title": "t", "waits_for": "release:o/r@>=0.9.3"})
+    assert out.startswith("Error:") and "release:o/r@<package>@" in out
+
+
+def test_release_ranges_read_every_page(monkeypatch):
+    seen = {}
+
+    def _fake(path, *, timeout=0.0, paginate=False):
+        seen["paginate"] = paginate
+        return 0, [{"tag_name": f"v1.0.{i}"} for i in range(150)], ""
+
+    monkeypatch.setattr(gates, "_gh_json", _fake)
+    assert gates.eval_release(parse_spec("release:o/r@>=1.0.149"))["met"] is True
+    assert seen["paginate"] is True
+
+
+def test_gh_json_concatenates_paginated_pages(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        gates.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout='[{"a":1}]\n[{"a":2}][{"a":3}]', stderr=""),
+    )
+    from conftest import REAL_SEAMS
+
+    rc, data, _err = REAL_SEAMS["gates._gh_json"]("x", paginate=True)
+    assert rc == 0 and data == [{"a": 1}, {"a": 2}, {"a": 3}]
+
+
+# ── contains: a publish PROVEN to carry the change (B2) ────────────────────────────
+
+MERGE = "a" * 40  # card 1's merge commit
+UNRELATED = "b" * 40  # the release commit of a publish that predates card 1's merge
+AFTER = "c" * 40  # the release commit of the publish that carries card 1
+
+
+class _Registry:
+    """npm + GitHub for the #528 interleaving: which versions are published, which tag
+    points where, what descends from what, and whether card 1's PR has merged."""
+
+    def __init__(self):
+        self.versions = ["0.61.0", "0.62.0"]
+        self.tags = {"@protolabsai/ui@0.61.0": "d" * 40, "@protolabsai/ui@0.62.0": "e" * 40}
+        self.descends = set()  # (anchor, commit) pairs where commit contains anchor
+        self.pr_merged = False
+        self.calls = []
+
+    def http(self, url, *, token="", timeout=0.0):
+        self.calls.append(url)
+        return 200, {"versions": {v: {} for v in self.versions}, "dist-tags": {"latest": self.versions[-1]}}
+
+    def gh(self, path, *, timeout=0.0, paginate=False):
+        self.calls.append(path)
+        if path == "repos/protoLabsAI/protoContent/pulls/501":
+            return 0, {"merged": self.pr_merged, "merge_commit_sha": MERGE if self.pr_merged else None}, ""
+        if path.startswith("repos/protoLabsAI/protoContent/git/ref/tags/"):
+            tag = gates.urllib.parse.unquote(path.rsplit("/", 1)[1])
+            if tag in self.tags:
+                return 0, {"ref": f"refs/tags/{tag}", "object": {"type": "tag", "sha": "t-" + tag}}, ""
+            return 1, {"status": "404"}, "gh: Not Found (HTTP 404)"
+        if path.startswith("repos/protoLabsAI/protoContent/git/tags/t-"):
+            return 0, {"object": {"type": "commit", "sha": self.tags[path.split("/t-", 1)[1]]}}, ""
+        if "/compare/" in path:
+            base, head = path.rsplit("/", 1)[1].split("...")
+            if base == head:
+                return 0, {"status": "identical"}, ""
+            return 0, {"status": "ahead" if (base, head) in self.descends else "behind"}, ""
+        raise AssertionError(f"unexpected gh api {path}")
+
+
+def _contains_env(monkeypatch):
+    reg = _Registry()
+    monkeypatch.setattr(gates, "_http_get_json", reg.http)
+    monkeypatch.setattr(gates, "_gh_json", reg.gh)
+    return reg
+
+
+CARD1 = {"id": "bd-a1", "pr_url": "https://github.com/protoLabsAI/protoContent/pull/501"}
+CONTAINS = "npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1"
+
+
+def test_parse_contains_spec():
+    s = parse_spec(CONTAINS)
+    assert (s.kind, s.target, s.anchor_repo, s.anchor) == (
+        "npm",
+        "@protolabsai/ui",
+        "protoLabsAI/protoContent",
+        "bd-a1",
+    )
+    assert s.describe() == "npm @protolabsai/ui containing protoLabsAI/protoContent@bd-a1"
+    assert parse_spec("npm:x@contains:o/r@ABCDEF1").anchor == "abcdef1"
+    for bad in ("npm:x@contains:o/r", "npm:x@contains:o/r@nodash", "npm:x@contains:../r@bd-1"):
+        with pytest.raises(GateSpecError):
+            parse_spec(bad)
+
+
+def test_the_528_interleaving_an_unrelated_publish_never_releases_the_consumer(monkeypatch):
+    """The exact race the review found: the changesets Version PR (protoContent#528) is
+    already open when card 2 is written, and publishes ui@0.62.1 BEFORE card 1 merges. A
+    version floor (`>0.62.0`, `>=0.63.0` after a minor) would be met by that publish; a
+    `contains:` gate must stay unmet until a publish carrying card 1's merge commit."""
+    reg = _contains_env(monkeypatch)
+    card = dict(CARD1)
+    t = [0.0]
+
+    def check():
+        t[0] += gates.MET_TTL_S + 1  # past every TTL — each call is a fresh read
+        (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: card if fid == "bd-a1" else None, now=t[0])
+        return r
+
+    # 1. card 1 still in review: no anchor yet.
+    r = check()
+    assert r["met"] is False and "card bd-a1 not merged yet (#501)" in r["detail"]
+    # 2. the ALREADY-OPEN Version PR merges first and publishes 0.62.1 WITHOUT card 1.
+    reg.versions.append("0.62.1")
+    reg.tags["@protolabsai/ui@0.62.1"] = UNRELATED
+    assert check()["met"] is False
+    # 3. card 1 merges — 0.62.1 (and every earlier version) still lacks it.
+    reg.pr_merged = True
+    r = check()
+    assert r["met"] is False and "latest 0.62.1" in r["detail"] and "lacks aaaaaaaaaaaa" in r["detail"]
+    # …a version floor WOULD have released the card by now — that is the bug:
+    assert gates.max_satisfying(reg.versions, ">0.62.0") is not None
+    # 4. the regenerated Version PR merges; 0.63.0 is tagged at a descendant of card 1.
+    reg.versions.append("0.63.0")
+    reg.tags["@protolabsai/ui@0.63.0"] = AFTER
+    reg.descends.add((MERGE, AFTER))
+    r = check()
+    assert r["met"] is True and "0.63.0 published, contains aaaaaaaaaaaa" in r["detail"]
+
+
+def test_contains_on_a_raw_sha_and_a_missing_tag(monkeypatch):
+    reg = _contains_env(monkeypatch)
+    spec = f"npm:@protolabsai/ui@contains:protoLabsAI/protoContent@{'e' * 40}"
+    (r,) = gates.evaluate([spec])
+    assert r["met"] is True  # the tag commit IS the anchor → identical
+    reg.versions.append("0.64.0")  # published, but never tagged
+    gates.reset_cache()
+    (r,) = gates.evaluate([spec])
+    assert r["met"] is False and "has no tag" in r["detail"]
+
+
+def test_contains_card_not_on_board_or_without_a_pr(monkeypatch):
+    _contains_env(monkeypatch)
+    (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: None)
+    assert "card bd-a1 not found" in r["detail"]
+    gates.reset_cache()
+    (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: {"id": fid, "pr_url": ""})
+    assert "card bd-a1 has no PR yet" in r["detail"]
+    gates.reset_cache()
+    other = {"id": "bd-a1", "pr_url": "https://github.com/else/where/pull/1"}
+    (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: other)
+    assert r["met"] is False and "is in else/where" in r["error"]
+
+
+async def test_claim_scan_resolves_a_card_anchor_through_the_store(monkeypatch):
+    reg = _contains_env(monkeypatch)
+    reg.pr_merged = True
+    reg.versions.append("0.63.0")
+    reg.tags["@protolabsai/ui@0.63.0"] = AFTER
+    reg.descends.add((MERGE, AFTER))
+    consumer = {"id": "bd-c2", "board_state": "ready", "files_to_modify": ["x"], "waits_for": [CONTAINS]}
+
+    class _Store(_GateStore):
+        def get_feature(self, fid):
+            return dict(CARD1) if fid == "bd-a1" else None
+
+    store = _Store([consumer])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 1})
+    finish = await _hold(loop, monkeypatch)
+    try:
+        await loop._spawn_ready()
+        assert store.claimed == ["bd-c2"]
+    finally:
+        await finish()
+
+
+# ── robustness: one bad gate never stops the board (M1) ───────────────────────────
+
+
+def test_leading_zero_prerelease_is_a_refusal_not_an_assert():
+    for bad in ("npm:x@1.2.3-01", "npm:x@>=1.2.3-01", "npm:x@^1.2.3-01", "npm:x@1.2.3-01 - 2"):
+        with pytest.raises(GateSpecError):
+            parse_spec(bad)
+
+
+def test_a_corrupt_gate_in_notes_is_unmet_never_a_crash(monkeypatch):
+    bad = "npm:x@1.2.3-01"
+    assert gates.evaluate([bad])[0]["met"] is False
+    (s,) = gates.card_status({"waits_for": [bad]})
+    assert s["met"] is False and s["error"]
+
+    def _boom(spec):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(gates, "parse_spec", _boom)
+    (r,) = gates.evaluate(["npm:x@1"])
+    assert r["met"] is False and "parser bug" in r["error"]
+    (s,) = gates.card_status({"waits_for": ["npm:x@2"]})
+    assert s["met"] is False and "parser bug" in s["error"]
+    (f,) = annotate_next_action([_card(waits_for=["npm:x@3"])], {})  # a listing survives
+    assert f["next_action"].startswith("waiting on publish:")
+
+
+async def test_a_corrupt_gate_holds_one_card_and_the_scan_goes_on(monkeypatch):
+    store = _GateStore(
+        [
+            {"id": "bd-1", "board_state": "ready", "files_to_modify": ["a"], "waits_for": ["npm:x@1.2.3-01"]},
+            {"id": "bd-2", "board_state": "ready", "files_to_modify": ["b"]},
+        ]
+    )
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"max_concurrent": 2})
+    finish = await _hold(loop, monkeypatch)
+    try:
+        await loop._spawn_ready()
+        assert store.claimed == ["bd-2"]
+    finally:
+        await finish()
+
+
+def test_a_file_path_that_looks_like_metadata_is_refused(make_board):
+    b, calls, _state = _recording_board(make_board)
+    with pytest.raises(BoardError, match="reserves for card metadata"):
+        b.create_feature("t", spec="s", files_to_modify=["waits-for: npm:x@1"])
+    assert calls == []
+
+
+# ── npm details (M3 + minors) ──────────────────────────────────────────────────────
+
+
+def test_a_404_on_a_scoped_package_without_a_token_names_the_token(monkeypatch):
+    _npm(monkeypatch, [], status=404)
+    assert "or private: set project_board.npm_token" in gates.eval_npm(parse_spec("npm:@acme/secret@>=1"))["detail"]
+    assert "npm_token" not in gates.eval_npm(parse_spec("npm:@acme/secret@>=1"), token="t")["detail"]
+    assert "npm_token" not in gates.eval_npm(parse_spec("npm:left-pad@>=1"))["detail"]
+
+
+def test_deprecated_versions_never_satisfy(monkeypatch):
+    def _get(url, *, token="", timeout=0.0):
+        return 200, {
+            "versions": {"1.0.0": {}, "1.1.0": {"deprecated": "broken, use 1.2.0"}},
+            "dist-tags": {"latest": "1.1.0"},
+        }
+
+    monkeypatch.setattr(gates, "_http_get_json", _get)
+    out = gates.eval_npm(parse_spec("npm:x@>=1.1.0"))
+    assert out["met"] is False and "only deprecated versions satisfy" in out["detail"]
+    assert gates.eval_npm(parse_spec("npm:x@>=1.0.0"))["version"] == "1.0.0"
+
+
+def test_no_range_is_met_by_a_prerelease_only_package(monkeypatch):
+    _npm(monkeypatch, ["1.0.0-beta.1"], latest="1.0.0-beta.1")
+    out = gates.eval_npm(parse_spec("npm:x"))
+    assert out["met"] is True and out["version"] == "1.0.0-beta.1"
+    _npm(monkeypatch, ["1.0.0-beta.1"], latest="1.0.0-beta.1")
+    assert gates.eval_npm(parse_spec("npm:x@*"))["met"] is False  # a range still follows npm's prerelease rule
+
+
+@pytest.mark.parametrize(
+    "rng, v, want",
+    [
+        ("* || 1.2.3-beta", "1.2.3-beta", False),
+        (">=0.0.0 || 1.2.3-beta", "1.2.3-beta", False),
+        ("1.x || 1.2.3-beta", "1.2.3-beta", True),
+    ],
+)
+def test_an_any_set_collapses_the_range_like_node(rng, v, want):
+    assert satisfies(v, rng) is want
+
+
+@pytest.mark.parametrize("bad", ["X.1", "1.*.3", "x.1.2", "1.x.3"])
+def test_a_number_after_a_wildcard_is_refused(bad):
+    with pytest.raises(GateSpecError):
+        gates.parse_range(bad)
+
+
+def test_slug_rejects_dot_segments():
+    for bad in ("pr:../r#1", "pr:o/..#1", "release:o/..@v1", "pr:o/a..b#1"):
+        with pytest.raises(GateSpecError):
+            parse_spec(bad)
+    assert parse_spec("pr:o/re.po#1").target == "o/re.po"
+
+
+def test_cache_scheduling_uses_the_monotonic_clock(monkeypatch):
+    calls = []
+    _npm(monkeypatch, ["1.0.0"], latest="1.0.0", calls=calls)
+    clock = {"mono": 100.0, "wall": 1_000_000.0}
+    monkeypatch.setattr(gates.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(gates.time, "time", lambda: clock["wall"])
+    (r,) = gates.evaluate(["npm:a@>=2"])
+    assert r["checked_at"] == 1_000_000.0  # wall time, for people
+    clock["wall"] += 10 * gates.UNMET_TTL_S  # the wall clock jumps; the schedule must not
+    gates.evaluate(["npm:a@>=2"])
+    assert len(calls) == 1
+    clock["mono"] += gates.UNMET_TTL_S
+    gates.evaluate(["npm:a@>=2"])
+    assert len(calls) == 2
 
 
 # ── cache, TTL, backoff, fail-closed ──────────────────────────────────────────────
@@ -526,7 +871,7 @@ async def test_claim_scan_holds_a_gated_card_and_claims_it_when_the_gate_clears(
     loop = BoardLoop({"max_concurrent": 5, "ready_skip_max": 2})
     finish = await _hold(loop, monkeypatch)
     now = [1000.0]
-    monkeypatch.setattr(gates.time, "time", lambda: now[0])
+    monkeypatch.setattr(gates.time, "monotonic", lambda: now[0])
     _gh(monkeypatch, {"repos/o/r/pulls/3": (0, {"merged": False, "state": "open"}, "")})
     try:
         with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
@@ -574,16 +919,18 @@ def test_parse_freeze_config_shapes():
     assert d == release_freeze.DEFAULT_PATTERNS
     assert release_freeze.parse_config(True) == d and release_freeze.parse_config("default") == d
     assert release_freeze.parse_config(False) is None and release_freeze.parse_config("off") is None
-    assert release_freeze.parse_config(["release/*", "workflow:release.yml", "cut.yaml"]) == {
+    assert release_freeze.parse_config(["release/*", "workflow:release.yml", "cut.yaml", "commit:release v*"]) == {
         "branches": ["release/*"],
         "pr_heads": ["release/*"],
         "workflows": ["release.yml", "cut.yaml"],
+        "release_commits": ["release v*"],
     }
     assert release_freeze.parse_config("release/*, workflow:r.yml")["workflows"] == ["r.yml"]
     assert release_freeze.parse_config({"pr_heads": ["prepare-release*"]}) == {
         "branches": [],
         "pr_heads": ["prepare-release*"],
         "workflows": [],
+        "release_commits": [],
     }
     assert release_freeze.parse_config({}) is None and release_freeze.parse_config([]) is None
 
@@ -744,3 +1091,129 @@ async def test_release_freeze_false_skips_the_check_per_project(monkeypatch):
         is False
     )
     assert seen
+
+
+# ── release freeze: blind signals (M2) and the untagged-release gap ─────────────────
+
+
+async def test_a_403_signal_is_skipped_once_warned_and_shown_in_setup(monkeypatch, caplog):
+    from project_board import setup_check
+
+    async def _no_actions(slug, wf, *, cwd="."):
+        raise worktree.SignalUnavailable("this gh credential cannot read o/r's Actions runs (403 — no Actions: read)")
+
+    _freeze_seams(monkeypatch)
+    monkeypatch.setattr(worktree, "active_workflow_runs", _no_actions)
+    pats = release_freeze.parse_config(None)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.project_board"):
+        for i in range(3):
+            assert await release_freeze.check("o/r", "/repo", pats, now=float(i * 100)) == ""  # NOT held
+    assert caplog.text.count("Actions runs (403") == 1  # warned once, not per poll
+    assert "Actions runs (403" in release_freeze.unavailable_hint()
+    status = setup_check.setup_status({"coder": ""}, which=lambda _b: None, delegates=lambda _n: None)
+    assert "partly blind" in status["release_freeze_hint"]
+
+    # …and the other signals still decide.
+    _freeze_seams(monkeypatch, prs=[(7, "prepare-release/v1.0.0")])
+    monkeypatch.setattr(worktree, "active_workflow_runs", _no_actions)
+    assert await release_freeze.check("o/r", "/repo", pats, now=1000.0) == "PR #7 (prepare-release/v1.0.0)"
+
+
+async def test_the_untagged_release_commit_gap_freezes(monkeypatch):
+    seen = {}
+
+    async def _gap(slug, base, patterns, *, cwd="."):
+        seen["args"] = (slug, base, tuple(patterns))
+        return "release commit abc123 (chore: release v0.173.0 (#3570)) not tagged v0.173.0 yet"
+
+    _freeze_seams(monkeypatch)
+    monkeypatch.setattr(worktree, "untagged_release_head", _gap)
+    got = await release_freeze.check("o/r", "/repo", release_freeze.parse_config(None), now=1.0, base="main")
+    assert got.startswith("release commit abc123") and seen["args"] == ("o/r", "main", ("chore: release v*",))
+
+
+def _fake_gh_proc(monkeypatch, answers):
+    """Drive worktree._gh with canned (rc, out, err) per path substring."""
+
+    async def _gh(*args, cwd=".", timeout=60):
+        path = args[-1]
+        for key, val in answers.items():
+            if key in path:
+                return val
+        raise AssertionError(f"unexpected gh {args}")
+
+    monkeypatch.setattr(worktree, "_gh", _gh)
+
+
+async def test_untagged_release_head_parses_the_subject_and_checks_the_tag(monkeypatch):
+    real = __import__("conftest").REAL_SEAMS["worktree.untagged_release_head"]
+    head = json.dumps({"sha": "f" * 40, "commit": {"message": "chore: release v0.173.0 (#3570)\n\nbody"}})
+    _fake_gh_proc(
+        monkeypatch,
+        {
+            "/commits/main": (0, head, ""),
+            "/git/ref/tags/v0.173.0": (1, '{"status":"404"}', "gh: Not Found (HTTP 404)"),
+        },
+    )
+    got = await real("o/r", "main", ["chore: release v*"])
+    assert got == "release commit ffffffffffff (chore: release v0.173.0 (#3570)) not tagged v0.173.0 yet"
+    _fake_gh_proc(monkeypatch, {"/commits/main": (0, head, ""), "/git/ref/tags/v0.173.0": (0, "{}", "")})
+    assert await real("o/r", "main", ["chore: release v*"]) == ""  # tagged → released
+    feat = json.dumps({"sha": "f" * 40, "commit": {"message": "feat: x"}})
+    _fake_gh_proc(monkeypatch, {"/commits/main": (0, feat, "")})
+    assert await real("o/r", "main", ["chore: release v*"]) == ""
+    _fake_gh_proc(monkeypatch, {"/commits/main": (1, "", "HTTP 403: Resource not accessible by integration")})
+    with pytest.raises(worktree.SignalUnavailable):
+        await real("o/r", "main", ["chore: release v*"])
+
+
+async def test_workflow_and_pull_reads_raise_signal_unavailable_on_403(monkeypatch):
+    real_runs = __import__("conftest").REAL_SEAMS["worktree.active_workflow_runs"]
+    real_prs = __import__("conftest").REAL_SEAMS["worktree.open_pr_heads"]
+    _fake_gh_proc(monkeypatch, {"/actions/": (1, '{"status":"403"}', "gh: Resource not accessible (HTTP 403)")})
+    with pytest.raises(worktree.SignalUnavailable, match="Actions: read"):
+        await real_runs("o/r", "prepare-release.yml")
+    _fake_gh_proc(monkeypatch, {"/pulls": (1, "", "gh: HTTP 403")})
+    with pytest.raises(worktree.SignalUnavailable):
+        await real_prs("o/r", ["prepare-release*"])
+    _fake_gh_proc(monkeypatch, {"/actions/": (1, "", "gh: HTTP 502 Bad Gateway")})
+    with pytest.raises(worktree.WorktreeError) as ei:  # any other failure still fails closed
+        await real_runs("o/r", "prepare-release.yml")
+    assert not isinstance(ei.value, worktree.SignalUnavailable)
+
+
+# ── PATCH waits_for mirrors the tool ────────────────────────────────────────────────
+
+
+def test_patch_waits_for_empty_is_untouched_none_clears(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from project_board import api
+
+    seen = []
+
+    class _S:
+        def get_feature(self, fid):
+            return {"id": fid, "board_state": "backlog", "title": "t"}
+
+        def update_feature(self, fid, **kw):
+            seen.append(kw)
+            return {"id": fid}
+
+        def comment(self, fid, text):
+            pass
+
+    monkeypatch.setattr(api, "get_store", lambda **_kw: _S(), raising=False)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _S())
+    app = FastAPI()
+    app.include_router(api.build_data_router({}), prefix="/p")
+    c = TestClient(app)
+    for body, want in (
+        ({"waits_for": ""}, {}),
+        ({"waits_for": "none"}, {"waits_for": []}),
+        ({"waits_for": []}, {"waits_for": []}),
+    ):
+        seen.clear()
+        assert c.patch("/p/features/bd-1", json=body).status_code == 200
+        assert seen == [want]

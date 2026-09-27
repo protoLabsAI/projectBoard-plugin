@@ -331,6 +331,37 @@ def _feature_reply(f: dict) -> str:
     return json.dumps(out)
 
 
+def _card_resolver(store):
+    """card id → projected card (or None) for a `contains:` gate anchored on a card."""
+
+    def _resolve(fid):
+        try:
+            return store.get_feature(fid)
+        except Exception:  # noqa: BLE001 — an unreadable card is "not found", never a crash
+            return None
+
+    return _resolve
+
+
+def _waits_for_refusal(waits_for) -> str | None:
+    """``Error: …`` when a `waits_for` spec parses but the REMOTE says it cannot mean what
+    the author thinks — today a bare `release:` range on a repo that tags per package
+    (changesets), which any package's version would satisfy. Best-effort: an unreadable
+    remote is not a refusal (evaluation re-detects the case on the card). A spec that
+    does not parse is left for the store to refuse with its own message."""
+    from . import gates as publish_gates
+
+    try:
+        specs = publish_gates.parse_specs(waits_for)
+    except publish_gates.GateSpecError:
+        return None
+    for spec in specs:
+        why = publish_gates.remote_refusal(spec)
+        if why:
+            return f"Error: waits_for spec {spec.raw!r}: {why}"
+    return None
+
+
 def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str | None:
     """The ``Skipped — …`` message a create verb returns when a new card would DUPLICATE
     existing/in-flight work, or None when it's clear to create — the ONE dedup contract
@@ -485,12 +516,16 @@ def _board_tools(cfg: dict):
         label. Defaults to the board's `default_project` when omitted; a single-repo
         board can ignore it. `waits_for` (comma-separated) names PUBLISH GATES — external facts that must ALL
         hold before the loop claims the card, for work that needs something another repo
-        SHIPS, not merely merges: `npm:<package>@<semver-range>` (a version satisfying the
-        range is on the npm registry, e.g. `npm:@protolabsai/ui@>0.62.0`),
-        `release:<owner>/<repo>@<tag-or-range>` (that tag exists / a GitHub release whose
-        version satisfies the range), `pr:<owner>/<repo>#<n>` (that PR is merged). An
-        unmet gate keeps the card out of the claim with `next_action` `waiting on publish:
-        …`; a bad spec refuses the create. Use `depends_on` for a card on THIS board.
+        SHIPS, not merely merges. For a consumer of another card's change use
+        `npm:<package>@contains:<owner>/<repo>@<card-id>` (e.g.
+        `npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`): met only once a
+        published version is proven to contain that card's merge commit — never a version
+        floor, which an unrelated publish can satisfy. Also `npm:<package>@<semver-range>`,
+        `release:<owner>/<repo>@<tag>`, `release:<owner>/<repo>@<package>@<range>` (a
+        bare range is refused on a repo that tags per package), and
+        `pr:<owner>/<repo>#<n>` (merged). An unmet gate keeps the card out of the claim
+        with `next_action` `waiting on publish: …`; a bad spec refuses the create. Use
+        `depends_on` for a card on THIS board.
 
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
@@ -528,6 +563,8 @@ def _board_tools(cfg: dict):
             depends_on = _strip_wrapping_quotes(depends_on)
             source_issue = _strip_wrapping_quotes(source_issue)
             waits_for = _strip_wrapping_quotes(waits_for)
+            if (refused := _waits_for_refusal(waits_for)) is not None:
+                return refused
             deps = _split_list(depends_on)
             files = _split_list(files_to_modify)
             if not force:
@@ -595,6 +632,8 @@ def _board_tools(cfg: dict):
             depends_on = _strip_wrapping_quotes(depends_on)
             source_issue = _strip_wrapping_quotes(source_issue)
             waits_for = _strip_wrapping_quotes(waits_for)
+            if (refused := _waits_for_refusal(waits_for)) is not None:
+                return refused
             deps = _split_list(depends_on)
             if not force:
                 skip = _dedup_skip_message(store, title, deps, source_issue)
@@ -684,7 +723,10 @@ def _board_tools(cfg: dict):
                 update_kw["priority"] = priority
             waits_for = _strip_wrapping_quotes(waits_for).strip()
             if waits_for:
-                update_kw["waits_for"] = [] if waits_for.lower() in ("none", "clear", "-") else waits_for
+                clear = waits_for.lower() in ("none", "clear", "-")
+                if not clear and (refused := _waits_for_refusal(waits_for)) is not None:
+                    return refused
+                update_kw["waits_for"] = [] if clear else waits_for
             f = store.update_feature(feature_id, **update_kw)
             return _feature_reply(f)
         except BoardError as exc:
@@ -706,7 +748,8 @@ def _board_tools(cfg: dict):
         blocking me now" signal), `waits_for` (the card's publish gates) with `gates` (each
         gate's last-checked verdict: `{spec, met, detail, error, checked_at}` — from the
         loop's cache, no network; board_check_gates re-checks) and `next_action` (e.g.
-        `waiting on publish: npm @x/y >0.62.0 (latest 0.62.0)`, `held: release freeze (…)`,
+        `waiting on publish: npm @x/y containing o/r@bd-a1 (card bd-a1 not merged yet (#5))`,
+        `held: release freeze (…)`,
         when something other than a coder is what moves the card). A TASK (#217) also carries `deliverable` (the recorded
         deliverable text — "" until board_deliver records one), `delivered_by`, and
         `open_requirements` (the ids of ledger items no delivery has closed) — what
@@ -1324,7 +1367,9 @@ def _board_tools(cfg: dict):
         token = publish_gates.npm_token(cfg)
         rows = []
         for f in feats:
-            results = publish_gates.evaluate(f.get("waits_for") or [], token=token, force=True)
+            results = publish_gates.evaluate(
+                f.get("waits_for") or [], token=token, force=True, resolve_card=_card_resolver(store)
+            )
             rows.append(
                 {
                     "id": f["id"],

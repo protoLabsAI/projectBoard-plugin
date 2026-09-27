@@ -638,8 +638,14 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
+        from . import _card_resolver
+
         results = await asyncio.to_thread(
-            publish_gates.evaluate, f.get("waits_for") or [], token=publish_gates.npm_token(cfg), force=True
+            publish_gates.evaluate,
+            f.get("waits_for") or [],
+            token=publish_gates.npm_token(cfg),
+            force=True,
+            resolve_card=_card_resolver(store()),
         )
         return {
             "id": fid,
@@ -700,6 +706,14 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             }
         )
         kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
+        # `waits_for` means what it means on board_update_feature: "" leaves the gates
+        # alone, "none" (or an explicit []) clears them, anything else REPLACES them.
+        if "waits_for" in kwargs:
+            wf = kwargs["waits_for"]
+            if isinstance(wf, str) and not wf.strip():
+                kwargs.pop("waits_for")
+            elif isinstance(wf, str) and wf.strip().lower() in ("none", "clear", "-"):
+                kwargs["waits_for"] = []
         changed = sorted(kwargs)
 
         updated = await _guard(lambda: s.update_feature(fid, **kwargs))

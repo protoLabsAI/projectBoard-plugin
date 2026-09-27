@@ -140,6 +140,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "active_workflow_runs": "REAL",
     "open_pr_heads": "REAL",
     "remote_branches": "REAL",
+    "untagged_release_head": "REAL",
 }
 
 # gates.py — publish gates (`waits_for`). Two seams reach the outside: `_http_get_json`
@@ -148,7 +149,11 @@ WORKTREE_SEAMS: dict[str, str] = {
 # `eval_npm` under PB_REQUIRE_NPM, `eval_release` / `eval_pr` under the real-gh tier's
 # PB_REQUIRE_GH — in the CI job that has both (the `test (real gh)` job).
 GATES_SEAMS: dict[str, str] = {
-    "eval_npm": "REAL",
+    "_anchor_sha": "REAL",  # a card's merged PR → merge commit (real gh, a merged plugin PR)
+    "_contains": "REAL",  # compare/<anchor>...<commit> (real protoContent tags, both directions)
+    "_packument": "REAL",  # the live registry (is-number, @protolabsai/ui)
+    "_release_versions": "REAL",  # every page of real releases (protoContent's per-package tags)
+    "_tag_commit": "REAL",  # annotated changesets tag → commit (real protoContent)
     "eval_pr": "REAL",
     "eval_release": "REAL",
 }
@@ -309,7 +314,7 @@ def test_gates_seams_are_all_covered_and_the_real_tier_cannot_skip_in_ci():
     tier = (_ROOT / "tests" / "test_publish_gate_real.py").read_text()
     for name in GATES_SEAMS:
         assert f"gates.{name}(" in tier, f"{name} is REAL but the real tier never calls gates.{name}("
-    for name in ("remote_branches", "open_pr_heads", "active_workflow_runs"):
+    for name in ("remote_branches", "open_pr_heads", "active_workflow_runs", "untagged_release_head"):
         assert f"worktree.{name}(" in tier, f"{name} is REAL but the real tier never calls worktree.{name}("
     assert "PB_REQUIRE_NPM" in tier and "PB_REQUIRE_GH" in tier
     ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
@@ -352,15 +357,15 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_33_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 33 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_34_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 34 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
     tests/test_stranded_work_405.py; and the 29th and 30th #427's ``commits_ahead`` and
-    ``own_worktree``, in tests/test_salvage_427.py; the 31st to 33rd the release-freeze reads
-    (``remote_branches``, ``open_pr_heads``, ``active_workflow_runs``), in
-    tests/test_publish_gate_real.py.
+    ``own_worktree``, in tests/test_salvage_427.py; the 31st to 34th the release-freeze reads
+    (``remote_branches``, ``open_pr_heads``, ``active_workflow_runs``,
+    ``untagged_release_head``), in tests/test_publish_gate_real.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -378,7 +383,7 @@ def test_worktree_coverage_contract_is_33_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 33, f"expected 33 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 34, f"expected 34 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

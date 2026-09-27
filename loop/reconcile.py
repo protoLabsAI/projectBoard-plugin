@@ -1139,7 +1139,7 @@ class ReconcileMixin:
         if patterns is None:
             return ""
         slug, _num = worktree._parse_pr(pr_url)
-        return await release_freeze.check(slug, repo, patterns, cwd=repo)
+        return await release_freeze.check(slug, repo, patterns, cwd=repo, base=self._base_branch_for(feature))
 
     def _note_freeze_hold(self, store, fid: str, pr_url: str, why: list[str]) -> None:
         """Record (or clear) the card's release-freeze hold — the process state the
