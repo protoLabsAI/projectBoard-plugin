@@ -334,14 +334,22 @@ claiming anything for about four hours.
 Now the reconcile only reads the lanes and **starts** a tracked task per card, as a claim
 starts a drive:
 
-- at most `reconcile_concurrency` of them run at once;
+- at most `reconcile_concurrency` of them run at once, and one repo's cards run one at a
+  time: sibling PRs must not both auto-merge on a merged-state stamp the first merge made
+  stale (#131);
+- a card that has to wait settles a merged or closed PR at once, and otherwise is re-read
+  when its turn comes. It is skipped if it has left review, changed PR, or a drive or review
+  now holds it;
 - a card whose last reconcile is still running is skipped on the next poll, never stacked;
 - shutdown cancels them, and a running gate's process tree dies with its task;
-- a stalled store read inside one is that card's, logged, and retried on the next poll.
+- a stalled store read inside one ends the next tick, as an inline stall ended its own
+  (#404).
 
 The tick itself stays O(seconds) and keeps filling slots. The review call also has a hard cap
 of its own, `review_gate_timeout_s`: a hung stream does not honour the host client's timeout
-(protoAgent#3699), so the board abandons the call itself.
+(protoAgent#3699), so the board abandons the call itself. A timeout leaves the card
+`review-pending` without spending `review_run_max`, and no new review of that card starts
+until the abandoned call has returned.
 
 If the claim scan still stops (a phase that hangs, a wedged store), the board says so. Ready
 cards plus a free slot plus no finished claim scan for `claim_stall_ticks` ticks puts a

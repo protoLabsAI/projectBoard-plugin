@@ -3220,6 +3220,27 @@ class DriveMixin:
             )
         return None
 
+    async def _gate_all(self, trees: list[str], feature: dict) -> list:
+        """Run the pre-PR gate over several candidate trees at once (Max-Mode selection). If
+        one raises (a candidate tree reaped under it, #461), the others are cancelled and
+        awaited — their gate process trees die with them — before it propagates; a plain
+        gather left them running, orphaned (#471 review)."""
+        tasks = [asyncio.ensure_future(self._run_local_gate(t, feature)) for t in trees]
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        failed = next((t for t in done if not t.cancelled() and t.exception() is not None), None)
+        if failed is not None:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise failed.exception()
+        return [t.result() for t in tasks]
+
     async def _judge_candidates(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
         """Max-Mode best-of-N judge: given N candidate worktrees for the same feature,
         pick the index whose diff best satisfies the ``acceptance_criteria``. Returns
@@ -3308,7 +3329,7 @@ class DriveMixin:
             return nonempty[0]
 
         fid = feature.get("id")
-        gates = await asyncio.gather(*(self._run_local_gate(worktrees[i], feature) for i in nonempty))
+        gates = await self._gate_all([worktrees[i] for i in nonempty], feature)
         passing = [i for i, gap in zip(nonempty, gates) if gap is None]
         if not passing:
             log.info(

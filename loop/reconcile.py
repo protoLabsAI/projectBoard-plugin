@@ -27,7 +27,7 @@ _SALVAGE_GATE_TAIL_CHARS = 3000
 _SALVAGE_GATE_MARKER = "<!-- project-board:salvage-gate -->"
 
 
-async def _within(coro, timeout: float):
+async def _within(coro, timeout: float, *, on_abandon=None):
     """Await ``coro`` for at most ``timeout`` seconds, then give up on it — HARD (#462).
 
     ``asyncio.wait_for`` waits for the cancelled call to actually finish, so a call that
@@ -45,7 +45,15 @@ async def _within(coro, timeout: float):
         return task.result()
     task.cancel()
     task.add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieve it: no "never retrieved" noise
+    if on_abandon is not None and not task.done():
+        on_abandon(task)  # the caller tracks the call that is still running (#471 review)
     raise asyncio.TimeoutError
+
+
+# The prefix of an unrunnable-review reason that is a TIMEOUT of the board's own cap (#462).
+# A timeout is not the review failing — a local model can simply be slow — so it does not
+# spend the `review-run` budget that blocks the card; see `_review_gate_run`.
+_REVIEW_TIMED_OUT = "review call timed out"
 
 
 def _gate_failure_block(gate_out: str) -> str:
@@ -945,13 +953,17 @@ class ReconcileMixin:
                     trees = [p for p, _b in worktree.feature_worktrees(repo, self.root, wtid)]
                     busy = await worktree.processes_in_trees(trees)
                     if busy:
-                        log.warning(
-                            "[project_board] sweep: kept worktree feat-%s — process(es) %s still working in %s",
+                        n = self._busy_keeps.get(wtid, 0) + 1
+                        self._busy_keeps[wtid] = n
+                        (log.warning if n <= _REAP_WARN_CAP else log.debug)(
+                            "[project_board] sweep: kept worktree feat-%s — process(es) %s still working in %s (%d)",
                             wtid,
                             ", ".join(str(pid) for pids in busy.values() for pid in pids),
                             ", ".join(busy),
+                            n,
                         )
                         continue
+                    self._busy_keeps.pop(wtid, None)
                     reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
                     if reaped:
                         self._reap_failures.pop(wtid, None)
@@ -999,7 +1011,14 @@ class ReconcileMixin:
     # ── the PR reconcile (terminal-edge fallback to the webhook) ───────────────
     async def _maybe_reconcile(self):
         """Run the PR reconcile at most once per ``merge_poll_interval`` (and only when
-        enabled) — cheap, but no reason to hammer ``gh`` every busy tick."""
+        enabled) — cheap, but no reason to hammer ``gh`` every busy tick.
+
+        A store stall inside a detached card reconcile (#462) ends the NEXT tick here, as a
+        stall in the inline reconcile used to end its own (#404): the rest of that tick would
+        only queue more calls on the wedged store."""
+        stall, self._card_stall = self._card_stall, None
+        if stall is not None:
+            raise stall
         if not self.merge_poll:
             return
         now = time.monotonic()
@@ -1058,21 +1077,82 @@ class ReconcileMixin:
         task.add_done_callback(_done)
         return task
 
+    def _repo_lock(self, repo: str) -> asyncio.Lock:
+        """The lock that keeps ONE repo's card reconciles serial (#471 review). Two PRs of one
+        repo reconciled at once could both auto-merge on a merged-state stamp the first merge
+        had just made stale (#131): the stamp is checked against base, then gh round trips,
+        then the merge — and the sibling's merge moves base in between. Serial within a repo
+        is what the old one-pass loop guaranteed; concurrency is across repos only."""
+        lock = self._repo_locks.get(repo)
+        if lock is None:
+            lock = self._repo_locks[repo] = asyncio.Lock()
+        return lock
+
+    def _card_held(self, fid: str) -> str:
+        """What else in the loop is working ``fid`` right now, or "" (#471 review)."""
+        if _loop.live_drive(fid) is not None or fid in self._inflight_files:
+            return "a drive holds it"
+        if fid in self._review_inflight:
+            return "its review gate is running"
+        return ""
+
     async def _card_work(self, store, f: dict):
-        """One card's reconcile, inside a ``reconcile_concurrency`` slot. A stall is this
-        card's, logged, and re-raised for an awaiting caller; the next poll tries again."""
+        """One card's reconcile: inside a ``reconcile_concurrency`` slot AND its repo's lock
+        (``_repo_lock``), so one repo's cards run one at a time and different repos in
+        parallel. A card that has to QUEUE first settles a merged/closed PR cheaply (it must
+        not wait behind a hung review to be marked done) and, once it gets its turn, is
+        re-read: the snapshot it was started from may be minutes old, and in that time the
+        card may have been requeued and claimed, blocked, or re-pointed at another PR. A
+        stall is recorded for the next tick to end on (#404) and re-raised for an awaiting
+        caller."""
+        fid = f["id"]
+        repo = self._repo_for(f)
         if self._card_slots is None:
             self._card_slots = asyncio.Semaphore(self.reconcile_concurrency)
-        async with self._card_slots:
-            try:
+        lock = self._repo_lock(repo)
+        try:
+            if self._card_slots.locked() or lock.locked():
+                try:
+                    state = await worktree.pr_state(f["pr_url"], cwd=repo)
+                except Exception:  # noqa: BLE001 — unread: take the ordinary path
+                    state = ""
+                if state in ("MERGED", "CLOSED"):
+                    if not self._card_held(fid):
+                        await self._reconcile_pr(store, f, known_state=state)
+                    return
+                async with self._card_slots, lock:
+                    fresh = await asyncio.to_thread(store.get_feature, fid)
+                    if (
+                        not fresh
+                        or fresh.get("board_state") not in ("in_review", "blocked")
+                        or fresh.get("pr_url") != f.get("pr_url")
+                    ):
+                        log.info(
+                            "[project_board] %s moved while its reconcile queued (now %s) — skipped this pass",
+                            fid,
+                            (fresh or {}).get("board_state") or "gone",
+                        )
+                        return
+                    held = self._card_held(fid)
+                    if held:
+                        log.info("[project_board] %s reconcile skipped this pass — %s", fid, held)
+                        return
+                    await self._reconcile_pr(store, fresh)
+                return
+            async with self._card_slots, lock:
+                held = self._card_held(fid)
+                if held:
+                    log.info("[project_board] %s reconcile skipped this pass — %s", fid, held)
+                    return
                 await self._reconcile_pr(store, f)
-            except store_mod.BoardTimeout as exc:
-                log.warning(
-                    "[project_board] reconcile for %s stalled on the board store — next poll retries: %s", f["id"], exc
-                )
-                raise
+        except store_mod.BoardTimeout as exc:
+            log.warning(
+                "[project_board] reconcile for %s stalled on the board store — the next tick ends on it: %s", fid, exc
+            )
+            self._card_stall = exc
+            raise
 
-    async def _reconcile_pr(self, store, f: dict):
+    async def _reconcile_pr(self, store, f: dict, *, known_state: str = ""):
         """The per-card body of ``_reconcile_prs`` (#462), unchanged: a one-card loop, so
         its ``continue`` still means "nothing further for this card this pass"."""
         for f in (f,):  # noqa: B020 — see the docstring
@@ -1083,7 +1163,7 @@ class ReconcileMixin:
             # #90: reconcile each PR against ITS project's checkout, not the board default.
             repo = self._repo_for(f)
             try:
-                state = await worktree.pr_state(pr_url, cwd=repo)
+                state = known_state or await worktree.pr_state(pr_url, cwd=repo)
                 if f.get("board_state") == "blocked" and state != "MERGED":
                     continue
                 if state == "MERGED":
@@ -1375,6 +1455,18 @@ class ReconcileMixin:
                 # residual TOCTOU: without it, a commit pushed after this comparison would be
                 # the head ``gh pr merge`` lands, merging code the gate never reviewed.
                 merge_head = live
+        # Re-read right before the merge (#471 review): the gh round trips above take seconds,
+        # and a requeue, a hold or a claimed fix round in that time makes this card no longer
+        # the one the gates were read for.
+        fresh = await asyncio.to_thread(store.get_feature, fid)
+        if (
+            not fresh
+            or fresh.get("board_state") != "in_review"
+            or _loop.live_drive(fid) is not None
+            or fid in self._inflight_files
+        ):
+            log.info("[project_board] %s not merging: the card moved during the merge checks", fid)
+            return False
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo, expected_head=merge_head)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
@@ -2114,6 +2206,13 @@ class ReconcileMixin:
         if fid in self._review_inflight:
             log.debug("[project_board] %s review gate already running — not re-armed", fid)
             return
+        zombie = self._review_zombies.get(fid)
+        if zombie is not None and not zombie.done():
+            # The last review call timed out and was abandoned, but it has not returned yet
+            # (#471 review). Starting a second one would stack model calls on a hung stream.
+            log.warning("[project_board] %s review gate not re-run — its abandoned review call is still running", fid)
+            return
+        self._review_zombies.pop(fid, None)
         self._review_inflight.add(fid)
         try:
             await self._review_gate_run(store, fid, pr_url, repo)
@@ -2144,6 +2243,13 @@ class ReconcileMixin:
             # poll — but bounded: a persistently unrunnable gate escalates to the
             # operator instead of re-burning the workflow every poll forever.
             reason = why or "review produced no output"
+            if reason.startswith(_REVIEW_TIMED_OUT):
+                # Our own cap fired (#462). That is not an unrunnable review, and counting it
+                # toward review_run_max would block cards on a slow local model that used to
+                # simply take long. Leave review-pending; the next poll retries once the
+                # abandoned call has returned (see `_review_gate`).
+                log.warning("[project_board] %s review gate timed out — will retry on the next poll: %s", fid, reason)
+                return
             n = await self._budget_get(store, fid, "review-run") + 1
             await self._budget_set(store, fid, "review-run", n)
             if n >= self.review_run_max:
@@ -2364,7 +2470,11 @@ class ReconcileMixin:
                 prior = self._review_prior.get(fid)
                 if prior:
                     inputs["prior_findings"] = prior
-                result = await _within(runner(self.review_workflow, inputs), self.review_gate_timeout)
+                result = await _within(
+                    runner(self.review_workflow, inputs),
+                    self.review_gate_timeout,
+                    on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
+                )
                 failed = list((result or {}).get("failed") or [])
                 if failed:
                     # A partial panel is NOT a review (ADR 0078 D3): a starved/errored
@@ -2394,8 +2504,8 @@ class ReconcileMixin:
                     self.review_gate_timeout,
                 )
                 no_run_reason = (
-                    f"workflow {self.review_workflow!r} did not finish within review_gate_timeout_s="
-                    f"{self.review_gate_timeout:g}s"
+                    f"{_REVIEW_TIMED_OUT}: workflow {self.review_workflow!r} did not finish within "
+                    f"review_gate_timeout_s={self.review_gate_timeout:g}s"
                 )
             except Exception as exc:  # noqa: BLE001 — a dead workflow ≠ a dead loop
                 log.warning("[project_board] %s review workflow %r failed: %s", fid, self.review_workflow, exc)
@@ -2419,7 +2529,11 @@ class ReconcileMixin:
                 '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '
                 "No findings → an empty array []."
             )
-            output = await _within(ADAPTERS["a2a"].dispatch(reviewer, msg), self.review_gate_timeout)
+            output = await _within(
+                ADAPTERS["a2a"].dispatch(reviewer, msg),
+                self.review_gate_timeout,
+                on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
+            )
             if output is None:
                 return None, f"reviewer {self.reviewer_name!r} returned no output"
             return output, None
@@ -2432,7 +2546,8 @@ class ReconcileMixin:
             )
             return (
                 None,
-                f"reviewer {self.reviewer_name!r} did not answer within review_gate_timeout_s={self.review_gate_timeout:g}s",
+                f"{_REVIEW_TIMED_OUT}: reviewer {self.reviewer_name!r} did not answer within "
+                f"review_gate_timeout_s={self.review_gate_timeout:g}s",
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("[project_board] %s reviewer fallback failed: %s", fid, exc)

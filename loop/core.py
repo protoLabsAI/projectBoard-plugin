@@ -133,6 +133,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self.reconcile_concurrency = _knob_int(self.cfg, "reconcile_concurrency", 2, floor=1)
         self._card_tasks: dict[str, asyncio.Task] = {}  # fid → its running reconcile (#462)
         self._card_slots: asyncio.Semaphore | None = None  # bound on first use, to the running loop
+        self._repo_locks: dict[str, asyncio.Lock] = {}  # one repo's cards reconcile one at a time
+        self._card_stall: Exception | None = None  # a card task's store stall, for the next tick (#404)
+        self._review_zombies: dict[str, asyncio.Task] = {}  # fid → an abandoned review call still running
+        self._busy_keeps: dict[str, int] = {}  # wtid → sweeps kept for a live process in the tree
         # Claim-stall health signal (#462): ready work, a free slot, and no claim scan
         # finished for this many ticks → a setup/health gap on /status naming the phase the
         # tick is stuck in. 0 turns the signal off.

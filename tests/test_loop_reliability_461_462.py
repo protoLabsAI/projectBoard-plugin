@@ -393,6 +393,10 @@ def _tick_loop(monkeypatch, store, **cfg):
     return loop, drove
 
 
+async def _open_pr_state(url, cwd="."):
+    return "OPEN"
+
+
 async def _cancel_cards(loop):
     tasks = list(loop._card_tasks.values())
     for t in tasks:
@@ -405,7 +409,7 @@ async def test_a_slow_review_gate_does_not_delay_a_claim(monkeypatch):
     loop, drove = _tick_loop(monkeypatch, store)
     started = asyncio.Event()
 
-    async def _hung_review(store_, f):  # a review-gate model call whose stream never ends
+    async def _hung_review(store_, f, **_kw):  # a review-gate model call whose stream never ends
         started.set()
         await asyncio.Event().wait()
 
@@ -442,7 +446,7 @@ async def test_a_real_gate_subprocess_on_an_in_review_card_does_not_delay_a_clai
 
     monkeypatch.setattr(worktree, "spawn_shell", _spawn)
 
-    async def _merged_state_gate(store_, f):
+    async def _merged_state_gate(store_, f, **_kw):
         await loop._run_local_gate(str(tmp_path))
 
     monkeypatch.setattr(loop, "_reconcile_pr", _merged_state_gate)
@@ -461,23 +465,28 @@ async def test_a_real_gate_subprocess_on_an_in_review_card_does_not_delay_a_clai
 
 async def test_the_card_reconciles_are_bounded_by_reconcile_concurrency(monkeypatch):
     class _Many(_TickStore):
+        rows = {
+            f"ds-{i}": {
+                "id": f"ds-{i}",
+                "board_state": "in_review",
+                "pr_url": f"https://github.com/o/r{i}/pull/{i}",
+                "repo": f"/repos/r{i}",  # five repos: concurrency is ACROSS repos
+                "labels": [],
+            }
+            for i in range(5)
+        }
+
         def list_features(self, state=None, **_kw):
-            if state != "in_review":
-                return []
-            return [
-                {
-                    "id": f"ds-{i}",
-                    "board_state": "in_review",
-                    "pr_url": f"https://github.com/o/r/pull/{i}",
-                    "labels": [],
-                }
-                for i in range(5)
-            ]
+            return [dict(r) for r in self.rows.values()] if state == "in_review" else []
+
+        def get_feature(self, fid):
+            return dict(self.rows[fid])
 
     loop, _drove = _tick_loop(monkeypatch, _Many(), reconcile_concurrency=2)
+    monkeypatch.setattr(worktree, "pr_state", _open_pr_state)
     running, peak, release = set(), [0], asyncio.Event()
 
-    async def _slow(store_, f):
+    async def _slow(store_, f, **_kw):
         running.add(f["id"])
         peak[0] = max(peak[0], len(running))
         await release.wait()
@@ -602,7 +611,7 @@ async def test_the_tick_records_each_finished_claim_scan(monkeypatch):
     store = _TickStore()
     loop, _drove = _tick_loop(monkeypatch, store)
 
-    async def _quick(store_, f):
+    async def _quick(store_, f, **_kw):
         return None
 
     monkeypatch.setattr(loop, "_reconcile_pr", _quick)
@@ -610,3 +619,261 @@ async def test_the_tick_records_each_finished_claim_scan(monkeypatch):
     await loop._tick()
     assert loop._last_claim_at is not None and loop._tick_phase_now is None
     await _cancel_cards(loop)
+
+
+# ── #471 review: serial within a repo, re-read after queueing, bounded side effects ──────
+
+X = "a" * 40
+Y = "b" * 40
+
+
+class _ReviewStore:
+    def __init__(self, cards):
+        self.cards = {c["id"]: c for c in cards}
+
+    def list_features(self, state=None, **_kw):
+        return [dict(c) for c in self.cards.values() if c["board_state"] == state]
+
+    def get_feature(self, fid):
+        c = self.cards.get(fid)
+        return dict(c) if c else None
+
+    def requeue(self, fid):
+        self.cards[fid]["board_state"] = "ready"
+
+    def __getattr__(self, name):  # any other bookkeeping write is a no-op
+        return lambda *a, **k: None
+
+
+def _in_review(n, **extra):
+    return {
+        "id": f"ds-{n}",
+        "board_state": "in_review",
+        "pr_url": f"https://github.com/o/r/pull/{n}",
+        "labels": [],
+        "title": f"t{n}",
+        **extra,
+    }
+
+
+async def test_sibling_prs_of_one_repo_never_merge_on_a_stamp_the_other_merge_made_stale(monkeypatch):
+    """B1: two in_review PRs in ONE repo, both stamped merged-verified against base X. The
+    first merge moves base to Y; the second must not merge on its X verdict (#131). Two
+    concurrent card tasks did, because the stamp check and the merge are gh round trips
+    apart. One repo's reconciles are serial again."""
+    store = _ReviewStore([_in_review(n, labels=[f"merged-verified:{X[:12]}"]) for n in (1, 2)])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    base, merged = {"sha": X}, []
+
+    async def pr_state(url, cwd="."):
+        return "OPEN"
+
+    async def pr_merge_state(url, cwd="."):
+        return "CLEAN"
+
+    async def origin_head_sha(repo, ref):
+        await asyncio.sleep(0.01)
+        return base["sha"]
+
+    async def pr_merge_info(url, cwd="."):
+        await asyncio.sleep(0.2)  # one gh round trip, during which the sibling merges
+        return {"mergeStateStatus": "CLEAN", "isDraft": False}
+
+    async def merge_pr(url, method="squash", cwd=".", expected_head=""):
+        merged.append(("ds-" + url.rsplit("/", 1)[1], base["sha"]))
+        base["sha"] = Y
+        return True, ""
+
+    async def merged_state_worktree(*a, **k):
+        return ("error", "no real repo here")
+
+    async def _noop(*a, **k):
+        return True
+
+    for name, fn in {
+        "pr_state": pr_state,
+        "pr_merge_state": pr_merge_state,
+        "origin_head_sha": origin_head_sha,
+        "pr_merge_info": pr_merge_info,
+        "merge_pr": merge_pr,
+        "merged_state_worktree": merged_state_worktree,
+        "reap_feature_worktree": _noop,
+        "delete_remote_branch": _noop,
+    }.items():
+        monkeypatch.setattr(worktree, name, fn)
+    loop = BoardLoop(
+        {
+            "coder": "proto",
+            "auto_merge": True,
+            "auto_rebase": True,
+            "ci_poll": False,
+            "review_gate": False,
+            "local_gate_cmd": "true",
+            "reconcile_concurrency": 2,
+        }
+    )
+
+    async def _no_freeze(*a, **k):
+        return ""
+
+    monkeypatch.setattr(loop, "_release_freeze_evidence", _no_freeze)
+    await loop._reconcile_prs()
+    assert len(merged) == 1 and merged[0][1] == X, merged  # the second held on its stale stamp
+
+
+async def test_a_queued_card_task_never_rebases_a_card_a_drive_now_owns(monkeypatch):
+    """M1: ds-2's reconcile queues behind ds-1's slow one. Meanwhile ds-2 is requeued and
+    claimed (a live fix-round drive). When it gets its turn it is re-read, and it must not
+    force-push a rebase of the branch the drive is working on."""
+    store = _ReviewStore([_in_review(1), _in_review(2)])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    gate, rebased = asyncio.Event(), []
+
+    async def pr_state(url, cwd="."):
+        if url.endswith("/1"):
+            await gate.wait()  # ds-1: a slow gate holding the only slot
+        return "OPEN"
+
+    async def pr_merge_state(url, cwd="."):
+        return "BEHIND"
+
+    async def rebase_onto_base(repo, branch, base, root=".worktrees"):
+        rebased.append(branch)
+        return ("clean", "")
+
+    monkeypatch.setattr(worktree, "pr_state", pr_state)
+    monkeypatch.setattr(worktree, "pr_merge_state", pr_merge_state)
+    monkeypatch.setattr(worktree, "rebase_onto_base", rebase_onto_base)
+    loop = BoardLoop(
+        {
+            "coder": "proto",
+            "auto_rebase": True,
+            "ci_poll": False,
+            "review_gate": False,
+            "auto_merge": False,
+            "reconcile_concurrency": 1,
+        }
+    )
+    await loop._reconcile_prs(detach=True)
+    await asyncio.sleep(0.05)
+    store.cards["ds-2"]["board_state"] = "in_progress"  # requeued and claimed meanwhile
+    drive = asyncio.create_task(asyncio.Event().wait())
+    _register_drive("ds-2", drive)
+    try:
+        gate.set()
+        await asyncio.gather(*loop._card_tasks.values(), return_exceptions=True)
+        assert not any("ds-2" in b for b in rebased), rebased
+        assert any("ds-1" in b for b in rebased)  # the card still in review was served
+    finally:
+        _unregister_drive("ds-2", drive)
+        drive.cancel()
+        await asyncio.gather(drive, return_exceptions=True)
+
+
+async def test_a_merged_pr_is_settled_without_queueing_behind_a_hung_review(monkeypatch):
+    """Minor 2: ds-1's review hangs in the only slot; ds-2's PR merged. ds-2 must reach done
+    now, not after the review cap."""
+    store = _ReviewStore([_in_review(1), _in_review(2)])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    settled = []
+
+    async def pr_state(url, cwd="."):
+        return "MERGED" if url.endswith("/2") else "OPEN"
+
+    monkeypatch.setattr(worktree, "pr_state", pr_state)
+    loop = BoardLoop({"coder": "proto", "reconcile_concurrency": 1})
+    hung = asyncio.Event()
+    real = loop._reconcile_pr
+
+    async def _body(store_, f, **kw):
+        if f["id"] == "ds-1":
+            await hung.wait()  # a review call that never returns
+            return
+        settled.append((f["id"], kw.get("known_state")))
+        return await real(store_, f, **kw)
+
+    monkeypatch.setattr(loop, "_reconcile_pr", _body)
+    try:
+        await loop._reconcile_prs(detach=True)
+        await asyncio.wait_for(loop._card_tasks["ds-2"], timeout=5)
+        assert settled == [("ds-2", "MERGED")]
+    finally:
+        await _cancel_cards(loop)
+
+
+async def test_a_card_tasks_store_stall_ends_the_next_tick(monkeypatch):
+    """Minor 4: #404's "the first store stall ends the tick" holds for detached card work."""
+    from project_board import store as store_mod
+
+    store = _TickStore()
+    loop, drove = _tick_loop(monkeypatch, store)
+
+    async def _stall(store_, f, **_kw):
+        raise store_mod.BoardTimeout("br show timed out after 1s")
+
+    monkeypatch.setattr(loop, "_reconcile_pr", _stall)
+    await loop._tick()  # starts the card task; the claim scan runs
+    await asyncio.gather(*loop._card_tasks.values(), return_exceptions=True)
+    claimed_before = list(store.claimed)
+    store.claimed.clear()
+    loop._last_poll = 0.0
+    await loop._tick()  # this tick ends on the recorded stall
+    assert store.claimed == [] and claimed_before == ["ds-new"]
+    assert loop._card_stall is None  # consumed: the tick after runs normally
+    await _cancel_cards(loop)
+
+
+async def test_a_timed_out_review_neither_spends_the_run_budget_nor_stacks_a_second_call(monkeypatch):
+    """Minor 3: an abandoned review call that is still running blocks a new review of the
+    card until it returns, and a timeout is not an unrunnable review (review_run_max)."""
+    release = asyncio.Event()
+    calls = []
+
+    async def _slow(workflow, inputs):
+        calls.append(1)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await release.wait()  # ignores its cancel until released
+        return {"output": "[]"}
+
+    _inject_runner(monkeypatch, _slow)
+    loop = BoardLoop({"review_gate": True, "review_gate_timeout_s": 0.2, "review_run_max": 1})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    store = _ReviewStore([_in_review(1)])
+    budgets = []
+    monkeypatch.setattr(loop, "_budget_set", lambda *a, **k: _async_append(budgets, a))
+
+    async def _head(*a, **k):
+        return X
+
+    async def _publish(*a, **k):
+        return None
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(loop, "_publish_gate_verdict", _publish)
+    url = "https://github.com/o/r/pull/1"
+    await loop._review_gate(store, "ds-1", url, ".")
+    assert len(calls) == 1 and "ds-1" in loop._review_zombies
+    assert not [b for b in budgets if "review-run" in b]  # no unrunnable-review budget spent
+    await loop._review_gate(store, "ds-1", url, ".")  # the zombie still runs → not re-run
+    assert len(calls) == 1
+    release.set()
+    await asyncio.sleep(0.05)
+    assert loop._review_zombies["ds-1"].done()
+
+
+async def _async_append(bucket, item):
+    bucket.append(item)
+
+
+async def test_one_candidate_gate_failing_cancels_its_siblings(tmp_path):
+    """Minor 6: Max-Mode's candidate gates run together; one tree gone must not orphan the
+    other gates' real process trees."""
+    live = tmp_path / "live"
+    live.mkdir()
+    loop = BoardLoop({"local_gate_cmd": "sleep 30", "local_gate_timeout_s": 60})
+    t0 = time.monotonic()
+    with pytest.raises(worktree.WorktreeMissing):
+        await asyncio.wait_for(loop._gate_all([str(tmp_path / "gone"), str(live)], {}), timeout=15)
+    assert time.monotonic() - t0 < 10  # the `sleep 30` sibling was cancelled, not waited out

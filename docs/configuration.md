@@ -340,9 +340,10 @@ The gates between a green build and main.
 or the a2a reviewer fallback. The cap is the board's own, not the host model client's. That
 client's `request_timeout` did not apply to a hung stream (protoAgent#3699), and one review
 sat for 80 minutes. When the cap is hit, the board abandons the call and returns at once,
-even if the call ignores its cancel. It then counts as an unrunnable review, so the card
-stays `review-pending` and the next poll retries it, up to `review_run_max`. There is no
-off switch, and `0` or a negative value means the default.
+even if the call ignores its cancel. The card stays `review-pending` and the next poll retries
+it. No second call starts for that card while the abandoned one is still running. A timeout
+is **not** an unrunnable review: it does not spend `review_run_max`, so a slow local model
+never blocks a card. There is no off switch, and `0` or a negative value means the default.
 
 ## Publish gates and the release freeze
 
@@ -483,7 +484,11 @@ in parallel.
 `reconcile_concurrency` bounds the per-card PR work: the rebase, the merged-state gate, the
 CI check, the review gate and auto-merge for each `in_review` card (floor 1). The claim scan
 never waits on this work (#462). Each card's reconcile runs as its own task, as a drive does,
-and a card whose last reconcile is still running is skipped on the next poll. Before this, the
+and a card whose last reconcile is still running is skipped on the next poll. The bound is
+**across repos**: one repo's cards always reconcile one at a time, because two sibling PRs
+merging concurrently could each pass on a merged-state stamp the other's merge had just made
+stale (#131). A card that has to wait first settles a merged or closed PR without queueing,
+and is re-read when its turn comes, so it never acts on a card a drive has since claimed. Before this, the
 tick ran that work inline, ahead of the claim scan. One 600 s merged-state gate and one hung
 review call kept a board with 32 ready cards and 0 in progress from claiming anything for four
 hours.

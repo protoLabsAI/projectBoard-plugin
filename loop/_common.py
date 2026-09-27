@@ -1201,6 +1201,8 @@ def worked_by_the_loop(fid: str) -> str:
     loop = _loop.live_loop()
     if loop is not None and (fid in loop._inflight_files or fid in loop._review_inflight):
         return "the loop is still working it (a claimed build or a running review gate)"
+    if loop is not None and fid in getattr(loop, "_card_tasks", {}):
+        return "the loop is still working it (its PR reconcile — rebase, merge gate or review — is running)"
     return ""
 
 
