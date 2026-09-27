@@ -680,14 +680,15 @@ def test_killed_by_signal_reads_both_forms_and_nothing_else():
     assert killed_by_signal(None) is None  # process never reaped
 
 
-async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch):
-    """A gate that can't even spawn must not block — it degrades to pass (CI gates)."""
+async def test_run_local_gate_degrades_to_pass_on_launch_error(monkeypatch, tmp_path):
+    """A gate that can't even spawn on a HEALTHY tree must not block — it degrades to pass
+    (CI gates)."""
 
     async def _boom(*a, **k):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr("asyncio.create_subprocess_shell", _boom)
-    assert await BoardLoop({"local_gate_cmd": "anything"})._run_local_gate("/wt") is None
+    assert await BoardLoop({"local_gate_cmd": "anything"})._run_local_gate(str(tmp_path)) is None
 
 
 def test_child_env_is_narrow_allowlist(monkeypatch):
@@ -5529,7 +5530,7 @@ async def test_maybe_reconcile_is_rate_limited(monkeypatch):
     loop = BoardLoop({"merge_poll": True, "merge_poll_interval_s": 60})
     calls = []
 
-    async def _reconcile():
+    async def _reconcile(**_kw):
         calls.append(1)
 
     monkeypatch.setattr(loop, "_reconcile_prs", _reconcile)

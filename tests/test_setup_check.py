@@ -565,6 +565,7 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("coder_rungs", None),
         ("preflight", None),
         ("legacy_binding", None),
+        ("claim_stall", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
@@ -830,6 +831,7 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
         "coder_rungs",
         "preflight",
         "legacy_binding",
+        "claim_stall",
     ]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db_legacy"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT

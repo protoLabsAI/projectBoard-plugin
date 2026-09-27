@@ -67,6 +67,15 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # panel steps failing) before escalating to the operator via flag_blocked —
         # fail closed without re-burning the workflow every poll forever (ADR 0078 D3).
         self.review_run_max = max(1, int(self.cfg.get("review_run_max", 3)))
+        # Hard cap on ONE review-gate model call (#462) — the host workflow run, or the a2a
+        # reviewer fallback. Ours, not the host client's: its request_timeout did not apply
+        # to a hung stream (protoAgent#3699), and the gate sat 80 minutes on one. A timeout
+        # counts as an unrunnable review (review_run_max). Not disableable; <= 0 → default.
+        try:
+            _review_cap = float(self.cfg.get("review_gate_timeout_s", 1800) or 0)
+        except (TypeError, ValueError):
+            _review_cap = 0.0
+        self.review_gate_timeout = _review_cap if _review_cap > 0 else 1800.0
         # Goal-verification gate (OPT-IN, default off). When on, a DETERMINISTIC pre-PR
         # check (no LLM, no diff dump): a code change must ship a test — CI runs tests but
         # can't require their presence, so the gate does. A miss → re-dispatch/escalate
@@ -118,6 +127,25 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # public webhook URL. On by default (cheap; only probes `in_review` PRs).
         self.merge_poll = bool(self.cfg.get("merge_poll", True))
         self.merge_poll_interval = float(self.cfg.get("merge_poll_interval_s", 60))
+        # How many in_review/blocked cards' PR reconciles (rebase, merged-state gate, CI,
+        # review gate, auto-merge) run at once (#462). Each is its own task, off the tick,
+        # so the claim scan never waits on them; this bounds them against each other.
+        self.reconcile_concurrency = _knob_int(self.cfg, "reconcile_concurrency", 2, floor=1)
+        self._card_tasks: dict[str, asyncio.Task] = {}  # fid → its running reconcile (#462)
+        self._card_slots: asyncio.Semaphore | None = None  # bound on first use, to the running loop
+        self._repo_locks: dict[str, asyncio.Lock] = {}  # one repo's cards reconcile one at a time
+        self._card_stall: Exception | None = None  # a card task's store stall, for the next tick (#404)
+        self._review_zombies: dict[str, asyncio.Task] = {}  # fid → an abandoned review call still running
+        self._busy_keeps: dict[str, int] = {}  # wtid → sweeps kept for a live process in the tree
+        # Claim-stall health signal (#462): ready work, a free slot, and no claim scan
+        # finished for this many ticks → a setup/health gap on /status naming the phase the
+        # tick is stuck in. 0 turns the signal off.
+        self.claim_stall_ticks = _knob_int(self.cfg, "claim_stall_ticks", 10, floor=0)
+        self._last_claim_at: float | None = None  # monotonic ts of the last finished claim scan
+        self._tick_phase_now: tuple[str, float] | None = None  # (phase, since) while a tick phase runs
+        self._setup_paused = False  # the setup gate is holding the puller (its own gap says why)
+        self._ready_count: int | None = None  # ready, unblocked cards at the last snapshot read
+        self._claim_stall: str = ""  # the current stall reason, "" when healthy
         # Health sweep: periodic self-heal (reclaim slots from dead drives, reap
         # orphaned worktrees). 0 disables it.
         self.sweep_interval = float(self.cfg.get("health_sweep_interval_s", 300))

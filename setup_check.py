@@ -105,6 +105,9 @@ PREFLIGHT_KEY = "preflight"
 # checkout a card uses, worst when it is ANOTHER clone of a project's own GitHub remote.
 # Advisory only, never a pause.
 LEGACY_BINDING_KEY = "legacy_binding"
+# The claim-stall health signal (#462): ready work, a free slot, and no claim scan finished for
+# `claim_stall_ticks` ticks. A health gap, not a setup check: reported, never a pause.
+CLAIM_STALL_KEY = "claim_stall"
 REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
     LOOP_STALE_KEY,
     LEGACY_STORE_KEY,
@@ -113,6 +116,7 @@ REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
     CODER_RUNGS_KEY,
     PREFLIGHT_KEY,
     LEGACY_BINDING_KEY,
+    CLAIM_STALL_KEY,
 )
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
@@ -808,6 +812,7 @@ def setup_status(
           "preflight_hint": str,       # slow preflights / unwinnable solve oracles, "" when none
           "legacy_binding": dict,      # flat repo/local_gate_cmd still set beside projects: (#454), {} when none
           "legacy_binding_hint": str,  # which binding wins for which cards, "" when none
+          "claim_stall_hint": str,  # #462: ready work, a free slot, no claim scan for N ticks; "" when none
           "ready": bool,               # every check ok
         }
 
@@ -988,6 +993,7 @@ def setup_status(
     legacy_bind = legacy_binding(cfg, run=run, isdir=isdir)
     status["legacy_binding"] = legacy_bind
     status["legacy_binding_hint"] = legacy_binding_hint(legacy_bind)
+    status["claim_stall_hint"] = health.claim_stall_hint()
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -1208,6 +1214,8 @@ class GapReporter:
                 msg = str((status or {}).get("preflight_hint") or "") or None
             elif key == LEGACY_BINDING_KEY:
                 msg = str((status or {}).get("legacy_binding_hint") or "") or None
+            elif key == CLAIM_STALL_KEY:
+                msg = str((status or {}).get("claim_stall_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
@@ -1222,6 +1230,21 @@ class GapReporter:
             except Exception:  # noqa: BLE001 — a host-side failure must never break the loop
                 log.warning("[project_board] report_setup_gap(%r) failed", key, exc_info=True)
         return changes
+
+    def report_key(self, key: str, msg: str | None) -> bool:
+        """Forward ONE key's message, edge-triggered like ``report`` — for a signal the loop
+        raises between full preflights (the claim stall, #462, fires while a tick is stuck,
+        when no preflight runs). True when it forwarded. Never raises."""
+        if key in self._reported and self._reported[key] == msg:
+            return False
+        self._reported[key] = msg
+        if self._fn is None:
+            return True
+        try:
+            self._emit(key, msg)
+        except Exception:  # noqa: BLE001 — a host-side failure must never break the loop
+            log.warning("[project_board] report_setup_gap(%r) failed", key, exc_info=True)
+        return True
 
     def _action_for(self, key: str, msg: str | None) -> dict | None:
         """The structured action for one gap: the ``plugin_config`` CTA for an ACTIVE

@@ -215,6 +215,7 @@ class DriveMixin:
         if not self.enabled:
             log.info("[project_board] loop disabled (project_board.loop_enabled=false) — board API still serves")
             return None
+        self._started_at = time.monotonic()  # the claim-stall clock before the first scan (#462)
         self._task = asyncio.create_task(self._run(), name="project-board-loop")
         # The working-state snapshot has a refresher of its own, not a step of the tick: a
         # loop paused at its setup gate runs no ticks, and the snapshot must not go stale
@@ -380,6 +381,9 @@ class DriveMixin:
         self._shutting_down = True
         self._stop.set()
         _unregister_loop(self)  # drop the process-stable handle (ADR 0326)
+        if self._claim_stall:
+            self._claim_stall = ""
+            health.publish_claim_stall("")  # a stopped loop is not a stalled one (#462)
         if self._task:
             setup_check.publish_loop_snapshot(None)  # no running loop → nothing to be stale against
         for task in (self._task, self._snapshot_task, getattr(self, "_base_refresh_task", None)):
@@ -400,10 +404,11 @@ class DriveMixin:
         if preflights:
             await asyncio.gather(*preflights, return_exceptions=True)
         drives, self._drives = list(self._drives), set()
-        for t in drives:
+        cards = list(self._card_tasks.values())  # per-card reconciles (#462) go with them
+        for t in (*drives, *cards):
             t.cancel()
-        if drives:
-            await asyncio.gather(*drives, return_exceptions=True)
+        if drives or cards:
+            await asyncio.gather(*drives, *cards, return_exceptions=True)
         inflight, self._inflight = dict(self._inflight), {}
         for fid, (repo, wt, branch) in inflight.items():
             try:
@@ -566,10 +571,12 @@ class DriveMixin:
             if not blockers:
                 if paused:
                     log.info("[project_board] loop resumed — setup gaps cleared")
+                self._setup_paused = False
                 return True
             if not paused:
                 log.warning("[project_board] loop paused: %s", setup_check.blocker_summary(status))
                 paused = True
+            self._setup_paused = True  # its own gap names why; no claim-stall signal on top (#462)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
             except asyncio.TimeoutError:
@@ -632,7 +639,10 @@ class DriveMixin:
                 # SAME queue can never interleave with this tick into over-claiming past
                 # max_concurrent or double-dispatching a card.
                 async with self._claim_guard():
-                    _, spawned = await self._tick_phase("claim scan", self._spawn_ready)
+                    scan, spawned = await self._tick_phase("claim scan", self._spawn_ready)
+                if scan == "ok":
+                    self._last_claim_at = time.monotonic()
+        self._check_claim_stall()
         return bool(spawned)
 
     async def _tick_phase(self, phase: str, step) -> tuple[str, object]:
@@ -646,6 +656,7 @@ class DriveMixin:
         calls behind it. Anything else is a bug and keeps its traceback. Nothing is retried
         here: each phase already runs on its own cadence (the merge poll interval, the sweep
         interval, the next tick), and that cadence is the retry."""
+        self._tick_phase_now = (phase, time.monotonic())  # what a claim stall names (#462)
         try:
             return "ok", await step()
         except store_mod.BoardTimeout as exc:
@@ -660,7 +671,63 @@ class DriveMixin:
             log.warning("[project_board] loop tick: %s failed, the rest of the tick continues: %s", phase, exc)
         except Exception:  # noqa: BLE001 — a bad phase must never kill the loop
             log.exception("[project_board] loop tick: %s failed, the rest of the tick continues", phase)
+        finally:
+            self._tick_phase_now = None
         return "failed", None
+
+    # ── claim-stall health signal (#462) ──────────────────────────────────────────
+    def _claim_stall_reason(self, now: float | None = None) -> str:
+        """Why the board is idle while it should be claiming, or "" when it is not.
+
+        Stalled means: ready cards (at the last snapshot read), a free drive slot, and no
+        claim scan FINISHED for ``claim_stall_ticks`` ticks' worth of time. That is the
+        shape of #462 — 32 ready cards, 0 in progress, four hours without a
+        ``claim_decision`` — and nothing on the board said so. A scan that finished and
+        claimed nothing (every card held, a WIP limit) is a decision, and is explained
+        where it is made (``board_dispatch``, the held cards' own hints)."""
+        if not self.claim_stall_ticks or not self.enabled or self._setup_paused or self._shutting_down:
+            return ""
+        ready = self._ready_count
+        if not ready or len(self._drives) >= self.max_concurrent:
+            return ""
+        now = time.monotonic() if now is None else now
+        since = self._last_claim_at if self._last_claim_at is not None else getattr(self, "_started_at", None)
+        if since is None:
+            return ""
+        threshold = max(self.claim_stall_ticks * self.interval, 60.0)
+        idle = now - since
+        if idle < threshold:
+            return ""
+        where = self._tick_phase_now
+        stuck = (
+            f"the tick has been in its {where[0]} phase for {int(now - where[1])}s"
+            if where
+            else "the tick is not reaching its claim scan"
+        )
+        return (
+            f"no claim decision for {int(idle)}s (> {self.claim_stall_ticks} ticks) with {ready} ready card(s) "
+            f"and {len(self._drives)}/{self.max_concurrent} drive slot(s) in use — {stuck}"
+        )
+
+    def _check_claim_stall(self) -> None:
+        """Publish the claim-stall signal on a CHANGE: one WARNING when it opens, one INFO
+        when it clears, and the host setup-gap seam either way. Cheap (no I/O) — it runs at
+        every tick's end and from the snapshot refresher, which keeps running while a tick
+        is stuck (that is the case it exists for). Never raises."""
+        try:
+            reason = self._claim_stall_reason()
+            if reason == self._claim_stall:
+                return
+            opened = bool(reason) and not self._claim_stall
+            self._claim_stall = reason
+            health.publish_claim_stall(reason)
+            if opened:
+                log.warning("[project_board] claim stall: %s", reason)
+            elif not reason:
+                log.info("[project_board] claim stall cleared — the claim scan is running again")
+            self._gap_reporter.report_key(setup_check.CLAIM_STALL_KEY, health.claim_stall_hint() or None)
+        except Exception:  # noqa: BLE001 — a health signal must never break the loop
+            log.warning("[project_board] claim-stall check failed", exc_info=True)
 
     async def _spawn_ready(self) -> bool:
         """Claim Ready features up to the concurrency cap and spawn a drive for each,
@@ -1108,6 +1175,7 @@ class DriveMixin:
                 # reports what it dispatched rather than swallowing it (r1/r3).
                 started = self._drive_fids(set(getattr(self, "_drives", ()) or ()) - drives_before)
                 return self._dispatch_error_record("ready-queue evaluation", exc, dispatched=started)
+            self._last_claim_at = time.monotonic()
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
         record = self._dispatch_decision_record(decision)
         if record["outcome"] in ("empty-queue", "all-candidates-held"):
@@ -1693,6 +1761,11 @@ class DriveMixin:
                             raise worktree.StrandedWorkError(repo, unsaved)
                     if reusing:
                         keep_wt = False  # consume the reuse
+                        if not worktree.tree_exists(wt):
+                            # A fix round continues the tree its last round left (#461). Gone
+                            # (reaped under the drive), the coder can only fail below the seam
+                            # — misread as a pre-model infra failure — so say what happened.
+                            raise worktree.WorktreeMissing(wt, "before its keep-worktree re-dispatch")
                         self._inflight[fid] = (repo, wt, branch)
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
@@ -1802,6 +1875,10 @@ class DriveMixin:
                     # dispatch scheduled on worker threads land before the drive
                     # proceeds toward open_pr (the pre-offload ordering).
                     await self._await_bg_records(fid)
+                    if wt and not worktree.tree_exists(wt):
+                        # Reaped while the coder ran (#461): every step from here — fixups, the
+                        # gate, the PR — would act on a directory that is gone. Stop now.
+                        raise worktree.WorktreeMissing(wt, "removed while its coder ran")
                     timeout_note = ""  # the dispatch that carried it has run — consumed
                     # The provider served this dispatch, so a down mark on it (#420) — set
                     # by another card, or one that was stale when every sibling was marked
@@ -2151,6 +2228,17 @@ class DriveMixin:
                             return
                         await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
+                        return
+                    if isinstance(exc, worktree.WorktreeMissing):
+                        # The tree was removed under the drive (#461). Nothing to retry on,
+                        # escalate or publish: fail the drive clearly. `transient`, so the
+                        # blocked sweep requeues it for a fresh build (a card with a PR
+                        # resumes its branch) — and tells the operator if it keeps happening.
+                        log.warning("[project_board] %s blocked (worktree missing): %s", fid, exc)
+                        if await self._block_or_stand_aside(
+                            store, fid, str(exc), category="transient", repo=repo, wt=None, branch=branch, pr_url=pr_url
+                        ):
+                            self._inflight.pop(fid, None)
                         return
                     policy = classify(str(exc))
                     # A PROVIDER failure is only ever the dispatch's own. The same words in a
@@ -3132,6 +3220,27 @@ class DriveMixin:
             )
         return None
 
+    async def _gate_all(self, trees: list[str], feature: dict) -> list:
+        """Run the pre-PR gate over several candidate trees at once (Max-Mode selection). If
+        one raises (a candidate tree reaped under it, #461), the others are cancelled and
+        awaited — their gate process trees die with them — before it propagates; a plain
+        gather left them running, orphaned (#471 review)."""
+        tasks = [asyncio.ensure_future(self._run_local_gate(t, feature)) for t in trees]
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        failed = next((t for t in done if not t.cancelled() and t.exception() is not None), None)
+        if failed is not None:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise failed.exception()
+        return [t.result() for t in tasks]
+
     async def _judge_candidates(self, feature: dict, base: str, worktrees: list[str]) -> int | None:
         """Max-Mode best-of-N judge: given N candidate worktrees for the same feature,
         pick the index whose diff best satisfies the ``acceptance_criteria``. Returns
@@ -3220,7 +3329,7 @@ class DriveMixin:
             return nonempty[0]
 
         fid = feature.get("id")
-        gates = await asyncio.gather(*(self._run_local_gate(worktrees[i], feature) for i in nonempty))
+        gates = await self._gate_all([worktrees[i] for i in nonempty], feature)
         passing = [i for i, gap in zip(nonempty, gates) if gap is None]
         if not passing:
             log.info(

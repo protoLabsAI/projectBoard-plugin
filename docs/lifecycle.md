@@ -241,6 +241,25 @@ Ambiguity resolves toward "killed" on purpose: the two errors are not symmetric.
 killed gate red states something false about the code and stops the board; calling a red
 gate killed only re-runs it, and the genuine failure is still there on the next run.
 
+### A gate over a missing tree is not a pass either
+
+"Couldn't run, so pass, and CI still gates" is right for a gate that times out or is killed
+on a **healthy** tree. It is wrong when the tree is gone. There is then nothing to gate and
+nothing to publish, and #461's drive went on to open a PR from a deleted directory. So when
+the tree is missing, the pre-PR gate raises `WorktreeMissing`. That covers a gate that could
+not launch in it, and a gate that timed out, was killed, or went red after the tree vanished
+under it. The drive then fails clearly:
+
+- it blocks the card `worktree missing: <path> …` under the `transient` class, so the blocked
+  sweep requeues it for a fresh build (a card with a PR resumes its branch) and tells the
+  operator if it keeps happening;
+- it opens and updates no PR;
+- a **keep-worktree re-dispatch** (a gate-fix, goal-fix or ledger round) checks for its tree
+  before it starts a coder, and fails the same way. Before, the coder died below the seam on
+  `workdir does not exist` and was misread as a pre-model infra failure.
+
+A merged-state verify whose throwaway tree vanishes stamps nothing, and the next poll re-runs it.
+
 ### A gate is a process tree, and it dies as one
 
 The board runs every repo command — the pre-PR and merged-state gates, the preflight,
@@ -302,6 +321,44 @@ spent 15 generations on "acceptance tests timed out after 300s". It was then blo
   the files it changed. An `apps/web` card is then judged by vitest and the typecheck, not
   by a Python suite that never looks at it.
 
+## The tick never waits on one card (#462)
+
+Each tick runs four phases in order: the PR reconcile, the health sweep, the gate
+preflight, then the claim scan. The PR reconcile used to do every `in_review` card's
+work **inline**: the rebase, the merged-state gate (a repo's own suite, up to
+`local_gate_timeout_s`), the CI check, the review gate (an in-process model call) and
+auto-merge. So one slow card held every claim behind it. On 2026-09-27 a 600 s gate and a
+review call whose stream had hung kept a board with 32 ready cards and 0 in progress from
+claiming anything for about four hours.
+
+Now the reconcile only reads the lanes and **starts** a tracked task per card, as a claim
+starts a drive:
+
+- at most `reconcile_concurrency` of them run at once, and one repo's cards run one at a
+  time: sibling PRs must not both auto-merge on a merged-state stamp the first merge made
+  stale (#131);
+- a card that has to wait settles a merged or closed PR at once, and otherwise is re-read
+  when its turn comes. It is skipped if it has left review, changed PR, or a drive or review
+  now holds it;
+- a card whose last reconcile is still running is skipped on the next poll, never stacked;
+- shutdown cancels them, and a running gate's process tree dies with its task;
+- a stalled store read inside one ends the next tick, as an inline stall ended its own
+  (#404).
+
+The tick itself stays O(seconds) and keeps filling slots. The review call also has a hard cap
+of its own, `review_gate_timeout_s`: a hung stream does not honour the host client's timeout
+(protoAgent#3699), so the board abandons the call itself. A timeout leaves the card
+`review-pending` without spending `review_run_max`, and no new review of that card starts
+until the abandoned call has returned.
+
+If the claim scan still stops (a phase that hangs, a wedged store), the board says so. Ready
+cards plus a free slot plus no finished claim scan for `claim_stall_ticks` ticks puts a
+`claim_stall` gap on `/status` and in the host's setup warnings, naming the phase the tick is
+stuck in. The snapshot refresher raises it, so a stuck tick can't hide its own stall.
+
+The gate preflight still runs inside the tick, ahead of the claim scan. It is fail-closed per
+project, and its timeout is its own subject (#456).
+
 ## A card moved under its build (#398)
 
 A drive owns its card only while the card is `in_progress`. Someone else can move it on
@@ -360,7 +417,20 @@ one removal:
 | `create_worktree` / `promote_worktree`, for any other caller | saves it, logs the branch, then clears it |
 
 **Which trees the health sweep calls orphaned.** Only a tree whose card is done or cancelled,
-or whose card the store has never heard of, and never one a live drive holds. The card is read
+or whose card the store has never heard of. It is never a tree that anything still holds. Before
+it reaps, the sweep asks, in order:
+
+- **The loop:** a drive in the live-drive registry (stalled or not), a salvage's reservation, the
+  card's running PR reconcile or merge gate, or its review gate. A drive still running for a card
+  that has since closed is **cancelled**, not reaped around. Its own cancel edge saves and removes
+  its tree, and a later sweep reaps any leftover.
+- **The OS:** any process whose cwd is inside the tree, such as a coder whose drive the board lost
+  track of, a gate, or an operator's shell. That tree is kept and the pids are logged. If the
+  probe can't answer (`/proc` on Linux, one `lsof` elsewhere), that counts as no evidence, so a
+  missing tool can't pin every tree forever.
+
+#461's stalled drive (`ds-wkt`) is the case for both checks. Its coder hung for an hour on a
+model stream, and the tree was reaped under it. The card is read
 from the tree's directory name, `feat-<id>[-<slug>]`, for any bead prefix (`bd-`, `ds-`, …).
 The sweep keeps a tree named with a slug when the store has no card for the id it parsed,
 because that proves only that the name could not be split (a prefix that itself holds a
@@ -669,7 +739,8 @@ per repo type and a worked example.
 ## Where to look next
 
 - [`docs/configuration.md`](configuration.md) — `review_gate`, `review_dispatch`,
-  `review_fix_max`, `review_run_max`, `auto_merge`, `merged_verify_max`.
+  `review_fix_max`, `review_run_max`, `review_gate_timeout_s`, `auto_merge`, `merged_verify_max`,
+  `reconcile_concurrency`, `claim_stall_ticks`.
 - [`docs/tools.md`](tools.md) — `board_block_feature`, `board_unblock_feature`,
   `board_requeue_feature`, `board_reset_merged_verify_budget`.
 - [`docs/adr/0326-merged-verify-exhaustion-auto-merge-hold.md`](adr/0326-merged-verify-exhaustion-auto-merge-hold.md).

@@ -561,6 +561,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # Both come from the loop's health sweep (this route never runs `br` or git).
         base_checkouts = health.base_checkouts_snapshot()
         return {
+            # #462: the loop has ready work and a free slot but no claim scan finished for
+            # `claim_stall_ticks` ticks — the reason names the phase the tick is stuck in.
+            "claim_stall": health.claim_stall_hint(),
             "bound": bound,
             "repo": store_kw.get("repo") or ".",
             "db_path": explicit_db,

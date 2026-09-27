@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **28 of 75 keys are in this state, including `coders` and `projects`** —
+never renders it. **28 of 78 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -333,7 +333,17 @@ The gates between a green build and main.
 | `merged_verify_max` | `5` | reload |
 | `ci_fix_max` | `2` | reload |
 | `review_fix_max` | `2` | reload |
+| `review_gate_timeout_s` | `1800` | reload |
 | `auto_merge` | `False` | live |
+
+`review_gate_timeout_s` is a hard cap on one review-gate model call: the host workflow run,
+or the a2a reviewer fallback. The cap is the board's own, not the host model client's. That
+client's `request_timeout` did not apply to a hung stream (protoAgent#3699), and one review
+sat for 80 minutes. When the cap is hit, the board abandons the call and returns at once,
+even if the call ignores its cancel. The card stays `review-pending` and the next poll retries
+it. No second call starts for that card while the abandoned one is still running. A timeout
+is **not** an unrunnable review: it does not spend `review_run_max`, so a slow local model
+never blocks a card. There is no off switch, and `0` or a negative value means the default.
 
 ## Publish gates and the release freeze
 
@@ -442,14 +452,16 @@ top-level `base_refresh: false` turns off the whole pass, fetches included.
 
 ## Concurrency
 
-How much the loop runs at once. All three are **live** — the running loop picks them up on
-its next tick, so you can throttle a board that is running hot without a restart.
+How much the loop runs at once. The first three are **live** — the running loop picks them
+up on its next tick, so you can throttle a board that is running hot without a restart.
 
 | Key | Default | Applies |
 |---|---|---|
 | `max_concurrent` | `1` | live |
 | `max_pending_reviews` | `5` | live |
 | `max_concurrent_sessions` | `0` | live |
+| `reconcile_concurrency` | `2` | reload |
+| `claim_stall_ticks` | `10` | reload |
 
 `max_concurrent` is the number of cards in flight at once (floor 1) — one per project is
 the usual setting for a multi-repo board. `max_pending_reviews` caps how many cards may sit
@@ -468,6 +480,31 @@ coder_solve_k=3: peak concurrent ACP sessions = max_concurrent × coder_solve_k 
 
 Set it to `1` to serialise candidates within a card while still building several cards
 in parallel.
+
+`reconcile_concurrency` bounds the per-card PR work: the rebase, the merged-state gate, the
+CI check, the review gate and auto-merge for each `in_review` card (floor 1). The claim scan
+never waits on this work (#462). Each card's reconcile runs as its own task, as a drive does,
+and a card whose last reconcile is still running is skipped on the next poll. The bound is
+**across repos**: one repo's cards always reconcile one at a time, because two sibling PRs
+merging concurrently could each pass on a merged-state stamp the other's merge had just made
+stale (#131). A card that has to wait first settles a merged or closed PR without queueing,
+and is re-read when its turn comes, so it never acts on a card a drive has since claimed. Before this, the
+tick ran that work inline, ahead of the claim scan. One 600 s merged-state gate and one hung
+review call kept a board with 32 ready cards and 0 in progress from claiming anything for four
+hours.
+
+`claim_stall_ticks` is the health signal for that shape. A board is flagged when all of these
+hold:
+
+- there are ready cards;
+- a drive slot is free (`max_concurrent`);
+- no claim scan has finished for this many ticks (`× loop_interval_s`, at least 60 s).
+
+`/status` then carries a `claim_stall` line. The same line appears as the `setup.claim_stall_hint`
+setup/health gap, which is also sent to the host's setup-gap warnings. The line names the tick
+phase that is stuck and how long it has been there. A scan that finished and claimed nothing (every
+card held, the review WIP limit) is a decision, not a stall. It is explained by `board_dispatch`.
+A loop paused at its setup gate reports its own gap instead. `0` turns the signal off.
 
 ## Everything else
 

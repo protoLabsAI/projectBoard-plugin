@@ -157,6 +157,18 @@ def _no_publish_gate_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fake_worktree_paths_exist(monkeypatch):
+    """The mocked drive tier hands the loop fake worktree paths (``/wt/feat-<id>``) and
+    never builds a tree. The drive's "is my kept tree still there?" check (#461) would read
+    every one as reaped, so the fake root counts as present; a real path is checked for
+    real (tests/test_loop_reliability_461_462.py removes real trees under a drive)."""
+    from project_board import worktree
+
+    real = worktree.tree_exists
+    monkeypatch.setattr(worktree, "tree_exists", lambda p: str(p).startswith("/wt") or real(p))
+
+
+@pytest.fixture(autouse=True)
 def _no_provider_down_marks():
     """The loop remembers a provider that refused its model (#420) in process-stable
     state, keyed by delegate name — and this suite reuses the same few names ("codex",

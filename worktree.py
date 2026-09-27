@@ -53,6 +53,23 @@ class CoderTimeout(WorktreeError):
     on the same prompt would likely hang again)."""
 
 
+class WorktreeMissing(WorktreeError):
+    """The worktree a drive was building in is gone — reaped or deleted under it (#461).
+
+    Not a verdict of any kind: a pre-PR gate whose cwd does not exist never ran, so it
+    must not read as a pass (the old "failed to run — treating as pass" opened a PR from
+    nothing), and a keep-worktree re-dispatch into it can only fail below the seam. The
+    drive fails with this, clearly, and publishes nothing."""
+
+    def __init__(self, path: str, during: str = ""):
+        self.path = path
+        super().__init__(
+            f"worktree missing: {path} no longer exists"
+            + (f" ({during})" if during else "")
+            + " — it was removed under the drive; nothing was published"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class StrandedTree:
     """One worktree holding work that exists nowhere else (#405): where it is, the branch
@@ -1532,6 +1549,94 @@ def list_feature_worktrees(repo: str, worktrees_root: str) -> list[str]:
     except OSError:
         return []
     return [_wt_id_from_dirname(n) for n in names if n.startswith("feat-") and os.path.isdir(os.path.join(base, n))]
+
+
+def tree_exists(path: str) -> bool:
+    """Is the worktree at ``path`` still on disk? The drive asks before it re-dispatches a
+    coder into a KEPT tree (#461). A seam, not a bare ``os.path.isdir``, so the mocked drive
+    tier (which builds no trees) can say its fake paths exist."""
+    return os.path.isdir(path)
+
+
+# ── who is still working in a tree (#461) ─────────────────────────────────────────────
+# The health sweep's last check before it reaps: a process whose cwd is inside the tree —
+# the coder's ACP session, a gate, the operator's own shell — means the tree is in use,
+# whatever the board's bookkeeping says. Linux reads /proc; elsewhere one `lsof` call per
+# sweep lists every process's cwd. Unanswerable (no /proc, no lsof, a timeout) reads as
+# "no evidence", never as "in use": the live-drive registry is the primary guard, this is
+# its backstop, and a probe that cannot run must not pin every tree forever.
+_CWD_PROBE_TIMEOUT_S = 10.0
+
+
+def _proc_cwds() -> dict[int, str] | None:
+    """``{pid: cwd}`` from ``/proc`` (Linux), or None where there is no ``/proc``."""
+    if not os.path.isdir("/proc/self"):
+        return None
+    out: dict[int, str] = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            out[int(name)] = os.readlink(f"/proc/{name}/cwd")
+        except OSError:  # gone, or not ours to read
+            continue
+    return out
+
+
+async def _lsof_cwds() -> dict[int, str] | None:
+    """``{pid: cwd}`` from ``lsof -d cwd -Fpn`` (macOS, BSD), or None when it can't answer."""
+    exe = shutil.which("lsof")
+    if not exe:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe,
+            "-w",
+            "-n",
+            "-P",
+            "-d",
+            "cwd",
+            "-F",
+            "pn",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        out, _ = await communicate_or_kill(proc, timeout=_CWD_PROBE_TIMEOUT_S)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    cwds: dict[int, str] = {}
+    pid = None
+    for line in (out or b"").decode("utf-8", "replace").splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+async def processes_in_trees(paths: Iterable[str]) -> dict[str, list[int]]:
+    """For each tree in ``paths``, the pids (other than this process) whose cwd is the tree
+    or inside it. Trees nobody is in are left out. Empty when the probe can't answer."""
+    trees = {p: os.path.realpath(p) for p in paths}
+    if not trees:
+        return {}
+    cwds = await asyncio.to_thread(_proc_cwds)
+    if cwds is None:
+        cwds = await _lsof_cwds()
+    if not cwds:
+        return {}
+    me = os.getpid()
+    found: dict[str, list[int]] = {}
+    for pid, cwd in cwds.items():
+        if pid == me or not cwd:
+            continue
+        real = os.path.realpath(cwd)
+        for path, tree in trees.items():
+            if real == tree or real.startswith(tree + os.sep):
+                found.setdefault(path, []).append(pid)
+    return found
 
 
 async def dispatch_coder(
