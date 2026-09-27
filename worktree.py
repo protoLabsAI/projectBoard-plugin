@@ -656,6 +656,65 @@ async def base_checkout_dirt(repo: str, base: str = "") -> str:
         return ""
 
 
+async def checkout_head_sha(repo: str) -> str:
+    """The commit ``repo``'s main checkout has checked out (``git rev-parse HEAD``), or ''
+    when git can't say (no repo, no commits, git missing). Local only: no fetch, no network.
+
+    The gate preflight keys its cached verdict on this (#456). The preflight runs the gate
+    in this checkout, so its verdict describes this commit. A new commit invalidates it, and
+    re-running the gate on the same commit only repeats the answer. '' means "unknown", and
+    the caller keeps its old once-per-run behaviour."""
+    try:
+        rc, out, _err = await _git(repo, "rev-parse", "HEAD")
+    except Exception:  # noqa: BLE001 — an unavailable git is "unknown", never an error
+        return ""
+    return out.strip() if rc == 0 else ""
+
+
+async def changed_paths(tree: str, base: str = "") -> list[str] | None:
+    """The repo-relative paths a worktree changes against the point it forked from
+    ``base``: commits made since then, uncommitted edits to tracked files, and new untracked
+    files. The board's own leftovers are dropped: the coder scratch (``CODER_SCRATCH``) and
+    the ``node_modules`` links. Returns ``None`` when git can't say.
+
+    ``coder.solve()``'s path-scoped oracle (#459) uses this to pick which test command a
+    candidate needs. The fork point is ``merge-base HEAD origin/<base>``, falling back to the
+    local ``<base>`` and then to ``HEAD``. So a candidate that commits its work and one that
+    leaves it uncommitted both report the same files. With no ``base`` the fork point is
+    the merge-base with the remote's default branch (``origin/HEAD``), then with the
+    branch's upstream (#467 review).
+
+    A rename or a deletion lists BOTH sides (#467 review). `git mv src/core.py docs/core.md`
+    changes what `src/**` tests cover, and diff's rename detection would report only the
+    new name. So ``--no-renames`` is used: the move is listed as a deleted ``src/core.py``
+    plus a new ``docs/core.md``."""
+    try:
+        fork = ""
+        refs = (f"origin/{base}", base) if base else ("origin/HEAD", "@{upstream}")
+        for ref in refs:
+            rc, out, _err = await _git(tree, "merge-base", "HEAD", ref)
+            if rc == 0 and out.strip():
+                fork = out.strip()
+                break
+        rc, out, _err = await _git(tree, "diff", "--name-only", "--no-renames", "-z", fork or "HEAD", "--")
+        if rc != 0:
+            return None
+        rc_u, untracked, _err = await _git(tree, "ls-files", "--others", "--exclude-standard", "-z")
+        if rc_u != 0:
+            return None
+    except WorktreeError:
+        return None
+    paths: list[str] = []
+    for entry in [*out.split("\0"), *untracked.split("\0")]:
+        rel = entry.strip()
+        if not rel or rel in paths or _is_board_link(tree, rel):
+            continue
+        if any(rel == s or rel.startswith(s + "/") for s in CODER_SCRATCH):
+            continue
+        paths.append(rel)
+    return paths
+
+
 async def prune_stale_worktrees(repo: str) -> str:
     """``git worktree prune -v`` in ``repo`` — drop stale ``.git/worktrees/*`` admin
     entries whose working tree is gone (a branch merged + its tree deleted, or a tree

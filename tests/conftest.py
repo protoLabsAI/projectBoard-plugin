@@ -167,6 +167,19 @@ def _no_provider_down_marks():
     _common._PROVIDER_DOWN.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_preflight_health():
+    """The loop publishes its preflight verdicts to process-stable health state, and the
+    setup check reads the slow-preflight and unwinnable-oracle advisories back from it
+    (#456/#459). Start and end every test with none, so one test's timed-out preflight
+    never shows up as a standing advisory in another test's setup report."""
+    from project_board import health
+
+    health._health.pop("preflight", None)
+    yield
+    health._health.pop("preflight", None)
+
+
 @pytest.fixture
 def make_board(monkeypatch):
     """Build a ``BeadsBoard`` with the ``br`` PATH check stubbed and ``_run``

@@ -173,9 +173,12 @@ def test_unresolvable_coder_names_the_missing_delegate(tmp_path):
     assert s["loop_blockers"] == ["coder"]
 
 
-def test_every_configured_coder_name_must_resolve(tmp_path):
-    """The flat `coder`, the `coders` tier map AND each `projects:` entry's own
-    `coders` all dispatch — one unresolvable rung blocks a whole escalation ladder."""
+def test_every_configured_coder_name_is_checked_but_only_the_base_coder_pauses(tmp_path):
+    """The flat `coder`, the `coders` tier map AND each `projects:` entry's own `coders`
+    all dispatch, so every name is checked. But only a missing BASE coder pauses the loop
+    (protoAgent#3692). A rung naming a deleted delegate degrades at dispatch, so it is an
+    advisory that names the rung. It used to pause every card, including ones that would
+    have run on the rungs still there."""
     cfg = {
         "coder": "proto",
         "coders": {"fast": "proto", "smart": "proto-smart"},
@@ -183,9 +186,30 @@ def test_every_configured_coder_name_must_resolve(tmp_path):
     }
     assert setup_check.coder_names(cfg) == ["proto", "proto-smart", "claude-acp"]
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "claude-acp"), run=_fake_run())
-    assert s["coder"]["ok"] is False and s["coder"]["missing"] == ["proto-smart"]
-    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "proto-smart", "claude-acp"), run=_fake_run())
+    assert s["coder"]["ok"] is True and s["coder"]["missing"] == ["proto-smart"]
+    assert "coder" not in s["loop_blockers"]
+    assert s["coder"]["missing_rungs"] == [{"tier": "smart", "project": "", "names": ["proto-smart"]}]
+    assert "rung 'smart': 'proto-smart'" in s["coder_rungs_hint"] and "keeps running" in s["coder_rungs_hint"]
+    # a project's rung is named with its project
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "proto-smart"), run=_fake_run())
     assert s["coder"]["ok"] is True
+    assert "rung 'reasoning' (project 'web'): 'claude-acp'" in s["coder_rungs_hint"]
+    # the BASE coder missing still pauses, and names only the base coder
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto-smart", "claude-acp"), run=_fake_run())
+    assert s["coder"]["ok"] is False and "'proto'" in s["coder"]["hint"] and "coder" in s["loop_blockers"]
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "proto-smart", "claude-acp"), run=_fake_run())
+    assert s["coder"]["ok"] is True and s["coder"]["missing_rungs"] == [] and s["coder_rungs_hint"] == ""
+
+
+def test_blank_coder_ladder_pauses_only_when_no_rung_resolves(tmp_path):
+    """With `coder` blank the ladder is the base: one deleted rung delegate degrades
+    (protoAgent#3692), and only a ladder with nothing live at all pauses."""
+    cfg = {"repo": str(tmp_path), "coders": {"smart": "a", "reasoning": "fable", "opus": "c"}}
+    s = setup_status(cfg, which=_which_all, delegates=_delegates("a", "c"), run=_fake_run())
+    assert s["coder"]["ok"] is True and "coder" not in s["loop_blockers"]
+    assert s["coder"]["missing_rungs"] == [{"tier": "reasoning", "project": "", "names": ["fable"]}]
+    s = setup_status(cfg, which=_which_all, delegates=_delegates(), run=_fake_run())
+    assert s["coder"]["ok"] is False and "coder" in s["loop_blockers"]
 
 
 def test_coders_ladder_alone_passes_only_when_every_tier_is_mapped(tmp_path):
@@ -538,6 +562,8 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("db_legacy", None),
         ("review_status", None),
         ("release_freeze", None),
+        ("coder_rungs", None),
+        ("preflight", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
@@ -800,6 +826,8 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
         "db_legacy",
         "review_status",
         "release_freeze",
+        "coder_rungs",
+        "preflight",
     ]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db_legacy"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT

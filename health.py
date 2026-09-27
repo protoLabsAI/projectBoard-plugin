@@ -44,19 +44,49 @@ def _attach() -> dict:
 _health: dict = _attach()
 
 
-def publish_preflight(state: dict, dirty: dict) -> None:
-    """Called by the loop after each preflight pass with its two live maps:
-    ``state`` (project -> True | reason-string | None) and ``dirty``
-    (project -> why the checkout wasn't at base)."""
+def publish_preflight(state: dict, dirty: dict, *, slow: dict | None = None, oracle: dict | None = None) -> None:
+    """Called by the loop after each preflight pass with its live maps:
+    ``state`` (project -> True | reason-string | None), ``dirty``
+    (project -> why the checkout wasn't at base), ``slow`` (project -> {cmd, timeout_s,
+    sha}: a preflight command that can't finish inside ``preflight_timeout_s``, #456) and
+    ``oracle`` (project -> why its coder.solve() oracle is unwinnable, #459)."""
     _health["preflight"] = {
         "held": {n: r for n, r in state.items() if isinstance(r, str)},
         "dirty": dict(dirty),
+        "slow": {n: dict(v) for n, v in (slow or {}).items()},
+        "unwinnable_oracle": dict(oracle or {}),
     }
 
 
 def preflight_snapshot() -> dict:
-    """``{held: {project: reason}, dirty: {project: why}}`` — held projects are the ones
-    whose ready work is frozen behind a red gate. Empty before the first preflight pass
-    (and on a board whose loop is off), which reads correctly as "nothing held"."""
+    """``{held: {project: reason}, dirty: {project: why}, slow: {project: {cmd,
+    timeout_s, sha}}, unwinnable_oracle: {project: why}}``. Held projects are the ones
+    whose ready work is frozen behind a red gate. Slow ones run a preflight that can't
+    finish in its timeout, so their verdict is only "indeterminate" (#456). An unwinnable
+    oracle means that project's cards skip coder.solve() (#459). Empty before the first
+    preflight pass (and on a board whose loop is off), which reads correctly as "nothing
+    held"."""
     snap = _health.get("preflight") or {}
-    return {"held": dict(snap.get("held") or {}), "dirty": dict(snap.get("dirty") or {})}
+    return {
+        "held": dict(snap.get("held") or {}),
+        "dirty": dict(snap.get("dirty") or {}),
+        "slow": {n: dict(v) for n, v in (snap.get("slow") or {}).items()},
+        "unwinnable_oracle": dict(snap.get("unwinnable_oracle") or {}),
+    }
+
+
+def advisory_hint() -> str:
+    """One operator line for the setup advisories: the projects whose preflight can't
+    finish in time (#456) and whose coder.solve() oracle is unwinnable (#459). "" when
+    there are none."""
+    snap = preflight_snapshot()
+    parts = []
+    for name, info in sorted(snap["slow"].items()):
+        parts.append(
+            f"project {name!r}: the preflight (`{info.get('cmd', '')}`) can't finish inside "
+            f"preflight_timeout_s={info.get('timeout_s', 0):.0f}s, so it gives no verdict — set a cheap "
+            "`preflight_cmd` (lint + an import check)"
+        )
+    for name, why in sorted(snap["unwinnable_oracle"].items()):
+        parts.append(f"project {name!r}: coder.solve() is off — {why}")
+    return "; ".join(parts)

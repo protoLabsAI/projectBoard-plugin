@@ -20,12 +20,15 @@ _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible se
 class PreflightMixin:
     async def _maybe_preflight(self) -> None:
         """Re-run each project's gate preflight while it hasn't passed, throttled per
-        project (#90). Once a project passes it stays passed for the run (a healthy env
-        doesn't spontaneously lose its toolchain; a per-PR gate failure is handled in the
-        drive, not here). Runs for every project with ready work, every project still
-        marked failed, AND every project this loop holds cards for. The last two cover a
-        project whose ready work got HELD (and so dropped out of `ready`): it still
-        re-checks and can recover."""
+        project (#90). Once a project passes, the pass stands for the checkout commit it
+        was reached on (#456). A healthy environment doesn't lose its toolchain on its own,
+        and a per-PR gate failure is handled in the drive, not here. When the checkout
+        moves, one re-check runs in the background while dispatch goes on. A run that timed
+        out counts as a pass here: it is indeterminate and is not repeated on the same
+        commit. At most one preflight per project runs at a time. Runs for every project
+        with ready work, every project still marked failed, AND every project this loop
+        holds cards for. The last two cover a project whose ready work got HELD (and so
+        dropped out of `ready`): it still re-checks and can recover."""
         if not self.preflight:
             return
         store = self._store()
@@ -54,31 +57,97 @@ class PreflightMixin:
             names.append(name)
         ran = False
         for name in names:
-            cmd = self._local_gate_cmd_for({"project": name})
+            feature = {"project": name}
+            cmd = self._preflight_cmd_for(feature)
             if not cmd:
                 self._preflight_state[name] = True  # nothing to smoke → runnable
                 continue
+            repo = self._repo_for(feature)
+            base = self._base_branch_for(feature)
             state = self._preflight_state.get(name)
             if state is True:
-                continue  # already passed this run
+                # A non-failing verdict stands for the commit it was reached on (#456).
+                # That covers a green run and an indeterminate one (a timeout). When the
+                # checkout moves, ONE re-check runs, in the background. Dispatch goes on
+                # under the old verdict meanwhile, and a red result holds the project from
+                # the next claim scan. A verdict with no recorded commit (git couldn't say,
+                # or nothing was smoked) stays for the run, as every pass used to.
+                known = self._preflight_sha.get(name)
+                if not known or name in self._preflight_tasks:
+                    continue
+                sha = await worktree.checkout_head_sha(repo)
+                if not sha or sha == known:
+                    continue
+                log.info(
+                    "[project_board] preflight[%s]: the checkout moved (%s → %s) — re-checking in the background",
+                    name,
+                    known[:10],
+                    sha[:10],
+                )
+                self._last_preflight[name] = now
+                self._start_preflight(name, cmd, repo, base, sha)
+                continue
             # First check runs immediately (state is None); re-checks of a KNOWN-failed
             # preflight are throttled so a slow gate isn't hammered every tick.
             if state is not None and (now - self._last_preflight.get(name, 0.0)) < max(self.interval, 60.0):
                 continue
             self._last_preflight[name] = now
             ran = True
-            await self._preflight(
-                name,
-                cmd,
-                self._repo_for({"project": name}),
-                self._base_branch_for({"project": name}),
-            )
+            # Single-flight (#456): a caller that finds a run already in flight for this
+            # project awaits it, rather than starting a second gate in the same checkout.
+            # Shielded, so a caller that is cancelled does not cancel the run the other
+            # caller is waiting on. stop() cancels runs still in flight.
+            await asyncio.shield(self._start_preflight(name, cmd, repo, base))
         if ran:
             # Surface the verdicts on /status (#255) — a board that stops picking work
             # up must be able to say why without the operator reading the log.
-            health.publish_preflight(self._preflight_state, self._preflight_dirty)
+            self._publish_preflight_health()
 
-    async def _preflight(self, name: str, cmd: str, repo: str, base: str = "") -> None:
+    def _start_preflight(self, name: str, cmd: str, repo: str, base: str, sha: str | None = None) -> asyncio.Task:
+        """Project ``name``'s running preflight, started if none is in flight (#456). Every
+        caller shares one task per project, so two callers never run two gates at once in
+        the same checkout. The task leaves ``_preflight_tasks`` when it finishes, and its
+        verdict is published to /status then. That matters for a background re-check,
+        which nobody awaits."""
+        task = self._preflight_tasks.get(name)
+        # Shared only when the run in flight smokes the SAME command in the SAME checkout. A
+        # registry save that changes the project's gate or repo resets its verdict, and the
+        # new routing must get its own run, not the old command's answer.
+        if task is not None and not task.done() and self._preflight_task_key.get(name) == (cmd, repo):
+            log.info("[project_board] preflight[%s]: a run is already in flight — waiting for its verdict", name)
+            return task
+        run = self._preflight_run_gen[name] = self._preflight_run_gen.get(name, 0) + 1
+        task = asyncio.create_task(self._preflight(name, cmd, repo, base, sha=sha, run=run), name=f"preflight[{name}]")
+        self._preflight_tasks[name] = task
+        self._preflight_task_key[name] = (cmd, repo)
+
+        def _done(t: asyncio.Task, n: str = name) -> None:
+            if self._preflight_tasks.get(n) is t:
+                self._preflight_tasks.pop(n, None)
+                self._preflight_task_key.pop(n, None)
+            if not t.cancelled() and t.exception() is not None:
+                log.warning("[project_board] preflight[%s] crashed: %s", n, t.exception())
+            try:
+                self._publish_preflight_health()
+            except Exception:  # noqa: BLE001 — publishing status must never break a preflight
+                log.debug("[project_board] preflight health publish failed", exc_info=True)
+
+        task.add_done_callback(_done)
+        return task
+
+    def _publish_preflight_health(self) -> None:
+        """Send the preflight verdicts, the slow-gate flags (#456) and the unwinnable-oracle
+        flags (#459) to /status."""
+        health.publish_preflight(
+            self._preflight_state,
+            self._preflight_dirty,
+            slow=self._preflight_slow,
+            oracle=self._oracle_unwinnable,
+        )
+
+    async def _preflight(
+        self, name: str, cmd: str, repo: str, base: str = "", *, sha: str | None = None, run: int | None = None
+    ) -> None:
         """Smoke-run project ``name``'s gate on its base checkout. Sets
         ``self._preflight_state[name]``: ``True`` when the gate exits 0 (runnable), a
         reason string on a CLEAN non-zero exit or a launch failure (broken environment →
@@ -102,7 +171,18 @@ class PreflightMixin:
         a clean red stays held (only a clean green may release it), and one that was never
         held is not newly held (state stays ``None``, so the claim scan keeps dispatching
         — the posture a timeout already had). Fail-closed and fail-open both keep their
-        meaning, and each is decided only on evidence that supports it."""
+        meaning, and each is decided only on evidence that supports it.
+
+        ``sha`` is the checkout commit the verdict describes, read here when not given
+        (#456). A non-failing verdict records it, and ``_maybe_preflight`` re-checks only
+        once the checkout moves. A run cut off by ``preflight_timeout_s`` is recorded as
+        SLOW: it is indeterminate, so dispatch is allowed, it is warned about once, it shows
+        on /status, and it is not re-run until the checkout moves. When the command is the
+        project's gate, the run's duration is kept for the coder.solve() oracle guard (#459)."""
+        if sha is None:
+            sha = await worktree.checkout_head_sha(repo)
+        is_gate = cmd == self._local_gate_cmd_for({"project": name})
+        started = time.monotonic()
         log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
         try:
             proc = await worktree.spawn_shell(
@@ -117,13 +197,14 @@ class PreflightMixin:
                 # base checkout, so an orphaned install left behind here is the worst kind.
                 out, _ = await worktree.communicate_or_kill(proc, timeout=self.preflight_timeout)
             except asyncio.TimeoutError:
-                log.warning(
-                    "[project_board] preflight[%s] timed out (%ss) — indeterminate, allowing dispatch",
-                    name,
-                    self.preflight_timeout,
-                )
-                self._preflight_state[name] = True
+                if self._preflight_superseded(name, run):
+                    return
+                self._record_preflight_timeout(name, cmd, sha, is_gate)
                 return
+            if self._preflight_superseded(name, run):
+                return
+            if is_gate:
+                self._record_gate_seconds(name, time.monotonic() - started, False)
             # The dirt probe runs BEFORE the exit code is read, because it decides
             # whether the exit code means anything at all — for a pass exactly as much
             # as for a failure (see the docstring).
@@ -140,6 +221,11 @@ class PreflightMixin:
                     dirt,
                     proc.returncode,
                 )
+                if sha and self._preflight_state.get(name) is True:
+                    # A background re-check on a dirty checkout (#456) keeps the old verdict,
+                    # and it has now looked at this commit. Without this, every tick would
+                    # re-run the gate in the background until the operator commits.
+                    self._preflight_sha[name] = sha
                 return
             self._preflight_dirty.pop(name, None)
             if proc.returncode == 0:
@@ -147,6 +233,9 @@ class PreflightMixin:
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
                 self._preflight_failed_at.pop(name, None)
                 self._preflight_state[name] = True
+                if sha:
+                    self._preflight_sha[name] = sha
+                self._preflight_slow.pop(name, None)  # it finished in time on this commit
                 await asyncio.to_thread(self._release_preflight_holds, name)
                 return
             text = (out or b"").decode("utf-8", "replace").strip()
@@ -170,6 +259,8 @@ class PreflightMixin:
                 return
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
+            if self._preflight_superseded(name, run):
+                return
             reason = f"gate command could not run: {exc}"
             # A missing CHECKOUT raises the same FileNotFoundError (the cwd); only name the
             # command when the checkout is there.
@@ -181,6 +272,69 @@ class PreflightMixin:
                     name,
                     self._preflight_state[name],
                 )
+
+    def _preflight_superseded(self, name: str, run: int | None) -> bool:
+        """Whether this run was replaced by a newer one for the same project (#467 review).
+        A registry save that changes a project's gate starts a fresh run while the old one
+        may still be going. Only the current run may write a verdict, so a late answer to
+        the OLD command never overwrites the new one, even if the new run has already
+        finished. ``run`` is the number ``_start_preflight`` gave this run; a direct call
+        (``run`` None) is always current."""
+        if run is None or run == self._preflight_run_gen.get(name):
+            return False
+        log.info("[project_board] preflight[%s]: superseded by a newer run — this result is dropped", name)
+        return True
+
+    def _record_gate_seconds(self, name: str, seconds: float, lower_bound: bool) -> None:
+        """Keep the gate's measured duration, and when it was measured, for the coder.solve()
+        oracle guard (#459). The guard is re-evaluated from this on every call."""
+        self._gate_seconds[name] = (seconds, lower_bound)
+        self._gate_measured_at[name] = time.monotonic()
+
+    def _record_preflight_timeout(self, name: str, cmd: str, sha: str, is_gate: bool) -> None:
+        """A preflight cut off at ``preflight_timeout_s`` (#456). This is indeterminate, so
+        dispatch is allowed, as before. But a command that can't finish inside the timeout
+        will never finish inside it, and running it again only makes every dispatch wait the
+        full timeout for the same non-answer. So the verdict is cached for this commit and
+        not re-run until the checkout moves. The project shows as slow on /status and in the
+        setup advisories, and the first time it happens the log names the fix
+        (``preflight_cmd``). When the command is the gate, the timeout is also a lower bound
+        on the gate's duration, which the coder.solve() oracle guard reads (#459).
+
+        A project already held for a clean RED keeps its hold (#467 review). A timeout is no
+        evidence that the gate recovered, so it can't release the hold, and it isn't cached,
+        so the throttled re-check keeps running until a clean green releases it."""
+        if is_gate:
+            self._record_gate_seconds(name, self.preflight_timeout, True)
+        self._preflight_slow[name] = {"cmd": cmd, "timeout_s": self.preflight_timeout, "sha": sha}
+        if isinstance(self._preflight_state.get(name), str):
+            log.warning(
+                "[project_board] preflight[%s] timed out (%ss) on a project held for a failing gate — "
+                "no verdict, so it stays held until the gate passes",
+                name,
+                self.preflight_timeout,
+            )
+            return
+        self._preflight_state[name] = True
+        if sha:
+            self._preflight_sha[name] = sha
+        if name in self._preflight_slow_warned:
+            log.info(
+                "[project_board] preflight[%s] timed out again (%ss) — indeterminate, allowing dispatch",
+                name,
+                self.preflight_timeout,
+            )
+            return
+        self._preflight_slow_warned.add(name)
+        log.warning(
+            "[project_board] preflight[%s] timed out (%ss) — indeterminate, allowing dispatch. `%s` can't finish "
+            "inside preflight_timeout_s, so the board won't run it again until the checkout moves%s. Set a cheap "
+            "`preflight_cmd` for this project (lint + an import check) to get a real verdict.",
+            name,
+            self.preflight_timeout,
+            cmd,
+            f" off {sha[:10]}" if sha else "",
+        )
 
     def _record_preflight_failure(self, name: str, reason: str) -> bool:
         """Set project ``name``'s failure ``reason`` and say whether to log it in full

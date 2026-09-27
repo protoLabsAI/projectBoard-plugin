@@ -124,6 +124,16 @@ STRANDED_WORK_CLASS = "stranded-work"
 # a sweep requeue would only race it into an immediate re-hold.
 PREFLIGHT_HOLD_CLASS = "preflight-hold"
 
+# The `blocked-class:` of a card whose coder.solve() acceptance ORACLE could not finish (#459):
+# several candidates in a row hit `coder_solve_test_timeout_s` running the same test command.
+# A timeout says nothing about the code, so this is an oracle or spec problem: a test command
+# slower than its budget, or one that never ends. The loop's own class, like the ones above.
+# It used to reach the sweep as `transient` (the message says "timed out"), which unblocked
+# the card and spent its whole generation budget again. Absent from the self-healing set on
+# purpose: waiting doesn't make the oracle faster. The fix is a quicker
+# `coder_solve_test_cmd`, a `coder_solve_test_paths` map, or a longer timeout.
+ORACLE_TIMEOUT_CLASS = "oracle-timeout"
+
 # The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
 # and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
 # WorktreeError and every watchdog kill to `coder timed out after …`, so a message that

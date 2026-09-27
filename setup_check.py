@@ -92,7 +92,20 @@ REVIEW_STATUS_KEY = "review_status"
 # cannot read (403 — e.g. no Actions: read) is SKIPPED rather than holding every merge; this
 # names it so the operator knows the guard is partly blind. Advisory only, never a pause.
 RELEASE_FREEZE_KEY = "release_freeze"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY, RELEASE_FREEZE_KEY)
+# protoAgent#3692: a `coders` rung naming a delegate that no longer exists. Advisory only, and
+# never a pause: the rung degrades at dispatch. Only a missing BASE coder fails `coder`.
+CODER_RUNGS_KEY = "coder_rungs"
+# #456 / #459: a gate preflight that can't finish inside its timeout, and a project whose
+# coder.solve() oracle is unwinnable. Both are published by the running loop. Advisory only.
+PREFLIGHT_KEY = "preflight"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
+    LOOP_STALE_KEY,
+    LEGACY_STORE_KEY,
+    REVIEW_STATUS_KEY,
+    RELEASE_FREEZE_KEY,
+    CODER_RUNGS_KEY,
+    PREFLIGHT_KEY,
+)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -656,7 +669,7 @@ def setup_status(
         {
           "br":    {"ok", "path", "version", "hint"},
           "gh":    {"ok", "path", "hint"},
-          "coder": {"ok", "name", "names", "missing", "hint"},
+          "coder": {"ok", "name", "names", "missing", "missing_rungs", "hint"},
           "repo":  {"ok", "path", "hint"},
           "loop_enabled": bool,
           "loop_blockers": [key, …],   # the failing checks the puller pauses on
@@ -671,6 +684,8 @@ def setup_status(
           "review_status_ok": bool,    # the review gate can publish its QA-panel commit status (#354)
           "review_status_hint": str,   # capability-warning copy, "" when capable / gate off
           "release_freeze_hint": str,  # freeze signals the gh credential can't read (403), "" when none
+          "coder_rungs_hint": str,     # coders rungs naming deleted delegates (skipped, not a pause)
+          "preflight_hint": str,       # slow preflights / unwinnable solve oracles, "" when none
           "ready": bool,               # every check ok
         }
 
@@ -751,12 +766,22 @@ def setup_status(
             missing.append(name)
     coder_name = str(cfg.get("coder") or "").strip()
     ladder_gap = _ladder_gap(cfg) if not coder_name else ""
+    # Only a missing BASE coder pauses the loop (protoAgent#3692). A rung naming a deleted
+    # delegate degrades at dispatch (its live siblings, the base coder, the nearest live
+    # rung), so it is an advisory here. It used to pause every card, including ones that
+    # would have run on a rung that was still there. With `coder` blank the ladder IS the
+    # base, so it pauses only when no name on it resolves at all.
+    blocking = (
+        ([coder_name] if coder_name in missing else [])
+        if coder_name
+        else (missing if len(missing) == len(names) else [])
+    )
     if not names:
         coder_hint = _no_coder_hint(acp_delegates)
     elif ladder_gap:
         coder_hint = ladder_gap
-    elif missing:
-        listed = ", ".join(repr(n) for n in missing)
+    elif blocking:
+        listed = ", ".join(repr(n) for n in blocking)
         coder_hint = (
             f"coder delegate {listed} is not declared as an acp delegate — declare it under "
             "Settings ▸ Delegates (plugins.enabled must include delegates) or pick another coder "
@@ -765,10 +790,11 @@ def setup_status(
     else:
         coder_hint = ""
     coder = {
-        "ok": bool(names) and not missing and not ladder_gap,
+        "ok": bool(names) and not blocking and not ladder_gap,
         "name": coder_name,
         "names": names,
         "missing": missing,
+        "missing_rungs": _missing_rungs(cfg, set(missing) - set(blocking)),
         "hint": coder_hint,
     }
 
@@ -830,8 +856,55 @@ def setup_status(
     from . import release_freeze  # lazy: keep the preflight's import surface small
 
     status["release_freeze_hint"] = release_freeze.unavailable_hint()
+    status["coder_rungs_hint"] = coder_rungs_hint(coder["missing_rungs"])
+    from . import health  # lazy, like release_freeze
+
+    # #456 / #459: a preflight that can't finish in its timeout, and a project whose
+    # coder.solve() oracle is unwinnable. The running loop publishes both. Advisory only.
+    status["preflight_hint"] = health.advisory_hint()
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
+
+
+def _missing_rungs(cfg: dict, missing: set[str]) -> list[dict]:
+    """Each ``coders`` rung naming a delegate in ``missing`` (protoAgent#3692), as
+    ``{tier, project, names}``. ``project`` is "" for the instance map."""
+    if not missing:
+        return []
+    out: list[dict] = []
+
+    def _scan(raw, project: str) -> None:
+        for tier, names in _normalize_coders(raw).items():
+            gone = [n for n in names if n in missing]
+            if gone:
+                out.append({"tier": tier, "project": project, "names": gone})
+
+    _scan(cfg.get("coders"), "")
+    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    if explicit:
+        try:
+            projects = resolve_projects(cfg)
+        except Exception:  # noqa: BLE001 — the repo check owns a malformed map
+            projects = {}
+        for name, entry in projects.items():
+            _scan((entry or {}).get("coders"), name)
+    return out
+
+
+def coder_rungs_hint(missing_rungs: list[dict]) -> str:
+    """The advisory line for rungs naming deleted delegates (protoAgent#3692), or ""."""
+    if not missing_rungs:
+        return ""
+    parts = []
+    for r in missing_rungs:
+        where = f"rung {r['tier']!r}" + (f" (project {r['project']!r})" if r.get("project") else "")
+        parts.append(f"{where}: {', '.join(repr(n) for n in r['names'])}")
+    return (
+        "coders ladder names delegate(s) that are not declared as acp delegates — "
+        + "; ".join(parts)
+        + ". Those are skipped: cards run on the rung's other delegates, the base coder, or the nearest "
+        "live rung, and the board keeps running. Declare them under Settings ▸ Delegates or remove them from `coders`."
+    )
 
 
 # Which restart-only knobs feed which check — for the per-check restart note.
@@ -1003,6 +1076,10 @@ class GapReporter:
                 msg = str((status or {}).get("review_status_hint") or "") or None
             elif key == RELEASE_FREEZE_KEY:
                 msg = str((status or {}).get("release_freeze_hint") or "") or None
+            elif key == CODER_RUNGS_KEY:
+                msg = str((status or {}).get("coder_rungs_hint") or "") or None
+            elif key == PREFLIGHT_KEY:
+                msg = str((status or {}).get("preflight_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")

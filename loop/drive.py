@@ -322,9 +322,18 @@ class DriveMixin:
                         self._last_preflight,
                         self._preflight_dirty,
                         self._preflight_failed_at,
+                        # #456/#459: the per-commit cache, the slow flag and the gate timing
+                        # describe the OLD command, and so does an oracle verdict built on it.
+                        self._preflight_sha,
+                        self._preflight_slow,
+                        self._gate_seconds,
+                        self._gate_measured_at,
+                        self._oracle_unwinnable,
+                        self._oracle_tripped,
                     ):
                         for stale_name in stale:
                             verdicts.pop(stale_name, None)
+                    self._preflight_slow_warned.difference_update(stale)
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)
@@ -383,6 +392,13 @@ class DriveMixin:
         # Cancel any in-flight drives and await them out. A drive cancelled mid-flight
         # can't run its own cleanup, so its worktree stays in self._inflight — reaped
         # below. (A completed/blocked drive already popped itself.)
+        # A preflight still in flight (#456) runs a gate in the operator's base checkout;
+        # cancelling it kills that process tree (`communicate_or_kill`).
+        preflights = [t for t in self._preflight_tasks.values() if not t.done()]
+        for t in preflights:
+            t.cancel()
+        if preflights:
+            await asyncio.gather(*preflights, return_exceptions=True)
         drives, self._drives = list(self._drives), set()
         for t in drives:
             t.cancel()
@@ -1588,6 +1604,11 @@ class DriveMixin:
                 siblings = coders.get(tier) if self.escalation_on else None
                 if not siblings:
                     siblings = [self.coder_name]
+                # A rung naming a delegate that no longer exists degrades instead of
+                # blocking (protoAgent#3692): its live siblings, else the base coder, else
+                # the nearest live rung. Only when nothing resolves does the block below
+                # name the missing delegate.
+                siblings = self._live_rung(tier, siblings, coders)
                 preferred = prefer_live_sibling(siblings, sib, spent_here)
                 if preferred != sib:
                     log.info(
@@ -1725,6 +1746,7 @@ class DriveMixin:
                             fid=fid,
                             dispatch_timeout=self.coder_timeout or None,
                             test_cmd=solve["test_cmd"],
+                            test_paths=solve["test_paths"],
                             test_timeout=solve["test_timeout"],
                             budget=solve["budget"],
                             k=solve["k"],
@@ -2105,6 +2127,30 @@ class DriveMixin:
                             pr_url=pr_url,
                         ):
                             self._inflight.pop(fid, None)
+                        return
+                    if isinstance(exc, coder_seam.OracleTimeout):
+                        # #459: the acceptance ORACLE can't finish, whatever the candidates
+                        # do. So no tier climb (a stronger model times out the same way), and
+                        # no `transient` class: the sweep would unblock the card to spend its
+                        # whole budget again. It blocks at once, for a human, under its own
+                        # class. When the oracle was the gate FALLBACK, the project's later
+                        # cards skip solve() too, rather than each paying for the discovery.
+                        await self._record_oracle_timeout(feature, exc)
+                        reason = str(exc)
+                        log.warning("[project_board] %s blocked (%s): %s", fid, ORACLE_TIMEOUT_CLASS, reason)
+                        if not await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            reason,
+                            category=ORACLE_TIMEOUT_CLASS,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                        ):
+                            return
+                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
+                        self._inflight.pop(fid, None)
                         return
                     policy = classify(str(exc))
                     # A PROVIDER failure is only ever the dispatch's own. The same words in a
@@ -2851,7 +2897,134 @@ class DriveMixin:
             return False
         if self.max_mode_n > 1:
             return False
-        return coder_seam.should_use_solve(feature, test_cmd=self._coder_solve_test_cmd_for(feature))
+        oracle = self._coder_solve_oracle_for(feature)
+        # A paths map is an oracle by itself, even with no default command (#459).
+        test_cmd = oracle["cmd"] or ("coder_solve_test_paths" if oracle["paths"] else "")
+        if not coder_seam.should_use_solve(feature, test_cmd=test_cmd):
+            return False
+        why = self._unwinnable_oracle(feature, oracle)
+        name = self._project_name(feature)
+        if why:
+            if name not in self._oracle_unwinnable:
+                self._oracle_unwinnable[name] = why
+                log.warning(
+                    "[project_board] project %s: coder.solve() is OFF — %s. Its cards take the plain coder "
+                    "path, and the pre-PR gate still runs. It turns back on by itself when the gate measures "
+                    "under the budget or the budget is raised; or set coder_solve_test_cmd / "
+                    "coder_solve_test_paths.",
+                    name,
+                    why,
+                )
+                self._publish_preflight_health()
+            return False
+        if self._oracle_unwinnable.pop(name, None) is not None:
+            log.info("[project_board] project %s: coder.solve() is back ON — its oracle fits the budget again", name)
+            self._publish_preflight_health()
+        return True
+
+    def _live_rung(self, tier: str, siblings: list[str], coders: dict) -> list[str]:
+        """The delegates this rung can actually dispatch to (protoAgent#3692).
+
+        A ``coders`` rung can name a delegate the operator has since deleted. That used to
+        pause the whole loop through the setup check, and a card that reached the rung
+        blocked with "not configured", even while other rungs were fine. Now a missing
+        delegate is skipped, and the operator is told once per rung and name (the setup
+        check flags it too). If the rung has no live delegate left, the card goes to the
+        nearest live rung: stronger rungs first, then the nearest weaker one, and the base
+        ``coder`` last. A card that climbed to a rung must not drop to the weakest model
+        just because its rung is gone (#467 review). With nothing live at all, the list
+        comes back unchanged, and the caller's block names the missing delegate as before."""
+        live = [n for n in siblings if self._resolve_delegate(n, "acp") is not None]
+        if len(live) == len(siblings):
+            return siblings
+        for name in siblings:
+            if name not in live and (tier, name) not in self._missing_rung_warned:
+                self._missing_rung_warned.add((tier, name))
+                log.warning(
+                    "[project_board] coders rung %r names delegate %r, which is not a configured acp delegate "
+                    "— skipping it (the rest of the ladder keeps running). Remove it from `coders` or declare it.",
+                    tier or "default",
+                    name,
+                )
+        if live:
+            return live
+        ladder = list(store_mod.TIER_LADDER)
+        at = ladder.index(tier) if tier in ladder else -1
+        order = ladder[at + 1 :] + list(reversed(ladder[: max(at, 0)])) if at >= 0 else ladder
+        for name in [n for t in order for n in (coders.get(t) or [])] + [self.coder_name]:
+            if name and name not in siblings and self._resolve_delegate(name, "acp") is not None:
+                if (tier, "→" + name) not in self._missing_rung_warned:
+                    self._missing_rung_warned.add((tier, "→" + name))
+                    log.warning(
+                        "[project_board] coders rung %r has no configured delegate left — dispatching %r instead",
+                        tier or "default",
+                        name,
+                    )
+                return [name]
+        return siblings
+
+    def _unwinnable_oracle(self, feature: dict, oracle: dict) -> str:
+        """Why this feature's solve() oracle can't pass whatever the code does (#459), or "".
+
+        This applies only to the gate FALLBACK (no ``coder_solve_test_cmd``, no paths map).
+        An oracle the operator chose explicitly is theirs to size, and the timeout breaker
+        still covers it. It is worked out again on every call, from the latest evidence and
+        the CURRENT ``coder_solve_test_timeout_s`` (#467 review), so one cold preflight or a
+        since-raised budget can't switch solve() off for the life of the process. The
+        evidence is either:
+
+        * the gate's duration from the last preflight that ran it (a timeout there is a
+          lower bound), which must reach the budget; or
+        * a card whose candidates tripped the timeout breaker on this fallback. That lifts
+          once the budget is raised past the one it tripped under, or once a later preflight
+          measures the gate under budget."""
+        if oracle.get("source") != "gate" or oracle.get("paths"):
+            return ""
+        name = self._project_name(feature)
+        budget = self._coder_solve_settings(feature)["test_timeout"]
+        measured = self._gate_seconds.get(name)
+        at = self._gate_measured_at.get(name, 0.0)
+        tripped = self._oracle_tripped.get(name)
+        if tripped is not None:
+            tripped_budget, tripped_at = tripped
+            fresh_fit = measured is not None and at > tripped_at and not measured[1] and measured[0] < budget
+            if budget > tripped_budget or fresh_fit:
+                self._oracle_tripped.pop(name, None)
+            else:
+                return (
+                    f"its oracle falls back to the gate (`{oracle['cmd']}`), which ran out the "
+                    f"{tripped_budget:.0f}s coder_solve_test_timeout_s on candidates in consecutive rounds"
+                )
+        if not measured:
+            return ""
+        seconds, lower_bound = measured
+        if seconds < budget:
+            return ""
+        took = f"at least {seconds:.0f}s (the preflight timed out)" if lower_bound else f"{seconds:.0f}s"
+        return (
+            f"its oracle falls back to the gate (`{oracle['cmd']}`), which took {took} on the last "
+            f"preflight, over coder_solve_test_timeout_s={budget:.0f}s, so no candidate could pass it"
+        )
+
+    async def _record_oracle_timeout(self, feature: dict, exc) -> None:
+        """Remember an oracle that tripped the timeout breaker (#459) when it was the gate
+        FALLBACK, so the project's next cards skip solve() instead of each paying for two
+        rounds of timeouts to learn the same thing. The flag lifts on its own (see
+        ``_unwinnable_oracle``). An explicit command or a paths map is left alone. That
+        card is blocked, and the next one may touch paths that pick a faster command."""
+        oracle = self._coder_solve_oracle_for(feature)
+        if oracle.get("source") != "gate" or oracle.get("paths"):
+            return
+        name = self._project_name(feature)
+        budget = float(getattr(exc, "timeout", 0.0) or self._coder_solve_settings(feature)["test_timeout"])
+        self._oracle_tripped[name] = (budget, time.monotonic())
+        self._oracle_unwinnable[name] = self._unwinnable_oracle(feature, oracle)
+        log.warning(
+            "[project_board] project %s: coder.solve() is OFF for its later cards — %s",
+            name,
+            self._oracle_unwinnable[name],
+        )
+        self._publish_preflight_health()
 
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the

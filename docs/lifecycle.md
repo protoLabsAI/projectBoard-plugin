@@ -261,6 +261,47 @@ carries the host's trade-off: a member stopped by a signal to its process group 
 takes a running gate with it. The drive's cancel path kills the tree if shutdown reaches it.
 On Windows `killpg` does not exist, so a timeout there still kills only the shell.
 
+## A check that can't finish in its budget
+
+Two of the board's checks have a timeout, and neither may turn "too slow" into a verdict
+about the code.
+
+**The gate preflight (#456).** Before any card in a project dispatches, the preflight
+smokes the project's check (`preflight_cmd`, else `local_gate_cmd`) on its base checkout.
+A run cut off by `preflight_timeout_s` is indeterminate, so dispatch is allowed. On
+protoAgent's board that happened on every dispatch: a 12-minute gate against a 600 s
+timeout, run twice at once in the same checkout. Every dispatch waited ten minutes for a
+non-answer. Now:
+
+- One preflight per project runs at a time. A second caller (the tick and a
+  `board_dispatch` together) waits for the run in flight.
+- A pass, or a timeout, is kept for the checkout's commit: the local `HEAD` the gate
+  runs in, not `origin/<base>`. The check runs again only when the checkout moves, and
+  then in the background while dispatch goes on. A timeout never releases a project
+  already held for a red gate.
+- A timed-out project is logged once, and shown as `preflight.slow` on `/status` and in the
+  setup advisories. The fix is a cheap `preflight_cmd`.
+
+**The coder.solve() oracle (#459).** Each candidate passes only if its acceptance command
+exits 0 inside `coder_solve_test_timeout_s`. With no `coder_solve_test_cmd` the command
+falls back to the gate, and a gate slower than that budget fails every candidate. bd-7aun
+spent 15 generations on "acceptance tests timed out after 300s". It was then blocked as
+`transient`, auto-unblocked, and spent them again. Now:
+
+- **The oracle guard.** If the preflight measured the gate as slower than the solve
+  timeout, and the oracle is the gate fallback, the project's cards skip solve() and take
+  the plain coder path. The guard is re-evaluated on every card, so a faster measurement or a raised
+  budget turns solve() back on. The pre-PR gate still runs. `/status` shows the project under
+  `preflight.unwinnable_oracle`.
+- **The timeout breaker.** When the same command times out in two separate rounds of
+  candidates, the ladder stops. Concurrent best-of-k timeouts count as one round, since
+  they may only be competing for the machine. The card blocks as `oracle-timeout` with no tier climb. That class is not
+  self-healing, so the sweep tells the operator and leaves the card alone. The #146 breaker
+  keys on an identical assertion, and a timeout has none, so it never tripped here.
+- **Path-scoped oracles.** `coder_solve_test_paths` picks each candidate's commands from
+  the files it changed. An `apps/web` card is then judged by vitest and the typecheck, not
+  by a Python suite that never looks at it.
+
 ## A card moved under its build (#398)
 
 A drive owns its card only while the card is `in_progress`. Someone else can move it on
@@ -467,6 +508,8 @@ happens next. Every sweep, the loop walks the blocked lane:
 - **Self-healing classes** — `rate-limit`, `transient`, `merge-conflict` — are cleared and
   requeued automatically, up to **2 auto-retries** per card. These are conditions that
   routinely pass on their own.
+  `oracle-timeout` (#459) is deliberately not one of them. The acceptance command can't
+  finish in its budget, and waiting doesn't make it faster.
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
