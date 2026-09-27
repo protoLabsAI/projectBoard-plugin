@@ -117,6 +117,8 @@ hand, and gates only govern whether the loop may *start* the work.
   So a scoped package's 404 without a token says `(not published yet — or private: set
   project_board.npm_token)`.
 - `release:`, `pr:` and `contains:` go through `gh api`, with the board's own `gh` login.
+  For a private producer repo (protoContent is private), that login must be able to read
+  it. A repo it can't read shows as `(check failed: … 404)` on the card.
 
 ### Where the specs live
 

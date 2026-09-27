@@ -257,22 +257,27 @@ async def test_remote_branches_matches_release_branches_on_a_real_origin(real_se
         await worktree.remote_branches(str(tmp_path / "not-a-repo"), ["x"])
 
 
-# ── contains: proven against real npm + GitHub (protoContent, the #457 review's case) ──
-
-DS_REPO = "protoLabsAI/protoContent"
+# ── contains: proven against real npm + GitHub ─────────────────────────────────────
+# A PUBLIC changesets monorepo (CI's token can read it; protoContent is private): it tags
+# every published version `<package>@<version>` exactly as protoContent does, and has both
+# lightweight and annotated tags.
+CS_REPO = "changesets/changesets"
+CS_PKG = "@changesets/cli"
+CS_OLD = "3.0.0"  # a lightweight tag on main, an ancestor of every later 3.x release
 
 
 @requires_gh
 def test_tag_commit_and_contains_on_real_github(real_seams):
-    """The two reads the `contains:` gate stands on: an ANNOTATED changesets tag
-    dereferences to its commit, and compare reports descent in the right direction."""
-    new = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.62.0")
-    old = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.61.0")
-    assert len(new) == 40 and len(old) == 40 and new != old
-    assert gates._tag_commit(DS_REPO, "@protolabsai/ui@999.0.0") == ""
-    assert gates._contains(DS_REPO, old, new) is True  # 0.62.0 carries 0.61.0's commit
-    assert gates._contains(DS_REPO, new, old) is False  # …not the other way round
-    assert gates._contains(DS_REPO, new, new) is True  # identical
+    """The two reads the `contains:` gate stands on: a changesets tag (lightweight or
+    annotated) resolves to its commit, and compare reports descent in the right direction."""
+    old = gates._tag_commit(CS_REPO, f"{CS_PKG}@{CS_OLD}")
+    annotated = gates._tag_commit(CS_REPO, f"{CS_PKG}@2.29.7")
+    newer = gates._tag_commit(CS_REPO, f"{CS_PKG}@3.0.3")
+    assert len(old) == 40 and len(annotated) == 40 and len(newer) == 40 and old != newer
+    assert gates._tag_commit(CS_REPO, f"{CS_PKG}@999.0.0") == ""
+    assert gates._contains(CS_REPO, old, newer) is True  # 3.0.3 carries 3.0.0's commit
+    assert gates._contains(CS_REPO, newer, old) is False  # …not the other way round
+    assert gates._contains(CS_REPO, newer, newer) is True  # identical
 
 
 @requires_gh
@@ -288,37 +293,37 @@ def test_anchor_sha_resolves_a_card_to_its_merge_commit(real_seams):
 
 @requires_gh
 @requires_npm
-def test_contains_end_to_end_on_the_live_design_system(real_seams):
-    """`npm:@protolabsai/ui@contains:protoLabsAI/protoContent@<sha>` against the real
-    registry + repo: an anchor the latest publish carries is met; the latest publish's own
-    tag commit is met (identical); an anchor that is NEWER than the latest publish is not."""
-    status, doc = gates._packument(gates.parse_spec("npm:@protolabsai/ui"), "")
+def test_contains_end_to_end_on_a_live_changesets_package(real_seams):
+    """`npm:@changesets/cli@contains:changesets/changesets@<sha>` against the real
+    registry + repo: an anchor the latest publish carries is met, the latest publish's own
+    tag commit is met (identical), and an anchor NEWER than the latest publish is not."""
+    status, doc = gates._packument(gates.parse_spec(f"npm:{CS_PKG}"), "")
     latest = doc["dist-tags"]["latest"]
-    tagged = gates._tag_commit(DS_REPO, f"@protolabsai/ui@{latest}")
-    older = gates._tag_commit(DS_REPO, "@protolabsai/ui@0.61.0")
+    tagged = gates._tag_commit(CS_REPO, f"{CS_PKG}@{latest}")
+    older = gates._tag_commit(CS_REPO, f"{CS_PKG}@{CS_OLD}")
     for anchor in (older, tagged):
-        out = gates.eval_npm(gates.parse_spec(f"npm:@protolabsai/ui@contains:{DS_REPO}@{anchor}"))
+        out = gates.eval_npm(gates.parse_spec(f"npm:{CS_PKG}@contains:{CS_REPO}@{anchor}"))
         assert out["met"] is True, out
-    rc, head, _err = gates._gh_json(f"repos/{DS_REPO}/commits/main")
+    rc, head, _err = gates._gh_json(f"repos/{CS_REPO}/commits/main")
     head_sha = head["sha"]
-    if head_sha != tagged and not gates._contains(DS_REPO, head_sha, tagged):
-        out = gates.eval_npm(gates.parse_spec(f"npm:@protolabsai/ui@contains:{DS_REPO}@{head_sha}"))
+    if head_sha != tagged and not gates._contains(CS_REPO, head_sha, tagged):
+        out = gates.eval_npm(gates.parse_spec(f"npm:{CS_PKG}@contains:{CS_REPO}@{head_sha}"))
         assert out["met"] is False and f"latest {latest}" in out["detail"]
 
 
 @requires_gh
-def test_release_ranges_on_the_live_changesets_monorepo(real_seams):
-    """The review's live reproduction of B1: `release:protoLabsAI/protoContent@>=0.9.3`,
-    meant for design (latest 0.9.2), was MET by `@protolabsai/ui@0.62.0`."""
-    bare = gates.parse_spec(f"release:{DS_REPO}@>=0.9.3")
+def test_release_ranges_on_a_live_changesets_monorepo(real_seams):
+    """B1 against real data: a monorepo that tags per package makes a bare range ambiguous
+    (any package's version would meet it), so it is never met and refused at write; the
+    package-qualified range counts only that package's tags."""
+    bare = gates.parse_spec(f"release:{CS_REPO}@>=3.0.0")
     versions, scoped = gates._release_versions(bare)
-    assert scoped, "protoContent tags releases per package"
+    assert scoped, "changesets tags releases per package"
     out = gates.eval_release(bare)
     assert out["met"] is False and "@<package>@" in out["detail"]
     assert gates.remote_refusal(bare)
-    design = gates.parse_spec(f"release:{DS_REPO}@@protolabsai/design@>=0.9.2")
-    assert gates.eval_release(design)["met"] is True
-    assert gates.eval_release(gates.parse_spec(f"release:{DS_REPO}@@protolabsai/design@>=99.0.0"))["met"] is False
+    assert gates.eval_release(gates.parse_spec(f"release:{CS_REPO}@{CS_PKG}@>=3.0.0"))["met"] is True
+    assert gates.eval_release(gates.parse_spec(f"release:{CS_REPO}@{CS_PKG}@>=999.0.0"))["met"] is False
 
 
 @requires_gh
