@@ -270,6 +270,14 @@ one removal:
 | the by-id reap: merge, closed PR, cancel, done, health sweep | saves it, logs the branch, and reaps it |
 | `create_worktree` / `promote_worktree`, for any other caller | saves it, logs the branch, then clears it |
 
+**Which trees the health sweep calls orphaned.** Only a tree whose card is done or cancelled,
+or whose card the store has never heard of, and never one a live drive holds. The card is read
+from the tree's directory name, `feat-<id>[-<slug>]`, for any bead prefix (`bd-`, `ds-`, …).
+The sweep keeps a tree named with a slug when the store has no card for the id it parsed,
+because that proves only that the name could not be split (a prefix that itself holds a
+`-`), not that the card is gone. It logs that once. Until #461 the parser knew only `bd-`,
+and every sweep on the `ds-` board reaped each slugged tree, live drives included.
+
 **What counts as work:**
 
 - **Every uncommitted change git can see:** modified, staged, deleted and untracked.
