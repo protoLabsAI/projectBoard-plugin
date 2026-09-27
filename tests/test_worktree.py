@@ -264,12 +264,12 @@ async def test_stage_all_excludes_coder_scratch(monkeypatch):
     monkeypatch.setattr(worktree, "_git", git)
     await worktree.stage_all("/wt")
     (add,) = git.ran("add")
-    # `add -A` over a positive `.` with an exclude pathspec per scratch path — so the
+    # `add -A` over a positive `.` that never NAMES the scratch (#465: naming an ignored
+    # path makes `add` exit 1), then the scratch is reset to HEAD in the index — so the
     # coder's `.proto/` session notes + `.cursor` cache never get staged into the commit.
-    assert add[:4] == ("add", "-A", "--", ".")
-    excludes = set(add[4:])
-    assert excludes == {f":(exclude){p}" for p in worktree.CODER_SCRATCH}
-    assert ":(exclude).proto" in excludes
+    assert add == ("add", "-A", "--", ".")
+    (reset,) = git.ran("reset")
+    assert reset == ("reset", "-q", "HEAD", "--", *worktree.CODER_SCRATCH)
 
 
 async def test_commit_worktree_stages_without_the_scratch(monkeypatch):
@@ -277,8 +277,9 @@ async def test_commit_worktree_stages_without_the_scratch(monkeypatch):
     git = FakeGit({"status": (0, " M f.py\n?? .proto/", "")})
     _install(monkeypatch, git, FakeGh())
     await worktree.commit_worktree("/wt", "msg")
-    (add,) = git.ran("add")
-    assert ":(exclude).proto" in add and git.ran("commit")
+    assert git.ran("add") and git.ran("commit")
+    (reset,) = git.ran("reset")
+    assert ".proto" in reset
 
 
 # ── #227: human-readable branch names — feat/<fid>-<slug> ────────────────────────

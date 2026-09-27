@@ -288,6 +288,92 @@ async def test_a_repo_that_ignores_the_coder_scratch_can_still_save(origin):
     assert ".proto/session.json" not in held.splitlines()
 
 
+def _track_scratch_then_ignore_it(origin: _Origin, wt: str) -> None:
+    """The #465 shape: the repo TRACKS a file under `.proto` (protoAgent versions
+    `.proto/evolve/`) while `.proto/` is ignored as a whole by another source (a global or
+    `info/exclude` entry). `check-ignore .proto` then answers "not ignored", because of the
+    tracked file, yet `git add` refuses any pathspec naming `.proto`: "The following paths
+    are ignored … .proto", exit 1."""
+    Path(wt, ".proto", "evolve").mkdir(parents=True)
+    Path(wt, ".proto", "evolve", "SKILL.md").write_text("versioned skill\n")
+    _git("-C", wt, "add", "-A")
+    _git("-C", wt, "commit", "-qm", "track a versioned skill under .proto")
+    exclude = Path(
+        _git("-C", origin.clone, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info", "exclude"
+    )
+    exclude.parent.mkdir(exist_ok=True)
+    exclude.write_text(exclude.read_text() + "\n.proto/\n" if exclude.exists() else ".proto/\n")
+    # the coder's session scratch, and an edit to the tracked file under it
+    Path(wt, ".proto", "memory").mkdir()
+    Path(wt, ".proto", "memory", "notes.md").write_text("session memory\n")
+    Path(wt, ".proto", "evolve", "SKILL.md").write_text("edited mid-session\n")
+
+
+async def test_a_tracked_file_under_an_ignored_scratch_dir_does_not_fail_the_save(origin):
+    """#465 (bd-fgtf): #446 asked `check-ignore` whether `.proto` is ignored and excluded it
+    when the answer was no. With a tracked file under an ignored `.proto/` the answer is
+    no, `add` still refused the exclude, and every candidate tree of an interrupted solve
+    blocked its card as stranded-work. The save must land, carrying the work and none of
+    the scratch — neither the session memory nor the mid-session edit to the tracked file."""
+    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-fgtf.g2")
+    _track_scratch_then_ignore_it(origin, wt)
+    rel, text = _strand(wt, "untracked")
+    readme, readme_text = _strand(wt, "tracked")
+
+    saved = await worktree.preserve_worktree(origin.clone, wt, branch, summary="test")
+
+    assert _show(origin, saved.ref, rel) == text
+    assert _show(origin, saved.ref, readme) == readme_text
+    held = _git("-C", origin.clone, "ls-tree", "-r", "--name-only", saved.ref).splitlines()
+    assert ".proto/memory/notes.md" not in held
+    assert _show(origin, saved.ref, ".proto/evolve/SKILL.md") == "versioned skill\n"  # HEAD's, not the edit
+    # the tree itself is untouched: its index was never written, the scratch is still there
+    assert Path(wt, ".proto", "memory", "notes.md").exists()
+    assert _git("-C", wt, "diff", "--cached", "--name-only") == ""
+
+
+async def test_a_protoagent_style_partial_ignore_saves_and_commits(origin):
+    """protoAgent's own spelling: only `.proto/memory/`, `.proto/session-notes.md` and
+    `.proto/repo-map-cache.json` are ignored, the rest of `.proto` is not. Both staging
+    callers — the stranded save and the PR commit — must succeed and leave the scratch out."""
+    wt, branch = await worktree.create_worktree(origin.clone, origin.base, "bd-fgtf.g3")
+    Path(wt, ".gitignore").write_text(
+        "node_modules/\n.proto/memory/\n.proto/session-notes.md\n.proto/repo-map-cache.json\n"
+    )
+    Path(wt, ".proto", "memory").mkdir(parents=True)
+    Path(wt, ".proto", "memory", "m.md").write_text("m\n")
+    Path(wt, ".proto", "session-notes.md").write_text("n\n")
+    Path(wt, ".proto", "evolve").mkdir()
+    Path(wt, ".proto", "evolve", "draft.md").write_text("an unversioned draft\n")
+    Path(wt, ".cursor").mkdir()
+    Path(wt, ".cursor", "cache").write_text("c\n")
+    rel, text = _strand(wt, "untracked")
+
+    saved = await worktree.preserve_worktree(origin.clone, wt, branch, summary="test")
+    assert _show(origin, saved.ref, rel) == text
+    held = _git("-C", origin.clone, "ls-tree", "-r", "--name-only", saved.ref).splitlines()
+    assert not [p for p in held if p.startswith((".proto", ".cursor"))]
+
+    await worktree.commit_worktree(wt, "feat: the card")
+    committed = _git("-C", wt, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert rel in committed and ".gitignore" in committed
+    assert not [p for p in committed if p.startswith((".proto", ".cursor"))]
+
+
+async def test_the_pr_commit_survives_a_tracked_file_under_an_ignored_scratch_dir(origin):
+    """The same #465 shape through `commit_worktree`: the coder's work is committed, the
+    tracked scratch file keeps its committed version, the edit to it stays in the tree."""
+    wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-fgtf")
+    _track_scratch_then_ignore_it(origin, wt)
+    rel, text = _strand(wt, "untracked")
+
+    await worktree.commit_worktree(wt, "feat: the card")
+
+    assert _git("-C", wt, "show", f"HEAD:{rel}") + "\n" == text
+    assert _git("-C", wt, "show", "HEAD:.proto/evolve/SKILL.md") == "versioned skill"
+    assert Path(wt, ".proto", "evolve", "SKILL.md").read_text() == "edited mid-session\n"
+
+
 async def test_an_existing_branch_is_never_overwritten_and_the_save_still_lands(origin, monkeypatch):
     monkeypatch.setattr(worktree, "_stamp", lambda: "20260906T232550.000Z", raising=False)  # red-checkable
     taken = "stranded/feat-bd-7.g1/20260906T232550.000Z"
