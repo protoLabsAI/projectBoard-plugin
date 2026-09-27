@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **24 of 70 keys are in this state, including `coders` and `projects`** —
+never renders it. **26 of 72 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -93,6 +93,69 @@ tree. Without it, a tree borrows the repo checkout's installed `node_modules` th
 symlinks, which is cheap but hands every card whatever that checkout last installed. Set it
 per project (a `projects:` entry) or board-wide. Bounded by `setup_timeout_s`: a failed or
 hung install is killed, logged, and the work goes ahead without it.
+
+## Card authoring — the Ready gate
+
+What `board_mark_ready` checks before a card can be pulled, and what `board_create_feature`
+/ `board_update_feature` dry-run the moment a card is written (#455).
+
+| Key | Default | Applies |
+|---|---|---|
+| `max_files_by_difficulty` | `—` | reload **· YAML only** |
+| `breadth_exclude` | `DEFAULT_BREADTH_EXCLUDE` | reload **· YAML only** |
+| `hot_files` | `[]` | reload **· YAML only** |
+
+**`max_files_by_difficulty`** — the breadth cap: the most COUNTED `files_to_modify` a card
+of each difficulty may name (built-in `{small: 4, medium: 4, large: 6}`; `architectural`
+is uncapped and answers to the design gate instead). A wider card times out before it
+lands, so the gate asks for a split.
+
+**`breadth_exclude`** — globs for files nobody authors, which stay in the card (the coder
+brief still lists them; the PR must carry them) but do not count toward the cap. Without
+it a one-token change in a changesets monorepo — `src/tokens.js`, the committed
+`dist/tokens.css` and `dist/tokens.json`, and the mandatory `.changeset/*.md` — is four
+files and already at the medium cap. The default list:
+
+```
+.changeset/**   pnpm-lock.yaml   package-lock.json   yarn.lock   uv.lock   poetry.lock
+Cargo.lock   **/dist/**   *.generated.*   CHANGELOG.md   changelog.d/**
+```
+
+A glob with no `/` matches the file name at any depth, the way a `.gitignore` line does;
+`**` spans directories; a trailing `/` means everything under that directory; a `(new)`
+marker is ignored. A configured list REPLACES the default. Put the word `defaults` in it
+to keep the built-in globs and add your own:
+
+```yaml
+projects:
+  protoContent:
+    repo: ~/dev/protoContent
+    breadth_exclude: [defaults, "packages/*/src/generated/**"]
+```
+
+`[]` counts every file. Set it in a `projects:` entry, or at the top level as every
+project's fallback.
+
+**`hot_files`** — globs for files nearly every card in a repo touches (`package.json`, a
+barrel `index.ts`), which would otherwise need a `depends_on` edge on every new card. When
+`board_create_feature` creates a card naming a hot file, the board adds a `depends_on` edge
+onto the open card at the end of that file's chain (the one no other holder depends on;
+the latest created breaks a tie), notes it on the card, and reports it as `hot_file_chain`.
+Cards on one file then form a chain in creation order as they are written. Empty by default:
+nothing is chained you didn't ask for. A batch `POST /features/batch` plan states its own
+order and is not auto-chained. Per project, or top level as the fallback:
+
+```yaml
+projects:
+  protoContent:
+    repo: ~/dev/protoContent
+    hot_files: ["packages/*/package.json", "packages/ui/src/index.ts"]
+```
+
+The shared-file check itself needs no config. Two open cards of one project naming the same
+file must be ordered by a `depends_on` PATH, in either direction, through open cards: a
+chain `C → B → A` orders A and C as well (#458). The refusal names every unserialised pair
+and the fewest edges that fix them, a chain in creation order.
 
 ## Dispatch and escalation
 
@@ -188,7 +251,6 @@ blank.
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
 | `decompose_after_timeouts` | `2` | **restart** |
-| `max_files_by_difficulty` | `—` | reload **· YAML only** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |

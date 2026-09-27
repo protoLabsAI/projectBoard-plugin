@@ -27,6 +27,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/milestones` | — |
 | `GET` | `/features` | The board listing (`?state=`, `?project=`, `?include_archived=`). A task row carries a small delivery signal — `delivered` (the current round: in review or done), `deliverable_chars`, `delivered_by`, a ≤280-char `deliverable_preview`, and `last_deliverable_preview` for a task sent back from review — never the full deliverable (#399). |
 | `GET` | `/features/{fid}` | One card's full projection, including a task's whole `deliverable`, its `requirements` ledger, its `waits_for` publish gates with their last-checked `gates` verdicts, and `next_action` when something other than a coder moves it. |
+| `GET` | `/features/{fid}/ready-check` | What the Ready gate would say about this card now, changing nothing (#455) — the REST twin of `board_check_ready`. Returns `{id, state, ok, refusals, advisories, breadth, unserialised, suggested_edges}`: every failed check at once, each `{gate, message, fix}`; the breadth count after `breadth_exclude`; every pair of open cards sharing a file with no `depends_on` path between them, and the chain edges that would serialise them (#458). 404 for an unknown card. |
 | `POST` | `/features/{fid}/gates/check` | Re-check this card's publish gates (`waits_for`) against npm / GitHub now — the REST twin of `board_check_gates`. Returns `{id, waits_for, gates, clear}`; a failed check reads unmet with its `error` (fail closed). |
 | `GET` | `/features/{fid}/progress` | Live coder-monitoring snapshot (#84) for the board view's monitor drawer. |
 | `PATCH` | `/features/{fid}` | In-place spec edit — the REST complement of `board_update_feature`. Accepts `title`, `spec`, `acceptance_criteria`, `design`, `files_to_modify`, `difficulty`, `priority`, `source_issue`, `waits_for` (replaces the publish gates; `[]` clears); only non-null fields are… |
@@ -34,7 +35,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/features/batch` | Batch-create a whole decomposition (#92). Body: `{"plan": [{title, spec, acceptance_criteria, files, difficulty, depends_on, foundation, source_issue}, …], "mark_ready": false}`. All-or-report: a malf… |
 | `POST` | `/features/{fid}/dep` | Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done. (Foundation gating is just a blocks-edge on the foundation feature.) |
 | `DELETE` | `/features/{fid}/dep` | Remove a `blocks` edge — inverse of POST …/dep. Body: `{"depends_on": "<id>"}`. |
-| `POST` | `/features/{fid}/ready` | The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing. |
+| `POST` | `/features/{fid}/ready` | The Ready gate (invariant #1) — 400 naming EVERY failed check at once, each with its fix (#455): required fields, phantom paths, breadth, design, shared files. `GET …/ready-check` asks the same question without promoting. |
 | `POST` | `/features/{fid}/block` | Block a card by hand. Body: `{"reason": "…"}` (required). A hand-set block is a hold, never a failure: it is never cleared automatically, whatever the reason says (#406). Lift it with `POST …/unblock`. |
 | `POST` | `/features/{fid}/unblock` | — |
 | `POST` | `/features/{fid}/cancel` | Cancel a feature created in error — the second terminal edge (#47). Closes the bead with an audit reason and tags it `cancelled` (a distinct state, not `done`), so a bad decomposition/duplicate leaves… |

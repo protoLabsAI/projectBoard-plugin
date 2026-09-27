@@ -319,16 +319,50 @@ def _split_list(raw: str) -> list[str]:
     return [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
 
 
-def _feature_reply(f: dict) -> str:
+def _feature_reply(f: dict, ready_check: dict | None = None) -> str:
     """Serialize a store feature for a tool return — carrying the success-with-warning
     trio through the boundary when set (QA panel on #88: stripping it hides the repair
-    contract from the agent)."""
+    contract from the agent), the hot-file edges the create added (#458), and the Ready
+    gate's dry run (#455) when the caller ran one."""
     out = {"id": f["id"], "state": f["board_state"], "title": f["title"]}
     if f.get("enrichment_failed"):
         out["enrichment_failed"] = True
         out["missing_fields"] = f.get("missing_fields", [])
         out["warning"] = f.get("warning", "")
+    if f.get("hot_file_chain"):
+        out["hot_file_chain"] = f["hot_file_chain"]
+    if ready_check is not None:
+        out["ready_check"] = ready_check
     return json.dumps(out)
+
+
+def _ready_dry_run(store, fid: str) -> dict:
+    """The Ready gate's dry run for a card just created or updated (#455): every check
+    ``board_mark_ready`` would refuse on, ALL of them, each with its fix — so the author
+    fixes them in one pass now instead of meeting them one at a time at mark_ready. The
+    card is written either way. Compact: ``ok``, then only what needs acting on. Never
+    raises — a read failure says so instead of failing the create that already landed."""
+    try:
+        res = store.ready_check(fid)
+    except Exception as exc:  # noqa: BLE001 — the card exists; the dry run is advice
+        return {"ok": None, "error": f"could not dry-run the Ready gate: {exc}"}
+    out: dict = {"ok": res["ok"]}
+    if res["refusals"]:
+        out["will_be_refused_at_ready"] = [f"{r['message']} Fix: {r['fix']}" for r in res["refusals"]]
+        out["summary"] = (
+            f"will be refused at ready: {', '.join(r['gate'] for r in res['refusals'])} — the card was "
+            "saved; fix each item (board_update_feature) before board_mark_ready."
+        )
+    if res.get("advisories"):
+        out["advisories"] = [f"{a['message']} Fix: {a['fix']}" for a in res["advisories"]]
+    if res.get("suggested_edges"):
+        out["suggested_edges"] = res["suggested_edges"]
+    breadth = res.get("breadth") or {}
+    if breadth.get("excluded"):
+        out["breadth"] = breadth
+    if res.get("note"):
+        out["note"] = res["note"]
+    return out
 
 
 def _card_resolver(store):
@@ -527,6 +561,23 @@ def _board_tools(cfg: dict):
         with `next_action` `waiting on publish: …`; a bad spec refuses the create. Use
         `depends_on` for a card on THIS board.
 
+        `files_to_modify` — every path must exist in the project's repo, EXCEPT a file this
+        card will CREATE, which carries the `(new)` marker after its path:
+        `src/tokens.js, dist/tokens.css, .changeset/add-accent.md (new)`. A changeset is
+        always new, so in a changesets repo nearly every card carries one `(new)` entry.
+        Generated and boilerplate files (the project's `breadth_exclude` globs; by default
+        `.changeset/**`, lockfiles, `**/dist/**`, `*.generated.*`, `CHANGELOG.md`,
+        `changelog.d/**`) still belong in the list — the coder needs them — but do not
+        count toward the breadth cap (small/medium 4, large 6). Two open cards naming the
+        same file must be ordered by a `depends_on` PATH (a chain counts: C → B → A orders
+        A and C too); a project's `hot_files` are chained for you at create.
+
+        The reply carries `ready_check` — a DRY RUN of every Ready-gate check that can be
+        judged now (required fields, paths exist or are `(new)`, breadth, design, shared
+        files, dependency sanity): `ok`, and when not ok `will_be_refused_at_ready` with
+        EVERY failure and its fix, plus `suggested_edges` for unserialised shared files.
+        The card is created either way; fix what it lists before `board_mark_ready`.
+
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
         twice for the same task (e.g. reconsidering mid-turn) stacks a duplicate the
@@ -586,7 +637,7 @@ def _board_tools(cfg: dict):
                 project=project,
                 waits_for=waits_for,
             )
-            return _feature_reply(f)
+            return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -652,7 +703,7 @@ def _board_tools(cfg: dict):
                 assignee=assignee,
                 waits_for=waits_for,
             )
-            return _feature_reply(f)
+            return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -691,7 +742,16 @@ def _board_tools(cfg: dict):
         leaves the current priority untouched. `waits_for` REPLACES the card's publish
         gates (comma-separated npm:/release:/pr: specs, see board_create_feature); `none`
         clears them; empty leaves them as-is. Inputs are stripped of any literal
-        wrapping double quotes before storage (same hygiene as board_create_feature)."""
+        wrapping double quotes before storage (same hygiene as board_create_feature).
+
+        `files_to_modify` REPLACES the whole list. Mark a file the card will CREATE with
+        `(new)` after its path (`.changeset/add-accent.md (new)`) — without it the Ready
+        gate refuses the path as nonexistent. Files matching the project's
+        `breadth_exclude` globs (changesets, lockfiles, build output by default) are kept
+        for the coder but not counted toward the breadth cap.
+
+        The reply carries `ready_check`, the same DRY RUN board_create_feature returns:
+        every check `board_mark_ready` would refuse on, all at once, each with its fix."""
         try:
             store = get_store(**store_kw)
             title = _strip_wrapping_quotes(title)
@@ -728,7 +788,7 @@ def _board_tools(cfg: dict):
                     return refused
                 update_kw["waits_for"] = [] if clear else waits_for
             f = store.update_feature(feature_id, **update_kw)
-            return _feature_reply(f)
+            return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -856,11 +916,32 @@ def _board_tools(cfg: dict):
 
     @tool
     def board_mark_ready(feature_id: str) -> str:
-        """Promote a feature backlog → ready. Fails if it lacks a spec +
-        acceptance_criteria (the Ready gate). Only `ready` features are pulled."""
+        """Promote a feature backlog → ready. The Ready gate refuses it, naming EVERY
+        failed check at once with its fix: a missing spec / acceptance_criteria /
+        files_to_modify, a path that does not exist and is not marked `(new)`, more counted
+        files than the breadth cap, a large card with no ADR-citing design, or a file
+        another open card names with no depends_on path between them. Only `ready`
+        features are pulled. board_check_ready asks the same question without promoting."""
         try:
             f = get_store(**store_kw).mark_ready(feature_id)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_check_ready(feature_id: str) -> str:
+        """Report what board_mark_ready would say about a card NOW, changing nothing (#455).
+        Returns `{id, state, ok, refusals, advisories, breadth, unserialised,
+        suggested_edges}`: `refusals` is every failed Ready check, each `{gate, message,
+        fix}` (gates: required-fields, phantom-paths, breadth, design, shared-file);
+        `advisories` refuse nothing (a depends_on edge onto a cancelled card); `breadth`
+        is the counted total, the cap, and the files `breadth_exclude` left out;
+        `unserialised` is every pair of open cards sharing a file with no depends_on path
+        between them, and `suggested_edges` the chain edges (earliest-created first) that
+        would serialise them all. Use it after a batch of edits, or before marking a
+        whole set ready."""
+        try:
+            return json.dumps(get_store(**store_kw).ready_check(feature_id))
         except BoardError as exc:
             return f"Error: {exc}"
 
@@ -1456,6 +1537,7 @@ def _board_tools(cfg: dict):
         board_get_feature,
         board_comments,
         board_mark_ready,
+        board_check_ready,
         board_mark_designing,
         board_cancel_feature,
         board_mark_done,

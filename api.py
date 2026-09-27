@@ -627,6 +627,15 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # (labels + config + in-process caches — no network).
         return annotate_next_action([f], cfg or {})[0]
 
+    @router.get("/features/{fid}/ready-check")
+    async def _ready_check(fid: str):
+        """What the Ready gate would say about this card now, changing nothing (#455) — the
+        REST twin of ``board_check_ready``: ``{id, state, ok, refusals, advisories, breadth,
+        unserialised, suggested_edges}``, every refusal with its ``fix``."""
+        if await _guard(lambda: store().get_feature(fid)) is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        return await _guard(lambda: store().ready_check(fid))
+
     @router.post("/features/{fid}/gates/check")
     async def _check_gates(fid: str):
         """Re-check this card's publish gates (``waits_for``) against npm / GitHub NOW —
@@ -764,7 +773,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     # ── transitions ───────────────────────────────────────────────────────────
     @router.post("/features/{fid}/ready")
     async def _ready(fid: str):
-        """The Ready gate (invariant #1) — 400 if spec/acceptance_criteria missing."""
+        """The Ready gate (invariant #1) — 400 naming EVERY failed check at once (#455)."""
         return await _guard(lambda: store().mark_ready(fid))
 
     @router.post("/features/{fid}/block")

@@ -51,7 +51,12 @@ board to a PR — or fork it as a starting point.
   `stranded-work` ([`docs/lifecycle.md`](docs/lifecycle.md), #405).
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
-  requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
+  requires a spec, EARS acceptance criteria, and explicit `files_to_modify` (a file the
+  card creates marked `(new)`), within a breadth cap that ignores generated files and
+  changesets (`breadth_exclude`), with cards sharing a file ordered by a `depends_on`
+  path. It names every failure at once, and `board_create_feature` /
+  `board_update_feature` dry-run it when the card is written (`ready_check`,
+  `board_check_ready`) — [`docs/lifecycle.md`](docs/lifecycle.md).
 - **Publish gates + release freeze (cross-repo chains)** — a card can also wait on
   something OUTSIDE the board. `waits_for: npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`
   holds only once a published version is PROVEN (via its changesets git tag + GitHub

@@ -436,6 +436,112 @@ ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # thing. Configurable via the `max_files_by_difficulty` config key (threaded to BeadsBoard
 # through store_kw, beside repo/base_branch); a None override keeps this default.
 MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4, "large": 6}
+# Files nobody AUTHORS don't count toward the breadth cap (#455). A one-token change in a
+# changesets monorepo touches tokens.js + dist/tokens.css + dist/tokens.json (built and
+# committed) + a mandatory `.changeset/*.md` — four files, already at the medium cap, for
+# one authored edit. The excluded files still reach the coder brief (they are real work the
+# PR must carry); they just aren't a measure of how wide the card is. Per project via the
+# `breadth_exclude` config key (top-level = every project's fallback). A glob with no `/`
+# matches the file name at any depth (gitignore-style); `**` spans directories. The token
+# `defaults` inside a configured list expands to this tuple, so a project can ADD globs
+# without restating these; a configured list without it REPLACES them (`[]` = count all).
+DEFAULT_BREADTH_EXCLUDE = (
+    ".changeset/**",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "uv.lock",
+    "poetry.lock",
+    "Cargo.lock",
+    "**/dist/**",
+    "*.generated.*",
+    "CHANGELOG.md",
+    "changelog.d/**",
+)
+_GLOB_DEFAULTS_TOKENS = ("defaults", "default")
+# The `(new)` marker a files_to_modify entry carries for a file the card CREATES (#110).
+# Stripped before any glob match or cross-card comparison, so `package.json` and
+# `package.json (new)` are the same file to the shared-file gate.
+_NEW_MARKER_RE = re.compile(r"\s*\(new\)\s*", re.IGNORECASE)
+
+
+def strip_new_marker(path) -> str:
+    """``path`` without its ``(new)`` marker (#110), trimmed — the file itself."""
+    return _NEW_MARKER_RE.sub(" ", str(path or "")).strip()
+
+
+@functools.lru_cache(maxsize=512)
+def _glob_regex(pattern: str) -> re.Pattern:
+    """Compile a path glob: ``**`` spans any number of directories (including none), ``*``
+    and ``?`` stay inside one path segment. A pattern with no ``/`` matches the file name
+    at any depth, the way a `.gitignore` line does."""
+    pat = pattern.strip()
+    while pat.startswith("./"):
+        pat = pat[2:]
+    if pat.endswith("/"):  # `dist/` names a directory: everything under it
+        pat += "**"
+    if "/" not in pat:
+        pat = "**/" + pat
+    out = []
+    i = 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pat.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pat[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def path_matches_glob(path, pattern) -> bool:
+    """True when the files_to_modify entry ``path`` (marker stripped, leading ``./``
+    dropped) matches ``pattern`` (see ``_glob_regex``)."""
+    p = strip_new_marker(path)
+    while p.startswith("./"):
+        p = p[2:]
+    pattern = str(pattern or "").strip()
+    return bool(p and pattern and _glob_regex(pattern).match(p))
+
+
+def parse_glob_list(raw, default: tuple = ()) -> tuple[str, ...]:
+    """A configured glob list (a YAML list, or one comma/newline separated string). Unset
+    (None) is ``default``; the token ``defaults`` inside a list expands to ``default``, so a
+    project can add to the built-in list instead of restating it; ``[]`` is an empty list."""
+    if raw is None:
+        return tuple(default)
+    items = raw.replace("\n", ",").split(",") if isinstance(raw, str) else list(raw or ())
+    out: list[str] = []
+    for item in items:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        for g in default if s.lower() in _GLOB_DEFAULTS_TOKENS else (s,):
+            if g not in out:
+                out.append(g)
+    return tuple(out)
+
+
+def split_breadth(files, patterns) -> tuple[list[str], list[str]]:
+    """``files`` split into (counted toward the breadth cap, excluded by ``patterns``)."""
+    counted: list[str] = []
+    excluded: list[str] = []
+    for p in files or ():
+        if not str(p).strip():
+            continue
+        (excluded if any(path_matches_glob(p, g) for g in patterns) else counted).append(str(p))
+    return counted, excluded
+
+
 PRIORITY_MIN = 0
 PRIORITY_MAX = 4
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
@@ -1555,6 +1661,7 @@ class BeadsBoard:
         issue_type: str = "feature",
         assignee: str = "",
         waits_for=(),
+        chain_hot_files: bool = True,
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -1666,6 +1773,15 @@ class BeadsBoard:
                     f"board_update_feature(feature_id={fid!r}, …)."
                 )
                 return f
+        # Hot shared files (#458): a card naming one of its project's `hot_files` is chained
+        # behind the open card already holding that file, so N cards on one package.json
+        # form a chain as they are created instead of each needing edges by hand.
+        chained = []
+        if chain_hot_files and files and issue_type != LABEL_TASK:
+            landed = [d for d in depends_on or () if d not in failed_deps]
+            chained = self._chain_hot_files(
+                {"id": fid, "project": proj, "files_to_modify": files, "depends_on": landed}
+            )
         if failed_deps:
             f = self.get_feature(fid) or {"id": fid, "board_state": "backlog", "title": title}
             f["enrichment_failed"] = True
@@ -1675,8 +1791,94 @@ class BeadsBoard:
                 f"{', '.join(failed_deps)} — repair with board_update_feature(feature_id={fid!r}, "
                 f"depends_on=...)."
             )
-            return f
-        return self.get_feature(fid)
+        else:
+            f = self.get_feature(fid)
+        if chained and f is not None:
+            f["hot_file_chain"] = chained
+        return f
+
+    def _chain_hot_files(self, f: dict) -> list[dict]:
+        """Chain a just-created card behind the open card holding each of its hot files (#458).
+
+        ``f`` is the new card as written (id, project, files_to_modify, depends_on). For
+        every files_to_modify entry that matches the project's `hot_files` globs, find
+        the open cards of the same project that already name that file, take the one at the
+        END of their chain (no other holder depends on it; the latest created breaks a tie)
+        and add ``fid depends_on <it>`` — unless ``fid`` already reaches it. A new card has
+        no dependents yet, so the edge can never close a cycle. Each edge is noted on the
+        card. Returns ``[{depends_on, files[, error]}]``. Never raises: a failed edge is
+        reported, and the Ready gate's shared-file check still stands behind it."""
+        fid = f["id"]
+        hot = self.hot_files_for(f)
+        if not hot:
+            return []
+        try:
+            mine = sorted(
+                {
+                    strip_new_marker(p)
+                    for p in f.get("files_to_modify") or []
+                    if str(p).strip() and any(path_matches_glob(p, g) for g in hot)
+                }
+            )
+            if not mine:
+                return []
+            my_project = str(f.get("project") or "")
+            others = {
+                r["id"]: r
+                for r in self.list_features()
+                if r.get("id")
+                and r["id"] != fid
+                and r.get("board_state") not in _TERMINAL_STATES
+                and r.get("issue_type") != LABEL_TASK
+                and str(r.get("project") or "") == my_project
+            }
+        except Exception:  # noqa: BLE001 — chaining is a convenience; the gate still guards
+            log.warning("[project_board] %s hot-file chaining could not read the board (skipped)", fid, exc_info=True)
+            return []
+        graph = {i: set(r.get("depends_on") or []) & set(others) for i, r in others.items()}
+        graph[fid] = set(f.get("depends_on") or []) & set(others)
+
+        def reach(start: str) -> set[str]:
+            seen: set[str] = set()
+            stack = list(graph.get(start, ()))
+            while stack:
+                n = stack.pop()
+                if n not in seen:
+                    seen.add(n)
+                    stack.extend(graph.get(n, ()))
+            return seen
+
+        edges: dict[str, dict] = {}
+        for path in mine:
+            holders = [
+                i for i, r in others.items() if path in {strip_new_marker(p) for p in r.get("files_to_modify") or []}
+            ]
+            if not holders:
+                continue
+            tails = [h for h in holders if not any(h in reach(o) for o in holders if o != h)] or holders
+            tail = max(tails, key=lambda i: (str(others[i].get("created_at") or ""), i))
+            if tail in edges:
+                edges[tail]["files"].append(path)
+                continue
+            if tail in reach(fid):
+                continue
+            edge = {"depends_on": tail, "files": [path]}
+            try:
+                self.add_dependency(fid, tail)
+                graph[fid].add(tail)
+            except BoardError as exc:
+                edge["error"] = str(exc)
+            edges[tail] = edge
+        for e in edges.values():
+            if "error" in e:
+                log.warning("[project_board] %s hot-file chain onto %s failed: %s", fid, e["depends_on"], e["error"])
+                continue
+            self.comment(
+                fid,
+                f"hot-file chain: depends on {e['depends_on']} (both edit {', '.join(e['files'])}, a hot_files "
+                "entry for this project) — added at create so the two build one after the other.",
+            )
+        return list(edges.values())
 
     def add_dependency(self, fid: str, depends_on: str) -> None:
         """`fid` is blocked until `depends_on` is **closed** (`blocks` edge). This is
@@ -1801,6 +2003,10 @@ class BeadsBoard:
                     foundation=bool(item.get("foundation", False)),
                     source_issue=str(item.get("source_issue") or ""),
                     waits_for=item.get("waits_for") or (),
+                    # The plan states its own order in phase 2; an automatic hot-file edge
+                    # added now could contradict it (a cycle br would refuse), so a plan's
+                    # shared files are left to the Ready gate's shared-file check (#458).
+                    chain_hot_files=False,
                 )
             except BoardError as exc:
                 results.append({"index": i, "created": False, "title": title, "error": str(exc)})
@@ -2000,127 +2206,349 @@ class BeadsBoard:
         entry = self.projects.get(name) if name else None
         return str((entry or {}).get("repo") or "").strip() or self.repo
 
+    def _project_entry(self, f: dict) -> dict:
+        """The `projects:` entry ``f`` belongs to (its `project` label, else the board's
+        default project), or {} — the per-project policy the Ready gate reads."""
+        name = str(f.get("project") or "").strip() or self.default_project
+        entry = self.projects.get(name) if name else None
+        return entry if isinstance(entry, dict) else {}
+
+    def breadth_exclude_for(self, f: dict) -> tuple[str, ...]:
+        """The `breadth_exclude` globs for ``f``'s project (#455): the entry's own list,
+        else the built-in ``DEFAULT_BREADTH_EXCLUDE``."""
+        return parse_glob_list(self._project_entry(f).get("breadth_exclude"), DEFAULT_BREADTH_EXCLUDE)
+
+    def hot_files_for(self, f: dict) -> tuple[str, ...]:
+        """The `hot_files` globs for ``f``'s project (#458) — files nearly every card in
+        that repo touches, which the board chains automatically at create. Empty by default."""
+        return parse_glob_list(self._project_entry(f).get("hot_files"), ())
+
+    def _ready_findings(self, f: dict, rows: list[dict] | None = None) -> dict:
+        """Every Ready-gate check that can be judged from the card and the board alone, ALL
+        of them, never stopping at the first (#455). Pure: it reads, it never writes.
+
+        ``refusals`` are what ``mark_ready`` refuses on, each ``{gate, message, fix}``;
+        ``advisories`` are worth knowing but refuse nothing (a depends_on edge onto a
+        cancelled card). ``breadth`` shows the count the cap judged, and what
+        ``breadth_exclude`` left out of it. ``unserialised`` lists every pair of open cards
+        that share a file with no depends_on PATH between them (#458), and
+        ``suggested_edges`` the fewest edges that serialise them: a chain per file, in
+        creation order. ``rows`` is an already-read ``list_features()``; None reads it
+        only when a check needs it.
+
+        The lane check is NOT here: it depends on when you ask, not on the card, so
+        ``_prepare_ready`` keeps it and ``ready_check`` reports the lane beside this."""
+        fid = f["id"]
+        files = [str(p) for p in f.get("files_to_modify") or [] if str(p).strip()]
+        refusals: list[dict] = []
+        advisories: list[dict] = []
+        out: dict = {"refusals": refusals, "advisories": advisories, "unserialised": [], "suggested_edges": []}
+
+        # REQUIRED fields. files_to_modify is a CODING-feature requirement: a task-type bead
+        # (#217) ships a deliverable (a doc, a decision, an artifact ref), not repo edits, so
+        # it goes Ready on spec + acceptance_criteria alone. It carries no files_to_modify
+        # anyway, so the phantom-path / breadth / shared-file checks below (all keyed off
+        # files_to_modify) are no-ops for it.
+        missing = [k for k in ("spec", "acceptance_criteria") if not str(f.get(k, "")).strip()]
+        if f.get("issue_type") != LABEL_TASK and not files:
+            missing.append("files_to_modify")
+        if missing:
+            refusals.append(
+                {
+                    "gate": "required-fields",
+                    "message": (
+                        f"Ready gate: feature {fid!r} is missing {', '.join(missing)} — a feature is "
+                        "Ready only with a spec, testable acceptance criteria, and the explicit files "
+                        "to create/modify (a junior — or a coding agent — could pick it up and finish)."
+                    ),
+                    "fix": (
+                        f"Fill the missing field(s) in place with board_update_feature(feature_id={fid!r}, "
+                        "…) and mark it ready again — no need to cancel and recreate the bead."
+                    ),
+                }
+            )
+
+        # PHANTOM paths (#110): every files_to_modify path must resolve in the bound checkout
+        # — a plausible-but-wrong file the card author guessed is invisible until a coder
+        # burns a run chasing it. A `(new)` marker (case-insensitive, anywhere in the entry)
+        # declares the file doesn't exist yet and bypasses the check. #90: the bound checkout
+        # is THIS FEATURE's project repo, so a multi-repo board checks each card against its
+        # own repo; a card with no project falls back to the instance repo.
+        repo = self._repo_for(f)
+        phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+        if phantom:
+            refusals.append(
+                {
+                    "gate": "phantom-paths",
+                    "message": (
+                        f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
+                        f"in the repo (bound root: {os.path.abspath(repo)!r}, set via project_board.repo): "
+                        f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
+                    ),
+                    "fix": (
+                        "A file this card will CREATE carries the `(new)` marker after its path — e.g. "
+                        f"`{strip_new_marker(phantom[0])} (new)` (a changeset is always new: "
+                        "`.changeset/<slug>.md (new)`). Otherwise correct the path, or bind the card's "
+                        f"project to the right checkout. board_update_feature(feature_id={fid!r}, "
+                        "files_to_modify=…) replaces the whole list."
+                    ),
+                }
+            )
+
+        # BREADTH cap (#143): a card that names more files than its difficulty allows times
+        # out before it lands — and a timeout teaches nothing (it burns the top tiers with
+        # zero diff, the single worst failure mode). Refuse it so the author must SPLIT the
+        # work. `architectural` carries no cap (absent from the dict), still subject to the
+        # design gate below. Configurable via `max_files_by_difficulty`. Files nobody authors
+        # — changesets, lockfiles, build output — are `breadth_exclude`d from the COUNT
+        # (#455); they still reach the coder brief.
+        diff = str(f.get("difficulty", "")).strip().lower()
+        cap = self.max_files_by_difficulty.get(diff)
+        counted, excluded = split_breadth(files, self.breadth_exclude_for(f))
+        out["breadth"] = {"counted": len(counted), "excluded": excluded, "cap": cap, "difficulty": diff}
+        if cap is not None and len(counted) > cap:
+            n = len(counted)
+            left_out = (
+                f" ({len(excluded)} more — {', '.join(excluded)} — are excluded from the count by breadth_exclude)"
+                if excluded
+                else ""
+            )
+            refusals.append(
+                {
+                    "gate": "breadth",
+                    "message": (
+                        f"Breadth gate: feature {fid!r} is difficulty={diff!r} and names {n} "
+                        f"files_to_modify{left_out}, over the cap of {cap} for a {diff} card — a card "
+                        "this wide times out before it lands, and a timeout teaches nothing. SPLIT it "
+                        "into cards each at or under the cap. Re-declaring it `large` raises the cap but "
+                        "does not remove it (#378: a large card with a design still timed out twice), and "
+                        "`large` additionally owes a design + ADR reference before it can go ready. Tune the "
+                        "limit with the max_files_by_difficulty config key if this cap is wrong."
+                    ),
+                    "fix": (
+                        f"Split it into cards of at most {cap} counted files each. If some of the "
+                        f"{n} are generated or boilerplate nobody authors (build output, a lockfile, a "
+                        "changeset), add their glob to the project's `breadth_exclude` instead."
+                    ),
+                }
+            )
+
+        # DESIGN gate (plan M6): a large/architectural feature is a decision, not just a task
+        # — it may not go ready until its `design` field exists AND references the ADR that
+        # records the decision. Small/medium features are untouched.
+        if diff in DESIGN_GATED_DIFFICULTIES:
+            design = str(f.get("design", "")).strip()
+            if not design:
+                refusals.append(
+                    {
+                        "gate": "design",
+                        "message": (
+                            f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} but has no "
+                            "`design` — at this blast radius the decision must be designed first (run the "
+                            "due-diligence workflow, record the decision as an ADR, and put the design + "
+                            "ADR reference in the feature's design field)."
+                        ),
+                        "fix": f"board_update_feature(feature_id={fid!r}, design=…) citing the ADR (e.g. 'ADR 0077').",
+                    }
+                )
+            elif not ADR_REF_RE.search(design):
+                refusals.append(
+                    {
+                        "gate": "design",
+                        "message": (
+                            f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} and has a "
+                            "design, but the design references no ADR — record the decision as an ADR and "
+                            "cite it (e.g. 'ADR 0077') so the rationale outlives this feature."
+                        ),
+                        "fix": f"Add the ADR reference to the design: board_update_feature(feature_id={fid!r}, design=…).",
+                    }
+                )
+
+        if not files and not f.get("depends_on"):
+            return out
+        if rows is None:
+            rows = self.list_features()
+        by_id = {r["id"]: r for r in rows if r.get("id")}
+        by_id[fid] = f  # the card as just read — fresher than the listing's copy
+
+        # DEPENDENCY sanity (advisory): an edge onto a CANCELLED card released the moment it
+        # was cancelled, without its work ever landing — almost always an edge the author
+        # forgot to re-point when the card was split or retired.
+        for dep in f.get("depends_on") or []:
+            row = by_id.get(dep)
+            if row is not None and row.get("board_state") == "cancelled":
+                advisories.append(
+                    {
+                        "gate": "dependency",
+                        "message": (
+                            f"feature {fid!r} depends on {dep!r}, which is CANCELLED — that edge released "
+                            "without its work landing, so it orders nothing."
+                        ),
+                        "fix": (
+                            f"Re-point it onto the card(s) that replaced {dep!r}: "
+                            f"board_update_feature(feature_id={fid!r}, depends_on=…)."
+                        ),
+                    }
+                )
+
+        # SHARED-FILE overlap (#143, #458): two open cards naming the same file must be
+        # SERIALISED — a depends_on PATH between them, in either direction, over the board's
+        # open cards (the transitive closure: a chain A <- B <- C orders A and C too).
+        # Otherwise the loop can claim one while the other sits unmerged and the second builds
+        # on a base about to move under it. Terminal cards no longer contend for the file and
+        # no longer hold an edge, so a path through one does not count. #197: paths only
+        # collide INSIDE a project — every repo carries PROTO.md/CLAUDE.md, so a bare-path
+        # comparison across projects would deadlock any two doc-touching cards.
+        if not files:
+            return out
+        my_project = str(f.get("project") or "")
+        open_ids = {i for i, r in by_id.items() if r.get("board_state") not in _TERMINAL_STATES or i == fid}
+        graph = {i: {d for d in (by_id[i].get("depends_on") or []) if d in open_ids} for i in open_ids}
+        closure: dict[str, set[str]] = {}
+
+        def reach(start: str) -> set[str]:
+            if start not in closure:
+                seen: set[str] = set()
+                stack = list(graph.get(start, ()))
+                while stack:
+                    n = stack.pop()
+                    if n not in seen:
+                        seen.add(n)
+                        stack.extend(graph.get(n, ()))
+                closure[start] = seen
+            return closure[start]
+
+        def serialised(a: str, b: str) -> bool:
+            return b in reach(a) or a in reach(b)
+
+        def files_of(row: dict) -> dict[str, str]:
+            return {strip_new_marker(p): str(p) for p in row.get("files_to_modify") or [] if str(p).strip()}
+
+        mine = files_of(f)
+        holders: dict[str, list[str]] = {}  # file → every open same-project card naming it
+        for i in open_ids:
+            row = by_id[i]
+            if str(row.get("project") or "") != my_project or row.get("issue_type") == LABEL_TASK:
+                continue
+            for path in files_of(row):
+                if path in mine:
+                    holders.setdefault(path, []).append(i)
+        conflicts: dict[str, list[str]] = {}  # other card → the shared files (as this card names them)
+        for path, ids in holders.items():
+            for other in ids:
+                if other != fid and not serialised(fid, other):
+                    conflicts.setdefault(other, []).append(mine[path])
+        if not conflicts:
+            return out
+
+        # Every unserialised pair on the contended files — this card's AND its neighbours',
+        # reported at once so one round of edits clears them all.
+        hot_paths = sorted({strip_new_marker(p) for ps in conflicts.values() for p in ps})
+        group = sorted({i for p in hot_paths for i in holders[p]})
+        pairs = []
+        for p in hot_paths:
+            ids = sorted(holders[p])
+            for x in range(len(ids)):
+                for y in range(x + 1, len(ids)):
+                    if not serialised(ids[x], ids[y]):
+                        pairs.append({"cards": [ids[x], ids[y]], "file": p})
+        out["unserialised"] = pairs
+
+        # The minimal fix: ONE order over the whole group — consistent with every existing
+        # path (a card after everything it already depends on), creation order otherwise —
+        # then per file, chain its holders in that order, adding only the edges not already
+        # implied. Every suggested edge points backwards in one global order, so the
+        # suggestion can never close a cycle, and each added edge is folded into the
+        # closure before the next pair is judged.
+        def created(i: str) -> tuple[str, str]:
+            return (str(by_id[i].get("created_at") or ""), i)
+
+        order: list[str] = []
+        remaining = set(group)
+        while remaining:
+            free = [i for i in remaining if not (reach(i) & (remaining - {i}))]
+            nxt = min(free or remaining, key=created)
+            order.append(nxt)
+            remaining.discard(nxt)
+        rank = {i: n for n, i in enumerate(order)}
+        edges: dict[tuple[str, str], list[str]] = {}
+        for p in hot_paths:
+            chain = sorted(holders[p], key=rank.__getitem__)
+            for prev, cur in zip(chain, chain[1:], strict=False):
+                if not serialised(prev, cur):
+                    edges.setdefault((cur, prev), []).append(p)
+                    graph.setdefault(cur, set()).add(prev)
+                    closure.clear()
+                elif (cur, prev) in edges:
+                    edges[(cur, prev)].append(p)
+        out["suggested_edges"] = [{"feature_id": c, "depends_on": d, "files": fs} for (c, d), fs in edges.items()]
+
+        detail = "; ".join(f"{oid} (shares {', '.join(ps)})" for oid, ps in sorted(conflicts.items()))
+        others = [pr for pr in pairs if fid not in pr["cards"]]
+        also = (
+            " Also unserialised on the same files: "
+            + "; ".join(f"{a} / {b} ({pr['file']})" for pr in others for a, b in [pr["cards"]])
+            + "."
+            if others
+            else ""
+        )
+        chains = "; ".join(
+            f"`{p}`: " + " <- ".join(sorted(holders[p], key=rank.__getitem__)) for p in hot_paths if len(holders[p]) > 1
+        )
+        adds = "; ".join(
+            f"board_update_feature(feature_id={e['feature_id']!r}, depends_on={e['depends_on']!r})"
+            for e in out["suggested_edges"]
+        )
+        refusals.append(
+            {
+                "gate": "shared-file",
+                "message": (
+                    f"Shared-file gate: feature {fid!r} names files_to_modify already claimed by "
+                    f"non-terminal card(s) with no depends_on path between them: {detail}. Two cards "
+                    "editing the same file without a dependency path build off a stale base and "
+                    "collide — add a depends_on edge (board_update_feature(feature_id="
+                    f"{fid!r}, depends_on=[…])) so one waits for the other to merge, or split the file "
+                    f"work so they don't overlap.{also}"
+                ),
+                "fix": (
+                    f"Chain them, earliest first — a path serialises every pair on it, so a chain of N "
+                    f"cards needs N-1 edges, not one per pair: {chains}. Add: {adds}."
+                ),
+            }
+        )
+        return out
+
+    def ready_check(self, fid: str) -> dict:
+        """What ``mark_ready`` would say about ``fid`` right now, WITHOUT changing anything
+        (#455): ``ok``, every refusal with its fix, the advisories, the breadth count, and
+        any unserialised shared-file pairs with the edges that would serialise them. A card
+        outside backlog/ready is reported too; ``note`` says it isn't promotable from there."""
+        f = self._require(fid)
+        res = self._ready_findings(f)
+        res.update(id=fid, state=f["board_state"], ok=not res["refusals"])
+        if f["board_state"] not in ("backlog", "ready"):
+            res["note"] = f"{fid} is {f['board_state']!r}; mark_ready only promotes a backlog card."
+        return res
+
     def _prepare_ready(self, fid: str) -> None:
         """Enforce the Ready gate and materialize the requirement ledger for ``fid``
         WITHOUT flipping the ``ready`` label — the prep half of ``mark_ready``, split
         out so a batch promotion can validate + prep every item first and then flip the
         whole batch's ``ready`` label in ONE ``br update`` (#111): the puller must never
         observe a partially-promoted batch (some items ready, some not). Raises
-        BoardError if the gate rejects the feature."""
+        BoardError if the gate rejects the feature — naming EVERY failed check at once
+        (#455), so one round of fixes clears the card instead of one per refusal."""
         f = self._require(fid)
         if f["board_state"] not in ("backlog", "ready"):
             raise BoardError(f"can't mark ready from {f['board_state']!r}")
-        missing = [k for k in ("spec", "acceptance_criteria") if not str(f.get(k, "")).strip()]
-        # files_to_modify is a CODING-feature requirement: a task-type bead (#217) ships a
-        # deliverable (a doc, a decision, an artifact ref), not repo edits, so it goes Ready
-        # on spec + acceptance_criteria alone. It carries no files_to_modify anyway, so the
-        # phantom-path / breadth / shared-file checks below (all keyed off files_to_modify)
-        # are no-ops for it — only this required-field gate needs the relaxation.
-        is_task = f.get("issue_type") == LABEL_TASK
-        if not is_task and not f.get("files_to_modify"):
-            missing.append("files_to_modify")
-        if missing:
+        refusals = self._ready_findings(f)["refusals"]
+        if len(refusals) == 1:
+            raise BoardError(f"{refusals[0]['message']} Fix: {refusals[0]['fix']}")
+        if refusals:
             raise BoardError(
-                f"Ready gate: feature {fid!r} is missing {', '.join(missing)} — a feature is "
-                "Ready only with a spec, testable acceptance criteria, and the explicit files "
-                "to create/modify (a junior — or a coding agent — could pick it up and finish). "
-                f"Fill the missing field(s) in place with board_update_feature(feature_id={fid!r}, "
-                "…) and mark it ready again — no need to cancel and recreate the bead."
+                f"Ready gate: feature {fid!r} fails {len(refusals)} checks (all listed, fix them in one pass):\n"
+                + "\n".join(f"{n}. {r['message']} Fix: {r['fix']}" for n, r in enumerate(refusals, 1))
             )
-        # #110: every files_to_modify path must resolve in the bound checkout — a phantom
-        # path (a plausible-but-wrong file the card author guessed) is invisible until a
-        # coder burns a run chasing it. A `(new)` marker (case-insensitive, anywhere in the
-        # entry) declares the file doesn't exist yet and bypasses the existence check.
-        # #90: the bound checkout is THIS FEATURE's project repo (via its `project` label),
-        # not the instance default — so a multi-repo board checks each card against its own
-        # repo; a card with no project falls back to the instance repo (single-repo path).
-        repo = self._repo_for(f)
-        phantom = [
-            p for p in f["files_to_modify"] if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))
-        ]
-        if phantom:
-            raise BoardError(
-                f"Ready gate: feature {fid!r} is missing files_to_modify paths that do not exist "
-                f"in the repo (bound root: {os.path.abspath(repo)!r}, set via project_board.repo): "
-                f"{', '.join(phantom)} — correct the path, add a `(new)` marker, or fix the repo binding."
-            )
-        # BREADTH cap (#143): a small/medium card that names more files than its difficulty
-        # allows times out before it lands — and a timeout teaches nothing (it burns the top
-        # tiers with zero diff, the single worst failure mode). Refuse it here so the author
-        # must SPLIT the work or re-declare the card `large` (which then owes the design + ADR
-        # the DESIGN gate below enforces). `large`/`architectural` carry no cap (absent from
-        # the dict) → exempt from breadth, still subject to that design gate. Configurable via
-        # the `max_files_by_difficulty` config key.
-        diff = str(f.get("difficulty", "")).strip().lower()
-        cap = self.max_files_by_difficulty.get(diff)
-        if cap is not None and len(f["files_to_modify"]) > cap:
-            n = len(f["files_to_modify"])
-            raise BoardError(
-                f"Breadth gate: feature {fid!r} is difficulty={diff!r} and names {n} "
-                f"files_to_modify, over the cap of {cap} for a {diff} card — a card this wide "
-                "times out before it lands, and a timeout teaches nothing. SPLIT it into cards "
-                "each at or under the cap. Re-declaring it `large` raises the cap but does not "
-                "remove it (#378: a large card with a design still timed out twice), and `large` "
-                "additionally owes a design + ADR reference before it can go ready. Tune the "
-                "limit with the max_files_by_difficulty config key if this cap is wrong."
-            )
-        # SHARED-FILE overlap (#143): two non-terminal cards naming the same file with no
-        # depends_on edge between them build off a stale base and collide — the loop can claim
-        # one while the other sits unmerged, so the second builds on a base that's about to
-        # move under it. Refuse unless a dependency edge (in EITHER direction) already orders
-        # them. (The in-flight hot-file guard only stops PARALLEL edits, and never fires at
-        # max_concurrent=1 — this is the serialization that guard can't provide, enforced at
-        # the gate.) `list_features` is the exhaustive non-archived projection; terminal
-        # (done/cancelled) cards no longer contend for the file, so they're skipped.
-        my_files = {p for p in f["files_to_modify"] if str(p).strip()}
-        if my_files:
-            my_deps = set(f.get("depends_on") or [])
-            my_project = str(f.get("project") or "")
-            conflicts: list[tuple[str, list[str]]] = []
-            for other in self.list_features():
-                if other["id"] == fid or other["board_state"] in _TERMINAL_STATES:
-                    continue
-                # #197: paths only collide INSIDE a project — every plugin repo carries
-                # PROTO.md/CLAUDE.md/AGENTS.md, so bare-path comparison deadlocks any two
-                # doc-touching cards in different repos on a multi-project board (#90).
-                # Unstamped cards ("" project) keep the old single-repo behavior.
-                if str(other.get("project") or "") != my_project:
-                    continue
-                shared = sorted(my_files & {p for p in (other.get("files_to_modify") or []) if str(p).strip()})
-                if not shared:
-                    continue
-                linked = other["id"] in my_deps or fid in set(other.get("depends_on") or [])
-                if not linked:
-                    conflicts.append((other["id"], shared))
-            if conflicts:
-                detail = "; ".join(f"{oid} (shares {', '.join(files)})" for oid, files in conflicts)
-                raise BoardError(
-                    f"Shared-file gate: feature {fid!r} names files_to_modify already claimed by "
-                    f"non-terminal card(s) with no depends_on edge between them: {detail}. Two cards "
-                    "editing the same file without a dependency edge build off a stale base and "
-                    f"collide — add a depends_on edge (board_update_feature(feature_id={fid!r}, "
-                    "depends_on=[…])) so one waits for the other to merge, or split the file work "
-                    "so they don't overlap."
-                )
-        # DESIGN gate (plan M6): a large/architectural feature is a decision, not just
-        # a task — it may not go ready until its `design` field exists AND references
-        # the ADR that records the decision (run /due-diligence, write the ADR, cite
-        # it). Small/medium features are untouched.
-        if str(f.get("difficulty", "")).strip().lower() in DESIGN_GATED_DIFFICULTIES:
-            design = str(f.get("design", "")).strip()
-            if not design:
-                raise BoardError(
-                    f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} but has no "
-                    "`design` — at this blast radius the decision must be designed first (run the "
-                    "due-diligence workflow, record the decision as an ADR, and put the design + "
-                    "ADR reference in the feature's design field)."
-                )
-            if not ADR_REF_RE.search(design):
-                raise BoardError(
-                    f"Design gate: feature {fid!r} is difficulty={f.get('difficulty')!r} and has a "
-                    "design, but the design references no ADR — record the decision as an ADR and "
-                    "cite it (e.g. 'ADR 0077') so the rationale outlives this feature."
-                )
         # Requirement ledger (#113): decompose the acceptance-criteria prose into
         # tracked items HERE — the same seam as the gates above (the PM authors prose;
         # the coder sees items). Only when the bead carries no ledger yet: a re-mark
@@ -2219,9 +2647,10 @@ class BeadsBoard:
                 "compiles once its siblings land.\n"
                 "   - A file that does not exist YET is marked `(new)`, or the Ready gate refuses "
                 "it as a phantom path.\n"
-                "   - Slices editing the SAME file need a depends_on edge between them. The edge "
-                "counts in either direction, but only between the two cards that share the file: "
-                "in a chain A->B->C, the A/C pair needs its OWN edge.\n"
+                "   - Slices editing the SAME file must be serialised by a depends_on PATH, in either "
+                "direction: chain them (B depends on A, C on B) and every pair on the chain counts, "
+                "A/C included. `board_create_feature` reports any pair still unserialised, with the "
+                "edges to add.\n"
                 "   - Order them so the first slice is independently useful and the rest gate behind it.\n"
                 f"2. Re-point every card that depends on {fid} (listed above; check again, the list "
                 "may have grown) onto the slice or slices that deliver what it needs: "
@@ -3970,6 +4399,8 @@ class BeadsBoard:
             # when the bead closed (`br` exposes it) — the archive pass selects on it,
             # and the board view sorts the Done column most-recent-first by it (#115).
             "closed_at": bead.get("closed_at", ""),
+            # creation order — the shared-file gate's suggested chain runs earliest first (#458).
+            "created_at": bead.get("created_at", ""),
             "spec": bead.get("description", ""),
             "acceptance_criteria": bead.get("acceptance_criteria", ""),
             "design": bead.get("design", ""),
