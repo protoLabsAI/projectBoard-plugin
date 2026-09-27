@@ -249,11 +249,9 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
 
     The single staging seam — shared by the commit path, the verify/judge diff probes and
     stranded-work preservation — so all of them see the same intended-only file set.
-    Excludes via a pathspec (``:(exclude)…``) rather than ``.git/info/exclude``, so it
-    mutates nothing in the repo and depends on no target-repo ``.gitignore`` entry: the
-    exclusion is scoped to this one staging call. The leading ``.`` is the positive
-    pathspec the excludes subtract from. Scratch the repo already ignores gets no exclude
-    (``add -A`` skips it anyway, and naming an ignored path makes ``add`` exit 1).
+    The scratch is dropped from the INDEX after the add (``reset HEAD -- <scratch>``), never
+    named in the add itself, so it depends on no target-repo ``.gitignore`` entry and cannot
+    trip ``add``'s refusal of an ignored pathspec, whatever the repo ignores (#465).
 
     The links need their own lookup. A ``node_modules/`` ignore pattern — the trailing-
     slash spelling most Node repos use — matches only a real directory, so the board's
@@ -265,22 +263,34 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
     preservation's private index, which must never touch the tree's."""
     env = {"GIT_INDEX_FILE": index_file} if index_file else None
     kw = {"env": env} if env else {}
-    # Only scratch the repo does NOT already ignore needs an exclude: `add -A` skips ignored
-    # paths on its own, and an exclude that NAMES an ignored path makes git print "The
-    # following paths are ignored" and exit 1 — after staging everything else. In a repo
-    # that ignores `.proto` (protoAgent does) that failed every stranded-work save, so the
-    # board kept a finished tree it could have cleared (bd-9wh1).
-    # Plain (not `-z`) output: `-z` is only valid with `--stdin`, and the scratch names are
-    # fixed, unquoted ASCII. Exit 1 = none ignored; anything else keeps every exclude.
-    rc, out, _err = await _git(worktree, "check-ignore", "--", *CODER_SCRATCH, **kw)
-    ignored = {line.strip() for line in out.splitlines()} if rc == 0 else set()
-    excludes = [f":(exclude){p}" for p in CODER_SCRATCH if p not in ignored]
+    # The scratch is NEVER named in the `add` (#465). Any pathspec — an exclude included —
+    # that matches a path git considers ignored makes `add` print "The following paths are
+    # ignored" and exit 1, and whether `.proto` counts as ignored can't be asked up front:
+    # with `.proto/` ignored (a global or info/exclude entry) but a file under it tracked,
+    # `check-ignore .proto` answers "not ignored" while `add` still refuses the exclude. The
+    # #446 probe trusted that answer, so every stranded-work save kept failing there and
+    # the card blocked for a human (bd-fgtf). So stage everything `add -A` takes, then put
+    # the scratch paths back the way HEAD has them: a tracked scratch file keeps its
+    # committed version, an untracked one leaves the index. `reset` never refuses a path
+    # for being ignored.
+    #
+    # The node_modules links are still excluded in the add: `ls-files --others
+    # --exclude-standard` lists only paths that are NOT ignored, so naming them is safe.
+    excludes: list[str] = []
     rc, out, _err = await _git(
         worktree, "ls-files", "-z", "--others", "--exclude-standard", "--", ":(glob)**/node_modules", **kw
     )
     if rc == 0:
         excludes += [f":(exclude,literal){p}" for p in out.split("\0") if p and _is_board_link(worktree, p)]
-    return await _git(worktree, "add", "-A", "--", ".", *excludes, **kw)
+    added = await _git(worktree, "add", "-A", "--", ".", *excludes, **kw)
+    if added[0] != 0:
+        return added
+    rc, out, err = await _git(worktree, "reset", "-q", "HEAD", "--", *CODER_SCRATCH, **kw)
+    if rc != 0:  # no HEAD to restore from (an unborn branch): nothing is tracked, just drop them
+        rc, out, err = await _git(
+            worktree, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *CODER_SCRATCH, **kw
+        )
+    return (rc, out, err) if rc != 0 else added
 
 
 def _is_board_link(tree: str, entry: str) -> bool:
