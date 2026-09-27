@@ -1488,7 +1488,9 @@ def compose_oracle(cmds: list[str]) -> str:
     """One shell command that runs ``cmds`` in order, each in its own subshell, so a
     ``cd`` in one can't leak into the next. Every command runs even after an earlier one
     fails, so the output shows all the failures. The exit status is non-zero if ANY
-    command failed. A single command is returned as it is."""
+    command failed. A single command is returned as it is. The whole sequence runs under
+    ONE ``coder_solve_test_timeout_s``, so the budget must cover every command a
+    candidate can pick together."""
     if len(cmds) == 1:
         return cmds[0]
     lines = ["__oracle_rc=0"]
@@ -1607,8 +1609,9 @@ class _WorktreeSolveAdapter:
     CIRCUIT_BREAKER_THRESHOLD = 3
     # #459: the same breaker for a TIMED-OUT oracle, with a lower threshold. A timeout
     # carries no assertion for the next candidate to learn from, and each one costs the
-    # whole `test_timeout`. Two candidates timing out on the same command is enough to say
-    # the command can't finish in its budget.
+    # whole `test_timeout`. Timing out on the same command in two SEPARATE rounds (runs that
+    # did not overlap) is enough to say it can't finish in its budget. Concurrent best-of-k
+    # timeouts count as one round, because they may only be contending for the machine.
     TIMEOUT_BREAKER_THRESHOLD = 2
 
     def __init__(
@@ -1659,8 +1662,12 @@ class _WorktreeSolveAdapter:
         # its changed files pick, and `_oracle_by_wt` remembers what ran for the feedback.
         self.test_paths = list(test_paths or [])
         self._oracle_by_wt: dict[str, str] = {}
-        # #459: the timeout breaker's count per timed-out command.
+        # #459: the timeout breaker's count of separate ROUNDS per timed-out command, the
+        # end time of the latest timed-out run per command (runs overlapping it are the same
+        # round), and each candidate's verify (start, end) in monotonic time.
         self._timeouts: dict[str, int] = {}
+        self._timeout_round_end: dict[str, float] = {}
+        self._verify_span: dict[str, tuple[float, float]] = {}
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         # The gate's env_passthrough whitelist (#86), threaded from the loop so the
         # acceptance-test (verify) subprocess sees the SAME allowlist environment the
@@ -1921,12 +1928,24 @@ class _WorktreeSolveAdapter:
             # the whole budget was spent. Then it was blocked as `transient`, and the sweep
             # unblocked it to spend the budget again. `OracleTimeout` stops the ladder, and
             # the loop blocks the card for a human without climbing a tier.
+            #
+            # It counts ROUNDS, not candidates (#467 review). Best-of-k verifies its k
+            # candidates concurrently, so k copies of a heavy gate compete for the machine and
+            # can all time out where one alone would finish. Timeouts whose runs overlapped
+            # count as ONE, so the breaker needs the oracle to time out again in a later,
+            # separate run (a rung with fewer concurrent candidates) before it blocks the card.
             if output.startswith(_ORACLE_TIMEOUT_PREFIX):
-                n = self._timeouts[ran] = self._timeouts.get(ran, 0) + 1
+                start, end = self._verify_span.get(candidate_wt, (0.0, 0.0))
+                last_end = self._timeout_round_end.get(ran)
+                if last_end is None or start >= last_end:
+                    self._timeouts[ran] = self._timeouts.get(ran, 0) + 1
+                self._timeout_round_end[ran] = max(end, last_end or 0.0)
+                n = self._timeouts[ran]
                 if n >= self.TIMEOUT_BREAKER_THRESHOLD:
                     raise OracleTimeout(
-                        f"acceptance oracle cannot finish: {n} candidates ran out the "
-                        f"{self.test_timeout:.0f}s coder_solve_test_timeout_s on `{ran}` — an oracle/spec "
+                        f"acceptance oracle cannot finish: it ran out the "
+                        f"{self.test_timeout:.0f}s coder_solve_test_timeout_s on `{ran}` in {n} separate rounds "
+                        "of candidates — an oracle/spec "
                         "problem, not the code. Set a faster coder_solve_test_cmd, map the changed paths "
                         "in coder_solve_test_paths, or raise coder_solve_test_timeout_s, then unblock the card.",
                         test_cmd=ran,
@@ -1967,9 +1986,24 @@ class _WorktreeSolveAdapter:
         if note:
             log.info("[project_board] %s oracle for %s: %s", self.fid, os.path.basename(candidate_wt), note)
         if not cmd:
+            # Every changed file hit a `skip` entry in coder_solve_test_paths. That is the
+            # operator's rule, so the candidate passes, but loudly: it was judged by nothing.
             self._oracle_by_wt[candidate_wt] = "(no oracle: every changed file is mapped to skip)"
-            return Verdict(passed=True, total=0, failed=0, output=f"no acceptance command applies — {note}")
+            log.warning(
+                "[project_board] %s: candidate %s PASSED WITHOUT TESTS — every changed file is mapped to skip "
+                "in coder_solve_test_paths (%s)",
+                self.fid,
+                os.path.basename(candidate_wt),
+                note,
+            )
+            return Verdict(
+                passed=True,
+                total=0,
+                failed=0,
+                output=f"passed without tests: every changed file is mapped to skip in coder_solve_test_paths — {note}",
+            )
         self._oracle_by_wt[candidate_wt] = cmd
+        started = time.monotonic()
         try:
             proc = await worktree.spawn_shell(
                 cmd,
@@ -1991,7 +2025,9 @@ class _WorktreeSolveAdapter:
             # then `await proc.wait()` — which on Python >= 3.11 waits for the orphaned
             # test runner to close its pipe, so a hung `pnpm install` froze the drive.
             out, _ = await worktree.communicate_or_kill(proc, timeout=self.test_timeout)
+            self._verify_span[candidate_wt] = (started, time.monotonic())
         except asyncio.TimeoutError:
+            self._verify_span[candidate_wt] = (started, time.monotonic())
             # Unlike the pre-PR local gate (which fails OPEN on a timeout — a broken
             # gate must never block otherwise-good work), THIS is the ladder's own
             # search oracle: a candidate we couldn't confirm passed must never be

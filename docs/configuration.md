@@ -105,12 +105,16 @@ project's ready cards until the check passes again. How it runs:
 - **One verdict per commit.** A pass, or a run that timed out, stands for the commit the
   checkout was on. When the checkout moves, one re-check runs in the background while
   dispatch goes on under the old verdict. A red result holds the project from the next
-  claim scan. A failed project is re-checked every minute or so, as before.
+  claim scan. A failed project is re-checked every minute or so, as before. "The
+  commit" is the local checkout's `HEAD`, the tree the preflight actually runs in, not
+  `origin/<base>`. A checkout that nobody pulls keeps its verdict however far the remote
+  base moves.
 - **A check slower than the timeout runs once.** A preflight cut off by
   `preflight_timeout_s` gives no verdict, and dispatch is allowed. It is not repeated
   until the checkout moves. It is logged once, and shown in `/status` under
   `preflight.slow` and in the setup advisories (`preflight_hint`). The duration also
-  feeds the coder.solve() oracle guard below.
+  feeds the coder.solve() oracle guard below. A project already held for a failing gate
+  stays held when a re-check times out: a timeout is no evidence that the gate recovered.
 
 **`preflight_cmd`**: a cheap command for the preflight to smoke instead of the full
 `local_gate_cmd`, such as `ruff check . && lint-imports`. The preflight asks "can this
@@ -222,13 +226,23 @@ every card (#459):
 - **An unwinnable fallback turns solve() off.** When the oracle is the gate fallback and
   the preflight measured the gate at longer than `coder_solve_test_timeout_s`, that
   project's cards take the plain coder path. The pre-PR gate still runs. The loop logs
-  this once, and `/status` shows it under `preflight.unwinnable_oracle`. It turns back on
-  once you set `coder_solve_test_cmd` or `coder_solve_test_paths`, or the gate gets faster.
-- **Two candidates timing out on the same command blocks the card.** The class is
+  this once, and `/status` shows it under `preflight.unwinnable_oracle`. The check runs
+  again on every card against the latest measurement and the current budget. So solve()
+  turns back on by itself once a preflight measures the gate under budget or you raise
+  `coder_solve_test_timeout_s`. Setting `coder_solve_test_cmd` or `coder_solve_test_paths`
+  also turns it back on.
+- **Timing out on the same command in two separate rounds blocks the card.** The class is
   `oracle-timeout`, and there is no tier climb. A timeout says nothing about the code, so
   another candidate or a stronger model would only time out again. The sweep never clears
   this class on its own. Fix the oracle, then unblock the card. When the command was the
-  gate fallback, the project's later cards skip solve() as well.
+  gate fallback, the project's later cards skip solve() as well, until the budget is raised
+  or the gate measures under it.
+  - Best-of-k verifies its `coder_solve_k` candidates at the same time, so k copies of a
+    heavy test command compete for the machine. Timeouts from runs that overlapped count as
+    ONE round. The card blocks only when the oracle also times out in a later run of its
+    own.
+  - A heavy oracle with a large `coder_solve_k` can still need a longer timeout than the
+    command takes alone, or `max_concurrent_sessions: 1` to serialise candidates.
 
 **`coder_solve_test_paths`**: judge each candidate by the tests for the files it
 changed. The value maps path globs to commands, per project or board-wide:
@@ -246,14 +260,17 @@ projects:
   `apps/web/*` and `apps/web/**` are the same.
 - For each changed file, the **first** matching entry wins. The distinct commands picked
   run one after another, each in its own subshell, and the candidate passes only if all of
-  them pass. They share one `coder_solve_test_timeout_s`.
+  them pass. They share ONE `coder_solve_test_timeout_s`, so size the budget for every
+  command a candidate can pick together.
 - `gate` means the project's `local_gate_cmd`. `""` (or `skip`) means no test for those
   files. A candidate whose every changed file hits a skip entry passes without a command.
+  That pass is logged at WARNING, and the candidate's verdict says it ran no tests.
 - A file no entry matches uses the ordinary oracle (`coder_solve_test_cmd`, else the
   gate). A candidate that changed nothing, or one whose files git can't list, also uses
   the ordinary oracle.
 - "Changed" means changed against the point the candidate forked from `base_branch`:
-  commits, uncommitted edits and new files.
+  commits, uncommitted edits, new files and deletions. A rename counts as both paths, so
+  moving `src/core.py` to `docs/` still runs the `src/**` command.
 - A mapping keeps its order in YAML. A list of `[glob, command]` pairs also works.
 
 ## Review and merge

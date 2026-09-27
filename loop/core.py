@@ -243,6 +243,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # live). A second caller now awaits the run already in flight.
         self._preflight_tasks: dict[str, asyncio.Task] = {}
         self._preflight_task_key: dict[str, tuple[str, str]] = {}  # (cmd, repo) each run smokes
+        self._preflight_run_gen: dict[str, int] = {}  # the latest run per project; only it writes
         # The checkout commit each project's current NON-failing verdict was reached on
         # (#456). The verdict stands until the checkout moves, and then one re-check runs.
         # Before, a pass stuck for the life of the process however far base moved.
@@ -258,6 +259,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # timeout, so it took at least that long. The coder.solve() guard reads this to
         # avoid using as its oracle a gate that can't finish in `coder_solve_test_timeout_s`.
         self._gate_seconds: dict[str, tuple[float, bool]] = {}
+        self._gate_measured_at: dict[str, float] = {}  # monotonic time of that measurement
         # Per-PROJECT preflight isolation (#90 slice 2): keyed by project name, not a
         # single scalar — a broken gate in project A holds only A's ready work while B
         # keeps dispatching. Each value is None=unchecked, True=runnable, str=failure
@@ -325,6 +327,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # for that project's cards, and the pre-PR gate still runs. /status shows the flag,
         # and it is logged once per project.
         self._oracle_unwinnable: dict[str, str] = {}
+        # Projects whose gate-fallback oracle tripped the timeout breaker (#459) → (the
+        # coder_solve_test_timeout_s it tripped under, when). The flag lifts on its own once
+        # the budget is raised, or once the preflight measures the gate under budget again.
+        self._oracle_tripped: dict[str, tuple[float, float]] = {}
         # (tier, delegate) pairs already warned about as missing (protoAgent#3692), so a
         # deleted rung delegate is logged once, not on every dispatch.
         self._missing_rung_warned: set[tuple[str, str]] = set()

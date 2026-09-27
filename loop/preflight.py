@@ -116,7 +116,8 @@ class PreflightMixin:
         if task is not None and not task.done() and self._preflight_task_key.get(name) == (cmd, repo):
             log.info("[project_board] preflight[%s]: a run is already in flight — waiting for its verdict", name)
             return task
-        task = asyncio.create_task(self._preflight(name, cmd, repo, base, sha=sha), name=f"preflight[{name}]")
+        run = self._preflight_run_gen[name] = self._preflight_run_gen.get(name, 0) + 1
+        task = asyncio.create_task(self._preflight(name, cmd, repo, base, sha=sha, run=run), name=f"preflight[{name}]")
         self._preflight_tasks[name] = task
         self._preflight_task_key[name] = (cmd, repo)
 
@@ -144,7 +145,9 @@ class PreflightMixin:
             oracle=self._oracle_unwinnable,
         )
 
-    async def _preflight(self, name: str, cmd: str, repo: str, base: str = "", *, sha: str | None = None) -> None:
+    async def _preflight(
+        self, name: str, cmd: str, repo: str, base: str = "", *, sha: str | None = None, run: int | None = None
+    ) -> None:
         """Smoke-run project ``name``'s gate on its base checkout. Sets
         ``self._preflight_state[name]``: ``True`` when the gate exits 0 (runnable), a
         reason string on a CLEAN non-zero exit or a launch failure (broken environment →
@@ -194,10 +197,14 @@ class PreflightMixin:
                 # base checkout, so an orphaned install left behind here is the worst kind.
                 out, _ = await worktree.communicate_or_kill(proc, timeout=self.preflight_timeout)
             except asyncio.TimeoutError:
+                if self._preflight_superseded(name, run):
+                    return
                 self._record_preflight_timeout(name, cmd, sha, is_gate)
                 return
+            if self._preflight_superseded(name, run):
+                return
             if is_gate:
-                self._gate_seconds[name] = (time.monotonic() - started, False)
+                self._record_gate_seconds(name, time.monotonic() - started, False)
             # The dirt probe runs BEFORE the exit code is read, because it decides
             # whether the exit code means anything at all — for a pass exactly as much
             # as for a failure (see the docstring).
@@ -252,6 +259,8 @@ class PreflightMixin:
                 return
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that CANNOT LAUNCH is the broken-env case we must catch
+            if self._preflight_superseded(name, run):
+                return
             reason = f"gate command could not run: {exc}"
             # A missing CHECKOUT raises the same FileNotFoundError (the cwd); only name the
             # command when the checkout is there.
@@ -264,6 +273,24 @@ class PreflightMixin:
                     self._preflight_state[name],
                 )
 
+    def _preflight_superseded(self, name: str, run: int | None) -> bool:
+        """Whether this run was replaced by a newer one for the same project (#467 review).
+        A registry save that changes a project's gate starts a fresh run while the old one
+        may still be going. Only the current run may write a verdict, so a late answer to
+        the OLD command never overwrites the new one, even if the new run has already
+        finished. ``run`` is the number ``_start_preflight`` gave this run; a direct call
+        (``run`` None) is always current."""
+        if run is None or run == self._preflight_run_gen.get(name):
+            return False
+        log.info("[project_board] preflight[%s]: superseded by a newer run — this result is dropped", name)
+        return True
+
+    def _record_gate_seconds(self, name: str, seconds: float, lower_bound: bool) -> None:
+        """Keep the gate's measured duration, and when it was measured, for the coder.solve()
+        oracle guard (#459). The guard is re-evaluated from this on every call."""
+        self._gate_seconds[name] = (seconds, lower_bound)
+        self._gate_measured_at[name] = time.monotonic()
+
     def _record_preflight_timeout(self, name: str, cmd: str, sha: str, is_gate: bool) -> None:
         """A preflight cut off at ``preflight_timeout_s`` (#456). This is indeterminate, so
         dispatch is allowed, as before. But a command that can't finish inside the timeout
@@ -272,13 +299,25 @@ class PreflightMixin:
         not re-run until the checkout moves. The project shows as slow on /status and in the
         setup advisories, and the first time it happens the log names the fix
         (``preflight_cmd``). When the command is the gate, the timeout is also a lower bound
-        on the gate's duration, which the coder.solve() oracle guard reads (#459)."""
+        on the gate's duration, which the coder.solve() oracle guard reads (#459).
+
+        A project already held for a clean RED keeps its hold (#467 review). A timeout is no
+        evidence that the gate recovered, so it can't release the hold, and it isn't cached,
+        so the throttled re-check keeps running until a clean green releases it."""
+        if is_gate:
+            self._record_gate_seconds(name, self.preflight_timeout, True)
+        self._preflight_slow[name] = {"cmd": cmd, "timeout_s": self.preflight_timeout, "sha": sha}
+        if isinstance(self._preflight_state.get(name), str):
+            log.warning(
+                "[project_board] preflight[%s] timed out (%ss) on a project held for a failing gate — "
+                "no verdict, so it stays held until the gate passes",
+                name,
+                self.preflight_timeout,
+            )
+            return
         self._preflight_state[name] = True
         if sha:
             self._preflight_sha[name] = sha
-        if is_gate:
-            self._gate_seconds[name] = (self.preflight_timeout, True)
-        self._preflight_slow[name] = {"cmd": cmd, "timeout_s": self.preflight_timeout, "sha": sha}
         if name in self._preflight_slow_warned:
             log.info(
                 "[project_board] preflight[%s] timed out again (%ss) — indeterminate, allowing dispatch",

@@ -495,3 +495,137 @@ def test_a_rung_gone_with_no_base_coder_falls_to_the_nearest_live_rung():
     assert lp._live_rung("reasoning", ["fable"], lp._coders_for({})) == ["a"]  # then weaker
     lp._resolve_delegate = lambda name, expect: None
     assert lp._live_rung("reasoning", ["fable"], lp._coders_for({})) == ["fable"]  # nothing: the block names it
+
+
+# ── #467 review: regressions ─────────────────────────────────────────────────────────
+
+
+def _clone_with_origin(tmp_path, seed_files=()) -> Path:
+    """A seed repo pushed to a bare origin, and a clone of it with a local identity."""
+    origin = tmp_path / "origin.git"
+    seed = _repo(tmp_path / "seed")
+    for name in seed_files:
+        _commit(seed, name, "def f(): pass\n")
+    _git("init", "--bare", str(origin))
+    _git("-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    _git("-C", str(seed), "remote", "add", "origin", str(origin))
+    _git("-C", str(seed), "push", "-u", "origin", "main")
+    tree = tmp_path / "clone"
+    _git("clone", str(origin), str(tree))
+    for k, v in (("user.email", "t@localhost"), ("user.name", "T"), ("commit.gpgsign", "false")):
+        _git("-C", str(tree), "config", k, v)
+    return tree
+
+
+async def test_R1_a_rename_lists_its_source_so_the_source_paths_tests_run(tmp_path):
+    """`git mv src/core.py docs/core.md` with `{docs/**: skip, src/**: pytest}` used to list
+    only docs/core.md, so the candidate passed with no test at all."""
+    tree = _clone_with_origin(tmp_path, ["src/core.py"])
+    (tree / "docs").mkdir()
+    _git("-C", str(tree), "mv", "src/core.py", "docs/core.md")
+    _git("-C", str(tree), "commit", "-qm", "mv")
+    changed = await worktree.changed_paths(str(tree), "main")
+    assert sorted(changed) == ["docs/core.md", "src/core.py"]
+    paths = coder_seam.parse_test_paths({"docs/**": "skip", "src/**": "pytest"})
+    assert coder_seam.select_oracle(paths, changed, "gate-cmd")[0] == ["pytest"]
+
+
+async def test_R2_changed_paths_with_no_base_uses_the_remote_default_branch(tmp_path):
+    tree = _clone_with_origin(tmp_path)
+    _commit(tree, "src/a.py")  # committed, so a HEAD-only diff would miss it
+    assert await worktree.changed_paths(str(tree), "") == ["src/a.py"]
+
+
+def test_R3_the_oracle_guard_is_re_evaluated_not_sticky(monkeypatch):
+    """One cold first preflight used to switch solve() off for the life of the process."""
+    _solve_on(monkeypatch)
+    lp = BoardLoop({"local_gate_cmd": "pytest", "coder_solve_test_timeout_s": 300})
+    card = {"acceptance_criteria": _AC}
+    lp._record_gate_seconds("default", 400.0, False)  # cold first preflight
+    assert lp._use_coder_solve(card) is False and "default" in lp._oracle_unwinnable
+    lp._record_gate_seconds("default", 60.0, False)  # the next commit measured fast
+    assert lp._use_coder_solve(card) is True and "default" not in lp._oracle_unwinnable
+
+
+def test_R3b_a_tripped_breaker_lifts_when_the_budget_is_raised_or_the_gate_measures_under_it(monkeypatch):
+    _solve_on(monkeypatch)
+    card = {"acceptance_criteria": _AC}
+    lp = BoardLoop({"local_gate_cmd": "pytest", "coder_solve_test_timeout_s": 300})
+    lp._oracle_tripped["default"] = (300.0, 10.0)
+    assert lp._use_coder_solve(card) is False
+    lp._record_gate_seconds("default", 90.0, False)  # a fresh measurement, under budget
+    assert lp._use_coder_solve(card) is True
+    raised = BoardLoop({"local_gate_cmd": "pytest", "coder_solve_test_timeout_s": 900})
+    raised._oracle_tripped["default"] = (300.0, 10.0)  # tripped under the old, smaller budget
+    assert raised._use_coder_solve(card) is True
+
+
+@posix_only
+async def test_R4_a_timeout_never_releases_a_project_held_for_a_red_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(worktree, "base_checkout_dirt", _clean)
+    repo = _repo(tmp_path / "r")
+    lp = _loop({"repo": str(repo), "local_gate_cmd": "echo red; exit 1", "preflight_timeout_s": 1})
+    await lp._preflight("default", "echo red; exit 1", str(repo), "main")
+    assert isinstance(lp._preflight_state["default"], str)
+    await asyncio.wait_for(lp._preflight("default", "echo red; sleep 5; exit 1", str(repo), "main"), timeout=20)
+    assert isinstance(lp._preflight_state["default"], str)  # still held
+    assert "default" not in lp._preflight_sha  # not cached: the throttled re-check keeps running
+
+
+@posix_only
+async def test_R5_a_superseded_run_cannot_overwrite_the_new_verdict(tmp_path, monkeypatch):
+    monkeypatch.setattr(worktree, "base_checkout_dirt", _clean)
+    repo = _repo(tmp_path / "r")
+    lp = _loop({"repo": str(repo)})
+    old = lp._start_preflight("default", "sleep 1; echo oldred; exit 1", str(repo), "main")
+    new = lp._start_preflight("default", "true", str(repo), "main")
+    await asyncio.wait_for(asyncio.gather(old, new), timeout=20)
+    assert lp._preflight_state["default"] is True  # the new command's green stands
+
+
+def test_R6_a_missing_top_rung_climbs_to_the_nearest_rung_not_the_base_coder():
+    lp = BoardLoop({"coder": "base", "coders": {"smart": "base", "reasoning": "mid", "opus": "top"}})
+    lp._resolve_delegate = lambda name, expect: None if name == "top" else name
+    assert lp._live_rung("opus", ["top"], lp._coders_for({})) == ["mid"]
+    lp._resolve_delegate = lambda name, expect: None if name in ("mid", "top") else name
+    assert lp._live_rung("reasoning", ["mid"], lp._coders_for({})) == ["base"]  # nothing stronger live
+
+
+def test_R6b_the_fallback_warning_is_logged_once(caplog):
+    lp = BoardLoop({"coder": "base", "coders": {"smart": "base", "reasoning": "mid", "opus": "top"}})
+    lp._resolve_delegate = lambda name, expect: None if name == "top" else name
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        for _ in range(3):
+            lp._live_rung("opus", ["top"], lp._coders_for({}))
+    assert len([r for r in caplog.records if "dispatching 'mid' instead" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "names delegate 'top'" in r.getMessage()]) == 1
+
+
+@posix_only
+async def test_concurrent_best_of_k_timeouts_count_as_one_round(tmp_path):
+    """k copies of a heavy gate verified at once can all time out from contention alone.
+    That is one round. The breaker needs a later, separate run to time out too."""
+    wts = []
+    for i in range(4):
+        wt = tmp_path / f"g{i}"
+        wt.mkdir()
+        wts.append(str(wt))
+    ad = _adapter(tmp_path, test_cmd="sleep 30", test_timeout=0.5)
+    verdicts = await asyncio.wait_for(asyncio.gather(*(ad.verify(w) for w in wts[:3])), timeout=20)
+    assert all(v.passed is False for v in verdicts)  # three timeouts, one round: no block
+    with pytest.raises(coder_seam.OracleTimeout, match="in 2 separate rounds"):
+        await asyncio.wait_for(ad.verify(wts[3]), timeout=20)
+
+
+async def test_an_all_skip_pass_is_loud(tmp_path, monkeypatch, caplog):
+    async def _changed(tree, base=""):
+        return ["docs/a.md"]
+
+    monkeypatch.setattr(worktree, "changed_paths", _changed)
+    wt = tmp_path / "g1"
+    wt.mkdir()
+    ad = _adapter(tmp_path, test_cmd="exit 1", test_timeout=10, test_paths=[("docs/**", "")])
+    with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
+        verdict = await ad.verify(str(wt))
+    assert verdict.passed is True and verdict.total == 0 and "passed without tests" in verdict.output
+    assert any("PASSED WITHOUT TESTS" in r.getMessage() for r in caplog.records)

@@ -670,15 +670,23 @@ async def changed_paths(tree: str, base: str = "") -> list[str] | None:
     ``coder.solve()``'s path-scoped oracle (#459) uses this to pick which test command a
     candidate needs. The fork point is ``merge-base HEAD origin/<base>``, falling back to the
     local ``<base>`` and then to ``HEAD``. So a candidate that commits its work and one that
-    leaves it uncommitted both report the same files."""
+    leaves it uncommitted both report the same files. With no ``base`` the fork point is
+    the merge-base with the remote's default branch (``origin/HEAD``), then with the
+    branch's upstream (#467 review).
+
+    A rename or a deletion lists BOTH sides (#467 review). `git mv src/core.py docs/core.md`
+    changes what `src/**` tests cover, and diff's rename detection would report only the
+    new name. So ``--no-renames`` is used: the move is listed as a deleted ``src/core.py``
+    plus a new ``docs/core.md``."""
     try:
         fork = ""
-        for ref in (f"origin/{base}", base) if base else ():
+        refs = (f"origin/{base}", base) if base else ("origin/HEAD", "@{upstream}")
+        for ref in refs:
             rc, out, _err = await _git(tree, "merge-base", "HEAD", ref)
             if rc == 0 and out.strip():
                 fork = out.strip()
                 break
-        rc, out, _err = await _git(tree, "diff", "--name-only", "-z", fork or "HEAD", "--")
+        rc, out, _err = await _git(tree, "diff", "--name-only", "--no-renames", "-z", fork or "HEAD", "--")
         if rc != 0:
             return None
         rc_u, untracked, _err = await _git(tree, "ls-files", "--others", "--exclude-standard", "-z")

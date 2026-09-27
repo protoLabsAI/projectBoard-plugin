@@ -275,8 +275,10 @@ non-answer. Now:
 
 - One preflight per project runs at a time. A second caller (the tick and a
   `board_dispatch` together) waits for the run in flight.
-- A pass, or a timeout, is kept for the checkout's commit. The check runs again only when
-  the checkout moves, and then in the background while dispatch goes on.
+- A pass, or a timeout, is kept for the checkout's commit: the local `HEAD` the gate
+  runs in, not `origin/<base>`. The check runs again only when the checkout moves, and
+  then in the background while dispatch goes on. A timeout never releases a project
+  already held for a red gate.
 - A timed-out project is logged once, and shown as `preflight.slow` on `/status` and in the
   setup advisories. The fix is a cheap `preflight_cmd`.
 
@@ -288,10 +290,12 @@ spent 15 generations on "acceptance tests timed out after 300s". It was then blo
 
 - **The oracle guard.** If the preflight measured the gate as slower than the solve
   timeout, and the oracle is the gate fallback, the project's cards skip solve() and take
-  the plain coder path. The pre-PR gate still runs. `/status` shows the project under
+  the plain coder path. The guard is re-evaluated on every card, so a faster measurement or a raised
+  budget turns solve() back on. The pre-PR gate still runs. `/status` shows the project under
   `preflight.unwinnable_oracle`.
-- **The timeout breaker.** When two candidates time out on the same command, the ladder
-  stops. The card blocks as `oracle-timeout` with no tier climb. That class is not
+- **The timeout breaker.** When the same command times out in two separate rounds of
+  candidates, the ladder stops. Concurrent best-of-k timeouts count as one round, since
+  they may only be competing for the machine. The card blocks as `oracle-timeout` with no tier climb. That class is not
   self-healing, so the sweep tells the operator and leaves the card alone. The #146 breaker
   keys on an identical assertion, and a timeout has none, so it never tripped here.
 - **Path-scoped oracles.** `coder_solve_test_paths` picks each candidate's commands from
