@@ -66,7 +66,13 @@ _PROJECT_SETTING_KEYS = (
     "setup_cmd",
     "env_passthrough",
     "release_freeze",
+    "breadth_exclude",
+    "hot_files",
 )
+# Card-authoring policy (#455, #458) that a top-level value sets for EVERY project, an
+# entry's own value overriding it — the `release_freeze` posture. (The execution keys
+# above deliberately don't inherit: a gate command or a ladder belongs to one repo.)
+_INHERITED_SETTING_KEYS = ("breadth_exclude", "hot_files")
 _CODER_SOLVE_PREFIX = "coder_solve_"
 
 
@@ -138,7 +144,12 @@ def resolve_projects(cfg: dict) -> dict[str, dict]:
     cfg = dict(cfg or {})
     raw = cfg.get("projects")
     if isinstance(raw, dict) and raw:
-        return {str(name): _resolve_project_entry(str(name), settings) for name, settings in raw.items()}
+        out = {str(name): _resolve_project_entry(str(name), settings) for name, settings in raw.items()}
+        for entry in out.values():
+            for key in _INHERITED_SETTING_KEYS:
+                if key not in entry and key in cfg:
+                    entry[key] = cfg[key]
+        return out
     name = str(cfg.get("default_project") or "").strip() or IMPLICIT_PROJECT_NAME
     return {name: _synthesize_implicit_project(name, cfg)}
 

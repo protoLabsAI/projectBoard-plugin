@@ -60,8 +60,11 @@ A bare `release:<repo>@<range>` on a repo that tags per package (changesets) is
    - **plain `v*` tags / releases**: `contains:` works too, since it falls back to the
      `v<version>` tag. Otherwise gate on `release:`.
 2. **Write the change card** in the producing project. Include the changeset in
-   `files_to_modify` (`.changeset/<slug>.md (new)`), and say in the spec which packages
-   bump and at what level.
+   `files_to_modify` (`.changeset/<slug>.md (new)`: the `(new)` marker, because the file
+   doesn't exist yet), and say in the spec which packages bump and at what level. Name the
+   committed build output the change regenerates (`dist/…`) too. By default neither the
+   changeset nor `dist/` counts toward the breadth cap (`breadth_exclude`), so they don't
+   force a split. Check the create's `ready_check` before marking it ready.
 3. **Write the consumer card** in the consuming project with
    `waits_for="npm:<package>@contains:<owner>/<repo>@<change card id>"`. One gate per
    package the consumer needs from that change. Its spec says to bump the dependency to

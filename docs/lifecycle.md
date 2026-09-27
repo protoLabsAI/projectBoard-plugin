@@ -18,6 +18,54 @@ bad card and its history visible instead of pretending it shipped. `blocked` is 
 not a lane**: the card keeps its underlying state, stays on the board with its reason
 visible, and is skipped by the puller until cleared.
 
+## The Ready gate: dry-run at authoring, enforced at `mark_ready`
+
+`backlog → ready` is the one edge an author controls, and the gate on it refuses a card a
+coder could not finish. Its checks, all judged from the card and the board alone:
+
+| Gate | Refuses when | Fix |
+|---|---|---|
+| `required-fields` | no `spec`, `acceptance_criteria`, or (for a coding feature) `files_to_modify` | fill them with `board_update_feature` |
+| `phantom-paths` | a `files_to_modify` path doesn't exist in the card's project repo and isn't marked `(new)` | correct it, or mark a file the card creates: `.changeset/x.md (new)` |
+| `breadth` | more COUNTED files than `max_files_by_difficulty` allows (small/medium 4, large 6) | split the card; files matching `breadth_exclude` (changesets, lockfiles, `dist/`, …) don't count |
+| `design` | a `large`/`architectural` card has no design, or one citing no ADR | write the ADR and cite it |
+| `shared-file` | another open card of the same project names one of its files, with no `depends_on` path between them | chain them, earliest first |
+
+Two properties make this cheap to satisfy, and both come from a live pilot where each card
+was created, refused, fixed, refused again for a different reason, and finally split (#455):
+
+- **Every failure at once.** `board_mark_ready` names every failed check in one refusal,
+  each with its fix, not the first one it meets.
+- **At authoring, not only at promotion.** `board_create_feature` and
+  `board_update_feature` run the same checks as a dry run and return them as `ready_check`
+  (`will_be_refused_at_ready: [...]`). The card is still written, so no work is lost.
+  `board_check_ready` (`GET /features/{fid}/ready-check`) asks at any time and changes
+  nothing. Dependency sanity rides along as an advisory that refuses nothing: an edge onto a
+  cancelled card released without its work ever landing.
+
+**Shared files are serialised by a path, not an edge (#458).** Two cards editing one file
+must not build in parallel off the same base, so one must wait for the other to merge. Any
+`depends_on` path through open cards does that, in either direction: in a chain
+`E → D → C → B → A`, A and E are ordered because E cannot start before D merges, and so
+on down. Five cards on one `package.json` need four edges, not ten. A path through a
+`done` or `cancelled` card doesn't count, because that card's edge has already released.
+The refusal lists every unserialised pair on the contended files, the card's own and its
+neighbours', and `suggested_edges`: one chain per file, adding only the edges that aren't
+implied already. The order respects the existing edges, then puts the furthest-along card
+first (in review, building, ready, backlog), then creation order. A card already past
+`ready` is never made the dependent: `br close` refuses a card with an open blocker, so it
+would sit in review with its PR merged. Two cards already building on the same file can't
+be ordered by an edge at all; they're reported as `in_flight_pairs`, to be resolved by
+letting one merge or blocking one.
+
+Because a path can run through a third card, **cancelling a card keeps the order it
+carried**. Before its edges drop, every open dependent that hasn't started building gets a
+direct edge onto each of the cancelled card's open blockers (`C → B → A` becomes `C → A`
+when B is cancelled), noted on the dependent and reported as `rewired_deps`. Removing an
+edge by hand (`DELETE /features/{fid}/dep`) has no such repair. Re-run `board_check_ready`
+on the cards involved. A project can list `hot_files` that the board chains at create time, so the edges
+never need writing by hand. Both settings are in [`configuration.md`](configuration.md).
+
 ## The review sub-state machine
 
 When `review_gate` is on, an `in_review` card carries exactly one review sub-state as a

@@ -49,6 +49,12 @@ coder (you have no shell of your own), and you *board* the work that needs judgm
    - a grounding doc — by convention `PROTO.md` (or its `CLAUDE.md` / `AGENTS.md` pointers, or a conventions section in the README);
    - the git remote, default branch, whether the repo **homepage** is set to the
      deployed-site URL (`gh repo view --json homepageUrl`), and any PR-triggered CI workflow.
+   - **card-sizing traps** for the report: committed generated output outside `dist/`
+     (e.g. `src/generated/`), and files nearly every change touches (a workspace
+     `package.json`, a barrel `index.ts`). The first inflate the breadth count unless the
+     project's `breadth_exclude` lists them; the second need a `depends_on` chain across
+     every card unless the project lists them in `hot_files`. Both are operator config.
+     Recommend the globs in the report; don't write config yourself.
 
 2. **Auto-fix the safe, deterministic gaps** — one `delegate_to(coder, …)` with a precise brief to, only as needed:
    - `br init` (and commit) if there is no `.beads/` — **this is a bootstrap step, not a board feature** (the board can't hold a feature until beads exists);

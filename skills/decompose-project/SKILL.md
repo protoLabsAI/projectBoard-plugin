@@ -15,6 +15,8 @@ tools:
   - write_file      # write planning docs to the tree (project must be read-write)
   - board_create_epic
   - board_create_feature
+  - board_update_feature   # repair what the create's ready_check reports
+  - board_check_ready      # re-run the Ready gate dry run, changing nothing
   - board_mark_ready
   - board_list
   - request_user_input   # the per-epic human approval gate
@@ -68,6 +70,20 @@ to fan out, but keep the propose→attack pairing for each.
    difficulty=…, depends_on="<blocking feature ids>", foundation=<true|false>)`.
    **`files_to_modify` is required by the Ready gate** — name the exact paths, and
    write the spec imperatively (a vague task makes a coder produce nothing).
+   - A file the feature **creates** carries `(new)` after its path
+     (`src/Badge.test.tsx (new)`, `.changeset/badge-subtle.md (new)`); every other path
+     must already exist in the project's repo, or the gate refuses it.
+   - List generated and boilerplate files too (committed `dist/` output, a lockfile, the
+     changeset): the coder needs them. The project's `breadth_exclude` globs keep them out
+     of the breadth count (small/medium 4 files, large 6), so size a card by the files
+     someone actually authors. Past the cap, split the feature.
+   - Features that edit the **same file** must be ordered by a `depends_on` path. Chain
+     them in the order they should land (B depends on A, C on B); a chain orders every
+     pair on it, so N features need N-1 edges.
+   - **Read the reply's `ready_check`.** It dry-runs every Ready check now. If `ok` is
+     false, `will_be_refused_at_ready` lists every failure with its fix and
+     `suggested_edges` the missing chain edges. Repair them with `board_update_feature`
+     before the human gate, so approval isn't followed by a round of refusals.
    Foundation edges are just `depends_on` on the foundation feature; set
    `foundation=True` on a shared-structure feature so dependents always gate on its
    **merge** (under `dep_gate: review`, non-foundation blockers release dependents at
@@ -80,8 +96,10 @@ to fan out, but keep the propose→attack pairing for each.
    criteria, deps, which are foundations) and call `request_user_input` to ask the
    operator to approve, amend, or reject **before any feature goes `ready`**. This is
    the single highest-ROI checkpoint — do not skip it.
-5. On approval, `board_mark_ready` each approved feature (the Ready gate re-checks
-   spec + acceptance_criteria). The board loop now builds them.
+5. On approval, `board_mark_ready` each approved feature. The Ready gate re-checks
+   everything the dry run reported, and names every failure at once. `board_check_ready`
+   re-runs the dry run without promoting, if you edited cards since. The board loop now
+   builds them.
 6. **Do not decompose the next epic until this one is approved** (and ideally its
    first slice has built green) — tighter feedback, no over-planning. Repeat from 3.
 
