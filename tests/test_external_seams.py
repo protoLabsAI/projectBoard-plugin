@@ -134,7 +134,25 @@ WORKTREE_SEAMS: dict[str, str] = {
     "stage_all": "REAL",
     "_tree_status": "REAL",
     "_unique_commits": "REAL",
+    # The release-freeze reads (release_freeze.py): `remote_branches` against a real bare
+    # origin (plain git), `open_pr_heads` / `active_workflow_runs` against real GitHub in the
+    # real-gh job — all in tests/test_publish_gate_real.py.
+    "active_workflow_runs": "REAL",
+    "open_pr_heads": "REAL",
+    "remote_branches": "REAL",
 }
+
+# gates.py — publish gates (`waits_for`). Two seams reach the outside: `_http_get_json`
+# (the npm registry) and `_gh_json` (`gh api`). Every evaluator that calls one is REAL:
+# tests/test_publish_gate_real.py drives each against the live registry / GitHub —
+# `eval_npm` under PB_REQUIRE_NPM, `eval_release` / `eval_pr` under the real-gh tier's
+# PB_REQUIRE_GH — in the CI job that has both (the `test (real gh)` job).
+GATES_SEAMS: dict[str, str] = {
+    "eval_npm": "REAL",
+    "eval_pr": "REAL",
+    "eval_release": "REAL",
+}
+MAX_UNCOVERED_GATES = 0
 
 # store.py — shells `br`. This is the strong tier: CI runs a real pinned binary across
 # a version matrix (0.1.23 / 0.2.16 / 0.3.2) with PB_REQUIRE_BR=1 so an absent binary
@@ -279,6 +297,25 @@ def test_every_worktree_external_seam_is_classified():
     _classify(WORKTREE_SEAMS, _external_seams("worktree.py", {"_gh", "_git"}, ("_git",)), "worktree.py")
 
 
+def test_every_gates_external_seam_is_classified():
+    _classify(GATES_SEAMS, _external_seams("gates.py", {"_http_get_json", "_gh_json"}), "gates.py")
+
+
+def test_gates_seams_are_all_covered_and_the_real_tier_cannot_skip_in_ci():
+    """The publish-gate evaluators exist ONLY to read npm / GitHub, so a mocked test is
+    the #353 shape. None may be UNCOVERED, the real tier must be gated by env the CI job
+    sets (an absent registry/credential FAILS there), and CI must run the file."""
+    assert sum(1 for v in GATES_SEAMS.values() if v == "UNCOVERED") <= MAX_UNCOVERED_GATES == 0
+    tier = (_ROOT / "tests" / "test_publish_gate_real.py").read_text()
+    for name in GATES_SEAMS:
+        assert f"gates.{name}(" in tier, f"{name} is REAL but the real tier never calls gates.{name}("
+    for name in ("remote_branches", "open_pr_heads", "active_workflow_runs"):
+        assert f"worktree.{name}(" in tier, f"{name} is REAL but the real tier never calls worktree.{name}("
+    assert "PB_REQUIRE_NPM" in tier and "PB_REQUIRE_GH" in tier
+    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert "tests/test_publish_gate_real.py" in ci and "PB_REQUIRE_NPM" in ci
+
+
 def test_every_store_external_seam_is_classified():
     _classify(STORE_SEAMS, _external_seams("store.py", {"_run"}), "store.py")
 
@@ -315,13 +352,15 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_30_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 30 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_33_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 33 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
     tests/test_stranded_work_405.py; and the 29th and 30th #427's ``commits_ahead`` and
-    ``own_worktree``, in tests/test_salvage_427.py.
+    ``own_worktree``, in tests/test_salvage_427.py; the 31st to 33rd the release-freeze reads
+    (``remote_branches``, ``open_pr_heads``, ``active_workflow_runs``), in
+    tests/test_publish_gate_real.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -339,7 +378,7 @@ def test_worktree_coverage_contract_is_30_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 30, f"expected 30 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 33, f"expected 33 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"
@@ -436,7 +475,7 @@ def test_no_real_worktree_seam_creates_closes_or_promotes_a_pr():
 
 
 def test_registry_values_are_wellformed():
-    for name, value in {**WORKTREE_SEAMS, **STORE_SEAMS}.items():
+    for name, value in {**WORKTREE_SEAMS, **STORE_SEAMS, **GATES_SEAMS}.items():
         assert value == "REAL" or value == "UNCOVERED" or value.startswith("EXEMPT: "), (
             f"{name}: {value!r} is not a valid classification. Use REAL, UNCOVERED, or "
             f"'EXEMPT: <reason>' — an exemption without a stated reason is not one."

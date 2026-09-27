@@ -50,6 +50,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from . import _TERMINAL_STATES, br_fetch, work_snapshot
+from . import gates as publish_gates
+from . import release_freeze
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -514,6 +516,13 @@ _SOURCE_ISSUE_SLUG_RE = re.compile(r"[^/\s#]+/[^/\s#]+#\d+")
 # distinguishable from completion (a coder satisfying two of five requirements no
 # longer produces the same board state as one satisfying five).
 NOTES_REQ_PREFIX = "req:"
+# Publish gates (`waits_for`): one `waits-for: <spec>` line per external condition the
+# card waits on (gates.py has the grammar). NOT a label: beads caps a label at 50 chars
+# and refuses the whole `br update` past it (#353), and a real spec
+# (`npm:@protolabsai/ui@>=0.63.0 <1.0.0-0`) is routinely longer — and carries `/`, `#`,
+# `@`, spaces and `<`, which the label validator would refuse on its own. The notes
+# field has none of those limits and already carries structured lines.
+NOTES_WAITS_PREFIX = "waits-for:"
 REQ_CLOSED_STATUSES = ("done", "declined")
 # A markdown bullet (-/*/+ or `1.`/`1)`) opens a new requirement item; anything else
 # is a continuation of the current one (or, with no bullets at all, plain prose = ONE item).
@@ -1034,7 +1043,7 @@ def validate_priority(raw) -> int:
     return priority
 
 
-def _render_notes(files, source_issue: str = "", requirements=()) -> str:
+def _render_notes(files, source_issue: str = "", requirements=(), waits_for=()) -> str:
     """Serialize the bead `notes` field: one files_to_modify path per line, one
     `req: {…json…}` requirement-item line per ledger entry (#113), plus a trailing
     `source-issue: owner/repo#N` metadata line when set — the single shared home
@@ -1043,6 +1052,9 @@ def _render_notes(files, source_issue: str = "", requirements=()) -> str:
     lines = [str(p).strip() for p in files or () if str(p).strip()]
     for item in requirements or ():
         lines.append(f"{NOTES_REQ_PREFIX} {json.dumps(item, ensure_ascii=False, sort_keys=True)}")
+    for spec in waits_for or ():
+        if str(spec).strip():
+            lines.append(f"{NOTES_WAITS_PREFIX} {str(spec).strip()}")
     if source_issue:
         lines.append(f"{NOTES_SOURCE_PREFIX} {source_issue}")
     return "\n".join(lines)
@@ -1065,6 +1077,8 @@ def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
         if s.startswith(NOTES_SOURCE_PREFIX):
             src = src or s[len(NOTES_SOURCE_PREFIX) :].strip()
             continue
+        if s.startswith(NOTES_WAITS_PREFIX):
+            continue  # a publish gate, read by _waits_from_notes — never a file path
         if s.startswith(NOTES_REQ_PREFIX):
             try:
                 item = json.loads(s[len(NOTES_REQ_PREFIX) :].strip())
@@ -1075,6 +1089,28 @@ def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
             continue
         files.append(s)
     return files, src, reqs
+
+
+def _waits_from_notes(notes) -> list[str]:
+    """The ``waits-for:`` publish-gate specs in the bead ``notes`` field, in order."""
+    out: list[str] = []
+    for line in str(notes or "").splitlines():
+        s = line.strip()
+        if s.startswith(NOTES_WAITS_PREFIX):
+            spec = s[len(NOTES_WAITS_PREFIX) :].strip()
+            if spec and spec not in out:
+                out.append(spec)
+    return out
+
+
+def _normalize_waits(raw) -> list[str]:
+    """Validate + canonicalize ``waits_for`` (comma-separated text or a list) BEFORE
+    anything is written — an unparseable spec refuses the write with a named error
+    rather than sitting on a card as a gate that can never be met."""
+    try:
+        return publish_gates.normalize_specs(raw)
+    except publish_gates.GateSpecError as exc:
+        raise BoardError(str(exc)) from None
 
 
 def _parse_closed_at(raw) -> float | None:
@@ -1504,6 +1540,7 @@ class BeadsBoard:
         project: str = "",
         issue_type: str = "feature",
         assignee: str = "",
+        waits_for=(),
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -1518,10 +1555,12 @@ class BeadsBoard:
         `issue_type` mints the bead as a `feature` (the default) or a `task` (#217) — a
         task rides the SAME rails but ships a deliverable instead of a PR, so it needs no
         files_to_modify (see `_prepare_ready`); `assignee` pre-assigns the bead (else it
-        starts unassigned and the puller claims it)."""
+        starts unassigned and the puller claims it). `waits_for` names publish gates
+        (gates.py grammar) that must ALL hold before the loop claims the card."""
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
+        waits = _normalize_waits(waits_for)
         proj = normalize_project(project or self.default_project)
         fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
@@ -1540,15 +1579,18 @@ class BeadsBoard:
             upd += [f"--design={design}"]
             enriched.append("design")
         files = [str(p).strip() for p in files_to_modify or () if str(p).strip()]
-        if files or src:
+        if files or src or waits:
             # files_to_modify + the source-issue record SHARE the bead `notes` field
             # (one path per line, the metadata line last — see _render_notes): the
-            # source can't be a label (its `/`/`#` fail beads' label validator, #101).
-            upd += [f"--notes={_render_notes(files, src)}"]
+            # source can't be a label (its `/`/`#` fail beads' label validator, #101),
+            # and neither can a publish gate (length + charset, see NOTES_WAITS_PREFIX).
+            upd += [f"--notes={_render_notes(files, src, (), waits)}"]
             if files:
                 enriched.append("files_to_modify")
             if src:
                 enriched.append("source_issue")
+            if waits:
+                enriched.append("waits_for")
         diff = difficulty.strip().lower()
         if diff:
             # normalize first, then guard: a whitespace-only difficulty must NOT stamp a
@@ -1743,6 +1785,7 @@ class BeadsBoard:
                     depends_on=(),  # wired in phase 2, once every plan-item id is known
                     foundation=bool(item.get("foundation", False)),
                     source_issue=str(item.get("source_issue") or ""),
+                    waits_for=item.get("waits_for") or (),
                 )
             except BoardError as exc:
                 results.append({"index": i, "created": False, "title": title, "error": str(exc)})
@@ -1839,6 +1882,7 @@ class BeadsBoard:
         foundation: bool | None = None,
         source_issue: str | None = None,
         priority: int | None = None,
+        waits_for=None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -1853,8 +1897,11 @@ class BeadsBoard:
         contract. ``source_issue`` (a full GitHub issue URL or ``owner/repo#N``)
         sets/replaces the originating-issue record the PR opener stamps as
         ``Fixes #N`` (#97). ``priority`` changes the scheduling rank in place
-        when supplied; None leaves the current priority untouched."""
+        when supplied; None leaves the current priority untouched. ``waits_for``
+        REPLACES the card's publish gates (a list or comma-separated text; an empty list
+        clears them); None leaves them untouched."""
         f = self._require(fid)
+        new_waits = _normalize_waits(waits_for) if waits_for is not None else None
         args = ["update", fid]
         # Free-text VALUES ride in `--flag=value` form so a value STARTING WITH '-' (a
         # markdown bullet, a leading-dash path) can't be mis-parsed as a CLI option and
@@ -1871,7 +1918,7 @@ class BeadsBoard:
         if priority is not None:
             args += ["-p", str(validate_priority(priority))]
         set_source = source_issue is not None and str(source_issue).strip()
-        if files_to_modify is not None or set_source:
+        if files_to_modify is not None or set_source or new_waits is not None:
             # files_to_modify + source_issue + the requirement ledger SHARE the bead
             # `notes` field (labels can't carry the source's `/`/`#`, #101; the
             # ledger rides the same structured lines, #113), and `br update --notes`
@@ -1887,7 +1934,8 @@ class BeadsBoard:
                 else f.get("files_to_modify") or []
             )
             src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
-            args += [f"--notes={_render_notes(files, src, f.get('requirements') or [])}"]
+            waits = new_waits if new_waits is not None else list(f.get("waits_for") or [])
+            args += [f"--notes={_render_notes(files, src, f.get('requirements') or [], waits)}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
@@ -2067,7 +2115,10 @@ class BeadsBoard:
                 self._run(
                     "update",
                     fid,
-                    f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
+                    "--notes="
+                    + _render_notes(
+                        f.get("files_to_modify"), str(f.get("source_issue") or ""), items, f.get("waits_for") or ()
+                    ),
                 )
 
     # Label marking a card whose repeated timeouts already asked for a decomposition
@@ -3283,7 +3334,10 @@ class BeadsBoard:
         self._run(
             "update",
             fid,
-            f"--notes={_render_notes(f.get('files_to_modify'), str(f.get('source_issue') or ''), items)}",
+            "--notes="
+            + _render_notes(
+                f.get("files_to_modify"), str(f.get("source_issue") or ""), items, f.get("waits_for") or ()
+            ),
         )
         return self.get_feature(fid)
 
@@ -3945,6 +3999,9 @@ class BeadsBoard:
             "self_verified": LABEL_SELF_VERIFIED in labels,
             "source_issue": source_issue,
             "requirements": requirements,
+            # Publish gates (`waits_for`, gates.py): external conditions the loop checks
+            # before it claims the card. [] for an ungated card.
+            "waits_for": _waits_from_notes(bead.get("notes")),
             "project": project,
             "labels": labels,
             "repo": self.repo,
@@ -4419,6 +4476,35 @@ def stranded_posture(feature: dict, *, cancelled: frozenset | set = frozenset())
     return out
 
 
+# ── publish gates (`waits_for`) + release-freeze merge holds ──────────────────────
+# A pre-claim card (backlog/ready) whose publish gates are not all met reads
+# `waiting on publish: <what>` — from the gate CACHE the loop's ready sweep fills, never
+# a network read here. An in_review card the auto-merge edge held because its repo is
+# mid-release reads `held: release freeze (<evidence>)`.
+NEXT_ACTION_RELEASE_FREEZE_PREFIX = "held: release freeze"
+
+
+def publish_gate_posture(feature: dict) -> dict:
+    """``{"next_action", "awaiting_merge", "next_action_hint"}`` for a card waiting on an
+    unmet publish gate, else an empty next_action. Only a card the loop could still
+    claim (backlog/ready, not blocked) is "waiting" — past the claim, gates no longer
+    gate anything."""
+    out = {"next_action": "", "awaiting_merge": False, "next_action_hint": ""}
+    if not feature.get("waits_for") or feature.get("board_state") not in ("backlog", "ready") or feature.get("blocked"):
+        return out
+    sentence = publish_gates.unmet_sentence(publish_gates.card_status(feature))
+    if not sentence:
+        return out
+    out["next_action"] = sentence
+    out["next_action_hint"] = (
+        "the loop re-checks each gate while the card is ready (an unmet gate about every "
+        f"{int(publish_gates.UNMET_TTL_S)}s, a failed check with backoff) and claims it the moment all hold; "
+        f"board_check_gates {feature.get('id', '')} checks now"
+        + (" — a backlog card still needs board_mark_ready" if feature.get("board_state") == "backlog" else "")
+    )
+    return out
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — a coding ``in_review`` card from the board's config
@@ -4470,10 +4556,14 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         # by task_posture. Route it there FIRST so merge_posture's coding wording (`awaiting
         # review verdict (no review-clean)`) never lands on a task, while coding features keep
         # merge_posture's precedence unchanged (ADR 0078: task verification is a SEPARATE edge).
+        if f.get("waits_for"):
+            f["gates"] = publish_gates.card_status(f)  # cached verdicts, no network
         if f.get("issue_type") == LABEL_TASK:
             posture = task_posture(f, is_driven=is_driven)
             if not posture["next_action"]:
                 posture = stranded_posture(f, cancelled=cancelled)  # #406: a task waits on dependencies too
+            if not posture["next_action"]:
+                posture = publish_gate_posture(f)
             if posture["next_action"]:
                 f["next_action"] = posture["next_action"]
                 f["awaiting_merge"] = posture["awaiting_merge"]
@@ -4488,6 +4578,8 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
             if not posture["next_action"]:
                 posture = stranded_posture(f, cancelled=cancelled)
             if not posture["next_action"]:
+                posture = publish_gate_posture(f)
+            if not posture["next_action"]:
                 continue
         elif f.get("ci_status") == "failing" and posture["next_action"] in (
             NEXT_ACTION_AWAITING_MERGE,
@@ -4496,6 +4588,20 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
             NEXT_ACTION_DRAFT,
         ):
             posture = {"next_action": NEXT_ACTION_CI_FAILING, "awaiting_merge": False, "next_action_hint": ""}
+        elif posture["next_action"] == NEXT_ACTION_AUTO_MERGE_PENDING:
+            # The loop's merge edge found the card's repo mid-release and held the merge
+            # (release_freeze). Process state the loop records, read here without a call.
+            hold = release_freeze.hold_for(str(f.get("id") or ""))
+            if hold:
+                posture = {
+                    "next_action": f"{NEXT_ACTION_RELEASE_FREEZE_PREFIX} ({hold['evidence']})",
+                    "awaiting_merge": False,
+                    "next_action_hint": (
+                        "the repo is preparing a release, and a merge now would restart the release's checks — "
+                        "the loop re-checks every merge poll and merges once the freeze lifts "
+                        "(release_freeze in the project entry configures or disables this)"
+                    ),
+                }
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **23 of 68 keys are in this state, including `coders` and `projects`** —
+never renders it. **24 of 70 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -136,6 +136,46 @@ The gates between a green build and main.
 | `ci_fix_max` | `2` | reload |
 | `review_fix_max` | `2` | reload |
 | `auto_merge` | `False` | live |
+
+## Publish gates and the release freeze
+
+Two guards for cross-repo work. [Publish gates](publish-gates.md) has the full story and a
+worked example.
+
+| Key | Default | Applies |
+|---|---|---|
+| `release_freeze` | `—` | reload **· YAML only** |
+| `npm_token` | `""` | **restart** |
+
+**`release_freeze`** — before the auto-merge edge merges a PR, it asks the PR's repo
+whether a release is in flight and, if so, holds the merge (the card stays `in_review`
+reading `held: release freeze (<evidence>)`) until the freeze lifts. Set it in a
+`projects:` entry (or top level, as every project's fallback):
+
+- unset / `true` — the default patterns: an `origin` branch or an open PR head matching
+  `prepare-release*`, or an active run of `prepare-release.yml` (protoAgent's release
+  flow). A repo with none of those is never frozen, so leaving it on costs three reads per
+  otherwise-ready merge and nothing else.
+- `false` — off. **Use it for a changesets repo such as protoContent**: its release is a
+  bot-maintained "Version Packages" PR (`changeset-release/main`) that is open whenever any
+  changeset is pending, and merging other PRs meanwhile just folds their changesets into
+  it — a freeze on it would hold nearly every merge for nothing.
+- a list — each item is a glob matched against remote branches AND open PR heads, except
+  `workflow:<file>` items (or items ending `.yml`/`.yaml`), which name workflows whose
+  active runs freeze: `[release/*, workflow:release.yml]`.
+- a mapping — `{branches: [...], pr_heads: [...], workflows: [...]}`, each signal set
+  separately (an absent key turns that signal off). Use it for a repo that KEEPS its
+  release branches after merging, where a branch glob would freeze forever:
+  `{pr_heads: [prepare-release*], workflows: [prepare-release.yml]}`.
+
+A freeze check that errors (GitHub down, rate limited) HOLDS the merge with the error as
+evidence and retries next merge poll: a delayed merge costs one poll interval, a merge into
+a release in flight costs the release's whole check run.
+
+**`npm_token`** — a read token for `npm:` publish gates on PRIVATE packages. Blank reads
+the public registry anonymously, which is all a public package (`@protolabsai/ui`) needs.
+Stored in secrets.yaml; `PROJECT_BOARD_NPM_TOKEN`, then `NPM_TOKEN`, are read when it is
+blank.
 
 ## Housekeeping
 

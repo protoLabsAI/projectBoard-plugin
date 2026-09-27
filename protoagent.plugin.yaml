@@ -25,7 +25,7 @@ min_protoagent_version: "0.153.2"  # settings_tabs + sandboxed custom Configure 
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
-secrets: [webhook_secret]
+secrets: [webhook_secret, npm_token]
 config:
   coder: ""                 # acp delegate name the loop dispatches builds to. NO DEFAULT
                             # (v0.42.0): unset = the setup preflight fails `coder`, the host
@@ -243,6 +243,9 @@ config:
   webhook_secret: ""        # HMAC secret for every public mutation: /webhook/pr,
                             # /features/<id>/ci, and /review. Blank → all three fail
                             # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.
+  npm_token: ""             # OPTIONAL npm registry token for `waits_for: npm:…` publish gates
+                            # on PRIVATE packages. Blank = anonymous reads (public packages).
+                            # Or set PROJECT_BOARD_NPM_TOKEN (then NPM_TOKEN).
 
 # Configure-dialog information architecture (protoAgent #3179/#3180). `projects` is
 # plugin-owned UI because a keyed map is not an honest scalar field; the other tabs use
@@ -313,6 +316,8 @@ settings:
 
   - { key: webhook_secret, label: "Webhook secret", type: secret, group: "Project Board", tab: security, restart: true,
       description: "HMAC-SHA256 secret for public merge, CI, and review ingress. Blank disables every public mutation route. Stored in secrets.yaml." }
+  - { key: npm_token, label: "npm registry token", type: secret, group: "Project Board", tab: security, restart: true,
+      description: "Read token for npm publish gates (waits_for npm:...) on PRIVATE packages. Blank reads the public registry anonymously, which is all a public package needs. Stored in secrets.yaml; PROJECT_BOARD_NPM_TOKEN or NPM_TOKEN also work." }
 
 # Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
 # The list/Kanban view is a projection over the /features API (no separate store).

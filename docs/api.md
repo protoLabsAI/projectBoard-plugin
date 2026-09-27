@@ -26,9 +26,10 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `POST` | `/epics` | — |
 | `POST` | `/milestones` | — |
 | `GET` | `/features` | The board listing (`?state=`, `?project=`, `?include_archived=`). A task row carries a small delivery signal — `delivered` (the current round: in review or done), `deliverable_chars`, `delivered_by`, a ≤280-char `deliverable_preview`, and `last_deliverable_preview` for a task sent back from review — never the full deliverable (#399). |
-| `GET` | `/features/{fid}` | One card's full projection, including a task's whole `deliverable` and its `requirements` ledger. |
+| `GET` | `/features/{fid}` | One card's full projection, including a task's whole `deliverable`, its `requirements` ledger, its `waits_for` publish gates with their last-checked `gates` verdicts, and `next_action` when something other than a coder moves it. |
+| `POST` | `/features/{fid}/gates/check` | Re-check this card's publish gates (`waits_for`) against npm / GitHub now — the REST twin of `board_check_gates`. Returns `{id, waits_for, gates, clear}`; a failed check reads unmet with its `error` (fail closed). |
 | `GET` | `/features/{fid}/progress` | Live coder-monitoring snapshot (#84) for the board view's monitor drawer. |
-| `PATCH` | `/features/{fid}` | In-place spec edit — the REST complement of `board_update_feature`. Accepts `title`, `spec`, `acceptance_criteria`, `design`, `files_to_modify`, `difficulty`, `source_issue`; only non-null fields are… |
+| `PATCH` | `/features/{fid}` | In-place spec edit — the REST complement of `board_update_feature`. Accepts `title`, `spec`, `acceptance_criteria`, `design`, `files_to_modify`, `difficulty`, `priority`, `source_issue`, `waits_for` (replaces the publish gates; `[]` clears); only non-null fields are… |
 | `POST` | `/features` | Create a feature — the body is splatted into `store.create_feature`, so it accepts every create field, including `project` (#90): the entry in the board's `projects:` map the feature builds in, stampe… |
 | `POST` | `/features/batch` | Batch-create a whole decomposition (#92). Body: `{"plan": [{title, spec, acceptance_criteria, files, difficulty, depends_on, foundation, source_issue}, …], "mark_ready": false}`. All-or-report: a malf… |
 | `POST` | `/features/{fid}/dep` | Add a `blocks` edge: `fid` waits for `depends_on` to be merged→done. (Foundation gating is just a blocks-edge on the foundation feature.) |

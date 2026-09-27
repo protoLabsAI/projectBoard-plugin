@@ -162,4 +162,8 @@ jobs:
           PB_GH_ALLOW_WRITES: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         # tests/test_attach_pr_gh_402.py: the attach edge's `pr_identity` seam (#402), REAL in the
         # seam ratchet. It needs no `br`, so it runs here, where the fixture is.
-        run: pytest -q tests/test_worktree_gh.py tests/test_attach_pr_gh_402.py
+        # tests/test_publish_gate_real.py: the publish-gate evaluators (`waits_for`: npm registry
+        # + GitHub PR/release reads) and the release-freeze reads, REAL in the seam ratchet.
+        # PB_REQUIRE_NPM=1 turns an unreachable npm registry into a FAILURE, like PB_REQUIRE_GH.
+        # Its real-`br` round-trip tests skip here (no `br`) and run on every `br` leg above.
+        run: PB_REQUIRE_NPM=1 pytest -q tests/test_worktree_gh.py tests/test_attach_pr_gh_402.py tests/test_publish_gate_real.py
