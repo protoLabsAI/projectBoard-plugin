@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import shutil
 
 import pytest
@@ -76,6 +77,7 @@ class _Round:
 
         async def _create(repo, base, fid, root, title="", **kw):
             self.creates.append(kw.get("resume"))
+            os.makedirs(self.wt, exist_ok=True)  # the drive checks its tree is still there (#461)
             return (self.wt, "feat/" + fid)
 
         async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):

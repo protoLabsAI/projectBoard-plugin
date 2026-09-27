@@ -114,3 +114,21 @@ def publish_orphaned_cards(cards: list) -> None:
 def orphaned_cards_snapshot() -> list:
     """The orphaned cards the last sweep found — ``[]`` before the first sweep."""
     return [dict(c) for c in _health.get("orphaned_cards") or ()]
+
+
+def publish_claim_stall(reason: str) -> None:
+    """Called by the loop when its claim-stall signal changes (#462): the reason the board
+    is idle with ready work and a free slot, or "" once the claim scan runs again."""
+    _health["claim_stall"] = str(reason or "")
+
+
+def claim_stall_hint() -> str:
+    """The operator-facing line for a claim stall, "" when there is none (or no loop). It
+    rides ``/status`` as a setup/health gap: a board that stops claiming says why."""
+    reason = str(_health.get("claim_stall") or "")
+    if not reason:
+        return ""
+    return (
+        f"the board loop is not claiming ready work: {reason}. A per-card gate or review may be hung "
+        "(see the agent log for that phase); `board_dispatch` runs a claim scan now"
+    )

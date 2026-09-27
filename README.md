@@ -608,7 +608,10 @@ Where it surfaces:
   `coder` is live (applied by `reload()`), so it never goes stale. **`loop_restart_required`**
   is that drift made actionable: `true` only when the loop is configured **on** *and* running on a
   stale knob, so the "restart to apply" state is distinguished from a loop simply configured off
-  (which has nothing running to restart).
+  (which has nothing running to restart). **`claim_stall`** (top level, and as
+  `setup.claim_stall_hint`) is the #462 health gap: ready cards, a free drive slot, and no claim
+  scan finished for `claim_stall_ticks` ticks. It names the tick phase that is stuck and is
+  forwarded to the host as the `claim_stall` warning ([configuration](docs/configuration.md#concurrency)).
 - **The board page** renders each failing check with its hint (a warning card above the
   board, or in place of the raw error when the board can't be read at all).
 - **Host operator warnings** — each failing check is forwarded to the host's

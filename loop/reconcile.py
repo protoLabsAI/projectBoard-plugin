@@ -27,6 +27,27 @@ _SALVAGE_GATE_TAIL_CHARS = 3000
 _SALVAGE_GATE_MARKER = "<!-- project-board:salvage-gate -->"
 
 
+async def _within(coro, timeout: float):
+    """Await ``coro`` for at most ``timeout`` seconds, then give up on it — HARD (#462).
+
+    ``asyncio.wait_for`` waits for the cancelled call to actually finish, so a call that
+    ignores or swallows its cancel (a hung model stream inside a host client whose own
+    ``request_timeout`` did not apply, protoAgent#3699) held the review gate for 80 minutes.
+    Here a timeout cancels the call and returns at once; its eventual outcome is retrieved
+    and dropped. Raises ``asyncio.TimeoutError``."""
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieve it: no "never retrieved" noise
+    raise asyncio.TimeoutError
+
+
 def _gate_failure_block(gate_out: str) -> str:
     """The red gate's output for a PR body or comment — fenced with more backticks than any
     run in the output itself, so a test log that prints a code fence cannot break out of it."""
@@ -644,6 +665,8 @@ class ReconcileMixin:
         the ready lane is logged (``_report_stranded``)."""
         revision = work_snapshot.board_revision()
         features = store_mod.annotate_next_action(store.live_cards(), self.cfg)
+        # The claim-stall signal's "is there ready work?" (#462), from the read this already makes.
+        self._ready_count = sum(1 for f in features if f.get("board_state") == "ready" and not f.get("blocked"))
         for f in features:
             if f.get("blocked") and not f.get("next_action_hint"):
                 cls = str(f.get("blocked_class") or "").strip()
@@ -723,6 +746,8 @@ class ReconcileMixin:
         while not self._stop.is_set() and not self._shutting_down:
             if self._work_snapshot_due():
                 await self._publish_work_snapshot()
+            # Off the tick on purpose (#462): a tick stuck in one phase can't report its own stall.
+            self._check_claim_stall()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=_SNAPSHOT_POLL_S)
             except asyncio.TimeoutError:
@@ -883,8 +908,18 @@ class ReconcileMixin:
             # The old raw-id `get_feature` lookup failed every sweep and just warned
             # forever without ever reaping the candidate.
             fid = worktree.parent_feature_id(wtid)
-            if fid in self._inflight_files:
-                continue  # a live drive owns this worktree (or its candidates)
+            drive = _loop.live_drive(fid)
+            if (
+                fid in self._inflight_files
+                or drive is not None
+                or fid in self._card_tasks
+                or fid in self._review_inflight
+            ):
+                # Held by the loop (#461): a drive — stalled or not — a salvage, or this card's
+                # reconcile/merge gate/review. Never an orphan. A drive still running for a card
+                # that has since closed is the one exception, and it is retired, not reaped.
+                await self._retire_dead_drive(store, fid, drive)
+                continue
             try:
                 f = await asyncio.to_thread(store.get_feature, fid)
                 if f is None and not worktree.wt_id_is_exact(repo, self.root, wtid):
@@ -904,6 +939,19 @@ class ReconcileMixin:
                         )
                     continue
                 if f is None or f["board_state"] in ("done", "cancelled"):
+                    # The last word before a reap (#461): a process working in the tree — a
+                    # coder whose drive the registry lost, a gate, an operator's shell — means
+                    # it is in use, whatever the board says. Kept; the next sweep looks again.
+                    trees = [p for p, _b in worktree.feature_worktrees(repo, self.root, wtid)]
+                    busy = await worktree.processes_in_trees(trees)
+                    if busy:
+                        log.warning(
+                            "[project_board] sweep: kept worktree feat-%s — process(es) %s still working in %s",
+                            wtid,
+                            ", ".join(str(pid) for pids in busy.values() for pid in pids),
+                            ", ".join(busy),
+                        )
+                        continue
                     reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
                     if reaped:
                         self._reap_failures.pop(wtid, None)
@@ -926,6 +974,28 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
+    async def _retire_dead_drive(self, store, fid: str, drive) -> None:
+        """Cancel a drive still running for a card that is done, cancelled or gone (#461).
+        Its tree is not reaped here: the drive's own cancel edge saves and removes it, and a
+        leftover is reaped by a later sweep once no drive holds it. Best-effort."""
+        if drive is None or drive.done():
+            return
+        try:
+            f = await asyncio.to_thread(store.get_feature, fid)
+        except store_mod.BoardTimeout:
+            raise
+        except Exception:  # noqa: BLE001 — unreadable: leave the drive be
+            return
+        if f is not None and f.get("board_state") not in ("done", "cancelled"):
+            return
+        log.warning(
+            "[project_board] sweep: %s is %s but its drive is still running — cancelling the drive; its "
+            "worktree is reaped once it has stopped",
+            fid,
+            (f or {}).get("board_state") or "gone",
+        )
+        drive.cancel()
+
     # ── the PR reconcile (terminal-edge fallback to the webhook) ───────────────
     async def _maybe_reconcile(self):
         """Run the PR reconcile at most once per ``merge_poll_interval`` (and only when
@@ -936,15 +1006,24 @@ class ReconcileMixin:
         if now - self._last_poll < self.merge_poll_interval:
             return
         self._last_poll = now
-        await self._reconcile_prs()
+        # The tick only STARTS the per-card work (#462): each card's reconcile runs as its
+        # own tracked task, so a 600 s gate or a hung review can't hold up the claim scan.
+        await self._reconcile_prs(detach=True)
 
-    async def _reconcile_prs(self):
+    async def _reconcile_prs(self, *, detach: bool = False):
         """Reconcile each ``in_review`` feature against its PR's real state — the
         fallback to the webhook and the active half of the terminal edges (for
         deployments GitHub can't post a webhook to, where a feature would otherwise
         sit in_review forever): ``MERGED`` → done (+reap); ``CLOSED`` unmerged →
         Blocked for triage (+reap; the work was rejected, don't silently re-dispatch);
-        ``OPEN`` → leave it in review."""
+        ``OPEN`` → leave it in review.
+
+        Each card's reconcile runs as its OWN tracked task (#462), at most
+        ``reconcile_concurrency`` at once, and a card whose previous pass is still running
+        is skipped. ``detach`` (the tick) returns once they are started: before, one card's
+        600 s merged-state gate or a hung review call held the whole tick, and the board
+        claimed nothing for four hours with 32 cards ready. Without it (a direct call) the
+        pass is awaited to the end, and a stalled store still raises out of it."""
         store = self._store()
         # #196: blocked cards can carry a PR too (review-verify blocks, closed-PR triage,
         # manual flags) — a merged PR is ground truth for them exactly as for in_review,
@@ -953,7 +1032,50 @@ class ReconcileMixin:
         # the OPEN-branch gates (rebase/CI/review) must not run against held work.
         in_review = await self._list_for_pass(store, "in_review", "PR reconcile")
         blocked = await self._list_for_pass(store, "blocked", "PR reconcile")
-        for f in [*in_review, *blocked]:
+        started = [t for t in (self._start_card_work(store, f) for f in [*in_review, *blocked] if f.get("pr_url")) if t]
+        if detach or not started:
+            return
+        for outcome in await asyncio.gather(*started, return_exceptions=True):
+            if isinstance(outcome, store_mod.BoardTimeout):
+                raise outcome
+
+    def _start_card_work(self, store, f: dict):
+        """Start ``f``'s reconcile as a tracked task, or None while its last one still runs."""
+        fid = f["id"]
+        tasks = self._card_tasks
+        running = tasks.get(fid)
+        if running is not None and not running.done():
+            return None
+        task = asyncio.create_task(self._card_work(store, f), name=f"pb-card-{fid}")
+        tasks[fid] = task
+
+        def _done(t, fid=fid):
+            if tasks.get(fid) is t:
+                tasks.pop(fid, None)
+            if not t.cancelled():
+                t.exception()  # a detached card's stall is logged in _card_work; mark it seen
+
+        task.add_done_callback(_done)
+        return task
+
+    async def _card_work(self, store, f: dict):
+        """One card's reconcile, inside a ``reconcile_concurrency`` slot. A stall is this
+        card's, logged, and re-raised for an awaiting caller; the next poll tries again."""
+        if self._card_slots is None:
+            self._card_slots = asyncio.Semaphore(self.reconcile_concurrency)
+        async with self._card_slots:
+            try:
+                await self._reconcile_pr(store, f)
+            except store_mod.BoardTimeout as exc:
+                log.warning(
+                    "[project_board] reconcile for %s stalled on the board store — next poll retries: %s", f["id"], exc
+                )
+                raise
+
+    async def _reconcile_pr(self, store, f: dict):
+        """The per-card body of ``_reconcile_prs`` (#462), unchanged: a one-card loop, so
+        its ``continue`` still means "nothing further for this card this pass"."""
+        for f in (f,):  # noqa: B020 — see the docstring
             fid = f["id"]
             pr_url = f.get("pr_url")
             if not pr_url:
@@ -2242,7 +2364,7 @@ class ReconcileMixin:
                 prior = self._review_prior.get(fid)
                 if prior:
                     inputs["prior_findings"] = prior
-                result = await runner(self.review_workflow, inputs)
+                result = await _within(runner(self.review_workflow, inputs), self.review_gate_timeout)
                 failed = list((result or {}).get("failed") or [])
                 if failed:
                     # A partial panel is NOT a review (ADR 0078 D3): a starved/errored
@@ -2262,6 +2384,19 @@ class ReconcileMixin:
                 if output:
                     return output, None
                 return None, f"workflow {self.review_workflow!r} ran but produced no output"
+            except asyncio.TimeoutError:
+                # A hard cap of our own (#462): a hung model stream ignored the host client's
+                # request_timeout (protoAgent#3699) and held this gate for 80 minutes.
+                log.warning(
+                    "[project_board] %s review workflow %r did not finish in %ss — abandoned",
+                    fid,
+                    self.review_workflow,
+                    self.review_gate_timeout,
+                )
+                no_run_reason = (
+                    f"workflow {self.review_workflow!r} did not finish within review_gate_timeout_s="
+                    f"{self.review_gate_timeout:g}s"
+                )
             except Exception as exc:  # noqa: BLE001 — a dead workflow ≠ a dead loop
                 log.warning("[project_board] %s review workflow %r failed: %s", fid, self.review_workflow, exc)
                 no_run_reason = f"workflow {self.review_workflow!r} call failed: {exc}"
@@ -2284,10 +2419,21 @@ class ReconcileMixin:
                 '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '
                 "No findings → an empty array []."
             )
-            output = await ADAPTERS["a2a"].dispatch(reviewer, msg)
+            output = await _within(ADAPTERS["a2a"].dispatch(reviewer, msg), self.review_gate_timeout)
             if output is None:
                 return None, f"reviewer {self.reviewer_name!r} returned no output"
             return output, None
+        except asyncio.TimeoutError:
+            log.warning(
+                "[project_board] %s reviewer %r did not answer in %ss",
+                fid,
+                self.reviewer_name,
+                self.review_gate_timeout,
+            )
+            return (
+                None,
+                f"reviewer {self.reviewer_name!r} did not answer within review_gate_timeout_s={self.review_gate_timeout:g}s",
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("[project_board] %s reviewer fallback failed: %s", fid, exc)
             return None, f"reviewer {self.reviewer_name!r} call failed: {exc}"
@@ -2316,15 +2462,25 @@ class ReconcileMixin:
         """Run the pre-PR local gate (``local_gate_cmd``) in the worktree.
 
         Returns ``None`` when the gate passes (exit 0), when no gate is configured,
-        or when the gate itself couldn't run (timeout / unlaunchable command) — a
-        broken or flaky gate must never block otherwise-good work, so those degrade
-        to "pass" (CI is still the real gate). Returns the captured output (tail,
+        or when the gate itself couldn't run on a HEALTHY tree (timeout / unlaunchable
+        command) — a broken or flaky gate must never block otherwise-good work, so those
+        degrade to "pass" (CI is still the real gate). Returns the captured output (tail,
         truncated to ``local_gate_output_chars``) on a CLEAN non-zero exit, so the
         caller can hand it to the coder to fix. Resolves the gate command from the
-        feature's project when given (#90)."""
+        feature's project when given (#90).
+
+        Raises ``worktree.WorktreeMissing`` when the tree itself is gone — before the
+        gate could launch, or by the time it ended (#461). That is not a gate that could
+        not run; there is nothing left to publish, and "treating as pass" opened a PR
+        from a deleted directory."""
         cmd = self._local_gate_cmd_for(feature) if feature is not None else self.local_gate_cmd
         if not cmd:
             return None
+
+        def _gone(during: str) -> None:
+            if not os.path.isdir(wt):
+                raise worktree.WorktreeMissing(wt, during)
+
         try:
             proc = await worktree.spawn_shell(
                 cmd,
@@ -2333,15 +2489,23 @@ class ReconcileMixin:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
+        except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block…
+            _gone("the pre-PR gate could not launch in it")  # …unless there is no tree to gate
+            log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
+            return None
+        try:
             try:
                 # Kills the whole gate tree on a timeout or cancel (#423) — killing only
                 # the shell orphaned `pnpm install` behind every timed-out gate.
                 out, _ = await worktree.communicate_or_kill(proc, timeout=self.local_gate_timeout)
             except asyncio.TimeoutError:
+                _gone("removed while the pre-PR gate ran")
                 log.warning("[project_board] pre-PR gate timed out (%ss) — treating as pass", self.local_gate_timeout)
                 return None
             if proc.returncode == 0:
                 return None
+            # A red or killed gate over a tree that has since vanished judged nothing.
+            _gone("removed while the pre-PR gate ran")
             sig = killed_by_signal(proc.returncode)
             if sig is not None:
                 # Killed by a signal — an operator `kill`, the OOM killer, a wrapper whose
@@ -2366,6 +2530,8 @@ class ReconcileMixin:
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             return text or f"gate command exited {proc.returncode} with no output"
+        except worktree.WorktreeMissing:
+            raise
         except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block
             log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
             return None
