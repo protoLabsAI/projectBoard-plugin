@@ -2097,7 +2097,12 @@ def test_status_reports_nothing_held_before_any_preflight_has_run(monkeypatch):
 
     body = c.get("/api/plugins/project_board/status").json()
 
-    assert body["held_projects"] == [] and body["preflight"] == {"held": {}, "dirty": {}}
+    assert body["held_projects"] == [] and body["preflight"] == {
+        "held": {},
+        "dirty": {},
+        "slow": {},
+        "unwinnable_oracle": {},
+    }
 
 
 # ── #258 F2c: async routes run their store calls OFF the event-loop thread ──────

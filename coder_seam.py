@@ -81,8 +81,11 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import re
+import shlex
 import concurrent.futures
+import fnmatch
 import sys
 import threading
 import time
@@ -1378,6 +1381,124 @@ class SolveExhausted(worktree.WorktreeError):
     on an unverified best-partial (ADR 0064's honest-degrade contract)."""
 
 
+class OracleTimeout(SolveExhausted):
+    """The acceptance ORACLE, not the candidates, is the problem (#459): several candidates
+    in a row hit ``coder_solve_test_timeout_s`` running the same test command. A timeout
+    says nothing about the code, so another candidate or a stronger tier would only time out
+    again. bd-7aun spent 15 generations this way on a 12-minute gate with a 300 s budget.
+    The loop blocks the card at once under ``oracle-timeout``, which is not self-healing,
+    and doesn't climb a tier. ``test_cmd`` and ``timeout`` name what timed out."""
+
+    def __init__(self, message: str, *, test_cmd: str = "", timeout: float = 0.0):
+        super().__init__(message)
+        self.test_cmd = test_cmd
+        self.timeout = timeout
+
+
+# ── path-scoped acceptance oracles (#459) ─────────────────────────────────────────────
+# `coder_solve_test_paths` maps path globs to test commands, so a candidate is judged by
+# the tests that cover the files it touched: `apps/web/**` → vitest + tsc, not the Python
+# suite. Globs are fnmatch-style against the repo-relative path. `*` also crosses `/`, so
+# `apps/web/*` and `apps/web/**` mean the same thing. For each changed file the FIRST
+# matching entry wins. The distinct commands that were picked then run in map order, one
+# after another, and the candidate passes only if every one of them passes.
+#
+# Two command values are special:
+#   * `gate`: the project's resolved `local_gate_cmd`.
+#   * `""` (or `skip`): no test for those files. A docs-only candidate runs nothing and passes.
+# A changed file that no entry matches falls back to the ordinary oracle
+# (`coder_solve_test_cmd`, else the gate). So a map only has to name the paths it wants to
+# treat differently.
+ORACLE_GATE = "gate"
+_ORACLE_SKIP = ("", "skip")
+
+
+def parse_test_paths(raw, *, gate_cmd: str = "") -> list[tuple[str, str]]:
+    """Normalise a ``coder_solve_test_paths`` value into ordered ``(glob, command)`` pairs.
+
+    Takes a mapping (YAML keeps its order), a list of one-key mappings, or a list of
+    ``[glob, command]`` pairs. ``gate`` resolves to ``gate_cmd``. A ``gate`` entry with no
+    gate configured is dropped (logged), because it has nothing to run. A skip entry is kept
+    as ``""``. Anything malformed is ignored, and an unusable value gives ``[]`` (no map)."""
+    pairs: list[tuple[object, object]] = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, dict):
+                pairs.extend(item.items())
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                pairs.append((item[0], item[1]))
+    out: list[tuple[str, str]] = []
+    for glob, cmd in pairs:
+        g = str(glob or "").strip()
+        c = str(cmd if cmd is not None else "").strip()
+        if not g:
+            continue
+        if c.lower() in _ORACLE_SKIP:
+            c = ""
+        elif c == ORACLE_GATE:
+            if not gate_cmd:
+                log.warning(
+                    "[project_board] coder_solve_test_paths: %r maps to `gate` but no local_gate_cmd is set — ignored",
+                    g,
+                )
+                continue
+            c = gate_cmd
+        out.append((g, c))
+    return out
+
+
+def select_oracle(test_paths: list[tuple[str, str]], changed: list[str] | None, fallback: str) -> tuple[list[str], str]:
+    """The commands a candidate's changes need, and a one-line note saying why.
+
+    ``changed`` is None when git couldn't list the files, and then the ``fallback`` oracle
+    runs. An EMPTY change list also runs the fallback: a candidate that changed nothing has
+    no files to pick commands by, and it should be judged like any other candidate, not
+    waved through. Otherwise each file picks the first matching entry. An unmatched file
+    adds the fallback, and a skip entry adds nothing. Commands keep map order and are
+    de-duplicated. The result can be ``[]`` only when every changed file hit a skip entry."""
+    if not changed:
+        why = "changed files unknown" if changed is None else "no changed files"
+        return ([fallback] if fallback else []), f"{why} → the default oracle"
+    picked: dict[int, str] = {}
+    unmatched: list[str] = []
+    for path in changed:
+        for i, (glob, cmd) in enumerate(test_paths):
+            if fnmatch.fnmatchcase(path, glob):
+                picked.setdefault(i, cmd)
+                break
+        else:
+            unmatched.append(path)
+    cmds: list[str] = []
+    for i in sorted(picked):
+        c = picked[i]
+        if c and c not in cmds:
+            cmds.append(c)
+    if unmatched and fallback and fallback not in cmds:
+        cmds.append(fallback)
+    matched = ", ".join(test_paths[i][0] for i in sorted(picked)) or "none"
+    note = f"{len(changed)} changed file(s); matched {matched}"
+    if unmatched:
+        note += f"; {len(unmatched)} unmatched → {'the default oracle' if fallback else 'no oracle'}"
+    return cmds, note
+
+
+def compose_oracle(cmds: list[str]) -> str:
+    """One shell command that runs ``cmds`` in order, each in its own subshell, so a
+    ``cd`` in one can't leak into the next. Every command runs even after an earlier one
+    fails, so the output shows all the failures. The exit status is non-zero if ANY
+    command failed. A single command is returned as it is."""
+    if len(cmds) == 1:
+        return cmds[0]
+    lines = ["__oracle_rc=0"]
+    for c in cmds:
+        lines.append(f"echo {shlex.quote('== oracle: ' + c)}")
+        lines.append(f"( {c}\n) || __oracle_rc=1")
+    lines.append("exit $__oracle_rc")
+    return "\n".join(lines)
+
+
 def _import_solve():
     """Best-effort import of the `coder` plugin's solve library. Returns the module,
     or ``None`` — `coder` is a separate, git-URL-installed plugin (ADR 0064), not a
@@ -1444,6 +1565,8 @@ def _augment_prompt(task: str, feedback: str | None) -> str:
 # id is anchored to a line start (pytest's short-summary form); the AssertionError
 # line is matched anywhere so BOTH the inline short-summary form (``FAILED … -
 # AssertionError: …``) and the ``E   AssertionError: …`` traceback form are caught.
+# The verdict text an oracle timeout produces, which the #459 breaker keys on.
+_ORACLE_TIMEOUT_PREFIX = "acceptance tests timed out after"
 _FAILED_TEST_RE = re.compile(r"^FAILED\s+(\S+::\S+)", re.MULTILINE)
 _ASSERTION_LINE_RE = re.compile(r"AssertionError:[^\n]*")
 
@@ -1482,6 +1605,11 @@ class _WorktreeSolveAdapter:
     # assertion, and the loop's existing SolveExhausted handler blocks the feature
     # with that quoted — the correct outcome for a spec smell.
     CIRCUIT_BREAKER_THRESHOLD = 3
+    # #459: the same breaker for a TIMED-OUT oracle, with a lower threshold. A timeout
+    # carries no assertion for the next candidate to learn from, and each one costs the
+    # whole `test_timeout`. Two candidates timing out on the same command is enough to say
+    # the command can't finish in its budget.
+    TIMEOUT_BREAKER_THRESHOLD = 2
 
     def __init__(
         self,
@@ -1495,6 +1623,7 @@ class _WorktreeSolveAdapter:
         test_cmd: str,
         test_timeout: float,
         verdict_cls,
+        test_paths: list[tuple[str, str]] | None = None,
         fusion_delegate=None,
         files_to_modify: list[str] | None = None,
         fusion_max_file_chars: int = FUSION_MAX_FILE_CHARS_DEFAULT,
@@ -1525,6 +1654,13 @@ class _WorktreeSolveAdapter:
         self.dispatch_timeout = dispatch_timeout
         self.test_cmd = test_cmd
         self.test_timeout = test_timeout
+        # #459: path-scoped oracles, as `(glob, command)` pairs (see `select_oracle`). Empty
+        # means every candidate runs `test_cmd`. Otherwise each candidate runs the commands
+        # its changed files pick, and `_oracle_by_wt` remembers what ran for the feedback.
+        self.test_paths = list(test_paths or [])
+        self._oracle_by_wt: dict[str, str] = {}
+        # #459: the timeout breaker's count per timed-out command.
+        self._timeouts: dict[str, int] = {}
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         # The gate's env_passthrough whitelist (#86), threaded from the loop so the
         # acceptance-test (verify) subprocess sees the SAME allowlist environment the
@@ -1765,7 +1901,7 @@ class _WorktreeSolveAdapter:
             progress_verify(
                 self.progress_fid,
                 gen,
-                test_cmd=self.test_cmd,
+                test_cmd=self._oracle_by_wt.get(candidate_wt, self.test_cmd),
                 output=getattr(verdict, "output", "") or "",
                 passed=bool(getattr(verdict, "passed", False)),
             )
@@ -1777,7 +1913,25 @@ class _WorktreeSolveAdapter:
             output = getattr(verdict, "output", "") or ""
             tail = output[-1500:]
             label = f"candidate {gen}" if gen is not None else "a prior candidate"
-            self._completed_failures.append(f"### {label} failed `{self.test_cmd}`:\n{tail}".rstrip())
+            ran = self._oracle_by_wt.get(candidate_wt, self.test_cmd)
+            self._completed_failures.append(f"### {label} failed `{ran}`:\n{tail}".rstrip())
+            # #459: the same breaker for an oracle that TIMES OUT. The #146 signature
+            # below never matches a timeout (there is no assertion), so a gate slower than
+            # `coder_solve_test_timeout_s` used to fail every candidate the same way until
+            # the whole budget was spent. Then it was blocked as `transient`, and the sweep
+            # unblocked it to spend the budget again. `OracleTimeout` stops the ladder, and
+            # the loop blocks the card for a human without climbing a tier.
+            if output.startswith(_ORACLE_TIMEOUT_PREFIX):
+                n = self._timeouts[ran] = self._timeouts.get(ran, 0) + 1
+                if n >= self.TIMEOUT_BREAKER_THRESHOLD:
+                    raise OracleTimeout(
+                        f"acceptance oracle cannot finish: {n} candidates ran out the "
+                        f"{self.test_timeout:.0f}s coder_solve_test_timeout_s on `{ran}` — an oracle/spec "
+                        "problem, not the code. Set a faster coder_solve_test_cmd, map the changed paths "
+                        "in coder_solve_test_paths, or raise coder_solve_test_timeout_s, then unblock the card.",
+                        test_cmd=ran,
+                        timeout=self.test_timeout,
+                    )
             # #146 circuit breaker: when K candidates fail on the IDENTICAL assertion
             # signature, the spec is unsatisfiable — not a model-capability failure — so
             # continuing to search only re-fails the same way and burns the budget. At
@@ -1796,11 +1950,29 @@ class _WorktreeSolveAdapter:
                     )
         return verdict
 
+    async def _oracle_for(self, candidate_wt: str) -> tuple[str, str]:
+        """The command this candidate is judged by, and a note on how it was picked
+        (#459). With no ``test_paths`` it is ``test_cmd``. Otherwise the candidate's changed
+        files pick the commands (``select_oracle``), and several run in sequence
+        (``compose_oracle``). ``""`` means every changed file hit a skip entry."""
+        if not self.test_paths:
+            return self.test_cmd, ""
+        changed = await worktree.changed_paths(candidate_wt, self.base)
+        cmds, note = select_oracle(self.test_paths, changed, self.test_cmd)
+        return (compose_oracle(cmds) if cmds else ""), note
+
     async def _run_acceptance_tests(self, candidate_wt: str):
         Verdict = self.verdict_cls
+        cmd, note = await self._oracle_for(candidate_wt)
+        if note:
+            log.info("[project_board] %s oracle for %s: %s", self.fid, os.path.basename(candidate_wt), note)
+        if not cmd:
+            self._oracle_by_wt[candidate_wt] = "(no oracle: every changed file is mapped to skip)"
+            return Verdict(passed=True, total=0, failed=0, output=f"no acceptance command applies — {note}")
+        self._oracle_by_wt[candidate_wt] = cmd
         try:
             proc = await worktree.spawn_shell(
-                self.test_cmd,
+                cmd,
                 cwd=candidate_wt,
                 # #86: with NO env= the child inherits os.environ verbatim (the host's
                 # PROTOAGENT_*/A2A_*/AGENT_NAME), which burned 15 solve gens on an
@@ -1825,7 +1997,10 @@ class _WorktreeSolveAdapter:
             # search oracle: a candidate we couldn't confirm passed must never be
             # silently treated as passing, or we'd be faking grounding.
             return Verdict(
-                passed=False, total=1, failed=1, output=f"acceptance tests timed out after {self.test_timeout:.0f}s"
+                passed=False,
+                total=1,
+                failed=1,
+                output=f"{_ORACLE_TIMEOUT_PREFIX} {self.test_timeout:.0f}s",
             )
         text = (out or b"").decode("utf-8", "replace").strip()
         ok = proc.returncode == 0
@@ -1833,7 +2008,7 @@ class _WorktreeSolveAdapter:
             passed=ok,
             total=1,
             failed=0 if ok else 1,
-            failing=[] if ok else [f"{self.test_cmd!r} (exit {proc.returncode})"],
+            failing=[] if ok else [f"{cmd!r} (exit {proc.returncode})"],
             output=text[-4000:],
         )
 
@@ -1876,6 +2051,7 @@ async def dispatch(
     budget: int,
     k: int,
     tree_depth: int,
+    test_paths: list[tuple[str, str]] | None = None,
     record_gens: RecordGens | None = None,
     fusion_delegate=None,
     fusion_k: int = 2,
@@ -1931,6 +2107,11 @@ async def dispatch(
     the repo itself, unlike the ACP rungs) — the same list the feature's Ready gate
     already required.
 
+    ``test_paths`` (#459) is the project's parsed ``coder_solve_test_paths``: when given, each
+    candidate is judged by the commands its changed files pick (``select_oracle``), with
+    ``test_cmd`` as the default for unmatched files. An oracle that times out on two
+    candidates raises :class:`OracleTimeout` rather than spending the rest of the budget.
+
     ``env_passthrough`` (#86) is the loop's env whitelist, threaded through to the
     adapter so the acceptance-test (verify) subprocess strips the same host
     identity/credential block (``PROTOAGENT_*``/``A2A_*``/``AGENT_NAME``) the gate and
@@ -1974,6 +2155,7 @@ async def dispatch(
         test_cmd=test_cmd,
         test_timeout=test_timeout,
         verdict_cls=Verdict,
+        test_paths=test_paths,
         fusion_delegate=fusion_delegate,
         files_to_modify=files_to_modify,
         fusion_max_file_chars=fusion_max_file_chars,

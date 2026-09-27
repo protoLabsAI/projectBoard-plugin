@@ -241,6 +241,8 @@ project_board:
                              # burning generations no coder could pass. Re-checks each cycle,
                              # releases on recovery. A slow gate times out → indeterminate →
                              # allow (never wedge the board). Set false to skip.
+  preflight_cmd: ""          # a cheaper check to smoke instead of the gate (lint + an
+                             # import check). Blank = smoke local_gate_cmd (#456).
   # With local_gate_cmd set, Max-Mode is EXECUTION-GROUNDED (ADR 0064): the winner is
   # picked from candidates whose gate actually PASSES; the LLM judge only breaks ties
   # among the passing set (or decides when no gate is set / none pass).
@@ -249,6 +251,9 @@ project_board:
                              # acceptance criteria + a test command — see "What it does").
   coder_solve_test_cmd: "pytest tests/ -q"  # solve()'s verify() oracle; falls back to
                              # local_gate_cmd if blank, else the seam honest-degrades.
+  # coder_solve_test_paths:  # per-path oracles (#459): first matching glob wins per
+  #   "apps/web/**": "npm ci && npx tsc --noEmit && npx vitest run"   # changed file;
+  #   "**": gate             # `gate` = local_gate_cmd. See docs/configuration.md.
   coder_solve_fusion_delegate: ""  # rung 4 (ADR 0064 P3), opt-in: an `openai`-type
                              # delegate name (e.g. protolabs/fusion) for the hardest
                              # features. Blank (default) = ladder stops at tree-search.
@@ -542,6 +547,11 @@ could pass, and re-checks each cycle so work resumes the moment it's fixed. A sl
 that times out is treated as indeterminate → allowed (a slow gate must never wedge the
 board). This is the fail-**closed** complement to the per-PR gate's fail-**open**: a
 flaky gate never blocks good work, but an *unrunnable* gate never starts bad work.
+
+One preflight runs per project at a time. A verdict stands for the checkout commit it was
+reached on, and a timed-out run is not repeated on the same commit. A project can smoke a
+cheaper `preflight_cmd` than its full gate. See
+[docs/configuration.md](docs/configuration.md#the-gate--the-coders-fast-slice-of-ci) (#456).
 
 ### Environment — what gate, format, and verify children see
 

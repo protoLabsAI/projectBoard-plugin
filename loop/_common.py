@@ -53,6 +53,7 @@ import types
 from .. import br_fetch, coder_seam, config, health, release_freeze, setup_check, work_snapshot, worktree
 from .. import gates as publish_gates
 from ..failures import (
+    ORACLE_TIMEOUT_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
     PREFLIGHT_HOLD_CLASS,
     STRANDED_WORK_CLASS,
@@ -1423,6 +1424,7 @@ __all__ = [
     "release_freeze",
     "RELEASE_FREEZE_BLOCKER",
     "WAITING_ON_PUBLISH",
+    "ORACLE_TIMEOUT_CLASS",
     "PRE_MODEL_DISPATCH_CLASS",
     "PREFLIGHT_HOLD_CLASS",
     "STRANDED_WORK_CLASS",

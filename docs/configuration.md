@@ -85,6 +85,7 @@ Run before a PR opens, so a failure costs a fix round instead of a CI round-trip
 | `setup_timeout_s` | `600` | reload **· YAML only** |
 | `preflight` | `True` | reload **· YAML only** |
 | `preflight_timeout_s` | `self.local_gate_timeout` | reload **· YAML only** |
+| `preflight_cmd` | `""` | reload **· YAML only** |
 
 **`setup_cmd`** — installs a fresh worktree's own dependencies before its coder starts,
 e.g. `npm ci --no-audit --no-fund --prefer-offline`. Runs in every worktree the board makes
@@ -93,6 +94,31 @@ tree. Without it, a tree borrows the repo checkout's installed `node_modules` th
 symlinks, which is cheap but hands every card whatever that checkout last installed. Set it
 per project (a `projects:` entry) or board-wide. Bounded by `setup_timeout_s`: a failed or
 hung install is killed, logged, and the work goes ahead without it.
+
+**The gate preflight** smokes each project's check on its clean base checkout before any
+of that project's cards dispatch (`preflight: true`, the default). A red result holds the
+project's ready cards until the check passes again. How it runs:
+
+- **One run per project at a time.** The tick and an on-demand `board_dispatch` both
+  preflight before they claim. A second caller waits for the run already in flight
+  instead of starting another gate in the same checkout (#456).
+- **One verdict per commit.** A pass, or a run that timed out, stands for the commit the
+  checkout was on. When the checkout moves, one re-check runs in the background while
+  dispatch goes on under the old verdict. A red result holds the project from the next
+  claim scan. A failed project is re-checked every minute or so, as before.
+- **A check slower than the timeout runs once.** A preflight cut off by
+  `preflight_timeout_s` gives no verdict, and dispatch is allowed. It is not repeated
+  until the checkout moves. It is logged once, and shown in `/status` under
+  `preflight.slow` and in the setup advisories (`preflight_hint`). The duration also
+  feeds the coder.solve() oracle guard below.
+
+**`preflight_cmd`**: a cheap command for the preflight to smoke instead of the full
+`local_gate_cmd`, such as `ruff check . && lint-imports`. The preflight asks "can this
+environment run the repo's tools?", and lint plus an import check answers that in seconds.
+A 12-minute test suite behind a 600 s timeout never answers it at all. Set it per project
+in a `projects:` entry. The top-level value applies only to a project with no
+`local_gate_cmd` of its own, so a check written for one repo never runs in another. Blank
+means the preflight smokes `local_gate_cmd`, as before.
 
 ## Card authoring — the Ready gate
 
@@ -187,6 +213,48 @@ Generate K candidate implementations and verify each against a real test command
 | `coder_solve_fusion_k` | `2` | reload **· YAML only** |
 | `coder_solve_fusion_max_file_chars` | `coder_seam.FUSION_MAX_FILE…` | reload **· YAML only** |
 | `coder_solve_fusion_max_total_chars` | `0` | reload |
+| `coder_solve_test_paths` | `—` | reload **· YAML only** |
+
+**The oracle.** Each candidate is judged by `coder_solve_test_cmd`. When that is blank, it
+falls back to the project's `local_gate_cmd`. Two guards stop a slow oracle from failing
+every card (#459):
+
+- **An unwinnable fallback turns solve() off.** When the oracle is the gate fallback and
+  the preflight measured the gate at longer than `coder_solve_test_timeout_s`, that
+  project's cards take the plain coder path. The pre-PR gate still runs. The loop logs
+  this once, and `/status` shows it under `preflight.unwinnable_oracle`. It turns back on
+  once you set `coder_solve_test_cmd` or `coder_solve_test_paths`, or the gate gets faster.
+- **Two candidates timing out on the same command blocks the card.** The class is
+  `oracle-timeout`, and there is no tier climb. A timeout says nothing about the code, so
+  another candidate or a stronger model would only time out again. The sweep never clears
+  this class on its own. Fix the oracle, then unblock the card. When the command was the
+  gate fallback, the project's later cards skip solve() as well.
+
+**`coder_solve_test_paths`**: judge each candidate by the tests for the files it
+changed. The value maps path globs to commands, per project or board-wide:
+
+```yaml
+projects:
+  protoAgent:
+    coder_solve_test_paths:
+      "apps/web/**": "npm ci --prefer-offline && (cd apps/web && npx tsc --noEmit) && npm run test:unit --workspace @protoagent/web"
+      "docs/**": ""        # no test for docs-only changes
+      "**": gate           # everything else: the project's local_gate_cmd
+```
+
+- Globs are fnmatch-style against the repo-relative path. `*` also crosses `/`, so
+  `apps/web/*` and `apps/web/**` are the same.
+- For each changed file, the **first** matching entry wins. The distinct commands picked
+  run one after another, each in its own subshell, and the candidate passes only if all of
+  them pass. They share one `coder_solve_test_timeout_s`.
+- `gate` means the project's `local_gate_cmd`. `""` (or `skip`) means no test for those
+  files. A candidate whose every changed file hits a skip entry passes without a command.
+- A file no entry matches uses the ordinary oracle (`coder_solve_test_cmd`, else the
+  gate). A candidate that changed nothing, or one whose files git can't list, also uses
+  the ordinary oracle.
+- "Changed" means changed against the point the candidate forked from `base_branch`:
+  commits, uncommitted edits and new files.
+- A mapping keeps its order in YAML. A list of `[glob, command]` pairs also works.
 
 ## Review and merge
 

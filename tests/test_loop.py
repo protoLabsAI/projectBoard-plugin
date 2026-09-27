@@ -1776,6 +1776,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         budget,
         k,
         tree_depth,
+        test_paths=None,
         record_gens=None,
         fusion_delegate=None,
         fusion_k=2,
@@ -1791,6 +1792,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         setup_timeout=600.0,
     ):
         seen["fid"] = fid
+        seen["test_paths"] = test_paths  # #459: no coder_solve_test_paths configured → []
         seen["setup_cmd"] = setup_cmd
         seen["test_cmd"] = test_cmd
         seen["task"] = task

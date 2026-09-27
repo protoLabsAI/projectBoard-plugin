@@ -97,6 +97,10 @@ WORKTREE_SEAMS: dict[str, str] = {
         "blocked card / operator signal, not absent execution."
     ),
     "base_checkout_dirt": "REAL",
+    # #456 / #459: the preflight's per-commit cache key and the path-scoped solve oracle's
+    # changed-file read, both against a real git repo in tests/test_preflight_oracle_456_459.py.
+    "changed_paths": "REAL",
+    "checkout_head_sha": "REAL",
     "close_pr": (
         "EXEMPT: closes a real PR — REAL coverage would need a disposable sandbox repo to open and "
         "tear down that PR (operator chose not to provision one now). Run routinely in production; "
@@ -357,15 +361,17 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_34_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 34 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_36_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 36 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
     tests/test_stranded_work_405.py; and the 29th and 30th #427's ``commits_ahead`` and
     ``own_worktree``, in tests/test_salvage_427.py; the 31st to 34th the release-freeze reads
     (``remote_branches``, ``open_pr_heads``, ``active_workflow_runs``,
-    ``untagged_release_head``), in tests/test_publish_gate_real.py.
+    ``untagged_release_head``), in tests/test_publish_gate_real.py; the 35th and 36th
+    ``checkout_head_sha`` (#456) and ``changed_paths`` (#459), in
+    tests/test_preflight_oracle_456_459.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -383,7 +389,7 @@ def test_worktree_coverage_contract_is_34_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 34, f"expected 34 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 36, f"expected 36 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

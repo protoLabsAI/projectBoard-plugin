@@ -233,6 +233,31 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # gate). Opt out with ``preflight: false``.
         self.preflight = bool(self.cfg.get("preflight", True))
         self.preflight_timeout = float(self.cfg.get("preflight_timeout_s", self.local_gate_timeout))
+        # A cheaper command to smoke instead of the full gate (#456): lint plus an import
+        # check is enough to tell "the environment can run this repo's tools" from "it
+        # can't". Blank means smoke `local_gate_cmd`, as before. Per project in `projects:`.
+        self.preflight_cmd = str(self.cfg.get("preflight_cmd", "")).strip()
+        # Single-flight (#456): the one running preflight per project. The tick and an
+        # on-demand `board_dispatch` both preflight before they claim, and each used to
+        # start its own gate in the same checkout (two `scripts/gate.py` at once, observed
+        # live). A second caller now awaits the run already in flight.
+        self._preflight_tasks: dict[str, asyncio.Task] = {}
+        self._preflight_task_key: dict[str, tuple[str, str]] = {}  # (cmd, repo) each run smokes
+        # The checkout commit each project's current NON-failing verdict was reached on
+        # (#456). The verdict stands until the checkout moves, and then one re-check runs.
+        # Before, a pass stuck for the life of the process however far base moved.
+        self._preflight_sha: dict[str, str] = {}
+        # Projects whose preflight command can't finish inside `preflight_timeout_s`
+        # (#456): {cmd, timeout_s, sha}. The run is indeterminate, so dispatch is allowed.
+        # It is not re-run until the checkout moves, and /status and setup say so. It is
+        # warned about once per project (`_preflight_slow_warned`).
+        self._preflight_slow: dict[str, dict] = {}
+        self._preflight_slow_warned: set[str] = set()
+        # How long each project's GATE took when the preflight last ran it (#459), as
+        # (seconds, lower_bound). lower_bound is True when the run was cut off at the
+        # timeout, so it took at least that long. The coder.solve() guard reads this to
+        # avoid using as its oracle a gate that can't finish in `coder_solve_test_timeout_s`.
+        self._gate_seconds: dict[str, tuple[float, bool]] = {}
         # Per-PROJECT preflight isolation (#90 slice 2): keyed by project name, not a
         # single scalar — a broken gate in project A holds only A's ready work while B
         # keeps dispatching. Each value is None=unchecked, True=runnable, str=failure
@@ -290,6 +315,19 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # the real test command); still blank ⇒ no runnable oracle ⇒ honest degrade.
         self.coder_solve_test_cmd = str(self.cfg.get("coder_solve_test_cmd", "")).strip() or self.local_gate_cmd
         self.coder_solve_test_timeout = float(self.cfg.get("coder_solve_test_timeout_s", 300))
+        # Path-scoped acceptance oracles (#459): path glob → test command, picked per
+        # candidate from the files it changed (coder_seam.select_oracle). Parsed per
+        # feature, against that project's gate (`_coder_solve_oracle_for`).
+        self.coder_solve_test_paths = self.cfg.get("coder_solve_test_paths")
+        # Projects whose solve oracle is known to be unwinnable (#459) → why. Set when the
+        # measured gate is slower than the solve timeout, or when a card's candidates trip
+        # the timeout breaker on the gate fallback. The loop then takes the plain coder path
+        # for that project's cards, and the pre-PR gate still runs. /status shows the flag,
+        # and it is logged once per project.
+        self._oracle_unwinnable: dict[str, str] = {}
+        # (tier, delegate) pairs already warned about as missing (protoAgent#3692), so a
+        # deleted rung delegate is logged once, not on every dispatch.
+        self._missing_rung_warned: set[tuple[str, str]] = set()
         self.coder_solve_budget = max(1, int(self.cfg.get("coder_solve_budget", 6)))
         self.coder_solve_k = max(1, int(self.cfg.get("coder_solve_k", 3)))
         self.coder_solve_tree_depth = max(0, int(self.cfg.get("coder_solve_tree_depth", 2)))
@@ -682,6 +720,40 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         gate = self._local_gate_cmd_for(feature)
         return gate or self.coder_solve_test_cmd
 
+    def _preflight_cmd_for(self, feature: dict) -> str:
+        """What the preflight smokes for this feature's project (#456): its
+        ``preflight_cmd`` when set, else its gate (``_local_gate_cmd_for``), as before.
+        The instance-level ``preflight_cmd`` applies only to a project with no gate of its
+        own, so a cheap check written for one repo is never run in another."""
+        pc = self._project_cfg(feature)
+        v = str(pc.get("preflight_cmd") or "").strip()
+        if v:
+            return v
+        if self.preflight_cmd and "local_gate_cmd" not in pc:
+            return self.preflight_cmd
+        return self._local_gate_cmd_for(feature)
+
+    def _coder_solve_oracle_for(self, feature: dict) -> dict:
+        """The coder.solve() oracle for this feature's project (#459): ``{cmd, paths,
+        source}``. ``cmd`` is what ``_coder_solve_test_cmd_for`` always returned.
+        ``paths`` is the parsed ``coder_solve_test_paths`` map, which overrides ``cmd`` for
+        the files it names. ``source`` says where ``cmd`` came from: ``explicit`` (a
+        ``coder_solve_test_cmd``), ``gate`` (the fallback to ``local_gate_cmd``), or ``""``
+        (none). Only the ``gate`` fallback is subject to the unwinnable-oracle guard. An
+        explicit command, or a paths map, is the operator's own choice of oracle."""
+        pc = self._project_cfg(feature)
+        gate = self._local_gate_cmd_for(feature)
+        raw = pc["coder_solve_test_paths"] if "coder_solve_test_paths" in pc else self.coder_solve_test_paths
+        paths = coder_seam.parse_test_paths(raw, gate_cmd=gate) if raw else []
+        explicit = str(pc.get("coder_solve_test_cmd", "")).strip()
+        if explicit:
+            return {"cmd": explicit, "paths": paths, "source": "explicit"}
+        if gate:
+            return {"cmd": gate, "paths": paths, "source": "gate"}
+        flat = str(self.cfg.get("coder_solve_test_cmd", "")).strip()
+        cmd = self.coder_solve_test_cmd
+        return {"cmd": cmd, "paths": paths, "source": ("explicit" if flat else "gate") if cmd else ""}
+
     def _coder_solve_settings(self, feature: dict) -> dict:
         """Resolve the coder.solve() search knobs for this feature's project (#90). Each
         `coder_solve_*` knob prefers the project entry, falling back to the instance-level
@@ -709,6 +781,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             fusion = str(pc.get("coder_solve_fusion_delegate") or "").strip()
         return {
             "test_cmd": self._coder_solve_test_cmd_for(feature),
+            "test_paths": self._coder_solve_oracle_for(feature)["paths"],
             "test_timeout": _float("coder_solve_test_timeout_s", self.coder_solve_test_timeout),
             "budget": _int("coder_solve_budget", self.coder_solve_budget, 1),
             "k": _int("coder_solve_k", self.coder_solve_k, 1),
