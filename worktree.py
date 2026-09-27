@@ -2224,3 +2224,137 @@ async def repo_slug(*, cwd: str = ".") -> str:
     except WorktreeError:
         return ""
     return out.strip() if rc == 0 else ""
+
+
+# ── release-freeze evidence (release_freeze.py) ─────────────────────────────────────
+# Three reads, one per signal a repo can be mid-release by. Each RAISES WorktreeError when
+# it cannot answer, so the freeze check can hold the merge on "don't know" (fail closed)
+# rather than read an outage as "no release in flight".
+_ACTIVE_RUN_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+
+
+class SignalUnavailable(WorktreeError):
+    """A freeze signal this credential cannot read (403 — e.g. a token without
+    ``Actions: read``). Not "don't know whether a release is in flight": the OTHER signals
+    still decide, and the operator is told once which one is blind (#457 review, M2)."""
+
+
+def _forbidden(rc: int, out: str, err: str) -> bool:
+    blob = (err or "") + (out or "").replace(" ", "")
+    return rc != 0 and ("403" in blob or "Resourcenotaccessiblebyintegration" in blob or "Must have admin" in blob)
+
+
+async def remote_branches(repo: str, patterns) -> list[str]:
+    """The ``origin`` branch names matching any fnmatch ``patterns`` (e.g.
+    ``prepare-release*``), via ``git ls-remote --heads origin`` — one network read, no
+    local ref touched."""
+    import fnmatch
+
+    pats = [str(p) for p in patterns or () if str(p).strip()]
+    if not pats:
+        return []
+    rc, out, err = await _git(repo, "ls-remote", "--heads", "origin", timeout=60)
+    if rc != 0:
+        raise WorktreeError(f"git ls-remote failed: {(err or out).strip()[:200]}")
+    names = []
+    for line in out.splitlines():
+        _sha, _tab, ref = line.partition("\t")
+        name = ref.strip().removeprefix("refs/heads/")
+        if name and any(fnmatch.fnmatchcase(name, p) for p in pats):
+            names.append(name)
+    return sorted(names)
+
+
+async def open_pr_heads(slug: str, patterns, *, cwd: str = ".") -> list[tuple[int, str]]:
+    """``[(number, head_ref)]`` of the OPEN PRs in ``slug`` whose head branch matches any
+    fnmatch ``patterns`` — one ``gh api`` page of up to 100 open PRs, newest first."""
+    import fnmatch
+
+    pats = [str(p) for p in patterns or () if str(p).strip()]
+    if not pats:
+        return []
+    rc, out, err = await _gh("api", f"/repos/{slug}/pulls?state=open&per_page=100", cwd=cwd)
+    if _forbidden(rc, out, err):
+        raise SignalUnavailable(f"this gh credential cannot list {slug}'s pull requests (403)")
+    if rc != 0:
+        raise WorktreeError(f"open-PR list failed for {slug}: {(err or out).strip()[:200]}")
+    try:
+        prs = json.loads(out or "[]")
+    except json.JSONDecodeError as exc:
+        raise WorktreeError(f"open-PR list for {slug} was not JSON: {exc}") from exc
+    hits = []
+    for pr in prs if isinstance(prs, list) else []:
+        head = str(((pr or {}).get("head") or {}).get("ref") or "")
+        if head and any(fnmatch.fnmatchcase(head, p) for p in pats):
+            hits.append((int(pr.get("number") or 0), head))
+    return hits
+
+
+async def active_workflow_runs(slug: str, workflow: str, *, cwd: str = ".") -> list[dict]:
+    """The not-yet-completed runs (queued / in_progress / waiting …) of ``workflow`` (a
+    file name like ``prepare-release.yml``, or its numeric id) in ``slug`` — ``[]`` when
+    none are active OR the repo has no such workflow (a 404 is an answer, not an error:
+    most repos have no release workflow, and that must never hold their merges)."""
+    import urllib.parse
+
+    wf = urllib.parse.quote(str(workflow).strip(), safe="")
+    rc, out, err = await _gh("api", f"/repos/{slug}/actions/workflows/{wf}/runs?per_page=20", cwd=cwd)
+    if rc != 0:
+        if "404" in err or '"status":"404"' in out.replace(" ", ""):
+            return []
+        if _forbidden(rc, out, err):
+            raise SignalUnavailable(
+                f"this gh credential cannot read {slug}'s Actions runs (403 — the token lacks Actions: read)"
+            )
+        raise WorktreeError(f"workflow-run list failed for {slug}/{workflow}: {(err or out).strip()[:200]}")
+    try:
+        runs = (json.loads(out or "{}") or {}).get("workflow_runs") or []
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise WorktreeError(f"workflow-run list for {slug}/{workflow} was not JSON: {exc}") from exc
+    return [
+        {"id": r.get("id"), "status": r.get("status"), "url": r.get("html_url", "")}
+        for r in runs
+        if isinstance(r, dict) and str(r.get("status") or "") in _ACTIVE_RUN_STATUSES
+    ]
+
+
+async def untagged_release_head(slug: str, base: str, patterns, *, cwd: str = ".") -> str:
+    """The gap between a release PR MERGING and its tag being pushed: ``base``'s head commit
+    is a release commit (its subject matches a ``patterns`` glob, e.g. ``chore: release v*``)
+    whose version tag does not exist yet. protoAgent deletes the merged ``prepare-release/*``
+    branch at once, so the branch/PR signals go quiet exactly while the release workflow is
+    still tagging and publishing from that commit. Returns the evidence sentence, or "".
+    Raises SignalUnavailable on a 403, WorktreeError when it cannot answer."""
+    import fnmatch
+
+    pats = [str(p) for p in patterns or () if str(p).strip()]
+    if not pats or not slug:
+        return ""
+    import urllib.parse
+
+    ref = urllib.parse.quote(str(base or "main"), safe="")
+    rc, out, err = await _gh("api", f"/repos/{slug}/commits/{ref}", cwd=cwd)
+    if _forbidden(rc, out, err):
+        raise SignalUnavailable(f"this gh credential cannot read {slug}'s commits (403)")
+    if rc != 0:
+        raise WorktreeError(f"head-commit read failed for {slug}@{base}: {(err or out).strip()[:200]}")
+    try:
+        head = json.loads(out or "{}")
+    except json.JSONDecodeError as exc:
+        raise WorktreeError(f"head-commit read for {slug} was not JSON: {exc}") from exc
+    sha = str(head.get("sha") or "")
+    subject = str(((head.get("commit") or {}).get("message") or "")).split("\n", 1)[0].strip()
+    if not any(fnmatch.fnmatchcase(subject, p) for p in pats):
+        return ""
+    m = re.search(r"\b(v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)", subject)
+    if not m:
+        return ""
+    tag = m.group(1)
+    rc, out, err = await _gh("api", f"/repos/{slug}/git/ref/tags/{urllib.parse.quote(tag, safe='')}", cwd=cwd)
+    if rc == 0:
+        return ""  # tagged — the release finished cutting
+    if "404" in err or '"status":"404"' in out.replace(" ", ""):
+        return f"release commit {sha[:12]} ({subject}) not tagged {tag} yet"
+    if _forbidden(rc, out, err):
+        raise SignalUnavailable(f"this gh credential cannot read {slug}'s tags (403)")
+    raise WorktreeError(f"tag read failed for {slug} {tag}: {(err or out).strip()[:200]}")

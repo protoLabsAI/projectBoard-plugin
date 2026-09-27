@@ -52,6 +52,18 @@ board to a PR — or fork it as a starting point.
 - **DAG + gates** — `depends_on` are `blocks` edges; a dependent stays out of the
   puller until its blocker is **merged** (foundation merge-gate). The **Ready gate**
   requires a spec, EARS acceptance criteria, and explicit `files_to_modify`.
+- **Publish gates + release freeze (cross-repo chains)** — a card can also wait on
+  something OUTSIDE the board. `waits_for: npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`
+  holds only once a published version is PROVEN (via its changesets git tag + GitHub
+  compare) to contain card bd-a1's merge commit — `depends_on` releases at the MERGE, and
+  a version floor can be met by an unrelated publish, both too early for a consumer that
+  installs the package. Also `npm:<pkg>@<range>`, `release:<owner>/<repo>@[<package>@]<tag-or-range>`,
+  `pr:<owner>/<repo>#<n>` (merged). The loop keeps the card out of the claim, visibly
+  (`waiting on publish: …`), until every gate holds. And before auto-merging, the loop
+  checks the PR's repo for a release in flight (`prepare-release*` branch/PR, an active
+  `prepare-release.yml` run, or an untagged `chore: release v*` head; per-project
+  `release_freeze`) and holds the merge until it lifts. [`docs/publish-gates.md`](docs/publish-gates.md) has the grammar and a worked
+  design-system → npm → consumer example.
 - **Escalation (opt-in)** — with a `coders` map of >1 distinct rung, a capability
   failure climbs to a stronger model. A rung may also hold SEVERAL interchangeable
   providers (`smart: [codex, sonnet]`, #362): the board round-robins across them, and on
@@ -91,7 +103,9 @@ board to a PR — or fork it as a starting point.
   it: **`onboard-project`** runs FIRST against a repo this board has not worked before —
   it scans for the preconditions a coding loop needs and auto-fixes the safe ones — and
   **`loop-retro`** runs after, mining the board's own attempt history into durable
-  grounding so the next runs stop repeating known failures.
+  grounding so the next runs stop repeating known failures. **`cross-repo-chain`** is
+  for work that spans repos through a release: the change in one repo, the publish, then
+  the consumer card gated on it with `waits_for`.
 - **Console view** — a Kanban + list projection over the `/features` API (ADR 0026).
 
 It **composes** the upstream `delegates` plugin (ADR 0024/0025) for the ACP/A2A
@@ -736,8 +750,10 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `setup_check.py` | the setup preflight (`br`/`gh`/coder/repo) + the host gap reporter — can the board run at all? |
 | `br_fetch.py` | `br` fetched on first run: the pinned beads-rust release + sha256 table, the off-loop once-per-process fetch, `BR_BIN` > fetched > PATH resolution |
 | `board_view.py` | the Kanban/list console view |
+| `gates.py` | publish gates (`waits_for`): spec grammar, a stdlib node-semver range matcher, the npm / `gh` evaluators, the shared per-spec cache |
+| `release_freeze.py` | the auto-merge edge's release-freeze guard: per-project patterns, the per-repo check, the per-card holds |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
-| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project` and `loop-retro` skills |
+| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain` and `loop-retro` skills |
 | `__init__.py` | `register()` — wires it all |
 
 Ships **disabled**; nothing runs until you enable it, declare a coder delegate and name

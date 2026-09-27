@@ -89,8 +89,22 @@ const NEXT_ACTION_CHIP = {
   "dependencies closed — promote": ["pl-badge--warning", "deps closed: promote"],
   "blocked — dependencies closed": ["pl-badge--warning", "deps closed"],
 };
+// Prefix-keyed chips: the sentence carries live evidence (which package, which release
+// branch), so it can't be a fixed key. The full sentence rides the tooltip.
+//  - publish gates (`waits_for`): a card waiting on an external publish/release/merge.
+//  - release freeze: the auto-merge edge held a PR because its repo is mid-release.
+const NEXT_ACTION_PREFIX_CHIP = [
+  ["waiting on publish", ["pl-badge--warning", "waiting on publish"]],
+  ["held: release freeze", ["pl-badge--warning", "held: release freeze"]],
+];
 function nextActionChip(f){
   if (!f.next_action || f.next_action === "blocked") return "";  // blocked has its own chip
+  const byPrefix = NEXT_ACTION_PREFIX_CHIP.find(([p]) => f.next_action.startsWith(p));
+  if (byPrefix) {
+    const [cls, label] = byPrefix[1];
+    const tip = f.next_action + (f.next_action_hint ? " — " + f.next_action_hint : "");
+    return '<span class="pl-badge '+cls+'" title="'+esc(tip)+'">'+esc(label)+'</span>';
+  }
   const [cls, label] = NEXT_ACTION_CHIP[f.next_action] || ["", f.next_action];
   const hint = f.next_action_hint || f.next_action;
   return '<span class="pl-badge '+cls+'" title="'+esc(hint)+'">'+esc(label)+'</span>';

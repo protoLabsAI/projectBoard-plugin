@@ -623,7 +623,36 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
-        return f
+        # next_action + cached publish-gate verdicts, the same stamp the listing carries
+        # (labels + config + in-process caches — no network).
+        return annotate_next_action([f], cfg or {})[0]
+
+    @router.post("/features/{fid}/gates/check")
+    async def _check_gates(fid: str):
+        """Re-check this card's publish gates (``waits_for``) against npm / GitHub NOW —
+        the REST twin of ``board_check_gates``. Returns ``{id, waits_for, gates, clear}``;
+        a failed check reads unmet with its ``error`` (fail closed). Results land in the
+        shared cache the loop and the listing read."""
+        from . import gates as publish_gates
+
+        f = await _guard(lambda: store().get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        from . import _card_resolver
+
+        results = await asyncio.to_thread(
+            publish_gates.evaluate,
+            f.get("waits_for") or [],
+            token=publish_gates.npm_token(cfg),
+            force=True,
+            resolve_card=_card_resolver(store()),
+        )
+        return {
+            "id": fid,
+            "waits_for": f.get("waits_for") or [],
+            "gates": results,
+            "clear": all(r["met"] for r in results),
+        }
 
     @router.get("/features/{fid}/progress")
     async def _progress(fid: str):
@@ -645,7 +674,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     async def _patch_feature(fid: str, body: dict = Body(default={})):
         """In-place spec edit — the REST complement of ``board_update_feature``.
         Accepts ``title``, ``spec``, ``acceptance_criteria``, ``design``,
-        ``files_to_modify``, ``difficulty``, ``source_issue``; only non-null
+        ``files_to_modify``, ``difficulty``, ``source_issue``, ``waits_for`` (replaces the
+        publish gates; ``[]`` clears); only non-null
         fields are written. Refuses edits to an ``in_progress`` feature unless
         ``force=true`` is passed (a live drive owns it)."""
         body = body or {}
@@ -672,9 +702,18 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 "difficulty",
                 "priority",
                 "source_issue",
+                "waits_for",
             }
         )
         kwargs = {k: v for k, v in body.items() if k in _PATCH_FIELDS and v is not None}
+        # `waits_for` means what it means on board_update_feature: "" leaves the gates
+        # alone, "none" (or an explicit []) clears them, anything else REPLACES them.
+        if "waits_for" in kwargs:
+            wf = kwargs["waits_for"]
+            if isinstance(wf, str) and not wf.strip():
+                kwargs.pop("waits_for")
+            elif isinstance(wf, str) and wf.strip().lower() in ("none", "clear", "-"):
+                kwargs["waits_for"] = []
         changed = sorted(kwargs)
 
         updated = await _guard(lambda: s.update_feature(fid, **kwargs))

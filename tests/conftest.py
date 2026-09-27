@@ -98,6 +98,62 @@ def _no_real_br_version(monkeypatch, tmp_path_factory):
     br_fetch.reset_state()
 
 
+# The real implementations of the publish-gate / release-freeze network seams, captured
+# BEFORE any autouse stub replaces them, so the real-network tier
+# (tests/test_publish_gate_real.py) can drive the genuine code.
+from project_board import gates as _gates_mod  # noqa: E402
+from project_board import release_freeze as _freeze_mod  # noqa: E402
+from project_board import worktree as _worktree_mod  # noqa: E402
+
+REAL_SEAMS = {
+    "gates._http_get_json": _gates_mod._http_get_json,
+    "gates._gh_json": _gates_mod._gh_json,
+    "worktree.remote_branches": _worktree_mod.remote_branches,
+    "worktree.open_pr_heads": _worktree_mod.open_pr_heads,
+    "worktree.active_workflow_runs": _worktree_mod.active_workflow_runs,
+    "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_publish_gate_network(monkeypatch):
+    """Publish gates (`waits_for`) and the release-freeze guard reach npm / GitHub. The
+    UNIT tier must never do that: every gate read raises (a test that wants a verdict
+    injects a fake), and the three freeze reads answer "no release in flight" — the
+    state every pre-existing auto-merge test assumes — unless a test injects evidence.
+    Both modules keep process-stable caches; each test starts and ends with them empty."""
+
+    def _no_http(url, **_kw):
+        raise AssertionError(f"unit tier tried to GET {url} — inject a fake gates._http_get_json")
+
+    def _no_gh(path, **_kw):
+        raise AssertionError(f"unit tier tried `gh api {path}` — inject a fake gates._gh_json")
+
+    async def _no_branches(_repo, _patterns):
+        return []
+
+    async def _no_prs(_slug, _patterns, *, cwd="."):
+        return []
+
+    async def _no_runs(_slug, _workflow, *, cwd="."):
+        return []
+
+    async def _no_release_gap(_slug, _base, _patterns, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(_gates_mod, "_http_get_json", _no_http)
+    monkeypatch.setattr(_gates_mod, "_gh_json", _no_gh)
+    monkeypatch.setattr(_worktree_mod, "remote_branches", _no_branches)
+    monkeypatch.setattr(_worktree_mod, "open_pr_heads", _no_prs)
+    monkeypatch.setattr(_worktree_mod, "active_workflow_runs", _no_runs)
+    monkeypatch.setattr(_worktree_mod, "untagged_release_head", _no_release_gap)
+    _gates_mod.reset_cache()
+    _freeze_mod.reset_state()
+    yield
+    _gates_mod.reset_cache()
+    _freeze_mod.reset_state()
+
+
 @pytest.fixture(autouse=True)
 def _no_provider_down_marks():
     """The loop remembers a provider that refused its model (#420) in process-stable

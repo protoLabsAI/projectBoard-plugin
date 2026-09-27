@@ -71,7 +71,11 @@ to fan out, but keep the propose→attack pairing for each.
    Foundation edges are just `depends_on` on the foundation feature; set
    `foundation=True` on a shared-structure feature so dependents always gate on its
    **merge** (under `dep_gate: review`, non-foundation blockers release dependents at
-   in_review — foundations never do).
+   in_review — foundations never do). A feature that needs another repo's change
+   **published** (an npm version, a GitHub release), not just merged, also carries
+   `waits_for="npm:<pkg>@contains:<owner>/<repo>@<producer card id>"`: the loop holds it
+   until a publish PROVEN to contain that card's merge lands (a version floor like
+   `>0.62.0` can be met by an unrelated publish — don't use one for this). The `cross-repo-chain` skill has the full pattern.
 4. **HUMAN GATE (per epic):** summarize the epic's features (titles, acceptance
    criteria, deps, which are foundations) and call `request_user_input` to ask the
    operator to approve, amend, or reject **before any feature goes `ready`**. This is

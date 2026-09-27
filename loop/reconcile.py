@@ -1125,7 +1125,49 @@ class ReconcileMixin:
             # failing; BEHIND/DIRTY = the rebase edge's job; UNKNOWN = GitHub still
             # computing; "" = gh failed. None of them is a merge.
             return [f"github mergeStateStatus={mss or 'unavailable'}"]
+        # LAST, and only for a PR that is otherwise mergeable right now: is the repo
+        # mid-release (release_freeze.py)? A merge during a release restarts its checks,
+        # so hold — never block, never spend a merge attempt — and re-ask next poll.
+        freeze = await self._release_freeze_evidence(feature, pr_url, repo)
+        if freeze:
+            return [f"{RELEASE_FREEZE_BLOCKER} ({freeze})"]
         return []
+
+    async def _release_freeze_evidence(self, feature: dict, pr_url: str, repo: str) -> str:
+        """The freeze evidence for this card's repo ("" = not frozen / check disabled)."""
+        patterns = release_freeze.parse_config(self._release_freeze_cfg_for(feature))
+        if patterns is None:
+            return ""
+        slug, _num = worktree._parse_pr(pr_url)
+        return await release_freeze.check(slug, repo, patterns, cwd=repo, base=self._base_branch_for(feature))
+
+    def _note_freeze_hold(self, store, fid: str, pr_url: str, why: list[str]) -> None:
+        """Record (or clear) the card's release-freeze hold — the process state the
+        listing reads for `held: release freeze (…)` — logging and commenting ONCE per
+        hold, not once per poll. Best-effort: bookkeeping never breaks the reconcile."""
+        held = next((w for w in why if w.startswith(RELEASE_FREEZE_BLOCKER)), "")
+        if not held:
+            prior = release_freeze.clear_hold(fid)
+            if prior:
+                log.info(
+                    "[project_board] %s release freeze lifted (was: %s) — merge edge open: %s",
+                    fid,
+                    prior["evidence"],
+                    pr_url,
+                )
+            return
+        evidence = held[len(RELEASE_FREEZE_BLOCKER) :].strip().removeprefix("(").removesuffix(")")
+        if release_freeze.set_hold(fid, evidence, repo=worktree._parse_pr(pr_url)[0]):
+            log.info("[project_board] %s auto-merge HELD — release freeze (%s): %s", fid, evidence, pr_url)
+            try:
+                store.comment(
+                    fid,
+                    f"auto-merge held: release freeze ({evidence}). The repo is preparing a release; a merge "
+                    f"now would restart its checks. The loop re-checks every merge poll and merges when it "
+                    f"lifts: {pr_url}",
+                )
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+                log.warning("[project_board] %s freeze-hold comment failed", fid, exc_info=True)
 
     async def _maybe_auto_merge(self, store, fid: str, pr_url: str, repo: str) -> bool:
         """Merge an in_review PR once every gate the loop owns is green and current
@@ -1142,8 +1184,10 @@ class ReconcileMixin:
         if why:
             # Store-only bookkeeping (a bead comment) — off the event loop (#258).
             await asyncio.to_thread(self._note_draft_hold, store, fid, pr_url, why)
+            await asyncio.to_thread(self._note_freeze_hold, store, fid, pr_url, why)
             log.debug("[project_board] %s not auto-merging: %s", fid, "; ".join(why))
             return False
+        await asyncio.to_thread(self._note_freeze_hold, store, fid, pr_url, why)
         self._draft_noted.discard(fid)
         # LAST gate before the merge (#323): a clean verdict is only a verdict about the
         # code it READ, so it is written pinned to that head and must still match the live

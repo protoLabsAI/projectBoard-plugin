@@ -626,6 +626,18 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             return str(pc.get("format_cmd") or "").strip()
         return self.format_cmd
 
+    def _release_freeze_cfg_for(self, feature: dict):
+        """This feature's project's ``release_freeze`` (release_freeze.py), else the flat
+        top-level key, else None (= the default prepare-release patterns)."""
+        pc = self._project_cfg(feature)
+        if "release_freeze" in pc:
+            return pc.get("release_freeze")
+        return self.cfg.get("release_freeze")
+
+    def _npm_token(self) -> str:
+        """The optional registry token for private-package publish gates (gates.npm_token)."""
+        return publish_gates.npm_token(self.cfg)
+
     def _setup_cmd_for(self, feature: dict) -> str:
         """The worktree dependency install (``setup_cmd``) for this feature's project
         (#90), else the instance default."""

@@ -465,6 +465,7 @@ _MINIMAL_ARGS = {
     "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
     "board_list": {},
     "board_retro": {},
+    "board_check_gates": {},
     "board_attach_pr": {"feature_id": "bd-1", "pr_url": "https://github.com/o/r/pull/1"},
 }
 

@@ -552,6 +552,21 @@ and the result carries a `warning`.
 Fix budgets the card already spent are not reset. A card whose automated fix rounds are
 exhausted still stops at the next failure, for a human.
 
+## Waiting on the outside world: publish gates and the release freeze
+
+Two holds that are neither `blocked` nor a lane, and that lift by themselves:
+
+- A `ready` card with **publish gates** (`waits_for`: an npm version, a GitHub release, a
+  merged PR) is skipped by the claim scan with reason `waiting-on-publish` until every gate
+  holds. It reads `waiting on publish: …`. The skip is not a livelock, so the card is never
+  flagged blocked however long the wait.
+- An `in_review` card whose repo is mid-release (`release_freeze`) is not auto-merged. It
+  reads `held: release freeze (<evidence>)`, no merge attempt is spent, and the next merge
+  poll after the freeze lifts merges it.
+
+[Publish gates and the release freeze](publish-gates.md) has the grammar, the defaults
+per repo type and a worked example.
+
 ## Where to look next
 
 - [`docs/configuration.md`](configuration.md) — `review_gate`, `review_dispatch`,

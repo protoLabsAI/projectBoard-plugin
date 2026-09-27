@@ -537,6 +537,7 @@ def test_reporter_sends_failing_hints_once_and_clears_on_recovery():
         ("loop", None),
         ("db_legacy", None),
         ("review_status", None),
+        ("release_freeze", None),
     ]
     # steady state → nothing forwarded (a 30 s tick must not spam the host)
     assert rep.report(_status(br=False, coder=False)) == {}
@@ -788,8 +789,18 @@ def test_register_reports_every_failing_check_to_a_host_with_the_seam(monkeypatc
     with caplog.at_level(logging.INFO, logger=LOGGER):
         pb.register(reg)
     msgs = dict(reg.gaps)
-    # every key on the first evaluation (br + loop + db + db_legacy + review_status as clears), in render order
-    assert [k for k, _ in reg.gaps] == ["br", "gh", "coder", "repo", "loop", "db_legacy", "review_status"]
+    # every key on the first evaluation (br + loop + db + db_legacy + review_status + release_freeze
+    # as clears), in render order
+    assert [k for k, _ in reg.gaps] == [
+        "br",
+        "gh",
+        "coder",
+        "repo",
+        "loop",
+        "db_legacy",
+        "review_status",
+        "release_freeze",
+    ]
     assert msgs["br"] is None and msgs["loop"] is None and msgs["db_legacy"] is None
     assert msgs["coder"] == setup_check.NO_CODER_HINT
     assert "gh auth login" in msgs["gh"]

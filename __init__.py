@@ -331,6 +331,37 @@ def _feature_reply(f: dict) -> str:
     return json.dumps(out)
 
 
+def _card_resolver(store):
+    """card id → projected card (or None) for a `contains:` gate anchored on a card."""
+
+    def _resolve(fid):
+        try:
+            return store.get_feature(fid)
+        except Exception:  # noqa: BLE001 — an unreadable card is "not found", never a crash
+            return None
+
+    return _resolve
+
+
+def _waits_for_refusal(waits_for) -> str | None:
+    """``Error: …`` when a `waits_for` spec parses but the REMOTE says it cannot mean what
+    the author thinks — today a bare `release:` range on a repo that tags per package
+    (changesets), which any package's version would satisfy. Best-effort: an unreadable
+    remote is not a refusal (evaluation re-detects the case on the card). A spec that
+    does not parse is left for the store to refuse with its own message."""
+    from . import gates as publish_gates
+
+    try:
+        specs = publish_gates.parse_specs(waits_for)
+    except publish_gates.GateSpecError:
+        return None
+    for spec in specs:
+        why = publish_gates.remote_refusal(spec)
+        if why:
+            return f"Error: waits_for spec {spec.raw!r}: {why}"
+    return None
+
+
 def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str | None:
     """The ``Skipped — …`` message a create verb returns when a new card would DUPLICATE
     existing/in-flight work, or None when it's clear to create — the ONE dedup contract
@@ -466,6 +497,7 @@ def _board_tools(cfg: dict):
         force: bool = False,
         source_issue: str = "",
         project: str = "",
+        waits_for: str = "",
     ) -> str:
         """Create a board feature (a bead; starts in `backlog`). To pass the Ready
         gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
@@ -482,7 +514,18 @@ def _board_tools(cfg: dict):
         which repo the feature's worktree/PR target and which repo the Ready gate
         validates its files against; it's stamped as an immutable `project:<name>`
         label. Defaults to the board's `default_project` when omitted; a single-repo
-        board can ignore it.
+        board can ignore it. `waits_for` (comma-separated) names PUBLISH GATES — external facts that must ALL
+        hold before the loop claims the card, for work that needs something another repo
+        SHIPS, not merely merges. For a consumer of another card's change use
+        `npm:<package>@contains:<owner>/<repo>@<card-id>` (e.g.
+        `npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`): met only once a
+        published version is proven to contain that card's merge commit — never a version
+        floor, which an unrelated publish can satisfy. Also `npm:<package>@<semver-range>`,
+        `release:<owner>/<repo>@<tag>`, `release:<owner>/<repo>@<package>@<range>` (a
+        bare range is refused on a repo that tags per package), and
+        `pr:<owner>/<repo>#<n>` (merged). An unmet gate keeps the card out of the claim
+        with `next_action` `waiting on publish: …`; a bad spec refuses the create. Use
+        `depends_on` for a card on THIS board.
 
         DEDUP: refuses to create when a feature with the same title is already OPEN
         on this board (backlog/ready/in_progress/in_review/blocked) — calling this
@@ -519,6 +562,9 @@ def _board_tools(cfg: dict):
             difficulty = _strip_wrapping_quotes(difficulty)
             depends_on = _strip_wrapping_quotes(depends_on)
             source_issue = _strip_wrapping_quotes(source_issue)
+            waits_for = _strip_wrapping_quotes(waits_for)
+            if (refused := _waits_for_refusal(waits_for)) is not None:
+                return refused
             deps = _split_list(depends_on)
             files = _split_list(files_to_modify)
             if not force:
@@ -538,6 +584,7 @@ def _board_tools(cfg: dict):
                 foundation=foundation,
                 source_issue=source_issue,
                 project=project,
+                waits_for=waits_for,
             )
             return _feature_reply(f)
         except BoardError as exc:
@@ -555,6 +602,7 @@ def _board_tools(cfg: dict):
         project: str = "",
         source_issue: str = "",
         force: bool = False,
+        waits_for: str = "",
     ) -> str:
         """Create a board TASK (a `task`-type bead; starts in `backlog`) — the sibling of
         board_create_feature for work that ships a DELIVERABLE (a doc, a decision, an
@@ -567,8 +615,8 @@ def _board_tools(cfg: dict):
 
         `assignee` pre-assigns the bead; `priority` (0 = highest) ranks it in the ready
         queue; `parent` is the epic/milestone id; `depends_on` is a comma-separated list of
-        blocking feature ids; `project` (#90) and `source_issue` (#97) behave exactly as on
-        board_create_feature. DEDUP is identical to board_create_feature — a same-title open
+        blocking feature ids; `project` (#90), `source_issue` (#97) and `waits_for` (publish
+        gates — npm:/release:/pr: specs) behave exactly as on board_create_feature. DEDUP is identical to board_create_feature — a same-title open
         card, a `depends_on` on an in-flight PR, or a `source_issue` an open PR already
         references is refused unless `force=true` (a store/GitHub read failure never blocks
         creation). Inputs are stripped of any literal wrapping double quotes first (same
@@ -583,6 +631,9 @@ def _board_tools(cfg: dict):
             parent = _strip_wrapping_quotes(parent)
             depends_on = _strip_wrapping_quotes(depends_on)
             source_issue = _strip_wrapping_quotes(source_issue)
+            waits_for = _strip_wrapping_quotes(waits_for)
+            if (refused := _waits_for_refusal(waits_for)) is not None:
+                return refused
             deps = _split_list(depends_on)
             if not force:
                 skip = _dedup_skip_message(store, title, deps, source_issue)
@@ -599,6 +650,7 @@ def _board_tools(cfg: dict):
                 project=project,
                 issue_type="task",
                 assignee=assignee,
+                waits_for=waits_for,
             )
             return _feature_reply(f)
         except BoardError as exc:
@@ -617,6 +669,7 @@ def _board_tools(cfg: dict):
         foundation: bool = False,
         source_issue: str = "",
         priority: int | None = None,
+        waits_for: str = "",
     ) -> str:
         """Partially update an existing feature — the REPAIR path for a bead the Ready
         gate rejects. Only the non-empty arguments are written; every other field is left
@@ -635,7 +688,9 @@ def _board_tools(cfg: dict):
         worktree/PR target, and re-homing an in-flight card mid-stream would strand its
         branch; cancel and recreate to move a feature to another project. `priority`
         changes the scheduling rank in place when supplied (0 = highest); omitted/None
-        leaves the current priority untouched. Inputs are stripped of any literal
+        leaves the current priority untouched. `waits_for` REPLACES the card's publish
+        gates (comma-separated npm:/release:/pr: specs, see board_create_feature); `none`
+        clears them; empty leaves them as-is. Inputs are stripped of any literal
         wrapping double quotes before storage (same hygiene as board_create_feature)."""
         try:
             store = get_store(**store_kw)
@@ -666,6 +721,12 @@ def _board_tools(cfg: dict):
             )
             if priority is not None:
                 update_kw["priority"] = priority
+            waits_for = _strip_wrapping_quotes(waits_for).strip()
+            if waits_for:
+                clear = waits_for.lower() in ("none", "clear", "-")
+                if not clear and (refused := _waits_for_refusal(waits_for)) is not None:
+                    return refused
+                update_kw["waits_for"] = [] if clear else waits_for
             f = store.update_feature(feature_id, **update_kw)
             return _feature_reply(f)
         except BoardError as exc:
@@ -684,7 +745,12 @@ def _board_tools(cfg: dict):
         open), plus two dependency views: `depends_on` (EVERY blocking edge — the
         historical ledger, including already-merged blockers) and `open_depends_on`
         (only the edges whose blocker is still OPEN — the live, actionable "what's
-        blocking me now" signal). A TASK (#217) also carries `deliverable` (the recorded
+        blocking me now" signal), `waits_for` (the card's publish gates) with `gates` (each
+        gate's last-checked verdict: `{spec, met, detail, error, checked_at}` — from the
+        loop's cache, no network; board_check_gates re-checks) and `next_action` (e.g.
+        `waiting on publish: npm @x/y containing o/r@bd-a1 (card bd-a1 not merged yet (#5))`,
+        `held: release freeze (…)`,
+        when something other than a coder is what moves the card). A TASK (#217) also carries `deliverable` (the recorded
         deliverable text — "" until board_deliver records one), `delivered_by`, and
         `open_requirements` (the ids of ledger items no delivery has closed) — what
         board_verify judges; open items are for the verifier to weigh, nothing refuses
@@ -698,6 +764,7 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
         if f is None:
             return f"Error: unknown feature {feature_id!r}"
+        annotate_next_action([f], cfg)  # labels + config + cached gate verdicts, no network
         return json.dumps(
             {
                 "id": f["id"],
@@ -719,6 +786,13 @@ def _board_tools(cfg: dict):
                 # Which project (#90) this feature builds in — "" for a pre-#90 feature
                 # or a single-repo board with no `projects:` map.
                 "project": f.get("project", ""),
+                "waits_for": f.get("waits_for", []),
+                **({"gates": f.get("gates", [])} if f.get("waits_for") else {}),
+                **(
+                    {"next_action": f["next_action"], "next_action_hint": f.get("next_action_hint", "")}
+                    if f.get("next_action")
+                    else {}
+                ),
                 # A task's work product (#399). Without it this "FULL detail" read showed a
                 # delivered task with no deliverable at all, and the PM agent reading it
                 # concluded the delivery was empty and set about "repairing" a card whose
@@ -1222,6 +1296,8 @@ def _board_tools(cfg: dict):
                 "difficulty": f["difficulty"],
                 "project": f.get("project", ""),
             }
+            if f.get("waits_for"):
+                row["waits_for"] = f["waits_for"]
             if f.get("next_action"):
                 row["next_action"] = f["next_action"]
                 row["awaiting_merge"] = bool(f.get("awaiting_merge"))
@@ -1262,6 +1338,50 @@ def _board_tools(cfg: dict):
         )
 
     @tool
+    def board_check_gates(feature_id: str = "") -> str:
+        """Check publish gates (`waits_for`) NOW, against the npm registry / GitHub, instead
+        of waiting for the loop's next ready sweep. With `feature_id`, that card's gates;
+        empty, every open (backlog/ready) card that carries any. Returns JSON rows `{id,
+        state, waits_for, gates: [{spec, met, detail, error, checked_at}], clear}` —
+        `clear: true` means every gate holds and the loop will claim the card (a backlog
+        card still needs board_mark_ready). A failed check reads unmet with its `error` (fail
+        closed). Results land in the same shared cache the loop reads, so a check here is
+        what the board shows next; a spec asked within the last 15s is answered from cache."""
+        from . import gates as publish_gates
+
+        try:
+            store = get_store(**store_kw)
+            if str(feature_id or "").strip():
+                f = store.get_feature(feature_id.strip())
+                if f is None:
+                    return f"Error: unknown feature {feature_id!r}"
+                feats = [f]
+            else:
+                feats = [
+                    f
+                    for f in store.list_features()
+                    if f.get("waits_for") and f.get("board_state") in ("backlog", "ready")
+                ]
+        except BoardError as exc:
+            return f"Error: {exc}"
+        token = publish_gates.npm_token(cfg)
+        rows = []
+        for f in feats:
+            results = publish_gates.evaluate(
+                f.get("waits_for") or [], token=token, force=True, resolve_card=_card_resolver(store)
+            )
+            rows.append(
+                {
+                    "id": f["id"],
+                    "state": f["board_state"],
+                    "waits_for": f.get("waits_for") or [],
+                    "gates": results,
+                    "clear": all(r["met"] for r in results),
+                }
+            )
+        return json.dumps(rows)
+
+    @tool
     async def board_dispatch() -> str:
         """Ask the running board loop to evaluate its ready queue RIGHT NOW instead of
         waiting for the next interval, and report what happened (#390) — the observable
@@ -1272,7 +1392,8 @@ def _board_tools(cfg: dict):
         (nothing is ready, and nothing is held); `held` (nothing is claimable, but cards are
         held: `held` maps each reason — `dependencies-closed-promote`,
         `blocked-dependencies-closed`, `ready-waiting-on-dependencies`,
-        `backlog-waiting-on-dependencies`, `blocked:<class>` — to its count, first few ids,
+        `backlog-waiting-on-dependencies`, `waiting-on-publish` (a ready card whose `waits_for`
+        publish gates are not all met), `blocked:<class>` — to its count, first few ids,
         and the step that moves it); `at-capacity` (all `max_concurrent` drive slots are full);
         `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
         task-type card was claimed to in_progress awaiting async delivery, holding no
@@ -1348,6 +1469,7 @@ def _board_tools(cfg: dict):
         board_reset_merged_verify_budget,
         board_list,
         board_retro,
+        board_check_gates,
         board_dispatch,
         board_salvage_feature,
     ]

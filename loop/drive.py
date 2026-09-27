@@ -37,7 +37,10 @@ _READY_SKIP_MAX_DEFAULT = 5
 #    coder_timeout) will free the file — a RESOLVING skip, transient by construction.
 #  - "blocked" / "preflight-hold": the card already sits in the visible blocked/held
 #    path — re-blocking is redundant and would clobber its real reason.
-_NON_LIVELOCK_SKIP_REASONS = frozenset({"hot-file", "blocked", "preflight-hold", "reserved"})
+#  - WAITING_ON_PUBLISH: the card waits on an external fact (a publish, a release, a
+#    merged PR — `waits_for`, gates.py) and says so on its next_action. Waiting days for
+#    a release is the design, not a stuck dispatch.
+_NON_LIVELOCK_SKIP_REASONS = frozenset({"hot-file", "blocked", "preflight-hold", "reserved", WAITING_ON_PUBLISH})
 
 
 def _is_livelock_skip_reason(reason: str) -> bool:
@@ -85,6 +88,11 @@ _HELD_REASONS = (
         "backlog, waiting on open dependencies",
         "none yet — once they close it still needs board_mark_ready",
     ),
+    (
+        "waiting-on-publish",
+        "waiting on a publish gate (waits_for)",
+        "none — claimable by itself the moment every gate holds (board_check_gates checks now)",
+    ),
 )
 
 
@@ -115,6 +123,8 @@ def _held_summary(feats) -> dict:
             key = "ready-waiting-on-dependencies"
         elif state == "backlog" and f.get("open_depends_on"):
             key = "backlog-waiting-on-dependencies"
+        elif state == "ready" and store_mod.publish_gate_posture(f)["next_action"]:
+            key = "waiting-on-publish"
         else:
             continue
         groups.setdefault(key, []).append(fid)
@@ -721,6 +731,21 @@ class DriveMixin:
             if isinstance(self._preflight_state.get(pname), str):
                 skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
                 continue
+            # Publish gates (`waits_for`, gates.py): an external fact — a version on npm, a
+            # GitHub release, a merged PR — the card needs before a coder can start. Checked
+            # here, at the claim, so only a card that is otherwise claimable costs a read,
+            # and through the shared per-spec cache (TTL + error backoff), so N cards on one
+            # package ask the registry once. Unmet — or unanswerable — keeps it unclaimed.
+            if candidate.get("waits_for"):
+                if not await self._publish_gates_clear(store, candidate):
+                    skipped.append(
+                        {
+                            "fid": cid,
+                            "reason": WAITING_ON_PUBLISH,
+                            "gates": list(candidate["waits_for"]),
+                        }
+                    )
+                    continue
             # #217: task-type dispatch — a `task` bead ships a DELIVERABLE (a doc, a
             # decision, an artifact ref), not a diff, so it takes NO git worktree and
             # skips the hot-file guard below (with no worktree there is no file to
@@ -794,6 +819,50 @@ class DriveMixin:
         # the blocked/escalation path rather than retrying forever.
         await self._bound_ready_skips(store, selected, parked, skipped)
         return spawned
+
+    async def _publish_gates_clear(self, store, candidate: dict) -> bool:
+        """True when every publish gate on ``candidate`` holds. Logs the transition both
+        ways ONCE per card (held → the what; cleared → a comment on the card too), never
+        per tick. Never raises: gates.evaluate fails closed on its own."""
+        fid = candidate["id"]
+        waiting = getattr(self, "_gate_waiting", None)
+        if waiting is None:
+            waiting = self._gate_waiting = set()
+
+        def _resolve(card_id):
+            try:
+                return store.get_feature(card_id)
+            except Exception:  # noqa: BLE001 — unreadable = not found = unmet, never a crash
+                return None
+
+        try:
+            results = await asyncio.to_thread(
+                publish_gates.evaluate, candidate["waits_for"], token=self._npm_token(), resolve_card=_resolve
+            )
+        except Exception as exc:  # noqa: BLE001 — belt: a gate bug holds ONE card, never the scan
+            log.warning("[project_board] %s publish-gate evaluation crashed — held: %s", fid, exc, exc_info=True)
+            return False
+        sentence = publish_gates.unmet_sentence(results)
+        if sentence:
+            if fid not in waiting:
+                waiting.add(fid)
+                getattr(self, "_gate_cleared", set()).discard(fid)
+                log.info("[project_board] %s held out of the claim — %s", fid, sentence)
+            return False
+        met = "; ".join(r["detail"] for r in results)
+        cleared = getattr(self, "_gate_cleared", None)
+        if cleared is None:
+            cleared = self._gate_cleared = set()
+        if fid not in cleared:  # once per card per process, not once per tick
+            cleared.add(fid)
+            log.info("[project_board] %s publish gates cleared (%s) — claimable", fid, met)
+        if fid in waiting:
+            waiting.discard(fid)
+            try:
+                await asyncio.to_thread(store.comment, fid, f"publish gates cleared: {met}")
+            except Exception:  # noqa: BLE001 — bookkeeping must never kill the scan
+                log.warning("[project_board] %s gates-cleared comment failed", fid, exc_info=True)
+        return True
 
     def _ready_skip_max(self) -> int:
         """The consecutive-skip threshold before a livelocked ready card is flagged

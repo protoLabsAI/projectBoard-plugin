@@ -50,7 +50,8 @@ import threading
 import time
 import types
 
-from .. import br_fetch, coder_seam, config, health, setup_check, work_snapshot, worktree
+from .. import br_fetch, coder_seam, config, health, release_freeze, setup_check, work_snapshot, worktree
+from .. import gates as publish_gates
 from ..failures import (
     PRE_MODEL_DISPATCH_CLASS,
     PREFLIGHT_HOLD_CLASS,
@@ -96,6 +97,15 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # ``_verify_merged_state`` truncates the live origin/<base> to the SAME width so the
 # ``stamped == current`` currency check stays exact.
 _MERGED_VERIFIED_SHA_LEN = 12
+
+# The auto-merge blocker phrase for a repo mid-release (release_freeze.py). The merge
+# edge records the hold under it; the listing reads the hold back as
+# `held: release freeze (<evidence>)`.
+RELEASE_FREEZE_BLOCKER = "release freeze"
+
+# The claim-scan skip reason for a ready card whose publish gates (`waits_for`, gates.py)
+# are not all met. Not a livelock: the card is waiting on the outside world, visibly.
+WAITING_ON_PUBLISH = "waiting-on-publish"
 
 # The review-verdict head stamp (#328) rides a ``reviewed-head:<sha>`` LABEL under the
 # SAME 50-char beads label cap that forced ``merged-verified:`` short (#135) — so the PR
@@ -1409,6 +1419,10 @@ __all__ = [
     "setup_check",
     "work_snapshot",
     "worktree",
+    "publish_gates",
+    "release_freeze",
+    "RELEASE_FREEZE_BLOCKER",
+    "WAITING_ON_PUBLISH",
     "PRE_MODEL_DISPATCH_CLASS",
     "PREFLIGHT_HOLD_CLASS",
     "STRANDED_WORK_CLASS",

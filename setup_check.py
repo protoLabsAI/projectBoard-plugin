@@ -88,7 +88,11 @@ LEGACY_STORE_KEY = "db_legacy"
 # records its verdict on the bead; this only warns the operator when the PR-visible status can't
 # be written. A single startup probe, so the board never silently degrades on every card (r6).
 REVIEW_STATUS_KEY = "review_status"
-REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY)
+# The release-freeze blind-signal advisory (#457 review, M2): a freeze signal the gh credential
+# cannot read (403 — e.g. no Actions: read) is SKIPPED rather than holding every merge; this
+# names it so the operator knows the guard is partly blind. Advisory only, never a pause.
+RELEASE_FREEZE_KEY = "release_freeze"
+REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (LOOP_STALE_KEY, LEGACY_STORE_KEY, REVIEW_STATUS_KEY, RELEASE_FREEZE_KEY)
 # The config keys the running loop reads ONCE at construction and cannot pick up on a
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
@@ -666,6 +670,7 @@ def setup_status(
           "legacy_store_hint": str,    # migration copy, "" when the advisory is quiet
           "review_status_ok": bool,    # the review gate can publish its QA-panel commit status (#354)
           "review_status_hint": str,   # capability-warning copy, "" when capable / gate off
+          "release_freeze_hint": str,  # freeze signals the gh credential can't read (403), "" when none
           "ready": bool,               # every check ok
         }
 
@@ -822,6 +827,9 @@ def setup_status(
     rs_ok, rs_hint = _review_status_capability(cfg, gh_ok=gh["ok"], run=run, probe=status_probe, cwd=repo_cwd)
     status["review_status_ok"] = rs_ok
     status["review_status_hint"] = rs_hint
+    from . import release_freeze  # lazy: keep the preflight's import surface small
+
+    status["release_freeze_hint"] = release_freeze.unavailable_hint()
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
 
@@ -993,6 +1001,8 @@ class GapReporter:
                 msg = str((status or {}).get("legacy_store_hint") or "") or None
             elif key == REVIEW_STATUS_KEY:
                 msg = str((status or {}).get("review_status_hint") or "") or None
+            elif key == RELEASE_FREEZE_KEY:
+                msg = str((status or {}).get("release_freeze_hint") or "") or None
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")

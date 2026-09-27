@@ -65,6 +65,7 @@ _PROJECT_SETTING_KEYS = (
     "format_cmd",
     "setup_cmd",
     "env_passthrough",
+    "release_freeze",
 )
 _CODER_SOLVE_PREFIX = "coder_solve_"
 
