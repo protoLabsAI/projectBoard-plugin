@@ -774,7 +774,10 @@ async def refresh_base_checkout(repo: str, base: str) -> dict:
                 "behind": behind,
                 "detail": f"{behind} commit(s) behind {remote} and {ahead} ahead (diverged) — not fast-forwarded",
             }
-        rc_m, _o, err_m = await _git(repo, "merge", "--ff-only", "--quiet", remote)
+        # --no-overwrite-ignore (#452 review M1): an IGNORED local file that upstream starts
+        # tracking (an operator's secret.env vs a committed template) would otherwise be
+        # silently replaced. With it git refuses, and the checkout reads `stale`.
+        rc_m, _o, err_m = await _git(repo, "merge", "--ff-only", "--no-overwrite-ignore", "--quiet", remote)
         if rc_m != 0:
             return {
                 "state": "stale",

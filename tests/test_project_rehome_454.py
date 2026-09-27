@@ -358,3 +358,107 @@ def test_patch_features_rehomes_and_refuses_like_the_tool(board, monkeypatch):
     assert bad.status_code == 400 and "not a project on this board" in bad.json()["detail"]
     blank = c.patch(f"/api/plugins/project_board/features/{orphan['id']}", json={"project": ""})
     assert blank.status_code == 200 and blank.json()["project"] == "docs"  # "" leaves it alone
+
+
+@requires_br
+def test_a_claim_between_the_check_and_the_relabel_is_undone(board, monkeypatch):
+    """Review M3: the state check and the label rewrite are two steps. A claim that lands
+    between them must not leave an in_progress card (building in web's repo) labelled docs."""
+    f = board.create_feature("c", spec="s", acceptance_criteria="a", files_to_modify=["app.py"], project="web")
+    board.mark_ready(f["id"])
+    real = BeadsBoard._rehome_refusal
+
+    def racing(self, feat, target, files=None):
+        out = real(self, feat, target, files)
+        assert self.claim(feat["id"]) is not None  # the loop's claim scan wins the race here
+        return out
+
+    monkeypatch.setattr(BeadsBoard, "_rehome_refusal", racing)
+    with pytest.raises(BoardError, match="claimed while the move was being written"):
+        board.update_feature(f["id"], project="docs", files_to_modify=["guide.md"])
+    after = board.get_feature(f["id"])
+    assert after["board_state"] == "in_progress" and after["project"] == "web"
+
+
+def test_claim_and_update_share_the_card_lock():
+    """The store-level half of M3: both edges run under the card's lock."""
+    assert BeadsBoard.claim.__wrapped__ and BeadsBoard.update_feature.__wrapped__
+
+
+@requires_br
+def test_a_leftover_feature_branch_in_the_old_repo_blocks_the_move(tmp_path):
+    """Review m2: a crash can dispatch without recording an attempt; the branch it left in
+    the old repo still says a build started there."""
+    web = tmp_path / "web"
+    web.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=web, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "i"],
+        cwd=web,
+        check=True,
+    )
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    projects = resolve_projects({"projects": {"web": {"repo": str(web)}, "docs": {"repo": str(docs)}}})
+    b = BeadsBoard(repo=str(tmp_path / "legacy"), actor="test", projects=projects, default_project="web")
+    (tmp_path / "legacy").mkdir()
+    f = b.create_feature("c", spec="s", project="web")
+    subprocess.run(["git", "branch", f"feat-{f['id']}-some-slug"], cwd=web, check=True)
+    with pytest.raises(BoardError, match=f"a branch for it already exists .*feat-{f['id']}-some-slug"):
+        b.update_feature(f["id"], project="docs")
+    assert b.get_feature(f["id"])["project"] == "web"
+
+
+@requires_br
+async def test_patch_rehome_takes_the_live_loops_claim_guard(board, monkeypatch):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from project_board import api
+    from project_board import loop as loop_pkg
+
+    f = board.create_feature("Old card", spec="s", project="default")
+    held = []
+
+    class _Loop:
+        def __init__(self):
+            import asyncio
+
+            self.lock = asyncio.Lock()
+
+        def _claim_guard(self):
+            return self.lock
+
+    fake = _Loop()
+    real_update = board.update_feature
+
+    def spy(fid, **kw):
+        held.append(fake.lock.locked())
+        return real_update(fid, **kw)
+
+    monkeypatch.setattr(board, "update_feature", spy)
+    monkeypatch.setattr(loop_pkg, "live_loop", lambda: fake)
+    monkeypatch.setattr(api, "get_store", lambda **_kw: board)
+    app = FastAPI()
+    cfg = {"default_project": "web", "projects": {n: {"repo": e["repo"]} for n, e in board.projects.items()}}
+    app.include_router(api.build_data_router(cfg), prefix="/api/plugins/project_board")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.patch(f"/api/plugins/project_board/features/{f['id']}", json={"project": "docs"})
+    assert r.status_code == 200 and held == [True]
+
+
+def test_the_advisory_reads_each_remote_once_per_ttl(tmp_path):
+    """Review m7: /status polls every 10 s; the git-remote reads are cached."""
+    remote = "https://github.com/o/r.git"
+    legacy = _clone_of(tmp_path / "old", remote)
+    project = _clone_of(tmp_path / "new", remote)
+    cfg = {"repo": str(legacy), "projects": {"r": {"repo": str(project)}}}
+    calls = []
+
+    def counting(cmd, **kw):
+        calls.append(cmd)
+        return _git_only(cmd, **kw)
+
+    for _ in range(5):
+        assert setup_check.legacy_binding(cfg, run=counting)["same_remote"] == ["r"]
+    assert len(calls) == 2  # one read per checkout, not one per poll

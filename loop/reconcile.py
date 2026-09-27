@@ -600,9 +600,10 @@ class ReconcileMixin:
         # project's repo, and a worktree resolved in repo A must be reaped in repo A.
         for repo in self._all_repos():
             await self._sweep_worktrees(store, repo)
-        # (a2) bring each project's base checkout up to origin/<base> where that is safe,
-        # and report the ones that can't be (#452). Never touches the board store.
-        await self._refresh_base_checkouts()
+        # (a2) bring each board-owned base checkout up to origin/<base> where that is safe,
+        # and report the ones that can't be (#452). Its own task: network-bound, so it must
+        # never hold the tick (#462). Never touches the board store.
+        self._start_base_refresh()
         # (a3) cards whose project no longer resolves (#454), for /status.
         await self._publish_orphaned_cards(store)
         # (b2) the blocked lane: self-heal what can be, and TELL THE OPERATOR about what

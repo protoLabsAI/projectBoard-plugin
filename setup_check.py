@@ -62,6 +62,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 
 from . import br_fetch
@@ -616,8 +617,27 @@ def _br_version(path: str, run) -> str:
     return version
 
 
+#: ``(path, runner) -> (monotonic ts, slug)`` — the legacy-binding advisory's remote reads,
+#: cached (#454 review m7): ``/status`` is polled every 10 s, and a remote URL doesn't change
+#: between polls. Keyed by the runner too, so an injected test runner never sees another's.
+_ORIGIN_CACHE: dict[tuple[str, int], tuple[float, str]] = {}
+_ORIGIN_TTL_S = 300.0
+
+
 def _origin_slug(path: str, run) -> str:
-    """``owner/repo`` of ``path``'s GitHub ``origin`` (a local ``git remote`` read), or ``""``."""
+    """``owner/repo`` of ``path``'s GitHub ``origin`` (a local ``git remote`` read, cached for
+    ``_ORIGIN_TTL_S``), or ``""``."""
+    key = (os.path.realpath(os.path.expanduser(path)), id(run))
+    hit = _ORIGIN_CACHE.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _ORIGIN_TTL_S:
+        return hit[1]
+    slug = _read_origin_slug(path, run)
+    _ORIGIN_CACHE[key] = (now, slug)
+    return slug
+
+
+def _read_origin_slug(path: str, run) -> str:
     try:
         proc = run(["git", "-C", path, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
     except Exception:  # noqa: BLE001 — no git / no remote is "unknown", never a failure

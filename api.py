@@ -737,7 +737,20 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 kwargs["waits_for"] = []
         changed = sorted(kwargs)
 
-        updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+        if "project" in kwargs:
+            # A re-home (#454) runs under the loop's claim guard, as attach-pr does
+            # (loop/attach.py): no claim scan can interleave with the store's re-read of
+            # the card's state and its label rewrite.
+            from .loop import live_loop
+
+            loop = live_loop()
+            if loop is not None:
+                async with loop._claim_guard():
+                    updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+            else:
+                updated = await _guard(lambda: s.update_feature(fid, **kwargs))
+        else:
+            updated = await _guard(lambda: s.update_feature(fid, **kwargs))
         if changed:
             await asyncio.to_thread(s.comment, fid, f"spec updated: {', '.join(changed)}")
 

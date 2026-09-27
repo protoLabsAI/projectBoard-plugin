@@ -30,6 +30,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _host_apply import callable_aware
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -80,7 +81,7 @@ def _host(monkeypatch, tmp_path, projects: dict):
     fake_plugins = types.ModuleType("graph.plugins")
     fake_plugins.__path__ = []
     fake_host = types.ModuleType("graph.plugins.host")
-    fake_host.HOST = types.SimpleNamespace(apply_settings=_apply_like_host(cfg))
+    fake_host.HOST = types.SimpleNamespace(apply_settings=callable_aware(_apply_like_host(cfg), cfg))
     monkeypatch.setitem(sys.modules, "graph.sdk", fake_sdk)
     monkeypatch.setitem(sys.modules, "graph.plugins", fake_plugins)
     monkeypatch.setitem(sys.modules, "graph.plugins.host", fake_host)

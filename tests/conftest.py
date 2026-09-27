@@ -75,6 +75,7 @@ def _no_real_br_version(monkeypatch, tmp_path_factory):
     )
     setup_check._BR_VERSION_CACHE.clear()
     setup_check._REVIEW_STATUS_CACHE.clear()  # #354: the per-process capability probe, per test
+    setup_check._ORIGIN_CACHE.clear()  # #454: the legacy-binding advisory's remote reads
     setup_check.publish_loop_snapshot(None)  # no running loop between tests
 
     # The `br` auto-fetch (v0.43.0): NEVER touch the network or ~/.protoagent from the

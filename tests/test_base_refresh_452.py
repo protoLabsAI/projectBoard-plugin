@@ -125,33 +125,159 @@ async def test_an_unreachable_origin_is_unknown_not_an_error(origin, tmp_path):
     assert result["state"] == "unknown" and "git fetch origin main failed" in result["detail"]
 
 
-async def test_the_sweep_refreshes_every_project_and_publishes_stale_ones(origin, tmp_path):
-    """The loop's sweep step: one clean checkout is moved, one dirty one is reported stale,
-    and both land in the health snapshot /status serves."""
+async def test_an_ignored_local_file_upstream_starts_tracking_is_never_overwritten(origin):
+    """Review M1: an operator's IGNORED secret.env, and upstream then commits a template at
+    that path. A plain ff-only merge replaced the secret; the refresh must refuse instead."""
+    Path(origin.seed, ".gitignore").write_text("secret.env\n")
+    _git("-C", origin.seed, "add", "-A")
+    _git("-C", origin.seed, "commit", "-m", "ignore secret.env")
+    _git("-C", origin.seed, "push", "origin", "main")
+    await worktree.refresh_base_checkout(origin.clone, "main")  # the ignore rule lands (a clean ff)
+    Path(origin.clone, "secret.env").write_text("OPERATOR LOCAL SECRET\n")
+    Path(origin.seed, "secret.env").write_text("TEMPLATE\n")
+    _git("-C", origin.seed, "add", "-f", "secret.env")
+    _git("-C", origin.seed, "commit", "-m", "track template")
+    _git("-C", origin.seed, "push", "origin", "main")
+    before = origin.head()
+
+    result = await worktree.refresh_base_checkout(origin.clone, "main")
+    assert result["state"] == "stale" and "fast-forward refused" in result["detail"]
+    assert Path(origin.clone, "secret.env").read_text() == "OPERATOR LOCAL SECRET\n"
+    assert origin.head() == before
+
+
+def _loop(projects: dict, **extra) -> BoardLoop:
+    return BoardLoop({"coder": "proto", "merge_poll": False, "projects": projects, **extra})
+
+
+async def test_only_board_owned_checkouts_are_moved_by_default(origin, tmp_path):
+    """Review M2: the operator's own checkout (outside the onboarding root, not registered by
+    the board) is never moved unless its project opts in with base_refresh: true."""
+    before = origin.head()
+    origin.release()
+    loop = _loop({"mine": {"repo": origin.clone}})
+    await loop._refresh_base_checkouts()
+    snap = health.base_checkouts_snapshot()
+    assert snap["mine"]["state"] == "skipped" and "base_refresh: true" in snap["mine"]["detail"]
+    assert origin.head() == before
+
+
+async def test_a_checkout_under_the_onboarding_root_is_board_owned(origin, tmp_path, monkeypatch):
+    import sys
+    import types
+
+    new = origin.release()
+    sdk = types.ModuleType("graph.sdk")
+    sdk.config = lambda: types.SimpleNamespace(onboarding_enabled=True, onboarding_root=str(tmp_path), plugin_config={})
+    monkeypatch.setitem(sys.modules, "graph.sdk", sdk)
+    await _loop({"web": {"repo": origin.clone}})._refresh_base_checkouts()
+    assert health.base_checkouts_snapshot()["web"]["state"] == "fast_forwarded"
+    assert origin.head() == new
+
+
+async def test_the_sweep_refreshes_opted_in_projects_and_publishes_stale_ones(origin, tmp_path):
+    """One clean checkout is moved, one dirty one is reported stale, one opted out is left."""
     other = _Origin(tmp_path / "other")
+    third = _Origin(tmp_path / "third")
     new = origin.release()
     other.release()
+    third_before = third.head()
+    third.release()
     Path(other.clone, "README.md").write_text("wip\n")
-    loop = BoardLoop(
+    loop = _loop(
         {
-            "coder": "proto",
-            "merge_poll": False,
-            "projects": {"web": {"repo": origin.clone}, "docs": {"repo": other.clone}},
-            "default_project": "web",
-        }
+            "web": {"repo": origin.clone, "base_refresh": True},
+            "docs": {"repo": other.clone, "base_refresh": True},
+            "ops": {"repo": third.clone, "base_refresh": False, "managed_project": "ops"},
+        },
+        default_project="web",
     )
     await loop._refresh_base_checkouts()
     snap = health.base_checkouts_snapshot()
     assert snap["web"]["state"] == "fast_forwarded" and origin.head() == new
     assert snap["docs"]["state"] == "stale" and "uncommitted changes" in snap["docs"]["detail"]
     assert snap["docs"]["repo"] == other.clone and snap["docs"]["base"] == "main"
+    assert snap["ops"]["state"] == "skipped" and third.head() == third_before
+
+
+async def test_the_fetches_run_concurrently_under_one_budget(origin, tmp_path, monkeypatch):
+    """Review M2: a pass never holds the loop for N × the git timeout. Checkouts refresh
+    concurrently, and any still running at the budget are cancelled and reported."""
+    import asyncio
+    import time
+
+    other = _Origin(tmp_path / "other")
+    started = []
+
+    async def slow(repo, base):
+        started.append(time.monotonic())
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(worktree, "refresh_base_checkout", slow)
+    loop = _loop({"a": {"repo": origin.clone, "base_refresh": True}, "b": {"repo": other.clone, "base_refresh": True}})
+    loop.base_refresh_budget_s = 0.3
+    t0 = time.monotonic()
+    await loop._refresh_base_checkouts()
+    assert time.monotonic() - t0 < 2
+    assert len(started) == 2 and abs(started[0] - started[1]) < 0.2  # both began together
+    snap = health.base_checkouts_snapshot()
+    assert snap["a"]["state"] == snap["b"]["state"] == "unknown" and "refresh budget" in snap["a"]["detail"]
+
+
+async def test_a_running_gate_smoke_holds_the_checkout(origin, monkeypatch):
+    """The registration gate smoke and the refresh share the per-checkout lock: a pass
+    skips a checkout whose smoke is running, and holds the lock while it refreshes."""
+    import asyncio
+
+    from project_board import project_registry
+
+    before = origin.head()
+    origin.release()
+    lock = project_registry._SMOKE_LOCKS.setdefault(str(Path(origin.clone).resolve()), asyncio.Lock())
+    async with lock:
+        await _loop({"web": {"repo": origin.clone, "base_refresh": True}})._refresh_base_checkouts()
+    assert "gate smoke is running" in health.base_checkouts_snapshot()["web"]["detail"]
+    assert origin.head() == before
+
+    held = []
+    real = worktree.refresh_base_checkout
+
+    async def spy(repo, base):
+        held.append(lock.locked())
+        return await real(repo, base)
+
+    monkeypatch.setattr(worktree, "refresh_base_checkout", spy)
+    await _loop({"web": {"repo": origin.clone, "base_refresh": True}})._refresh_base_checkouts()
+    assert held == [True] and not lock.locked()
+
+
+async def test_the_sweep_starts_the_refresh_off_the_tick(origin, monkeypatch):
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def blocked(repo, base):
+        await gate.wait()
+        return {"state": "current", "behind": 0, "detail": ""}
+
+    monkeypatch.setattr(worktree, "refresh_base_checkout", blocked)
+    loop = _loop({"web": {"repo": origin.clone, "base_refresh": True}})
+    loop._start_base_refresh()
+    first = loop._base_refresh_task
+    loop._start_base_refresh()  # one pass at a time
+    assert loop._base_refresh_task is first and not first.done()
+    gate.set()
+    await first
+    assert health.base_checkouts_snapshot()["web"]["state"] == "current"
 
 
 async def test_base_refresh_false_leaves_every_checkout_alone(origin):
     before = origin.head()
     origin.release()
-    loop = BoardLoop({"coder": "proto", "merge_poll": False, "repo": origin.clone, "base_refresh": False})
+    loop = _loop({"web": {"repo": origin.clone, "base_refresh": True}}, base_refresh=False)
     health.publish_base_checkouts({})
     await loop._refresh_base_checkouts()
+    loop._start_base_refresh()
+    assert getattr(loop, "_base_refresh_task", None) is None
     assert origin.head() == before
     assert health.base_checkouts_snapshot() == {}

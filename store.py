@@ -1124,6 +1124,27 @@ def normalize_external_ref(raw, *, edge: str) -> str:
     return s
 
 
+def _feature_branches(repo: str, fid: str) -> list[str]:
+    """The ``feat-<fid>`` branches (local, or on ``origin``) in ``repo``: a build's branch
+    and its worktree's. ``[]`` when there are none, or ``repo`` is not a readable checkout
+    (nothing can have been built there). A local ``git for-each-ref``, no network."""
+    if not fid or not repo or not os.path.isdir(repo):
+        return []
+    refs = [f"refs/heads/feat-{fid}", f"refs/remotes/origin/feat-{fid}"]
+    patterns = refs + [f"{r}-*" for r in refs]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "for-each-ref", "--format=%(refname:short)", *patterns],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
+
+
 def normalize_project(raw) -> str:
     """Normalize + validate a project name for the `project:<name>` label (#90).
 
@@ -2126,6 +2147,10 @@ class BeadsBoard:
         }
 
     # ── partial update (the repair path) ──────────────────────────────────────
+    # Under the card's lock (#454 review M3), which `claim` takes too: a re-home checks
+    # the card's state and rewrites its project label, and a claim landing between the
+    # two would leave a card building in one repo labelled for another.
+    @_task_edge
     def update_feature(
         self,
         fid: str,
@@ -2228,6 +2253,27 @@ class BeadsBoard:
         if len(args) > 2:  # something to write beyond the bare `update <fid>`
             self._run(*args)
         if rehome is not None:
+            # Re-read after the write (#454 review M3). The card lock keeps this store's own
+            # claim out, but a claim can come from anywhere `br` is shared; if the card left
+            # backlog/ready or gained an owner meanwhile, undo the label rather than leave a
+            # build in the old repo labelled for the new one.
+            after = self.get_feature(fid) or {}
+            moved_on = after.get("board_state") not in ("backlog", "ready") or str(after.get("assignee") or "") != str(
+                f.get("assignee") or ""
+            )
+            if moved_on:
+                if rehome[0]:
+                    undo = replace_prefixed_label_args(
+                        after.get("labels"), LABEL_PROJECT_PREFIX, LABEL_PROJECT_PREFIX + rehome[0]
+                    )
+                else:
+                    undo = ["--remove-label", LABEL_PROJECT_PREFIX + rehome[1]]
+                self._run("update", fid, *undo)
+                raise BoardError(
+                    f"can't move feature {fid!r} to project {rehome[1]!r}: it was claimed while the move was "
+                    f"being written (now {after.get('board_state')!r}), so its project was put back to "
+                    f"{rehome[0] or '(none)'!r}; any other fields in this update were saved"
+                )
             try:
                 self.comment(fid, f"project re-homed: {rehome[0] or '(none)'} → {rehome[1]}")
             except BoardError:
@@ -2276,6 +2322,14 @@ class BeadsBoard:
             return (
                 "it has been dispatched before, so a branch may exist in its current project's repo — "
                 "cancel it and create a new card in the target project instead"
+            )
+        # A crash can dispatch a card without recording the attempt (#454 review m2), so the
+        # labels are not the whole story: its branch or worktree in the old repo is.
+        leftover = _feature_branches(self._repo_for(f), str(f.get("id") or ""))
+        if leftover:
+            return (
+                f"a branch for it already exists in its current project's repo ({', '.join(leftover[:3])}) — "
+                "a build started there; cancel it and create a new card in the target project instead"
             )
         if state == "ready":
             files = (
@@ -2872,6 +2926,7 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
+    @_task_edge  # serializes against a re-home of the same card (#454 review M3)
     def claim(self, fid: str, assignee: str = "") -> dict | None:
         """Atomically claim a SPECIFIC ready feature → `in_progress` (vs
         ``claim_next_ready``, which takes the top of the queue). The loop uses this to

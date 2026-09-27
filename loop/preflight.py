@@ -403,51 +403,130 @@ class PreflightMixin:
         self._preflight_held.pop(name, None)
 
     # ── base-checkout freshness (#452) ───────────────────────────────────────────
-    async def _refresh_base_checkouts(self) -> None:
-        """Fetch each project's base and fast-forward its MAIN checkout when that is safe
-        (clean, on the base branch, nothing local the remote lacks) — the health sweep's
-        step (a2). Worktrees were always cut from ``origin/<base>``, but the checkout the
-        agent READS (and the gate preflight smokes) never moved: an agent read a v0.7.1
-        tree an hour after v0.9.0 shipped. A checkout that can't be moved safely is left
-        exactly as it is and reported ``stale`` on ``/status`` with the reason.
+    #: The most one refresh pass may take, all checkouts together. The fetches run
+    #: concurrently; any still running at the cap are cancelled (their git tree killed)
+    #: and reported `unknown`, so a slow remote can never hold a pass open.
+    base_refresh_budget_s = 120.0
 
-        Skips a checkout whose registration-time gate smoke is running right now (the
-        registry's per-checkout smoke lock), so a fast-forward never lands under a gate."""
+    def _start_base_refresh(self) -> None:
+        """Start a refresh pass as its OWN task, off the tick (#452 review M2): a pass is
+        network-bound, and run inline it would stall claims and reconciles behind every
+        fetch — #462's starvation again. At most one pass runs at a time."""
         if not self.base_refresh:
             return
+        task = getattr(self, "_base_refresh_task", None)
+        if task is not None and not task.done():
+            return
+        self._base_refresh_task = asyncio.create_task(self._refresh_base_checkouts())
+
+    def _base_refresh_owned(self, name: str, repo: str) -> tuple[bool, str]:
+        """Whether the board may move project ``name``'s checkout at ``repo``, and why.
+
+        Only a checkout the BOARD owns is refreshed by default (#452 review M2): one under
+        the host's onboarding root (where onboarding and board registration clone), or one
+        the board registered as a managed project. An operator's own checkout elsewhere
+        (``~/dev/<repo>``, the one they work in) is never moved unless its project entry
+        says ``base_refresh: true``; ``base_refresh: false`` opts any checkout out."""
+        raw: dict = {}
+        try:
+            from ..project_registry import _host_onboarding, _live_section
+
+            live = _live_section().get("projects")
+            source = live if isinstance(live, dict) else self.cfg.get("projects")
+            raw = dict((source or {}).get(name) or {}) if isinstance(source, dict) else {}
+            _enabled, root = _host_onboarding()
+        except Exception:  # noqa: BLE001 — no host: nothing is known to be the board's
+            root = ""
+        if "base_refresh" in raw:
+            on = _knob_bool(raw, "base_refresh", False, strict=False)
+            return on, "base_refresh set on the project"
+        if str(raw.get("managed_project") or "").strip():
+            return True, "registered by the board"
+        if root:
+            try:
+                r = Path(root).expanduser().resolve()
+                p = Path(repo).expanduser().resolve()
+                if p == r or r in p.parents:
+                    return True, "under the onboarding root"
+            except OSError:
+                pass
+        return (
+            False,
+            "not a board-owned checkout (outside the onboarding root) — set base_refresh: true on the project to include it",
+        )
+
+    async def _refresh_one(self, repo: str, base: str) -> dict:
+        """Refresh one checkout while HOLDING its registration smoke lock for the whole
+        refresh, so neither can run under the other (#452 review M2). A checkout whose gate
+        smoke is running right now is skipped for this pass, not waited on."""
         from ..project_registry import _SMOKE_LOCKS
 
+        lock = _SMOKE_LOCKS.setdefault(str(Path(repo).expanduser().resolve()), asyncio.Lock())
+        if lock.locked():
+            return {"state": "unknown", "behind": 0, "detail": "a registration gate smoke is running in it — next pass"}
+        async with lock:  # uncontended: acquired without yielding, so nothing slips in between
+            return await worktree.refresh_base_checkout(repo, base)
+
+    async def _refresh_base_checkouts(self) -> None:
+        """Fetch each board-owned project's base and fast-forward its MAIN checkout when that
+        is safe (clean, on the base branch, nothing local the remote lacks). Worktrees were
+        always cut from ``origin/<base>``, but the checkout the agent READS (and the gate
+        preflight smokes) never moved: an agent read a v0.7.1 tree an hour after v0.9.0
+        shipped. A checkout that can't be moved safely is left exactly as it is and
+        reported ``stale`` on ``/status`` with the reason; one the board doesn't own is
+        reported ``skipped``."""
+        if not self.base_refresh:
+            return
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         results: dict[str, dict] = {}
-        done: dict[tuple[str, str], dict] = {}
+        jobs: dict[tuple[str, str], list[str]] = {}
+        where: dict[str, tuple[str, str]] = {}
         for name in list(self._projects):
             repo = self._repo_for({"project": name})
             base = self._base_branch_for({"project": name})
             if not repo or not os.path.exists(os.path.join(repo, ".git")):
                 continue  # no checkout: the repo setup check owns that
-            key = (os.path.realpath(repo), base)
-            if key not in done:
-                lock = _SMOKE_LOCKS.get(str(Path(repo).expanduser().resolve()))
-                if lock is not None and lock.locked():
-                    continue  # a registration gate smoke is running in this checkout — next sweep
-                done[key] = await worktree.refresh_base_checkout(repo, base)
-                state = done[key]["state"]
-                # WARN once per distinct reason; the sweep re-checks every few minutes, and an
-                # unchanged stale checkout re-logged each time would bury the log.
-                seen = self.__dict__.setdefault("_base_stale_logged", {})
-                if state == "stale" and seen.get(key) != done[key]["detail"]:
-                    log.warning("[project_board] base checkout for %s is stale: %s", name, done[key]["detail"])
-                if state == "stale":
-                    seen[key] = done[key]["detail"]
-                else:
-                    seen.pop(key, None)
-                if state == "unknown":
-                    log.info("[project_board] base checkout for %s not refreshed: %s", name, done[key]["detail"])
-            results[name] = {
-                "repo": repo,
-                "base": base,
-                **done[key],
-                "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
+            where[name] = (repo, base)
+            owned, why = self._base_refresh_owned(name, repo)
+            if not owned:
+                results[name] = {"state": "skipped", "behind": 0, "detail": why}
+                continue
+            jobs.setdefault((os.path.realpath(repo), base), []).append(name)
+        tasks = {key: asyncio.create_task(self._refresh_one(where[names[0]][0], key[1])) for key, names in jobs.items()}
+        if tasks:
+            _done, pending = await asyncio.wait(tasks.values(), timeout=self.base_refresh_budget_s)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        seen = self.__dict__.setdefault("_base_stale_logged", {})
+        for key, names in jobs.items():
+            t = tasks[key]
+            if t.cancelled():
+                outcome = {
+                    "state": "unknown",
+                    "behind": 0,
+                    "detail": f"not finished within the {self.base_refresh_budget_s:g}s refresh budget",
+                }
+            elif t.exception() is not None:
+                outcome = {"state": "unknown", "behind": 0, "detail": f"base refresh failed: {t.exception()}"}
+            else:
+                outcome = t.result()
+            # WARN once per distinct reason: the sweep re-checks every few minutes, and an
+            # unchanged stale checkout re-logged each time would bury the log.
+            if outcome["state"] == "stale" and seen.get(key) != outcome["detail"]:
+                log.warning("[project_board] base checkout for %s is stale: %s", ", ".join(names), outcome["detail"])
+            if outcome["state"] == "stale":
+                seen[key] = outcome["detail"]
+            else:
+                seen.pop(key, None)
+            if outcome["state"] == "unknown":
+                log.info("[project_board] base checkout for %s not refreshed: %s", ", ".join(names), outcome["detail"])
+            for name in names:
+                results[name] = dict(outcome)
+        for name, row in results.items():
+            repo, base = where[name]
+            row.update(repo=repo, base=base, checked_at=stamp)
         health.publish_base_checkouts(results)
 
     async def _publish_orphaned_cards(self, store) -> None:

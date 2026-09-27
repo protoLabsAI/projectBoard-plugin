@@ -15,11 +15,14 @@ checks those rules against the real host function when protoAgent is importable.
 
 from __future__ import annotations
 
+import copy
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
-from _host_apply import HostConfig, wire_host
+from _host_apply import HostConfig, apply_updates, resolve_patch, wire_host
 
 from project_board import worktree
 from project_board.projects import parse_github_remote
@@ -239,8 +242,8 @@ async def test_a_readback_that_misses_the_managed_entry_is_not_reported_as_succe
     real_apply = host.apply_settings
 
     def drops_the_registry(patch):
-        patch = {k: v for k, v in patch.items() if k != "projects"}
-        return real_apply(patch)
+        resolved = patch(host)  # the callable the host would run under its lock
+        return real_apply({k: v for k, v in resolved.items() if k != "projects"})
 
     host.apply_settings = drops_the_registry
     wire_host(monkeypatch, host)
@@ -276,3 +279,99 @@ async def test_moving_onto_an_already_managed_checkout_drops_the_board_entry(mon
     assert "managed_project" not in host.doc["project_board"]["projects"]["web"]
     assert (await delete_project("web"))["managed_project"]["action"] == "none"
     assert _registry(host) == [onboarded]
+
+
+# ── #452 review: the lost update, and the review's minor findings ─────────────────────
+class _LockedHost(HostConfig):
+    """Like the real host: writes serialize on a lock, a CALLABLE patch runs inside it
+    against the committed config, and the live config is committed only after the reload."""
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        self.__dict__["lock"] = threading.Lock()
+
+    def apply_settings(self, patch):
+        with self.lock:
+            new = copy.deepcopy(self.doc)
+            resolved = resolve_patch(patch, self)
+            if isinstance(resolved, tuple):
+                return resolved
+            apply_updates(new, copy.deepcopy(resolved))
+            time.sleep(0.5)  # the graph reload
+            self.__dict__["doc"] = new
+        return True, []
+
+
+async def test_a_concurrent_onboard_write_still_reloading_is_not_dropped(monkeypatch, tmp_path):
+    """Review B1: the board merged the host's `projects:` list from a config read OUTSIDE
+    the host's write lock and sent it whole, so an onboard_project entry still reloading was
+    silently dropped. The merge now runs inside the lock, as a callable."""
+    host = _LockedHost(_host(tmp_path).doc)
+    wire_host(monkeypatch, host)
+    repo = _checkout(tmp_path / "workspace" / "boardrepo")
+    onboard = {"name": "onboarded", "path": str(tmp_path / "workspace" / "x"), "write": True}
+    t = threading.Thread(target=host.apply_settings, args=({"projects": list(host.projects) + [onboard]},))
+    t.start()
+    time.sleep(0.05)  # the onboard apply is in flight (reloading)
+    await upsert_project("boardrepo", str(repo), base_branch="main")
+    t.join()
+    assert sorted(e["name"] for e in host.doc["projects"]) == ["boardrepo", "onboarded"]
+
+
+def test_the_superset_guard_refuses_to_drop_an_entry_it_does_not_own(tmp_path):
+    from project_board.project_registry import ProjectRegistryError, _assert_host_superset
+
+    live = HostConfig({"projects": [{"name": "a", "path": "/a"}, {"name": "b", "path": "/b"}]})
+    with pytest.raises(ProjectRegistryError, match="would drop 'b'"):
+        _assert_host_superset(live, {"projects": [{"name": "a", "path": "/a"}]})
+    _assert_host_superset(live, {"projects": [{"name": "a", "path": "/a"}]}, ("b", "/b"))  # the owned drop
+
+
+async def test_unregister_keeps_an_entry_the_operator_made_writable(monkeypatch, tmp_path):
+    host = _host(tmp_path)
+    repo = _checkout(tmp_path / "workspace" / "web")
+    wire_host(monkeypatch, host)
+    await upsert_project("web", str(repo))
+    host.doc["projects"][0]["write"] = True
+    deleted = await delete_project("web")
+    assert deleted["managed_project"]["action"] == "kept" and "writable" in deleted["managed_project"]["detail"]
+    assert _registry(host)[0]["write"] is True
+
+
+async def test_two_board_projects_on_one_checkout_share_the_entry_until_the_last_goes(monkeypatch, tmp_path):
+    """Review m4: the second project finds the entry present; deleting the owner hands
+    ownership to the sibling instead of pulling the entry out from under it."""
+    host = _host(tmp_path)
+    repo = _checkout(tmp_path / "workspace" / "web")
+    wire_host(monkeypatch, host)
+    await upsert_project("web", str(repo))
+    assert (await upsert_project("web-docs", str(repo)))["managed_project"]["action"] == "present"
+
+    first = await delete_project("web")
+    assert first["managed_project"]["action"] == "kept" and "'web-docs'" in first["managed_project"]["detail"]
+    assert [e["name"] for e in _registry(host)] == ["web"]
+    assert host.doc["project_board"]["projects"]["web-docs"]["managed_project"] == "web"
+
+    last = await delete_project("web-docs")
+    assert last["managed_project"]["action"] == "removed"
+    assert _registry(host) == []
+
+
+async def test_a_checkout_the_fence_already_lists_gets_no_second_name(monkeypatch, tmp_path):
+    """Review m6: an explicit filesystem.projects entry already reaches the checkout."""
+    repo = _checkout(tmp_path / "workspace" / "web")
+    host = _host(tmp_path, filesystem={"projects": [{"name": "my-web", "path": str(repo), "write": True}]})
+    wire_host(monkeypatch, host)
+    result = await upsert_project("web", str(repo))
+    assert result["managed_project"] == {"action": "present", "name": "my-web", "detail": ""}
+    assert _registry(host) == []
+
+
+def test_the_host_floor_has_the_locked_callable_apply():
+    """The merge above is only safe inside the host's write lock, which a CALLABLE
+    `HOST.apply_settings` patch reaches from protoAgent 0.164.0 (#2743). An older host
+    would get a callable it cannot apply, so the floor says so."""
+    import yaml
+
+    m = yaml.safe_load((Path(__file__).resolve().parent.parent / "protoagent.plugin.yaml").read_text())
+    assert tuple(int(x) for x in str(m["min_protoagent_version"]).split(".")) >= (0, 164, 0)

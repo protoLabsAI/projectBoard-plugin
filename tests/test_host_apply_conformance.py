@@ -88,3 +88,16 @@ def test_the_double_applies_a_patch_exactly_as_the_host_does(patch):
     ours = apply_updates(copy.deepcopy(_DOC), copy.deepcopy(patch))
     theirs = _host_apply_updates()(copy.deepcopy(_DOC), copy.deepcopy(patch))
     assert ours == theirs
+
+
+def test_the_host_runs_a_callable_patch_inside_its_write_lock():
+    """The managed-project merge is only safe because the host calls a CALLABLE patch with
+    its current config inside `_CONFIG_WRITE_LOCK` (#2743, 0.164.0). Read the host's source
+    (never imported — `server/` is off limits to a plugin) and pin that contract."""
+    src_root = os.environ.get("PB_PROTOAGENT_SRC", "").strip()
+    path = Path(src_root, "server", "agent_init.py") if src_root else None
+    if path is None or not path.is_file():
+        pytest.skip("set PB_PROTOAGENT_SRC to a protoAgent checkout to run the host conformance check")
+    src = path.read_text()
+    assert "if callable(config):" in src and "config = config(STATE.graph_config)" in src
+    assert "HOST.apply_settings = lambda patch: _apply_settings_changes(config=patch)" in src

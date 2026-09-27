@@ -616,157 +616,217 @@ async def _origin_github(repo: Path) -> str:
         return ""
 
 
-def _plan_managed_upsert(
-    live: Any, prior: Any, project: str, repo: Path, branch: str, github: str
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """``(host_updates, board_markers, report)`` for registering ``project`` → ``repo``.
+def _falsey(value: Any) -> bool:
+    """The host's read of ``write`` (ADR 0095 ``_falsey``): a string ``"false"`` is false."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("", "0", "false", "no", "off")
+    return not value
 
-    ``host_updates`` is the top-level patch (``projects`` / ``filesystem``) to send in the
-    same ``apply_settings`` call as the board entry, ``{}`` when nothing changes.
-    ``board_markers`` are the ownership fields the board entry should carry afterwards
-    (``None`` = drop the field). ``report`` is ``{action, name, detail}`` for the caller."""
+
+def _no_markers() -> dict[str, Any]:
+    return {_MANAGED_MARKER: None, _MANAGED_FENCE_MARKER: None}
+
+
+def _set_markers(entry: dict[str, Any], markers: dict[str, Any]) -> None:
+    for key, value in markers.items():
+        if value is None:
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+
+
+def _plan_managed_upsert(
+    live: Any, board: dict[str, Any], project: str, repo: Path, branch: str, github: str, prior_repo: Any = None
+) -> dict[str, Any]:
+    """The managed-project half of registering ``project`` → ``repo``, planned from ``live``
+    — the config the host hands the patch callable INSIDE its write lock (#452).
+
+    Returns the ``_apply_registry`` plan outcome: ``host_updates`` (the complete top-level
+    ``projects`` list, and ``filesystem.projects`` when an explicit fence override is in
+    force; ``{}`` when nothing changes), ``projects`` (``board`` with this entry's ownership
+    markers set), ``managed`` (``{action, name, detail}``) and the readback's
+    ``present`` / ``absent``."""
+    board = copy.deepcopy(board)
+    entry = board[project]
+    out: dict[str, Any] = {"host_updates": {}, "projects": board, "present": None, "absent": None}
+
+    def done(action: str, name: str, detail: str = "", markers: dict[str, Any] | None = None) -> dict[str, Any]:
+        _set_markers(entry, markers if markers is not None else _no_markers())
+        out["managed"] = {"action": action, "name": name, "detail": detail}
+        return out
+
     registry_raw = getattr(live, "projects", None) if live is not None else None
     if registry_raw is None:
-        return (
-            {},
-            {},
-            {
-                "action": "unsupported",
-                "name": "",
-                "detail": "this host has no managed-projects registry (ADR 0095, host 0.115.0+)",
-            },
-        )
+        return done("unsupported", "", "this host has no managed-projects registry (ADR 0095, host 0.115.0+)", {})
     registry = _dict_list(registry_raw)
     fence = _dict_list(getattr(live, "filesystem_projects", None))
-    prior = prior if isinstance(prior, dict) else {}
-    owned_name = str(prior.get(_MANAGED_MARKER) or "").strip()
+    # The ownership recorded by the LAST save: `entry` still carries its markers, and
+    # `prior_repo` is the path the board's managed entry was written with.
+    owned_name = str(entry.get(_MANAGED_MARKER) or "").strip()
+    fence_owned = bool(entry.get(_MANAGED_FENCE_MARKER))
     owned_idx = next(
         (
             i
             for i, e in enumerate(registry)
-            if owned_name and str(e.get("name") or "") == owned_name and _same_path(e.get("path"), prior.get("repo"))
+            if owned_name and str(e.get("name") or "") == owned_name and _same_path(e.get("path"), prior_repo)
         ),
         None,
     )
     desired = {"path": str(repo), "default_branch": branch}
     if github:
         desired["github"] = github
-    updates: dict[str, Any] = {}
-    markers: dict[str, Any] = {_MANAGED_MARKER: None, _MANAGED_FENCE_MARKER: None}
+
+    def _drop_owned_fence(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            f for f in entries if not (str(f.get("name") or "") == owned_name and _same_path(f.get("path"), prior_repo))
+        ]
 
     if owned_idx is not None:
         # The board added this entry and it still points where the board put it: keep it
         # in step with the board entry (a moved repo, a new base branch). The operator's
         # own edits to other keys (e.g. `write`) are preserved.
-        entry = registry[owned_idx]
-        changed = {k: v for k, v in desired.items() if entry.get(k) != v}
-        markers[_MANAGED_MARKER] = owned_name
-        fence_owned = bool(prior.get(_MANAGED_FENCE_MARKER))
-        if fence_owned:
-            markers[_MANAGED_FENCE_MARKER] = True
+        current = registry[owned_idx]
+        changed = {k: v for k, v in desired.items() if current.get(k) != v}
+        markers = {_MANAGED_MARKER: owned_name, _MANAGED_FENCE_MARKER: True if fence_owned else None}
         if not changed:
-            return {}, markers, {"action": "unchanged", "name": owned_name, "detail": ""}
+            return done("unchanged", owned_name, "", markers)
         other = next(
             (e for i, e in enumerate(registry) if i != owned_idx and _same_path(e.get("path"), repo)),
             None,
-        )
+        ) or next((f for f in fence if _same_path(f.get("path"), repo) and not fence_owned), None)
         if other is not None:
-            # Moved onto a checkout that is ALREADY someone else's managed project: that
-            # one covers the new path, so the board's own entry (for the old path) goes and
-            # the board stops owning anything — never two entries for one checkout.
+            # Moved onto a checkout that is ALREADY someone else's managed project: that one
+            # covers the new path, so the board's own entry (for the old path) goes and the
+            # board stops owning anything — never two names for one checkout.
             del registry[owned_idx]
-            updates["projects"] = registry
-            markers = {_MANAGED_MARKER: None, _MANAGED_FENCE_MARKER: None}
+            out["host_updates"]["projects"] = registry
+            out["absent"] = (owned_name, str(prior_repo or ""))
             if fence_owned:
-                updates["filesystem"] = {
-                    "projects": [
-                        f
-                        for f in fence
-                        if not (str(f.get("name") or "") == owned_name and _same_path(f.get("path"), prior.get("repo")))
-                    ]
-                }
-            return updates, markers, {"action": "present", "name": str(other.get("name") or ""), "detail": ""}
-        entry.update(changed)
-        updates["projects"] = registry
+                out["host_updates"]["filesystem"] = {"projects": _drop_owned_fence(fence)}
+            return done("present", str(other.get("name") or ""))
+        current.update(changed)
+        out["host_updates"]["projects"] = registry
+        out["present"] = (owned_name, str(repo))
+        # a moved path drops the old (name, path) pair from the superset check
+        if not _same_path(prior_repo, repo):
+            out["absent"] = None
+            out["moved_from"] = (owned_name, str(prior_repo or ""))
         if fence_owned:
             for f in fence:
-                if str(f.get("name") or "") == owned_name and _same_path(f.get("path"), prior.get("repo")):
+                if str(f.get("name") or "") == owned_name and _same_path(f.get("path"), prior_repo):
                     f["path"] = str(repo)
                     if github:
                         f["github"] = github
-            updates["filesystem"] = {"projects": fence}
-        return updates, markers, {"action": "updated", "name": owned_name, "detail": ", ".join(sorted(changed))}
+            out["host_updates"]["filesystem"] = {"projects": fence}
+        return done("updated", owned_name, ", ".join(sorted(changed)), markers)
 
-    present = next((e for e in registry if _same_path(e.get("path"), repo)), None)
+    # Already reachable by path — through the registry (onboard_project, the operator) or an
+    # explicit fence entry (#452 review m6). Not the board's to change, or to remove later.
+    present = next((e for e in registry if _same_path(e.get("path"), repo)), None) or next(
+        (f for f in fence if _same_path(f.get("path"), repo)), None
+    )
     if present is not None:
-        # Already managed (onboard_project, the operator). Not the board's to change, or
-        # to remove later — no marker.
-        return {}, markers, {"action": "present", "name": str(present.get("name") or ""), "detail": ""}
+        return done("present", str(present.get("name") or ""))
     clash = next((e for e in registry if str(e.get("name") or "") == project), None)
     if clash is not None:
-        return (
-            {},
-            markers,
-            {
-                "action": "skipped",
-                "name": project,
-                "detail": f"a managed project named {project!r} already points at {clash.get('path')!r}",
-            },
-        )
-    new_entry = {"name": project, **desired, "write": False}
-    updates["projects"] = registry + [new_entry]
-    markers[_MANAGED_MARKER] = project
-    if fence and not any(_same_path(f.get("path"), repo) for f in fence):
+        return done("skipped", project, f"a managed project named {project!r} already points at {clash.get('path')!r}")
+    out["host_updates"]["projects"] = registry + [{"name": project, **desired, "write": False}]
+    out["present"] = (project, str(repo))
+    markers = {_MANAGED_MARKER: project, _MANAGED_FENCE_MARKER: None}
+    if fence:
         # An explicit `filesystem.projects` override shadows the registry in the fence
         # (ADR 0095 D2: explicit wins), so without this mirror the entry would be
         # registered yet unreachable by the fs tools — onboard_project does the same.
         fence_entry = {"name": project, "path": str(repo), "write": False}
         if github:
             fence_entry["github"] = github
-        updates["filesystem"] = {"projects": fence + [fence_entry]}
+        out["host_updates"]["filesystem"] = {"projects": fence + [fence_entry]}
         markers[_MANAGED_FENCE_MARKER] = True
     detail = ""
-    if live is not None and getattr(live, "filesystem_enabled", True) is False:
+    if getattr(live, "filesystem_enabled", True) is False:
         detail = (
             "the filesystem tools are switched off on this host, so they can't read it until filesystem.enabled is on"
         )
-    return updates, markers, {"action": "added", "name": project, "detail": detail}
+    return done("added", project, detail, markers)
 
 
-def _plan_managed_removal(live: Any, prior: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    """``(host_updates, report)`` for unregistering a board project whose entry was
-    ``prior``: remove the managed-project entry ONLY when the board added it (the marker)
-    and it still points at the board's repo. Anything else is left alone."""
+def _plan_managed_removal(live: Any, board: dict[str, Any], prior: Any) -> dict[str, Any]:
+    """The managed-project half of unregistering a board project whose entry was ``prior``,
+    planned from ``live`` inside the host's write lock. ``board`` is the SURVIVING board map.
+
+    The entry goes only when the board added it (the marker), it still points at the
+    board's repo, it is still read-only (#452 review m3), and no other board project still
+    uses that checkout (m4). In that last case ownership MOVES to the sibling instead, so a
+    later unregister of the sibling can still clean up."""
+    board = copy.deepcopy(board)
     prior = prior if isinstance(prior, dict) else {}
+    out: dict[str, Any] = {"host_updates": {}, "projects": board, "present": None, "absent": None}
     owned_name = str(prior.get(_MANAGED_MARKER) or "").strip()
+
+    def done(action: str, detail: str = "") -> dict[str, Any]:
+        out["managed"] = {"action": action, "name": owned_name, "detail": detail}
+        return out
+
     if not owned_name:
-        return {}, {"action": "none", "name": "", "detail": ""}
+        return done("none")
     registry_raw = getattr(live, "projects", None) if live is not None else None
     if registry_raw is None:
-        return {}, {"action": "none", "name": owned_name, "detail": "no managed-projects registry on this host"}
+        return done("none", "no managed-projects registry on this host")
     registry = _dict_list(registry_raw)
-    keep = [
-        e
-        for e in registry
-        if not (str(e.get("name") or "") == owned_name and _same_path(e.get("path"), prior.get("repo")))
-    ]
-    if len(keep) == len(registry):
-        return {}, {
-            "action": "kept",
-            "name": owned_name,
-            "detail": "the managed project was changed or removed by someone else, so it was left alone",
-        }
-    updates: dict[str, Any] = {"projects": keep}
+    repo = prior.get("repo")
+    owned = next(
+        (e for e in registry if str(e.get("name") or "") == owned_name and _same_path(e.get("path"), repo)),
+        None,
+    )
+    if owned is None:
+        return done("kept", "the managed project was changed or removed by someone else, so it was left alone")
+    if not _falsey(owned.get("write")):
+        return done("kept", "the managed project was made writable since the board added it, so it was left alone")
+    heir = next(
+        (n for n, e in sorted(board.items()) if isinstance(e, dict) and _same_path(e.get("repo"), repo)),
+        None,
+    )
+    if heir is not None:
+        board[heir][_MANAGED_MARKER] = owned_name
+        if prior.get(_MANAGED_FENCE_MARKER):
+            board[heir][_MANAGED_FENCE_MARKER] = True
+        return done("kept", f"board project {heir!r} still uses that checkout and now owns the managed project")
+    out["host_updates"]["projects"] = [e for e in registry if e is not owned]
+    out["absent"] = (owned_name, str(repo or ""))
     if prior.get(_MANAGED_FENCE_MARKER):
         fence = _dict_list(getattr(live, "filesystem_projects", None))
-        kept_fence = [
-            f
-            for f in fence
-            if not (str(f.get("name") or "") == owned_name and _same_path(f.get("path"), prior.get("repo")))
-        ]
-        if len(kept_fence) != len(fence):
-            updates["filesystem"] = {"projects": kept_fence}
-    return updates, {"action": "removed", "name": owned_name, "detail": ""}
+        kept = [f for f in fence if not (str(f.get("name") or "") == owned_name and _same_path(f.get("path"), repo))]
+        if len(kept) != len(fence):
+            out["host_updates"]["filesystem"] = {"projects": kept}
+    return done("removed")
+
+
+def _assert_host_superset(live: Any, host_updates: dict[str, Any], dropped: Any = None) -> None:
+    """Refuse a host write that would drop an entry it doesn't mean to (#452 review B1).
+
+    Every ``(name, path)`` in the live ``projects:`` registry and the explicit
+    ``filesystem.projects`` fence must survive the write, apart from ``dropped`` — the one
+    entry a removal (or a move) takes out. Raised inside the host's patch callable, the
+    host answers ``(False, ["config update: …"])`` and nothing is written."""
+    allowed = {tuple(dropped)} if dropped else set()
+    for label, key, before in (
+        ("projects", "projects", getattr(live, "projects", None)),
+        ("filesystem.projects", "filesystem", getattr(live, "filesystem_projects", None)),
+    ):
+        after = host_updates.get(key)
+        if key == "filesystem":
+            after = (after or {}).get("projects") if isinstance(after, dict) else None
+        if after is None:
+            continue
+        for e in _dict_list(before):
+            pair = (str(e.get("name") or ""), str(e.get("path") or ""))
+            if any(pair[0] == a[0] and _same_path(pair[1], a[1]) for a in allowed):
+                continue
+            if not any(_same_path(e.get("path"), x.get("path")) for x in _dict_list(after)):
+                raise ProjectRegistryError(
+                    f"refusing to write {label}: it would drop {pair[0] or '?'!r} ({pair[1]}) — "
+                    "another writer changed it; nothing was saved, save again"
+                )
 
 
 def managed_note(managed: dict[str, Any]) -> str:
@@ -815,39 +875,57 @@ async def _apply_registry(
     expected: dict[str, dict[str, Any]] | None = None,
     absent: set[str] | None = None,
     default_project: str | None = None,
-    host_updates: dict[str, Any] | None = None,
-    managed_present: tuple[str, str] | None = None,
-    managed_absent: tuple[str, str] | None = None,
-) -> None:
+    plan: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Apply a complete registry and prove the intended live state landed.
 
-    ``host_updates`` (#452) rides the SAME ``apply_settings`` patch: the top-level
-    ``projects`` list (and, when an explicit fence override is in force,
-    ``filesystem.projects``) for the managed-project half. The host assigns a top-level
-    list wholesale, so it is always the complete merged list. ``managed_present`` /
-    ``managed_absent`` are the ``(name, path)`` the readback must then find / not find."""
+    The patch goes to ``HOST.apply_settings`` as a CALLABLE (host 0.164.0+, #2743): the
+    host runs it INSIDE its config write lock against the config every earlier writer has
+    committed, so a read-merge-write computed there cannot lose a concurrent writer's
+    change. That matters for the managed-project half (#452): the host's top-level
+    ``projects:`` list is replaced WHOLESALE, so a list merged from a config read outside
+    the lock would silently drop an entry ``onboard_project`` was still writing.
+
+    ``plan(live, projects)`` (#452) computes the managed-project half from that locked
+    config and returns ``{host_updates, projects, managed, present, absent}``:
+    ``host_updates`` is the top-level ``projects`` list (and ``filesystem.projects`` for an
+    explicit fence override) to send in the same patch; ``projects`` the board map with its
+    ownership markers applied; ``present`` / ``absent`` the ``(name, path)`` the readback
+    must find / not find. Every host list it writes must be a SUPERSET of the live one,
+    apart from the one entry it removes (``_assert_host_superset``). Returns what the plan
+    decided (``{}`` without one)."""
     from graph.plugins.host import HOST
 
     if HOST.apply_settings is None:
         raise ProjectRegistryError("project changes are unavailable — the host is not wired for config apply")
 
-    intended = copy.deepcopy(projects)
-    # A removed project needs an explicit `None` — the host's `apply_updates_to_yaml`
-    # MERGES a section-member map (siblings under `projects:` are kept by design, so a
-    # concurrent writer's entry is never dropped), and only a `None` value removes a key.
-    # Sending the surviving map alone therefore deletes nothing: the entry stays in the
-    # YAML, and the readback below is the only reason that surfaced instead of reporting
-    # a success that never happened. (#408)
-    written: dict[str, Any] = copy.deepcopy(intended)
-    for gone in absent or set():
-        written[gone] = None
-    section: dict[str, Any] = {"projects": written}
-    if default_project is not None:
-        section["default_project"] = default_project
-    patch: dict[str, Any] = {**copy.deepcopy(host_updates or {}), "project_board": section}
-    ok, messages = await asyncio.to_thread(HOST.apply_settings, patch)
+    decided: dict[str, Any] = {}
+
+    def compute(live: Any) -> dict[str, Any]:
+        outcome = plan(live, copy.deepcopy(projects)) if plan is not None else {}
+        board = outcome.get("projects", projects)
+        host_updates = copy.deepcopy(outcome.get("host_updates") or {})
+        _assert_host_superset(live, host_updates, outcome.get("absent") or outcome.get("moved_from"))
+        decided.clear()
+        decided.update(outcome, projects=copy.deepcopy(board))
+        # A removed project needs an explicit `None` — the host's `apply_updates_to_yaml`
+        # MERGES a section-member map (siblings under `projects:` are kept by design, so a
+        # concurrent writer's entry is never dropped), and only a `None` value removes a
+        # key. Sending the surviving map alone therefore deletes nothing (#408).
+        written: dict[str, Any] = copy.deepcopy(board)
+        for gone in absent or set():
+            written[gone] = None
+        section: dict[str, Any] = {"projects": written}
+        if default_project is not None:
+            section["default_project"] = default_project
+        return {**host_updates, "project_board": section}
+
+    ok, messages = await asyncio.to_thread(HOST.apply_settings, compute)
     if not ok:
         raise ProjectRegistryError("; ".join(messages) or "the host refused the config update")
+    intended = copy.deepcopy(decided.get("projects", projects))
+    if plan is not None:
+        expected = {name: intended[name] for name in (expected or {}) if name in intended}
 
     persisted_section = _live_section(required=True)
     persisted = _projects_from_section(persisted_section, required=True)
@@ -860,7 +938,7 @@ async def _apply_registry(
         for key, value in fields.items():
             if not isinstance(landed, dict) or landed.get(key) != value:
                 mismatched.append(f"{name}.{key}")
-    managed_problems = _verify_managed(managed_present, managed_absent)
+    managed_problems = _verify_managed(decided.get("present"), decided.get("absent"))
     if missing or unexpected or changed_entries or mismatched or managed_problems:
         detail = list(managed_problems)
         if missing:
@@ -878,6 +956,7 @@ async def _apply_registry(
         )
     if default_project is not None and str(persisted_section.get("default_project") or "") != default_project:
         raise ProjectRegistryError("the host reported success, but the default project did not persist")
+    return decided
 
 
 async def upsert_project(
@@ -1019,13 +1098,6 @@ async def _upsert(
                 f"project {project!r} was changed by another save while this one waited, and its gate now "
                 "needs proving in this checkout — save again"
             )
-        # The managed-project half (#452), planned against the same fresh read.
-        host_updates, markers, managed = _plan_managed_upsert(_live_host(), prior, project, repo_p, branch, github)
-        for key, value in markers.items():
-            if value is None:
-                entry.pop(key, None)
-            else:
-                entry[key] = value
         merged = dict(existing)
         merged[project] = entry
         if not set(existing) <= set(merged):
@@ -1045,13 +1117,17 @@ async def _upsert(
             # automatic sole default and report/persist it truthfully.
             default = current_default or _effective_default({}, merged)
         status["stage"] = _APPLYING
-        await _apply_registry(
+        # The managed-project half (#452) is planned INSIDE the host's write lock, from the
+        # config it hands the patch callable — never from a read taken out here.
+        prior_repo = prior.get("repo") if isinstance(prior, dict) else None
+        decided = await _apply_registry(
             merged,
             expected={project: entry},
             default_project=default,
-            host_updates=host_updates,
-            managed_present=(managed["name"], str(repo_p)) if host_updates else None,
+            plan=lambda live, board: _plan_managed_upsert(live, board, project, repo_p, branch, github, prior_repo),
         )
+        entry = decided["projects"][project]
+        managed = decided["managed"]
         log.info(
             "[project_board] register[%s]: %s — repo %s, base %s",
             project,
@@ -1102,15 +1178,15 @@ async def delete_project(
         merged = dict(existing)
         merged.pop(project)
         default = (next(iter(merged)) if len(merged) == 1 else "") if current_default == project else current_default
-        # The managed-project half (#452): removed only if the board added it.
-        host_updates, managed = _plan_managed_removal(_live_host(), prior)
-        await _apply_registry(
+        # The managed-project half (#452): removed only if the board added it, planned
+        # inside the host's write lock.
+        decided = await _apply_registry(
             merged,
             absent={project},
             default_project=default,
-            host_updates=host_updates,
-            managed_absent=(managed["name"], str(prior.get("repo") or "")) if host_updates else None,
+            plan=lambda live, board: _plan_managed_removal(live, board, prior),
         )
+        managed = decided["managed"]
         return {
             "project": project,
             "deleted": True,

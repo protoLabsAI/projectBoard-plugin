@@ -48,7 +48,8 @@ can read the checkout its coders branch from. The entry's `github` comes from th
 `origin` remote and its `default_branch` is `base_branch`. The reply says which of these
 happened: added, already a managed project (left alone), skipped because the name is taken
 by another path, or not possible on a host without the registry. Deleting the board project
-removes the managed entry only if the registration added it. See
+removes the managed entry only if the registration added it, it is still read-only, and no
+other board project uses the checkout. See
 [Multi-project](configuration.md#multi-project).
 
 ## Notes

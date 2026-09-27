@@ -78,10 +78,37 @@ class HostConfig:
             return str((doc.get("onboarding") or {}).get("root", "") or "")
         raise AttributeError(name)
 
-    def apply_settings(self, patch: dict):
-        self.patches.append(copy.deepcopy(patch))
-        apply_updates(self.doc, copy.deepcopy(patch))
+    def apply_settings(self, patch):
+        resolved = resolve_patch(patch, self)
+        if isinstance(resolved, tuple):
+            return resolved  # the callable refused: (False, [why]) — nothing written
+        self.patches.append(copy.deepcopy(resolved))
+        apply_updates(self.doc, copy.deepcopy(resolved))
         return True, []
+
+
+def resolve_patch(patch, live):
+    """The host's handling of a CALLABLE patch (``_apply_settings_changes``, #2743): call
+    it with the current config inside the write lock; an exception is ``(False, [...])``
+    and nothing is written. A dict passes through."""
+    if not callable(patch):
+        return patch
+    try:
+        return patch(live)
+    except Exception as exc:  # noqa: BLE001 — mirrors the host's (ok, messages) contract
+        return False, [f"config update: {exc}"]
+
+
+def callable_aware(apply_settings, live):
+    """Wrap a dict-only ``apply_settings`` fake so it accepts the callable form too."""
+
+    def apply(patch):
+        resolved = resolve_patch(patch, live)
+        if isinstance(resolved, tuple):
+            return resolved
+        return apply_settings(resolved)
+
+    return apply
 
 
 def wire_host(monkeypatch, host: HostConfig) -> None:
