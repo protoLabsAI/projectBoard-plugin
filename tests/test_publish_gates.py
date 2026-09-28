@@ -361,6 +361,8 @@ class _Registry:
             return 1, {"status": "404"}, "gh: Not Found (HTTP 404)"
         if path.startswith("repos/protoLabsAI/protoContent/git/tags/t-"):
             return 0, {"object": {"type": "commit", "sha": self.tags[path.split("/t-", 1)[1]]}}, ""
+        if path.startswith("repos/protoLabsAI/protoContent/pulls?state=all"):
+            return 0, [], ""  # the cross-board branch lookup: no other board has built it
         if "/compare/" in path:
             base, head = path.rsplit("/", 1)[1].split("...")
             if base == head:
@@ -444,7 +446,9 @@ def test_contains_on_a_raw_sha_and_a_missing_tag(monkeypatch):
 def test_contains_card_not_on_board_or_without_a_pr(monkeypatch):
     _contains_env(monkeypatch)
     (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: None)
-    assert "card bd-a1 not found" in r["detail"]
+    # not on this board → looked up by branch in the anchor repo; none there yet → unmet
+    assert "card bd-a1 is not on this board" in r["detail"] and "feat/bd-a1-*" in r["detail"]
+    assert r["met"] is False and not r.get("error")
     gates.reset_cache()
     (r,) = gates.evaluate([CONTAINS], resolve_card=lambda fid: {"id": fid, "pr_url": ""})
     assert "card bd-a1 has no PR yet" in r["detail"]
@@ -1217,3 +1221,43 @@ def test_patch_waits_for_empty_is_untouched_none_clears(monkeypatch):
         seen.clear()
         assert c.patch("/p/features/bd-1", json=body).status_code == 200
         assert seen == [want]
+
+
+# ── contains: anchored on a card from ANOTHER board (DS board → PM board) ─────────
+
+
+def _pulls(*prs):
+    def fake(path, **_kw):
+        assert path.startswith("repos/protoLabsAI/protoContent/pulls?state=all")
+        return 0, list(prs), ""
+
+    return fake
+
+
+def test_a_foreign_card_with_no_pr_yet_is_unmet_not_an_error(monkeypatch):
+    """The friction case: waits_for=npm:@protolabsai/ui@contains:protoLabsAI/protoContent@ds-ffd
+    on projectManager's board, with ds-ffd on the designSystem board. Before this it read
+    'card ds-ffd not found on this board' forever; now it waits for ds-ffd's PR."""
+    monkeypatch.setattr(gates, "_gh_json", _pulls({"number": 7, "head": {"ref": "feat/ds-abc-other"}}))
+    spec = gates.parse_spec("npm:@protolabsai/ui@contains:protoLabsAI/protoContent@ds-ffd")
+    sha, why = gates._anchor_sha(spec, lambda fid: None)
+    assert sha == "" and "no PR from a feat/ds-ffd-* branch yet" in why
+
+
+def test_a_foreign_card_resolves_to_its_merged_pr(monkeypatch):
+    monkeypatch.setattr(
+        gates,
+        "_gh_json",
+        _pulls(
+            {"number": 9, "head": {"ref": "feat/ds-ffdx-not-this"}, "merged_at": "t", "merge_commit_sha": "0" * 40},
+            {"number": 8, "head": {"ref": "feat/ds-ffd-type-scale"}, "merged_at": "t", "merge_commit_sha": "a" * 40},
+        ),
+    )
+    spec = gates.parse_spec("npm:@protolabsai/ui@contains:protoLabsAI/protoContent@ds-ffd")
+    assert gates._anchor_sha(spec, lambda fid: None) == ("a" * 40, "")
+
+
+def test_a_foreign_card_whose_pr_is_open_is_not_merged_yet(monkeypatch):
+    monkeypatch.setattr(gates, "_gh_json", _pulls({"number": 8, "head": {"ref": "feat/ds-ffd"}, "merged_at": None}))
+    spec = gates.parse_spec("npm:@protolabsai/ui@contains:protoLabsAI/protoContent@ds-ffd")
+    assert gates._anchor_sha(spec, lambda fid: None) == ("", "card ds-ffd not merged yet (#8)")
