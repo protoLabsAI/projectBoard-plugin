@@ -136,6 +136,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self._repo_locks: dict[str, asyncio.Lock] = {}  # one repo's cards reconcile one at a time
         self._card_stall: Exception | None = None  # a card task's store stall, for the next tick (#404)
         self._review_zombies: dict[str, asyncio.Task] = {}  # fid → an abandoned review call still running
+        # project → {cmd, timeout_s}: its local gate TIMED OUT (fail-open "pass", #483). The
+        # merged-state re-verify stops re-running it until the command or timeout changes.
+        self._slow_gates: dict[str, dict] = {}
         self._busy_keeps: dict[str, int] = {}  # wtid → sweeps kept for a live process in the tree
         # Claim-stall health signal (#462): ready work, a free slot, and no claim scan
         # finished for this many ticks → a setup/health gap on /status naming the phase the
