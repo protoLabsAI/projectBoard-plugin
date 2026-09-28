@@ -2404,6 +2404,30 @@ async def read_review_status(
     return {"state": state, "head_sha": head_sha, "passed": state == "success"}
 
 
+async def pr_review_state(pr_url: str, *, cwd: str = ".") -> dict | None:
+    """The PR's head, reviews and head-commit check rollup in ONE read (#473) —
+    ``gh pr view --json headRefOid,reviews,statusCheckRollup`` — for the external QA
+    panel's verdict (``external_review.evaluate`` judges it). One call, so the head the
+    reviews and checks are judged against is the head they were read with.
+
+    Returns the parsed object, or ``None`` when ``gh`` fails, times out or answers with
+    something that is not a JSON object carrying a head. Never raises into the loop: an
+    unreadable review state is simply not a FAIL, and the reconcile carries on as before."""
+    try:
+        rc, out, _err = await _gh("pr", "view", pr_url, "--json", "headRefOid,reviews,statusCheckRollup", cwd=cwd)
+    except WorktreeError:
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or not str(data.get("headRefOid") or "").strip():
+        return None
+    return data
+
+
 async def _find_marked_comment(repo_slug: str, number: str, marker: str, *, cwd: str) -> tuple[str, str]:
     """The ``(id, body)`` of the board's marked PR comment (the one whose body contains
     ``marker``), or ``("", "")`` when none exists or the list can't be read — the caller then

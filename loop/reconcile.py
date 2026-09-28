@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 
+from .. import external_review
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
@@ -1197,6 +1198,13 @@ class ReconcileMixin:
                     await self._budget_reset(store, fid)
                     log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                 elif state == "OPEN":
+                    # FIRST (#473): has the repo's own QA panel FAILED this PR at its current
+                    # head? Then the PR cannot merge as it stands, whatever the board's own gate
+                    # said. Bounce it into a fix round (or hold it for a human), and skip every
+                    # edge below: re-verifying the merged state, rebasing, bouncing on CI or
+                    # merging a PR the panel has rejected spends budget on nothing.
+                    if await self._reconcile_external_review(store, f, pr_url, repo):
+                        continue
                     # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
                     # sibling merge re-stales the others off the shared base, and a rebase
                     # force-pushes + re-runs CI — so checking CI on the stale head first
@@ -2106,6 +2114,175 @@ class ReconcileMixin:
             "[project_board] %s reconciled a trusted current-head QA PASS (%s) → review-clean, pinned to that head: %s",
             fid,
             head[:12],
+            pr_url,
+        )
+        return True
+
+    # ── the external QA panel's FAIL at the current head (#473) ───────────────
+    def _external_review_cfg_for(self, feature: dict):
+        """This feature's project's ``external_review`` setting, else the flat top-level key,
+        parsed (``external_review.parse_config``): a Config, or None when the check is off."""
+        pc = self._project_cfg(feature)
+        raw = pc.get("external_review") if "external_review" in pc else self.cfg.get("external_review")
+        return external_review.parse_config(raw)
+
+    def _note_external_hold(self, store, fid: str, head: str, why: str) -> None:
+        """Say ONCE per (card, head) why a card the panel failed is held rather than bounced
+        — on the bead and to the operator. Store-only; runs off the event loop."""
+        held = getattr(self, "_ext_review_held", None)
+        if held is None:
+            held = self._ext_review_held = {}
+        if held.get(fid) == head:
+            return
+        held[fid] = head
+        log.warning("[project_board] %s held: %s", fid, why)
+        try:
+            store.comment(fid, f"auto-merge held: {why}")
+        except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+            log.warning("[project_board] %s external-review hold comment failed", fid, exc_info=True)
+        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"external-review|{head}")
+
+    async def _reconcile_external_review(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+        """Act on an EXTERNAL QA panel's FAIL at the PR's CURRENT head (#473). Returns True
+        when the panel has failed this head, whatever was done about it, so the caller
+        skips the rest of the pass: no rebase, no merged-state gate (and no merged-verify
+        budget spent), no CI bounce and no merge for a PR the panel has rejected.
+
+        One read (``worktree.pr_review_state``) gives the head, the reviews and the head
+        commit's checks; ``external_review.evaluate`` judges it. A FAIL is:
+
+        * the latest review by a configured reviewer (``protoreview[bot]``) whose hidden
+          marker (``<!-- protoagent-qa-review head=<sha> verdict=FAIL … -->``) names the
+          current head; or
+        * the configured check run (``QA panel``) or status (``Review at head``) failing
+          at the head, unless the latest marked review at the head says PASS.
+
+        Then, in order:
+
+        * no FAIL review at this head (only a red check or status) → HOLD. There are no
+          findings to hand a coder, and a bounce without them re-runs the same code. The
+          operator is told once.
+        * the head already carries this card's ``ext-review-bounced:<sha>`` stamp → HOLD.
+          The fix round came back without a new head. Once per head: only a new push
+          re-arms the bounce.
+        * the loop is still working the card (a live drive, a claimed build, a running
+          review gate — ``requeue_refusal``) → hold for this pass, never bounce under it.
+        * ``review_fix_max`` external fix rounds are spent (``budget:ext-review-fix``,
+          counted apart from the in-process gate's own, which a clean verdict resets) →
+          Blocked for a human, the findings on the bead, as the gate's exhaustion does.
+        * otherwise → a fix round on the SAME PR: the findings (blocker/major, confirmed or
+          verified, with file:line, claim and evidence) are recorded as a review-bounce
+          comment with the head stamped (``record_review_bounce``), queued to lead the
+          next prompt (``queue_review_feedback``) with the PR diff beside them, one
+          ext-review-fix unit is spent, and the card is requeued.
+
+        Fails OPEN on anything unreadable (no config, a ``gh`` error, no head): an
+        unreadable panel is not a FAIL, and the pass goes on as it did before #473."""
+        fid = feature["id"]
+        cfg = self._external_review_cfg_for(feature)
+        if cfg is None:
+            return False
+        view = await worktree.pr_review_state(pr_url, cwd=repo)
+        verdict = external_review.evaluate(view, cfg) if view else None
+        if verdict is None or not verdict.failed:
+            getattr(self, "_ext_review_held", {}).pop(fid, None)
+            return False
+        head = verdict.head
+        short = head[: store_mod.SHORT_SHA_LEN]
+        signals = external_review.fail_summary(verdict)
+        if not verdict.has_findings_review:
+            await asyncio.to_thread(
+                self._note_external_hold,
+                store,
+                fid,
+                head,
+                f"the external review FAILED at head {short} ({signals}) but no findings review from "
+                f"{', '.join(cfg.reviewers)} names this head, so there is nothing to hand a fix round — the "
+                f"merge edge and the merged-state gate are skipped until the panel passes or posts its findings: "
+                f"{pr_url}",
+            )
+            return True
+        stamp = f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{short}"
+        if stamp in (feature.get("labels") or []):
+            await asyncio.to_thread(
+                self._note_external_hold,
+                store,
+                fid,
+                head,
+                f"the external review still FAILS at head {short} ({signals}), and a fix round was already "
+                f"bounced for this head without a new push — needs a human (push a fix, or close the PR): "
+                f"{pr_url}",
+            )
+            return True
+        if (
+            _loop.live_drive(fid) is not None
+            or fid in self._inflight_files
+            or fid in self._review_inflight
+            or _loop.requeue_refusal(fid)
+        ):
+            log.info(
+                "[project_board] %s external review FAILED at %s, but the loop is still working the card — "
+                "bounce deferred to the next poll: %s",
+                fid,
+                short,
+                pr_url,
+            )
+            return True
+        rendered = external_review.render_findings(verdict, pr_url)
+        n = await self._budget_get(store, fid, "ext-review-fix", feature)
+        # The diff the panel failed rides beside the findings (the gate's carry-the-lesson
+        # lever). Read BEFORE the claim lock: a `gh` round-trip must not hold the claim scan.
+        prior_diff = ""
+        if n < self.review_fix_max:
+            try:
+                prior_diff = await worktree.pr_diff(pr_url, cwd=repo)
+            except Exception:  # noqa: BLE001 — the diff is a convenience; the branch is resumed regardless
+                prior_diff = ""
+        async with self._claim_guard():
+            # Re-read under the claim lock (#402): an attach, a salvage or an operator
+            # requeue may have moved the card since the pass read it.
+            fresh = await asyncio.to_thread(store.get_feature, fid) or {}
+            if fresh.get("board_state") != "in_review" or stamp in (fresh.get("labels") or []):
+                return True
+            if _loop.live_drive(fid) is not None or fid in self._inflight_files or _loop.requeue_refusal(fid):
+                return True
+            await asyncio.to_thread(lambda: store.record_review_bounce(fid, rendered, head=head))
+            if n >= self.review_fix_max:
+                await asyncio.to_thread(
+                    store.flag_blocked,
+                    fid,
+                    f"external review FAILED at head {short} ({signals}) after {n} review fix round(s) — "
+                    f"needs human review: {pr_url}",
+                    # Stated, never guessed from the words: a `TIMED_OUT` check in the reason
+                    # must not read as a transient block the sweep would auto-requeue.
+                    category="terminal",
+                )
+                self._ci_feedback.pop(fid, None)
+                self._ci_prior_diff.pop(fid, None)
+                await self._budget_reset(store, fid, "ext-review-fix")
+                log.warning(
+                    "[project_board] %s blocked (external review FAIL at %s, %d fix round(s) spent): %s",
+                    fid,
+                    short,
+                    n,
+                    pr_url,
+                )
+                return True
+            await self._budget_set(store, fid, "ext-review-fix", n + 1)
+            _loop.queue_review_feedback(fid, rendered)
+            if prior_diff:
+                self._ci_prior_diff[fid] = prior_diff
+            else:
+                self._ci_prior_diff.pop(fid, None)
+            await asyncio.to_thread(store.requeue, fid)
+        getattr(self, "_ext_review_held", {}).pop(fid, None)
+        log.info(
+            "[project_board] %s external review FAILED at %s (%s) → fix round %d/%d on the same PR: %s",
+            fid,
+            short,
+            signals,
+            n + 1,
+            self.review_fix_max,
             pr_url,
         )
         return True

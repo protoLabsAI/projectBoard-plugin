@@ -1017,12 +1017,14 @@ def test_review_escalate_exhausted_blocks(monkeypatch):
     assert any(call[0] == "block_from_review" for call in store.calls)
 
 
-def test_review_is_public_hmac_authenticated_not_operator_gated(monkeypatch):
+def test_review_is_public_hmac_authenticated_and_has_an_operator_twin(monkeypatch):
     c = _client(monkeypatch, FakeStore(), cfg=_external_cfg())
-    # served on the public prefix behind its own HMAC boundary…
+    # served on the public prefix behind its own HMAC boundary: unsigned is refused there…
     assert _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"}).status_code == 200
-    # …and NOT on the gated /api prefix.
-    assert c.post("/api/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 404
+    assert c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 401
+    # …and, since #473, on the gated /api prefix too, where the host's operator bearer is the
+    # boundary instead of the webhook secret (tests/test_external_review_473.py).
+    assert c.post("/api/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 200
 
 
 def test_review_from_a_non_in_review_state_surfaces_as_400(monkeypatch):

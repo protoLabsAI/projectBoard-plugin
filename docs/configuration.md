@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **28 of 78 keys are in this state, including `coders` and `projects`** —
+never renders it. **29 of 79 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -334,6 +334,7 @@ The gates between a green build and main.
 | `ci_fix_max` | `2` | reload |
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
+| `external_review` | `—` | reload **· YAML only** |
 | `auto_merge` | `False` | live |
 
 `review_gate_timeout_s` is a hard cap on one review-gate model call: the host workflow run,
@@ -344,6 +345,31 @@ even if the call ignores its cancel. The card stays `review-pending` and the nex
 it. No second call starts for that card while the abandoned one is still running. A timeout
 is **not** an unrunnable review: it does not spend `review_run_max`, so a slow local model
 never blocks a card. There is no off switch, and `0` or a negative value means the default.
+
+**`external_review`** (#473) — whose PR review the board treats as an external QA panel,
+and how its verdict is spelled. When that panel FAILS the PR at its current head, the
+reconcile bounces the card into a fix round on the same PR with the panel's findings. It
+holds the card if the head was already bounced or the panel posted no findings, and it
+never runs the merged-state gate or merges while the FAIL stands.
+[The lifecycle](lifecycle.md#an-external-qa-panels-fail-at-the-head-473) has the rules. Unset
+or `true` means the protoreview panel defaults below. `false` turns it off. A mapping
+overrides any key. It may be set at the top level or in a `projects:` entry, and a project's
+value wins:
+
+```yaml
+external_review:
+  reviewers: ["protoreview[bot]"]   # whose reviews count; `[bot]` optional (GraphQL drops it)
+  marker: protoagent-qa-review      # <!-- <marker> head=<sha> verdict=FAIL|PASS … --> in the review body
+  check_runs: ["QA panel"]          # CHECK RUNS whose failure at the head is a FAIL ([] = ignore)
+  statuses: ["Review at head"]      # commit STATUSES whose failure at the head is a FAIL ([] = ignore)
+  # enabled: false                  # same as `external_review: false`
+```
+
+`check_runs` matches check runs only and `statuses` matches statuses only. Don't list
+`QA panel` under `statuses`: that is the board's own gate verdict (#354), so the board would
+be reading itself. The external fix rounds share `review_fix_max`, but they have their own
+count (`budget:ext-review-fix`), which the gate's clean verdicts don't reset. The check costs
+one `gh pr view` per in-review card per merge poll.
 
 ## Publish gates and the release freeze
 

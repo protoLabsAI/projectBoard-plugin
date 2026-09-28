@@ -131,7 +131,7 @@ ungrounded finding is unfalsifiable by construction, whatever mangled it.
 
 ### Verdicts are pinned to a head, not to a card
 
-A verdict means nothing without the commit it was made about, so three labels stamp a
+A verdict means nothing without the commit it was made about, so four labels stamp a
 short sha:
 
 | Label | What its sha identifies | Lifetime |
@@ -139,6 +139,7 @@ short sha:
 | `reviewed-head:<sha>` | the PR head a **blocking** verdict was made about | a clean verdict deliberately clears it, so a LATER `changes-requested` can't be judged stale |
 | `review-clean-sha:<sha>` | the PR head a **clean** verdict examined (#323) | written only alongside `review-clean`; any requeue drops it |
 | `merged-verified:<sha>` | the `origin/<base>` commit the gate ran against (#131) | REPLACED, never accumulated, on each re-verify |
+| `ext-review-bounced:<sha>` | the PR head an external panel's FAIL already bounced the card for (#473) | REPLACED on the next bounce; a new head re-arms it |
 
 Read the last one carefully: its sha is the **base**, not the head. The currency check is
 `label sha == current origin/<base>` — if base has moved the verdict is **stale, which is
@@ -182,6 +183,59 @@ reconcile runs them **in this order** — the ordering is load-bearing:
 
 An unchanged head that was genuinely rejected stays rejected. That is the point of pinning
 identity to a sha rather than to a timestamp or the presence of a label.
+
+### An external QA panel's FAIL at the head (#473)
+
+A repo can run its own review bot on every PR, separate from the board's gate. On protoAgent
+that is the `protoreview` App. Its verdict is pinned to the head it read, and it arrives three
+ways at once: a `CHANGES_REQUESTED` review whose body carries a hidden marker
+(`<!-- protoagent-qa-review head=<sha> verdict=FAIL … -->`) and the findings as a fenced
+`json` array, a `QA panel` **check run** concluding `failure`, and a `Review at head` commit
+**status** `failure`. The board read none of this. On bd-524n (protoAgent#3698) the board's
+own gate said clean at the head the panel failed, so the card sat `in_review` for seven
+hours. Every time main moved it re-ran the ~12-minute merged-state gate, until
+`merged-verify budget (5) spent`.
+
+The reconcile now asks first, before any other edge of an `OPEN` PR. One read
+(`gh pr view --json headRefOid,reviews,statusCheckRollup`) gives the head, the reviews and
+the head commit's checks. The panel has **failed this head** when:
+
+- the latest review by a configured reviewer whose marker names the current head says
+  `verdict=FAIL`, or
+- a configured check run concluded failed, or a configured status is `failure`/`error`,
+  unless that latest marked review at the head says `PASS`.
+
+A marker naming another head is ignored, because it judged code that is gone. A marker from
+anyone but a configured reviewer is ignored as well. The board's OWN verdict is a `QA panel`
+commit *status* (#354), so the panel's check is matched only as a *check run*, and the board
+can never read its own clean verdict back as the panel's.
+
+While the panel has failed the head, the pass does nothing else for the card: **no rebase, no
+merged-state gate, no merged-verify budget spent, no CI bounce, no merge.** What it does:
+
+| Situation | Action |
+|---|---|
+| A FAIL review with findings at this head, first time seen | **Fix round on the same PR.** The blocking findings (blocker/major, `confirmed` or `verified`, each with `file:line`, claim and evidence) go on the bead as a `review requested changes:` comment. They lead the next prompt, with the PR diff beside them. The head is stamped `ext-review-bounced:<sha>`, one `ext-review-fix` budget unit is spent, and the card is requeued. |
+| This head is already stamped `ext-review-bounced:<sha>` | **Held.** The fix round came back without a new head. The bead gets one `auto-merge held:` comment and the operator one alert. A new push is a new head and re-arms the bounce. |
+| Only the check run or status failed, with no findings review at this head | **Held**, told once. There is nothing to hand a coder, and a bounce without findings re-runs the same code. |
+| The loop is still working the card (a live drive, a claimed build, a running review gate) | Held for this pass. It never bounces under a live round (#398). |
+| `review_fix_max` external rounds already spent | **Blocked** (`terminal`) for a human, with the findings on the bead, the same as the gate's own exhaustion. |
+
+The external rounds are counted in their own budget, `budget:ext-review-fix`, bounded by
+`review_fix_max`. The gate resets its `review-fix` count on every clean verdict. In this
+incident that is every round, so a shared count would never run out.
+
+Anything unreadable fails **open**: no config, a `gh` error or no head means today's pass
+runs unchanged. The reviewers, the marker and the check and status names are configurable
+(`external_review` in [configuration](configuration.md#review-and-merge)), and
+`external_review: false` turns the whole check off, board-wide or per project.
+
+An operator can do the same bounce by hand without the webhook secret:
+`POST /api/plugins/project_board/features/{fid}/review` (`{findings, escalate?}`) on the
+bearer-gated surface, or `board_requeue_feature(feature_id, findings, escalate?)`. That is
+the signed `/plugins/project_board/features/{fid}/review` without the HMAC. It needs
+`in_review` and refuses a card the loop is still working. It stamps no head and spends no
+budget, because the operator is the judge.
 
 ## The requirement ledger, and the two ways it can be unsatisfied
 
@@ -387,7 +441,7 @@ used. With nothing to go on, the drive stands aside, and the health sweep reconc
 card as one with no live drive.
 
 The commonest trigger is closed at the door. `board_requeue_feature`, `board_requeue_ci_fix`,
-`POST …/ci` and `POST …/review` refuse a card the loop is still working (a live drive, a
+`POST …/ci` and both `POST …/review` routes (signed and operator) refuse a card the loop is still working (a live drive, a
 claimed build, a running review gate), and say to wait for the round or cancel the card.
 Live, `bd-p8ft` was requeued under its own CI-fix round. The round's hand-off then failed,
 and the card went terminal with an open PR.
@@ -740,7 +794,7 @@ per repo type and a worked example.
 
 - [`docs/configuration.md`](configuration.md) — `review_gate`, `review_dispatch`,
   `review_fix_max`, `review_run_max`, `review_gate_timeout_s`, `auto_merge`, `merged_verify_max`,
-  `reconcile_concurrency`, `claim_stall_ticks`.
+  `reconcile_concurrency`, `claim_stall_ticks`, `external_review`.
 - [`docs/tools.md`](tools.md) — `board_block_feature`, `board_unblock_feature`,
   `board_requeue_feature`, `board_reset_merged_verify_budget`.
 - [`docs/adr/0326-merged-verify-exhaustion-auto-merge-hold.md`](adr/0326-merged-verify-exhaustion-auto-merge-hold.md).
