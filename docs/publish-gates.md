@@ -64,6 +64,14 @@ this. What changesets does record is a git tag per version it publishes:
 1. resolves the anchor. A sha is used as is. A card id is looked up on the board. Its PR
    must be merged, and the PR's `merge_commit_sha` is the anchor. Until then the gate
    reads `card bd-a1 not merged yet (#501)`.
+
+   A card id that **isn't on this board** — another agent's card, e.g. design-system work
+   on the designSystem board gating an adoption card on projectManager's — is found by its
+   branch in the anchor repo instead: every board names a build branch
+   `feat/<card-id>-<slug>` (or `feat/<card-id>`), so the gate lists the anchor repo's newest
+   PRs and takes the one from that branch. No such PR yet → the gate is unmet and waits
+   (`card ds-ffd is not on this board and protoLabsAI/protoContent has no PR from a
+   feat/ds-ffd-* branch yet`); once it merges, its merge commit is the anchor as above.
 2. reads the packument and takes the newest non-deprecated stable version.
 3. finds its tag in the anchor repo (`<package>@<version>`, else `v<version>`, else
    `<version>`) and dereferences an annotated tag to its commit.

@@ -162,6 +162,7 @@ WORKTREE_SEAMS: dict[str, str] = {
 # PB_REQUIRE_GH — in the CI job that has both (the `test (real gh)` job).
 GATES_SEAMS: dict[str, str] = {
     "_anchor_sha": "REAL",  # a card's merged PR → merge commit (real gh, a merged plugin PR)
+    "_pr_for_card_branch": "REAL",  # another board's card → its PR by feat/<fid>-* branch (real gh, #449)
     "_contains": "REAL",  # compare/<anchor>...<commit> (real protoContent tags, both directions)
     "_packument": "REAL",  # the live registry (is-number, @protolabsai/ui)
     "_release_versions": "REAL",  # every page of real releases (protoContent's per-package tags)

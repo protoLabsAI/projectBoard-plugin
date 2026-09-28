@@ -623,14 +623,46 @@ def eval_npm(spec: GateSpec, *, token: str = "", resolve_card=None) -> dict:
     return {"met": False, "detail": f"{what} (latest {latest or 'none'}{extra})", "latest": latest}
 
 
+def _pr_for_card_branch(slug: str, fid: str) -> dict | None:
+    """The PR a card built in ``slug``, found by its branch — ``feat/<fid>-<slug>`` or
+    ``feat/<fid>`` (worktree.branch_name, the convention every board shares). This is how
+    a ``contains:`` anchor names a card on ANOTHER board: design-system work on the
+    designSystem board, the adoption gated on it on projectManager's. Newest PRs first, up
+    to 300; ``None`` when no such branch has a PR yet."""
+    exact, prefix = f"feat/{fid}", f"feat/{fid}-"
+    for page in (1, 2, 3):
+        rc, data, err = _gh_json(f"repos/{slug}/pulls?state=all&sort=created&direction=desc&per_page=100&page={page}")
+        if rc != 0 or not isinstance(data, list):
+            raise GateCheckError(f"GitHub PR listing failed for {slug}: {err or f'rc={rc}'}")
+        for pr in data:
+            ref = str(((pr or {}).get("head") or {}).get("ref") or "")
+            if ref == exact or ref.startswith(prefix):
+                return pr
+        if len(data) < 100:
+            break
+    return None
+
+
 def _anchor_sha(spec: GateSpec, resolve_card) -> tuple[str, str]:
     """``(sha, "")`` for the anchor commit, or ``("", why-unmet)``. A card id resolves to its
-    PR's merge commit, and only once that PR has MERGED."""
+    PR's merge commit, and only once that PR has MERGED. A card that isn't on this board is
+    looked up by its branch in the anchor repo (another board's card, same convention); until
+    that card has opened a PR, the gate is simply unmet — it clears once the PR merges."""
     if _SHA_RE.match(spec.anchor):
         return spec.anchor, ""
     card = resolve_card(spec.anchor) if resolve_card else None
     if card is None:
-        return "", f"card {spec.anchor} not found on this board"
+        if not _CARD_ID_RE.match(spec.anchor):
+            return "", f"card {spec.anchor} not found on this board"
+        pr = _pr_for_card_branch(spec.anchor_repo, spec.anchor)
+        if pr is None:
+            return "", (
+                f"card {spec.anchor} is not on this board and {spec.anchor_repo} has no PR from a "
+                f"feat/{spec.anchor}-* branch yet"
+            )
+        if not pr.get("merged_at") or not pr.get("merge_commit_sha"):
+            return "", f"card {spec.anchor} not merged yet (#{pr.get('number')})"
+        return str(pr["merge_commit_sha"]), ""
     pr_url = str(card.get("pr_url") or "")
     m = re.search(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", pr_url)
     if not m:

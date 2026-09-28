@@ -292,6 +292,21 @@ def test_anchor_sha_resolves_a_card_to_its_merge_commit(real_seams):
 
 
 @requires_gh
+def test_a_card_on_another_board_resolves_by_its_branch(real_seams):
+    """A contains: anchor naming a card that ISN'T on this board (the designSystem board's
+    card, gated on projectManager's) is found by its feat/<fid>-* branch in the anchor repo.
+    bd-msqv merged as #449 from feat/bd-msqv-… — real GitHub."""
+    spec = gates.parse_spec(f"npm:x@contains:{PLUGIN_SLUG}@bd-msqv")
+    sha, why = gates._anchor_sha(spec, lambda fid: None)
+    assert why == "" and sha.startswith("dd38b4fe3548")
+    pr = gates._pr_for_card_branch(PLUGIN_SLUG, "bd-msqv")
+    assert pr and pr["number"] == 449 and pr["head"]["ref"].startswith("feat/bd-msqv-")
+    ghost = gates.parse_spec(f"npm:x@contains:{PLUGIN_SLUG}@bd-zzzz9")
+    sha, why = gates._anchor_sha(ghost, lambda fid: None)
+    assert sha == "" and "has no PR from a feat/bd-zzzz9-* branch yet" in why
+
+
+@requires_gh
 @requires_npm
 def test_contains_end_to_end_on_a_live_changesets_package(real_seams):
     """`npm:@changesets/cli@contains:changesets/changesets@<sha>` against the real
