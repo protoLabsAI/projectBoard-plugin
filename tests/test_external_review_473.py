@@ -382,6 +382,43 @@ async def test_a_fail_at_the_head_bounces_into_a_fix_round_on_the_same_pr(monkey
     assert loop.ran == []
 
 
+async def test_the_bounce_runs_inside_its_own_reconcile_task_on_a_live_loop(monkeypatch):
+    """Live, the loop is registered and the pass runs each card as a tracked ``_card_tasks``
+    task (#462). The bounce runs INSIDE that task, so the liveness guard must not count the
+    card's own reconcile as "the loop is still working it" — it did, on every pass, and a
+    Vera FAIL was deferred forever (protoAgent#3736 sat 3+ hours)."""
+    store = _Store(labels=["review-clean", "review-clean-sha:e5c66aa9ad75"])
+    loop = _loop(monkeypatch, store)
+    loop_mod._register_loop(loop)
+    try:
+        await loop._reconcile_prs()
+    finally:
+        loop_mod._unregister_loop(loop)
+    assert ("record_review_bounce", HEAD) in store.calls and store.state == "ready"
+
+
+async def test_another_reconcile_task_for_the_card_still_defers_the_bounce(monkeypatch):
+    """The guard still holds against a DIFFERENT task working the card — e.g. an API caller
+    asking while the card's reconcile runs."""
+    import asyncio
+
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    loop_mod._register_loop(loop)
+    other = asyncio.get_running_loop().create_future()
+    loop._card_tasks["bd-1"] = other
+    try:
+        assert loop_mod.requeue_refusal("bd-1")
+        assert loop_mod.requeue_refusal("bd-1", own_task=asyncio.current_task())
+        loop._card_tasks["bd-1"] = asyncio.current_task()
+        assert loop_mod.requeue_refusal("bd-1", own_task=asyncio.current_task()) == ""
+        assert loop_mod.requeue_refusal("bd-1")  # no own_task → refuse, as before
+    finally:
+        loop._card_tasks.pop("bd-1", None)
+        other.cancel()
+        loop_mod._unregister_loop(loop)
+
+
 async def test_a_fail_never_spends_merged_verify_or_runs_the_merged_state_gate(monkeypatch):
     """The other half of the incident: while the panel's FAIL stands at the head — held, not
     bounced — every pass skips the merged-state gate, so its budget is never spent."""
@@ -420,7 +457,7 @@ async def test_never_bounced_under_a_live_round(monkeypatch):
     assert store.state == "in_review" and not store.calls
     assert loop.ran == []  # still held: no merged-state gate under a FAIL
     loop._inflight_files.clear()
-    monkeypatch.setattr(loop_mod, "requeue_refusal", lambda fid: "a coder drive is still building it")
+    monkeypatch.setattr(loop_mod, "requeue_refusal", lambda fid, **_: "a coder drive is still building it")
     await loop._reconcile_prs()
     assert store.state == "in_review" and not store.calls
 
@@ -614,7 +651,7 @@ def test_the_operator_route_escalates_on_request(monkeypatch):
 def test_the_operator_route_refuses_under_a_live_round(monkeypatch):
     store = _ApiStore()
     monkeypatch.setattr(
-        loop_mod, "requeue_refusal", lambda fid: "bd-1 can't be requeued while a coder drive is still building it"
+        loop_mod, "requeue_refusal", lambda fid, **_: "bd-1 can't be requeued while a coder drive is still building it"
     )
     c = _client(monkeypatch, store)
     r = c.post("/api/plugins/project_board/features/bd-1/review", json={"findings": "x"})

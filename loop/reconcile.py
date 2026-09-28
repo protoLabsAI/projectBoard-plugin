@@ -2252,7 +2252,7 @@ class ReconcileMixin:
             _loop.live_drive(fid) is not None
             or fid in self._inflight_files
             or fid in self._review_inflight
-            or _loop.requeue_refusal(fid)
+            or _loop.requeue_refusal(fid, own_task=asyncio.current_task())
         ):
             log.info(
                 "[project_board] %s external review FAILED at %s, but the loop is still working the card — "
@@ -2278,7 +2278,11 @@ class ReconcileMixin:
             fresh = await asyncio.to_thread(store.get_feature, fid) or {}
             if fresh.get("board_state") != "in_review" or stamp in (fresh.get("labels") or []):
                 return True
-            if _loop.live_drive(fid) is not None or fid in self._inflight_files or _loop.requeue_refusal(fid):
+            if (
+                _loop.live_drive(fid) is not None
+                or fid in self._inflight_files
+                or _loop.requeue_refusal(fid, own_task=asyncio.current_task())
+            ):
                 return True
             await asyncio.to_thread(lambda: store.record_review_bounce(fid, rendered, head=head))
             if n >= self.review_fix_max:
