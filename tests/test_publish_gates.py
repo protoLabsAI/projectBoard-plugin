@@ -1261,3 +1261,29 @@ def test_a_foreign_card_whose_pr_is_open_is_not_merged_yet(monkeypatch):
     monkeypatch.setattr(gates, "_gh_json", _pulls({"number": 8, "head": {"ref": "feat/ds-ffd"}, "merged_at": None}))
     spec = gates.parse_spec("npm:@protolabsai/ui@contains:protoLabsAI/protoContent@ds-ffd")
     assert gates._anchor_sha(spec, lambda fid: None) == ("", "card ds-ffd not merged yet (#8)")
+
+
+def test_a_mixed_case_card_id_parse_accepts_still_gets_the_branch_lookup(monkeypatch):
+    """QA panel on #498: a second, stricter card-id regex shadowed the module's own, so ids
+    parse_spec accepts (`protoEngineer-x9z`) skipped the cross-board lookup. One regex."""
+    seen = []
+
+    def fake(path, **_kw):
+        seen.append(path)
+        return (
+            0,
+            [
+                {
+                    "number": 3,
+                    "head": {"ref": "feat/protoEngineer-x9z-a"},
+                    "merged_at": "t",
+                    "merge_commit_sha": "b" * 40,
+                }
+            ],
+            "",
+        )
+
+    monkeypatch.setattr(gates, "_gh_json", fake)
+    spec = gates.parse_spec("npm:@protolabsai/ui@contains:protoLabsAI/protoContent@protoEngineer-x9z")
+    assert gates._anchor_sha(spec, lambda fid: None) == ("b" * 40, "")
+    assert seen and seen[0].startswith("repos/protoLabsAI/protoContent/pulls?state=all")

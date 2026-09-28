@@ -623,9 +623,6 @@ def eval_npm(spec: GateSpec, *, token: str = "", resolve_card=None) -> dict:
     return {"met": False, "detail": f"{what} (latest {latest or 'none'}{extra})", "latest": latest}
 
 
-_CARD_ID_RE = re.compile(r"^[a-z][a-z0-9]*-[a-z0-9]+$")
-
-
 def _pr_for_card_branch(slug: str, fid: str) -> dict | None:
     """The PR a card built in ``slug``, found by its branch — ``feat/<fid>-<slug>`` or
     ``feat/<fid>`` (worktree.branch_name, the convention every board shares). This is how
