@@ -135,6 +135,21 @@ class _Husk(WorktreeError):
     a removal interrupted half-way): nothing can be committed from it."""
 
 
+class BranchCheckedOutError(WorktreeError):
+    """``create_worktree`` was asked for a branch that another LIVE worktree has checked
+    out (#475). That tree is somebody's — a concurrent drive, an operator's checkout — so
+    the board neither resets the branch nor touches the tree. A ``coder.solve`` candidate
+    moves on to the next free ``.g<n>`` index instead; any other caller gets this reason."""
+
+    def __init__(self, branch: str, holder: str):
+        self.branch = branch
+        self.holder = holder
+        super().__init__(
+            f"branch {branch} is checked out in another worktree ({holder}); the board will not "
+            f"reset it or touch that tree"
+        )
+
+
 async def _git(repo: str, *args: str, timeout: float = 60, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run a git command in ``repo``; return (rc, stdout, stderr). ``env`` ADDS to the
     inherited environment — the one use is a private ``GIT_INDEX_FILE``."""
@@ -867,7 +882,10 @@ async def create_worktree(
     same name first (idempotent re-run after a crashed feature) — after saving any work
     that tree holds that exists nowhere else to a ``stranded/…`` branch
     (``preserve_worktree``), or raising ``StrandedWorkError`` and leaving it untouched when
-    saving fails (#405).
+    saving fails (#405). A leftover directory with no ``.git`` (a husk) is moved aside, and
+    a leftover BRANCH of the same name is recreated, after its unique commits are saved —
+    never terminal; only a branch another live worktree has checked out is refused, with
+    ``BranchCheckedOutError`` (#475).
 
     ``resume`` (a FIX ROUND on a card that already has an open PR) starts from
     ``origin/<branch>`` instead — the PR head — when that ref resolves. Without it the
@@ -902,7 +920,23 @@ async def create_worktree(
     await _clear_for(repo, path, branch, base, "replacing")
     # Best-effort cleanup of a prior run's leftovers.
     await _git(repo, "worktree", "remove", "--force", rel)
-    await _git(repo, "branch", "-D", branch)
+    # A leftover BRANCH of the same name (#475) — a prior attempt's, whose tree is gone — is
+    # recreated, never terminal: its commits that exist nowhere else are saved to a
+    # `stranded/…` branch first, then `worktree add -B` resets it onto the fresh start. The
+    # one branch never reset is one another live worktree has checked out.
+    holder = (await _checked_out_branches(repo)).get(branch, "")
+    if holder:
+        if os.path.realpath(holder) == os.path.realpath(path):
+            raise WorktreeError(f"worktree {rel} ({branch}) is still checked out and could not be removed")
+        raise BranchCheckedOutError(branch, holder)
+    saved = await _save_branch(repo, branch, os.path.basename(os.path.normpath(path)), base)
+    if saved:
+        log.warning(
+            "[project_board] leftover branch %s held commits that existed nowhere else — saved them to %s "
+            "before recreating it (#475)",
+            branch,
+            saved,
+        )
     # Branch off the LATEST remote base. Two-branch repos put features on `dev`,
     # which the local clone may not even have as a branch; and even when it does, a
     # stale local ref would build off old code. Fetch best-effort, then start from
@@ -928,7 +962,10 @@ async def create_worktree(
     rc_chk, _o, _e = await _git(repo, "rev-parse", "--verify", "--quiet", start)
     if rc_chk != 0:
         start = base
-    rc, _out, err = await _git(repo, "worktree", "add", rel, "-b", branch, start)
+    # `-B`, not `-b`: `worktree add` creates the branch BEFORE it checks the path, so a
+    # failed add leaves the branch behind — and with `-b` the retry below then failed on
+    # that branch alone ("a branch named … already exists"), hiding the real error (#475).
+    rc, _out, err = await _git(repo, "worktree", "add", rel, "-B", branch, start)
     if rc != 0:
         # A git error here (classically 'fatal: not a git repository' out of a corrupt
         # worktree admin dir, #225) — prune the stale references and retry the add ONCE.
@@ -939,8 +976,18 @@ async def create_worktree(
             err.strip()[:200],
         )
         await prune_stale_worktrees(repo)
-        rc, _out, err = await _git(repo, "worktree", "add", rel, "-b", branch, start)
+        rc, _out, err = await _git(repo, "worktree", "add", rel, "-B", branch, start)
         if rc != 0:
+            # Don't leave the branch the failed add created for the next attempt to trip on
+            # (#475): it was just made at `start`, so it holds nothing of its own — unless
+            # something else has it checked out, or it somehow does, and then it stays.
+            try:
+                if not (await _checked_out_branches(repo)).get(branch) and not await _unique_commits(
+                    repo, branch, base, head=False
+                ):
+                    await _git(repo, "branch", "-D", branch)
+            except WorktreeError as exc:
+                log.warning("[project_board] could not drop %s after the failed add: %s", branch, exc)
             raise WorktreeError(f"worktree add failed: {err.strip()[:300]}")
     abspath = os.path.abspath(path)
     # A fresh worktree is a bare checkout with NO node_modules, so an npm/pnpm pre-PR gate
@@ -1044,13 +1091,31 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     When ``git worktree remove`` fails because the git metadata is already gone
     (stderr contains "is not a working tree"), the directory may still be on disk.
     In that case: prune stale admin entries, then remove the directory via
-    ``shutil.rmtree``, and return True only if the directory is now absent.
+    ``shutil.rmtree``, and return True only if the directory is now absent. The same for
+    a husk whose ``.git`` a removal interrupted half-way already took (#475): git's
+    "'.git' does not exist" refusal, or our own timeout on a removal that got that far.
     Any other failure reason (dirty tree, locked, permissions) returns False
     without touching the directory."""
-    rc, _out, err = await _git(repo, "worktree", "remove", "--force", worktree)
+    interrupted = False
+    try:
+        # A large tree takes a while to delete; killed at `_git`'s default 60s, git left
+        # it half-removed — no `.git`, some files — which is how a husk is born (#475).
+        rc, _out, err = await _git(repo, "worktree", "remove", "--force", worktree, timeout=300)
+    except WorktreeError as exc:  # timed out — teardown must not raise into the loop
+        rc, err, interrupted = 1, str(exc), True
     removed = rc == 0
     if not removed:
-        if "is not a working tree" in err:
+        # "is not a working tree": git's metadata is gone. A HUSK — a removal interrupted
+        # half-way (this one, or an earlier one) already took the `.git` link, and git
+        # now refuses with "validation failed … '.git' does not exist" (#475). Either way
+        # git can no longer remove it, and what is left is junk this path discards. Any
+        # other refusal (dirty, locked) leaves the directory alone.
+        husk = (
+            os.path.isdir(worktree)
+            and not os.path.lexists(os.path.join(worktree, ".git"))
+            and (interrupted or ".git' does not exist" in err)
+        )
+        if "is not a working tree" in err or husk:
             await _git(repo, "worktree", "prune")
             try:
                 shutil.rmtree(worktree)
@@ -1062,6 +1127,58 @@ async def remove_worktree(repo: str, worktree: str, branch: str = "") -> bool:
     if branch:
         await _git(repo, "branch", "-D", branch)
     return removed
+
+
+async def _checked_out_branches(repo: str) -> dict[str, str]:
+    """``{branch: worktree path}`` for every branch a worktree of ``repo`` has checked out
+    (``git worktree list --porcelain``) — the main checkout included. A branch in here is
+    in use and is never reset or deleted by the board (#475). Empty when git cannot say."""
+    rc, out, _err = await _git(repo, "worktree", "list", "--porcelain")
+    if rc != 0:
+        return {}
+    held: dict[str, str] = {}
+    path = ""
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :]
+        elif line.startswith("branch refs/heads/"):
+            held[line[len("branch refs/heads/") :]] = path
+    return held
+
+
+async def reap_candidate_branches(repo: str, fid: str, *, base: str = "", test_rung: bool = True) -> list[str]:
+    """Delete the leftover CANDIDATE branches (``feat/<fid>.g<n>`` / ``.c<n>`` / ``.test``…)
+    of card ``fid`` that no worktree has checked out — the ones whose tree is already gone
+    (#475). The tree-by-tree reap only finds a branch through its directory, so a candidate
+    whose tree went first (a failed ``worktree add``, a removal interrupted half-way, a tree
+    deleted by hand) kept its branch forever, and the next attempt at that index blocked the
+    card on it. A branch holding commits that exist nowhere else is saved to a
+    ``stranded/…`` branch first (#405); one that could not be saved is kept. A branch some
+    worktree has checked out is live and never touched. ``test_rung=False`` leaves the
+    test-rung diagnostic's own branches alone. Best-effort; returns the branches deleted."""
+    rc, out, _err = await _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/feat/")
+    if rc != 0:
+        return []
+    held = await _checked_out_branches(repo)
+    deleted: list[str] = []
+    for branch in out.split():
+        wt_id = branch[len("feat/") :]
+        if not wt_id.startswith(f"{fid}.") or parent_feature_id(wt_id) != fid or branch in held:
+            continue
+        if not test_rung and _is_test_rung(wt_id, fid):
+            continue
+        try:
+            saved = await _save_branch(repo, branch, f"feat-{wt_id}", base)
+        except WorktreeError as exc:
+            log.warning("[project_board] kept leftover branch %s: saving its commits failed (%s)", branch, exc)
+            continue
+        if (await _git(repo, "branch", "-D", branch))[0] == 0:
+            deleted.append(branch)
+            if saved:
+                log.warning("[project_board] leftover branch %s held work — saved it to %s (#475)", branch, saved)
+    if deleted:
+        log.info("[project_board] %s: deleted leftover candidate branch(es) %s", fid, ", ".join(deleted))
+    return deleted
 
 
 def _is_test_rung(wt_id: str, fid: str) -> bool:
@@ -1285,8 +1402,34 @@ async def _clear_for(repo: str, path: str, branch: str, base: str, why: str) -> 
     ``branch -D``. Raises ``StrandedWorkError`` — the tree left as it is — when there was
     work that could not be saved, or a saved tree that would not come off its path."""
     async with _tree_lock(path):
+        name = os.path.basename(os.path.normpath(path))
         if not os.path.exists(path):
-            await _save_branch(repo, branch, os.path.basename(os.path.normpath(path)), base)
+            await _save_branch(repo, branch, name, base)
+            return
+        if os.path.isdir(path) and not os.path.lexists(os.path.join(path, ".git")):
+            # A husk with no `.git` at all: a removal interrupted half-way (a `worktree
+            # remove` killed on its timeout, a crash) deleted the link and some files and
+            # left the rest (#475). `unpublished_work` answers "" for it — git would speak
+            # for the enclosing checkout — and `worktree remove` refuses it, so it used to sit
+            # on the path forever: every `worktree add` then created the branch, died on
+            # "already exists", and its one retry reported only "a branch named … already
+            # exists" (bd-fgtf, blocked terminal 5 times). Save the branch's commits, then
+            # move the leftover files aside, bytes intact (an empty dir is simply removed).
+            await _save_branch(repo, branch, name, base)
+            try:
+                if os.listdir(path):
+                    moved = await _move_aside(repo, path)
+                    log.warning(
+                        "[project_board] %s was a husk (no .git — a removal interrupted half-way); "
+                        "moved it aside to %s before %s it (#475)",
+                        path,
+                        moved,
+                        why,
+                    )
+                else:
+                    os.rmdir(path)
+            except OSError as exc:
+                raise WorktreeError(f"{path} is a leftover directory with no .git, and clearing it failed: {exc}")
             return
         stranded = await unpublished_work(path, branch=branch, base=base)
         if not stranded:
@@ -1384,6 +1527,12 @@ async def reap_feature_worktree(repo: str, worktrees_root: str, fid: str) -> boo
         log.info("[project_board] reaped worktrees for %s: %s", fid, ", ".join(cleaned + reaped))
     if kept:
         _warn_kept(fid, kept)
+    # …and the candidate branches whose trees were already gone, which no scan above can
+    # find (#475). A kept tree's branch is still checked out there, so it stays.
+    try:
+        await reap_candidate_branches(repo, fid)
+    except WorktreeError as exc:
+        log.warning("[project_board] %s: sweeping leftover candidate branches failed: %s", fid, exc)
     return removed
 
 
