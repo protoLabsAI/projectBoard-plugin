@@ -736,7 +736,8 @@ def _board_tools(cfg: dict):
         this tool never removes the flag). `source_issue` (a full GitHub issue URL or
         `owner/repo#N`, stored normalized off-label in the bead's notes metadata)
         sets/replaces the originating issue the feature's PR will reference as
-        `Fixes #N`. `project` RE-HOMES the card to another entry of the board's
+        `Fixes #N`; `"none"` clears it (move a split's closing edge to its last slice).
+        `project` RE-HOMES the card to another entry of the board's
         `projects:` map (#454) — e.g. the cards left on `default` after a board moved from
         the flat `repo:` binding to projects. A card's project decides which repo its
         worktree/branch/PR target, so the move is allowed only while the card is backlog

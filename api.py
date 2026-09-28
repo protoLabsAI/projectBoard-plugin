@@ -697,7 +697,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     async def _patch_feature(fid: str, body: dict = Body(default={})):
         """In-place spec edit — the REST complement of ``board_update_feature``.
         Accepts ``title``, ``spec``, ``acceptance_criteria``, ``design``,
-        ``files_to_modify``, ``difficulty``, ``source_issue``, ``waits_for`` (replaces the
+        ``files_to_modify``, ``difficulty``, ``source_issue`` (``"none"`` clears it), ``waits_for`` (replaces the
         publish gates; ``[]`` clears), ``project`` (re-homes the card, #454 — backlog/ready,
         no PR, never dispatched; refused with the reason otherwise); only non-null
         fields are written. Refuses edits to an ``in_progress`` feature unless
