@@ -288,14 +288,204 @@ async def test_checked_out_branches_names_every_worktrees_branch(origin):
     assert os.path.realpath(held["main"]) == os.path.realpath(origin.clone)
 
 
-async def test_remove_worktree_clears_a_tree_whose_removal_was_interrupted(origin):
-    """How the husk is born: git deleted the ``.git`` link and some files, then stopped. The
-    next ``worktree remove`` refuses it ('.git' does not exist); the removal must still
-    finish, and drop the branch."""
+async def test_remove_worktree_finishes_its_own_removal_that_timed_out(origin, monkeypatch):
+    """How the husk is born: our ``worktree remove`` hit its timeout after git had deleted the
+    ``.git`` link and some files. The removal must finish (not leave the next husk), and the
+    branch's unique commits are saved before its ``branch -D`` — git never vouched for it."""
     path, branch = await worktree.create_worktree(origin.clone, "main", "bd-x.g1", ".worktrees")
-    os.remove(os.path.join(path, ".git"))
+    Path(path, "work.py").write_text("committed\n")
+    _git("-C", path, "add", "-A")
+    _git("-C", path, "commit", "-m", "unpushed")
+    work = _git("-C", path, "rev-parse", "HEAD")
+    real_git = worktree._git
 
+    async def _killed_mid_remove(repo, *args, **kw):
+        if args[:2] == ("worktree", "remove"):
+            os.remove(os.path.join(path, ".git"))
+            os.remove(os.path.join(path, "README.md"))
+            raise worktree.WorktreeError("git worktree remove timed out after 300s")
+        return await real_git(repo, *args, **kw)
+
+    monkeypatch.setattr(worktree, "_git", _killed_mid_remove)
     assert await worktree.remove_worktree(origin.clone, path, branch)
 
     assert not os.path.exists(path)
     assert origin.branches("refs/heads/feat/") == []
+    assert [origin.sha(b) for b in origin.stranded("feat-bd-x.g1")] == [work]
+
+
+async def test_remove_worktree_leaves_a_husk_an_earlier_removal_left(origin):
+    """A registered husk it did not make is not ``remove_worktree``'s to delete: the
+    save-then-move edges (``discard_worktree``, ``_clear_for``) own it."""
+    path, branch = await worktree.create_worktree(origin.clone, "main", "bd-x.g1", ".worktrees")
+    Path(path, "untracked.py").write_text("uncommitted\n")
+    os.remove(os.path.join(path, ".git"))
+
+    assert not await worktree.remove_worktree(origin.clone, path, "")
+
+    assert Path(path, "untracked.py").read_text() == "uncommitted\n"
+
+
+# ── a husk holding work, through every edge that clears it (#481 review B1) ───────────
+
+
+async def _husk_with_work(origin, cid: str = "bd-x.g1") -> tuple[str, str, str]:
+    """A registered tree whose removal was interrupted: an unpushed commit on its branch,
+    an untracked file, and no ``.git``. Returns ``(path, branch, commit)``."""
+    path, branch = await worktree.create_worktree(origin.clone, "main", cid, ".worktrees")
+    Path(path, "work.py").write_text("committed unpushed work\n")
+    _git("-C", path, "add", "-A")
+    _git("-C", path, "commit", "-m", "unpushed")
+    sha = _git("-C", path, "rev-parse", "HEAD")
+    Path(path, "untracked.py").write_text("uncommitted\n")
+    os.remove(os.path.join(path, ".git"))
+    return path, branch, sha
+
+
+def _assert_husk_saved(origin, sha: str) -> None:
+    holders = _git("-C", origin.clone, "for-each-ref", "--contains", sha, "--format=%(refname:short)").split()
+    assert any(h.startswith("stranded/") for h in holders), f"the unpushed commit was lost: {holders}"
+    kept = list(Path(origin.root, ".stranded").rglob("untracked.py"))
+    assert len(kept) == 1 and kept[0].read_text() == "uncommitted\n", "the untracked file was lost"
+
+
+async def test_discard_saves_a_husks_commits_and_files(origin):
+    path, branch, sha = await _husk_with_work(origin)
+
+    removed, record = await worktree.discard_worktree(origin.clone, path, branch)
+
+    assert removed and not os.path.exists(path)
+    assert record is not None and record.moved_to and record.ref
+    _assert_husk_saved(origin, sha)
+    assert origin.branches("refs/heads/feat/") == []
+
+
+async def test_reap_saves_a_husks_commits_and_files(origin):
+    """The base-branch loss too: the canonical tree's removal pruned the husk's admin entry,
+    after which "is not a working tree" meant rmtree + ``branch -D``."""
+    path, _branch, sha = await _husk_with_work(origin)
+
+    await worktree.reap_feature_worktree(origin.clone, ".worktrees", "bd-x")
+
+    assert not os.path.exists(path)
+    _assert_husk_saved(origin, sha)
+    assert origin.branches("refs/heads/feat/") == []
+
+
+async def test_create_over_a_husk_saves_its_commits_and_files(origin):
+    path, branch, sha = await _husk_with_work(origin)
+
+    again, _ = await worktree.create_worktree(origin.clone, "main", "bd-x.g1", ".worktrees")
+
+    assert os.path.realpath(again) == os.path.realpath(path)
+    _assert_husk_saved(origin, sha)
+    assert origin.sha(branch) == origin.sha("origin/main")
+
+
+async def test_a_husk_under_a_path_with_spaces_is_moved_aside_whole(tmp_path):
+    o = _Origin(tmp_path / "Application Support" / "x y")
+    path, _ = await worktree.create_worktree(o.clone, "main", "bd-x.g1", ".worktrees")
+    Path(path, "sub").mkdir()
+    Path(path, "sub", "deep.txt").write_text("deep\n")
+    os.remove(os.path.join(path, ".git"))
+
+    again, _ = await worktree.create_worktree(o.clone, "main", "bd-x.g1", ".worktrees")
+
+    (moved,) = Path(o.root, ".stranded").iterdir()
+    assert Path(moved, "sub", "deep.txt").read_text() == "deep\n"
+    assert os.path.exists(os.path.join(again, ".git"))
+
+
+# ── the candidate-branch sweep's edges ────────────────────────────────────────────────
+
+
+async def test_the_sweep_takes_only_the_cards_candidates_and_saves_each_one_first(origin):
+    names = [
+        "feat/bd-1.g1",
+        "feat/bd-12.g1",
+        "feat/bd-1-slug",
+        "feat/bd-1.2.g1",
+        "feat/bd-1.gx",
+        "feat/bd-1.c3",
+        "feat/bd-1.test.g2",
+        "feat/bd-1",
+        "feat/ds-1.g1",
+    ]
+    shas = {n: origin.branch_with_commit(n, f"f{i}.txt") for i, n in enumerate(names)}
+
+    deleted = await worktree.reap_candidate_branches(origin.clone, "bd-1")
+
+    assert sorted(deleted) == ["feat/bd-1.c3", "feat/bd-1.g1", "feat/bd-1.test.g2"]
+    for name in deleted:
+        assert _git("-C", origin.clone, "branch", "--list", "stranded/*", "--contains", shas[name]), name
+
+
+def _rebase_in_progress(origin, tree: str) -> str:
+    """Leave the candidate branch checked out in ``tree`` stopped mid-rebase (a conflict).
+    Returns the branch's tip."""
+    Path(tree, "README.md").write_text("candidate edit\n")
+    _git("-C", tree, "commit", "-am", "cand")
+    tip = _git("-C", tree, "rev-parse", "HEAD")
+    origin.advance_origin()
+    r = subprocess.run(["git", "-C", tree, "rebase", "origin/main"], capture_output=True, text=True)
+    assert r.returncode != 0  # stopped on the conflict: HEAD detached, the branch still in use
+    return tip
+
+
+async def test_a_branch_mid_rebase_is_held_and_the_sweep_leaves_no_copy_of_it(origin):
+    tree = str(origin.tmp / "rebasing")
+    _git("-C", origin.clone, "worktree", "add", "-b", "feat/bd-x.g1", tree, "origin/main")
+    _identity(tree)
+    tip = _rebase_in_progress(origin, tree)
+
+    assert "feat/bd-x.g1" in await worktree._checked_out_branches(origin.clone)
+    assert await worktree.reap_candidate_branches(origin.clone, "bd-x") == []
+    assert origin.sha("feat/bd-x.g1") == tip
+    assert origin.branches("refs/heads/stranded/") == []
+
+
+async def test_create_refuses_a_branch_being_rebased_in_another_tree(origin):
+    tree = str(origin.tmp / "other tree")
+    _git("-C", origin.clone, "worktree", "add", "-b", "feat/bd-x.g1", tree, "origin/main")
+    _identity(tree)
+    tip = _rebase_in_progress(origin, tree)
+
+    with pytest.raises(worktree.BranchCheckedOutError):
+        await worktree.create_worktree(origin.clone, "main", "bd-x.g1", ".worktrees")
+
+    assert origin.sha("feat/bd-x.g1") == tip
+    assert origin.branches("refs/heads/stranded/") == []
+
+
+async def test_a_skipped_index_is_not_counted_as_a_generation(origin, monkeypatch):
+    _git("-C", origin.clone, "worktree", "add", "-b", "feat/bd-x.g1", str(origin.tmp / "elsewhere"), "origin/main")
+
+    async def _solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        await generate(task)  # lands on g2
+        raise RuntimeError("the coder died")
+
+    async def _tapped(coder, wt, prompt, **_kw):
+        return "done"
+
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _tapped)
+    gens: list[int] = []
+    with pytest.raises(RuntimeError):
+        await coder_seam.dispatch(
+            task="t",
+            coder=object(),
+            repo=origin.clone,
+            base="main",
+            root=".worktrees",
+            fid="bd-x",
+            dispatch_timeout=None,
+            test_cmd="true",
+            test_timeout=10,
+            budget=4,
+            k=2,
+            tree_depth=1,
+            record_gens=gens.append,
+            _solve=_solve,
+            _budget_cls=lambda n: n,
+            _verdict_cls=object,
+        )
+    assert gens == [1]

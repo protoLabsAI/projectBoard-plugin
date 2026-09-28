@@ -1702,6 +1702,9 @@ class _WorktreeSolveAdapter:
         # step; the slow part (the coder dispatch) still runs in parallel.
         self._wt_lock = asyncio.Lock()
         self._n = 0
+        # `.g<n>` indices skipped because another live worktree held that branch (#475):
+        # never generations, so never counted as spend.
+        self._skipped = 0
         # worktree_path -> the coder's own final reply (its clean PR summary, per
         # `loop._build_prompt`'s "your FINAL message becomes the PR description"
         # contract) — captured so `dispatch()` can use the WINNING candidate's real
@@ -1724,6 +1727,11 @@ class _WorktreeSolveAdapter:
         # SolveExhausted rather than spend the rest of the budget re-failing identically.
         self._failure_signatures: dict[str, int] = {}
 
+    @property
+    def generations(self) -> int:
+        """Generations attempted so far: the indices used, minus those skipped (#475)."""
+        return self._n - self._skipped
+
     async def _new_candidate_worktree(self) -> tuple[str, str]:
         async with self._wt_lock:
             # A `.g<n>` whose branch another live worktree has checked out (#475) is not
@@ -1735,6 +1743,7 @@ class _WorktreeSolveAdapter:
                     wt, branch = await worktree.create_worktree(self.repo, self.base, cid, self.root)
                     break
                 except worktree.BranchCheckedOutError as exc:
+                    self._skipped += 1
                     if attempt + 1 == _CANDIDATE_INDEX_TRIES:
                         raise
                     log.warning("[project_board] %s: skipping candidate index — %s", cid, exc)
@@ -2231,7 +2240,7 @@ async def dispatch(
         for wt, branch in adapter.candidates:
             await worktree.remove_worktree(repo, wt, branch)
         await _sweep_candidate_branches(repo, fid)
-        if record_gens is not None and adapter._n:
+        if record_gens is not None and adapter.generations:
             # `solve()` never got to return a `gens_spent` count — the attempted
             # generation count is the honest stand-in (a failed dispatch still spent
             # the gen; ADR 0064's cost accounting doesn't get to look the other way).
@@ -2239,7 +2248,7 @@ async def dispatch(
             # here must never fail the build"): the worktrees above are ALREADY
             # reaped and the original exception below is what the loop must see —
             # a transient `br` failure recording the spend must never mask it.
-            _record_gens_best_effort(record_gens, fid, adapter._n)
+            _record_gens_best_effort(record_gens, fid, adapter.generations)
         log.warning(
             "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
             fid,
