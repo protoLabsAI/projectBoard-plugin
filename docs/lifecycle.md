@@ -230,6 +230,21 @@ runs unchanged. The reviewers, the marker and the check and status names are con
 (`external_review` in [configuration](configuration.md#review-and-merge)), and
 `external_review: false` turns the whole check off, board-wide or per project.
 
+The check runs inside each card's own reconcile task (#471), under its repo's lock, and the
+bounce re-reads the card under the claim lock before it writes. A card that moved since the
+pass read it (claimed, blocked, attached elsewhere) is left alone.
+
+**A fix round must move the head (#476).** On bd-524n the first bounce's coder worked for
+fourteen minutes and committed nothing. The branch was still at the failed head, yet the
+drive logged `coder done → PR`. The gate re-reviewed that same head clean and the
+merged-state gate re-ran, while the panel's FAIL stood. Now, before a card that already owns
+a PR publishes, the drive compares its tree with `origin/<branch>`, the head the round
+resumed from, and logs `head <before> → <after>`. If HEAD has not moved and nothing is left
+uncommitted (bar the coder's scratch), the round is a `NoChangesError`: a failed attempt
+with the reason `fix round produced no commit — <branch> is still at <sha>`. It is retried,
+escalated or blocked like any empty build. Nothing is pushed or re-reviewed, and the
+unchanged head never reaches `in_review` again as if it were new work.
+
 An operator can do the same bounce by hand without the webhook secret:
 `POST /api/plugins/project_board/features/{fid}/review` (`{findings, escalate?}`) on the
 bearer-gated surface, or `board_requeue_feature(feature_id, findings, escalate?)`. That is

@@ -218,15 +218,17 @@ async def test_pr_ci_status_reports_a_known_rollup(gh_fixture):
 
 
 @requires_gh
-async def test_pr_review_state_reads_head_reviews_and_rollup_in_one_call(gh_fixture):
+async def test_pr_review_state_reads_head_reviews_and_rollup_in_one_call(gh_fixture, monkeypatch):
     """``pr_review_state`` asks real GitHub for ``headRefOid,reviews,statusCheckRollup`` in one
     ``gh pr view`` — the payload the external-review reconcile judges (#473). A mock would accept
     any field name; this proves `gh` accepts these three, that the head is the fixture's live
     head, and that the shapes ``external_review.evaluate`` walks are what GitHub returns. The
     fixture has no QA-panel FAIL to find, so the verdict is pinned by CONTRACT (it evaluates,
     pinned to the live head), not by colour."""
+    from conftest import REAL_SEAMS
     from project_board import external_review
 
+    monkeypatch.setattr(worktree, "pr_review_state", REAL_SEAMS["worktree.pr_review_state"])
     view = await worktree.pr_review_state(gh_fixture.url, cwd=gh_fixture.repo_dir)
     assert isinstance(view, dict), "gh pr view --json headRefOid,reviews,statusCheckRollup must parse"
     assert view["headRefOid"] == gh_fixture.head_sha
@@ -242,8 +244,11 @@ async def test_pr_review_state_reads_head_reviews_and_rollup_in_one_call(gh_fixt
 
 
 @requires_gh
-async def test_pr_review_state_is_none_for_a_pr_that_does_not_exist(gh_fixture):
+async def test_pr_review_state_is_none_for_a_pr_that_does_not_exist(gh_fixture, monkeypatch):
     """An unreadable PR is ``None`` — never a raise, never a verdict (fail open to today's flow)."""
+    from conftest import REAL_SEAMS
+
+    monkeypatch.setattr(worktree, "pr_review_state", REAL_SEAMS["worktree.pr_review_state"])
     missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
     assert await worktree.pr_review_state(missing, cwd=gh_fixture.repo_dir) is None
 

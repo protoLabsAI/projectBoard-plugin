@@ -2149,6 +2149,17 @@ class DriveMixin:
                         await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
+                    if feature.get("pr_url") and wt:
+                        # #476: a FIX ROUND must move the PR head. One that ends on the same
+                        # commit with nothing uncommitted changed nothing — a failed attempt
+                        # (NoChangesError: counted, escalated or blocked like any empty build),
+                        # never "coder done", and never a re-review of the head the bounce was about.
+                        still = await worktree.fix_round_unchanged(wt, branch or "")
+                        if still:
+                            raise worktree.NoChangesError(
+                                f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
+                                "the bounce was about; nothing new to push or review"
+                            )
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that

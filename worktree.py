@@ -408,6 +408,36 @@ async def _unique_commits(where: str, branch: str = "", base: str = "", *, head:
     return len(unique)
 
 
+async def fix_round_unchanged(path: str, branch: str) -> str:
+    """The head a FIX ROUND ended on when it changed nothing (#476), else ``""``.
+
+    A fix round resumes the PR's branch from ``origin/<branch>`` (``create_worktree(resume=
+    True)`` fetches it). It changed nothing when the tree's HEAD is still that commit AND
+    nothing is left uncommitted (bar the board's own droppings — ``_tree_status``). Handing
+    such a round to ``open_pr`` pushes nothing, and the review gate then re-reviews and the
+    reconcile re-gates the very head the bounce was about, as if it were new work (bd-524n).
+
+    Any doubt answers ``""`` (no judgement, today's path): the tree or the remote ref can't
+    be read, or the tree holds uncommitted work. Logs the head it compared, before → after."""
+    try:
+        rc_b, before, _e = await _git(
+            path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}^{{commit}}"
+        )
+        rc_a, after, _e = await _git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    except (WorktreeError, OSError):  # a timeout, or a tree that is not there
+        return ""
+    before, after = before.strip(), after.strip()
+    if rc_b != 0 or rc_a != 0 or not before or not after:
+        return ""
+    log.info("[project_board] fix round on %s: head %s → %s", branch, before[:12], after[:12])
+    if before != after:
+        return ""
+    changes, _nested, unreadable = await _tree_status(path)
+    if changes or unreadable:
+        return ""
+    return after
+
+
 async def unpublished_work(path: str, *, branch: str = "", base: str = "") -> str:
     """What removing the worktree at ``path`` — and deleting ``branch`` with it — would
     destroy, as a short summary; ``""`` when nothing would be lost (#405).
@@ -2415,7 +2445,7 @@ async def pr_review_state(pr_url: str, *, cwd: str = ".") -> dict | None:
     unreadable review state is simply not a FAIL, and the reconcile carries on as before."""
     try:
         rc, out, _err = await _gh("pr", "view", pr_url, "--json", "headRefOid,reviews,statusCheckRollup", cwd=cwd)
-    except WorktreeError:
+    except (WorktreeError, OSError):  # a timeout, no `gh`, a cwd that is gone
         return None
     if rc != 0 or not out.strip():
         return None

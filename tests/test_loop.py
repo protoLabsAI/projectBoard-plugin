@@ -11417,3 +11417,61 @@ async def test_prepare_tree_lets_a_cancel_through(monkeypatch):
     monkeypatch.setattr(worktree, "prepare_worktree", _cancelled)
     with pytest.raises(asyncio.CancelledError):
         await BoardLoop({"setup_cmd": "npm ci"})._prepare_tree("/wt", {"id": "bd-1"})
+
+
+# ── #476: a fix round that changed nothing is a failed attempt, never "coder done" ────
+
+
+async def test_a_fix_round_that_left_the_head_unchanged_is_not_done(monkeypatch):
+    """bd-524n: the coder ran fourteen minutes on a review bounce and committed nothing. The
+    branch was still at the head the bounce was about, yet the drive logged `coder done → PR`,
+    the gate re-reviewed that SAME head clean and the merged-state gate re-ran. Now the round
+    is a NoChangesError: no PR push, no review, the card blocked (single coder) with the reason."""
+    opened = []
+
+    async def _open_pr(*a, **k):
+        opened.append(a)
+        return "https://example/pr/1"
+
+    async def _unchanged(wt, branch):
+        return "e5c66aa9ad75731286916a06d2bd6059494e0389"
+
+    monkeypatch.setattr(worktree, "fix_round_unchanged", _unchanged)
+    feature = {**FEATURE, "pr_url": "https://github.com/o/r/pull/9"}
+
+    def _worked(loop):  # the coder DID work (tool calls) — it just committed nothing
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda fid: (True, "end_turn"))
+
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature, seed=_worked)
+    assert opened == []  # nothing pushed
+    assert not any(c[0] == "open_review" for c in store.calls)  # never re-reviewed
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert blocked and "fix round produced no commit" in blocked[-1][2] and "e5c66aa9ad75" in blocked[-1][2]
+
+
+async def test_a_fix_round_that_moved_the_head_opens_review(monkeypatch):
+    async def _open_pr(*a, **k):
+        return "https://github.com/o/r/pull/9"
+
+    async def _moved(wt, branch):
+        return ""
+
+    monkeypatch.setattr(worktree, "fix_round_unchanged", _moved)
+    feature = {**FEATURE, "pr_url": "https://github.com/o/r/pull/9"}
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert ("open_review", "bd-1", "https://github.com/o/r/pull/9") in store.calls
+
+
+async def test_a_first_build_is_never_asked_whether_its_head_moved(monkeypatch):
+    asked = []
+
+    async def _open_pr(*a, **k):
+        return "https://example/pr/1"
+
+    async def _probe(wt, branch):
+        asked.append(wt)
+        return "x" * 40
+
+    monkeypatch.setattr(worktree, "fix_round_unchanged", _probe)
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no pr_url
+    assert asked == [] and ("open_review", "bd-1", "https://example/pr/1") in store.calls
