@@ -1190,23 +1190,28 @@ def live_loop():
     return _loop_slot().loop
 
 
-def worked_by_the_loop(fid: str) -> str:
+def worked_by_the_loop(fid: str, *, own_task=None) -> str:
     """What the loop is doing with ``fid`` right now, or ``""`` when nothing (#398). Three
     signals span a card's time in the loop's hands: a live drive task (the process-stable
     registry the cancel verbs read), a claimed build's file hold, and a running review gate.
     The review reconcile applies this same liveness guard before it touches a card (#340,
-    #323), and so does #437's attach."""
+    #323), and so does #437's attach.
+
+    ``own_task`` is the caller's own PR-reconcile task. An edge running INSIDE that task
+    (the external-review bounce, #473) must not count its own reconcile as "the loop is
+    still working it" — it IS that work, and the check would refuse it on every pass."""
     if _loop.live_drive(fid) is not None:
         return "a coder drive is still building it"
     loop = _loop.live_loop()
     if loop is not None and (fid in loop._inflight_files or fid in loop._review_inflight):
         return "the loop is still working it (a claimed build or a running review gate)"
-    if loop is not None and fid in getattr(loop, "_card_tasks", {}):
+    card_task = getattr(loop, "_card_tasks", {}).get(fid) if loop is not None else None
+    if card_task is not None and (own_task is None or card_task is not own_task):
         return "the loop is still working it (its PR reconcile — rebase, merge gate or review — is running)"
     return ""
 
 
-def requeue_refusal(fid: str) -> str:
+def requeue_refusal(fid: str, *, own_task=None) -> str:
     """Why ``fid`` must not be requeued right now, or ``""`` (#398). Every edge that puts a
     card back to ready from outside the loop — board_requeue_feature, board_requeue_ci_fix,
     POST /features/{fid}/ci and /review — refuses while the loop is still working it. A
@@ -1214,7 +1219,7 @@ def requeue_refusal(fid: str) -> str:
     then failed and the card went terminal with an open PR, and a first build requeued the
     same way loses its finished work to the rebuild. Refused, not overridden: the round
     moves the card on by itself when it ends."""
-    doing = worked_by_the_loop(fid)
+    doing = worked_by_the_loop(fid, own_task=own_task)
     if not doing:
         return ""
     return (
