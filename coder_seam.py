@@ -261,6 +261,23 @@ class _GenBuffer:
                 "input_preview": preview,
             }
             self.recent_tools.append({"name": name, "kind": kind, "status": "start", "locations": locs})
+        elif phase == "update":
+            # A refinement of the OPEN call (#463, protoAgent#3691): claude-agent-acp opens
+            # each tool with a placeholder title and empty args, then names it. Refresh the
+            # live line and rename its start row in place — never a new row, and nothing for
+            # a call that already ended or isn't the current one.
+            cur = self.current_tool
+            if not cur or cur.get("id") != tid or cur.get("status") != "running":
+                return
+            old_name = cur.get("name")
+            locs = _extract_locations(event.get("input")) if event.get("input") else cur.get("locations") or []
+            cur.update(name=name, kind=kind, locations=locs)
+            if event.get("input"):
+                cur["input_preview"] = str(event.get("input"))[:_TOOL_INPUT_PREVIEW_MAX]
+            for row in reversed(self.recent_tools):
+                if row.get("status") == "start" and row.get("name") == old_name:
+                    row.update(name=name, kind=kind, locations=locs)
+                    break
         elif phase == "end":
             status = str(event.get("status") or "completed")
             if self.current_tool and self.current_tool.get("id") == tid:

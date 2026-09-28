@@ -2736,3 +2736,30 @@ async def test_a_failed_candidate_install_does_not_stop_the_ladder(monkeypatch, 
 
 async def _async(val):
     return val
+
+
+def test_update_phase_refines_the_open_tool_in_place():
+    """#463: claude-agent-acp opens a tool as a placeholder, then refines it with
+    phase="update". The live line and its start row take the refined name/args; no new row."""
+    p = coder_seam._GenBuffer(1)
+    p.add_tool({"phase": "start", "id": "t1", "name": "Read File", "input": "{}"})
+    p.add_tool({"phase": "update", "id": "t1", "name": "Read src/app.py", "input": '{"file_path": "src/app.py"}'})
+    assert p.current_tool["name"] == "Read src/app.py"
+    assert "src/app.py" in p.current_tool["input_preview"]
+    assert p.current_tool["locations"]
+    assert [r["name"] for r in p.recent_tools] == ["Read src/app.py"]  # renamed, not appended
+    p.add_tool({"phase": "end", "id": "t1", "name": "Read src/app.py", "status": "completed"})
+    assert [(r["name"], r["status"]) for r in p.recent_tools] == [
+        ("Read src/app.py", "start"),
+        ("Read src/app.py", "completed"),
+    ]
+
+
+def test_update_phase_ignores_an_ended_or_foreign_call():
+    p = coder_seam._GenBuffer(1)
+    p.add_tool({"phase": "start", "id": "t1", "name": "Terminal", "input": "{}"})
+    p.add_tool({"phase": "update", "id": "other", "name": "rm -rf /", "input": "{}"})
+    assert p.current_tool["name"] == "Terminal"
+    p.add_tool({"phase": "end", "id": "t1", "name": "Terminal", "status": "completed"})
+    p.add_tool({"phase": "update", "id": "t1", "name": "late", "input": "{}"})
+    assert p.current_tool["name"] == "Terminal" and all(r["name"] == "Terminal" for r in p.recent_tools)
