@@ -117,7 +117,8 @@ def _view(*, head=HEAD, reviews=None, checks=None):
 def test_config_defaults_and_overrides():
     cfg = external_review.parse_config(None)
     assert cfg.reviewers == ("protoreview[bot]",) and cfg.marker == "protoagent-qa-review"
-    assert cfg.check_runs == ("QA panel",) and cfg.statuses == ("Review at head",)
+    # No status by default: `Review at head` is red on every head not reviewed YET (#477 review).
+    assert cfg.check_runs == ("QA panel",) and cfg.statuses == ()
     assert external_review.parse_config(True) == cfg
     assert external_review.parse_config(False) is None
     assert external_review.parse_config("false") is None
@@ -138,7 +139,7 @@ def test_the_incident_payload_is_a_fail_at_the_head_with_findings():
     assert v.reviewer == "protoreview"
     summary = external_review.fail_summary(v)
     assert "verdict=FAIL" in summary and "check run `QA panel` FAILURE" in summary
-    assert "status `Review at head` FAILURE" in summary
+    assert "Review at head" not in summary  # not read by default
     # The board's OWN `QA panel` verdict is a commit STATUS, and it said clean: it must not
     # be read as the panel's (nor count against it).
     assert "status `QA panel`" not in summary
@@ -167,6 +168,73 @@ def test_the_latest_marked_review_at_the_head_wins_and_a_pass_clears_a_lingering
     # …but ORDER comes from submittedAt, not list position.
     v = external_review.evaluate(_view(reviews=list(reversed(reviews))), external_review.Config())
     assert v.review_verdict == "PASS" and not v.failed
+
+
+def test_an_unreviewed_head_is_not_failed():
+    """The #477 review's MAJOR: protoAgent's `Review at head` is `failure` on every head the
+    panel has not reviewed YET ("no QA panel verdict for <sha> — this head is unreviewed").
+    A fresh push — old PASS for the previous head, red `Review at head`, no check yet — is
+    not a FAIL, or every new head would be held."""
+    old_pass = _review(VERA_BODY.replace("verdict=FAIL", "verdict=PASS"), state="APPROVED")
+    view = _view(
+        head=NEW_HEAD,
+        reviews=[old_pass],
+        checks=[{"__typename": "StatusContext", "context": "Review at head", "state": "FAILURE"}],
+    )
+    v = external_review.evaluate(view, external_review.Config())
+    assert not v.failed and v.signals == []
+
+
+def test_a_dismissed_review_is_the_operators_override():
+    dismissed = _review(VERA_BODY, state="DISMISSED")
+    v = external_review.evaluate(_view(reviews=[dismissed], checks=[]), external_review.Config())
+    assert not v.failed and v.review_verdict == ""
+
+
+def test_block_and_reject_are_blocking_verdicts_and_warn_is_not():
+    for word in ("BLOCK", "REJECT"):
+        body = VERA_BODY.replace("verdict=FAIL", f"verdict={word}")
+        v = external_review.evaluate(_view(reviews=[_review(body)], checks=[]), external_review.Config())
+        assert v.failed and v.has_findings_review and f"verdict={word}" in external_review.fail_summary(v)
+    warn = VERA_BODY.replace("verdict=FAIL", "verdict=WARN")
+    v = external_review.evaluate(_view(reviews=[_review(warn)], checks=[]), external_review.Config())
+    assert not v.failed
+
+
+def _check(conclusion, *, completed="", workflow=""):
+    c = {"__typename": "CheckRun", "name": "QA panel", "conclusion": conclusion, "workflowName": workflow}
+    if completed:
+        c["completedAt"] = completed
+    return c
+
+
+def test_a_red_check_after_the_clearing_review_still_counts():
+    passed = _review(VERA_BODY.replace("verdict=FAIL", "verdict=PASS"), at="2026-09-27T10:00:00Z", state="APPROVED")
+    later = external_review.evaluate(
+        _view(reviews=[passed], checks=[_check("FAILURE", completed="2026-09-27T11:00:00Z")]), external_review.Config()
+    )
+    assert later.failed and not later.has_findings_review  # held, not bounced: no findings to hand over
+    earlier = external_review.evaluate(
+        _view(reviews=[passed], checks=[_check("FAILURE", completed="2026-09-27T09:00:00Z")]), external_review.Config()
+    )
+    assert not earlier.failed  # the panel re-reviewed and cleared it
+    undated = external_review.evaluate(_view(reviews=[passed], checks=[_check("FAILURE")]), external_review.Config())
+    assert not undated.failed  # nothing to order them by: the review wins
+
+
+def test_only_an_app_check_run_counts_not_an_actions_job_of_that_name():
+    cfg = external_review.Config()
+    actions = external_review.evaluate(_view(reviews=[], checks=[_check("FAILURE", workflow="CI")]), cfg)
+    assert not actions.failed
+    unknown = {"__typename": "CheckRun", "name": "QA panel", "conclusion": "FAILURE"}  # an older gh: no key
+    assert not external_review.evaluate(_view(reviews=[], checks=[unknown]), cfg).failed
+    assert external_review.evaluate(_view(reviews=[], checks=[_check("FAILURE")]), cfg).failed
+
+
+def test_a_configured_status_still_counts_when_listed():
+    cfg = external_review.parse_config({"statuses": ["Panel verdict"]})
+    red = {"__typename": "StatusContext", "context": "Panel verdict", "state": "FAILURE"}
+    assert external_review.evaluate(_view(reviews=[], checks=[red]), cfg).failed
 
 
 def test_a_red_check_with_no_marked_review_fails_without_findings():
@@ -392,8 +460,8 @@ async def test_off_by_config_reads_nothing(monkeypatch):
     store = _Store()
     loop = _loop(monkeypatch, store, cfg={"external_review": False})
     await loop._reconcile_prs()
-    assert loop.reads == [] and store.state == "in_review"
-    assert "merged-verify" in loop.ran
+    assert store.state == "in_review" and not store.calls  # the FAIL is not acted on
+    assert "merged-verify" in loop.ran and "auto-merge" in loop.ran
 
 
 async def test_a_project_can_turn_it_off_for_its_own_repo(monkeypatch):
@@ -401,7 +469,7 @@ async def test_a_project_can_turn_it_off_for_its_own_repo(monkeypatch):
     cfg = {"projects": {"p": {"repo": "/r", "external_review": False}}, "default_project": "p"}
     loop = _loop(monkeypatch, store, cfg=cfg)
     await loop._reconcile_prs()
-    assert loop.reads == [] and store.state == "in_review"
+    assert store.state == "in_review" and not store.calls and "merged-verify" in loop.ran
 
 
 async def test_an_unreadable_review_state_fails_open_to_the_old_pass(monkeypatch):
@@ -579,3 +647,70 @@ def test_board_requeue_feature_escalates_with_findings(monkeypatch):
     store.calls.clear()
     tools["board_requeue_feature"].invoke({"feature_id": "bd-1", "findings": "x"})
     assert [c[0] for c in store.calls] == ["record_review_bounce", "requeue"]  # same tier by default
+
+
+async def test_one_read_per_card_carries_the_state_and_the_verdict(monkeypatch):
+    """The pass's PR state rides the same `gh pr view` as the panel's verdict: no separate
+    `pr_state` call when the combined read answered."""
+    store = _Store()
+    loop = _loop(monkeypatch, store, view={**_view(), "state": "OPEN"})
+    plain = []
+
+    async def _state(pr_url, *, cwd="."):
+        plain.append(pr_url)
+        return "OPEN"
+
+    monkeypatch.setattr(worktree, "pr_state", _state)
+    await loop._reconcile_prs()
+    assert loop.reads == [PR] and plain == []  # one read, and the bounce used it
+    assert store.state == "ready"
+
+
+async def test_a_merged_pr_is_settled_from_the_same_read(monkeypatch):
+    store = _Store()
+    merged = []
+    store.record_merge = lambda pr_url: merged.append(pr_url) or {"id": "bd-1"}
+    loop = _loop(monkeypatch, store, view={**_view(), "state": "MERGED"})
+
+    async def _reap(*a, **k):
+        return True
+
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    await loop._reconcile_prs()
+    assert merged == [PR] and not store.calls  # done, not bounced
+
+
+async def test_the_merge_edge_asks_again_right_before_merging(monkeypatch):
+    """Defence in depth: the panel FAILS the head between the pass's check and the merge."""
+    store = _Store(labels=["review-clean"])
+    loop = BoardLoop({"merge_poll": True, "auto_merge": True})
+    merges = []
+
+    async def _no_blockers(*a, **k):
+        return []
+
+    async def _merge(*a, **k):
+        merges.append(a)
+        return True, ""
+
+    async def _failed(pr_url, *, cwd="."):
+        return _view()
+
+    monkeypatch.setattr(loop, "_auto_merge_blockers", _no_blockers)
+    monkeypatch.setattr(worktree, "merge_pr", _merge)
+    monkeypatch.setattr(worktree, "pr_review_state", _failed)
+    assert await loop._maybe_auto_merge(store, "bd-1", PR, "/repo") is False
+    assert merges == []
+    assert not any(l.startswith("budget:auto-merge") for l in store.labels)  # no attempt spent
+
+    async def _clean(pr_url, *, cwd="."):
+        return _view(reviews=[], checks=[])
+
+    monkeypatch.setattr(worktree, "pr_review_state", _clean)
+
+    async def _noop(*a, **k):
+        return True
+
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _noop)
+    monkeypatch.setattr(worktree, "delete_remote_branch", _noop)
+    assert await loop._maybe_auto_merge(store, "bd-1", PR, "/repo") is True and merges

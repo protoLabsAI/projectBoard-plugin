@@ -9,7 +9,8 @@ arrives three ways at once, all pinned to the PR head it reviewed:
   ``<!-- protoagent-qa-review head=<sha> verdict=FAIL promoted=false diff=… -->`` — and
   the findings as a fenced ``json`` array (file, line, severity, claim, evidence, verdict);
 * a ``QA panel`` CHECK RUN from the App, concluding ``failure``;
-* a ``Review at head`` commit STATUS, ``failure``.
+* a ``Review at head`` commit STATUS, ``failure`` — NOT read by default: it is also red on
+  every head the panel has not reviewed yet, so it cannot tell "rejected" from "not yet".
 
 The board used to read none of this. On 2026-09-27 its own gate said clean at the head the
 panel failed (bd-524n, protoAgent#3698), so the card sat ``in_review`` for seven hours while
@@ -35,7 +36,11 @@ from dataclasses import dataclass, field
 DEFAULT_REVIEWERS: tuple[str, ...] = ("protoreview[bot]",)
 DEFAULT_MARKER = "protoagent-qa-review"
 DEFAULT_CHECK_RUNS: tuple[str, ...] = ("QA panel",)
-DEFAULT_STATUSES: tuple[str, ...] = ("Review at head",)
+# No status by default. protoAgent's `Review at head` status (scripts/review_at_head.py) is
+# `failure` whenever the head has no verdict YET ("no QA panel verdict for <sha> — this head
+# is unreviewed") and flips green minutes later, so reading it as a FAIL held every fresh
+# head (#477 review). A status is only worth listing if its red means "the panel rejected it".
+DEFAULT_STATUSES: tuple[str, ...] = ()
 
 # A finding blocks the merge when it is serious AND the panel stood behind it — the same
 # bar the in-process gate applies (blocker/major, not refuted), made explicit for the
@@ -47,6 +52,8 @@ CONFIRMED_VERDICTS = frozenset({"confirmed", "verified"})
 # running, or one that was skipped, says nothing.
 _FAILED_CHECK = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED"})
 _FAILED_STATUS = frozenset({"FAILURE", "ERROR"})
+# The marker verdicts that reject a head — protoAgent's `review_at_head.BLOCKING_VERDICTS`.
+BLOCKING_VERDICTS = frozenset({"FAIL", "BLOCK", "REJECT"})
 
 # How much of a review body a bounce carries when no finding parses out of it.
 _BODY_EXCERPT_CHARS = 4000
@@ -137,8 +144,10 @@ class Verdict:
     head: str
     # The panel failed this head, by any signal.
     failed: bool = False
-    # FAIL / PASS from the latest marked review AT THIS HEAD; "" when there is none.
+    # The verdict of the latest marked review AT THIS HEAD (FAIL, PASS, WARN, …); "" when none.
     review_verdict: str = ""
+    # When that review was submitted (ISO-8601, as GitHub gives it); "" when unknown.
+    review_at: str = ""
     # That review's author and body (the findings source); "" when there is none.
     reviewer: str = ""
     body: str = ""
@@ -148,25 +157,33 @@ class Verdict:
     @property
     def has_findings_review(self) -> bool:
         """A FAIL review at this head exists — something a fix round can act on."""
-        return self.review_verdict == "FAIL" and bool(self.body)
+        return self.review_verdict in BLOCKING_VERDICTS and bool(self.body)
+
+
+def _author(r: dict) -> str:
+    return str(((r.get("author") or {}).get("login")) or (r.get("user") or {}).get("login") or "")
 
 
 def evaluate(view: dict, cfg: Config) -> Verdict | None:
-    """Judge one ``gh pr view --json headRefOid,reviews,statusCheckRollup`` payload.
+    """Judge one ``gh pr view --json state,headRefOid,reviews,statusCheckRollup`` payload.
 
     Returns ``None`` when the payload names no head (nothing can be pinned). Otherwise a
     :class:`Verdict` whose ``failed`` is true when, AT THE PR'S CURRENT HEAD:
 
-    * the latest review by a configured reviewer whose marker names this head says
-      ``verdict=FAIL``; or
-    * a configured check run concluded failed, or a configured status is failure/error —
-      unless that latest marked review at this head says PASS (the panel re-reviewed and
-      cleared it; a lingering red is not the verdict).
+    * the latest non-dismissed review by a configured reviewer whose marker names this head
+      carries a blocking verdict (``FAIL`` / ``BLOCK`` / ``REJECT``); or
+    * a configured check run concluded failed (or a configured status is failure/error),
+      unless the latest marked review at this head is non-blocking AND was submitted after
+      that check completed — the panel re-reviewed and cleared it. A red that landed AFTER
+      the clearing review counts; with no timestamp to order them by, the review wins.
 
-    A review whose marker names another head is ignored: it judged code that is gone. The
-    rollup is the head commit's by construction, so its signals need no such filter. A
-    check run is matched by name only as a CHECK RUN, and a status only as a STATUS, so the
-    board's own ``QA panel`` commit status can never read as the panel's check run."""
+    Ignored: a review whose marker names another head (it judged code that is gone), one by
+    anyone but a configured reviewer, and a DISMISSED review — an operator's dismissal is
+    the override. A check run is matched only as a CHECK RUN published by an App (an empty
+    ``workflowName`` that is present: GitHub Actions runs always carry theirs, and the rollup
+    names no app, so ``check_runs`` should name a check only the panel's App publishes),
+    and a status only as a STATUS, so neither the board's own ``QA panel`` commit status nor
+    an Actions job that happens to be called ``QA panel`` can read as the panel's verdict."""
     head = str((view or {}).get("headRefOid") or "").strip()
     if not head:
         return None
@@ -176,32 +193,44 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
     # reordered payload can't promote an older verdict over a newer one.
     reviews.sort(key=lambda r: str(r.get("submittedAt") or ""))
     for r in reviews:
-        author = str(((r.get("author") or {}).get("login")) or (r.get("user") or {}).get("login") or "")
-        if not cfg.is_reviewer(author):
+        if str(r.get("state") or "").upper() == "DISMISSED" or not cfg.is_reviewer(_author(r)):
             continue
         attrs = parse_marker(str(r.get("body") or ""), cfg.marker)
         if not attrs or not head_matches(attrs.get("head", ""), head):
             continue
         verdict.review_verdict = str(attrs.get("verdict") or "").strip().upper()
-        verdict.reviewer = author
+        verdict.review_at = str(r.get("submittedAt") or "")
+        verdict.reviewer = _author(r)
         verdict.body = str(r.get("body") or "")
-    if verdict.review_verdict == "FAIL":
-        verdict.signals.append(f"review by {verdict.reviewer}: verdict=FAIL at {head[:12]}")
-    red: list[str] = []
+    blocking_review = verdict.review_verdict in BLOCKING_VERDICTS
+    if blocking_review:
+        verdict.signals.append(f"review by {verdict.reviewer}: verdict={verdict.review_verdict} at {head[:12]}")
+    cleared_at = verdict.review_at if verdict.review_verdict and not blocking_review else ""
     for c in view.get("statusCheckRollup") or []:
         if not isinstance(c, dict):
             continue
         kind = str(c.get("__typename") or "")
         if kind == "CheckRun" and str(c.get("name") or "") in cfg.check_runs:
-            state = str(c.get("conclusion") or "").upper()
-            if state in _FAILED_CHECK:
-                red.append(f"check run `{c.get('name')}` {state}")
+            if "workflowName" not in c or str(c.get("workflowName") or "").strip():
+                # A GitHub Actions job of that name (it names its workflow), or an entry we
+                # cannot tell apart from one (an older `gh` omits the key): not the App's check.
+                continue
+            state, at, label = str(c.get("conclusion") or "").upper(), str(c.get("completedAt") or ""), "check run"
+            name = c.get("name")
+            if state not in _FAILED_CHECK:
+                continue
         elif kind == "StatusContext" and str(c.get("context") or "") in cfg.statuses:
-            state = str(c.get("state") or "").upper()
-            if state in _FAILED_STATUS:
-                red.append(f"status `{c.get('context')}` {state}")
-    if red and verdict.review_verdict != "PASS":
-        verdict.signals.extend(red)
+            state, at, label = str(c.get("state") or "").upper(), str(c.get("startedAt") or ""), "status"
+            name = c.get("context")
+            if state not in _FAILED_STATUS:
+                continue
+        else:
+            continue
+        # A clearing review submitted after this red outranks it; one it can't be ordered
+        # against (no timestamp on either side) still does, as before.
+        if cleared_at and (not at or cleared_at > at):
+            continue
+        verdict.signals.append(f"{label} `{name}` {state}")
     verdict.failed = bool(verdict.signals)
     return verdict
 
@@ -242,7 +271,8 @@ def render_findings(verdict: Verdict, pr_url: str = "") -> str:
     but its findings are all minor, unconfirmed or unreadable), the review's own text is
     quoted instead, so the coder still sees what the panel objected to."""
     where = f" on {pr_url}" if pr_url else ""
-    head = f"External review FAILED — {verdict.reviewer or 'the QA panel'} at head {verdict.head[:12]}{where}."
+    said = f" ({verdict.review_verdict})" if verdict.review_verdict else ""
+    head = f"External review FAILED{said} — {verdict.reviewer or 'the QA panel'} at head {verdict.head[:12]}{where}."
     findings = parse_findings(verdict.body)
     must = blocking(findings or [])
     lines = [head, ""]

@@ -232,6 +232,7 @@ async def test_pr_review_state_reads_head_reviews_and_rollup_in_one_call(gh_fixt
     view = await worktree.pr_review_state(gh_fixture.url, cwd=gh_fixture.repo_dir)
     assert isinstance(view, dict), "gh pr view --json headRefOid,reviews,statusCheckRollup must parse"
     assert view["headRefOid"] == gh_fixture.head_sha
+    assert view["state"] == "OPEN"  # the reconcile's state edge rides this same read
     assert isinstance(view.get("reviews"), list)
     assert isinstance(view.get("statusCheckRollup"), list)
     for r in view["reviews"]:

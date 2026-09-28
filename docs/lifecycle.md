@@ -196,19 +196,27 @@ own gate said clean at the head the panel failed, so the card sat `in_review` fo
 hours. Every time main moved it re-ran the ~12-minute merged-state gate, until
 `merged-verify budget (5) spent`.
 
-The reconcile now asks first, before any other edge of an `OPEN` PR. One read
-(`gh pr view --json headRefOid,reviews,statusCheckRollup`) gives the head, the reviews and
-the head commit's checks. The panel has **failed this head** when:
+The reconcile now asks first, before any other edge of an `OPEN` PR. One read per card per
+poll (`gh pr view --json state,headRefOid,reviews,statusCheckRollup`) gives the PR's state,
+the head, the reviews and the head commit's checks. The panel has **failed this head** when:
 
-- the latest review by a configured reviewer whose marker names the current head says
-  `verdict=FAIL`, or
-- a configured check run concluded failed, or a configured status is `failure`/`error`,
-  unless that latest marked review at the head says `PASS`.
+- the latest non-dismissed review by a configured reviewer whose marker names the current
+  head carries a blocking verdict (`FAIL`, `BLOCK` or `REJECT`), or
+- the panel App's `QA panel` check run concluded failed at the head, unless a non-blocking
+  marked review at that head was submitted after it completed.
 
-A marker naming another head is ignored, because it judged code that is gone. A marker from
-anyone but a configured reviewer is ignored as well. The board's OWN verdict is a `QA panel`
-commit *status* (#354), so the panel's check is matched only as a *check run*, and the board
-can never read its own clean verdict back as the panel's.
+Several things are ignored:
+- a marker naming another head, because it judged code that is gone;
+- a marker from anyone but a configured reviewer;
+- a dismissed review, because the dismissal is the operator's override;
+- a check run carrying a `workflowName`, which is an Actions job that happens to share the name.
+
+The board's OWN verdict is a `QA panel` commit *status* (#354), so the panel's check is
+matched only as a *check run*, and the board can never read its own clean verdict back as the
+panel's. `Review at head` is **not** read by default. protoAgent posts it `failure` on every
+head the panel has not reviewed *yet*, so it can't tell "rejected" from "not yet". Reading
+it held every fresh push. The merge edge re-asks the same question right before it merges,
+pinned to the head it is about to merge.
 
 While the panel has failed the head, the pass does nothing else for the card: **no rebase, no
 merged-state gate, no merged-verify budget spent, no CI bounce, no merge.** What it does:
@@ -238,8 +246,9 @@ pass read it (claimed, blocked, attached elsewhere) is left alone.
 fourteen minutes and committed nothing. The branch was still at the failed head, yet the
 drive logged `coder done → PR`. The gate re-reviewed that same head clean and the
 merged-state gate re-ran, while the panel's FAIL stood. Now, before a card that already owns
-a PR publishes, the drive compares its tree with `origin/<branch>`, the head the round
-resumed from, and logs `head <before> → <after>`. If HEAD has not moved and nothing is left
+a PR publishes, the drive compares its tree with the commit the round resumed from. That
+commit is recorded when the round starts, not re-read from `origin/<branch>`, which a coder
+that pushed its own fix would have moved. The drive logs `head <before> → <after>`. If HEAD has not moved and nothing is left
 uncommitted (bar the coder's scratch), the round is a `NoChangesError`: a failed attempt
 with the reason `fix round produced no commit — <branch> is still at <sha>`. It is retried,
 escalated or blocked like any empty build. Nothing is pushed or re-reviewed, and the

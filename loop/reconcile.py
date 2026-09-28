@@ -1164,7 +1164,11 @@ class ReconcileMixin:
             # #90: reconcile each PR against ITS project's checkout, not the board default.
             repo = self._repo_for(f)
             try:
-                state = known_state or await worktree.pr_state(pr_url, cwd=repo)
+                # ONE read for the PR's state AND the external panel's verdict (#473): the
+                # state rides the same `gh pr view` as the head, reviews and checks. Unreadable
+                # → the plain state read, and no external verdict this pass (fail open).
+                view = None if known_state else await worktree.pr_review_state(pr_url, cwd=repo)
+                state = known_state or str((view or {}).get("state") or "") or await worktree.pr_state(pr_url, cwd=repo)
                 if f.get("board_state") == "blocked" and state != "MERGED":
                     continue
                 if state == "MERGED":
@@ -1203,7 +1207,7 @@ class ReconcileMixin:
                     # said. Bounce it into a fix round (or hold it for a human), and skip every
                     # edge below: re-verifying the merged state, rebasing, bouncing on CI or
                     # merging a PR the panel has rejected spends budget on nothing.
-                    if await self._reconcile_external_review(store, f, pr_url, repo):
+                    if await self._reconcile_external_review(store, f, pr_url, repo, view=view):
                         continue
                     # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
                     # sibling merge re-stales the others off the shared base, and a rebase
@@ -1475,6 +1479,31 @@ class ReconcileMixin:
         ):
             log.info("[project_board] %s not merging: the card moved during the merge checks", fid)
             return False
+        # Defence in depth (#473): the pass's external-review step ran minutes ago, and the
+        # panel may have FAILED this head since. Ask again, pinned to the head about to
+        # merge, and hold (no merge attempt spent) on a FAIL there. Unreadable → merge as
+        # before: GitHub's own required-review rules still stand behind it.
+        ext_cfg = self._external_review_cfg_for(feature)
+        if ext_cfg is not None:
+            view = await worktree.pr_review_state(pr_url, cwd=repo)
+            ext = external_review.evaluate(view, ext_cfg) if view else None
+            if ext is not None and ext.failed and (not merge_head or ext.head == merge_head):
+                log.info(
+                    "[project_board] %s not merging: the external review FAILED head %s (%s): %s",
+                    fid,
+                    ext.head[:12],
+                    external_review.fail_summary(ext),
+                    pr_url,
+                )
+                return False
+            if ext is not None and merge_head and ext.head != merge_head:
+                log.info(
+                    "[project_board] %s not merging: the head moved to %s under the merge: %s",
+                    fid,
+                    ext.head[:12],
+                    pr_url,
+                )
+                return False
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo, expected_head=merge_head)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
@@ -2142,7 +2171,9 @@ class ReconcileMixin:
             log.warning("[project_board] %s external-review hold comment failed", fid, exc_info=True)
         self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"external-review|{head}")
 
-    async def _reconcile_external_review(self, store, feature: dict, pr_url: str, repo: str) -> bool:
+    async def _reconcile_external_review(
+        self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
+    ) -> bool:
         """Act on an EXTERNAL QA panel's FAIL at the PR's CURRENT head (#473). Returns True
         when the panel has failed this head, whatever was done about it, so the caller
         skips the rest of the pass: no rebase, no merged-state gate (and no merged-verify
@@ -2153,9 +2184,11 @@ class ReconcileMixin:
 
         * the latest review by a configured reviewer (``protoreview[bot]``) whose hidden
           marker (``<!-- protoagent-qa-review head=<sha> verdict=FAIL … -->``) names the
-          current head; or
-        * the configured check run (``QA panel``) or status (``Review at head``) failing
-          at the head, unless the latest marked review at the head says PASS.
+          current head with a blocking verdict (FAIL / BLOCK / REJECT), not dismissed; or
+        * the configured check run (``QA panel``, an App check) failing at the head, unless
+          a non-blocking marked review at the head was submitted after it (a configured
+          status likewise; none by default — ``Review at head`` is also red on every head
+          the panel has not reviewed YET, #477 review).
 
         Then, in order:
 
@@ -2182,7 +2215,8 @@ class ReconcileMixin:
         cfg = self._external_review_cfg_for(feature)
         if cfg is None:
             return False
-        view = await worktree.pr_review_state(pr_url, cwd=repo)
+        if view is None:  # not handed the pass's read (a queued card, a direct call): read it
+            view = await worktree.pr_review_state(pr_url, cwd=repo)
         verdict = external_review.evaluate(view, cfg) if view else None
         if verdict is None or not verdict.failed:
             getattr(self, "_ext_review_held", {}).pop(fid, None)

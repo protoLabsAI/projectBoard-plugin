@@ -11475,3 +11475,26 @@ async def test_a_first_build_is_never_asked_whether_its_head_moved(monkeypatch):
     monkeypatch.setattr(worktree, "fix_round_unchanged", _probe)
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr)  # FEATURE has no pr_url
     assert asked == [] and ("open_review", "bd-1", "https://example/pr/1") in store.calls
+
+
+async def test_the_fix_round_is_judged_against_the_head_it_started_on(monkeypatch):
+    """#477 review: the comparison is against the commit the resumed round STARTED on (read
+    right after create_worktree(resume=True)), never the live remote ref a coder's own push
+    would move."""
+    seen = []
+
+    async def _open_pr(*a, **k):
+        return "https://github.com/o/r/pull/9"
+
+    async def _start(path):
+        return "s" * 40
+
+    async def _judge(wt, start):
+        seen.append((wt, start))
+        return ""
+
+    monkeypatch.setattr(worktree, "checkout_head_sha", _start)
+    monkeypatch.setattr(worktree, "fix_round_unchanged", _judge)
+    feature = {**FEATURE, "pr_url": "https://github.com/o/r/pull/9"}
+    await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert seen == [("/wt/feat-bd-1", "s" * 40)]

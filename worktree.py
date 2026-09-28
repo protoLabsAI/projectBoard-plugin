@@ -408,29 +408,34 @@ async def _unique_commits(where: str, branch: str = "", base: str = "", *, head:
     return len(unique)
 
 
-async def fix_round_unchanged(path: str, branch: str) -> str:
+async def fix_round_unchanged(path: str, start_sha: str) -> str:
     """The head a FIX ROUND ended on when it changed nothing (#476), else ``""``.
 
-    A fix round resumes the PR's branch from ``origin/<branch>`` (``create_worktree(resume=
-    True)`` fetches it). It changed nothing when the tree's HEAD is still that commit AND
-    nothing is left uncommitted (bar the board's own droppings — ``_tree_status``). Handing
-    such a round to ``open_pr`` pushes nothing, and the review gate then re-reviews and the
-    reconcile re-gates the very head the bounce was about, as if it were new work (bd-524n).
+    ``start_sha`` is the commit the round STARTED on: the drive reads it right after
+    ``create_worktree(resume=True)`` checked the tree out from ``origin/<branch>``. It is
+    recorded then, not re-read from the live remote-tracking ref now, because a coder that
+    pushed its fix itself moves ``origin/<branch>`` to its own HEAD, and comparing against
+    the live ref would call a real fix "no commit" (#477 review).
 
-    Any doubt answers ``""`` (no judgement, today's path): the tree or the remote ref can't
-    be read, or the tree holds uncommitted work. Logs the head it compared, before → after."""
+    The round changed nothing when HEAD is still ``start_sha`` AND nothing is left
+    uncommitted (bar the board's own droppings — ``_tree_status``). Handing such a round to
+    ``open_pr`` pushes nothing, and the review gate then re-reviews and the reconcile
+    re-gates the very head the bounce was about, as if it were new work (bd-524n).
+
+    Any doubt answers ``""`` (no judgement, today's path): no start sha, an unreadable tree,
+    or uncommitted work. Logs the head before → after."""
+    start_sha = str(start_sha or "").strip()
+    if not start_sha:
+        return ""
     try:
-        rc_b, before, _e = await _git(
-            path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}^{{commit}}"
-        )
-        rc_a, after, _e = await _git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        rc, after, _e = await _git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     except (WorktreeError, OSError):  # a timeout, or a tree that is not there
         return ""
-    before, after = before.strip(), after.strip()
-    if rc_b != 0 or rc_a != 0 or not before or not after:
+    after = after.strip()
+    if rc != 0 or not after:
         return ""
-    log.info("[project_board] fix round on %s: head %s → %s", branch, before[:12], after[:12])
-    if before != after:
+    log.info("[project_board] fix round in %s: head %s → %s", path, start_sha[:12], after[:12])
+    if after != start_sha:
         return ""
     changes, _nested, unreadable = await _tree_status(path)
     if changes or unreadable:
@@ -2435,16 +2440,17 @@ async def read_review_status(
 
 
 async def pr_review_state(pr_url: str, *, cwd: str = ".") -> dict | None:
-    """The PR's head, reviews and head-commit check rollup in ONE read (#473) —
-    ``gh pr view --json headRefOid,reviews,statusCheckRollup`` — for the external QA
-    panel's verdict (``external_review.evaluate`` judges it). One call, so the head the
-    reviews and checks are judged against is the head they were read with.
+    """The PR's state, head, reviews and head-commit check rollup in ONE read (#473) —
+    ``gh pr view --json state,headRefOid,reviews,statusCheckRollup`` — for the PR
+    reconcile's state edge and the external QA panel's verdict (``external_review.evaluate``
+    judges it). One call per card per poll, and the head the reviews and checks are judged
+    against is the head they were read with.
 
     Returns the parsed object, or ``None`` when ``gh`` fails, times out or answers with
     something that is not a JSON object carrying a head. Never raises into the loop: an
     unreadable review state is simply not a FAIL, and the reconcile carries on as before."""
     try:
-        rc, out, _err = await _gh("pr", "view", pr_url, "--json", "headRefOid,reviews,statusCheckRollup", cwd=cwd)
+        rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state,headRefOid,reviews,statusCheckRollup", cwd=cwd)
     except (WorktreeError, OSError):  # a timeout, no `gh`, a cwd that is gone
         return None
     if rc != 0 or not out.strip():

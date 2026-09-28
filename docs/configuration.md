@@ -360,14 +360,17 @@ value wins:
 external_review:
   reviewers: ["protoreview[bot]"]   # whose reviews count; `[bot]` optional (GraphQL drops it)
   marker: protoagent-qa-review      # <!-- <marker> head=<sha> verdict=FAIL|PASS … --> in the review body
-  check_runs: ["QA panel"]          # CHECK RUNS whose failure at the head is a FAIL ([] = ignore)
-  statuses: ["Review at head"]      # commit STATUSES whose failure at the head is a FAIL ([] = ignore)
+  check_runs: ["QA panel"]          # App CHECK RUNS whose failure at the head is a FAIL ([] = ignore)
+  statuses: []                      # commit STATUSES whose failure at the head is a FAIL (none by default)
   # enabled: false                  # same as `external_review: false`
 ```
 
-`check_runs` matches check runs only and `statuses` matches statuses only. Don't list
-`QA panel` under `statuses`: that is the board's own gate verdict (#354), so the board would
-be reading itself. The external fix rounds share `review_fix_max`, but they have their own
+`check_runs` matches check runs published by an App (the rollup names no app, so a check
+run carrying a `workflowName` is an Actions job and is skipped). `statuses` matches statuses
+only. Don't list `QA panel` under `statuses`: that is the board's own gate verdict (#354),
+so the board would be reading itself. Don't list protoAgent's `Review at head` either: it is
+`failure` on every head the panel has not reviewed *yet*, so every fresh push would be held.
+Blocking marker verdicts are `FAIL`, `BLOCK` and `REJECT`, and a dismissed review never counts. The external fix rounds share `review_fix_max`, but they have their own
 count (`budget:ext-review-fix`), which the gate's clean verdicts don't reset. The check costs
 one `gh pr view` per in-review card per merge poll.
 
