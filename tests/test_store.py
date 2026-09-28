@@ -3196,6 +3196,50 @@ def test_update_feature_none_clears_the_source_line_and_keeps_files(make_board, 
     assert call == ("update", "bd-1", "--notes=a.py")
 
 
+def _ledger_board(make_board, monkeypatch, *, statuses=("open", "open")):
+    br = Br()
+    b = make_board(br)
+    reqs = [
+        {"id": f"r{i + 1}", "text": t, "status": st}
+        for i, (t, st) in enumerate(zip(["old one", "PR body carries Fixes #9"], statuses))
+    ]
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {
+            "id": fid,
+            "files_to_modify": ["a.py"],
+            "acceptance_criteria": "- old one\n- PR body carries Fixes #9",
+            "requirements": reqs,
+            "labels": [],
+        },
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    return br, b
+
+
+def test_an_ac_edit_re_decomposes_an_untouched_ledger(make_board, monkeypatch):
+    """bd-83sh: the closing edge moved to another card and the AC lost "Fixes #N", but the
+    ledger kept it, so the coder was still told to close the issue."""
+    br, b = _ledger_board(make_board, monkeypatch)
+    b.update_feature("bd-1", acceptance_criteria="- new one\n- Refs #9, never Fixes")
+    notes = next(a for a in br.cmds("update")[0] if str(a).startswith("--notes="))
+    assert '"text": "new one"' in notes and '"text": "Refs #9, never Fixes"' in notes
+    assert "PR body carries Fixes #9" not in notes and "a.py" in notes
+
+
+def test_an_ac_edit_keeps_a_ledger_with_recorded_progress(make_board, monkeypatch):
+    br, b = _ledger_board(make_board, monkeypatch, statuses=("done", "open"))
+    b.update_feature("bd-1", acceptance_criteria="- new one")
+    assert not any(str(a).startswith("--notes=") for a in br.cmds("update")[0])  # dispositions are not ours to wipe
+
+
+def test_the_same_ac_text_leaves_the_ledger_alone(make_board, monkeypatch):
+    br, b = _ledger_board(make_board, monkeypatch)
+    b.update_feature("bd-1", acceptance_criteria="- old one\n- PR body carries Fixes #9")
+    assert not any(str(a).startswith("--notes=") for a in br.cmds("update")[0])
+
+
 def test_update_feature_files_update_preserves_the_source_line(make_board, monkeypatch):
     """The mirror image: a files-only update must never drop the stored source."""
     br = Br()

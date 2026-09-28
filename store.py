@@ -2222,12 +2222,24 @@ class BeadsBoard:
             args += [f"--design={design}"]
         if priority is not None:
             args += ["-p", str(validate_priority(priority))]
+        # The requirement ledger (#113) is decomposed from the ACs once, at mark_ready. An AC
+        # edit used to leave the OLD items in place, so the coder was steered by criteria the
+        # PM had removed (bd-83sh kept "PR body carries Fixes #3760" after the closing edge
+        # moved to another card). Re-decompose when the ACs change and nothing has been
+        # disposed yet; a ledger with recorded done/declined items is left alone — that
+        # progress is not ours to wipe.
+        new_ledger = None
+        if acceptance_criteria is not None and f.get("requirements"):
+            old_items = f.get("requirements") or []
+            untouched = all(str(i.get("status", "open")).strip().lower() == "open" for i in old_items)
+            if untouched and str(acceptance_criteria).strip() != str(f.get("acceptance_criteria") or "").strip():
+                new_ledger = _decompose_ac(acceptance_criteria)
         # "none" / "clear" / "-" CLEARS the source issue (the `waits_for` convention): a
         # split whose closing edge moves to a later slice must be able to drop it here, or
         # two slices would both say "Fixes #N" and the first merge closes the issue early.
         clear_source = isinstance(source_issue, str) and source_issue.strip().lower() in ("none", "clear", "-")
         set_source = (source_issue is not None and str(source_issue).strip()) or clear_source
-        if files_to_modify is not None or set_source or new_waits is not None:
+        if files_to_modify is not None or set_source or new_waits is not None or new_ledger is not None:
             # files_to_modify + source_issue + the requirement ledger SHARE the bead
             # `notes` field (labels can't carry the source's `/`/`#`, #101; the
             # ledger rides the same structured lines, #113), and `br update --notes`
@@ -2247,7 +2259,8 @@ class BeadsBoard:
             else:
                 src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
             waits = new_waits if new_waits is not None else list(f.get("waits_for") or [])
-            args += [f"--notes={_render_notes(files, src, f.get('requirements') or [], waits)}"]
+            ledger = new_ledger if new_ledger is not None else (f.get("requirements") or [])
+            args += [f"--notes={_render_notes(files, src, ledger, waits)}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
