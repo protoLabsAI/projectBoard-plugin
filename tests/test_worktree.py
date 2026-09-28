@@ -259,26 +259,32 @@ async def test_commit_worktree_stages_and_commits_a_dirty_tree(monkeypatch):
 # ── stage_all: keep the coder's own scratch out of the PR (#49) ──────────────────
 
 
-async def test_stage_all_excludes_coder_scratch(monkeypatch):
+async def test_stage_all_never_names_scratch_and_resets_it_out(monkeypatch, tmp_path):
+    """The coder's `.proto/` notes and `.cursor` cache stay out of the commit — but NEVER by
+    naming them in the pathspec. git refuses a pathspec that matches ignored files, and a
+    repo may ignore only part of a scratch dir (protoAgent ignores `.proto/memory/`), which
+    is what made `add` exit 1 and failed every stranded-work save (bd-fgtf)."""
+    (tmp_path / ".proto").mkdir()
     git = FakeGit()
     monkeypatch.setattr(worktree, "_git", git)
-    await worktree.stage_all("/wt")
+    await worktree.stage_all(str(tmp_path))
     (add,) = git.ran("add")
-    # `add -A` over a positive `.` with an exclude pathspec per scratch path — so the
-    # coder's `.proto/` session notes + `.cursor` cache never get staged into the commit.
     assert add[:4] == ("add", "-A", "--", ".")
-    excludes = set(add[4:])
-    assert excludes == {f":(exclude){p}" for p in worktree.CODER_SCRATCH}
-    assert ":(exclude).proto" in excludes
+    assert not [a for a in add[4:] if ".proto" in a or ".cursor" in a], f"scratch named in the pathspec: {add}"
+    (reset,) = git.ran("reset")
+    assert reset[:3] == ("reset", "-q", "--") and ".proto" in reset[3:]
 
 
-async def test_commit_worktree_stages_without_the_scratch(monkeypatch):
-    """The commit path stages via stage_all, so the dirty-tree commit excludes scratch."""
+async def test_commit_worktree_stages_without_the_scratch(monkeypatch, tmp_path):
+    """The commit path stages via stage_all, so the dirty-tree commit keeps scratch out —
+    through the index, not through a pathspec that names it."""
+    (tmp_path / ".proto").mkdir()
     git = FakeGit({"status": (0, " M f.py\n?? .proto/", "")})
     _install(monkeypatch, git, FakeGh())
-    await worktree.commit_worktree("/wt", "msg")
+    await worktree.commit_worktree(str(tmp_path), "msg")
     (add,) = git.ran("add")
-    assert ":(exclude).proto" in add and git.ran("commit")
+    assert not [a for a in add if ".proto" in a], f"scratch named in the pathspec: {add}"
+    assert git.ran("reset") and git.ran("commit")
 
 
 # ── #227: human-readable branch names — feat/<fid>-<slug> ────────────────────────

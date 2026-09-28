@@ -249,11 +249,13 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
 
     The single staging seam — shared by the commit path, the verify/judge diff probes and
     stranded-work preservation — so all of them see the same intended-only file set.
-    Excludes via a pathspec (``:(exclude)…``) rather than ``.git/info/exclude``, so it
-    mutates nothing in the repo and depends on no target-repo ``.gitignore`` entry: the
-    exclusion is scoped to this one staging call. The leading ``.`` is the positive
-    pathspec the excludes subtract from. Scratch the repo already ignores gets no exclude
-    (``add -A`` skips it anyway, and naming an ignored path makes ``add`` exit 1).
+    Scratch is never NAMED in the pathspec: git refuses a pathspec that matches ignored
+    files ("The following paths are ignored…", exit 1), and a repo can ignore PART of a
+    scratch dir — protoAgent ignores `.proto/memory/` while tracking `.proto/skills` — which
+    no ``check-ignore`` probe of the top path can see. So everything is staged and scratch is
+    taken back out of the index afterwards: ``add -A`` already leaves ignored scratch alone,
+    and the reset covers scratch the repo does not ignore. It mutates nothing in the repo
+    and depends on no target-repo ``.gitignore`` entry.
 
     The links need their own lookup. A ``node_modules/`` ignore pattern — the trailing-
     slash spelling most Node repos use — matches only a real directory, so the board's
@@ -265,22 +267,26 @@ async def stage_all(worktree: str, *, index_file: str = "") -> tuple[int, str, s
     preservation's private index, which must never touch the tree's."""
     env = {"GIT_INDEX_FILE": index_file} if index_file else None
     kw = {"env": env} if env else {}
-    # Only scratch the repo does NOT already ignore needs an exclude: `add -A` skips ignored
-    # paths on its own, and an exclude that NAMES an ignored path makes git print "The
-    # following paths are ignored" and exit 1 — after staging everything else. In a repo
-    # that ignores `.proto` (protoAgent does) that failed every stranded-work save, so the
-    # board kept a finished tree it could have cleared (bd-9wh1).
-    # Plain (not `-z`) output: `-z` is only valid with `--stdin`, and the scratch names are
-    # fixed, unquoted ASCII. Exit 1 = none ignored; anything else keeps every exclude.
-    rc, out, _err = await _git(worktree, "check-ignore", "--", *CODER_SCRATCH, **kw)
-    ignored = {line.strip() for line in out.splitlines()} if rc == 0 else set()
-    excludes = [f":(exclude){p}" for p in CODER_SCRATCH if p not in ignored]
+    # The board's node_modules links are untracked and un-ignored, so naming THOSE is safe.
+    excludes: list[str] = []
     rc, out, _err = await _git(
         worktree, "ls-files", "-z", "--others", "--exclude-standard", "--", ":(glob)**/node_modules", **kw
     )
     if rc == 0:
-        excludes += [f":(exclude,literal){p}" for p in out.split("\0") if p and _is_board_link(worktree, p)]
-    return await _git(worktree, "add", "-A", "--", ".", *excludes, **kw)
+        excludes = [f":(exclude,literal){p}" for p in out.split("\0") if p and _is_board_link(worktree, p)]
+    rc, out, err = await _git(worktree, "add", "-A", "--", ".", *excludes, **kw)
+    if rc != 0:
+        return rc, out, err
+    # Scratch out of the INDEX, never out of the pathspec (see the docstring): an exclude
+    # naming `.proto` is what made `add` exit 1 in a repo that ignores only part of it, and
+    # that exit failed every stranded-work save there — the board then kept trees, and their
+    # branches, that it could have cleared, until `worktree add` itself failed (bd-fgtf).
+    present = [p for p in CODER_SCRATCH if os.path.exists(os.path.join(worktree, p))]
+    if present:
+        # Best-effort: the add is the result that matters. A path with nothing in HEAD or
+        # the index has nothing staged to undo, whatever reset makes of it.
+        await _git(worktree, "reset", "-q", "--", *present, **kw)
+    return rc, out, err
 
 
 def _is_board_link(tree: str, entry: str) -> bool:

@@ -170,6 +170,49 @@ async def test_stage_all_succeeds_in_a_repo_that_already_ignores_coder_scratch(o
     assert ".proto" not in staged and ".cursor" not in staged
 
 
+async def test_stage_all_succeeds_when_scratch_is_excluded_and_partly_tracked(origin):
+    """bd-fgtf, reproduced as the live board hits it. protoAgent ignores `.proto/` through
+    `.git/info/exclude` (the COMMON dir, so every worktree inherits it) while TRACKING
+    `.proto/skills`. `git check-ignore -- .proto` skips tracked paths, so it reports nothing
+    and the old code kept its `:(exclude).proto` pathspec — which matched only ignored files,
+    so `git add` printed "The following paths are ignored" and exited 1. That failed every
+    stranded-work save: the board kept trees AND their branches until `worktree add` itself
+    failed with "a branch named 'feat/bd-fgtf.g1' already exists"."""
+    wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-excluded")
+    exclude = Path(origin.clone, ".git", "info", "exclude")
+    exclude.write_text(exclude.read_text() + "\n.proto/\n")  # the common-dir rule, as protoAgent has
+    Path(wt, ".proto", "skills").mkdir(parents=True)
+    Path(wt, ".proto", "skills", "x.md").write_text("tracked skill\n")
+    _git_run("-C", wt, "add", "-f", ".proto/skills/x.md")
+    _git_run("-C", wt, "commit", "-m", "track a skill under the scratch dir")
+    Path(wt, ".proto", "session-notes.md").write_text("scratch\n")  # untracked + excluded
+    Path(wt, "real.txt").write_text("real\n")
+
+    rc, _out, err = await worktree.stage_all(wt)
+
+    assert rc == 0, f"staging failed where the scratch dir is excluded but partly tracked: {err}"
+    staged = _git_run("-C", wt, "diff", "--cached", "--name-only")
+    assert "real.txt" in staged
+    assert ".proto" not in staged, f"scratch reached the index: {staged}"
+
+
+async def test_stage_all_keeps_unignored_scratch_out_of_the_index(origin):
+    """Scratch the repo does NOT ignore is kept out through the index, not the pathspec."""
+    wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-unignored")
+    Path(wt, ".cursor").mkdir()
+    Path(wt, ".cursor", "cache.bin").write_text("x\n")
+    Path(wt, ".proto").mkdir()
+    Path(wt, ".proto", "session-notes.md").write_text("notes\n")
+    Path(wt, "real.txt").write_text("real\n")
+
+    rc, _out, err = await worktree.stage_all(wt)
+
+    assert rc == 0, err
+    staged = _git_run("-C", wt, "diff", "--cached", "--name-only")
+    assert "real.txt" in staged
+    assert ".cursor" not in staged and ".proto" not in staged, f"scratch reached the index: {staged}"
+
+
 async def test_commit_worktree_commits_intended_files_only(origin):
     wt, _branch = await worktree.create_worktree(origin.clone, origin.base, "bd-commit")
     Path(wt, "real.txt").write_text("real\n")
