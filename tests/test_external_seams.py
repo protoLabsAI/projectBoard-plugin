@@ -110,6 +110,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "commits_ahead": "REAL",
     "create_worktree": "REAL",
     "delete_remote_branch": "REAL",
+    "fix_round_unchanged": "REAL",  # #476: real git (bare origin + clone), tests/test_fix_round_no_change_476.py
     "merge_pr": "REAL",
     "merged_state_worktree": "REAL",
     "open_pr": (
@@ -127,6 +128,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_head_sha": "REAL",
     "pr_identity": "REAL",  # #402: the pinned PR, tests/test_attach_pr_gh_402.py (the real-gh CI job)
     "pr_merge_info": "REAL",
+    "pr_review_state": "REAL",  # #473: the external QA panel's verdict read, tests/test_worktree_gh.py
     "pr_state": "REAL",
     "pr_url_for_branch": "REAL",
     "promote_worktree": "REAL",
@@ -223,6 +225,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_merge": "REAL",
     "record_merged_verified": "REAL",
     "record_pr_url": "REAL",  # #398: through real `br` in tests/test_requeue_under_drive_398.py
+    "record_review_bounce": "REAL",  # #473: the head stamp + comment, real `br` in tests/test_external_review_473.py
     "record_reviewed_head": "UNCOVERED",
     "request_decomposition": "REAL",
     "record_verification": "REAL",
@@ -403,8 +406,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_38_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 38 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_40_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 40 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -415,7 +418,10 @@ def test_worktree_coverage_contract_is_38_real_3_exempt_0_uncovered():
     ``checkout_head_sha`` (#456) and ``changed_paths`` (#459), in
     tests/test_preflight_oracle_456_459.py; the 37th and 38th #452's
     ``origin_github_slug`` and ``refresh_base_checkout``, against real git remotes in
-    tests/test_managed_project_452.py and tests/test_base_refresh_452.py.
+    tests/test_managed_project_452.py and tests/test_base_refresh_452.py; the 39th #473's
+    ``pr_review_state`` (the external QA panel's verdict read), against the pinned PR in
+    tests/test_worktree_gh.py; the 40th #476's ``fix_round_unchanged``, against real git in
+    tests/test_fix_round_no_change_476.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -433,7 +439,7 @@ def test_worktree_coverage_contract_is_38_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 38, f"expected 38 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 40, f"expected 40 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

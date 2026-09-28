@@ -29,7 +29,8 @@ every push, the paths the loop actually opens PRs from.
 
 The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for_branch``,
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
-``read_review_status``, ``_find_marked_comment``, ``post_or_update_pr_comment``, ``merge_pr``.
+``read_review_status``, ``_find_marked_comment``, ``post_or_update_pr_comment``, ``merge_pr`` —
+and, since #473, ``pr_review_state`` (the external QA panel's verdict read).
 Reads use the pinned fixture. The only writes are (1) EXACTLY ONE commit status per run, keyed
 on a STABLE disposable ``(context, sha)`` — GitHub records each POST as a new immutable entry
 (the combined-status rollup, which the review gate reads, reports only the latest per context),
@@ -211,6 +212,46 @@ async def test_pr_ci_status_reports_a_known_rollup(gh_fixture):
     status, summary = await worktree.pr_ci_status(gh_fixture.url, cwd=gh_fixture.repo_dir)
     assert status in {"passing", "failing", "pending", "none"}
     assert isinstance(summary, str)
+
+
+# ── pr_review_state (#473: the external QA panel's verdict read) ─────────────────────────
+
+
+@requires_gh
+async def test_pr_review_state_reads_head_reviews_and_rollup_in_one_call(gh_fixture, monkeypatch):
+    """``pr_review_state`` asks real GitHub for ``headRefOid,reviews,statusCheckRollup`` in one
+    ``gh pr view`` — the payload the external-review reconcile judges (#473). A mock would accept
+    any field name; this proves `gh` accepts these three, that the head is the fixture's live
+    head, and that the shapes ``external_review.evaluate`` walks are what GitHub returns. The
+    fixture has no QA-panel FAIL to find, so the verdict is pinned by CONTRACT (it evaluates,
+    pinned to the live head), not by colour."""
+    from conftest import REAL_SEAMS
+    from project_board import external_review
+
+    monkeypatch.setattr(worktree, "pr_review_state", REAL_SEAMS["worktree.pr_review_state"])
+    view = await worktree.pr_review_state(gh_fixture.url, cwd=gh_fixture.repo_dir)
+    assert isinstance(view, dict), "gh pr view --json headRefOid,reviews,statusCheckRollup must parse"
+    assert view["headRefOid"] == gh_fixture.head_sha
+    assert view["state"] == "OPEN"  # the reconcile's state edge rides this same read
+    assert isinstance(view.get("reviews"), list)
+    assert isinstance(view.get("statusCheckRollup"), list)
+    for r in view["reviews"]:
+        assert isinstance(r.get("author"), dict) and "login" in r["author"], r
+        assert "body" in r and "submittedAt" in r, r
+    for c in view["statusCheckRollup"]:
+        assert c.get("__typename") in {"CheckRun", "StatusContext"}, c
+    verdict = external_review.evaluate(view, external_review.Config())
+    assert verdict is not None and verdict.head == gh_fixture.head_sha
+
+
+@requires_gh
+async def test_pr_review_state_is_none_for_a_pr_that_does_not_exist(gh_fixture, monkeypatch):
+    """An unreadable PR is ``None`` — never a raise, never a verdict (fail open to today's flow)."""
+    from conftest import REAL_SEAMS
+
+    monkeypatch.setattr(worktree, "pr_review_state", REAL_SEAMS["worktree.pr_review_state"])
+    missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
+    assert await worktree.pr_review_state(missing, cwd=gh_fixture.repo_dir) is None
 
 
 # ── post_review_status + read_review_status (the commit-status write + its readback) ────

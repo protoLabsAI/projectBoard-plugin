@@ -114,6 +114,7 @@ REAL_SEAMS = {
     "worktree.active_workflow_runs": _worktree_mod.active_workflow_runs,
     "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
     "worktree.refresh_base_checkout": _worktree_mod.refresh_base_checkout,
+    "worktree.pr_review_state": _worktree_mod.pr_review_state,
 }
 
 
@@ -361,4 +362,19 @@ def _no_base_checkout_refresh(monkeypatch):
         return {"state": "current", "behind": 0, "detail": ""}
 
     monkeypatch.setattr(_worktree_mod, "refresh_base_checkout", _current)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_external_review_read(monkeypatch):
+    """The PR reconcile asks GitHub for the external QA panel's verdict first (#473). In the
+    unit tier every PR url is made up, so a real read would shell `gh` against a repo that
+    does not exist, on every reconcile test. Stub it to "unreadable" (no verdict — the pass
+    runs as before); tests/test_external_review_473.py fakes verdicts, and the real-gh tier
+    (tests/test_worktree_gh.py) puts the real one back (``REAL_SEAMS``)."""
+
+    async def _unread(_pr_url, *, cwd="."):
+        return None
+
+    monkeypatch.setattr(_worktree_mod, "pr_review_state", _unread)
     yield

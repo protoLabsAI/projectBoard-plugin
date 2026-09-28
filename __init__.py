@@ -462,6 +462,7 @@ def _board_tools(cfg: dict):
         MANUAL_BLOCK_CLASS,
         BoardError,
         annotate_next_action,
+        escalation_enabled,
         get_store,
         open_requirement_ids,
         open_requirements_note,
@@ -1127,7 +1128,7 @@ def _board_tools(cfg: dict):
         return json.dumps(out)
 
     @tool
-    def board_requeue_feature(feature_id: str, findings: str = "") -> str:
+    def board_requeue_feature(feature_id: str, findings: str = "", escalate: bool = False) -> str:
         """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
         the fix-round doctrine needs to carry review findings to the SAME branch.
 
@@ -1147,7 +1148,12 @@ def _board_tools(cfg: dict):
         escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
         literal wrapping double quotes before storage (same hygiene as
         board_create_feature). Refused while the loop is still working the card (a live
-        drive or review gate): wait for the round to end, or cancel the card."""
+        drive or review gate): wait for the round to end, or cancel the card.
+
+        `escalate=true` (with `findings`) climbs the model ladder as the bounce requeues,
+        exactly as `POST /features/{fid}/review` with `escalate: true` does; with the ladder
+        already at its top the card is Blocked instead (#473). Without a configured ladder it
+        is a same-tier bounce."""
         try:
             # Never under a live round (#398): pulling the card out from under a build that
             # is still running is how a requeued card went terminal. Refused, not overridden.
@@ -1159,17 +1165,20 @@ def _board_tools(cfg: dict):
             store = get_store(**store_kw)
             findings = _strip_wrapping_quotes(findings)
             if findings.strip():
-                # Mirror the non-escalating POST /features/{fid}/review path: record the
-                # distinct review-bounce comment, hand the findings to the loop so its
-                # next dispatch prompt LEADS with them, THEN requeue onto the same PR.
-                # Without this the findings would silently not travel and the coder would
-                # burn a run re-producing the rejected output. Import queue_review_feedback
-                # lazily (as the API route does) — the loop imports from here, so a
+                # The SAME bounce as POST /features/{fid}/review (#473, api.review_bounce):
+                # record the distinct review-bounce comment, hand the findings to the loop
+                # so its next dispatch prompt LEADS with them, THEN requeue onto the same
+                # PR (climbing the ladder when `escalate`). Without this the findings would
+                # silently not travel and the coder would burn a run re-producing the
+                # rejected output. Imported lazily — the loop imports from here, so a
                 # top-level import would be circular.
-                store.record_review_bounce(feature_id, findings)
-                from .loop import queue_review_feedback
+                from .api import review_bounce
 
-                queue_review_feedback(feature_id, findings)
+                out = review_bounce(
+                    store, feature_id, findings, escalate=bool(escalate), escalate_on=escalation_enabled(cfg)
+                )
+                f = out["feature"]
+                return json.dumps({"id": f["id"], "state": f["board_state"]})
             f = store.requeue(feature_id)
             return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:

@@ -69,6 +69,7 @@ _PROJECT_SETTING_KEYS = (
     "setup_cmd",
     "env_passthrough",
     "release_freeze",
+    "external_review",
     "breadth_exclude",
     "hot_files",
     "preflight_cmd",

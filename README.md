@@ -69,6 +69,11 @@ board to a PR — or fork it as a starting point.
   `prepare-release.yml` run, or an untagged `chore: release v*` head; per-project
   `release_freeze`) and holds the merge until it lifts. [`docs/publish-gates.md`](docs/publish-gates.md) has the grammar and a worked
   design-system → npm → consumer example.
+- **External QA panel (#473)** — when the repo's own review bot (protoreview's `QA panel`
+  by default, `external_review`) FAILS a PR at its current head, the reconcile bounces the
+  card into a fix round on the same PR with the panel's findings, once per head, and runs
+  no merged-state gate and no merge while that FAIL stands. See
+  [`docs/lifecycle.md`](docs/lifecycle.md#an-external-qa-panels-fail-at-the-head-473).
 - **Escalation (opt-in)** — with a `coders` map of >1 distinct rung, a capability
   failure climbs to a stronger model. A rung may also hold SEVERAL interchangeable
   providers (`smart: [codex, sonnet]`, #362): the board round-robins across them, and on
@@ -326,7 +331,9 @@ quiets once `db_path` is pinned explicitly or the repo no longer carries a
   external systems. Every public POST requires
   `X-Hub-Signature-256: sha256=<HMAC-SHA256(raw-body, webhook_secret)>`; a blank
   secret disables public mutations with 503. GitHub signs `/webhook/pr` natively;
-  CI/review callers must sign the exact JSON bytes they send.
+  CI/review callers must sign the exact JSON bytes they send. An operator bounces a
+  card with findings WITHOUT the secret through the bearer-gated twin,
+  `POST /api/plugins/project_board/features/{id}/review` (#473).
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
@@ -773,6 +780,7 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `board_view.py` | the Kanban/list console view |
 | `gates.py` | publish gates (`waits_for`): spec grammar, a stdlib node-semver range matcher, the npm / `gh` evaluators, the shared per-spec cache |
 | `release_freeze.py` | the auto-merge edge's release-freeze guard: per-project patterns, the per-repo check, the per-card holds |
+| `external_review.py` | an external QA panel's verdict on a PR (#473): its config, the FAIL-at-head judge over one `gh pr view` read, and the findings a fix round leads with |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
 | `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain` and `loop-retro` skills |
 | `__init__.py` | `register()` — wires it all |

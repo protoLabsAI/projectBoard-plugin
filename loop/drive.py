@@ -1629,6 +1629,10 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        # #476: the commit a fix round's resumed tree started on ("" = not a resumed fix
+        # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
+        # tree records its own.
+        round_start = ""
         attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
@@ -1723,6 +1727,7 @@ class DriveMixin:
                     #  • otherwise → one fresh worktree, one dispatch.
                     reusing = keep_wt and wt is not None
                     if not reusing:
+                        round_start = ""  # a fresh tree: only a resumed checkout records one
                         # A FRESH build first clears the ground, and the two halves are one
                         # rule (#405). This drive's own earlier attempt is its to throw away:
                         # the handler below already judged it, and a retry has always rebuilt
@@ -1867,6 +1872,10 @@ class DriveMixin:
                             repo, base, fid, self.root, title=raw_title, resume=bool(feature.get("pr_url"))
                         )
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
+                        # #476: the commit this fix round STARTS on — the PR head it resumed. A
+                        # round that ends here changed nothing. Recorded now, never re-read from
+                        # the live remote ref, which a coder's own push would move.
+                        round_start = await worktree.checkout_head_sha(wt) if feature.get("pr_url") else ""
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
                         result = await coder_seam.dispatch_coder_tapped(
                             coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
@@ -2149,6 +2158,17 @@ class DriveMixin:
                         await self._discard_tree(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
+                    if feature.get("pr_url") and wt:
+                        # #476: a FIX ROUND must move the PR head. One that ends on the same
+                        # commit with nothing uncommitted changed nothing — a failed attempt
+                        # (NoChangesError: counted, escalated or blocked like any empty build),
+                        # never "coder done", and never a re-review of the head the bounce was about.
+                        still = await worktree.fix_round_unchanged(wt, round_start)
+                        if still:
+                            raise worktree.NoChangesError(
+                                f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
+                                "the bounce was about; nothing new to push or review"
+                            )
                     body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that

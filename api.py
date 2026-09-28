@@ -174,6 +174,38 @@ def setup_cmd_for_feature(feature: dict | None, store_kw: dict, instance_cmd: st
     return str(instance_cmd or "").strip()
 
 
+def review_bounce(board, fid: str, findings: str, *, escalate: bool = False, escalate_on: bool = False) -> dict:
+    """The adverse-review bounce, shared by the signed ``POST /features/{fid}/review``, its
+    bearer-gated operator twin (#473) and ``board_requeue_feature``: record the findings as
+    a DISTINCT review-bounce comment on the bead (``record_review_bounce`` — it requires
+    ``in_review``), queue them to lead the next dispatch prompt (``queue_review_feedback``),
+    then requeue onto the SAME open PR. ``escalate`` climbs the model ladder when one is
+    configured; with the ladder already at its top the card is Blocked instead of looping.
+
+    Refused (``BoardError``) while the loop is still working the card (#398): the review
+    gate runs inside the drive, so a bounce landing then would requeue the card out from
+    under it. Blocking: call it off the event loop."""
+    from .loop import queue_review_feedback, requeue_refusal
+
+    refusal = requeue_refusal(fid)
+    if refusal:
+        raise BoardError(refusal)
+    board.record_review_bounce(fid, findings)
+    queue_review_feedback(fid, findings)
+    if escalate and escalate_on:
+        nxt = board.escalate(fid, f"review-fail: {findings}" if findings else "review-fail")
+        if nxt is None:
+            return {
+                "requeued": False,
+                "escalated": True,
+                "exhausted": True,
+                "feature": board.block_from_review(fid, f"review-fail: {findings}"),
+            }
+        return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": board.requeue(fid)}
+    # escalate=false (or no ladder configured): requeue at the SAME tier.
+    return {"requeued": True, "escalated": False, "feature": board.requeue(fid)}
+
+
 def build_router(cfg: dict):
     from fastapi import APIRouter, HTTPException
     from fastapi.responses import HTMLResponse
@@ -309,37 +341,8 @@ def build_router(cfg: dict):
         body = await _signed_json(request)
         findings = str(body.get("findings", ""))
         escalate = bool(body.get("escalate", False))
-
-        def _handle():
-            # Never under a live round (#398): the review gate runs inside the drive, so a
-            # bounce landing then would requeue the card out from under it.
-            from .loop import requeue_refusal
-
-            refusal = requeue_refusal(fid)
-            if refusal:
-                raise BoardError(refusal)
-            s = store()
-            # Distinct review-bounce comment on the bead (enforces in_review), then hand
-            # the findings to the loop so its next dispatch prompt LEADS with them — the
-            # external sibling of the in-loop review gate's _ci_feedback write.
-            s.record_review_bounce(fid, findings)
-            from .loop import queue_review_feedback
-
-            queue_review_feedback(fid, findings)
-            if escalate and escalate_on:
-                nxt = s.escalate(fid, f"review-fail: {findings}" if findings else "review-fail")
-                if nxt is None:
-                    return {
-                        "requeued": False,
-                        "escalated": True,
-                        "exhausted": True,
-                        "feature": s.block_from_review(fid, f"review-fail: {findings}"),
-                    }
-                return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": s.requeue(fid)}
-            # escalate=false (or no ladder configured): requeue at the SAME tier.
-            return {"requeued": True, "escalated": False, "feature": s.requeue(fid)}
-
-        return await _guard(_handle)
+        # The operator twin on the data router (#473) runs the same bounce.
+        return await _guard(lambda: review_bounce(store(), fid, findings, escalate=escalate, escalate_on=escalate_on))
 
     # ── the ONE Done edge: merge webhook ──────────────────────────────────────
     @router.post("/webhook/pr")
@@ -861,6 +864,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().mark_done(fid, reason=str((body or {}).get("reason", ""))))
         await _reap_worktree(fid, f)
         return f
+
+    @router.post("/features/{fid}/review")
+    async def _operator_review(fid: str, body: dict = Body(default={})):
+        """The operator's adverse-review bounce (#473) — the bearer-gated twin of the
+        signed ``/plugins/project_board/features/{fid}/review``, so an operator can send a
+        card back to a fix round with findings without the webhook secret. Body:
+        ``{findings: str, escalate: bool=false}``. Records the findings as a DISTINCT
+        review-bounce comment, leads the next dispatch prompt with them, and requeues onto
+        the SAME open PR; ``escalate: true`` climbs the model ladder (Blocked at its top).
+        400 unless the card is ``in_review``, and while the loop is still working it (a
+        live drive or review gate, #398)."""
+        body = body or {}
+        findings = str(body.get("findings", ""))
+        escalate = body.get("escalate") is True
+        escalate_on = escalation_enabled(cfg)
+        return await _guard(lambda: review_bounce(store(), fid, findings, escalate=escalate, escalate_on=escalate_on))
 
     @router.post("/features/{fid}/attach-pr")
     async def _attach_pr(fid: str, body: dict = Body(default={})):

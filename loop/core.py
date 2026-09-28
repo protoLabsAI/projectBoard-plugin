@@ -514,6 +514,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # Review-gate bounce re-dispatches so far (fid → count), same-tier — the
         # review sibling of _ci_fix_attempts (plan M5).
         self._review_fix_attempts: dict[str, int] = {}
+        # Fix rounds bounced by an EXTERNAL QA panel's FAIL (#473), bounded by the same
+        # review_fix_max but counted apart: the in-process gate resets its own count on a
+        # clean verdict, and the panel failing what the gate passed is exactly the case
+        # this counts. Shared, it would reset on every round and never run out.
+        self._ext_review_fix_attempts: dict[str, int] = {}
         # Consecutive review runs that could not complete (panel step failed / no
         # runner) — after review_run_max the feature is Blocked for the operator
         # instead of re-burning the workflow every poll (ADR 0078 D3: fail closed,

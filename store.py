@@ -608,6 +608,14 @@ SHORT_SHA_LEN = 12
 # reviewed head (current — the rejection stands). Recorded SHA identity, not a timestamp
 # or the label's mere presence, so an UNCHANGED rejected head remains rejected.
 LABEL_REVIEWED_HEAD_PREFIX = "reviewed-head:"
+# The PR head an EXTERNAL QA-panel FAIL already bounced the card for (#473) —
+# `ext-review-bounced:<sha>`, replaced (never accumulated), SHORT for the 50-char label
+# cap. The reconcile bounces a card into a fix round the first time it sees the panel's
+# FAIL at a head, and this is what makes it ONCE per head: the same head FAILING again
+# after the round (the coder pushed nothing) is held for a human instead of re-bounced,
+# and a new push is a new head, which re-arms it. On the bead, not in memory, so a
+# restart can't re-bounce a head the last process already bounced.
+LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX = "ext-review-bounced:"
 # The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
 # metadata line in the bead `notes` field, beside the files_to_modify path lines.
 # NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
@@ -3314,17 +3322,29 @@ class BeadsBoard:
             self.comment(fid, f"CI failed: {reason}")
         return self.get_feature(fid)
 
-    def record_review_bounce(self, fid: str, findings: str = "") -> dict:
+    def record_review_bounce(self, fid: str, findings: str = "", *, head: str = "") -> dict:
         """Record an adverse code-review bounce as a DISTINCT comment on the bead —
         the review sibling of ``bounce_ci_fail``'s ``CI failed:`` note, kept separate
         from the requeue so the review history survives on the bead even though the
         same open PR is reused. Expects ``in_review`` — the state an adverse review
-        lands from; the caller then ``requeue``s onto the same PR (pr_url preserved)."""
+        lands from; the caller then ``requeue``s onto the same PR (pr_url preserved).
+
+        ``head`` (#473) is the PR head an EXTERNAL review failed: it is stamped as the
+        single ``ext-review-bounced:<sha>`` label BEFORE the comment, so the reconcile
+        never bounces the same head twice. The stamp is written first on purpose: a crash
+        between the two leaves a stamped head with no comment (the next pass holds it for a
+        human), never a bounce the next pass would repeat."""
         f = self._require(fid)
         if f["board_state"] != "in_review":
             raise BoardError(f"review bounce expects in_review, got {f['board_state']!r}")
+        head = str(head or "").strip()[:SHORT_SHA_LEN]
+        if head:
+            want = f"{LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{head}"
+            self._run(
+                "update", fid, *replace_prefixed_label_args(f.get("labels"), LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX, want)
+            )
         self.comment(fid, f"{REVIEW_BOUNCE_PREFIX}: {findings}" if findings else REVIEW_BOUNCE_PREFIX)
-        return f
+        return self.get_feature(fid) if head else f
 
     def record_ci_fix_feedback(self, fid: str, ci_failure: str = "") -> dict:
         """Record concrete CI feedback for a bounced coding feature.

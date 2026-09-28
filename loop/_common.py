@@ -1313,6 +1313,7 @@ _BUDGET_KINDS: dict[str, str] = {
     "merged-verify": "_merged_verify_attempts",
     "auto-merge": "_auto_merge_failures",
     "review-fix": "_review_fix_attempts",
+    "ext-review-fix": "_ext_review_fix_attempts",  # #473: the external QA panel's fix rounds
     "review-run": "_review_run_failures",
     # Cumulative CoderTimeouts on this card (#378). Not a fix budget like its siblings —
     # nothing retries on it — but it wants exactly their durability: the count must survive
