@@ -191,8 +191,10 @@ def _no_preflight_health():
     from project_board import health
 
     health._health.pop("preflight", None)
+    health._health.pop("slow_gates", None)  # a timed-out local gate (#483) likewise
     yield
     health._health.pop("preflight", None)
+    health._health.pop("slow_gates", None)
 
 
 @pytest.fixture

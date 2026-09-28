@@ -89,7 +89,25 @@ def advisory_hint() -> str:
         )
     for name, why in sorted(snap["unwinnable_oracle"].items()):
         parts.append(f"project {name!r}: coder.solve() is off — {why}")
+    for name, info in sorted(slow_gates_snapshot().items()):
+        parts.append(
+            f"project {name!r}: the local gate (`{info.get('cmd', '')}`) timed out at "
+            f"local_gate_timeout_s={info.get('timeout_s', 0):.0f}s, so it verifies nothing and the merged-state "
+            "re-verify is skipped — set a cheaper `local_gate_cmd` (CI is the test gate) or raise the timeout"
+        )
     return "; ".join(parts)
+
+
+def publish_slow_gates(slow: dict) -> None:
+    """Called by the loop when a project's ``local_gate_cmd`` times out (or recovers):
+    ``{project: {cmd, timeout_s}}`` (#483). A timed-out gate is a fail-open "pass" that
+    verified nothing, so the merged-state re-verify stops re-running it."""
+    _health["slow_gates"] = {n: dict(v) for n, v in (slow or {}).items()}
+
+
+def slow_gates_snapshot() -> dict:
+    """``{project: {cmd, timeout_s}}`` — the projects whose local gate can't finish in time."""
+    return {n: dict(v) for n, v in (_health.get("slow_gates") or {}).items()}
 
 
 def publish_base_checkouts(results: dict) -> None:

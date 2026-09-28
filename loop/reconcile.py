@@ -1716,6 +1716,27 @@ class ReconcileMixin:
                         pr_url,
                     )
             return False
+        if self._gate_known_slow(feature, self._local_gate_cmd_for(feature)):
+            # The gate timed out last time (#483): its "pass" was fail-open and verified
+            # nothing, yet each re-run held this repo's lock for the full timeout, one card
+            # after another, on every base move (protoAgent PRs stalled for hours). Record
+            # the same outcome a timed-out run would have (the stamp, so the merge edge is
+            # not held on it) without running it again, and spend no budget: nothing ran.
+            short = base_sha[:_MERGED_VERIFIED_SHA_LEN]
+            try:
+                await asyncio.to_thread(store.record_merged_verified, fid, short)
+            except BoardError:
+                return False
+            log.info(
+                "[project_board] %s merged-state gate skipped — this project's local gate timed out at %ss "
+                "(verifies nothing); stamped %s@%s as a timed-out run would: %s",
+                fid,
+                self.local_gate_timeout,
+                base,
+                short,
+                pr_url,
+            )
+            return False
         branch = worktree.branch_name(fid, feature.get("title") or "")
         outcome, detail = await worktree.merged_state_worktree(repo, branch, base_sha, root=self.root)
         if outcome == "error":
@@ -2788,6 +2809,24 @@ class ReconcileMixin:
         except ImportError:  # unreachable when _parse_findings succeeded; belt+braces
             return "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in findings)
 
+    def _note_gate_speed(self, feature: dict | None, cmd: str, *, timed_out: bool) -> None:
+        """Remember whether this project's gate finishes inside ``local_gate_timeout_s``
+        (#483). A timeout is recorded against the exact command and timeout; a gate run
+        that FINISHES (any exit) clears it."""
+        project = self._project_name(feature) if feature is not None else ""
+        before = dict(self._slow_gates)
+        if timed_out:
+            self._slow_gates[project] = {"cmd": cmd, "timeout_s": float(self.local_gate_timeout)}
+        else:
+            self._slow_gates.pop(project, None)
+        if self._slow_gates != before:
+            health.publish_slow_gates(self._slow_gates)
+
+    def _gate_known_slow(self, feature: dict, cmd: str) -> bool:
+        """This project's gate, as configured NOW, timed out last time it ran (#483)."""
+        slow = self._slow_gates.get(self._project_name(feature))
+        return bool(slow) and slow["cmd"] == cmd and slow["timeout_s"] == float(self.local_gate_timeout)
+
     async def _run_local_gate(self, wt: str, feature: dict | None = None) -> str | None:
         """Run the pre-PR local gate (``local_gate_cmd``) in the worktree.
 
@@ -2831,7 +2870,9 @@ class ReconcileMixin:
             except asyncio.TimeoutError:
                 _gone("removed while the pre-PR gate ran")
                 log.warning("[project_board] pre-PR gate timed out (%ss) — treating as pass", self.local_gate_timeout)
+                self._note_gate_speed(feature, cmd, timed_out=True)
                 return None
+            self._note_gate_speed(feature, cmd, timed_out=False)
             if proc.returncode == 0:
                 return None
             # A red or killed gate over a tree that has since vanished judged nothing.
