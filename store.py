@@ -2222,7 +2222,11 @@ class BeadsBoard:
             args += [f"--design={design}"]
         if priority is not None:
             args += ["-p", str(validate_priority(priority))]
-        set_source = source_issue is not None and str(source_issue).strip()
+        # "none" / "clear" / "-" CLEARS the source issue (the `waits_for` convention): a
+        # split whose closing edge moves to a later slice must be able to drop it here, or
+        # two slices would both say "Fixes #N" and the first merge closes the issue early.
+        clear_source = isinstance(source_issue, str) and source_issue.strip().lower() in ("none", "clear", "-")
+        set_source = (source_issue is not None and str(source_issue).strip()) or clear_source
         if files_to_modify is not None or set_source or new_waits is not None:
             # files_to_modify + source_issue + the requirement ledger SHARE the bead
             # `notes` field (labels can't carry the source's `/`/`#`, #101; the
@@ -2238,7 +2242,10 @@ class BeadsBoard:
                 if files_to_modify is not None
                 else f.get("files_to_modify") or []
             )
-            src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
+            if clear_source:
+                src = ""
+            else:
+                src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
             waits = new_waits if new_waits is not None else list(f.get("waits_for") or [])
             args += [f"--notes={_render_notes(files, src, f.get('requirements') or [], waits)}"]
         if difficulty is not None:

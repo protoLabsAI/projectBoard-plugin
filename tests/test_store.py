@@ -3179,6 +3179,23 @@ def test_update_feature_replaces_a_stale_source_line_and_keeps_files(make_board,
     assert call == ("update", "bd-1", "--notes=a.py\nsource-issue: acme/widgets#9")
 
 
+@pytest.mark.parametrize("sentinel", ["none", "CLEAR", " - "])
+def test_update_feature_none_clears_the_source_line_and_keeps_files(make_board, monkeypatch, sentinel):
+    """A split whose closing edge moves to a later slice drops the earlier slice's source
+    issue; otherwise two slices both say "Fixes #N" and the first merge closes it early."""
+    br = Br()
+    b = make_board(br)
+    monkeypatch.setattr(
+        b,
+        "_require",
+        lambda fid: {"id": fid, "files_to_modify": ["a.py"], "source_issue": "acme/widgets#9", "labels": []},
+    )
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "labels": []})
+    b.update_feature("bd-1", source_issue=sentinel)
+    (call,) = br.cmds("update")
+    assert call == ("update", "bd-1", "--notes=a.py")
+
+
 def test_update_feature_files_update_preserves_the_source_line(make_board, monkeypatch):
     """The mirror image: a files-only update must never drop the stored source."""
     br = Br()
