@@ -1258,6 +1258,10 @@ _FUSION_FILE_RE = re.compile(r"^###\s+(\S.+?)\s*$\n```[^\n]*\n(.*?)```", re.MULT
 FUSION_MAX_FILE_CHARS_DEFAULT = 8_000
 FUSION_MAX_TOTAL_CHARS_DEFAULT = 16_000
 
+# How many `.g<n>` indices one candidate tries when the branch at an index is checked out
+# in another live worktree (#475) before it fails — that one candidate, with the reason.
+_CANDIDATE_INDEX_TRIES = 5
+
 # Defense-in-depth for `generate_fusion`'s write guard: a returned file under this
 # fraction of the ORIGINAL file's size is treated as a likely-truncated rewrite,
 # not a legitimately smaller edit, and is refused. Only applies above a minimum
@@ -1698,6 +1702,9 @@ class _WorktreeSolveAdapter:
         # step; the slow part (the coder dispatch) still runs in parallel.
         self._wt_lock = asyncio.Lock()
         self._n = 0
+        # `.g<n>` indices skipped because another live worktree held that branch (#475):
+        # never generations, so never counted as spend.
+        self._skipped = 0
         # worktree_path -> the coder's own final reply (its clean PR summary, per
         # `loop._build_prompt`'s "your FINAL message becomes the PR description"
         # contract) — captured so `dispatch()` can use the WINNING candidate's real
@@ -1720,11 +1727,26 @@ class _WorktreeSolveAdapter:
         # SolveExhausted rather than spend the rest of the budget re-failing identically.
         self._failure_signatures: dict[str, int] = {}
 
+    @property
+    def generations(self) -> int:
+        """Generations attempted so far: the indices used, minus those skipped (#475)."""
+        return self._n - self._skipped
+
     async def _new_candidate_worktree(self) -> tuple[str, str]:
-        self._n += 1
-        cid = f"{self.fid}.g{self._n}"
         async with self._wt_lock:
-            wt, branch = await worktree.create_worktree(self.repo, self.base, cid, self.root)
+            # A `.g<n>` whose branch another live worktree has checked out (#475) is not
+            # this candidate's to take: skip to the next free index instead of failing it.
+            for attempt in range(_CANDIDATE_INDEX_TRIES):
+                self._n += 1
+                cid = f"{self.fid}.g{self._n}"
+                try:
+                    wt, branch = await worktree.create_worktree(self.repo, self.base, cid, self.root)
+                    break
+                except worktree.BranchCheckedOutError as exc:
+                    self._skipped += 1
+                    if attempt + 1 == _CANDIDATE_INDEX_TRIES:
+                        raise
+                    log.warning("[project_board] %s: skipping candidate index — %s", cid, exc)
         self.candidates.append((wt, branch))
         # Outside the lock: only `worktree add` must serialize; best-of-k siblings install
         # in parallel. Best-effort, like the drive's own trees.
@@ -2217,7 +2239,8 @@ async def dispatch(
     except Exception as exc:
         for wt, branch in adapter.candidates:
             await worktree.remove_worktree(repo, wt, branch)
-        if record_gens is not None and adapter._n:
+        await _sweep_candidate_branches(repo, fid)
+        if record_gens is not None and adapter.generations:
             # `solve()` never got to return a `gens_spent` count — the attempted
             # generation count is the honest stand-in (a failed dispatch still spent
             # the gen; ADR 0064's cost accounting doesn't get to look the other way).
@@ -2225,7 +2248,7 @@ async def dispatch(
             # here must never fail the build"): the worktrees above are ALREADY
             # reaped and the original exception below is what the loop must see —
             # a transient `br` failure recording the spend must never mask it.
-            _record_gens_best_effort(record_gens, fid, adapter._n)
+            _record_gens_best_effort(record_gens, fid, adapter.generations)
         log.warning(
             "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
             fid,
@@ -2242,6 +2265,7 @@ async def dispatch(
     if not result.passed or not result.solution:
         for wt, branch in adapter.candidates:
             await worktree.remove_worktree(repo, wt, branch)
+        await _sweep_candidate_branches(repo, fid)
         detail = result.verdict.feedback() if result.verdict else ""
         log.info(
             "[project_board] %s coder.solve exhausted (rung=%s, gens=%d/%d) — no candidate passed",
@@ -2293,6 +2317,18 @@ async def dispatch(
         adapter._replies.get(win_wt) or f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
     )
     return canon_wt, canon_branch, result_text
+
+
+async def _sweep_candidate_branches(repo: str, fid: str) -> None:
+    """After a failed ladder, drop the card's candidate branches that no worktree holds any
+    more (#475) — a candidate whose ``create_worktree`` failed never reached
+    ``adapter.candidates``, so the per-tree cleanup above cannot see its branch. Saved first
+    if it holds anything unique (``worktree.reap_candidate_branches``). Best-effort: the
+    ORIGINAL failure is what the loop must see."""
+    try:
+        await worktree.reap_candidate_branches(repo, fid, test_rung=False)
+    except Exception:  # noqa: BLE001 — cleanup must never mask the ladder's own failure
+        log.warning("[project_board] %s: sweeping leftover candidate branches failed (ignored)", fid, exc_info=True)
 
 
 async def test_rung(

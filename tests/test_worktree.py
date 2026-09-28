@@ -1192,6 +1192,8 @@ async def test_reap_tolerates_a_candidate_that_fails_to_remove(monkeypatch, tmp_
     in place — never an exception into the loop."""
     cand = tmp_path / ".worktrees" / "feat-bd-9.g1"
     cand.mkdir(parents=True)
+    # A real tree has its `.git` link; one without is a husk, cleared by save-and-move (#475).
+    (cand / ".git").write_text("gitdir: /nowhere\n")
 
     async def _fake_git(repo, *args, timeout=60):
         if args[:2] == ("worktree", "remove"):
