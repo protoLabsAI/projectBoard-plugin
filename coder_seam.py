@@ -85,6 +85,7 @@ import os
 import re
 import shlex
 import concurrent.futures
+import contextlib
 import fnmatch
 import sys
 import threading
@@ -778,7 +779,7 @@ async def dispatch_coder_tapped(
         progress_tool(fid, gen, event)
 
     # Old adapter-path semantics preserved: no configured timeout = UNBOUNDED dispatch,
-    # else hard-bound with asyncio.wait_for exactly as worktree.dispatch_coder does —
+    # else hard-bound with worktree.coder_bound exactly as worktree.dispatch_coder does —
     # on timeout the seam coro is cancelled (its own finally reaps the subprocess) and
     # we raise CoderTimeout. The seam owns the client's own internal timeout bookkeeping.
     try:
@@ -800,7 +801,7 @@ async def dispatch_coder_tapped(
             on_thought=_thought_cb,
             on_text=_answer_cb,
         )
-        result = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        result = await worktree.coder_bound(coro, timeout)
     except asyncio.CancelledError:
         # Turn stopped (operator/watchdog): the public seam already dropped the pooled
         # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
@@ -949,7 +950,7 @@ async def _dispatch_coder_tapped_legacy(
             text_callback=_answer_cb,
             timeout=prompt_timeout,
         )
-        reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        reply = await worktree.coder_bound(coro, timeout)
         progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
         return reply
     except asyncio.CancelledError:
@@ -1019,7 +1020,7 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
     adapter = ADAPTERS.get(kind) or ADAPTERS["acp"]
     try:
         coro = adapter.dispatch(delegate, prompt, timeout=timeout)
-        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        return await worktree.coder_bound(coro, timeout)
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"task delegate timed out after {timeout}s")
     except DelegateError as exc:
@@ -1171,13 +1172,14 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
     work = None  # the submitted synchronous call, so the cancel handler can interrogate it
     try:
         if inspect.iscoroutinefunction(invoke):
-            # A coroutine invoke IS cancellable — wait_for cancels it cleanly on timeout.
+            # A coroutine invoke IS cancellable — coder_bound cancels it cleanly on timeout.
             coro = invoke(prompt, session_id, **kwargs)
-            reply = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+            reply = await worktree.coder_bound(coro, timeout)
         else:
             # The worker thread is uncancellable — never abandon it past the timeout (see the
-            # docstring). ``asyncio.wait`` returns pending tasks WITHOUT cancelling them, so on
-            # timeout we drain the still-running thread before raising CoderTimeout.
+            # docstring). The bound waits on a SHIELD, so its timeout cancels only the shield,
+            # never the thread; on timeout we drain the still-running thread before raising
+            # CoderTimeout. The bound counts time asleep, like the others (#472).
             def _invoke_releasing_the_slot():
                 try:
                     return invoke(prompt, session_id, **kwargs)
@@ -1189,7 +1191,8 @@ async def dispatch_self(invoke, prompt: str, session_id: str, *, timeout: float 
             work = holder.executor.submit(_invoke_releasing_the_slot)
             thread = asyncio.ensure_future(asyncio.wrap_future(work))
             if timeout:
-                await asyncio.wait({thread}, timeout=timeout)
+                with contextlib.suppress(TimeoutError):
+                    await worktree.coder_bound(asyncio.shield(thread), timeout)
                 if not thread.done():
                     try:
                         await thread  # drain the uncancellable worker — never leak it past the guard
