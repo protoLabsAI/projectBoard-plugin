@@ -2464,6 +2464,17 @@ def _is_blocking_check(c: dict) -> bool:
     return True
 
 
+# The rollup conclusions that read as a FAILED check (shared by ``pr_ci_status`` and
+# ``failed_ci_run_ids`` so "failing" means the same thing to the bounce and the rerun).
+_CI_FAIL = frozenset({"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"})
+
+
+def _ci_conclusion(c: dict) -> str:
+    # GH Actions checks carry `conclusion` (+ `status` while running); legacy
+    # status contexts carry `state`. Normalize to an upper-case token.
+    return str(c.get("conclusion") or c.get("status") or c.get("state") or "").upper()
+
+
 async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) -> tuple[str, str]:
     """The PR's CI rollup → ``("passing" | "failing" | "pending" | "none", summary)``.
 
@@ -2492,13 +2503,9 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     if not checks:
         return "none", ""
 
-    _FAIL = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+    _FAIL = _CI_FAIL
     _PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED", ""}
-
-    def _conclusion(c: dict) -> str:
-        # GH Actions checks carry `conclusion` (+ `status` while running); legacy
-        # status contexts carry `state`. Normalize to an upper-case token.
-        return str(c.get("conclusion") or c.get("status") or c.get("state") or "").upper()
+    _conclusion = _ci_conclusion
 
     def _name(c: dict) -> str:
         return str(c.get("name") or c.get("context") or c.get("workflowName") or "check")
@@ -2525,6 +2532,83 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
         if lrc == 0 and lout.strip():
             summary += f"\n\nFailing log (truncated):\n{lout.strip()[-log_chars:]}"
     return "failing", summary
+
+
+# ── #487: rerun a red PR's failed Actions jobs once before a coder fix round ────────
+# A red check is not always the code's fault: a flaky e2e, a runner that died, a registry
+# that timed out. Spending a coder fix round on one burns a model run and a same-tier budget
+# unit on a diff that was fine (protoAgent#3736 needed a hand rerun). So the CI reconcile
+# asks GitHub to rerun the failed jobs ONCE per head first, and bounces only if the rerun
+# fails again. The run ids ride each Actions check's ``detailsUrl``
+# (``https://github.com/<owner>/<repo>/actions/runs/<id>/job/<job>``); a non-Actions status
+# has none, and there is nothing to rerun.
+_ACTIONS_RUN_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/actions/runs/(\d+)")
+_PR_SLUG_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/\d+")
+
+
+def failed_ci_run_ids(checks) -> list[tuple[str, str]]:
+    """``(owner/repo, run_id)`` for every GitHub Actions run behind a FAILED blocking check
+    in a ``statusCheckRollup``, deduplicated in rollup order (one workflow run carries many
+    jobs, and ``gh run rerun --failed`` reruns all of a run's failed jobs at once). Pure: the
+    rollup read is the caller's, so the rerun below can also be pointed at known run ids.
+    A failed check with no Actions ``detailsUrl`` (a legacy status, a third-party check)
+    contributes nothing."""
+    out: list[tuple[str, str]] = []
+    for c in checks or []:
+        if not isinstance(c, dict) or not _is_blocking_check(c) or _ci_conclusion(c) not in _CI_FAIL:
+            continue
+        m = _ACTIONS_RUN_RE.search(str(c.get("detailsUrl") or ""))
+        if m and (m.group(1), m.group(2)) not in out:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+async def rerun_failed_ci(
+    pr_url: str = "", *, cwd: str = ".", run_ids: Iterable[str] | None = None, slug: str = ""
+) -> list[str]:
+    """Rerun the failed jobs of a PR's failing GitHub Actions runs (#487) —
+    ``gh run rerun <id> --failed`` per run — and return the run ids GitHub accepted.
+
+    With ``run_ids`` the rollup read is skipped and exactly those runs are rerun (in
+    ``slug``, else the repo ``cwd`` resolves to). That is the seam the real-GitHub tier
+    drives against a pinned, deliberately failed fixture run; the loop passes the PR.
+
+    Best-effort, never raises into the loop: an unreadable rollup, no Actions run behind the
+    failures, or a ``gh`` refusal (no ``actions: write``, a run already rerunning, a run too
+    old to rerun) is logged and that run is left out, so ``[]`` means "nothing was rerun" and
+    the caller bounces the card as it did before #487."""
+    if run_ids is None:
+        try:
+            rc, out, err = await _gh(
+                "pr", "view", pr_url, "--json", "statusCheckRollup", "--jq", ".statusCheckRollup", cwd=cwd
+            )
+        except (WorktreeError, OSError) as exc:
+            log.warning("[project_board] rerun_failed_ci: reading %s's checks failed: %s", pr_url, exc)
+            return []
+        if rc != 0:
+            log.warning("[project_board] rerun_failed_ci: reading %s's checks failed: %s", pr_url, err.strip()[:200])
+            return []
+        try:
+            checks = json.loads(out or "[]") or []
+        except json.JSONDecodeError:
+            return []
+        m = _PR_SLUG_RE.search(pr_url or "")
+        targets = [(s or (m.group(1) if m else ""), rid) for s, rid in failed_ci_run_ids(checks)]
+    else:
+        targets = [(slug, str(r).strip()) for r in run_ids if str(r).strip().isdigit()]
+    reran: list[str] = []
+    for run_slug, rid in targets:
+        args = ["run", "rerun", rid, "--failed"] + (["-R", run_slug] if run_slug else [])
+        try:
+            rc, out, err = await _gh(*args, cwd=cwd, timeout=60)
+        except (WorktreeError, OSError) as exc:
+            log.warning("[project_board] rerun_failed_ci: gh run rerun %s failed: %s", rid, exc)
+            continue
+        if rc != 0:
+            log.warning("[project_board] rerun_failed_ci: gh run rerun %s refused: %s", rid, (err or out).strip()[:200])
+            continue
+        reran.append(rid)
+    return reran
 
 
 # ── #347's App-only check-run seam removed (bd-doo0) ─────────────────────────────────
