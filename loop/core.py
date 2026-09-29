@@ -497,6 +497,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # half of the rebase edge, bounded by the same rebase_fix_max budget so a
         # base that moves repeatedly doesn't burn a gate run every poll forever.
         self._merged_verify_attempts: dict[str, int] = {}
+        # #490: the worktrees whose last `_run_local_gate` degraded to "pass" without a
+        # verdict (timeout, signal kill, unlaunchable). The merged-state re-verify reads it:
+        # only such a run spends the merged-verify budget, a real green resets it.
+        self._gate_no_verdict: set[str] = set()
         # ADR 0326: serializes the ONE-TIME merged-verify exhaustion sentinel write
         # (`_arm_merged_verify_exhaustion`) against the operator budget reset
         # (`_invalidate_merged_verify_budget`), which run on different threads (the async

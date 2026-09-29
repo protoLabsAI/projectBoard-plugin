@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from .. import external_review
+from .. import external_review, merge_state_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
@@ -1171,6 +1171,8 @@ class ReconcileMixin:
                 state = known_state or str((view or {}).get("state") or "") or await worktree.pr_state(pr_url, cwd=repo)
                 if f.get("board_state") == "blocked" and state != "MERGED":
                     continue
+                if state in ("MERGED", "CLOSED"):
+                    merge_state_hold.clear_hold(fid)  # #495: a finished PR holds nothing
                 if state == "MERGED":
                     if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
@@ -1295,7 +1297,7 @@ class ReconcileMixin:
                     # CI / review outcomes, and re-reads the feature rather than
                     # trusting the snapshot those gates may have changed.
                     if self.auto_merge:
-                        await self._maybe_auto_merge(store, fid, pr_url, repo)
+                        await self._maybe_auto_merge(store, fid, pr_url, repo, view=view)
             except store_mod.BoardTimeout:
                 raise  # a stalled store, not this PR's failure: stop the pass (#404)
             except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
@@ -1405,18 +1407,49 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
                 log.warning("[project_board] %s freeze-hold comment failed", fid, exc_info=True)
 
-    async def _maybe_auto_merge(self, store, fid: str, pr_url: str, repo: str) -> bool:
+    def _note_merge_state_hold(self, fid: str, pr_url: str, why: list[str], view: dict | None) -> None:
+        """Record (or clear) why GitHub does not read this PR as CLEAN (#495) — the process
+        state ``annotate_next_action`` reads to say ``held: PR not clean on GitHub
+        (UNSTABLE) — QA panel: in progress`` instead of ``auto-merge pending``. Built from
+        reads the pass already made: the ``mergeStateStatus`` in ``why`` and the head's
+        checks in the pass's ``pr_review_state`` payload. No GitHub call of its own.
+
+        UNSTABLE / BLOCKED set the hold; an UNKNOWN or unreadable status keeps whatever was
+        there (GitHub computing, a gh blip); any other outcome clears it. Logged once per
+        distinct blocker — BLOCKED on pending required checks is every fresh PR's normal
+        state, so the bead is not commented and the operator is not paged for it."""
+        prefix = "github mergeStateStatus="
+        mss = next((w[len(prefix) :] for w in why if w.startswith(prefix)), None)
+        if mss in ("UNKNOWN", "unavailable"):
+            return
+        if mss not in merge_state_hold.HELD_STATUSES:
+            merge_state_hold.clear_hold(fid)
+            return
+        checks = merge_state_hold.outstanding_checks(view)
+        if merge_state_hold.set_hold(fid, mss, checks, pr_url):
+            log.info(
+                "[project_board] %s auto-merge held: PR is %s on GitHub (%s): %s",
+                fid,
+                mss,
+                "; ".join(checks) or "no pending or failing check in the pass's read",
+                pr_url,
+            )
+
+    async def _maybe_auto_merge(self, store, fid: str, pr_url: str, repo: str, *, view: dict | None = None) -> bool:
         """Merge an in_review PR once every gate the loop owns is green and current
         (see ``_auto_merge_blockers``). Returns True if it merged. The board flips to
         done on the next reconcile pass (the existing MERGED edge — one Done path,
         idempotent, webhook-compatible). A refusal is retried next pass up to
         ``auto_merge_max`` times, then recorded on the bead and left for a human —
-        never a block: the work is good, only the merge didn't land."""
+        never a block: the work is good, only the merge didn't land. ``view`` is the
+        pass's ``pr_review_state`` read, used only to name the checks holding a PR that
+        GitHub does not read as CLEAN (#495)."""
         feature = await asyncio.to_thread(store.get_feature, fid)
         if feature is None:  # card deleted between the reconcile snapshot and this re-read
             log.debug("[project_board] %s vanished before auto-merge — nothing to merge", fid)
             return False
         why = await self._auto_merge_blockers(store, feature, pr_url, repo)
+        self._note_merge_state_hold(fid, pr_url, why, view)
         if why:
             # Store-only bookkeeping (a bead comment) — off the event loop (#258).
             await asyncio.to_thread(self._note_draft_hold, store, fid, pr_url, why)
@@ -1641,7 +1674,10 @@ class ReconcileMixin:
         (or one that can't run — the ``_run_local_gate`` fail-open contract; CI is
         still the real gate) just refreshes the stamp and the card stays in review;
         only a CLEAN gate FAILURE on the merged state blocks. Bounded by
-        ``merged_verify_max`` (0 = unlimited): once spent, re-verification stops and
+        ``merged_verify_max`` (0 = unlimited), which counts only the runs that reached
+        no verdict (a gate that timed out, was killed or could not launch) and red ones:
+        a real green verdict RESETS the count (#490), because base moving under a card
+        that keeps passing is a busy repo, not a failure. Once spent, re-verification stops and
         the stale stamp stays visible to the adjudicator rather than the loop burning
         a gate run every poll forever — with ``auto_merge`` on that hold is the merge
         edge's, so exhaustion logs a WARNING naming the remedy. A merge conflict is the
@@ -1755,6 +1791,11 @@ class ReconcileMixin:
             failure = await self._run_local_gate(detail, feature)
         finally:
             await worktree.remove_worktree(repo, detail)
+        # #490: did the gate reach a verdict, or degrade to "pass" (timeout, killed,
+        # unlaunchable)? Only the latter counts toward merged_verify_max.
+        no_verdict = self.__dict__.get("_gate_no_verdict", set())
+        judged = detail not in no_verdict
+        no_verdict.discard(detail)
         short = base_sha[:_MERGED_VERIFIED_SHA_LEN]
         if failure is None:
             # Green: the verdict still holds on the merged state. Stamp the SHORT sha,
@@ -1773,7 +1814,25 @@ class ReconcileMixin:
                     exc_info=True,
                 )
                 return False
-            await self._budget_set(store, fid, "merged-verify", n + 1)
+            if not judged:
+                # The gate ran to no verdict (fail-open "pass"): nothing was verified, so
+                # this is the run the cap exists for — a gate burned every poll forever.
+                await self._budget_set(store, fid, "merged-verify", n + 1)
+                log.info(
+                    "[project_board] %s merged-state gate reached no verdict against %s@%s (counted %d/%s)",
+                    fid,
+                    base,
+                    short,
+                    n + 1,
+                    self.merged_verify_max or "unlimited",
+                )
+                return False
+            # A real green verdict (#490). Being moved by siblings' merges is not this
+            # card's failure, and on a busy repo it is the normal state: a steady run of
+            # green re-verifies must never park the card. Reset instead of spending (only
+            # when something was spent, so a clean card pays no store write per poll).
+            if n:
+                await self._budget_reset(store, fid, "merged-verify")
             log.info(
                 "[project_board] %s merged-state gate green — verdict re-verified against %s@%s",
                 fid,
@@ -2845,6 +2904,11 @@ class ReconcileMixin:
         cmd = self._local_gate_cmd_for(feature) if feature is not None else self.local_gate_cmd
         if not cmd:
             return None
+        # #490: every "treating as pass" below is a run that judged nothing; say so to the
+        # caller that counts verdicts (the merged-state re-verify) without changing the
+        # return contract every other caller relies on.
+        no_verdict = self.__dict__.setdefault("_gate_no_verdict", set())
+        no_verdict.discard(wt)
 
         def _gone(during: str) -> None:
             if not os.path.isdir(wt):
@@ -2861,6 +2925,7 @@ class ReconcileMixin:
         except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block…
             _gone("the pre-PR gate could not launch in it")  # …unless there is no tree to gate
             log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
+            no_verdict.add(wt)
             return None
         try:
             try:
@@ -2871,6 +2936,7 @@ class ReconcileMixin:
                 _gone("removed while the pre-PR gate ran")
                 log.warning("[project_board] pre-PR gate timed out (%ss) — treating as pass", self.local_gate_timeout)
                 self._note_gate_speed(feature, cmd, timed_out=True)
+                no_verdict.add(wt)
                 return None
             self._note_gate_speed(feature, cmd, timed_out=False)
             if proc.returncode == 0:
@@ -2896,6 +2962,7 @@ class ReconcileMixin:
                     "no verdict, treating as pass (CI still gates)",
                     sig,
                 )
+                no_verdict.add(wt)
                 return None
             text = (out or b"").decode("utf-8", "replace").strip()
             if len(text) > self.local_gate_output_chars:
@@ -2905,4 +2972,5 @@ class ReconcileMixin:
             raise
         except Exception as exc:  # noqa: BLE001 — a gate that can't run must not block
             log.info("[project_board] pre-PR gate failed to run (treating as pass — CI still gates): %s", exc)
+            no_verdict.add(wt)
             return None

@@ -158,6 +158,23 @@ def _no_publish_gate_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_leaked_merge_state():
+    """Process-stable state a listing reads (#490, #495): the merge edge's GitHub holds and
+    the registered live loop, whose ``merged_verify_max`` wins over a listing's config. Each
+    test starts with neither, and whatever a test registers is put back afterwards."""
+    from project_board import merge_state_hold
+    from project_board.loop import _common as loop_common
+
+    slot = loop_common._loop_slot()
+    prior = slot.loop
+    slot.loop = None
+    merge_state_hold.reset_state()
+    yield
+    slot.loop = prior
+    merge_state_hold.reset_state()
+
+
+@pytest.fixture(autouse=True)
 def _fake_worktree_paths_exist(monkeypatch):
     """The mocked drive tier hands the loop fake worktree paths (``/wt/feat-<id>``) and
     never builds a tree. The drive's "is my kept tree still there?" check (#461) would read

@@ -51,7 +51,7 @@ from urllib.parse import urlparse
 
 from . import _TERMINAL_STATES, br_fetch, work_snapshot
 from . import gates as publish_gates
-from . import release_freeze
+from . import merge_state_hold, release_freeze
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -4764,6 +4764,11 @@ NEXT_ACTION_AUTO_MERGE_PENDING = "auto-merge pending"
 # `auto-merge pending` lie. Raising `merged_verify_max` (or resetting the budget) flips
 # it back to `auto-merge pending` with no restart, mirroring how the loop re-arms.
 NEXT_ACTION_MERGED_VERIFY_EXHAUSTED = "auto-merge held: merged-verify budget exhausted"
+# #495: the merge edge read the PR as UNSTABLE / BLOCKED (a check pending or failing, a
+# required review unmet) — recorded by the loop in merge_state_hold, projected here as
+# `held: PR not clean on GitHub (UNSTABLE) — QA panel: in progress` in place of the
+# `auto-merge pending` that hid it for hours.
+NEXT_ACTION_MERGE_STATE_HOLD_PREFIX = "held: PR not clean on GitHub"
 NEXT_ACTION_REVIEW_IN_PROGRESS = "review in progress"
 NEXT_ACTION_CHANGES_REQUESTED = "changes requested"
 NEXT_ACTION_AWAITING_VERDICT = "awaiting review verdict (no review-clean)"
@@ -5048,6 +5053,48 @@ NEXT_ACTION_AWAITING_DELIVERABLE = "awaiting deliverable"
 NEXT_ACTION_AWAITING_VERIFICATION = "awaiting verification"
 
 
+def _live_merged_verify_max() -> int | None:
+    """The running loop's ``merged_verify_max`` (#490), or None when no loop is running in
+    this process (or it can't be reached). Lazily imported, like ``_live_drive_predicate``:
+    ``loop`` imports ``store``."""
+    try:
+        from .loop import live_loop
+
+        loop = live_loop()
+    except Exception:  # noqa: BLE001 — a listing must not crash on the loop read
+        return None
+    value = getattr(loop, "merged_verify_max", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def merge_state_hold_posture(feature: dict) -> dict | None:
+    """``{"next_action", "awaiting_merge", "next_action_hint"}`` for an ``auto-merge
+    pending`` card whose PR the merge edge last read as UNSTABLE / BLOCKED (#495), else
+    None. Process state the loop records (``merge_state_hold``), no GitHub call."""
+    hold = merge_state_hold.hold_for(str(feature.get("id") or ""))
+    if not hold:
+        return None
+    status, checks = hold["status"], hold["checks"]
+    sentence = f"{NEXT_ACTION_MERGE_STATE_HOLD_PREFIX} ({status})"
+    if checks:
+        sentence += " — " + "; ".join(checks)
+    meaning = (
+        "a required check or review is not satisfied (unresolved review threads count)"
+        if status == "BLOCKED"
+        else "a check is pending or failing"
+    )
+    n = pr_number(feature.get("pr_url", ""))
+    return {
+        "next_action": sentence,
+        "awaiting_merge": False,
+        "next_action_hint": (
+            f"GitHub reads {'#' + n if n else 'the PR'} as {status}: {meaning}. The loop merges only on CLEAN "
+            "and re-checks every merge poll — clear what is outstanding on the PR (a failing check, an "
+            "uncleared review panel, open review threads), or label the card merge-hold to hand it to a human"
+        ),
+    }
+
+
 def _live_drive_predicate():
     """The default ``is_driven`` for ``annotate_next_action``: True when the loop holds a
     live drive for the fid. Lazily imported (``loop`` imports ``store``, so a top-level
@@ -5280,6 +5327,13 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         merged_verify_max = max(0, int(cfg.get("merged_verify_max", 5)))
     except (TypeError, ValueError):
         merged_verify_max = 0
+    # #490: the running loop's cap wins. It is what actually wrote (and compares against)
+    # the exhaustion sentinel; `merged_verify_max` is a restart knob, so a Settings save or
+    # a re-registered route can hand this listing a config the loop is not running yet —
+    # and a card the loop has parked read `auto-merge pending`.
+    live = _live_merged_verify_max()
+    if live is not None:
+        merged_verify_max = live
     if is_driven is None:
         is_driven = _live_drive_predicate()
     # Which of this listing's cards were cancelled, so a stranded card can say its
@@ -5338,6 +5392,8 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
                         "(release_freeze in the project entry configures or disables this)"
                     ),
                 }
+            else:
+                posture = merge_state_hold_posture(f) or posture
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]
