@@ -5095,9 +5095,22 @@ async def test_verify_merged_state_red_gate_blocks(monkeypatch):
     assert reaped == ["bd-1"]
 
 
+def _no_verdict_gate(loop):
+    """A `_run_local_gate` double for a gate that degraded to "pass" without a verdict
+    (timed out, killed, unlaunchable) — the only green-looking run that spends the
+    merged-verify budget (#490)."""
+
+    async def _gate(wt, feature=None):
+        loop._gate_no_verdict.add(wt)
+        return None
+
+    return _gate
+
+
 async def test_verify_merged_state_budget_bounds_reverification(monkeypatch):
-    """merged_verify_max bounds re-verification: a base that moves repeatedly stops
-    burning gate runs — the stale stamp stays visible, the card stays in review."""
+    """merged_verify_max bounds re-verification: a base that moves repeatedly under a
+    gate that never reaches a verdict stops burning gate runs — the stale stamp stays
+    visible, the card stays in review."""
     shas = iter(["aaa", "bbb", "ccc"])
 
     async def _sha(repo, ref):
@@ -5114,7 +5127,7 @@ async def test_verify_merged_state_budget_bounds_reverification(monkeypatch):
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     store = _VerifyStore({"id": "bd-1"})
     loop = _vloop(merged_verify_max=1)
-    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))
+    monkeypatch.setattr(loop, "_run_local_gate", _no_verdict_gate(loop))
     # 1st move (no stamp yet) → verify + stamp against aaa.
     assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
     assert store.verified == [("bd-1", "aaa")]
@@ -5217,7 +5230,7 @@ async def test_verify_merged_state_persists_the_exhaustion_sentinel_once(monkeyp
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     store = _VerifyStore({"id": "bd-1"})
     loop = _vloop(merged_verify_max=1)
-    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green
+    monkeypatch.setattr(loop, "_run_local_gate", _no_verdict_gate(loop))  # no verdict (#490)
     # 1st move: budget 0 < cap 1 → the gate RUNS, stamps, and spends 0→1.
     assert await loop._verify_merged_state(store, {"id": "bd-1", "labels": []}, "pr", "/repo") is False
     assert built == ["s1"] and store.budgets == [("bd-1", "merged-verify", 1)]
@@ -5233,9 +5246,9 @@ async def test_verify_merged_state_persists_the_exhaustion_sentinel_once(monkeyp
 
 
 async def test_verify_merged_state_spends_budget_only_on_a_terminal_gate_result(monkeypatch):
-    """AC5: a re-verify unit is spent ONLY after the merged-state gate actually runs and
-    yields a terminal verdict. An infra error and a merge conflict run no terminal gate,
-    so they spend nothing and the NEXT real verdict still gets its budget."""
+    """AC5: a re-verify unit is spent ONLY after the merged-state gate actually runs. An
+    infra error and a merge conflict run no gate, so they spend nothing; the run that
+    follows (here one that reaches no verdict, the kind #490 still counts) spends one."""
     monkeypatch.setattr(worktree, "origin_head_sha", _aret("abc"))
     outcomes = iter([("error", "fetch"), ("conflict", "x.py"), ("merged", "/wt")])
 
@@ -5246,13 +5259,13 @@ async def test_verify_merged_state_spends_budget_only_on_a_terminal_gate_result(
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     store = _VerifyStore({"id": "bd-1"})
     loop = _vloop(merged_verify_max=5)
-    monkeypatch.setattr(loop, "_run_local_gate", _aret(None))  # green when the gate DOES run
+    monkeypatch.setattr(loop, "_run_local_gate", _no_verdict_gate(loop))  # runs, reaches no verdict
     feature = {"id": "bd-1", "labels": []}
     assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # infra error
     assert store.budgets == []
     assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # merge conflict
     assert store.budgets == []
-    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # terminal green
+    assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False  # the gate ran
     assert store.verified == [("bd-1", "abc")] and store.budgets == [("bd-1", "merged-verify", 1)]
 
 
@@ -5367,7 +5380,7 @@ async def test_pinned_zero_defeats_a_stale_exhaustion_label_snapshot(monkeypatch
     feature = {"id": "bd-1", "labels": ["merged-verified:old", "budget:merged-verify:2"]}
     assert await loop._verify_merged_state(store, feature, "pr", "/repo") is False
     assert store.verified == [("bd-1", "freshbase")]  # re-verified, not held on the stale label
-    assert loop._merged_verify_attempts["bd-1"] == 1  # a real re-verify spent 0→1
+    assert loop._merged_verify_attempts["bd-1"] == 0  # a green verdict spends nothing (#490)
 
 
 def test_start_publishes_the_loop_to_the_process_stable_slot():
