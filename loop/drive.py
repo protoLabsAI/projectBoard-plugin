@@ -2127,36 +2127,46 @@ class DriveMixin:
                         )
                         return
                     # Source-issue closed guard (#166): re-check the issue before
-                    # opening a PR. A closed source issue means another PR already
-                    # resolved the ticket — opening a duplicate wastes reviewer/CI
-                    # cycles. Fail-open: any gh error lets the PR proceed normally.
-                    # #253: but on a MULTI-SLICE board several features can share one
-                    # source_issue — when a sibling slice merges first its `Fixes #N`
-                    # closes the shared issue, and this guard must NOT then cancel the
-                    # remaining siblings. Only cancel when the closure came from OUTSIDE
-                    # the board's own feature set (no done sibling with a PR for it).
+                    # opening a PR. A closed source issue MAY mean another PR already
+                    # resolved the ticket. Fail-open: any gh error lets the PR proceed.
+                    # #253: on a MULTI-SLICE board several features share one
+                    # source_issue — a sibling slice's merged `Fixes #N` closes it, and
+                    # the remaining siblings must still publish.
+                    # The guard NEVER destroys finished work (protoAgent#3832): a closed
+                    # issue is a question for a human, not proof the change is unwanted —
+                    # 9 verified builds were once cancelled and their trees discarded
+                    # because an unrelated PR closed a design-decision issue they cited.
+                    #  • a source issue in ANOTHER repo is skipped outright: this PR can't
+                    #    close it (cross-repo it gets a `Refs` link, never `Fixes`), so its
+                    #    closure says nothing about whether THIS change is still wanted;
+                    #  • a same-repo closure not by a sibling BLOCKS the card and keeps the
+                    #    worktree as it is, for a human to cancel or salvage.
                     si_raw = str(feature.get("source_issue") or "").strip()
-                    if (
+                    si_foreign = await self._source_issue_is_foreign(feature, wt) if si_raw else ""
+                    if si_foreign:
+                        log.info(
+                            "[project_board] %s source issue %s is in another repo than this card's %s — "
+                            "not checking its state (a PR here cannot close it); publishing",
+                            fid,
+                            si_raw,
+                            si_foreign,
+                        )
+                    elif (
                         si_raw
                         and not await _loop._source_issue_still_open(si_raw, wt)
                         and not await asyncio.to_thread(_issue_closed_by_board_sibling, store, feature)
                     ):
-                        reason = f"source issue {si_raw} already closed — work superseded"
-                        log.info("[project_board] %s skipping PR — %s", fid, reason)
-                        try:
-                            await asyncio.to_thread(store.cancel_feature, fid, reason)
-                        except Exception:  # noqa: BLE001
-                            log.warning(
-                                "[project_board] %s cancel_feature failed — flagging blocked instead",
-                                fid,
-                                exc_info=True,
-                            )
-                            if not await self._block_or_stand_aside(
-                                store, fid, reason, repo=repo, wt=wt, branch=branch
-                            ):
-                                return
-                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
-                        self._inflight.pop(fid, None)
+                        reason = (
+                            f"source issue {si_raw} was closed while this card was building (not by a board "
+                            f"sibling). The finished work is kept, unpublished, on {branch or '?'} in worktree "
+                            f"{wt or '?'} — confirm it is superseded (cancel the card) or still wanted "
+                            "(salvage it: board_salvage_feature / POST /features/<id>/salvage publishes that tree)"
+                        )
+                        log.warning("[project_board] %s holding PR, work kept — %s", fid, reason)
+                        if await self._block_or_stand_aside(
+                            store, fid, reason, repo=repo, wt=wt, branch=branch, category="terminal"
+                        ):
+                            self._inflight.pop(fid, None)
                         return
                     if feature.get("pr_url") and wt:
                         # #476: a FIX ROUND must move the PR head. One that ends on the same
@@ -2973,6 +2983,25 @@ class DriveMixin:
             log.debug("[project_board] %s cancel comment failed", fid, exc_info=True)
         self._inflight.pop(fid, None)
         log.info("[project_board] %s %s", fid, note)
+
+    async def _source_issue_is_foreign(self, feature: dict, wt) -> str:
+        """The card's own GitHub ``owner/repo`` when its source issue lives in a DIFFERENT
+        repo, else ``""``. Used by the #166 closed-issue guard: a PR can only close an issue
+        in its own repo, so a closed issue elsewhere (a design decision, a tracking issue in
+        another repo) says nothing about whether this card's change is still wanted
+        (protoAgent#3832). A bare ``#N`` is same-repo by definition. An unresolvable target
+        repo reads as same-repo (``""``) — the guard then only ever blocks and keeps the
+        work, never discards it."""
+        parsed = _source_issue(feature)
+        if not parsed or not parsed[0] or not wt:
+            return ""
+        try:
+            target = str(await worktree.repo_slug(cwd=wt) or "").strip()
+        except Exception:  # noqa: BLE001 — unknown target ⇒ treat as same repo (block, keep work)
+            return ""
+        if target and target.lower() != parsed[0].strip().lower():
+            return target
+        return ""
 
     async def _with_source_issue_ref(self, feature: dict, wt: str, body: str) -> str:
         """Stamp the feature's source issue onto the PR body — ``Fixes #n`` when the
