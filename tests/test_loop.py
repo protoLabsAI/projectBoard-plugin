@@ -1480,9 +1480,58 @@ async def test_source_issue_still_open_bare_number_unresolvable_fail_open(monkey
     assert gh_called == []  # never called gh when slug unresolvable
 
 
+def _record_discards(monkeypatch, loop_cls=BoardLoop):
+    """Record every ``_discard_tree`` call — the #166 guard must never make one."""
+    discards = []
+
+    async def _discard(self, store, fid, repo, wt, branch, *, base="", comment=True):
+        discards.append((fid, wt, branch))
+        return ""
+
+    monkeypatch.setattr(loop_cls, "_discard_tree", _discard)
+    return discards
+
+
 async def test_drive_skips_pr_when_source_issue_closed(monkeypatch):
-    """When source_issue is closed at PR-open time, no PR is created and the
-    card is cancelled (cancel_feature is called with the supersede reason)."""
+    """When a SAME-repo source_issue is closed at PR-open time (and no board sibling
+    closed it), no PR is created — and the finished work is NOT thrown away
+    (protoAgent#3832): the card is blocked (terminal, a human's call) with a reason
+    naming the kept branch/worktree, no ``cancel_feature``, no ``_discard_tree``."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opened.append((wt, branch))
+        return "https://example/pr/99"
+
+    async def _closed(si_raw, cwd):
+        return False
+
+    async def _slug(*, cwd):
+        return "owner/repo"
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    discards = _record_discards(monkeypatch)
+    feature = dict(FEATURE, source_issue="owner/repo#42")
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert opened == []  # no PR opened
+    assert "cancel_feature" not in store.names()
+    assert "open_review" not in store.names()
+    assert discards == []  # the finished tree is kept
+    assert store.removes == []
+    blocks = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocks) == 1
+    reason = blocks[0][2]
+    assert "owner/repo#42" in reason and "not by a board sibling" in reason
+    assert "feat/bd-1" in reason and "/wt/feat-bd-1" in reason  # where the work is
+    assert "salvage" in reason
+    assert blocks[0][3] == "terminal"  # a human's call: the sweep must not auto-clear it
+    assert loop._inflight == {}
+
+
+async def test_drive_bare_source_issue_closed_is_same_repo_and_kept(monkeypatch):
+    """A bare ``#N`` source issue is the card's own repo by definition: closed, it
+    takes the block-and-keep path, never the cross-repo skip."""
     opened = []
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
@@ -1493,14 +1542,72 @@ async def test_drive_skips_pr_when_source_issue_closed(monkeypatch):
         return False
 
     monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
-    feature = dict(FEATURE, source_issue="owner/repo#42")
+    discards = _record_discards(monkeypatch)
+    feature = dict(FEATURE, source_issue="#42")
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
-    assert opened == []  # no PR opened
-    assert "cancel_feature" in store.names()
-    assert "open_review" not in store.names()
-    cancel_calls = [c for c in store.calls if c[0] == "cancel_feature"]
-    assert any("superseded" in c[2] for c in cancel_calls)
+    assert opened == []
+    assert "cancel_feature" not in store.names()
+    assert "flag_blocked" in store.names()
+    assert discards == []
+
+
+async def test_drive_publishes_when_cross_repo_source_issue_closed(monkeypatch):
+    """protoAgent#3832: the card cites a design-decision issue in ANOTHER repo, and an
+    unrelated PR closed it. This card's PR can't close that issue (cross-repo it gets a
+    ``Refs`` link), so its state says nothing about this change — the guard is skipped:
+    the issue's state is never even read, and the PR opens normally."""
+    opened = []
+    checked = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opened.append(body)
+        return "https://example/pr/7"
+
+    async def _closed(si_raw, cwd):
+        checked.append(si_raw)
+        return False
+
+    async def _slug(*, cwd):
+        return "protoLabsAI/protoAgent"
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    discards = _record_discards(monkeypatch)
+    feature = dict(FEATURE, source_issue="protoLabsAI/protoContent#551")
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert len(opened) == 1
+    assert "Refs https://github.com/protoLabsAI/protoContent/issues/551" in opened[0]
+    assert ("open_review", "bd-1", "https://example/pr/7") in store.calls
+    assert checked == []  # a foreign issue's state is not the guard's business
+    assert "cancel_feature" not in store.names()
+    assert "flag_blocked" not in store.names()
+    assert discards == []
     assert loop._inflight == {}
+
+
+async def test_drive_source_issue_repo_match_is_case_insensitive(monkeypatch):
+    """GitHub slugs are case-insensitive: ``Owner/Repo#42`` on a card whose repo
+    resolves as ``owner/repo`` is SAME-repo, so a closure still holds the PR."""
+    opened = []
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        opened.append(body)
+        return "https://example/pr/7"
+
+    async def _closed(si_raw, cwd):
+        return False
+
+    async def _slug(*, cwd):
+        return "owner/repo"
+
+    monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    discards = _record_discards(monkeypatch)
+    feature = dict(FEATURE, source_issue="Owner/Repo#42")
+    loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
+    assert opened == []
+    assert "flag_blocked" in store.names()
+    assert discards == []
 
 
 async def test_drive_opens_pr_when_source_issue_still_open(monkeypatch):
@@ -1618,10 +1725,11 @@ async def test_drive_proceeds_when_source_issue_closed_by_board_sibling(monkeypa
     assert loop._inflight == {}
 
 
-async def test_drive_cancels_when_source_issue_closed_externally(monkeypatch):
+async def test_drive_blocks_and_keeps_work_when_source_issue_closed_externally(monkeypatch):
     """#253 boundary: the source issue is closed and NO board sibling carries it
-    (only a done card for an unrelated issue), so the closure is external and the
-    #166 supersede-cancel proceeds unchanged."""
+    (only a done card for an unrelated issue), so the closure is external. The PR is
+    held — but the card is BLOCKED for a human with its tree kept, never cancelled
+    and discarded (protoAgent#3832)."""
     opened = []
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
@@ -1631,15 +1739,22 @@ async def test_drive_cancels_when_source_issue_closed_externally(monkeypatch):
     async def _closed(si_raw, cwd):
         return False
 
+    async def _slug(*, cwd):
+        return "owner/repo"
+
     monkeypatch.setattr(loop_mod, "_source_issue_still_open", _closed)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    discards = _record_discards(monkeypatch)
     feature = dict(FEATURE, id="bd-2", source_issue="owner/repo#42")
     unrelated = {"id": "bd-1", "board_state": "done", "source_issue": "owner/repo#99", "pr_url": "https://x/pr/1"}
     loop, store = await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature, store_features=[unrelated])
     assert opened == []  # no PR opened
-    assert "cancel_feature" in store.names()
+    assert "cancel_feature" not in store.names()
     assert "open_review" not in store.names()
-    cancel_calls = [c for c in store.calls if c[0] == "cancel_feature"]
-    assert any("superseded" in c[2] for c in cancel_calls)
+    assert discards == [] and store.removes == []
+    blocks = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocks) == 1 and blocks[0][1] == "bd-2"
+    assert "owner/repo#42" in blocks[0][2] and "feat/bd-2" in blocks[0][2]
     assert loop._inflight == {}
 
 
