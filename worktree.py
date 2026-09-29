@@ -53,6 +53,22 @@ class CoderTimeout(WorktreeError):
     on the same prompt would likely hang again)."""
 
 
+async def coder_bound(aw, timeout):
+    """Await a coder dispatch under its ``coder_timeout_s`` bound, counting time asleep (#472).
+
+    ``asyncio.wait_for`` runs on ``time.monotonic()``, which on macOS stops while the machine
+    sleeps, so a 1800s bound set during a DarkWake held for hours of real time. The host's
+    ``infra.clock.wait_for`` keeps the deadline on a clock that counts sleep; otherwise it
+    behaves like ``asyncio.wait_for`` (cancels ``aw`` and raises ``TimeoutError``). A falsy
+    ``timeout`` is unbounded, as before. The host import is lazy like every other host import
+    here; there is no fallback, since ``min_protoagent_version`` (0.185.0) guarantees it."""
+    if not timeout:
+        return await aw
+    from infra.clock import wait_for
+
+    return await wait_for(aw, timeout)
+
+
 class WorktreeMissing(WorktreeError):
     """The worktree a drive was building in is gone — reaped or deleted under it (#461).
 
@@ -1937,10 +1953,10 @@ async def dispatch_coder(
         log.warning("[project_board] forget_session failed for %s", worktree, exc_info=True)
     try:
         # Hard-bound the dispatch so a hung coder can't hold a worktree/slot forever.
-        # On timeout asyncio.wait_for cancels the dispatch — the finally below reaps
+        # On timeout coder_bound cancels the dispatch — the finally below reaps
         # the subprocess — and we raise CoderTimeout (capability, not transient).
         coro = adapter.dispatch(scoped, prompt, timeout=timeout)
-        return await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        return await coder_bound(coro, timeout)
     except asyncio.TimeoutError:
         raise CoderTimeout(f"coder timed out after {timeout}s")
     except DelegateError as exc:

@@ -58,6 +58,33 @@ if "graph" not in sys.modules:
     sys.modules["graph"] = _graph
     sys.modules["graph.sdk"] = _graph_sdk
 
+# `infra.clock.wait_for` is the host's sleep-aware `asyncio.wait_for` (protoAgent 0.185.0,
+# #3724) that bounds every coder dispatch (worktree.coder_bound, #472). The host-free suite
+# has no `infra` package, so register a double with the same signature. It delegates to
+# `asyncio.wait_for`: sleep is not something a unit test can produce, and the host's own
+# suite covers the clock. tests/test_sleep_aware_coder_timeout_472.py proves the dispatch
+# paths go through it, and checks the signature against the host with PB_PROTOAGENT_SRC.
+try:
+    import infra.clock  # noqa: F401 — a real host on the path wins
+except ImportError:
+    import asyncio as _asyncio
+    import time as _time
+
+    _infra = sys.modules.get("infra") or types.ModuleType("infra")
+    if not hasattr(_infra, "__path__"):
+        _infra.__path__ = []  # a package, so `infra.paths` still fails as "no host" (ImportError)
+    _infra_clock = types.ModuleType("infra.clock")
+
+    async def _double_wait_for(aw, timeout, *, slice_s=None):
+        return await _asyncio.wait_for(aw, timeout)
+
+    _infra_clock.wait_for = _double_wait_for
+    _infra_clock.now = _time.monotonic
+    _infra_clock.DEFAULT_SLICE_S = 15.0
+    _infra.clock = _infra_clock
+    sys.modules["infra"] = _infra
+    sys.modules["infra.clock"] = _infra_clock
+
 
 @pytest.fixture(autouse=True)
 def _no_real_br_version(monkeypatch, tmp_path_factory):

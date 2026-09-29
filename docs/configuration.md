@@ -96,7 +96,7 @@ project is deleted.
 
 The registry write is a read-modify-write of the host's whole `projects:` list. It runs
 inside the host's config write lock, through the callable form of `HOST.apply_settings`
-(protoAgent 0.164.0+, which is why that is the minimum). Before it writes, it checks that
+(protoAgent 0.164.0+; the plugin now requires 0.185.0 for sleep-aware coder timeouts, #472). Before it writes, it checks that
 every existing entry is still in the new list, so a concurrent `onboard_project` can't be
 dropped.
 

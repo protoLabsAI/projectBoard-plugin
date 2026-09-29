@@ -2313,9 +2313,11 @@ async def test_dispatch_coder_tapped_normalizes_a_seam_failure_to_worktree_error
 
 
 async def test_dispatch_coder_tapped_maps_a_seam_timeout_to_coder_timeout(monkeypatch):
-    """A configured timeout hard-bounds the seam via asyncio.wait_for exactly as the
-    untapped path does — a fired deadline surfaces as CoderTimeout, not a raw error."""
+    """A configured timeout hard-bounds the seam via worktree.coder_bound (the host's
+    sleep-aware infra.clock.wait_for, #472) exactly as the untapped path does — a fired
+    deadline surfaces as CoderTimeout, not a raw error."""
     import asyncio as real_asyncio
+    import sys
 
     coder_seam._progress.clear()
 
@@ -2323,11 +2325,11 @@ async def test_dispatch_coder_tapped_maps_a_seam_timeout_to_coder_timeout(monkey
         await real_asyncio.sleep(10)
         return "never"
 
-    async def _boom_wait_for(coro, timeout):
+    async def _boom_wait_for(coro, timeout, *, slice_s=None):
         coro.close()
         raise real_asyncio.TimeoutError()
 
-    monkeypatch.setattr("project_board.coder_seam.asyncio.wait_for", _boom_wait_for)
+    monkeypatch.setattr(sys.modules["infra.clock"], "wait_for", _boom_wait_for)
 
     try:
         await coder_seam.dispatch_coder_tapped(

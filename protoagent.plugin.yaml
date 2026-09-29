@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.164.0"  # callable HOST.apply_settings under the config write lock (#2743); settings_tabs (#3179/#3180)
+min_protoagent_version: "0.185.0"  # infra.clock.wait_for: sleep-aware coder timeouts (#472, protoAgent #3724); callable HOST.apply_settings (#2743); settings_tabs (#3179/#3180)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
@@ -147,7 +147,10 @@ config:
   coder_timeout_s: 1800     # stuck-drive watchdog: hard cap on one coder dispatch
                             # (30 min). A timeout reaps the coder + is a capability
                             # failure (escalate-or-block), not a transient retry.
-                            # 0 disables the cap.
+                            # 0 disables the cap. The cap counts time the machine
+                            # spends asleep (host infra.clock, #472): a coder
+                            # dispatched before a Mac sleeps times out at the first
+                            # awake moment past the cap, not after 30 AWAKE minutes.
   max_concurrent: 1         # worktree/coder concurrency cap (token + merge cost).
                             # >1 drives that many features in parallel, each in its
                             # own worktree; 1 = serial (the safe default). Parallel
