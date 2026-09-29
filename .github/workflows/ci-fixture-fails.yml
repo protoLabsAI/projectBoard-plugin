@@ -1,0 +1,29 @@
+name: CI fixture (always fails)
+
+# ⚠️ FIXTURE — the real-GitHub test tier's permanently-FAILED run (#487).
+#
+# `worktree.rerun_failed_ci` (rerun a PR's failed Actions jobs once before spending a coder
+# fix round on what may be a flake) shells a real `gh run rerun --failed`. The external-seam
+# ratchet requires that seam to be exercised against real GitHub, which needs a run that
+# FAILED on purpose. Dispatch this once; pin the run id in the repo variable
+# `PB_GH_FIXTURE_FAILED_RUN`. The real tier reruns that run's failed job and asserts a new
+# attempt starts (it fails again, by design — each rerun costs one ~5 s job).
+#
+# Never triggered by push/PR: dispatch only. Don't delete it or its pinned run.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  always-fails:
+    name: always fails (fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fail on purpose
+        run: |
+          echo "projectBoard-plugin CI fixture: this job fails by design (#487)."
+          exit 1
