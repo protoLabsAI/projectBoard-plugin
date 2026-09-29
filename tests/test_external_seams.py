@@ -153,6 +153,10 @@ WORKTREE_SEAMS: dict[str, str] = {
     "open_pr_heads": "REAL",
     "remote_branches": "REAL",
     "untagged_release_head": "REAL",
+    # #487: rerun a red PR's failed Actions jobs once before a fix round — a real
+    # `gh run rerun --failed` against the pinned, deliberately failed fixture run
+    # (PB_GH_FIXTURE_FAILED_RUN) in tests/test_publish_gate_real.py.
+    "rerun_failed_ci": "REAL",
 }
 
 # gates.py — publish gates (`waits_for`). Two seams reach the outside: `_http_get_json`
@@ -231,6 +235,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_merged_verified": "REAL",
     "record_pr_url": "REAL",  # #398: through real `br` in tests/test_requeue_under_drive_398.py
     "record_review_bounce": "REAL",  # #473: the head stamp + comment, real `br` in tests/test_external_review_473.py
+    "record_ci_rerun": "REAL",  # #487: the rerun stamp, real `br` in tests/test_ci_rerun_487.py
     "record_reviewed_head": "UNCOVERED",
     "request_decomposition": "REAL",
     "record_verification": "REAL",
@@ -342,11 +347,20 @@ def test_gates_seams_are_all_covered_and_the_real_tier_cannot_skip_in_ci():
     tier = (_ROOT / "tests" / "test_publish_gate_real.py").read_text()
     for name in GATES_SEAMS:
         assert f"gates.{name}(" in tier, f"{name} is REAL but the real tier never calls gates.{name}("
-    for name in ("remote_branches", "open_pr_heads", "active_workflow_runs", "untagged_release_head"):
+    for name in (
+        "remote_branches",
+        "open_pr_heads",
+        "active_workflow_runs",
+        "untagged_release_head",
+        "rerun_failed_ci",
+    ):
         assert f"worktree.{name}(" in tier, f"{name} is REAL but the real tier never calls worktree.{name}("
     assert "PB_REQUIRE_NPM" in tier and "PB_REQUIRE_GH" in tier
     ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert "tests/test_publish_gate_real.py" in ci and "PB_REQUIRE_NPM" in ci
+    # #487: the rerun seam needs its pinned failed run and a token that may rerun it.
+    assert "PB_GH_FIXTURE_FAILED_RUN" in tier and "PB_GH_ALLOW_WRITES" in tier
+    assert "PB_GH_FIXTURE_FAILED_RUN: ${{ vars.PB_GH_FIXTURE_FAILED_RUN }}" in ci and "actions: write" in ci
 
 
 def _host_config_writers(path: str) -> set[str]:
@@ -411,8 +425,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_42_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 42 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_43_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 43 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -427,7 +441,9 @@ def test_worktree_coverage_contract_is_42_real_3_exempt_0_uncovered():
     ``pr_review_state`` (the external QA panel's verdict read), against the pinned PR in
     tests/test_worktree_gh.py; the 40th #476's ``fix_round_unchanged``, against real git in
     tests/test_fix_round_no_change_476.py; the 41st and 42nd #475's ``_checked_out_branches`` and
-    ``reap_candidate_branches``, against real git in tests/test_stale_candidate_branch_475.py.
+    ``reap_candidate_branches``, against real git in tests/test_stale_candidate_branch_475.py; the
+    43rd #487's ``rerun_failed_ci``, a real ``gh run rerun --failed`` of the pinned failed fixture
+    run in tests/test_publish_gate_real.py.
 
     Every worktree seam is exercised against the real binary/API (REAL) EXCEPT the three PR-lifecycle
     WRITES — open_pr / close_pr / _promote_adopted_draft — which are honestly EXEMPT: each creates,
@@ -445,7 +461,7 @@ def test_worktree_coverage_contract_is_42_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 42, f"expected 42 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 43, f"expected 43 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

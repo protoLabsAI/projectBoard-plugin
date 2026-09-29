@@ -175,6 +175,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # feature is blocked for human triage (a real bug, not a self-fixable nit).
         self.ci_poll = bool(self.cfg.get("ci_poll", self.merge_poll))
         self.ci_fix_max = max(0, int(self.cfg.get("ci_fix_max", 2)))
+        # #487: before a red rollup spends a `ci_fix_max` unit, rerun its failed GitHub
+        # Actions jobs up to this many times per PR head — a flaky job is not the coder's
+        # bug. Recorded on the bead (`ci-rerun:<sha>:<n>`), so a restart can't rerun a
+        # head twice; a new push re-arms it. 0 disables (bounce on the first red, as before).
+        self.ci_rerun_max = max(0, int(self.cfg.get("ci_rerun_max", 1)))
         # Auto-rebase a stale/conflicting in_review PR onto base. Parallel PRs branch
         # off the SAME base, and the hot-file guard serializes DISPATCH not the branch
         # BASE — so each merge re-stales the others (a sibling's change lands in the
@@ -473,6 +478,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # The prompt-feedback dicts (_ci_feedback/_ci_prior_diff/_review_prior)
         # stay memory-only: they enrich the next prompt, they never gate anything.
         self._ci_feedback: dict[str, str] = {}
+        # #487: the failed check names a CI rerun was spent on, for the flake log line
+        # when the rerun comes back green (in memory only; a restart just names fewer).
+        self._ci_rerun_checks: dict[str, str] = {}
         self._ci_prior_diff: dict[str, str] = {}
         self._ci_fix_attempts: dict[str, int] = {}
         # Pre-PR goal-verify gap re-dispatches so far (fid → count), same-tier.

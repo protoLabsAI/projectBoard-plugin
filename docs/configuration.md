@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **29 of 79 keys are in this state, including `coders` and `projects`** —
+never renders it. **29 of 80 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -332,10 +332,21 @@ The gates between a green build and main.
 | `auto_merge_max` | `3` | reload |
 | `merged_verify_max` | `5` | reload |
 | `ci_fix_max` | `2` | reload |
+| `ci_rerun_max` | `1` | reload |
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
 | `external_review` | `—` | reload **· YAML only** |
 | `auto_merge` | `False` | live |
+
+`ci_rerun_max` is how many times a red PR's failed GitHub Actions jobs are rerun per PR head
+before `ci_fix_max` spends a coder fix round on them (#487). A flaky job is not the coder's bug.
+On the first red, the board runs `gh run rerun <id> --failed` for each failing Actions run,
+stamps the bead `ci-rerun:<sha>:<n>` and spends nothing. If the rerun comes back green, it
+logs one `CI flake` line naming the checks that failed and clears the stamp. If it is red again
+at the same head, the card bounces into a fix round as before. A new push is a new head and
+gets a fresh allowance. With no Actions run behind the red checks (only a non-Actions required
+status failed), or when `gh` refuses the rerun, the card bounces at once. Rerunning needs the
+board's `gh` token to hold `actions: write` on the repo. `0` turns reruns off.
 
 `review_gate_timeout_s` is a hard cap on one review-gate model call: the host workflow run,
 or the a2a reviewer fallback. The cap is the board's own, not the host model client's. That

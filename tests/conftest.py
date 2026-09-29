@@ -142,6 +142,7 @@ REAL_SEAMS = {
     "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
     "worktree.refresh_base_checkout": _worktree_mod.refresh_base_checkout,
     "worktree.pr_review_state": _worktree_mod.pr_review_state,
+    "worktree.rerun_failed_ci": _worktree_mod.rerun_failed_ci,
 }
 
 
@@ -177,6 +178,15 @@ def _no_publish_gate_network(monkeypatch):
     monkeypatch.setattr(_worktree_mod, "open_pr_heads", _no_prs)
     monkeypatch.setattr(_worktree_mod, "active_workflow_runs", _no_runs)
     monkeypatch.setattr(_worktree_mod, "untagged_release_head", _no_release_gap)
+
+    # #487: the CI reconcile reruns a red PR's failed Actions jobs before a fix round. The
+    # unit tier never asks GitHub to rerun anything: by default nothing is rerun, so every
+    # pre-existing CI-bounce test bounces on the first red exactly as before. A test of the
+    # rerun edge injects its own; tests/test_publish_gate_real.py restores the real seam.
+    async def _no_rerun(_pr_url="", *, cwd=".", run_ids=None, slug=""):
+        return []
+
+    monkeypatch.setattr(_worktree_mod, "rerun_failed_ci", _no_rerun)
     _gates_mod.reset_cache()
     _freeze_mod.reset_state()
     yield

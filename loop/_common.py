@@ -446,6 +446,15 @@ def _ci_failure_reason(summary: str, max_chars: int = 500) -> str:
     return reason[:max_chars]
 
 
+def _ci_failed_check_names(summary: str) -> str:
+    """The failing check names from a ``pr_ci_status`` summary (``- <name>: <CONCLUSION>``
+    lines above the log excerpt), joined for one log line — what a CI rerun (#487) was
+    spent on. ``""`` when the summary names none."""
+    head = (summary or "").split("\n\nFailing log", 1)[0]
+    lines = [ln[2:].strip() for ln in head.splitlines() if ln.startswith("- ")]
+    return ", ".join(ln.rpartition(":")[0].strip() or ln for ln in lines)
+
+
 _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
 
 
@@ -1485,6 +1494,7 @@ __all__ = [
     "_is_test_path",
     "_is_code_path",
     "_CI_SIGNAL_RE",
+    "_ci_failed_check_names",
     "_ci_failure_reason",
     "_PR_URL_RE",
     "_parse_pr_url",

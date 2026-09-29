@@ -1886,7 +1886,13 @@ class ReconcileMixin:
         if await worktree.pr_state(pr_url, cwd=repo) != "OPEN":
             return  # merged/closed since the poll started -> never dispatch a CI fix
         status, summary = await worktree.pr_ci_status(pr_url, cwd=repo)
+        if status == "passing":
+            await self._settle_ci_rerun(store, fid, pr_url, repo, feature)
         if status != "failing":
+            return
+        # #487: a red rollup may be a flake. Rerun its failed Actions jobs once per head
+        # before spending a fix round; the next pass sees the rerun's verdict.
+        if await self._rerun_ci_once(store, fid, pr_url, repo, feature, summary):
             return
         # Carry the lesson: the CI error + the diff that failed it (best-effort).
         self._ci_feedback[fid] = summary
@@ -1934,6 +1940,83 @@ class ReconcileMixin:
         await _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
         await worktree.reap_feature_worktree(repo, self.root, fid)
         log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
+
+    async def _rerun_ci_once(self, store, fid: str, pr_url: str, repo: str, feature: dict | None, summary: str) -> bool:
+        """Rerun a red PR's failed GitHub Actions jobs before a coder fix round (#487).
+
+        Returns True when a rerun was started: the caller then spends nothing and requeues
+        nothing, and a later pass reads the rerun's verdict (green → ``_settle_ci_rerun``
+        logs the flake; red again at the same head → the bounce below runs as it always has).
+
+        At most ``ci_rerun_max`` reruns per PR head, counted on the bead's
+        ``ci-rerun:<sha>:<n>`` label so a restart can't rerun a head again; a new push is a
+        new head and gets a fresh allowance. Returns False — bounce exactly as before — when
+        reruns are off (``ci_rerun_max: 0``), this head's allowance is spent, the head can't
+        be read to prove otherwise, or nothing was rerun (no Actions run behind the red
+        checks, e.g. only a non-Actions required status failed, or ``gh`` refused)."""
+        cap = int(getattr(self, "ci_rerun_max", 0) or 0)
+        if cap <= 0:
+            return False
+        stamped, used = store_mod.ci_rerun_from_labels((feature or {}).get("labels"))
+        head = ""
+        if stamped:
+            # Only a stamp needs the head up front: without one this is the head's first
+            # rerun whatever it is, and the head is read after the rerun to stamp it.
+            head = await worktree.pr_head_sha(pr_url, cwd=repo)
+            if not head:
+                return False  # can't prove this head still has an allowance → bounce as before
+            if head[: store_mod.SHORT_SHA_LEN] != stamped:
+                used = 0  # a new push since the last rerun: a fresh allowance
+            elif used >= cap:
+                return False  # this head was already rerun and is red again → a real failure
+        run_ids = await worktree.rerun_failed_ci(pr_url, cwd=repo)
+        if not run_ids:
+            return False
+        if not head:
+            head = await worktree.pr_head_sha(pr_url, cwd=repo)
+        short = head[: store_mod.SHORT_SHA_LEN] if head else "an unreadable head"
+        self.__dict__.setdefault("_ci_rerun_checks", {})[fid] = _ci_failed_check_names(summary)
+        if head:
+            try:
+                await asyncio.to_thread(store.record_ci_rerun, fid, head, used + 1)
+            except Exception as exc:  # noqa: BLE001 — the rerun is already running; a failed
+                # stamp only means a later red at this head may be rerun once more.
+                log.warning("[project_board] %s: could not stamp the CI rerun at %s: %s", fid, short, exc)
+        log.info(
+            "[project_board] %s CI red at %s — rerunning failed jobs once before a fix round: %s (%s)",
+            fid,
+            short,
+            ", ".join(run_ids),
+            pr_url,
+        )
+        return True
+
+    async def _settle_ci_rerun(self, store, fid: str, pr_url: str, repo: str, feature: dict | None) -> None:
+        """A green rollup on a card with a ``ci-rerun:`` stamp (#487): the rerun passed with
+        no fix round. Log ONE flake line naming the checks that failed the first time (when
+        the head is still the one that was rerun; a green new head is just a fixed PR), and
+        clear the stamp. Best-effort: an unreadable head leaves the stamp for the next poll."""
+        checks_by_fid = self.__dict__.setdefault("_ci_rerun_checks", {})
+        stamped, _used = store_mod.ci_rerun_from_labels((feature or {}).get("labels"))
+        if not stamped:
+            checks_by_fid.pop(fid, None)
+            return
+        head = await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head:
+            return
+        checks = checks_by_fid.pop(fid, "") or "the failed checks (names not kept across a restart)"
+        if head[: store_mod.SHORT_SHA_LEN] == stamped:
+            log.info(
+                "[project_board] %s CI flake: the rerun at %s passed with no fix round spent — failed first: %s (%s)",
+                fid,
+                stamped,
+                checks,
+                pr_url,
+            )
+        try:
+            await asyncio.to_thread(store.record_ci_rerun, fid, "")
+        except Exception as exc:  # noqa: BLE001 — a stale stamp only costs a rerun allowance
+            log.warning("[project_board] %s: could not clear the CI rerun stamp: %s", fid, exc)
 
     async def _request_review(self, fid: str, pr_url: str):
         """Hand the PR to the reviewer (an a2a delegate, e.g. quinn). Best-effort:

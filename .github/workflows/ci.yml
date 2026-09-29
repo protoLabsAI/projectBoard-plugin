@@ -132,6 +132,8 @@ jobs:
       statuses: write
       pull-requests: write
       issues: write
+      # #487: `gh run rerun --failed` of the pinned failed fixture run (PB_GH_FIXTURE_FAILED_RUN).
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -160,6 +162,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PB_GH_FIXTURE_PR: ${{ vars.PB_GH_FIXTURE_PR || github.event.pull_request.html_url }}
           PB_GH_ALLOW_WRITES: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
+          # #487: a run of ci-fixture-fails.yml (dispatch-only, always fails) that the rerun seam
+          # reruns for real — a public run id, never a credential. Needs `actions: write` above.
+          PB_GH_FIXTURE_FAILED_RUN: ${{ vars.PB_GH_FIXTURE_FAILED_RUN }}
         # tests/test_attach_pr_gh_402.py: the attach edge's `pr_identity` seam (#402), REAL in the
         # seam ratchet. It needs no `br`, so it runs here, where the fixture is.
         # tests/test_publish_gate_real.py: the publish-gate evaluators (`waits_for`: npm registry

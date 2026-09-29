@@ -616,6 +616,13 @@ LABEL_REVIEWED_HEAD_PREFIX = "reviewed-head:"
 # and a new push is a new head, which re-arms it. On the bead, not in memory, so a
 # restart can't re-bounce a head the last process already bounced.
 LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX = "ext-review-bounced:"
+# The PR head whose failed CI jobs the reconcile already RERAN (#487) —
+# `ci-rerun:<sha>:<n>`, replaced (never accumulated), SHORT for the 50-char label cap. A
+# red rollup is rerun (`gh run rerun --failed`) up to `ci_rerun_max` times per head before
+# a coder fix round is spent on what may be a flake; `<n>` is how many reruns this head has
+# had. On the bead, not in memory, so a restart can't rerun a head the last process already
+# reran. A new push is a new head, which re-arms the allowance; a green rollup clears it.
+LABEL_CI_RERUN_PREFIX = "ci-rerun:"
 # The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
 # metadata line in the bead `notes` field, beside the files_to_modify path lines.
 # NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
@@ -669,6 +676,19 @@ def budgets_from_labels(labels) -> dict[str, int]:
         if kind and num.isdigit():
             out[kind] = int(num)
     return out
+
+
+def ci_rerun_from_labels(labels) -> tuple[str, int]:
+    """``(short_head, reruns)`` from a bead's ``ci-rerun:<sha>:<n>`` label (#487), or
+    ``("", 0)`` when there is none. A malformed count reads as 1: the label only exists
+    once a rerun was spent, so it must never re-arm an allowance it cannot parse."""
+    for label in labels or []:
+        if not str(label).startswith(LABEL_CI_RERUN_PREFIX):
+            continue
+        head, _, num = str(label)[len(LABEL_CI_RERUN_PREFIX) :].partition(":")
+        if head:
+            return head, int(num) if num.isdigit() and int(num) > 0 else 1
+    return "", 0
 
 
 def replace_prefixed_label_args(labels, prefix: str, desired: str) -> list[str]:
@@ -3974,6 +3994,27 @@ class BeadsBoard:
             f.get("labels"), LABEL_MERGED_VERIFIED_PREFIX, f"{LABEL_MERGED_VERIFIED_PREFIX}{sha}"
         )
         self._run(*args)
+        return self.get_feature(fid)
+
+    # ── CI rerun stamp (#487) ─────────────────────────────────────────────────
+    def record_ci_rerun(self, fid: str, head: str = "", n: int = 1) -> dict:
+        """Stamp the PR head whose failed CI jobs were rerun, and how many times (#487) —
+        a single, replaced ``ci-rerun:<sha>:<n>`` label (the ``merged-verified:`` pattern),
+        SHORT-abbreviated for beads' 50-char label cap. ``head=""`` CLEARS the stamp (the
+        rerun came back green, or the head moved on). No-op when there is nothing to change,
+        so a green poll never burns a ``br`` write."""
+        f = self._require(fid)
+        labels = f.get("labels") or []
+        short = str(head or "").strip()[:SHORT_SHA_LEN]
+        if short:
+            args = replace_prefixed_label_args(
+                labels, LABEL_CI_RERUN_PREFIX, f"{LABEL_CI_RERUN_PREFIX}{short}:{max(1, int(n))}"
+            )
+        else:
+            args = [a for l in labels if str(l).startswith(LABEL_CI_RERUN_PREFIX) for a in ("--remove-label", str(l))]
+        if not args:
+            return f
+        self._run("update", fid, *args)
         return self.get_feature(fid)
 
     # ── review-verdict head stamp (#328) ──────────────────────────────────────

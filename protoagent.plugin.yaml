@@ -193,6 +193,11 @@ config:
   ci_fix_max: 2             # cap on CI-fix re-dispatches before the feature is Blocked for
                             # human triage (a real bug, not a self-fixable nit). 0 = never
                             # auto-fix (block on the first CI failure).
+  ci_rerun_max: 1           # #487: rerun a red PR's failed GitHub Actions jobs this many times
+                            # per PR head BEFORE a ci_fix_max fix round — a flaky job is not
+                            # the coder's bug. Green after the rerun → a logged flake, nothing
+                            # spent; red again at the same head → the usual bounce. A new push
+                            # re-arms it. Needs `actions: write` on the gh token. 0 = off.
   auto_rebase: true         # keep stale in_review PRs mergeable (v0.14.0, bd-2gu). Parallel
                             # PRs branch off the SAME base and the hot-file guard serializes
                             # DISPATCH not the branch BASE, so each merge re-stales the others.
@@ -329,6 +334,8 @@ settings:
       description: "Poll CI for in-review PRs and re-dispatch failures instead of leaving red PRs parked forever." }
   - { key: ci_fix_max, label: "CI fix attempts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: ci_poll },
       description: "Automatic CI-fix re-dispatches before the card blocks for human triage. 0 blocks on the first failure." }
+  - { key: ci_rerun_max, label: "CI reruns before a fix", type: number, minimum: 0, maximum: 5, group: "Project Board", tab: review, restart: true, depends_on: { key: ci_poll },
+      description: "Rerun a red PR's failed GitHub Actions jobs this many times per head before spending a CI fix attempt on a possible flake. 0 turns reruns off." }
   - { key: auto_rebase, label: "Rebase stale PRs", type: bool, group: "Project Board", tab: review, restart: true,
       description: "Cleanly rebase behind PRs and re-dispatch genuine conflicts so parallel work remains mergeable." }
   - { key: rebase_fix_max, label: "Conflict fix attempts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: auto_rebase },
