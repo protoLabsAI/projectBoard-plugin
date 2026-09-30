@@ -1944,8 +1944,9 @@ class ReconcileMixin:
     async def _rerun_ci_once(self, store, fid: str, pr_url: str, repo: str, feature: dict | None, summary: str) -> bool:
         """Rerun a red PR's failed GitHub Actions jobs before a coder fix round (#487).
 
-        Returns True when a rerun was started: the caller then spends nothing and requeues
-        nothing, and a later pass reads the rerun's verdict (green → ``_settle_ci_rerun``
+        Returns True when a rerun was started — or when the red run is still running, so
+        GitHub can't rerun it yet (wait a pass, unstamped) — the caller then spends nothing
+        and requeues nothing, and a later pass reads the rerun's verdict (green → ``_settle_ci_rerun``
         logs the flake; red again at the same head → the bounce below runs as it always has).
 
         At most ``ci_rerun_max`` reruns per PR head, counted on the bead's
@@ -1969,7 +1970,23 @@ class ReconcileMixin:
                 used = 0  # a new push since the last rerun: a fresh allowance
             elif used >= cap:
                 return False  # this head was already rerun and is red again → a real failure
-        run_ids = await worktree.rerun_failed_ci(pr_url, cwd=repo)
+        busy: list[str] = []
+        run_ids = await worktree.rerun_failed_ci(pr_url, cwd=repo, busy=busy)
+        if not run_ids and busy:
+            # A job failed while the rest of its run is still going: GitHub won't rerun a
+            # run until it finishes. That is "not yet", not "nothing to rerun" — wait a pass
+            # (no stamp, no fix round spent) and rerun once the run completes.
+            waiting = self.__dict__.setdefault("_ci_rerun_waiting", {})
+            if waiting.get(fid) != tuple(busy):
+                waiting[fid] = tuple(busy)
+                log.info(
+                    "[project_board] %s CI red but run(s) %s still running — waiting for them to finish before a rerun (%s)",
+                    fid,
+                    ", ".join(busy),
+                    pr_url,
+                )
+            return True
+        self.__dict__.setdefault("_ci_rerun_waiting", {}).pop(fid, None)
         if not run_ids:
             return False
         if not head:

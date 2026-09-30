@@ -183,7 +183,7 @@ def _no_publish_gate_network(monkeypatch):
     # unit tier never asks GitHub to rerun anything: by default nothing is rerun, so every
     # pre-existing CI-bounce test bounces on the first red exactly as before. A test of the
     # rerun edge injects its own; tests/test_publish_gate_real.py restores the real seam.
-    async def _no_rerun(_pr_url="", *, cwd=".", run_ids=None, slug=""):
+    async def _no_rerun(_pr_url="", *, cwd=".", run_ids=None, slug="", busy=None):
         return []
 
     monkeypatch.setattr(_worktree_mod, "rerun_failed_ci", _no_rerun)

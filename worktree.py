@@ -2543,6 +2543,9 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
 # (``https://github.com/<owner>/<repo>/actions/runs/<id>/job/<job>``); a non-Actions status
 # has none, and there is nothing to rerun.
 _ACTIONS_RUN_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/actions/runs/(\d+)")
+# What `gh run rerun` says for a run whose other jobs haven't finished (lower-cased match):
+# "run <id> cannot be rerun; This workflow is already running".
+_RUN_STILL_RUNNING = "workflow is already running"
 _PR_SLUG_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/\d+")
 
 
@@ -2564,7 +2567,12 @@ def failed_ci_run_ids(checks) -> list[tuple[str, str]]:
 
 
 async def rerun_failed_ci(
-    pr_url: str = "", *, cwd: str = ".", run_ids: Iterable[str] | None = None, slug: str = ""
+    pr_url: str = "",
+    *,
+    cwd: str = ".",
+    run_ids: Iterable[str] | None = None,
+    slug: str = "",
+    busy: list[str] | None = None,
 ) -> list[str]:
     """Rerun the failed jobs of a PR's failing GitHub Actions runs (#487) —
     ``gh run rerun <id> --failed`` per run — and return the run ids GitHub accepted.
@@ -2576,7 +2584,12 @@ async def rerun_failed_ci(
     Best-effort, never raises into the loop: an unreadable rollup, no Actions run behind the
     failures, or a ``gh`` refusal (no ``actions: write``, a run already rerunning, a run too
     old to rerun) is logged and that run is left out, so ``[]`` means "nothing was rerun" and
-    the caller bounces the card as it did before #487."""
+    the caller bounces the card as it did before #487.
+
+    A run GitHub refuses because it is STILL RUNNING (a fast job failed while its siblings
+    finish — ``gh`` says "This workflow is already running") is not a refusal to rerun, only
+    "not yet": its id goes into ``busy`` when the caller passes a list, so the caller can
+    wait a pass instead of spending a fix round on a run it never got to rerun."""
     if run_ids is None:
         try:
             rc, out, err = await _gh(
@@ -2605,7 +2618,11 @@ async def rerun_failed_ci(
             log.warning("[project_board] rerun_failed_ci: gh run rerun %s failed: %s", rid, exc)
             continue
         if rc != 0:
-            log.warning("[project_board] rerun_failed_ci: gh run rerun %s refused: %s", rid, (err or out).strip()[:200])
+            why = (err or out).strip()
+            if busy is not None and _RUN_STILL_RUNNING in why.lower():
+                busy.append(rid)
+                continue
+            log.warning("[project_board] rerun_failed_ci: gh run rerun %s refused: %s", rid, why[:200])
             continue
         reran.append(rid)
     return reran

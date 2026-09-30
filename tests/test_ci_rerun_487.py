@@ -75,8 +75,8 @@ class _Store:
 class _Gh:
     """The mocked GitHub the reconcile reads: a CI verdict, a head, and the rerun seam."""
 
-    def __init__(self, monkeypatch, *, ci=RED, head=HEAD, rerun=("111",)):
-        self.ci, self.head, self.rerun = ci, head, list(rerun)
+    def __init__(self, monkeypatch, *, ci=RED, head=HEAD, rerun=("111",), busy=()):
+        self.ci, self.head, self.rerun, self.busy = ci, head, list(rerun), list(busy)
         self.reruns: list[str] = []
 
         async def _pr_state(url, *, cwd="."):
@@ -97,8 +97,10 @@ class _Gh:
         async def _head(url, *, cwd="."):
             return self.head
 
-        async def _rerun(pr_url="", *, cwd=".", run_ids=None, slug=""):
+        async def _rerun(pr_url="", *, cwd=".", run_ids=None, slug="", busy=None):
             self.reruns.append(pr_url)
+            if busy is not None:
+                busy.extend(self.busy)
             return list(self.rerun)
 
         monkeypatch.setattr(worktree, "pr_state", _pr_state)
@@ -183,6 +185,26 @@ async def test_no_actions_run_ids_bounces_immediately(monkeypatch):
     await loop._reconcile_prs()
     assert gh.reruns == [PR] and store.requeued == ["bd-ci"] and _ci_fix_spent(store) == [1]
     assert store.feature["labels"] == [] and store.stamps == []
+
+
+async def test_a_red_job_whose_run_is_still_running_waits_instead_of_bouncing(monkeypatch, caplog):
+    """A fast job fails while the rest of its run is still going: GitHub refuses the rerun
+    ("This workflow is already running"). That is "not yet", not "nothing to rerun" — bd-4fsn
+    spent three coder rounds (sonnet → opus → opus, each correctly committing nothing) and
+    went terminal-blocked on exactly this. Wait, unstamped and unspent, then rerun."""
+    store, gh, loop = _setup(monkeypatch, rerun=(), busy=("36672773134",))
+    with caplog.at_level(logging.INFO, logger="protoagent.plugins.project_board"):
+        await loop._reconcile_prs()
+        await loop._reconcile_prs()  # still running: waits again, logs once
+    assert store.requeued == [] and _ci_fix_spent(store) == [] and store.blocked == []
+    assert store.stamps == [] and "bd-ci" not in loop._ci_feedback
+    waits = [r.getMessage() for r in caplog.records if "still running" in r.getMessage()]
+    assert len(waits) == 1 and "36672773134" in waits[0]
+    gh.rerun, gh.busy = ["36672773134"], []  # the run finished: GitHub accepts the rerun
+    await loop._reconcile_prs()
+    assert store.requeued == [] and store.feature["labels"] == [f"ci-rerun:{HEAD[:12]}:1"]
+    await loop._reconcile_prs()  # red again after the real rerun → the old bounce
+    assert store.requeued == ["bd-ci"] and _ci_fix_spent(store) == [1]
 
 
 async def test_ci_rerun_max_zero_is_the_old_behavior(monkeypatch):
@@ -286,6 +308,19 @@ async def test_rerun_failed_ci_reruns_each_run_and_drops_refusals(monkeypatch):
     real = REAL_SEAMS["worktree.rerun_failed_ci"]
     assert await real(PR, cwd="/repo") == ["11"]
     assert calls[1] == ("run", "rerun", "11", "--failed", "-R", "acme/app")
+    # With a `busy` list, the still-running refusal (gh's verbatim text) is reported as
+    # "not yet" rather than dropped; any other refusal is still just dropped.
+    busy: list[str] = []
+    assert await real(PR, cwd="/repo", busy=busy) == ["11"] and busy == ["22"]
+
+    async def _gh_other(*args, cwd, timeout=60):
+        if args[:2] == ("pr", "view"):
+            return 0, rollup, ""
+        return 1, "", "HTTP 403: Resource not accessible by integration"
+
+    monkeypatch.setattr(worktree, "_gh", _gh_other)
+    busy = []
+    assert await real(PR, cwd="/repo", busy=busy) == [] and busy == []
 
     async def _boom(*args, cwd, timeout=60):
         raise worktree.WorktreeError("gh timed out")
