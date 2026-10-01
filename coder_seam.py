@@ -171,6 +171,135 @@ def _extract_locations(tool_input) -> list[str]:
     return out[:8]
 
 
+# ── Display hygiene for the drawer (camera-ready monitor) ────────────────────────
+# The coder works in an absolute worktree path (`<repo>/.worktrees/feat-…`), and its
+# tool inputs, titles and narration carry that path verbatim — so the drawer printed
+# `/Users/<you>/…/.worktrees/feat-bd-x-…/tests/test_cli.py` on every row. The monitor
+# shows paths RELATIVE to the gen's worktree (or the repo it was cut from), falls back
+# to the basename for anything else absolute, and never prints the home directory.
+# Applied at SNAPSHOT time, so the buffer keeps the raw data and the persisted
+# `coder-monitor:` comment is as clean as the live view.
+
+# A narration replay shorter than this is left alone (mirrors protoAgent's
+# `_SEGMENT_REPLAY_FLOOR`, #3979): a two-word segment equal to the next chunk can be real.
+_SEGMENT_REPLAY_FLOOR = 8
+
+# Tool-input keys that say WHAT a call does in plain words, in preference order. The
+# drawer shows the first one present instead of the raw JSON args.
+_DETAIL_KEYS = ("description", "command", "cmd", "pattern", "query", "url", "prompt")
+
+
+def _display_roots(root: str) -> list[str]:
+    """The prefixes a path is made relative to, longest first: the worktree (as given
+    and resolved, since macOS hands out both `/tmp/…` and `/private/tmp/…`) and the repo
+    a `.worktrees/<name>` checkout was cut from (a coder that reads the main checkout
+    by its absolute path still shows `tinytodo/cli.py`)."""
+    roots: list[str] = []
+    for r in (root, os.path.realpath(root) if root else ""):
+        r = (r or "").rstrip("/")
+        if not r or r in roots:
+            continue
+        roots.append(r)
+        marker = "/.worktrees/"
+        if marker in r:
+            parent = r.split(marker, 1)[0]
+            if parent and parent not in roots:
+                roots.append(parent)
+    return sorted(roots, key=len, reverse=True)
+
+
+def _display_path(path, roots: list[str]) -> str:
+    """One location as the drawer shows it: relative to the first root it sits under,
+    else its basename when absolute (or home-relative), else unchanged."""
+    s = str(path or "").strip()
+    if not s:
+        return s
+    for r in roots:
+        if s == r:
+            return os.path.basename(r) or s
+        if s.startswith(r + "/"):
+            return s[len(r) + 1 :] or os.path.basename(r)
+    if s.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", s):
+        return os.path.basename(s.rstrip("/\\")) or s
+    return s
+
+
+# An absolute-path token running to the END of a string — what a clipped tool title
+# leaves behind ("cd \"/Users/me/demo/tiny-to"): if it is a prefix of a root, it is the
+# worktree path cut short and reads as "…".
+_TRAILING_PATH_RE = re.compile(r"/[^\s\"'`]*$")
+# A command's leading `cd <worktree> && ` — the coder already runs in the worktree, so on
+# the drawer that prefix is noise in front of the actual command.
+_LEADING_CD_RE = re.compile(r"^cd\s+(\"[^\"]*\"?|'[^']*'?|\S+)\s*(?:&&|;)\s*")
+
+
+def _scrub_text(text, roots: list[str], *, command: bool = False) -> str:
+    """Free text (a tool title, input preview, narration) with every root prefix
+    stripped and the home directory shown as `~` — never `/Users/<name>/…`. With
+    ``command`` (a tool's title/detail), a leading ``cd <worktree> &&`` is dropped too."""
+    s = str(text or "")
+    if not s:
+        return s
+    # The clipped tail first: a shorter root (the repo) would otherwise eat a prefix of
+    # the cut-short worktree path and leave `.worktrees/` behind.
+    m = _TRAILING_PATH_RE.search(s)
+    tok = m.group(0).rstrip("/") if m else ""
+    if len(tok) >= 8 and tok not in roots and any(r.startswith(tok) for r in roots):
+        s = s[: m.start()] + "…"
+    for r in roots:
+        s = s.replace(r + "/", "").replace(r, os.path.basename(r) or r)
+    if command:
+        cd = _LEADING_CD_RE.match(s)
+        if cd:
+            target = cd.group(1).strip("\"'")
+            if target in ("…", ".") or target.endswith("…") or any(target == os.path.basename(r) for r in roots):
+                s = s[cd.end() :] or s
+    home = os.path.expanduser("~").rstrip("/")
+    if home and home != "/" and len(home) > 1:
+        s = s.replace(home + "/", "~/").replace(home, "~")
+    return s
+
+
+def _tool_detail(tool_input) -> str:
+    """A plain-words line for a tool call: its ``description`` (claude-agent-acp's Bash
+    carries one), else the command / pattern / query, from the FULL input — the raw
+    preview is a 200-char cut of JSON that rarely parses. ``""`` when nothing fits."""
+    data = tool_input
+    if isinstance(tool_input, str):
+        s = tool_input.strip()
+        if not s.startswith("{"):
+            return ""
+        try:
+            data = json.loads(s)
+        except (ValueError, TypeError):
+            return ""
+    if not isinstance(data, dict):
+        return ""
+    for k in _DETAIL_KEYS:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            # Generous here: the worktree prefix it usually carries is stripped at
+            # snapshot time, which then clips to the display cap.
+            return " ".join(v.split())[: 4 * _TOOL_INPUT_PREVIEW_MAX]
+    return ""
+
+
+def _event_locations(event: dict) -> list[str]:
+    """Structured ACP ``locations`` ({path, line}) when the host forwards them (protoAgent
+    ≥ #3979), else the path-ish keys mined from the raw input."""
+    raw = event.get("locations")
+    if isinstance(raw, list) and raw:
+        out: list[str] = []
+        for loc in raw[:8]:
+            if isinstance(loc, dict) and isinstance(loc.get("path"), str) and loc["path"].strip():
+                out.append(loc["path"].strip())
+            elif isinstance(loc, str) and loc.strip():
+                out.append(loc.strip())
+        if out:
+            return list(dict.fromkeys(out))
+    return _extract_locations(event.get("input"))
+
+
 class _GenBuffer:
     """One coder generation's live state (one ACP dispatch = one gen)."""
 
@@ -189,11 +318,27 @@ class _GenBuffer:
         "answer_tail",
         "plan",
         "stop_reason",
+        "root",
+        "_paragraph",
+        "_segment",
+        "_segment_chunks",
     )
 
-    def __init__(self, gen: int, tier: str = ""):
+    def __init__(self, gen: int, tier: str = "", root: str = ""):
         self.gen = int(gen)
         self.tier = tier or ""
+        # The worktree this gen's coder runs in — the drawer shows paths relative to it.
+        self.root = str(root or "")
+        # Work (a tool call or a plan update) happened since the last narration: the next
+        # text chunk starts a new paragraph instead of gluing onto the previous sentence
+        # ("…the feature.Let me check…") — the same rule protoAgent's delegation card and
+        # ACP client apply (#3408, #3979).
+        self._paragraph = False
+        # The narration streamed since the last tool call, and how many chunks built it,
+        # for the segment-replay guard: claude-agent-acp streams a text block as deltas and
+        # then can re-send the WHOLE block as one more chunk (protoAgent #3979).
+        self._segment = ""
+        self._segment_chunks = 0
         # Dispatch epoch this gen belongs to (assigned by progress_begin). Scopes the
         # first-token check in dispatch_reached_model to the CURRENT dispatch so a
         # stale gen an earlier dispatch left in the buffer can't answer for it (#339).
@@ -223,6 +368,21 @@ class _GenBuffer:
         # signal — but unbounded accumulation is exactly what this buffer must never do.
         if not delta:
             return
+        # The segment replay (#3979): exact whole-segment equality after >=2 chunks is the
+        # adapter re-sending what it just streamed, never a model restating its paragraph
+        # with no joiner. A host whose ACP client already drops it never reaches here.
+        if self._segment_chunks >= 2 and len(delta) >= _SEGMENT_REPLAY_FLOOR and delta == self._segment:
+            return
+        self._segment += delta
+        self._segment_chunks += 1
+        # Two narration runs with no work signal between can still arrive glued: the
+        # coder's task-list calls become ACP plan updates the host may only hand over
+        # at turn end. "…and implement.Now let me…" — a sentence end followed directly by
+        # a capital, with no space, is never prose a model streams within one run.
+        glued = bool(re.search(r"[.!?:]$", self.answer_tail) and re.match(r"[A-Z]", delta))
+        if (self._paragraph or glued) and self.answer_tail and not self.answer_tail.endswith("\n"):
+            delta = "\n\n" + delta.lstrip("\n")
+        self._paragraph = False
         self.answer_tail = (self.answer_tail + delta)[-_ANSWER_TAIL_MAX:]
 
     def set_plan(self, entries) -> None:
@@ -231,6 +391,9 @@ class _GenBuffer:
         # entry-capped so a runaway plan can't bloat the buffer.
         if not isinstance(entries, (list, tuple)):
             return
+        # A plan update is a work boundary like a tool call (narration after it is a new
+        # paragraph); the replay guard's segment is deliberately NOT reset (#3979).
+        self._paragraph = True
         plan = []
         for e in entries[:_PLAN_ENTRIES_MAX]:
             if isinstance(e, dict):
@@ -249,7 +412,9 @@ class _GenBuffer:
         kind = str(event.get("kind") or "") or _infer_tool_kind(name)
         tid = str(event.get("id") or name)
         if phase == "start":
-            locs = _extract_locations(event.get("input"))
+            self._paragraph = True
+            self._segment, self._segment_chunks = "", 0
+            locs = _event_locations(event)
             # The raw input's head is the "what exactly is it running" line (the
             # command for execute, the pattern for search) — locations alone lose it.
             preview = str(event.get("input") or "")[:_TOOL_INPUT_PREVIEW_MAX]
@@ -260,8 +425,9 @@ class _GenBuffer:
                 "locations": locs,
                 "status": "running",
                 "input_preview": preview,
+                "detail": _tool_detail(event.get("input")),
             }
-            self.recent_tools.append({"name": name, "kind": kind, "status": "start", "locations": locs})
+            self.recent_tools.append({"id": tid, "name": name, "kind": kind, "status": "start", "locations": locs})
         elif phase == "update":
             # A refinement of the OPEN call (#463, protoAgent#3691): claude-agent-acp opens
             # each tool with a placeholder title and empty args, then names it. Refresh the
@@ -269,12 +435,28 @@ class _GenBuffer:
             # a call that already ended or isn't the current one.
             cur = self.current_tool
             if not cur or cur.get("id") != tid or cur.get("status") != "running":
+                # Not the live line — but claude-agent-acp opens parallel reads as a burst of
+                # placeholder "Read File" calls and names each one after the next has
+                # started. Name THAT call's own start row (matched by id), so the feed shows
+                # "Read tests/helpers.py" with its file, not a placeholder; never a call
+                # that already ended.
+                ended = any(r.get("id") == tid and r.get("status") != "start" for r in self.recent_tools)
+                if ended:
+                    return
+                for row in reversed(self.recent_tools):
+                    if row.get("id") == tid and row.get("status") == "start":
+                        locs = _event_locations(event) if (event.get("input") or event.get("locations")) else []
+                        row.update(name=name, kind=kind, locations=locs or row.get("locations") or [])
+                        break
                 return
             old_name = cur.get("name")
-            locs = _extract_locations(event.get("input")) if event.get("input") else cur.get("locations") or []
+            locs = (_event_locations(event) if (event.get("input") or event.get("locations")) else []) or (
+                cur.get("locations") or []
+            )
             cur.update(name=name, kind=kind, locations=locs)
             if event.get("input"):
                 cur["input_preview"] = str(event.get("input"))[:_TOOL_INPUT_PREVIEW_MAX]
+                cur["detail"] = _tool_detail(event.get("input")) or cur.get("detail") or ""
             for row in reversed(self.recent_tools):
                 if row.get("status") == "start" and row.get("name") == old_name:
                     row.update(name=name, kind=kind, locations=locs)
@@ -286,11 +468,41 @@ class _GenBuffer:
                 self.current_tool["output"] = str(event.get("output") or "")[:400]
                 locs = self.current_tool.get("locations") or []
             else:
-                locs = []
+                # Not the live call: its files are on its own start row (by id).
+                locs = next(
+                    (
+                        list(r.get("locations") or [])
+                        for r in reversed(self.recent_tools)
+                        if r.get("id") == tid and r.get("status") == "start"
+                    ),
+                    [],
+                )
                 self.current_tool = {"id": tid, "name": name, "kind": kind, "locations": locs, "status": status}
-            self.recent_tools.append({"name": name, "kind": kind, "status": status, "locations": locs})
+            self.recent_tools.append({"id": tid, "name": name, "kind": kind, "status": status, "locations": locs})
+
+    def _clean_tool(self, row: dict | None, roots: list[str]) -> dict | None:
+        if not row:
+            return None
+        out = dict(row)
+        out["name"] = _scrub_text(out.get("name"), roots, command=True)
+        out["locations"] = [_display_path(p, roots) for p in (out.get("locations") or [])]
+        for k in ("input_preview", "detail", "output"):
+            if out.get(k):
+                out[k] = _scrub_text(out[k], roots, command=k == "detail")
+        if out.get("detail"):
+            out["detail"] = out["detail"][:_TOOL_INPUT_PREVIEW_MAX]
+        # A clipped shell title that was all worktree path ("cd \"/Users/me/…/feat-x") says
+        # nothing once scrubbed (`cd "…`): show the command itself instead.
+        if re.fullmatch(r"cd\s+\S*…\S*", out["name"] or ""):
+            out["name"] = out.get("detail") or "shell"
+        # "Read /Users/me/…/.worktrees/feat-x/tests/hel" clipped by the host scrubs to
+        # "Read …" — name the file from the call's own location instead.
+        elif (out["name"] or "").endswith("…") and out["locations"]:
+            out["name"] = out["name"][:-1].rstrip() + " " + out["locations"][0]
+        return out
 
     def snapshot(self) -> dict:
+        roots = _display_roots(self.root)
         return {
             "gen": self.gen,
             "tier": self.tier,
@@ -298,10 +510,10 @@ class _GenBuffer:
             # A finished gen's clock FREEZES at progress_end — otherwise the drawer can't
             # tell a completed gen from a running one (panel finding on #89).
             "elapsed_s": round(max(0.0, (self.ended if self.ended is not None else _monotonic()) - self.started), 1),
-            "current_tool": dict(self.current_tool) if self.current_tool else None,
-            "recent_tools": list(self.recent_tools),
-            "thought_tail": self.thought_tail,
-            "answer_tail": self.answer_tail,
+            "current_tool": self._clean_tool(self.current_tool, roots),
+            "recent_tools": [self._clean_tool(r, roots) for r in self.recent_tools],
+            "thought_tail": _scrub_text(self.thought_tail, roots),
+            "answer_tail": _scrub_text(self.answer_tail, roots),
             "plan": list(self.plan) if self.plan else None,
             "usage": dict(self.usage) if self.usage else None,
             "verify": dict(self.verify) if self.verify else None,
@@ -423,7 +635,7 @@ def progress_new_run(fid: str | None) -> None:
         _progress.pop(fid, None)
 
 
-def progress_begin(fid: str | None, gen: int, tier: str = "", *, new_dispatch: bool = False) -> None:
+def progress_begin(fid: str | None, gen: int, tier: str = "", *, new_dispatch: bool = False, root: str = "") -> None:
     """Register (or reset) a generation's buffer. No-op when ``fid`` is falsy — the
     operator-only test-rung path passes None (it's a diagnostic, not a live run).
 
@@ -456,7 +668,7 @@ def progress_begin(fid: str | None, gen: int, tier: str = "", *, new_dispatch: b
         # A new dispatch that did NOT clear the buffer opens the next epoch; everything
         # else joins the current one (epoch 0 on a freshly cleared / empty buffer).
         epoch = (maxrun + 1) if new_dispatch else max(maxrun, 0)
-        buf = _GenBuffer(g, tier)
+        buf = _GenBuffer(g, tier, root)
         buf.run = epoch
         gens[g] = buf
 
@@ -684,6 +896,14 @@ def dispatch_reached_model(fid: str) -> bool:
         return False
 
 
+def _seam_accepts(fn, name: str) -> bool:
+    """Does ``fn``'s signature NAME the keyword ``name``? ``False`` on anything unreadable."""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _import_dispatch_tapped():
     """Best-effort handle on coding_agent's PUBLIC tapped-dispatch seam (C1): the host
     function that drives the pooled ACP client WITH progress callbacks wired in and
@@ -738,7 +958,7 @@ async def dispatch_coder_tapped(
     ``_dispatch_tapped`` is a test-injection seam (mirrors ``_solve``/
     ``_fusion_dispatch``); production callers never pass it — the real best-effort
     import happens in ``_import_dispatch_tapped``."""
-    progress_begin(fid, gen, tier, new_dispatch=new_dispatch)
+    progress_begin(fid, gen, tier, new_dispatch=new_dispatch, root=worktree_path)
     tapped = _dispatch_tapped if _dispatch_tapped is not None else _import_dispatch_tapped()
     if tapped is None:
         # Public C1 seam absent. Do NOT jump to the untapped dispatch — that records a
@@ -778,6 +998,9 @@ async def dispatch_coder_tapped(
     async def _tool_cb(event):
         progress_tool(fid, gen, event)
 
+    async def _plan_cb(entries):
+        progress_plan(fid, gen, entries)
+
     # Old adapter-path semantics preserved: no configured timeout = UNBOUNDED dispatch,
     # else hard-bound with worktree.coder_bound exactly as worktree.dispatch_coder does —
     # on timeout the seam coro is cancelled (its own finally reaps the subprocess) and
@@ -793,14 +1016,14 @@ async def dispatch_coder_tapped(
         # died on `dispatch_tapped() got an unexpected keyword argument`. The fake in
         # the test below now mirrors this signature exactly (no **kwargs) so a rename
         # on either side fails here instead of on a live board.
-        coro = tapped(
-            scoped,
-            prompt,
-            timeout=timeout,
-            on_tool=_tool_cb,
-            on_thought=_thought_cb,
-            on_text=_answer_cb,
-        )
+        stream_kw: dict = {"on_tool": _tool_cb, "on_thought": _thought_cb, "on_text": _answer_cb}
+        # A LIVE plan (the coder's checklist while it works, not only once the turn ends)
+        # needs a host whose seam takes `on_plan`. Passed only when the signature NAMES it:
+        # an unknown keyword kills every dispatch (the F7 outage above), and a bare
+        # **kwargs proves nothing about what the seam does with it.
+        if _seam_accepts(tapped, "on_plan"):
+            stream_kw["on_plan"] = _plan_cb
+        coro = tapped(scoped, prompt, timeout=timeout, **stream_kw)
         result = await worktree.coder_bound(coro, timeout)
     except asyncio.CancelledError:
         # Turn stopped (operator/watchdog): the public seam already dropped the pooled

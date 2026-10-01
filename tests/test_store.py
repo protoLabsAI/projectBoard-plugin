@@ -216,9 +216,10 @@ def test_default_db_path_host_free_fallback(monkeypatch):
 
 def test_ensure_workspace_inits_the_default_store_in_the_store_root(monkeypatch, tmp_path):
     """Fresh instance, defaulted db: ONE `br init`, cwd'd in the STORE root — never
-    the project repo. The plain no-`--db` init form is load-bearing: `br init --db`
-    ALSO drops a `.beads/` in its cwd (real br 0.1.23 and 0.2.16), which with
-    cwd=repo would be exactly the repo pollution D3 removes."""
+    the project repo (`br init --db` ALSO drops a `.beads/` in its cwd, real br 0.1.23
+    and 0.2.16, which with cwd=repo would be exactly the repo pollution D3 removes).
+    And it names its `--db`: a bare init runs br's discovery, which walks up to an
+    ancestor `~/.beads` and refuses (see test_br_init_under_home_beads)."""
     dbfile = tmp_path / "project_board" / ".beads" / "beads.db"
     monkeypatch.setattr(store, "default_db_path", lambda: str(dbfile))
     inits = []
@@ -234,7 +235,7 @@ def test_ensure_workspace_inits_the_default_store_in_the_store_root(monkeypatch,
     b._ensure_workspace()
     assert len(inits) == 1 and b._workspace_ready
     cmd, cwd = inits[0]
-    assert cmd[:2] == [store.BR, "init"] and "--db" not in cmd
+    assert cmd[:2] == [store.BR, "init"] and cmd[cmd.index("--db") + 1] == str(dbfile)
     assert "--prefix" in cmd  # ids keep the documented bd- shape (default = dir name)
     assert cwd == str(tmp_path / "project_board")  # the store ROOT, not the repo
     b._ensure_workspace()  # idempotent — no second init
