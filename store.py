@@ -1533,10 +1533,13 @@ class BeadsBoard:
         """`br init` the instance-default board store (D3, #260) — once, on a fresh
         instance's first op. Runs with cwd = the store ROOT (…/project_board), so the
         workspace lands at exactly the `.beads/beads.db` path every op's ``--db``
-        names; the `br init --db <path>` form can't be used because it ALSO drops a
-        `.beads/` in the cwd (verified against real br 0.1.23 and 0.2.16) — with the
-        board's `cwd=self.repo` that would be the project-repo pollution D3 exists to
-        remove. `--prefix bd` keeps ids in the documented `bd-…` shape (br's default
+        names. It ALSO passes that ``--db``: a bare `br init` runs br's workspace
+        discovery, which walks UP from the cwd, and an instance under ``$HOME`` finds
+        ``~/.beads`` (a user's own beads db) — br then refuses ("ordinary commands
+        never migrate an existing tracker database") and every board read fails after.
+        `br init --db` also drops a `.beads/` in the cwd (verified against real br
+        0.1.23 and 0.2.16), which is why the cwd must be the store root and never the
+        project repo (the pollution D3 exists to remove). `--prefix bd` keeps ids in the documented `bd-…` shape (br's default
         prefix is the store dir's name). Raced inits (two per-project boards on one
         fresh instance) are fine: the loser's failure is ignored when the winner's db
         is present."""
@@ -1549,7 +1552,9 @@ class BeadsBoard:
         )
         # NB: a direct subprocess, NOT self._run — that would recurse here (and carry
         # --db into an init that must key off cwd alone).
-        proc = _run_br_process([BR, "init", "--prefix", "bd", "--actor", self.actor], cwd=root, args=("init",))
+        proc = _run_br_process(
+            [BR, "init", "--prefix", "bd", "--actor", self.actor, "--db", self.db], cwd=root, args=("init",)
+        )
         if proc.returncode != 0 and not os.path.isfile(self.db):
             raise BoardError(
                 f"instance board store {root!r} could not be initialized (`br init` failed: "

@@ -405,7 +405,12 @@ async function load(){
     // to fix it — a warning card above the board, never a silent green.
     const s = await api("/api/plugins/project_board/status").catch(() => null);
     // br fetched on first run (v0.43.0): say so in the subtitle, once it's the store's binary.
-    if (s && s.setup && s.setup.br && s.setup.br.source === "fetched") $("sub").textContent += " · br v" + (s.setup.br.fetch.version || "?") + " fetched to " + s.setup.br.path;
+    // Only the version on the page (it is on camera, and the path is the operator's home
+    // dir); the path rides the tooltip for whoever needs it.
+    if (s && s.setup && s.setup.br && s.setup.br.source === "fetched") {
+      $("sub").textContent += " · br v" + (s.setup.br.fetch.version || "?");
+      $("sub").title = "br fetched to " + (s.setup.br.path || "?");
+    }
     // Gate-preflight holds (#255/#261): a fully-`ready` board can still pick up nothing
     // because a project's gate failed on its clean base and the loop held that project's
     // cards — without a card the board just looks idle. When setup ALSO fails, the held
@@ -568,11 +573,33 @@ let TASK_DETAIL = null;
 // fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
 const TASK_DETAIL_SEQ = {};
 
+// One tool row: status, the tool's own title, and its file(s) only when the title does
+// not already name them. ACP's kind (read/edit/execute) rides a class for the colour,
+// never as a raw "[edit]" tag. One line, ellipsized; the full text is the tooltip.
+const TOOL_STATUS_WORD = {start: "running", running: "running", completed: "done", failed: "failed"};
 function toolLine(t){
-  const st = esc(t.status||"");
-  const loc = (t.locations && t.locations.length) ? " <span class=\"loc\">"+esc(t.locations.join(", "))+"</span>" : "";
-  return '<li><span class="st-'+st+'">'+st+'</span> '+esc(t.name||"tool")
-    + (t.kind?' <span class="loc">['+esc(t.kind)+']</span>':"")+loc+'</li>';
+  const raw = t.status || "";
+  const st = esc(raw === "start" ? "running" : raw);
+  const word = esc(TOOL_STATUS_WORD[raw] || raw);
+  const name = String(t.name || "tool");
+  const locs = (t.locations || []).filter(l => l && name.indexOf(l) < 0 && name.indexOf(l.split("/").pop()) < 0);
+  const loc = locs.length ? ' <span class="loc">'+esc(locs.join(", "))+'</span>' : "";
+  const full = word + " " + name + (locs.length ? " " + locs.join(", ") : "");
+  return '<li class="k-'+esc(t.kind||"")+'" title="'+esc(full)+'"><span class="st st-'+st+'">'+word+'</span> '
+    + '<span class="tn">'+esc(name)+'</span>'+loc+'</li>';
+}
+// The feed lists every call ONCE: a call's end replaces its own start row in place (by
+// tool id, else by name for an older buffer without ids), so the drawer shows "done Edit
+// cli.py", not a "start" and a "completed" line for the same edit.
+function collapseTools(rows){
+  const out = [], open = new Map();
+  for (const r of rows){
+    const key = r.id || r.name || "";
+    if (r.status === "start"){ open.set(key, out.length); out.push(r); continue; }
+    if (open.has(key)){ out[open.get(key)] = r; open.delete(key); continue; }
+    out.push(r);
+  }
+  return out;
 }
 // ── "saying" markdown (bd-p87t): the coder's streamed answer_tail is markdown prose
 // (headings, code blocks, inline code, bold/italic, lists, links), so the "saying"
@@ -660,11 +687,19 @@ function genCard(g){
         }).join("") + '</ul>';
   }
   const cur = g.current_tool;
-  h += '<div class="lbl">current tool</div><div class="cur">'
-    + (cur ? '<span class="st-'+esc(cur.status||"")+'">'+esc(cur.status||"")+'</span> '+esc(cur.name||"")
-        + (cur.locations&&cur.locations.length?' <span class="loc">'+esc(cur.locations.join(", "))+'</span>':"")
-        + (cur.input_preview?'<div class="inprev">'+esc(cur.input_preview)+'</div>':"")
-       : "—") + '</div>';
+  // The current call: its title, its file(s) unless the title names them, and ONE plain
+  // line of what it does (the input's description/command/pattern, server-side `detail`)
+  // instead of the raw JSON args. An older buffer without `detail` keeps the raw preview.
+  let curHtml = "—";
+  if (cur){
+    const cname = String(cur.name || "");
+    const clocs = (cur.locations || []).filter(l => l && cname.indexOf(l) < 0 && cname.indexOf(l.split("/").pop()) < 0);
+    const detail = cur.detail !== undefined ? (cur.detail && cur.detail !== cname ? cur.detail : "") : (cur.input_preview || "");
+    curHtml = '<span class="st-'+esc(cur.status||"")+'">'+esc(cur.status||"")+'</span> '+esc(cname)
+      + (clocs.length ? ' <span class="loc">'+esc(clocs.join(", "))+'</span>' : "")
+      + (detail ? '<div class="inprev">'+esc(detail)+'</div>' : "");
+  }
+  h += '<div class="lbl">current tool</div><div class="cur">' + curHtml + '</div>';
   // "saying" is markdown — carry the raw source on data-md and render esc()'d text inline
   // as the fallback; enhanceSaying() upgrades it to rendered markdown once marked loads.
   // The .thought class is kept so it inherits the drawer's scroll/overflow cap + lone-gen
@@ -672,7 +707,7 @@ function genCard(g){
   if (g.answer_tail){ h += '<div class="lbl">saying</div><div class="thought md-saying" data-md="'+esc(g.answer_tail)+'">'+esc(g.answer_tail)+'</div>'; }
   // "thinking" stays plain esc()'d text — internal reasoning, not user-facing prose.
   if (g.thought_tail){ h += '<div class="lbl">thinking</div><div class="thought">'+esc(g.thought_tail)+'</div>'; }
-  const rt = (g.recent_tools||[]).slice(-30).reverse();
+  const rt = collapseTools(g.recent_tools||[]).slice(-30).reverse();
   if (rt.length){ h += '<div class="lbl">recent tools</div><ul class="tools">'+rt.map(toolLine).join("")+'</ul>'; }
   if (g.verify){ h += '<div class="lbl">verify</div><div class="cur"><span class="st-'
     + (g.verify.passed?"completed":"failed")+'">'+(g.verify.passed?"passed":"failed")+'</span> '
@@ -685,6 +720,15 @@ function renderMonitor(data){
     ? gens.map(genCard).join("")
     : '<div class="pl-empty">No live coder run for this feature right now.</div>';
   enhanceSaying($("drawer-body"));   // upgrade "saying" plain text → rendered markdown (lazy, best-effort)
+  pinSayingToLatest($("drawer-body"));
+}
+// "saying" is a rolling TAIL — the newest narration is at the bottom, so the box opens
+// scrolled there (each poll re-renders it into a fresh node, which would start at the top
+// and clip the latest line mid-heading).
+function pinSayingToLatest(root){
+  const pin = () => root.querySelectorAll(".md-saying").forEach(el => { el.scrollTop = el.scrollHeight; });
+  pin();
+  if (!MARKED && MARKED_LOAD) MARKED_LOAD.then(pin);   // markdown upgrade changes the height
 }
 async function pollMonitor(){
   // Fence on the fid we START the request for: clearInterval stops FUTURE polls but

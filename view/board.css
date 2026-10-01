@@ -81,7 +81,10 @@
   .gen .inprev{color:var(--pl-color-fg-muted);font-size:10.5px;white-space:pre-wrap;word-break:break-all;
     max-height:48px;overflow:hidden;margin-top:2px}
   .gen ul.tools{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}
-  .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gen ul.tools li .st{display:inline-block;min-width:4.5em}
+  .gen ul.tools li .tn{color:var(--pl-color-fg)}
   /* #226-UX: a LONE gen fills the drawer. The common case is watching ONE live build,
      so a solo gen card becomes a flex column owning the full drawer-body height
      (margin-bottom:0 so it doesn't spill past 100% and re-introduce a body scroll), and

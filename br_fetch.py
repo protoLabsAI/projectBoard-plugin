@@ -387,10 +387,39 @@ def _activate(path: Path) -> None:
         log.warning("[project_board] br fetched to %s but the store could not be re-pointed", path, exc_info=True)
 
 
-def _run_fetch(spec: FetchSpec, dest: Path, downloader, timeout: float) -> None:
+def _point_store_at(value: str) -> None:
+    """Re-point ``store.BR`` (best-effort; an explicit BR_BIN always wins)."""
+    try:
+        from . import store as store_mod
+
+        if not str(os.environ.get(ENV_BR_BIN) or "").strip():
+            store_mod.BR = value
+    except Exception:  # noqa: BLE001 — host-free import shapes
+        pass
+
+
+def _run_fetch(spec: FetchSpec, dest: Path, downloader, timeout: float, *, shadowed: str = "") -> None:
     try:
         path = fetch_br(spec, dest, downloader=downloader, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — every failure is a setup gap, never a traceback
+        if shadowed:
+            # We passed over an OLDER `br` on PATH to fetch the pin. The fetch failed, so
+            # that older one is still better than no board at all — hand it back.
+            _point_store_at("br")
+            _set(
+                state="done",
+                path=shadowed,
+                error=f"pinned br v{spec.version} fetch failed ({type(exc).__name__}: {exc}); using {shadowed}",
+                finished=time.time(),
+                spec=None,
+            )
+            log.warning(
+                "[project_board] br v%s auto-fetch failed: %s — falling back to the older br on PATH (%s)",
+                spec.version,
+                exc,
+                shadowed,
+            )
+            return
         _set(state="failed", error=f"{type(exc).__name__}: {exc}", finished=time.time())
         log.warning("[project_board] br v%s auto-fetch failed: %s — %s", spec.version, exc, INSTALL_HINT)
         return
@@ -414,6 +443,8 @@ def ensure_br(
     dest: Path | None = None,
     background: bool = True,
     timeout: float = FETCH_TIMEOUT_S,
+    version_of=None,
+    store_db: str | None = None,
 ) -> dict:
     """Make sure a ``br`` is available: no-op when one already resolves (``BR_BIN``,
     a previous fetch, PATH); otherwise — once per process, when
@@ -426,7 +457,19 @@ def ensure_br(
         current = resolve_br_bin(fetched=dest)
         target = dest or fetched_br_path()
         holder = _slot()
-        if which(current):
+        shadowed = ""
+        if (
+            which(current)
+            and current == "br"
+            and _stale_path_br_should_yield(cfg, which, version_of, store_db, platform)
+        ):
+            # An OLDER `br` on PATH (a stale `cargo install`, say) must not create the
+            # board store: the pinned release refuses a database an older br made
+            # ("ordinary commands never migrate…"), so the board would break the day the
+            # pin takes over. On a FRESH store, prefer the pinned binary — fetch it, and
+            # keep the store off the old one until it lands.
+            shadowed = str(which(current) or "")
+        if which(current) and not shadowed:
             with holder.lock:
                 if holder.state["state"] == "idle":
                     # `current` is the version-keyed fetched path (a previous run's fetch)
@@ -464,23 +507,93 @@ def ensure_br(
             if spent:
                 return fetch_state()  # once per process — a failure stays reported until a restart
             holder.state.update(state="fetching", spec=spec, started=time.time(), finished=0.0, error="", path="")
+        if shadowed:
+            _point_store_at(str(target))  # not the old br — nothing runs until the pin lands
+            log.warning(
+                "[project_board] br on PATH (%s) is older than the pinned v%s and the board store is new — "
+                "fetching the pinned release instead of letting the older br create it",
+                shadowed,
+                spec.version,
+            )
         dl = downloader or _host_downloader(host)
         log.info(
-            "[project_board] br not on PATH — fetching beads-rust v%s for %s from %s …",
+            "[project_board] %s — fetching beads-rust v%s for %s from %s …",
+            "br on PATH is older than the pin" if shadowed else "br not on PATH",
             spec.version,
             spec.platform,
             spec.url,
         )
         if background:
             threading.Thread(
-                target=_run_fetch, args=(spec, target, dl, timeout), name="project-board-br-fetch", daemon=True
+                target=_run_fetch,
+                args=(spec, target, dl, timeout),
+                kwargs={"shadowed": shadowed},
+                name="project-board-br-fetch",
+                daemon=True,
             ).start()
         else:
-            _run_fetch(spec, target, dl, timeout)
+            _run_fetch(spec, target, dl, timeout, shadowed=shadowed)
     except Exception as exc:  # noqa: BLE001 — belt and braces: a fetch must never break registration
         _set(state="failed", error=f"{type(exc).__name__}: {exc}", finished=time.time())
         log.warning("[project_board] br auto-fetch could not start: %s", exc, exc_info=True)
     return fetch_state()
+
+
+def parse_version(text: str) -> tuple[int, ...]:
+    """``"br 0.2.16"`` → ``(0, 2, 16)``; ``()`` when no dotted version is present."""
+    import re
+
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(text or ""))
+    if not m:
+        return ()
+    return tuple(int(g) for g in m.groups() if g is not None)
+
+
+def _sample_version(path: str) -> str:
+    try:
+        import subprocess
+
+        proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=3)
+        return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+    except Exception:  # noqa: BLE001 — unreadable version is "unknown", never a verdict
+        return ""
+
+
+def _board_store_exists(cfg: dict, store_db: str | None) -> bool:
+    """Is there already a board db the PATH br may have created? An explicit
+    ``store_db`` (tests), else the configured ``db_path``, else the instance default."""
+    path = store_db
+    if path is None:
+        path = str(cfg.get("db_path") or "").strip()
+        if not path:
+            try:
+                from .store import default_db_path
+
+                path = default_db_path()
+            except Exception:  # noqa: BLE001 — host-free shapes: can't tell → assume it exists
+                return True
+    return os.path.isfile(os.path.expanduser(path))
+
+
+def _stale_path_br_should_yield(cfg: dict, which, version_of, store_db: str | None, platform: str | None) -> bool:
+    """Should the plugin fetch its pinned ``br`` instead of using the one on PATH? Only
+    when ALL hold: no explicit BR_BIN, auto-fetch on, this platform has a pin, the PATH
+    br reports a version OLDER than the pin, and the board store does not exist yet (an
+    existing store was made by that br and the pin would refuse it — leave it be)."""
+    try:
+        if str(os.environ.get(ENV_BR_BIN) or "").strip():
+            return False
+        if not _knob_on(cfg.get("br_autofetch", True)) or fetch_spec(platform) is None:
+            return False
+        path = str(which("br") or "")
+        if not path:
+            return False
+        have = parse_version((version_of or _sample_version)(path))
+        if not have or have >= parse_version(BR_VERSION):
+            return False
+        return not _board_store_exists(cfg, store_db)
+    except Exception:  # noqa: BLE001 — a guard must never break the fetch decision
+        return False
 
 
 def _knob_on(raw) -> bool:
