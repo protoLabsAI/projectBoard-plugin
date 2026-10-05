@@ -814,14 +814,36 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         return await _guard(lambda: store().flag_blocked(fid, str(body.get("reason", "")), category=MANUAL_BLOCK_CLASS))
 
     @router.post("/features/{fid}/unblock")
-    async def _unblock(fid: str):
+    async def _unblock(fid: str, body: dict = Body(default={})):
+        """Clear the `blocked` flag so a feature can be re-dispatched. When the card was a
+        review-gated in_review PR (#512), ``clear_blocked`` alone lands it back in_review with
+        no review substate and the board's own `failure` gate status still on the head, so it
+        can never promote — ``unblock_side_effects`` then DECIDES the gate on the PR's live head.
+
+        Body: ``{override_review: bool=false}``. Default re-arms the gate (review-pending, a
+        fresh review-fix budget, a pending `board/review-gate` status) so the next reconcile
+        re-reviews the current head; ``override_review: true`` is the operator's explicit
+        acceptance of the review findings (a success `board/review-gate` status, review-clean
+        pinned to the live head, an audit comment) while the ordinary merge gates still decide."""
+        # Read the card BEFORE the clear (as _cancel does): a blocked in_review PR still carries
+        # the in-review label, pr_url and block reason the side effects need.
+        before = await _guard(lambda: store().get_feature(fid))
         f = await _guard(lambda: store().clear_blocked(fid))
         # The running loop's cached timeout count wins over the label the store just reset
         # (#259) — drop it too, so a card parked `too-wide` gets a real retry (#378).
-        from .loop import forget_timeout_count
+        from .loop import forget_timeout_count, unblock_side_effects
 
         forget_timeout_count(fid)
-        return f
+        override = bool((body or {}).get("override_review"))
+        # #262: act in the FEATURE's project repo (the pre-unblock read carries the label; the
+        # unblock projection is the fallback), not the board default's.
+        repo = repo_for_feature(before or f, store_kw)
+        # Thread THIS route's store (the operator's configured db_path) in, so the helper's
+        # substate/budget writes land in the same database clear_blocked just wrote to (#512).
+        side = await asyncio.to_thread(
+            unblock_side_effects, fid, before or f, store(), override_review=override, cwd=repo
+        )
+        return {**f, "review": side}
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):

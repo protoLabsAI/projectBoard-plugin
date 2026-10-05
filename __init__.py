@@ -1246,21 +1246,51 @@ def _board_tools(cfg: dict):
             return f"Error: {exc}"
 
     @tool
-    def board_unblock_feature(feature_id: str) -> str:
+    def board_unblock_feature(feature_id: str, override_review: bool = False) -> str:
         """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
         board_block_feature. Removes the blocked label; the puller can claim it again once
         it's otherwise `ready`. A card parked `too-wide` after repeated timeouts also gets
-        its timeout count reset, so the retry is a real attempt."""
+        its timeout count reset, so the retry is a real attempt.
+
+        When the card was a review-gated in_review PR (the review gate exhausted its fix budget
+        and blocked it), lifting the flag alone leaves it back in_review with no review substate
+        and the board's own `failure` gate status still on the PR head, so it can never promote
+        (#512). This verb then DECIDES the gate on the PR's LIVE head:
+
+        - default (`override_review=False`) RE-ARMS the gate — review-pending with a fresh
+          review-fix budget and a pending `board/review-gate` status, so the next reconcile
+          re-reviews the current head from scratch;
+        - `override_review=True` is YOUR explicit acceptance of the review findings as a human:
+          it posts a success `board/review-gate` status at the live head, sets review-clean
+          PINNED to that head, and records an audit comment. The ordinary merged-state / CI /
+          auto-merge gates still decide the merge, and a later push leaves the pin stale, so an
+          override never covers an unreviewed head. Use it only when you have read the findings
+          and judged them acceptable."""
         try:
-            f = get_store(**store_kw).clear_blocked(feature_id)
+            store = get_store(**store_kw)
+            # Read the card BEFORE the clear: a blocked in_review PR still carries the in-review
+            # label, pr_url and block reason the review side effects need.
+            before = store.get_feature(feature_id)
+            f = store.clear_blocked(feature_id)
             # The running loop's cached timeout count wins over the label the store just
             # reset (#259) — drop it too (#378). Lazy import: the loop imports from here.
             from .loop import forget_timeout_count
 
             forget_timeout_count(feature_id)
-            return json.dumps({"id": f["id"], "state": f["board_state"]})
         except BoardError as exc:
             return f"Error: {exc}"
+        # #512: decide the review gate on the PR's live head (re-arm, or operator override).
+        # #262: act in the FEATURE's project repo (the shared route/tool resolver), not the
+        # board default's. The helper never raises; it reports every gh/store failure in `side`.
+        from .api import repo_for_feature
+        from .loop import unblock_side_effects
+
+        # Pass the tool's own store (the operator's configured db_path) so the helper's
+        # substate/budget writes land in the same database clear_blocked just wrote to (#512).
+        side = unblock_side_effects(
+            feature_id, before or f, store, override_review=override_review, cwd=repo_for_feature(before or f, store_kw)
+        )
+        return json.dumps({"id": f["id"], "state": f["board_state"], "review": side})
 
     @tool
     def board_reset_merged_verify_budget(feature_id: str) -> str:

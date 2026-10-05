@@ -68,7 +68,9 @@ from ..store import (
     BR_FAILURES,
     AlreadyDelivered,
     BoardError,
+    LABEL_BLOCKED,
     LABEL_CHANGES_REQUESTED,
+    LABEL_IN_REVIEW,
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_REVIEW_CLEAN,
     LABEL_REVIEW_PENDING,
@@ -1304,6 +1306,207 @@ def cancel_side_effects(fid: str, pr_url: str = "", *, cwd: str = ".") -> dict:
     return out
 
 
+# ── operator unblock of a review-gate block (#512) ───────────────────────────────
+# When the in-loop review gate exhausts its fix budget it BLOCKS the card ("review
+# findings persist after N fix attempt(s) — needs human review") AND leaves a `failure`
+# status under worktree.GATE_STATUS_CONTEXT on the PR head (reconcile.py ~2938).
+# ``store.clear_blocked`` alone lifts the blocked flag but touches neither the review
+# substate nor that status, so the card lands back in_review with no review substate and a
+# board-authored `failure` the #323 adoption reads as fail-closed — it can promote only if
+# an operator hand-edits GitHub statuses (the careercoach#17 symptom #512 fixes). An unblock
+# of such a card must therefore also DECIDE the gate: re-arm it (the default — the next
+# reconcile re-reviews the live head) or, on an explicit operator override, SUPERSEDE the
+# board's own failure with a recorded human acceptance.
+_UNBLOCK_GH_TIMEOUT = 30.0
+_UNBLOCK_REARM_STATUS_DESC = "Review gate re-armed by operator unblock"
+_UNBLOCK_OVERRIDE_STATUS_DESC = "Operator override — review findings accepted by a human"
+# The exact reason shape the in-loop review gate writes when it exhausts its review-fix
+# budget (reconcile.py ~2933: "review findings persist after <n> fix attempt(s) — needs
+# human review: <pr_url>"). Both substrings together fingerprint THAT block and nothing
+# else: a hand block (board_block_feature / POST /block) carries an operator reason, a
+# transient failure carries a classifier reason, and the external-review block says
+# "external review FAILED …" (a DIFFERENT panel) — none match both markers.
+_REVIEW_GATE_BLOCK_MARKERS = ("review findings persist after", "needs human review")
+
+
+def _is_review_gate_block(feature_before: dict) -> bool:
+    """True ONLY for a card the in-loop review gate itself blocked by exhausting its
+    review-fix budget. Requires BOTH that the card is still blocked (the projection is read
+    pre-``clear_blocked``, so a review-gate block shows the ``blocked`` label / state) AND
+    that its latest ``blocked_reason`` is the gate's exhaustion marker. A hand block, a
+    different failure, or a STALE ``blocked_reason`` comment left on a card that is no longer
+    blocked all read False — so an unblock leaves their review verdict, SHA pin, budget and
+    gate status untouched (#512 review: a blanket in_review+pr_url guard clobbered them)."""
+    labels = set(feature_before.get("labels") or [])
+    blocked_now = LABEL_BLOCKED in labels or feature_before.get("board_state") == "blocked"
+    reason = str(feature_before.get("blocked_reason") or "")
+    return blocked_now and all(marker in reason for marker in _REVIEW_GATE_BLOCK_MARKERS)
+
+
+def _post_gate_status_sync(
+    slug: str, head: str, *, state: str, description: str, target_url: str = "", cwd: str = "."
+) -> tuple[bool, str]:
+    """Publish a commit status under ``worktree.GATE_STATUS_CONTEXT`` at ``head``, synchronously
+    — the sync sibling of ``worktree.post_review_status`` for the unblock verbs (a worker thread
+    with no event loop). Mirrors its fields (state / context / description + an optional
+    ``target_url``), coerces an unknown state to ``error`` and truncates the description to
+    GitHub's 140-char cap exactly as it does, and NEVER posts under the external panel's legacy
+    ``QA panel`` context (#512 r4). Returns ``(ok, detail)``; never raises."""
+    if not slug or not head:
+        return False, "missing slug/head"
+    if state not in worktree._STATUS_STATES:
+        state = "error"
+    description = (description or "")[: worktree._STATUS_DESCRIPTION_MAX]
+    fields = [
+        "-f",
+        f"state={state}",
+        "-f",
+        f"context={worktree.GATE_STATUS_CONTEXT}",
+        "-f",
+        f"description={description}",
+    ]
+    if target_url:
+        fields += ["-f", f"target_url={target_url}"]
+    try:
+        rc, _out, err = worktree._gh_sync(
+            "api", "--method", "POST", f"/repos/{slug}/statuses/{head}", *fields, cwd=cwd, timeout=_UNBLOCK_GH_TIMEOUT
+        )
+    except Exception as exc:  # noqa: BLE001 — missing gh / timeout / bad cwd
+        return False, str(exc)[:300]
+    return (rc == 0), ("" if rc == 0 else (err or "").strip()[:300])
+
+
+def unblock_side_effects(
+    fid: str, feature_before: dict, store, *, override_review: bool = False, cwd: str = "."
+) -> dict:
+    """What an unblock must do BEYOND ``store.clear_blocked`` when the card was a review-gated
+    in_review PR (#512). Shared by the route and the tool; sync, so it runs in the tool's
+    worker thread as-is and via ``asyncio.to_thread`` from the route. NEVER raises — the unblock
+    itself already happened, so every gh/store failure is logged and reported in the returned
+    dict rather than thrown.
+
+    ``store`` is the caller's OWN board (``get_store(**store_kw)`` with the operator's configured
+    ``db_path``), threaded in so the substate/budget writes land in the SAME database the
+    ``clear_blocked`` before them did — resolving it afresh here would fall back to the instance
+    default and write to the wrong store (#512 review).
+
+    ``feature_before`` is the card's projection read BEFORE ``clear_blocked`` (it still carries
+    the ``in-review`` label, ``pr_url`` and ``blocked_reason`` a blocked card has). The helper
+    acts ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR (see
+    ``_is_review_gate_block``) and that the loop is NOT still working — anything else (a hand
+    block, a different failure, a card no longer blocked, or one the loop still drives) returns
+    ``{"review": "n/a"}`` and does nothing. When it acts it reads the PR's LIVE head
+    synchronously; an unreadable head posts no status and returns ``{"review": "head-unknown"}``
+    (the unblock still succeeds, r3).
+
+    - Default (``override_review=False``) — **re-arm the gate.** Set the review substate to
+      ``review-pending`` and reset the ``review-fix`` budget, so the next reconcile's resume
+      edge (reconcile.py ~1291) re-runs the gate on the CURRENT head with a fresh budget; and
+      post a ``pending`` ``board/review-gate`` status at that head, superseding the board's own
+      ``failure``. Returns ``{"review": "re-armed", "head": head}``.
+    - ``override_review=True`` — **explicit operator override.** Post a ``success``
+      ``board/review-gate`` status at the live head, set ``review-clean`` PINNED to that head,
+      and record an audit comment naming the override, the head and the prior block reason. The
+      ordinary merged-state / CI / auto-merge gates still decide the merge; a later push leaves
+      the pin stale, so an override never covers an unreviewed head. Returns ``{"review":
+      "overridden", "head": head}``.
+    """
+    feature_before = feature_before or {}
+    labels = set(feature_before.get("labels") or [])
+    pr_url = str(feature_before.get("pr_url") or "").strip()
+    in_review = LABEL_IN_REVIEW in labels or feature_before.get("board_state") == "in_review"
+    # Act ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR with a PR.
+    # A blanket in_review+pr_url guard also re-armed a hand-blocked card, a card blocked for a
+    # different reason, and (with override) a card carrying a valid review-clean verdict — each
+    # time removing that verdict + its SHA pin, resetting the review-fix budget and posting a
+    # pending status over a passing head (#512 review). ``_is_review_gate_block`` keeps the verb
+    # to the one block it was built to lift.
+    if not (in_review and pr_url and _is_review_gate_block(feature_before)):
+        return {"review": "n/a"}
+    # And never decide the gate out from under the loop — a live coder drive, a claimed build or
+    # a RUNNING review gate (#512 review: there was no liveness guard). Its own verdict write
+    # would race ours; a re-arm or override mid-review could land review-pending/clean over a
+    # head the gate is still judging. A blocked card normally has no drive in flight, but this is
+    # the same liveness check the review reconcile (#323) and attach (#437) apply before touching
+    # a card. Refused, not forced: the loop moves the card on by itself, and the operator can
+    # unblock once it has.
+    busy = worked_by_the_loop(fid)
+    if busy:
+        log.info("[project_board] %s unblock: review gate left undecided — %s", fid, busy)
+        return {"review": "n/a"}
+
+    _number, slug = _parse_pr_url(pr_url)
+    head = ""
+    try:
+        rc, out, _err = worktree._gh_sync(
+            "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid", cwd=cwd, timeout=_UNBLOCK_GH_TIMEOUT
+        )
+        if rc == 0:
+            head = (out or "").strip()
+    except Exception as exc:  # noqa: BLE001 — missing gh / timeout / bad cwd
+        log.warning("[project_board] %s unblock: could not read live PR head for %s: %s", fid, pr_url, exc)
+    if not head or not slug:
+        # An unreadable head means we cannot name the commit a verdict would pin to, so NOTHING
+        # is posted — a status must never land against a head we did not read (r3).
+        log.warning("[project_board] %s unblock: live PR head unreadable for %s — no gate status posted", fid, pr_url)
+        return {"review": "head-unknown"}
+
+    if override_review:
+        result = {"review": "overridden", "head": head}
+        ok, detail = _post_gate_status_sync(
+            slug, head, state="success", description=_UNBLOCK_OVERRIDE_STATUS_DESC, target_url=pr_url, cwd=cwd
+        )
+        result["status_posted"] = ok
+        if not ok:
+            result["status_detail"] = detail
+            log.warning("[project_board] %s unblock override: gate success status not posted: %s", fid, detail)
+        prior = str(feature_before.get("blocked_reason") or "").strip()
+        note = (
+            "review-clean set by operator override — review findings accepted by a human; "
+            f"board/review-gate marked success on head {head[:12]}"
+            + (f" (prior block: {prior})" if prior else "")
+            + f": {pr_url}"
+        )
+        try:
+            # PIN the clean verdict to the live head: a later push leaves the pin stale and the
+            # merge gate declines, so an override never covers a head nothing reviewed.
+            store.set_review_substate(fid, LABEL_REVIEW_CLEAN, note=note, head_sha=head)
+        except Exception as exc:  # noqa: BLE001 — the unblock already happened
+            result["substate_error"] = str(exc)[:300]
+            log.warning("[project_board] %s unblock override: review-clean not set: %s", fid, exc)
+        return result
+
+    result = {"review": "re-armed", "head": head}
+    try:
+        store.set_review_substate(
+            fid,
+            LABEL_REVIEW_PENDING,
+            note=f"review gate re-armed by operator unblock — re-reviewing the current head {head[:12]}: {pr_url}",
+        )
+    except Exception as exc:  # noqa: BLE001 — the unblock already happened
+        result["substate_error"] = str(exc)[:300]
+        log.warning("[project_board] %s unblock: review-pending not set: %s", fid, exc)
+    try:
+        store.clear_budgets(fid, ["review-fix"])
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never break the unblock
+        result["budget_error"] = str(exc)[:300]
+        log.warning("[project_board] %s unblock: review-fix budget not reset: %s", fid, exc)
+    # The running loop's in-process budget cache wins over the label the store just reset
+    # (#259); a blocked card has no drive in flight to race, so popping is safe (the next
+    # reconcile re-derives 0 from the now-cleared label).
+    loop = live_loop()
+    if loop is not None:
+        loop._budget_cache("review-fix").pop(fid, None)
+    ok, detail = _post_gate_status_sync(
+        slug, head, state="pending", description=_UNBLOCK_REARM_STATUS_DESC, target_url=pr_url, cwd=cwd
+    )
+    result["status_posted"] = ok
+    if not ok:
+        result["status_detail"] = detail
+        log.warning("[project_board] %s unblock: re-arm pending status not posted: %s", fid, detail)
+    return result
+
+
 _MAX_MODE_JUDGE_SYS = (
     "You are a strict code reviewer choosing the best of several diffs for the same "
     "task. Pick the one that most completely and correctly satisfies the acceptance "
@@ -1455,6 +1658,7 @@ __all__ = [
     "AlreadyDelivered",
     "BoardError",
     "LABEL_CHANGES_REQUESTED",
+    "LABEL_IN_REVIEW",
     "LABEL_MERGED_VERIFIED_PREFIX",
     "LABEL_REVIEW_CLEAN",
     "LABEL_REVIEW_PENDING",
@@ -1538,6 +1742,10 @@ __all__ = [
     "forget_timeout_count",
     "cancel_pr_comment",
     "cancel_side_effects",
+    "unblock_side_effects",
+    "_post_gate_status_sync",
+    "_UNBLOCK_REARM_STATUS_DESC",
+    "_UNBLOCK_OVERRIDE_STATUS_DESC",
     "_MAX_MODE_JUDGE_SYS",
     "_BUDGET_KINDS",
     "_SELF_HEALING_BLOCKS",
