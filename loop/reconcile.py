@@ -2243,11 +2243,15 @@ class ReconcileMixin:
         False); the board never manufactures a PASS from its own signals.
 
         Strictest verdict wins (#512): before adopting, the board's OWN ``board/review-gate``
-        status at the live head is read (``worktree.read_review_status``). A completed
-        non-success (``failure`` / ``error``) or a ``pending`` gate status VETOES the external
-        PASS — the card is NOT promoted, and one hold comment per (card, head) records the
-        internal-vs-external disagreement and that an operator unblock/override is required. An
-        ABSENT gate status (the gate never ran this head) does not block adoption.
+        status at the live head is read TRI-STATE (``worktree.read_review_status_result``). A
+        completed non-success (``failure`` / ``error``) or a ``pending`` gate status VETOES the
+        external PASS — the card is NOT promoted, and one hold comment per (card, head) records
+        the internal-vs-external disagreement and that an operator unblock/override is required.
+        A PROVEN-ABSENT gate status (the gate never ran this head) does not block adoption; but an
+        UNREADABLE gate read (a gh error / malformed / ambiguous response, which the plain
+        ``read_review_status`` could not tell apart from absence) FAILS CLOSED — the card is not
+        promoted this pass and the next poll retries, so a transient read failure can never be
+        mistaken for "no gate verdict" and promote a head the gate may have FAILED (careercoach#17).
 
         It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a blocking state
         to clean (never manufactures a blocking one). Fails CLOSED, leaving the card exactly as
@@ -2313,10 +2317,27 @@ class ReconcileMixin:
             return False
         # A trusted, current-head external PASS. Strictest verdict wins (#512): the board's OWN
         # gate status at this head can VETO the PASS, but can never BE it — read only the board's
-        # own context. A completed non-success or a pending gate status holds the card; an absent
-        # one (the gate never ran this head) does not.
-        gate = await worktree.read_review_status(repo_slug, head, context=worktree.GATE_STATUS_CONTEXT, cwd=repo)
-        if gate is not None and gate.get("state") in ("failure", "error", "pending"):
+        # own context, and read it TRI-STATE so a PROVEN-ABSENT gate status (the gate never ran
+        # this head — adoption may proceed) is told apart from an UNREADABLE one. The veto must
+        # FAIL CLOSED on an unreadable read: ``read_review_status`` returns None for BOTH absence
+        # and a gh error / malformed / ambiguous response, and treating a transient read failure
+        # as "no gate verdict" would promote a head the gate may have FAILED (careercoach#17).
+        outcome, gate = await worktree.read_review_status_result(
+            repo_slug, head, context=worktree.GATE_STATUS_CONTEXT, cwd=repo
+        )
+        if outcome == worktree.STATUS_READ_UNREADABLE:
+            # The gate status could not be read cleanly — we cannot PROVE the gate did not FAIL
+            # this head, so we do not adopt. Not a recorded disagreement (no operator hold): a
+            # transient read failure the next poll simply retries.
+            log.info(
+                "[project_board] %s gate status unreadable at head %s — not adopting the external PASS this "
+                "pass (fail closed, retries next poll): %s",
+                fid,
+                head[:12],
+                pr_url,
+            )
+            return False
+        if outcome == worktree.STATUS_READ_PRESENT and gate.get("state") in ("failure", "error", "pending"):
             gate_state = gate.get("state")
             short = head[: store_mod.SHORT_SHA_LEN]
             verb = "is still PENDING" if gate_state == "pending" else f"FAILED ({gate_state})"

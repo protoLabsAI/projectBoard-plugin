@@ -6400,10 +6400,11 @@ def _no_real_pr_head_sha(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_real_review_status_seam(monkeypatch):
     """#354: the gate now publishes via ``worktree.post_review_status`` + a findings PR comment
-    (``post_or_update_pr_comment``) and the reconcile reads back ``worktree.read_review_status``.
-    Pin all three to fail-closed / no-op defaults so no gate/reconcile test shells a real
-    ``gh api`` — a test that asserts the new seam installs its own recorder. This is the only
-    verdict-publication seam left to pin (bd-doo0 removed the App-only check-run guards)."""
+    (``post_or_update_pr_comment``) and the reconcile reads back the gate status via
+    ``worktree.read_review_status_result`` (and its back-compat ``read_review_status``). Pin them
+    to fail-closed / no-op defaults so no gate/reconcile test shells a real ``gh api`` — a test
+    that asserts a seam installs its own recorder. The gate-status read defaults to a PROVEN-ABSENT
+    result (the old ``None``-means-no-veto behaviour); a #323/#512 test overrides it."""
 
     async def _ok(*a, **k):
         return True
@@ -6411,9 +6412,13 @@ def _no_real_review_status_seam(monkeypatch):
     async def _none(*a, **k):
         return None
 
+    async def _absent(*a, **k):
+        return (worktree.STATUS_READ_ABSENT, None)
+
     monkeypatch.setattr(worktree, "post_review_status", _ok)
     monkeypatch.setattr(worktree, "post_or_update_pr_comment", _ok)
     monkeypatch.setattr(worktree, "read_review_status", _none)
+    monkeypatch.setattr(worktree, "read_review_status_result", _absent)
 
 
 def _record_review_statuses(monkeypatch):
@@ -7441,13 +7446,15 @@ def _ext_view(head, *, verdict="PASS", marker_head=None, reviewer="protoreview",
     }
 
 
-def _qa_loop(monkeypatch, *, head, view=None, gate_status=None, cfg=None, external=True):
+def _qa_loop(monkeypatch, *, head, view=None, gate_status=None, gate_unreadable=False, cfg=None, external=True):
     """A review_gate loop for the #323/#512 inbound reconcile. The live PR head is ``head``; the
     external panel read (``worktree.pr_review_state``) returns ``view``; and the board's OWN
-    gate-status read (``worktree.read_review_status``) returns ``gate_status`` — but ONLY for the
-    board's own ``board/review-gate`` context (the reconcile must never read ``QA panel`` as its
-    own verdict). ``external`` toggles the project's ``external_review`` config (False ⇒ no panel
-    configured, so there is nothing to adopt)."""
+    gate-status read (``worktree.read_review_status_result``) returns a TRI-STATE for the board's
+    own ``board/review-gate`` context (the reconcile must never read ``QA panel`` as its own
+    verdict). ``gate_status`` is the PRESENT status dict (None ⇒ a PROVEN-ABSENT read, the gate
+    never ran this head), and ``gate_unreadable`` forces an UNREADABLE read (a gh error / malformed
+    / ambiguous response). ``external`` toggles the project's ``external_review`` config (False ⇒
+    no panel configured, so there is nothing to adopt)."""
     loop = BoardLoop({"review_gate": True, "merge_poll": False, "external_review": external, **(cfg or {})})
     monkeypatch.setattr(worktree, "pr_head_sha", _head_returning(head))
 
@@ -7456,12 +7463,18 @@ def _qa_loop(monkeypatch, *, head, view=None, gate_status=None, cfg=None, extern
 
     monkeypatch.setattr(worktree, "pr_review_state", _state)
 
-    async def _read(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
         # The board reads back only its OWN context — a legacy `QA panel` status is invisible here.
         assert context == worktree.GATE_STATUS_CONTEXT
-        return gate_status if head_sha == head else None
+        if head_sha != head:
+            return (worktree.STATUS_READ_ABSENT, None)  # no status for any other head
+        if gate_unreadable:
+            return (worktree.STATUS_READ_UNREADABLE, None)  # the read itself failed → fail closed
+        if gate_status is None:
+            return (worktree.STATUS_READ_ABSENT, None)  # a clean read proved the gate never ran this head
+        return (worktree.STATUS_READ_PRESENT, gate_status)
 
-    monkeypatch.setattr(worktree, "read_review_status", _read)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
     return loop
 
 
@@ -7532,6 +7545,23 @@ async def test_trusted_qa_gate_pending_holds_the_external_pass(monkeypatch):
     feature = {"id": "bd-1", "labels": list(store.labels)}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert "review-clean" not in store.labels
+
+
+async def test_trusted_qa_unreadable_gate_status_fails_closed(monkeypatch):
+    """r3 (the review-finding regression): the external panel PASSed the live head, but the board's
+    OWN gate-status read FAILED (a gh error / malformed / ambiguous response) rather than proving
+    the gate never ran. ``read_review_status`` collapses that unreadable read to the same ``None``
+    as a proven absence; the tri-state read does NOT, so the reconcile FAILS CLOSED — the card is
+    not promoted (we can't prove the gate didn't FAIL this head), yet it is NOT a recorded
+    disagreement, so there is no operator hold comment. The next poll simply retries."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    loop = _qa_loop(monkeypatch, head=_QA_HEAD, view=_ext_view(_QA_HEAD), gate_unreadable=True)
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels  # not promoted on a read it could not trust
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+    assert not any(c[0] == "comment" for c in store.calls)  # a transient read failure is no hold
 
 
 async def test_trusted_qa_legacy_qa_panel_status_neither_blocks_nor_promotes(monkeypatch):
@@ -7624,12 +7654,12 @@ async def test_trusted_qa_fails_closed_on_an_unreadable_live_head(monkeypatch):
         consulted.append("panel")
         return _ext_view(_QA_HEAD)
 
-    async def _read(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
         consulted.append("gate")
-        return {"state": "success", "head_sha": head_sha, "passed": True}
+        return (worktree.STATUS_READ_PRESENT, {"state": "success", "head_sha": head_sha, "passed": True})
 
     monkeypatch.setattr(worktree, "pr_review_state", _state)
-    monkeypatch.setattr(worktree, "read_review_status", _read)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
     feature = {"id": "bd-1", "labels": ["changes-requested"]}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert consulted == []  # short-circuited before reading the panel or the gate
@@ -7702,13 +7732,13 @@ async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_revie
     async def _head(pr_url, *, cwd="."):
         return _QA_HEAD  # unchanged since the verdict → NOT a #328 head move
 
-    async def _read(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
-        return None  # the board wrote no gate status for this head → no veto
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+        return (worktree.STATUS_READ_ABSENT, None)  # the board wrote no gate status for this head → no veto
 
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
     monkeypatch.setattr(worktree, "pr_review_state", _state)
     monkeypatch.setattr(worktree, "pr_head_sha", _head)
-    monkeypatch.setattr(worktree, "read_review_status", _read)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     await loop._reconcile_prs()
@@ -7740,8 +7770,8 @@ async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_t
     async def _head(pr_url, *, cwd="."):
         return _QA_HEAD_2  # an external push moved the head off the reviewed one
 
-    async def _read(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
-        return None
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+        return (worktree.STATUS_READ_ABSENT, None)
 
     async def _diff(url, *, cwd=".", max_chars=4000):
         return "diff --git a/a.py b/a.py"
@@ -7749,7 +7779,7 @@ async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_t
     monkeypatch.setattr(loop, "_run_review_workflow", _run)
     monkeypatch.setattr(worktree, "pr_review_state", _state)
     monkeypatch.setattr(worktree, "pr_head_sha", _head)
-    monkeypatch.setattr(worktree, "read_review_status", _read)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
     monkeypatch.setattr(worktree, "pr_diff", _diff)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
@@ -7762,8 +7792,9 @@ async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_t
 def _automerge_reconcile_env(monkeypatch, *, head, view, gate_status=None, mss="CLEAN"):
     """Stub the worktree reads a full reconcile+auto-merge pass makes for #323/#512: the PR is
     OPEN, its live head is ``head``, the external panel read returns ``view``, the board's own
-    gate-status read returns ``gate_status`` (default None → no veto), and GitHub reports ``mss``
-    (CLEAN → mergeable, not a draft). Records each ``merge_pr`` call."""
+    gate-status read (``read_review_status_result``) returns ``gate_status`` (default None → a
+    PROVEN-ABSENT read, no veto), and GitHub reports ``mss`` (CLEAN → mergeable, not a draft).
+    Records each ``merge_pr`` call."""
     merges = []
 
     async def _pr_state(url, *, cwd="."):
@@ -7775,8 +7806,10 @@ def _automerge_reconcile_env(monkeypatch, *, head, view, gate_status=None, mss="
     async def _state(url, *, cwd="."):
         return view
 
-    async def _read(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
-        return gate_status if head_sha == head else None
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+        if head_sha != head or gate_status is None:
+            return (worktree.STATUS_READ_ABSENT, None)
+        return (worktree.STATUS_READ_PRESENT, gate_status)
 
     async def _info(url, *, cwd="."):
         return {"mergeStateStatus": mss, "isDraft": False}
@@ -7791,7 +7824,7 @@ def _automerge_reconcile_env(monkeypatch, *, head, view, gate_status=None, mss="
     monkeypatch.setattr(worktree, "pr_state", _pr_state)
     monkeypatch.setattr(worktree, "pr_head_sha", _pr_head)
     monkeypatch.setattr(worktree, "pr_review_state", _state)
-    monkeypatch.setattr(worktree, "read_review_status", _read)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
     monkeypatch.setattr(worktree, "pr_merge_info", _info)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
     monkeypatch.setattr(worktree, "delete_remote_branch", _delete)

@@ -1650,6 +1650,83 @@ async def test_read_review_status_none_on_unreadable_or_malformed_json(monkeypat
     assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
 
 
+# ── #512: tri-state read (read_review_status_result) — PROVEN-ABSENT vs UNREADABLE ──
+
+
+async def test_read_review_status_result_present_returns_the_recorded_verdict(monkeypatch):
+    """r3: a single `board/review-gate` status for the head is PRESENT, carrying its verdict dict —
+    the same payload `read_review_status` surfaces, now tagged with the tri-state outcome."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="failure")]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_PRESENT,
+        {"state": "failure", "head_sha": _HEAD, "passed": False},
+    )
+
+
+async def test_read_review_status_result_absent_is_distinct_from_unreadable(monkeypatch):
+    """r3 (the crux of #512): a CLEAN read that finds NO status of the context is ABSENT (the gate
+    never ran this head — the veto may proceed), which is DISTINCT from every read that could not
+    be trusted. An empty `.statuses`, or only unrelated contexts, is ABSENT."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (worktree.STATUS_READ_ABSENT, None)
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(context="ci")]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (worktree.STATUS_READ_ABSENT, None)
+
+
+async def test_read_review_status_result_unreadable_on_every_failed_read(monkeypatch):
+    """r3: a read that could not be trusted is UNREADABLE, NOT absent — so the veto fails closed
+    instead of mistaking it for "the gate never ran". Covers an empty slug/head, a gh non-zero, a
+    raised WorktreeError, non-JSON / non-list output, an AMBIGUOUS (>1) match, and a malformed
+    state. `read_review_status` still collapses all of these to `None` (back-compat)."""
+    # empty slug/head — no gh call, but still "can't prove absence"
+    assert await worktree.read_review_status_result("", _HEAD, cwd="/repo") == (worktree.STATUS_READ_UNREADABLE, None)
+    assert await worktree.read_review_status_result(_SLUG, "", cwd="/repo") == (worktree.STATUS_READ_UNREADABLE, None)
+
+    async def _rc1(*a, cwd, timeout=60):
+        return (1, "", "not found")
+
+    monkeypatch.setattr(worktree, "_gh", _rc1)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    async def _raise(*a, cwd, timeout=60):
+        raise worktree.WorktreeError("gh timed out")
+
+    monkeypatch.setattr(worktree, "_gh", _raise)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    async def _garbage(*a, cwd, timeout=60):
+        return (0, "not json", "")
+
+    monkeypatch.setattr(worktree, "_gh", _garbage)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    # an AMBIGUOUS match (>1 status of the context) is unreadable, not absent — the veto must not
+    # proceed on data it cannot resolve to a single verdict.
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(), _qa_status()]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    # a matched status whose state is missing/blank is malformed → unreadable.
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "board/review-gate", "state": ""}]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+    # and `read_review_status` keeps collapsing the same cases to None.
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+
 # ── #354: the idempotent findings PR comment (post_or_update_pr_comment) ───────────
 
 
