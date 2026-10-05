@@ -296,7 +296,8 @@ def test_board_unblock_feature_removes_the_blocked_label(make_board, monkeypatch
 
     out = json.loads(_get_tool("board_unblock_feature").invoke({"feature_id": "bd-1"}))
 
-    assert out == {"id": "bd-1", "state": "ready"}
+    # The card was not an in_review PR, so the #512 review side effects are a no-op.
+    assert out == {"id": "bd-1", "state": "ready", "review": {"review": "n/a"}}
     (update,) = br.cmds("update")
     assert update[:2] == ("update", "bd-1")
     assert "--remove-label" in update and "blocked" in update
