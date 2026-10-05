@@ -838,7 +838,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # #262: act in the FEATURE's project repo (the pre-unblock read carries the label; the
         # unblock projection is the fallback), not the board default's.
         repo = repo_for_feature(before or f, store_kw)
-        side = await asyncio.to_thread(unblock_side_effects, fid, before or f, override_review=override, cwd=repo)
+        # Thread THIS route's store (the operator's configured db_path) in, so the helper's
+        # substate/budget writes land in the same database clear_blocked just wrote to (#512).
+        side = await asyncio.to_thread(
+            unblock_side_effects, fid, before or f, store(), override_review=override, cwd=repo
+        )
         return {**f, "review": side}
 
     @router.post("/features/{fid}/cancel")

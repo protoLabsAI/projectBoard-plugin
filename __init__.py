@@ -1285,8 +1285,10 @@ def _board_tools(cfg: dict):
         from .api import repo_for_feature
         from .loop import unblock_side_effects
 
+        # Pass the tool's own store (the operator's configured db_path) so the helper's
+        # substate/budget writes land in the same database clear_blocked just wrote to (#512).
         side = unblock_side_effects(
-            feature_id, before or f, override_review=override_review, cwd=repo_for_feature(before or f, store_kw)
+            feature_id, before or f, store, override_review=override_review, cwd=repo_for_feature(before or f, store_kw)
         )
         return json.dumps({"id": f["id"], "state": f["board_state"], "review": side})
 
