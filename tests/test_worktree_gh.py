@@ -302,12 +302,27 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
     read = await worktree.read_review_status(slug, head, context=TEST_STATUS_CONTEXT, cwd=cwd)
     assert read == {"state": "success", "head_sha": head, "passed": True}
 
+    # #512: the tri-state seam the back-compat wrapper delegates to — PRESENT on the true head,
+    # carrying the same verdict dict, now tagged with its outcome. This is the function the #323
+    # strictest-verdict veto reads so it can tell a PROVEN-ABSENT gate status apart from an
+    # UNREADABLE one; covering it here keeps that seam REAL, not just transitively exercised.
+    assert await worktree.read_review_status_result(slug, head, context=TEST_STATUS_CONTEXT, cwd=cwd) == (
+        worktree.STATUS_READ_PRESENT,
+        {"state": "success", "head_sha": head, "passed": True},
+    )
+
     # Head-identity (r5), reusing the single write above: the verdict is present on the TRUE head,
     # yet a DIFFERENT well-formed head reads back None — the status is scoped by the commit in its
     # URL (no status at that sha, or the commit doesn't exist → gh errors) and is never attributed
-    # to a moved head. No extra POST, so nothing else accumulates on the fixture.
+    # to a moved head. No extra POST, so nothing else accumulates on the fixture. Tri-state: that
+    # same read is never PRESENT for the wrong head — either ABSENT (no status) or UNREADABLE (the
+    # sha doesn't exist → gh errors), never a verdict wrongly attributed to a moved head.
     wrong = _different_sha(head)
     assert await worktree.read_review_status(slug, wrong, context=TEST_STATUS_CONTEXT, cwd=cwd) is None
+    wrong_outcome, wrong_status = await worktree.read_review_status_result(
+        slug, wrong, context=TEST_STATUS_CONTEXT, cwd=cwd
+    )
+    assert wrong_status is None and wrong_outcome in (worktree.STATUS_READ_ABSENT, worktree.STATUS_READ_UNREADABLE)
 
     # Head-safe skips: an unknown head neither posts nor reads a verdict (no gh shelled).
     assert (

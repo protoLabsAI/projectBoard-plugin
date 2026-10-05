@@ -137,7 +137,11 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_url_for_branch": "REAL",
     "promote_worktree": "REAL",
     "prune_stale_worktrees": "REAL",
-    "read_review_status": "REAL",
+    # #512: the back-compat `read_review_status` no longer shells `gh` itself — it delegates to
+    # the tri-state `read_review_status_result`, which is the real seam (covered end-to-end against
+    # the pinned PR in tests/test_worktree_gh.py). So the seam detected by AST is the `_result`
+    # function; `read_review_status` is a pure in-process wrapper and is no longer a seam.
+    "read_review_status_result": "REAL",
     "rebase_onto_base": "REAL",
     "refresh_base_checkout": "REAL",  # #452: real bare origin + clone in tests/test_base_refresh_452.py
     "remove_worktree": "REAL",

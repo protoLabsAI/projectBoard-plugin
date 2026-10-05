@@ -1449,10 +1449,11 @@ class _StatusGh:
         return None
 
 
-async def test_post_review_status_creates_a_pat_compatible_status_on_the_head(monkeypatch):
-    """r1: a clean verdict publishes a `QA panel` COMMIT STATUS via the PAT-compatible
-    `POST /repos/<slug>/statuses/<sha>` — keyed to the exact immutable head, success state, a
-    concise description, and the PR link as the stable target url."""
+async def test_post_review_status_defaults_to_the_board_review_gate_context(monkeypatch):
+    """r1 (#512): a clean verdict publishes a COMMIT STATUS via the PAT-compatible
+    `POST /repos/<slug>/statuses/<sha>` under the board's OWN `board/review-gate` context by
+    DEFAULT — never the panel's `QA panel` App check — keyed to the exact immutable head,
+    success state, a concise description, and the PR link as the stable target url."""
     gh = _StatusGh()
     monkeypatch.setattr(worktree, "_gh", gh)
     ok = await worktree.post_review_status(
@@ -1468,7 +1469,8 @@ async def test_post_review_status_creates_a_pat_compatible_status_on_the_head(mo
     assert write[write.index("--method") + 1] == "POST"
     assert write[write.index("--method") + 2] == f"/repos/{_SLUG}/statuses/{_HEAD}"  # the FULL immutable head
     assert _StatusGh.field(write, "state") == "success"
-    assert _StatusGh.field(write, "context") == "QA panel"
+    assert _StatusGh.field(write, "context") == "board/review-gate"  # #512: the board's OWN context
+    assert worktree.GATE_STATUS_CONTEXT == "board/review-gate"
     assert _StatusGh.field(write, "description") == "Review gate clean — 0 findings"
     assert _StatusGh.field(write, "target_url") == "https://github.com/o/r/pull/9"
 
@@ -1549,13 +1551,13 @@ def _status_gh(statuses):
     return _gh
 
 
-def _qa_status(context="QA panel", state="success"):
+def _qa_status(context="board/review-gate", state="success"):
     return {"context": context, "state": state, "id": 3, "target_url": "https://github.com/o/r/pull/9"}
 
 
 async def test_read_review_status_returns_a_current_head_pass(monkeypatch):
-    """r5: exactly one `QA panel` status of state `success` for the head-scoped commit is a
-    trusted, current-head PASS."""
+    """r5: exactly one `board/review-gate` status of state `success` for the head-scoped commit
+    is the board's own, current-head PASS record."""
     monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="success")]))
     assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") == {
         "state": "success",
@@ -1565,16 +1567,27 @@ async def test_read_review_status_returns_a_current_head_pass(monkeypatch):
 
 
 async def test_read_review_status_reports_a_current_head_failure_as_not_passed(monkeypatch):
-    """r5: a `QA panel` non-success state is a real, trusted verdict (not None) — but `passed`
-    is False, so a caller never promotes off it."""
+    """r5: a `board/review-gate` non-success state is a real, recorded verdict (not None) — but
+    `passed` is False, so a caller never promotes off it."""
     monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="failure")]))
     v = await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo")
     assert v == {"state": "failure", "head_sha": _HEAD, "passed": False}
 
 
+async def test_read_review_status_does_not_match_a_legacy_qa_panel_status(monkeypatch):
+    """r5 (#512): a `QA panel` status — the external panel's App check name, and what an OLDER
+    board wrote its own verdict under — is a DIFFERENT context from the default `board/review-gate`
+    read, so it is NOT matched: a stale `QA panel` failure can neither block nor promote. A read
+    scoped explicitly to `QA panel` still finds it (the `context=` parameter is retained)."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(context="QA panel", state="failure")]))
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None  # default: board/review-gate
+    v = await worktree.read_review_status(_SLUG, _HEAD, context="QA panel", cwd="/repo")
+    assert v == {"state": "failure", "head_sha": _HEAD, "passed": False}
+
+
 async def test_read_review_status_none_when_absent_or_ambiguous(monkeypatch):
-    """r5: no `QA panel` status (only unrelated contexts / none) → None; and, defensively,
-    MORE THAN ONE `QA panel` status → None (ambiguous never promotes)."""
+    """r5: no `board/review-gate` status (only unrelated contexts / none) → None; and,
+    defensively, MORE THAN ONE such status → None (ambiguous never promotes)."""
     monkeypatch.setattr(
         worktree, "_gh", _status_gh([_qa_status(context="ci"), {"context": "lint", "state": "success"}])
     )
@@ -1586,10 +1599,10 @@ async def test_read_review_status_none_when_absent_or_ambiguous(monkeypatch):
 
 
 async def test_read_review_status_none_when_malformed(monkeypatch):
-    """A `QA panel` status carrying no readable state is not a verdict → None."""
-    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "QA panel"}]))
+    """A `board/review-gate` status carrying no readable state is not a verdict → None."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "board/review-gate"}]))
     assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
-    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "QA panel", "state": ""}]))
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "board/review-gate", "state": ""}]))
     assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
 
 
@@ -1634,6 +1647,83 @@ async def test_read_review_status_none_on_unreadable_or_malformed_json(monkeypat
         return (0, '{"statuses": []}', "")  # a dict, not the jq'd array
 
     monkeypatch.setattr(worktree, "_gh", _obj)
+    assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
+
+
+# ── #512: tri-state read (read_review_status_result) — PROVEN-ABSENT vs UNREADABLE ──
+
+
+async def test_read_review_status_result_present_returns_the_recorded_verdict(monkeypatch):
+    """r3: a single `board/review-gate` status for the head is PRESENT, carrying its verdict dict —
+    the same payload `read_review_status` surfaces, now tagged with the tri-state outcome."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(state="failure")]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_PRESENT,
+        {"state": "failure", "head_sha": _HEAD, "passed": False},
+    )
+
+
+async def test_read_review_status_result_absent_is_distinct_from_unreadable(monkeypatch):
+    """r3 (the crux of #512): a CLEAN read that finds NO status of the context is ABSENT (the gate
+    never ran this head — the veto may proceed), which is DISTINCT from every read that could not
+    be trusted. An empty `.statuses`, or only unrelated contexts, is ABSENT."""
+    monkeypatch.setattr(worktree, "_gh", _status_gh([]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (worktree.STATUS_READ_ABSENT, None)
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(context="ci")]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (worktree.STATUS_READ_ABSENT, None)
+
+
+async def test_read_review_status_result_unreadable_on_every_failed_read(monkeypatch):
+    """r3: a read that could not be trusted is UNREADABLE, NOT absent — so the veto fails closed
+    instead of mistaking it for "the gate never ran". Covers an empty slug/head, a gh non-zero, a
+    raised WorktreeError, non-JSON / non-list output, an AMBIGUOUS (>1) match, and a malformed
+    state. `read_review_status` still collapses all of these to `None` (back-compat)."""
+    # empty slug/head — no gh call, but still "can't prove absence"
+    assert await worktree.read_review_status_result("", _HEAD, cwd="/repo") == (worktree.STATUS_READ_UNREADABLE, None)
+    assert await worktree.read_review_status_result(_SLUG, "", cwd="/repo") == (worktree.STATUS_READ_UNREADABLE, None)
+
+    async def _rc1(*a, cwd, timeout=60):
+        return (1, "", "not found")
+
+    monkeypatch.setattr(worktree, "_gh", _rc1)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    async def _raise(*a, cwd, timeout=60):
+        raise worktree.WorktreeError("gh timed out")
+
+    monkeypatch.setattr(worktree, "_gh", _raise)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    async def _garbage(*a, cwd, timeout=60):
+        return (0, "not json", "")
+
+    monkeypatch.setattr(worktree, "_gh", _garbage)
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    # an AMBIGUOUS match (>1 status of the context) is unreadable, not absent — the veto must not
+    # proceed on data it cannot resolve to a single verdict.
+    monkeypatch.setattr(worktree, "_gh", _status_gh([_qa_status(), _qa_status()]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+
+    # a matched status whose state is missing/blank is malformed → unreadable.
+    monkeypatch.setattr(worktree, "_gh", _status_gh([{"context": "board/review-gate", "state": ""}]))
+    assert await worktree.read_review_status_result(_SLUG, _HEAD, cwd="/repo") == (
+        worktree.STATUS_READ_UNREADABLE,
+        None,
+    )
+    # and `read_review_status` keeps collapsing the same cases to None.
     assert await worktree.read_review_status(_SLUG, _HEAD, cwd="/repo") is None
 
 

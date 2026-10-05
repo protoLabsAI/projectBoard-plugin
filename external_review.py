@@ -21,10 +21,14 @@ This module is the pure half: parse the config, decide from one ``gh pr view`` p
 findings into the text a fix round leads with. The reconcile (``loop/reconcile.py``) owns
 what happens next. Nothing here shells out.
 
-Not to be confused with the board's OWN verdict: the in-process gate publishes a ``QA
-panel`` commit STATUS (#354). The panel's check of the same name is a CHECK RUN, and the
-two are told apart by type, so the board can never read its own verdict back as the
-panel's.
+Not to be confused with the board's OWN verdict: the in-process gate publishes a
+``board/review-gate`` commit STATUS (#354, #512) — its own context, kept apart from the
+panel's ``QA panel``. #354 first wrote that status under the ``QA panel`` name, which collided
+with the panel's App check of the same name (careercoach#17): the board read its own earlier
+FAIL back as the panel's verdict. #512 moved the board's status to ``board/review-gate``, so
+the panel's ``QA panel`` check is matched only under the panel's name and the board can never
+read its own verdict back as the panel's. The board's status is a record of ITS verdict, never
+evidence of the panel's.
 """
 
 from __future__ import annotations

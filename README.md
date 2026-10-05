@@ -806,7 +806,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path("/path/to/projectBoard-plugin")
-spec = importlib.util.spec_from_file_location("project_board", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+spec = importlib.util.spec_from_file_location(
+    "project_board", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)]
+)
 sys.modules["project_board"] = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sys.modules["project_board"])
 

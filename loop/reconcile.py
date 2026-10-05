@@ -1244,10 +1244,11 @@ class ReconcileMixin:
                         and await self._rearm_review_for_new_head(store, f, pr_url, repo)
                     ):
                         f = await asyncio.to_thread(store.get_feature, fid) or f
-                    # The INBOUND half of the review gate (#323): a trusted, promoted QA
+                    # The INBOUND half of the review gate (#323/#512): a trusted EXTERNAL-panel
                     # PASS for the PR's CURRENT head repairs a stale changes-requested or an
-                    # absent local review verdict to review-clean, so the ordinary merge
-                    # gates can proceed — the counterpart to #347's head-pinned publish.
+                    # absent local review verdict to review-clean, so the ordinary merge gates
+                    # can proceed — unless the board's OWN gate FAILED that head, in which case
+                    # the strictest verdict wins and the card is held for an operator (#512).
                     # Runs AFTER #328 (a genuine head move takes the fresh-internal-review
                     # path, never this trust path — #328 flipped it to review-pending, which
                     # this edge then skips) and BEFORE #340 (a proven current-head PASS
@@ -2227,35 +2228,65 @@ class ReconcileMixin:
 
     # ── inbound trusted-QA reconcile on the current head (#323) ───────────────
     async def _reconcile_trusted_qa_pass(self, store, feature: dict, pr_url: str, repo: str) -> bool:
-        """Ingest a trusted, promoted QA PASS for the PR's CURRENT head and repair a stale
-        ``changes-requested`` or ABSENT local review verdict to ``review-clean`` (#323) —
-        the inbound counterpart of #347's head-pinned publish.
+        """Ingest a trusted EXTERNAL-PANEL PASS for the PR's CURRENT head and repair a stale
+        ``changes-requested`` or ABSENT local review verdict to ``review-clean`` (#323) — the
+        inbound counterpart of the gate's head-pinned publish.
 
-        #354 makes the board's own gate verdict a reliable, head-pinned ``QA panel`` commit
-        STATUS (the PAT-compatible successor to #347's check run). This reads that SAME status
-        back (``worktree.read_review_status`` — the identity plumbing, not a second parsed
-        signal): when a PROMOTED PASS whose head-scoped status equals the LIVE PR head exists —
-        never promoting from ambiguous/untrusted data — the local review substate is repaired to
-        ``review-clean`` so the ordinary merged-state / CI / auto-merge gates decide the
-        rest. It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a
-        blocking state to clean (never manufactures a blocking one).
+        #512: the PASS signal is the configured external review panel's marker review NAMING
+        the live head with a non-blocking verdict — read via ``worktree.pr_review_state`` +
+        ``external_review.evaluate``, exactly as the panel-FAIL edge reads it. It is NEVER a
+        commit status: #354 first wrote the board's own gate verdict under ``QA panel``, the
+        very name the panel's App check uses, and #323 read that back as the panel's verdict —
+        so on careercoach#17 the board trusted its OWN earlier FAIL and held a head the panel
+        had PASSed for hours. The board's own status is a record of ITS verdict, never evidence
+        of the panel's. With no external panel configured there is nothing to adopt (returns
+        False); the board never manufactures a PASS from its own signals.
 
-        Fails CLOSED, leaving the card exactly as it was (no promotion, so the merge edge
-        still can't touch it), on everything that is not a provable current-head PASS: a
-        FAIL never promotes or clears a blocking state (r2); a PASS for another head,
-        unreadable / malformed / ambiguous marker data, or no promotion evidence changes
-        nothing (r3); and — the TOCTOU guard — a live head that MOVED between the check read
-        and the promotion write (a PR push landing mid-reconcile) is not trusted either, so
-        a PASS proven for the old head can never mark a newly pushed, unreviewed head clean
-        (r3). That guard is BOTH a pre-write early-out AND a post-write confirmation: a push
-        that races the review-clean write itself is detected right after it lands and the
-        write is UNDONE (reverted to the prior blocking / absent substate) before the merge
-        edge can act on it. NEVER races the internal gate (r4/r5): it skips a ``review-pending``
-        card (the gate owns that live verdict) and a ``review-clean`` card (already promoted
-        → idempotent no-op), and — the same liveness guard the stranded-fix recovery (#340)
-        uses — any card with a live drive, a claimed worktree, or an in-flight gate. Returns
-        True only when it repaired the substate; the caller then refreshes its snapshot so
-        the downstream #340 / merge edges read the cleaned labels this same pass."""
+        Strictest verdict wins (#512), checked in two layers once a current-head external PASS is
+        in hand — the PRIMARY veto is the card's OWN local verdict, NOT a status read back:
+
+          1. ``changes-requested`` set AND the card's ``reviewed-head:<sha>`` stamp (prefix,
+             ``_REVIEWED_HEAD_SHA_LEN``) EQUALS the live head ⇒ the board's own gate FAILED this
+             EXACT head. HOLD (``_note_gate_override_hold`` once per (card, head)) and do not adopt.
+             A status read cannot override this — it stands even if the gate's ``failure`` status
+             never reached GitHub (the round-3 edge: a verdict that never posted still lives here).
+          2. ``changes-requested`` set but the stamp names a DIFFERENT head ⇒ the rejection is stale
+             (an external push moved the head out from under it). Fall through to adoption.
+          3. ``changes-requested`` set with NO (or an ambiguous) stamp ⇒ fail closed, do not adopt —
+             #328's missing-stamp doctrine: identity we cannot prove stale stays blocking.
+          4. No local verdict (ABSENT — a pre-upgrade card, an operator unblock, the inert-gate
+             exit) ⇒ fall through to adoption. A leftover ``pending`` status plays no part (round 2).
+
+        The SECONDARY veto, belt-and-braces AFTER the local check, is the board's OWN
+        ``board/review-gate`` status at the live head, read TRI-STATE
+        (``worktree.read_review_status_result`` on the board's OWN context, never ``QA panel``): a
+        COMPLETED non-success (``failure`` / ``error``) — a real, head-pinned verdict the gate
+        actually REACHED — HOLDS (``_note_gate_override_hold``), recording the internal-vs-external
+        disagreement and that an operator unblock/override is required; an UNREADABLE read (a gh
+        error / malformed / ambiguous response the plain ``read_review_status`` could not tell apart
+        from absence) FAILS CLOSED this pass — we cannot prove the gate did not FAIL this head, so a
+        transient read failure is never mistaken for "no gate verdict" and promotes a head the gate
+        may have FAILED (careercoach#17, round 1); a ``pending`` or PROVEN-ABSENT status does NOT
+        veto — a genuinely-running gate is already excluded ABOVE (its card is ``review-pending``,
+        which this method skips, plus the live-drive / in-flight guards) BEFORE the status is read,
+        so a ``pending`` reaching it is the INERT-gate exit's leftover (it posts ``pending`` then
+        clears the substate without a terminal verdict), the very ABSENT-verdict case this method
+        repairs; holding on it would strand, for good, a card the external PASS can clean (round 2).
+
+        It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a blocking state
+        to clean (never manufactures a blocking one). Fails CLOSED, leaving the card exactly as
+        it was, on everything that is not a provable current-head external PASS: no config (r4),
+        an unreadable panel view, a panel FAIL (r2/r6), a PASS judged against a head that is no
+        longer live (the TOCTOU guard — a push between ``pr_head_sha`` and the panel read leaves
+        ``verdict.head != head``, r3), or no marker PASS at the head at all. The verdict is
+        written PINNED to the head it was proven for (#323): a later push leaves the pin naming a
+        dead head, the merge gate declines, and the card goes back for review — nothing to race,
+        nothing to undo. NEVER races the internal gate (r4/r5): it skips a ``review-pending``
+        card (the gate owns that live verdict) and a ``review-clean`` card (already promoted →
+        idempotent no-op), and — the same liveness guard the stranded-fix recovery (#340) uses —
+        any card with a live drive, a claimed worktree, or an in-flight gate. Returns True only
+        when it repaired the substate; the caller then refreshes its snapshot so the downstream
+        #340 / merge edges read the cleaned labels this same pass."""
         fid = feature["id"]
         if not self.review_gate:
             return False  # no gate ⇒ no review substate to repair
@@ -2278,36 +2309,116 @@ class ReconcileMixin:
         _number, repo_slug = _parse_pr_url(pr_url)
         if not repo_slug:
             return False  # no repo identity → fail closed
-        verdict = await worktree.read_review_status(repo_slug, head, cwd=repo)
-        if verdict is None:
-            # Unreadable / absent / malformed / ambiguous / another-head status → fail closed,
-            # leaving the card unpromoted (#354 r5). Never promotes from ambiguous/untrusted data.
+        # The PASS signal is the EXTERNAL panel's marker review (#512), never a commit status the
+        # board wrote. No panel configured for this card's project ⇒ nothing to adopt.
+        ext_cfg = self._external_review_cfg_for(feature)
+        if ext_cfg is None:
             return False
-        if not verdict.get("passed"):
-            # A trusted, current-head FAIL is authoritative the OTHER way: it must never
-            # promote or clear a blocking state (r2). Leave changes-requested / absence as is.
+        view = await worktree.pr_review_state(pr_url, cwd=repo)
+        verdict = external_review.evaluate(view, ext_cfg) if view else None
+        if verdict is None or verdict.head != head:
+            # Unreadable panel view, or one judged against a head that is no longer live (a push
+            # landed between the head read and the panel read) → fail closed. Never adopt a PASS
+            # that could be for a head that is gone.
+            return False
+        if verdict.failed:
+            # The panel FAILED this head — authoritative the OTHER way (``_reconcile_external_review``
+            # owns the bounce). It must never promote or clear a blocking state (r2).
             log.info(
-                "[project_board] %s trusted QA verdict for current head %s is %s — not promoting (fail closed): %s",
+                "[project_board] %s external panel FAILED the current head %s — not promoting: %s",
                 fid,
                 head[:12],
-                verdict.get("state"),
                 pr_url,
             )
             return False
-        # A trusted, PROMOTED, current-head PASS. The verdict is written PINNED to the head
-        # it was proven for (#323): `set_review_substate` stamps `review-clean-sha:<head>`
-        # and `merge_posture` refuses to merge unless that pin equals the live head.
-        #
-        # That is what makes this write safe with no race window. The first cuts tried to
-        # guard it — re-read the head before the write, then re-read again after and undo —
-        # and review correctly rejected both: a push can land after ANY check, so
-        # check-then-act cannot be made safe here. It can, however, be made IRRELEVANT. A
-        # push at any point leaves the pin naming a head that no longer exists, the merge
-        # gate declines, and the card goes back for review. There is nothing to lose a race
-        # to, and nothing to undo.
+        if not verdict.review_verdict or verdict.review_verdict in external_review.BLOCKING_VERDICTS:
+            # ``failed`` is False but NO configured reviewer's marker review names this head with a
+            # non-blocking (PASS) verdict — a green CI rollup or an un-reviewed head is not a PASS.
+            return False
+        # A trusted, current-head external PASS. Strictest verdict wins (#512), PRIMARY veto: the
+        # card's OWN local verdict, read from its labels — NOT a commit status read back (a status
+        # read can be unreadable, or the gate's FAIL may never have reached GitHub at all). A live
+        # ``changes-requested`` whose ``reviewed-head:<sha>`` stamp NAMES the live head is the
+        # board's own gate FAILING this EXACT head; it vetoes the external PASS and no status read
+        # can override it (round 3). The stamp is the same #328 identity the stale-review re-arm
+        # compares, read SHORT (``_REVIEWED_HEAD_SHA_LEN``).
+        if stale_rejection:
+            stamps = [l[len(LABEL_REVIEWED_HEAD_PREFIX) :] for l in labels if l.startswith(LABEL_REVIEWED_HEAD_PREFIX)]
+            if len(stamps) != 1 or not stamps[0]:
+                # changes-requested with NO (or an ambiguous) reviewed-head stamp → fail closed:
+                # #328's missing-stamp doctrine. We cannot prove the rejection is stale, so the
+                # blocking verdict stands and the external PASS is not adopted. Not a recorded
+                # disagreement (no operator hold) — the rejection is simply still in force.
+                log.info(
+                    "[project_board] %s changes-requested with no reviewed-head stamp — not adopting the external "
+                    "PASS (fail closed, #328 missing-stamp doctrine): %s",
+                    fid,
+                    pr_url,
+                )
+                return False
+            if head[:_REVIEWED_HEAD_SHA_LEN] == stamps[0]:
+                # The board's own gate FAILED this EXACT head (the live head carries the rejected
+                # verdict's stamp). Strictest verdict wins — HOLD, once per (card, head). This stands
+                # even if the gate's ``failure`` status never posted, and even if the secondary
+                # status read below would find nothing (round 3).
+                short = head[: store_mod.SHORT_SHA_LEN]
+                why = (
+                    f"internal review gate rejected (changes-requested) head {short} while the external panel "
+                    f"PASSed — strictest verdict wins; an operator unblock/override is required to merge: {pr_url}"
+                )
+                await asyncio.to_thread(self._note_gate_override_hold, store, fid, head, why)
+                return False
+            # The stamp names a DIFFERENT head — the rejection is for a head a push has since
+            # replaced. The local verdict does not veto THIS head; fall through to the secondary
+            # gate-status check and then adoption.
+        # Strictest verdict wins (#512), SECONDARY veto (belt-and-braces, AFTER the local check):
+        # the board's OWN gate status at this head can VETO the PASS, but can never BE it — read
+        # only the board's own context, and read it TRI-STATE so a PROVEN-ABSENT gate status (the
+        # gate never ran this head — adoption may proceed) is told apart from an UNREADABLE one. The
+        # veto must FAIL CLOSED on an unreadable read: ``read_review_status`` returns None for BOTH
+        # absence and a gh error / malformed / ambiguous response, and treating a transient read
+        # failure as "no gate verdict" would promote a head the gate may have FAILED (careercoach#17).
+        outcome, gate = await worktree.read_review_status_result(
+            repo_slug, head, context=worktree.GATE_STATUS_CONTEXT, cwd=repo
+        )
+        if outcome == worktree.STATUS_READ_UNREADABLE:
+            # The gate status could not be read cleanly — we cannot PROVE the gate did not FAIL
+            # this head, so we do not adopt. Not a recorded disagreement (no operator hold): a
+            # transient read failure the next poll simply retries.
+            log.info(
+                "[project_board] %s gate status unreadable at head %s — not adopting the external PASS this "
+                "pass (fail closed, retries next poll): %s",
+                fid,
+                head[:12],
+                pr_url,
+            )
+            return False
+        # Only a COMPLETED gate verdict vetoes — ``failure`` / ``error``, a real head-pinned
+        # judgement the gate actually reached. A ``pending`` status does NOT veto here: a gate that
+        # is genuinely mid-run is already excluded ABOVE (its card is ``review-pending``, which this
+        # method skips, and its fid is in ``_review_inflight`` / has a live drive), so a ``pending``
+        # reaching this read is the INERT-gate exit's leftover — it posts ``pending`` then clears the
+        # review substate without landing a terminal status. That is the ABSENT-verdict case this
+        # method's contract repairs; vetoing on it would strand the card the external PASS can clean,
+        # for good (the #512 review finding). The gate holds a card only when it has a real FAILING
+        # verdict for the head, never merely because it once began looking.
+        if outcome == worktree.STATUS_READ_PRESENT and gate.get("state") in ("failure", "error"):
+            gate_state = gate.get("state")
+            short = head[: store_mod.SHORT_SHA_LEN]
+            why = (
+                f"internal review gate FAILED ({gate_state}) at head {short} while the external panel "
+                f"PASSed — strictest verdict wins; an operator unblock/override is required to merge: {pr_url}"
+            )
+            await asyncio.to_thread(self._note_gate_override_hold, store, fid, head, why)
+            return False
+        # No internal-gate veto. The verdict is written PINNED to the head it was proven for
+        # (#323): `set_review_substate` stamps `review-clean-sha:<head>` and `merge_posture`
+        # refuses to merge unless that pin equals the live head. A push at any point leaves the
+        # pin naming a head that no longer exists, the merge gate declines, and the card goes
+        # back for review — there is nothing to lose a race to, and nothing to undo.
         note = (
-            f"review reconciled to clean (#323): a trusted QA PASS ({verdict.get('state')}) is promoted for "
-            f"PR head {head[:12]} — "
+            f"review reconciled to clean (#323): the external QA panel PASSed PR head {head[:12]} "
+            f"({verdict.review_verdict}) — "
             + ("the stale changes-requested verdict" if stale_rejection else "no local review verdict was recorded")
             + " has been repaired to review-clean, PINNED to that head; the ordinary merge gates decide the rest"
         )
@@ -2320,12 +2431,36 @@ class ReconcileMixin:
         await self._stamp_reviewed_head(store, fid, "")
         await self._budget_reset(store, fid, "review-fix")
         log.info(
-            "[project_board] %s reconciled a trusted current-head QA PASS (%s) → review-clean, pinned to that head: %s",
+            "[project_board] %s adopted a trusted current-head external QA PASS (%s) → review-clean, pinned to %s: %s",
             fid,
+            verdict.review_verdict,
             head[:12],
             pr_url,
         )
         return True
+
+    def _note_gate_override_hold(self, store, fid: str, head: str, why: str) -> None:
+        """Say ONCE per (card, head) that the board's own review gate REJECTED a head the external
+        panel PASSed, so an operator override is needed to merge (#512) — on the bead and to the
+        operator. Fires from EITHER veto in ``_reconcile_trusted_qa_pass``: the PRIMARY local-verdict
+        veto (a live ``changes-requested`` whose ``reviewed-head`` stamp names this exact head) or
+        the SECONDARY gate-status veto (a COMPLETED ``failure`` / ``error`` status). Never fires on a
+        merely ``pending`` gate status (that is the inert-gate leftover, not a verdict — see
+        ``_reconcile_trusted_qa_pass``). A SEPARATE ledger from ``_note_external_hold`` (that one is
+        CLEARED whenever the panel passes, which is exactly when THIS hold fires), so the two never
+        cross-silence each other. Store-only; runs off the event loop."""
+        held = getattr(self, "_gate_override_held", None)
+        if held is None:
+            held = self._gate_override_held = {}
+        if held.get(fid) == head:
+            return
+        held[fid] = head
+        log.warning("[project_board] %s held: %s", fid, why)
+        try:
+            store.comment(fid, f"auto-merge held: {why}")
+        except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+            log.warning("[project_board] %s gate-override hold comment failed", fid, exc_info=True)
+        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"gate-override|{head}")
 
     # ── the external QA panel's FAIL at the current head (#473) ───────────────
     def _external_review_cfg_for(self, feature: dict):
@@ -2520,9 +2655,11 @@ class ReconcileMixin:
         COMMIT STATUS (#354), replacing #347's check run. ``POST /repos/{slug}/statuses/{sha}``
         succeeds under the board's user/PAT ``gh`` token; #347's ``POST /check-runs`` needs a
         GitHub App installation token and 403s here ("You must authenticate via a GitHub App"),
-        so it never actually published. The status is a ``QA panel`` context (the same historic
-        name), one of success/failure/pending, a concise <=140-char ``description``, and the PR
-        link as the stable ``target_url``.
+        so it never actually published. The status is posted under the board's OWN
+        ``board/review-gate`` context (#512 — NOT the external panel's ``QA panel`` App check, so
+        the #323 adoption can never read this verdict back as the panel's PASS), one of
+        success/failure/pending, a concise <=140-char ``description``, and the PR link as the
+        stable ``target_url``.
 
         Pinned to ``head_sha``, the IMMUTABLE head the gate actually reviewed (#328,
         ``reviewed_head`` read BEFORE the panel): an unknown head (gh couldn't read it, so
@@ -2546,7 +2683,13 @@ class ReconcileMixin:
             return
         try:
             ok = await worktree.post_review_status(
-                repo_slug, head_sha, state=state, description=description, target_url=pr_url, cwd=repo
+                repo_slug,
+                head_sha,
+                state=state,
+                description=description,
+                target_url=pr_url,
+                context=worktree.GATE_STATUS_CONTEXT,
+                cwd=repo,
             )
         except Exception as exc:  # noqa: BLE001 — a status post must never break the landed verdict
             log.warning("[project_board] %s review status post raised (verdict still on the bead): %s", fid, exc)
@@ -2675,7 +2818,13 @@ class ReconcileMixin:
         findings = self._parse_findings(output)
         if findings is None:
             # Host predates the findings convention (ADR 0077) — the gate can't
-            # judge, so it must not pretend to. Record and leave in review.
+            # judge, so it must not pretend to. Record and leave in review. The
+            # ``pending`` status posted above is left on the head (we never fake a
+            # terminal verdict the gate did not reach); it is an ABANDONED gate, not a
+            # running one, so the trusted-QA adoption treats it as the repairable
+            # ABSENT-verdict case and the external panel can still clean the card —
+            # a ``pending`` gate status does NOT veto that adoption (see
+            # ``_reconcile_trusted_qa_pass``; #512 review finding).
             await asyncio.to_thread(
                 store.set_review_substate, fid, None, note="review gate: host lacks graph.review.findings — gate inert"
             )
