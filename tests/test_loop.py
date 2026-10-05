@@ -7420,8 +7420,11 @@ _QA_PR = "https://github.com/o/r/pull/9"
 _QA_HEAD = "c0ffee11c0ffee22c0ffee33c0ffee44c0ffee55"
 _QA_HEAD_2 = "dec0de11dec0de22dec0de33dec0de44dec0de55"  # a DIFFERENT head
 # The reviewed-head stamp is stored SHORT (#328, 12-char prefix) — the form #328's re-arm
-# compares the live head's prefix against, so a same-head card does NOT re-arm.
+# compares the live head's prefix against, so a same-head card does NOT re-arm. A stamp that
+# names the LIVE head is the board's own rejection of THIS head (the PRIMARY veto, #512); one
+# that names a DIFFERENT head is a STALE rejection a push moved out from under.
 _QA_HEAD_SHORT = _QA_HEAD[:12]
+_QA_HEAD_2_SHORT = _QA_HEAD_2[:12]  # the stale-rejection stamp — names a head that is no longer live
 
 
 def _ext_view(head, *, verdict="PASS", marker_head=None, reviewer="protoreview", checks=None):
@@ -7478,20 +7481,76 @@ def _qa_loop(monkeypatch, *, head, view=None, gate_status=None, gate_unreadable=
     return loop
 
 
-async def test_trusted_qa_pass_repairs_changes_requested_to_clean(monkeypatch):
-    """(a) r1/r2: an external marker PASS at the live head + NO board gate status repairs a stale
-    ``changes-requested`` to ``review-clean``, pinned to that head, and clears the reviewed-head
-    stamp (a clean verdict pins no head). It ADOPTS the panel's verdict — no internal review is
-    invented, and the PASS comes from the panel's review, never a commit status the board wrote."""
+async def test_trusted_qa_pass_repairs_stale_changes_requested_to_clean(monkeypatch):
+    """(a) r1/r2: an external marker PASS at the live head + NO board gate status repairs a STALE
+    ``changes-requested`` (its ``reviewed-head`` stamp names a DIFFERENT, since-replaced head) to
+    ``review-clean``, pinned to the live head, and clears the reviewed-head stamp (a clean verdict
+    pins no head). It ADOPTS the panel's verdict — no internal review is invented, and the PASS
+    comes from the panel's review, never a commit status the board wrote. The local verdict does
+    NOT veto, because its rejection was for a head a push has since moved out from under."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_2_SHORT}"]  # stamp names a STALE head
     loop = _qa_loop(monkeypatch, head=_QA_HEAD, view=_ext_view(_QA_HEAD))  # gate_status None → absent
     feature = {"id": "bd-1", "labels": list(store.labels)}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
     assert "review-clean" in store.labels and "changes-requested" not in store.labels
-    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven head (short)
+    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven LIVE head (short)
     assert not any(l.startswith("reviewed-head:") for l in store.labels)  # clean pins no head
     assert store.review_states[-1][0] == "review-clean"
+
+
+async def test_trusted_qa_same_head_changes_requested_held_with_no_gate_status(monkeypatch):
+    """ROUND 3 (the primary veto): the external panel PASSed the live head, but the card's OWN
+    local verdict is ``changes-requested`` whose ``reviewed-head`` stamp NAMES that exact head —
+    the board's own gate rejected THIS head. Strictest verdict wins from the local verdict alone:
+    the card is held EVEN WITH NO ``board/review-gate`` status at the head (the gate's ``failure``
+    status never posted), and a status read cannot override it. One hold comment per (card, head)."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]  # stamp names the LIVE head
+    loop = _qa_loop(monkeypatch, head=_QA_HEAD, view=_ext_view(_QA_HEAD))  # gate_status None → absent
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels  # held, not promoted
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+    holds = [c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]
+    assert len(holds) == 1 and "review gate" in holds[0][2] and "operator" in holds[0][2]
+    # Once PER HEAD: a second reconcile of the same head adds no further comment.
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert len([c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]) == 1
+
+
+async def test_trusted_qa_same_head_changes_requested_held_despite_pending_gate(monkeypatch):
+    """ROUND 3 + round-2 leftover: a same-head ``changes-requested`` (stamp names the live head) is
+    held by the PRIMARY local-verdict veto even when a leftover ``pending`` gate status sits at the
+    head. The local rejection of THIS head wins; the ``pending`` (which on its own would NOT veto)
+    never gets the chance to relax it."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    loop = _qa_loop(
+        monkeypatch,
+        head=_QA_HEAD,
+        view=_ext_view(_QA_HEAD),
+        gate_status={"state": "pending", "head_sha": _QA_HEAD, "passed": False},  # inert-gate leftover
+    )
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels
+    holds = [c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]
+    assert len(holds) == 1 and "review gate" in holds[0][2] and "operator" in holds[0][2]
+
+
+async def test_trusted_qa_changes_requested_with_no_stamp_fails_closed(monkeypatch):
+    """The primary veto, #328 missing-stamp doctrine: a ``changes-requested`` card with NO
+    ``reviewed-head`` stamp cannot be PROVEN stale, so the external PASS is NOT adopted — fail
+    closed, the blocking verdict stands. It is not a recorded disagreement (no operator hold)."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested"]  # no reviewed-head stamp at all
+    loop = _qa_loop(monkeypatch, head=_QA_HEAD, view=_ext_view(_QA_HEAD))
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+    assert not any(c[0] == "comment" for c in store.calls)  # fail-closed, not a recorded hold
 
 
 async def test_trusted_qa_pass_repairs_absent_review_state_to_clean(monkeypatch):
@@ -7506,12 +7565,14 @@ async def test_trusted_qa_pass_repairs_absent_review_state_to_clean(monkeypatch)
 
 
 async def test_trusted_qa_gate_failure_holds_the_external_pass(monkeypatch):
-    """(b) r3 — the careercoach#17 sequence: the external panel PASSed the live head while the
-    board's OWN ``board/review-gate`` status at that same head is ``failure`` (its fix budget was
-    spent). Strictest verdict wins: the card is NOT promoted, and ONE hold comment per (card,
-    head) names the internal-vs-external disagreement and the operator override."""
+    """(b) — the careercoach#17 sequence: the gate spent its fix budget and REJECTED the head
+    (``changes-requested`` + a ``reviewed-head`` stamp naming the live head) and posted ``failure``
+    there, while the external panel PASSed that same head. The PRIMARY local-verdict veto holds it
+    (the stamp names the live head) — strictest verdict wins, the card is NOT promoted, and ONE hold
+    comment per (card, head) names the internal-vs-external disagreement and the operator override.
+    The ``failure`` status is consistent but not needed — the local verdict alone would hold it."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]  # stamp names the LIVE head
     loop = _qa_loop(
         monkeypatch,
         head=_QA_HEAD,
@@ -7530,19 +7591,42 @@ async def test_trusted_qa_gate_failure_holds_the_external_pass(monkeypatch):
     assert len([c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]) == 1
 
 
-async def test_trusted_qa_gate_error_holds_the_external_pass(monkeypatch):
-    """(b) r3: an ``error`` board gate status (a completed non-success, like ``failure``) at the
-    live head holds the external PASS the same way — strictest verdict wins, no promotion, one
-    operator hold."""
+async def test_trusted_qa_gate_failure_holds_an_absent_verdict_card(monkeypatch):
+    """The SECONDARY veto (PRESENT ``failure`` on an ABSENT-verdict card): a card with NO local
+    review verdict (empty labels — the local primary veto cannot fire) whose live head the external
+    panel PASSed, but whose board's OWN ``board/review-gate`` status at that head is ``failure`` — a
+    completed, head-pinned rejection the gate actually reached. Strictest verdict wins: NOT promoted,
+    and ONE hold comment per (card, head) names the disagreement and the operator override."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = []  # ABSENT local verdict — only the secondary gate-status veto can fire
+    loop = _qa_loop(
+        monkeypatch,
+        head=_QA_HEAD,
+        view=_ext_view(_QA_HEAD),
+        gate_status={"state": "failure", "head_sha": _QA_HEAD, "passed": False},
+    )
+    feature = {"id": "bd-1", "labels": []}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels  # held, not promoted
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+    holds = [c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]
+    assert len(holds) == 1 and "failure" in holds[0][2]
+    assert "review gate" in holds[0][2] and "operator" in holds[0][2]
+
+
+async def test_trusted_qa_gate_error_holds_an_absent_verdict_card(monkeypatch):
+    """The secondary veto, ``error`` variant: an ``error`` board gate status (a completed
+    non-success, like ``failure``) at the live head holds an ABSENT-verdict card's external PASS the
+    same way — strictest verdict wins, no promotion, one operator hold."""
+    store = _RoundTripStore()
+    store.labels = []
     loop = _qa_loop(
         monkeypatch,
         head=_QA_HEAD,
         view=_ext_view(_QA_HEAD),
         gate_status={"state": "error", "head_sha": _QA_HEAD, "passed": False},
     )
-    feature = {"id": "bd-1", "labels": list(store.labels)}
+    feature = {"id": "bd-1", "labels": []}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert "review-clean" not in store.labels  # held, not promoted
     assert not any(c[0] == "set_review_substate" for c in store.calls)
@@ -7550,16 +7634,39 @@ async def test_trusted_qa_gate_error_holds_the_external_pass(monkeypatch):
     assert len(holds) == 1 and "error" in holds[0][2]
 
 
-async def test_trusted_qa_gate_pending_does_not_hold_the_external_pass(monkeypatch):
-    """r3 / the #512 review finding: a ``pending`` board gate status at the live head does NOT hold
-    the external PASS. A gate that is genuinely mid-run is excluded ABOVE (the ``review-pending``
-    label skip + the in-flight / live-drive guards) BEFORE the status is read, so a ``pending``
-    reaching the veto is the INERT-gate exit's leftover — it posts ``pending`` then clears the
-    review substate without landing a terminal verdict — i.e. the ABSENT-verdict case this method
-    repairs. The card is promoted to review-clean (pinned to the proven head) and NO operator hold
-    is raised; only a COMPLETED ``failure`` / ``error`` vetoes."""
+async def test_trusted_qa_absent_verdict_with_pending_leftover_adopted(monkeypatch):
+    """ROUND 2 / the #512 review finding: an ABSENT-verdict card (empty labels) with a leftover
+    ``pending`` board gate status at the live head IS adopted. A gate that is genuinely mid-run is
+    excluded ABOVE (the ``review-pending`` label skip + the in-flight / live-drive guards) BEFORE the
+    status is read, so a ``pending`` reaching the SECONDARY veto is the INERT-gate exit's leftover —
+    it posts ``pending`` then clears the review substate without landing a terminal verdict — i.e.
+    the very ABSENT-verdict case this method repairs. The card is promoted to review-clean (pinned
+    to the proven head) and NO operator hold is raised; only a COMPLETED ``failure`` / ``error``
+    vetoes. Holding here would strand, for good, a card the external PASS can clean."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = []
+    loop = _qa_loop(
+        monkeypatch,
+        head=_QA_HEAD,
+        view=_ext_view(_QA_HEAD),
+        gate_status={"state": "pending", "head_sha": _QA_HEAD, "passed": False},
+    )
+    feature = {"id": "bd-1", "labels": []}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
+    assert "review-clean" in store.labels
+    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven head
+    assert store.review_states[-1][0] == "review-clean"
+    assert not any(c[0] == "comment" and "strictest verdict wins" in c[2] for c in store.calls)
+
+
+async def test_trusted_qa_stale_head_changes_requested_with_pending_leftover_adopted(monkeypatch):
+    """A STALE ``changes-requested`` (its ``reviewed-head`` stamp names a DIFFERENT, since-replaced
+    head) with a leftover ``pending`` gate status is adopted: the primary local-verdict veto does
+    NOT fire (the rejection is for a head a push moved out from under), and the secondary ``pending``
+    veto does not fire either (it is the inert-gate leftover). The external PASS cleans the card to
+    review-clean, pinned to the live head."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_2_SHORT}"]  # stale stamp
     loop = _qa_loop(
         monkeypatch,
         head=_QA_HEAD,
@@ -7569,23 +7676,22 @@ async def test_trusted_qa_gate_pending_does_not_hold_the_external_pass(monkeypat
     feature = {"id": "bd-1", "labels": list(store.labels)}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
     assert "review-clean" in store.labels and "changes-requested" not in store.labels
-    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven head
+    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven live head
     assert store.review_states[-1][0] == "review-clean"
-    # No false "internal review gate is still PENDING" operator hold — the inert gate is repairable.
     assert not any(c[0] == "comment" and "strictest verdict wins" in c[2] for c in store.calls)
 
 
 async def test_trusted_qa_unreadable_gate_status_fails_closed(monkeypatch):
-    """r3 (the review-finding regression): the external panel PASSed the live head, but the board's
-    OWN gate-status read FAILED (a gh error / malformed / ambiguous response) rather than proving
-    the gate never ran. ``read_review_status`` collapses that unreadable read to the same ``None``
-    as a proven absence; the tri-state read does NOT, so the reconcile FAILS CLOSED — the card is
-    not promoted (we can't prove the gate didn't FAIL this head), yet it is NOT a recorded
-    disagreement, so there is no operator hold comment. The next poll simply retries."""
+    """ROUND 1 (the review-finding regression): an ABSENT-verdict card whose live head the external
+    panel PASSed, but whose board's OWN gate-status read FAILED (a gh error / malformed / ambiguous
+    response) rather than proving the gate never ran. ``read_review_status`` collapses that
+    unreadable read to the same ``None`` as a proven absence; the tri-state read does NOT, so the
+    SECONDARY veto FAILS CLOSED — the card is not promoted (we can't prove the gate didn't FAIL this
+    head), yet it is NOT a recorded disagreement, so there is no operator hold. The next poll retries."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = []  # ABSENT local verdict → the primary veto does not fire; the secondary read runs
     loop = _qa_loop(monkeypatch, head=_QA_HEAD, view=_ext_view(_QA_HEAD), gate_unreadable=True)
-    feature = {"id": "bd-1", "labels": list(store.labels)}
+    feature = {"id": "bd-1", "labels": []}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
     assert "review-clean" not in store.labels  # not promoted on a read it could not trust
     assert not any(c[0] == "set_review_substate" for c in store.calls)
@@ -7596,10 +7702,10 @@ async def test_trusted_qa_legacy_qa_panel_status_neither_blocks_nor_promotes(mon
     """(c) r5: a board-written ``QA panel`` commit status (an older board's own verdict, or the
     panel's App check surfacing as a StatusContext) is IGNORED entirely. It is not the PASS signal
     (that is the panel's marker review), and it cannot VETO the PASS (the board reads back only
-    ``board/review-gate``). With an external marker PASS + a stray ``QA panel`` FAILURE in the
-    rollup and NO ``board/review-gate`` status, the card still promotes."""
+    ``board/review-gate``). With an ABSENT-verdict card, an external marker PASS + a stray ``QA
+    panel`` FAILURE in the rollup and NO ``board/review-gate`` status, the card still promotes."""
     store = _RoundTripStore()
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = []  # ABSENT local verdict — the `QA panel` FAILURE is the only hostile signal
     qa_panel_fail = {"__typename": "StatusContext", "context": "QA panel", "state": "FAILURE"}
     loop = _qa_loop(
         monkeypatch,
@@ -7607,7 +7713,7 @@ async def test_trusted_qa_legacy_qa_panel_status_neither_blocks_nor_promotes(mon
         view=_ext_view(_QA_HEAD, checks=[qa_panel_fail]),  # a legacy `QA panel` FAILURE sits in the rollup
         gate_status=None,  # the board wrote NO status under its own context
     )
-    feature = {"id": "bd-1", "labels": list(store.labels)}
+    feature = {"id": "bd-1", "labels": []}
     assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
     assert "review-clean" in store.labels  # the `QA panel` FAILURE neither blocked nor was needed
 
@@ -7740,13 +7846,15 @@ async def test_trusted_qa_reconcile_is_a_noop_when_the_gate_is_off(monkeypatch):
 
 
 async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_reviews(monkeypatch):
-    """r1/r5 end-to-end: a full reconcile of an in_review PR stuck in ``changes-requested`` for
-    the SAME (unchanged) head — so #328 does not re-arm and #340 would otherwise requeue the
-    "stranded" round — instead adopts a current-head external PASS: it repairs to ``review-clean``,
-    clears the stamp, requeues nothing, and never re-runs the internal review gate."""
+    """r1/r5 end-to-end: a full reconcile of an in_review PR with NO local review verdict (an
+    ABSENT state — a pre-upgrade card, an operator unblock, or the inert-gate exit) adopts a
+    current-head external PASS: it repairs to ``review-clean``, pins the head, requeues nothing
+    (#340 needs ``changes-requested``), and never re-runs the internal review gate. This is the
+    clean #323 adoption path in the full reconcile — a stale changes-requested would be re-armed by
+    #328 first, and a same-head changes-requested would be HELD by the strictest-verdict veto."""
     store = _RoundTripStore()
     store.state = "in_review"
-    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    store.labels = []  # ABSENT local verdict — repairable, with no local veto to stand in the way
     loop = BoardLoop({"review_gate": True, "merge_poll": False, "external_review": True})
     runs = []
 
@@ -7758,7 +7866,7 @@ async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_revie
         return _ext_view(_QA_HEAD)  # the external panel PASSed the live head
 
     async def _head(pr_url, *, cwd="."):
-        return _QA_HEAD  # unchanged since the verdict → NOT a #328 head move
+        return _QA_HEAD
 
     async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
         return (worktree.STATUS_READ_ABSENT, None)  # the board wrote no gate status for this head → no veto
@@ -7770,10 +7878,42 @@ async def test_reconcile_promotes_a_trusted_current_head_pass_and_never_re_revie
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     await loop._reconcile_prs()
-    assert "review-clean" in store.labels and "changes-requested" not in store.labels
-    assert not any(l.startswith("reviewed-head:") for l in store.labels)
+    assert "review-clean" in store.labels
+    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven head
     assert runs == []  # adopted the external PASS — the internal gate never re-ran
     assert not any(c[0] == "requeue" for c in store.calls)  # #340 did not requeue it either
+
+
+async def test_reconcile_holds_a_same_head_rejection_despite_an_external_pass(monkeypatch):
+    """The careercoach#17 full-flow regression (round 3): an in_review PR stuck in
+    ``changes-requested`` for the SAME (unchanged) head the board's own gate rejected — so #328 does
+    NOT re-arm — is NOT promoted when the external panel PASSes that head, even with NO
+    ``board/review-gate`` status recorded (the gate's ``failure`` never posted). The strictest-verdict
+    veto holds it (one operator hold), the internal gate does not re-run as a promotion, and the card
+    is never repaired to review-clean."""
+    store = _RoundTripStore()
+    store.state = "in_review"
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]  # stamp names the LIVE head
+    loop = BoardLoop({"review_gate": True, "merge_poll": False, "external_review": True})
+
+    async def _state(url, *, cwd="."):
+        return _ext_view(_QA_HEAD)  # the external panel PASSed the live head
+
+    async def _head(pr_url, *, cwd="."):
+        return _QA_HEAD  # unchanged since the verdict → NOT a #328 head move
+
+    async def _read_result(repo_slug, head_sha, *, context=worktree.GATE_STATUS_CONTEXT, cwd="."):
+        return (worktree.STATUS_READ_ABSENT, None)  # the gate's failure status never reached GitHub
+
+    monkeypatch.setattr(worktree, "pr_review_state", _state)
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    monkeypatch.setattr(worktree, "read_review_status_result", _read_result)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+
+    await loop._reconcile_prs()
+    assert "review-clean" not in store.labels  # the external PASS never cleared the local rejection
+    holds = [c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]
+    assert len(holds) == 1 and "operator" in holds[0][2]
 
 
 async def test_reconcile_head_move_prefers_a_fresh_internal_review_over_the_qa_trust_path(monkeypatch):

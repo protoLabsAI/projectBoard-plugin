@@ -211,9 +211,10 @@ Several things are ignored:
 - a dismissed review, because the dismissal is the operator's override;
 - a check run carrying a `workflowName`, which is an Actions job that happens to share the name.
 
-The board's OWN verdict is a `QA panel` commit *status* (#354), so the panel's check is
-matched only as a *check run*, and the board can never read its own clean verdict back as the
-panel's. `Review at head` is **not** read by default. protoAgent posts it `failure` on every
+The board's OWN verdict is a `board/review-gate` commit *status* (#354, #512) — its own context,
+not the panel's `QA panel` — so the panel's check is matched only as a *check run* under the
+panel's name, and the board can never read its own verdict back as the panel's. `Review at head`
+is **not** read by default. protoAgent posts it `failure` on every
 head the panel has not reviewed *yet*, so it can't tell "rejected" from "not yet". Reading
 it held every fresh push. The merge edge re-asks the same question right before it merges,
 pinned to the head it is about to merge.
