@@ -2244,14 +2244,21 @@ class ReconcileMixin:
 
         Strictest verdict wins (#512): before adopting, the board's OWN ``board/review-gate``
         status at the live head is read TRI-STATE (``worktree.read_review_status_result``). A
-        completed non-success (``failure`` / ``error``) or a ``pending`` gate status VETOES the
-        external PASS — the card is NOT promoted, and one hold comment per (card, head) records
-        the internal-vs-external disagreement and that an operator unblock/override is required.
-        A PROVEN-ABSENT gate status (the gate never ran this head) does not block adoption; but an
-        UNREADABLE gate read (a gh error / malformed / ambiguous response, which the plain
-        ``read_review_status`` could not tell apart from absence) FAILS CLOSED — the card is not
-        promoted this pass and the next poll retries, so a transient read failure can never be
-        mistaken for "no gate verdict" and promote a head the gate may have FAILED (careercoach#17).
+        COMPLETED non-success (``failure`` / ``error``) gate status — a real, head-pinned verdict
+        the gate actually REACHED — VETOES the external PASS: the card is NOT promoted, and one
+        hold comment per (card, head) records the internal-vs-external disagreement and that an
+        operator unblock/override is required. A ``pending`` gate status does NOT veto: a gate
+        that is genuinely running is already excluded ABOVE (its card is ``review-pending``, which
+        this method skips, plus the live-drive / in-flight guards) BEFORE the status is ever read,
+        so a ``pending`` reaching the read is a gate that STARTED and ABANDONED the head without a
+        verdict — the INERT-gate exit posts ``pending`` then clears the review substate without
+        landing a terminal status — which is precisely the ABSENT-verdict case this method repairs;
+        holding on it would strand, for good, a card the external PASS can clean (the #512 review
+        finding). A PROVEN-ABSENT gate status (the gate never ran this head) likewise does not block
+        adoption; but an UNREADABLE gate read (a gh error / malformed / ambiguous response, which
+        the plain ``read_review_status`` could not tell apart from absence) FAILS CLOSED — the card
+        is not promoted this pass and the next poll retries, so a transient read failure can never
+        be mistaken for "no gate verdict" and promote a head the gate may have FAILED (careercoach#17).
 
         It invents no verdict — it ADOPTS a verified one, and only ever RELAXES a blocking state
         to clean (never manufactures a blocking one). Fails CLOSED, leaving the card exactly as
@@ -2337,13 +2344,21 @@ class ReconcileMixin:
                 pr_url,
             )
             return False
-        if outcome == worktree.STATUS_READ_PRESENT and gate.get("state") in ("failure", "error", "pending"):
+        # Only a COMPLETED gate verdict vetoes — ``failure`` / ``error``, a real head-pinned
+        # judgement the gate actually reached. A ``pending`` status does NOT veto here: a gate that
+        # is genuinely mid-run is already excluded ABOVE (its card is ``review-pending``, which this
+        # method skips, and its fid is in ``_review_inflight`` / has a live drive), so a ``pending``
+        # reaching this read is the INERT-gate exit's leftover — it posts ``pending`` then clears the
+        # review substate without landing a terminal status. That is the ABSENT-verdict case this
+        # method's contract repairs; vetoing on it would strand the card the external PASS can clean,
+        # for good (the #512 review finding). The gate holds a card only when it has a real FAILING
+        # verdict for the head, never merely because it once began looking.
+        if outcome == worktree.STATUS_READ_PRESENT and gate.get("state") in ("failure", "error"):
             gate_state = gate.get("state")
             short = head[: store_mod.SHORT_SHA_LEN]
-            verb = "is still PENDING" if gate_state == "pending" else f"FAILED ({gate_state})"
             why = (
-                f"internal review gate {verb} at head {short} while the external panel PASSed — strictest "
-                f"verdict wins; an operator unblock/override is required to merge: {pr_url}"
+                f"internal review gate FAILED ({gate_state}) at head {short} while the external panel "
+                f"PASSed — strictest verdict wins; an operator unblock/override is required to merge: {pr_url}"
             )
             await asyncio.to_thread(self._note_gate_override_hold, store, fid, head, why)
             return False
@@ -2376,10 +2391,12 @@ class ReconcileMixin:
         return True
 
     def _note_gate_override_hold(self, store, fid: str, head: str, why: str) -> None:
-        """Say ONCE per (card, head) that the board's own review gate FAILED/holds a head the
-        external panel PASSed, so an operator override is needed to merge (#512) — on the bead
-        and to the operator. A SEPARATE ledger from ``_note_external_hold`` (that one is CLEARED
-        whenever the panel passes, which is exactly when THIS hold fires), so the two never
+        """Say ONCE per (card, head) that the board's own review gate reached a COMPLETED FAILING
+        verdict (``failure`` / ``error``) for a head the external panel PASSed, so an operator
+        override is needed to merge (#512) — on the bead and to the operator. Never fires on a
+        merely ``pending`` gate status (that is the inert-gate leftover, not a verdict — see
+        ``_reconcile_trusted_qa_pass``). A SEPARATE ledger from ``_note_external_hold`` (that one is
+        CLEARED whenever the panel passes, which is exactly when THIS hold fires), so the two never
         cross-silence each other. Store-only; runs off the event loop."""
         held = getattr(self, "_gate_override_held", None)
         if held is None:
@@ -2750,7 +2767,13 @@ class ReconcileMixin:
         findings = self._parse_findings(output)
         if findings is None:
             # Host predates the findings convention (ADR 0077) — the gate can't
-            # judge, so it must not pretend to. Record and leave in review.
+            # judge, so it must not pretend to. Record and leave in review. The
+            # ``pending`` status posted above is left on the head (we never fake a
+            # terminal verdict the gate did not reach); it is an ABANDONED gate, not a
+            # running one, so the trusted-QA adoption treats it as the repairable
+            # ABSENT-verdict case and the external panel can still clean the card —
+            # a ``pending`` gate status does NOT veto that adoption (see
+            # ``_reconcile_trusted_qa_pass``; #512 review finding).
             await asyncio.to_thread(
                 store.set_review_substate, fid, None, note="review gate: host lacks graph.review.findings — gate inert"
             )

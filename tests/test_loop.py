@@ -7530,10 +7530,34 @@ async def test_trusted_qa_gate_failure_holds_the_external_pass(monkeypatch):
     assert len([c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]) == 1
 
 
-async def test_trusted_qa_gate_pending_holds_the_external_pass(monkeypatch):
-    """(b) r3: a ``pending`` board gate status at the live head (the gate is mid-run) likewise
-    holds an external PASS — the board does not promote off the panel while its own verdict for
-    that head is still open."""
+async def test_trusted_qa_gate_error_holds_the_external_pass(monkeypatch):
+    """(b) r3: an ``error`` board gate status (a completed non-success, like ``failure``) at the
+    live head holds the external PASS the same way — strictest verdict wins, no promotion, one
+    operator hold."""
+    store = _RoundTripStore()
+    store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
+    loop = _qa_loop(
+        monkeypatch,
+        head=_QA_HEAD,
+        view=_ext_view(_QA_HEAD),
+        gate_status={"state": "error", "head_sha": _QA_HEAD, "passed": False},
+    )
+    feature = {"id": "bd-1", "labels": list(store.labels)}
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
+    assert "review-clean" not in store.labels  # held, not promoted
+    assert not any(c[0] == "set_review_substate" for c in store.calls)
+    holds = [c for c in store.calls if c[0] == "comment" and "strictest verdict wins" in c[2]]
+    assert len(holds) == 1 and "error" in holds[0][2]
+
+
+async def test_trusted_qa_gate_pending_does_not_hold_the_external_pass(monkeypatch):
+    """r3 / the #512 review finding: a ``pending`` board gate status at the live head does NOT hold
+    the external PASS. A gate that is genuinely mid-run is excluded ABOVE (the ``review-pending``
+    label skip + the in-flight / live-drive guards) BEFORE the status is read, so a ``pending``
+    reaching the veto is the INERT-gate exit's leftover — it posts ``pending`` then clears the
+    review substate without landing a terminal verdict — i.e. the ABSENT-verdict case this method
+    repairs. The card is promoted to review-clean (pinned to the proven head) and NO operator hold
+    is raised; only a COMPLETED ``failure`` / ``error`` vetoes."""
     store = _RoundTripStore()
     store.labels = ["changes-requested", f"reviewed-head:{_QA_HEAD_SHORT}"]
     loop = _qa_loop(
@@ -7543,8 +7567,12 @@ async def test_trusted_qa_gate_pending_holds_the_external_pass(monkeypatch):
         gate_status={"state": "pending", "head_sha": _QA_HEAD, "passed": False},
     )
     feature = {"id": "bd-1", "labels": list(store.labels)}
-    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is False
-    assert "review-clean" not in store.labels
+    assert await loop._reconcile_trusted_qa_pass(store, feature, _QA_PR, "/repo") is True
+    assert "review-clean" in store.labels and "changes-requested" not in store.labels
+    assert f"review-clean-sha:{_QA_HEAD_SHORT}" in store.labels  # pinned to the proven head
+    assert store.review_states[-1][0] == "review-clean"
+    # No false "internal review gate is still PENDING" operator hold — the inert gate is repairable.
+    assert not any(c[0] == "comment" and "strictest verdict wins" in c[2] for c in store.calls)
 
 
 async def test_trusted_qa_unreadable_gate_status_fails_closed(monkeypatch):
