@@ -2635,20 +2635,30 @@ async def rerun_failed_ci(
 # ("You must authenticate via a GitHub App") — no token scope can make it succeed. #354 moved
 # publication + readback to the PAT-compatible COMMIT STATUS seam below; the dead check-run
 # helpers (and their mock-only tests) are removed so nothing can reintroduce a publisher that
-# is structurally unavailable under the deployed credential model. ``REVIEW_STATUS_CONTEXT``
-# below keeps the historical ``QA panel`` name, so the PR still shows ONE coherent QA signal.
+# is structurally unavailable under the deployed credential model. #512 then split the board's
+# OWN verdict onto ``GATE_STATUS_CONTEXT`` below so it can never be read back as the panel's.
 
 
-# ── #354: PAT-compatible commit-status publication of the review-gate verdict ─────────
+# ── #354 / #512: PAT-compatible commit-status publication of the review-gate verdict ──────
 # #347 published the verdict as a GitHub CHECK RUN, but ``POST /check-runs`` requires a
 # GitHub App INSTALLATION token: under the board's user/PAT ``gh`` credential it ALWAYS
 # 403s ("You must authenticate via a GitHub App"), so that path is structurally inert here
 # — no token scope can make it succeed. A COMMIT STATUS (``POST /repos/{repo}/statuses/{sha}``)
 # is the PAT-compatible signal: a user/PAT token with ``repo`` scope can create it, it is
 # pinned to an immutable commit exactly like a check run, and it surfaces on the PR as the
-# same merge-relevant rollup. The context keeps the historical ``QA panel`` name so the PR
-# shows ONE coherent QA signal (the same context the review workflow has posted as a side
-# effect), and ``read_review_status`` reconciles that single record rather than a parallel one.
+# same merge-relevant rollup.
+#
+# #354 first wrote this under the historical ``QA panel`` name. That COLLIDED with the external
+# review panel's own ``QA panel`` App check run (careercoach#17, #512): the board wrote a FAIL
+# status there, then #323's trusted-PASS adoption read it back as though it were the panel's
+# verdict and trusted the board's own earlier FAIL ("fail closed" on a head the panel had
+# PASSed). #512 gives the board's OWN gate its own ``GATE_STATUS_CONTEXT``; the board writes
+# and reads ONLY that. The board's status is a record of ITS verdict, NEVER evidence of the
+# external panel's — the panel's PASS lives in its marker review (see ``external_review``), and
+# #323's adoption reads that, not a commit status. ``REVIEW_STATUS_CONTEXT`` is retained only
+# as the historical ``QA panel`` name an older board wrote under; nothing the board writes uses
+# it any more.
+GATE_STATUS_CONTEXT = "board/review-gate"
 REVIEW_STATUS_CONTEXT = "QA panel"
 
 # GitHub commit-status ``state`` values (the merge-relevant ones the gate uses). An unknown
@@ -2682,7 +2692,7 @@ async def post_review_status(
     state: str,
     description: str,
     target_url: str = "",
-    context: str = REVIEW_STATUS_CONTEXT,
+    context: str = GATE_STATUS_CONTEXT,
     cwd: str = ".",
 ) -> bool:
     """Publish the in-loop review gate's verdict as a PAT-compatible COMMIT STATUS pinned to
@@ -2700,10 +2710,12 @@ async def post_review_status(
     ``_STATUS_STATES`` (an unknown value degrades to ``error``); ``description`` is truncated
     to GitHub's 140-char cap; a ``target_url`` (the stable PR link) is attached when given.
 
-    Idempotent by construction (r4): a commit status is keyed by ``(context, sha)`` — re-posting
-    the same context on the same commit SUPERSEDES the prior state in the PR's combined rollup,
-    so a reconcile/retry of the same verdict reconciles the single ``QA panel`` signal rather
-    than stacking duplicate records."""
+    Owns the board's ``board/review-gate`` context by default (#512) — the board's OWN verdict,
+    kept apart from the external panel's ``QA panel`` App check so the #323 adoption can never
+    read it back as the panel's PASS. Idempotent by construction (r4): a commit status is keyed
+    by ``(context, sha)`` — re-posting the same context on the same commit SUPERSEDES the prior
+    state in the PR's combined rollup, so a reconcile/retry of the same verdict reconciles the
+    single ``board/review-gate`` signal rather than stacking duplicate records."""
     if not repo_slug or not head_sha:
         return False
     if state not in _STATUS_STATES:
@@ -2735,28 +2747,31 @@ async def read_review_status(
     repo_slug: str,
     head_sha: str,
     *,
-    context: str = REVIEW_STATUS_CONTEXT,
+    context: str = GATE_STATUS_CONTEXT,
     cwd: str = ".",
 ) -> dict | None:
-    """Read back the head-pinned ``QA panel`` COMMIT STATUS (#354, the PAT-compatible successor
-    to #347's ``read_review_check``) — the inbound identity plumbing #323's trusted-verdict
-    reconcile turns on. Returns the promoted verdict recorded for ``head_sha`` as
-    ``{"state": str, "head_sha": str, "passed": bool}``, or ``None`` when no trusted verdict can
-    be PROVEN for that exact head.
+    """Read back a head-pinned COMMIT STATUS (#354, the PAT-compatible successor to #347's
+    ``read_review_check``). Defaults to the board's OWN ``board/review-gate`` context (#512):
+    this reads what the board ITSELF published, NEVER the external panel's verdict. #323's
+    trusted-PASS adoption uses it only as the strictest-verdict VETO (``_reconcile_trusted_qa_pass``
+    reads this gate status to refuse promoting a head its own gate FAILED) — the PASS signal is
+    the external panel's marker review, read via ``external_review.evaluate``, not any status.
+    Returns the verdict recorded for ``head_sha`` as ``{"state": str, "head_sha": str,
+    "passed": bool}``, or ``None`` when no status of ``context`` can be PROVEN for that exact head.
 
     Reads the COMBINED status of the commit (``GET /repos/{slug}/commits/{sha}/status``, jq'd to
-    ``.statuses``): GitHub collapses that to ONE latest status per context, so a ``QA panel``
-    match is unambiguous by construction — there is never a stale earlier ``QA panel`` state
-    racing the current one. The endpoint is head-scoped by the URL, so a status it returns IS
-    for ``head_sha`` (the currency invariant of #328). ``passed`` is ``state == "success"`` — a
-    green CI rollup and an unpinned review comment are NOT this signal; only the named status is.
+    ``.statuses``): GitHub collapses that to ONE latest status per context, so a match is
+    unambiguous by construction — there is never a stale earlier state of the same context racing
+    the current one, and a legacy ``QA panel`` status an older board left is simply a DIFFERENT
+    context that this read (defaulting to ``board/review-gate``) never matches. The endpoint is
+    head-scoped by the URL, so a status it returns IS for ``head_sha`` (the currency invariant of
+    #328). ``passed`` is ``state == "success"``.
 
-    Fails CLOSED to ``None`` — so a caller can never act on a signal it could not read cleanly,
-    and never promotes from ambiguous/untrusted status data (#354 r5) — on an empty slug/head, a
-    ``gh`` error, malformed/non-list JSON, NO ``QA panel`` status, or (the defensive case the
-    combined endpoint should preclude) MORE THAN ONE match. A completed NON-success state returns
-    ``passed=False`` — a real, trusted verdict a caller must not promote off, DISTINCT from an
-    unreadable ``None``. Never raises into the loop."""
+    Fails CLOSED to ``None`` — so a caller can never act on a signal it could not read cleanly
+    (#354 r5) — on an empty slug/head, a ``gh`` error, malformed/non-list JSON, NO status of
+    ``context``, or (the defensive case the combined endpoint should preclude) MORE THAN ONE
+    match. A completed NON-success state returns ``passed=False`` — a real, recorded verdict,
+    DISTINCT from an unreadable ``None``. Never raises into the loop."""
     if not repo_slug or not head_sha:
         return None
     try:
