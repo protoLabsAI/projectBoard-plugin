@@ -101,6 +101,14 @@ log = logging.getLogger("protoagent.plugins.project_board")
 # ``stamped == current`` currency check stays exact.
 _MERGED_VERIFIED_SHA_LEN = 12
 
+# Consecutive merged-state re-verifies of one card that may hit INFRA (a failed
+# `setup_cmd` install, or a gate run over a broken dependency tree) before the loop stops
+# retrying: each infra run is retried next poll without a stamp or a budget unit, and the
+# Nth surfaces one clearly-labelled INFRA warning (log + card comment) and records the
+# run as a no-verdict one — stamped like a timed-out gate, one merged-verify unit spent —
+# so a project whose install is broken does not reinstall every poll forever.
+_MERGED_VERIFY_INFRA_MAX = 3
+
 # The auto-merge blocker phrase for a repo mid-release (release_freeze.py). The merge
 # edge records the hold under it; the listing reads the hold back as
 # `held: release freeze (<evidence>)`.
@@ -621,6 +629,47 @@ def killed_by_signal(returncode: int | None) -> int | None:
     if 128 < returncode <= 128 + _MAX_SIGNAL:
         return returncode - 128
     return None
+
+
+# A gate that ran over a BROKEN DEPENDENCY TREE judged nothing about the code: it never
+# got as far as the code. Seen 2026-09-29/30 (designSystem, two docs-only cards): in the
+# merged-state worktree pnpm printed its "modules directories will be removed and
+# reinstalled from scratch. Proceed?" prompt (auto-answered), the install left
+# node_modules half-built, and `tsc` died with MODULE_NOT_FOUND for
+# node_modules/typescript/bin/tsc. The board filed "gate FAILED on the merged state —
+# the RESULT is broken" and terminal-blocked a card whose PR CI was green.
+#
+# These are signatures of the TOOLCHAIN failing, not the repo's code: a module that
+# cannot be found UNDER node_modules (an installed package's own files are missing —
+# a bare `Cannot find module 'lodash'` from the code's own import is NOT matched, that
+# is a real, fixable failure), pnpm's reinstall prompt, and pnpm's own ERR_PNPM_* codes.
+# ERR_PNPM_OUTDATED_LOCKFILE is the one pnpm code deliberately left a verdict: a
+# lockfile that disagrees with package.json is the repo's state (CI's frozen install
+# fails the same way), something a coder can and should fix.
+_BROKEN_TREE_SIGNATURES = (
+    re.compile(r"""Cannot find module ['"][^'"\n]*node_modules[/\\][^'"\n]*['"]"""),
+    re.compile(r"The modules directories will be removed and reinstalled from scratch"),
+    re.compile(r"\bERR_PNPM_(?!OUTDATED_LOCKFILE\b)[A-Z0-9_]+"),
+)
+
+
+def broken_dependency_tree(output: str | bytes | None) -> str:
+    """The first line of gate output that shows the dependency tree itself was broken
+    (so the gate reached NO verdict on the code), or ``""`` when nothing matches.
+
+    Same asymmetry as ``killed_by_signal``: calling a toolchain failure red states
+    something false about the code and blocks; calling it no-verdict only re-runs it
+    (and CI still gates)."""
+    if not output:
+        return ""
+    text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output)
+    for pat in _BROKEN_TREE_SIGNATURES:
+        m = pat.search(text)
+        if m:
+            start = text.rfind("\n", 0, m.start()) + 1
+            end = text.find("\n", m.end())
+            return text[start : end if end != -1 else len(text)].strip()[:300]
+    return ""
 
 
 def _requirement_gate_diagnostics(result: str, open_items: list[dict]) -> dict:
@@ -1605,6 +1654,7 @@ _loop = sys.modules[__package__]
 # them up.
 __all__ = [
     "killed_by_signal",
+    "broken_dependency_tree",
     "_GROUNDING_DIFF_MAX_CHARS",
     "evidence_is_grounded",
     "partition_by_grounding",
@@ -1674,6 +1724,7 @@ __all__ = [
     "reconfigure_cached_store",
     "log",
     "_MERGED_VERIFIED_SHA_LEN",
+    "_MERGED_VERIFY_INFRA_MAX",
     "_REVIEWED_HEAD_SHA_LEN",
     "_REVIEW_FINDINGS_TITLE",
     "_REAP_WARN_CAP",

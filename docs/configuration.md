@@ -138,7 +138,9 @@ for a build: the card's tree, each Max-Mode and ladder candidate, and the merged
 tree. Without it, a tree borrows the repo checkout's installed `node_modules` through
 symlinks, which is cheap but hands every card whatever that checkout last installed. Set it
 per project (a `projects:` entry) or board-wide. Bounded by `setup_timeout_s`: a failed or
-hung install is killed, logged, and the work goes ahead without it.
+hung install is killed, logged, and the work goes ahead without it. The merged-state verify
+is the exception: it skips its gate and retries next poll (see the lifecycle doc, "A broken
+dependency tree is not a failed gate").
 
 **The gate preflight** smokes each project's check on its clean base checkout before any
 of that project's cards dispatch (`preflight: true`, the default). A red result holds the
