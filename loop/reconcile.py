@@ -1223,7 +1223,7 @@ class ReconcileMixin:
                     # LAND was never gated. Re-run the gate on the merged state
                     # (no push) and stamp the sha; only a red gate blocks.
                     if self.auto_rebase and await self._verify_merged_state(store, f, pr_url, repo):
-                        continue  # blocked on a red merged-state gate → nothing further this pass
+                        continue  # blocked on a red merged-state gate (or the card left review) → nothing further
                     if self.ci_poll:
                         await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
                     # The re-arm half of the review gate (#328): a direct/human push to
@@ -1683,8 +1683,14 @@ class ReconcileMixin:
         a gate run every poll forever — with ``auto_merge`` on that hold is the merge
         edge's, so exhaustion logs a WARNING naming the remedy. A merge conflict is the
         DIRTY/rebase edge's job and an infra error retries next poll — neither burns
-        budget nor stamps. Returns True only when it BLOCKED the card (the caller
-        skips the rest of this pass)."""
+        budget nor stamps. So does INFRA in the tree itself: a failed ``setup_cmd``
+        install skips the gate, and a gate whose output shows a broken dependency tree
+        (``broken_dependency_tree``) is no verdict. Both retry next poll, up to
+        ``_MERGED_VERIFY_INFRA_MAX`` in a row, then surface one INFRA warning and count
+        as a no-verdict run. Before a red verdict blocks, the PR and card are re-read
+        (``_merged_verify_red_is_moot``): a card that merged, closed or left review
+        while the gate ran is reported, not blocked. Returns True when it BLOCKED the
+        card or found it gone from review (the caller skips the rest of this pass)."""
         fid = feature["id"]
         if not self._local_gate_cmd_for(feature):
             return False  # no gate → nothing to verify the merged state WITH
@@ -1788,8 +1794,11 @@ class ReconcileMixin:
             return False
         try:
             # The merged tree is fresh too: its gate needs the same deps a coder's tree gets.
-            await self._prepare_tree(detail, feature)
-            failure = await self._run_local_gate(detail, feature)
+            # A FAILED install leaves a tree no gate can judge — running one anyway is how a
+            # half-built node_modules became "the RESULT is broken" on a green PR — so the
+            # gate is skipped and the run is INFRA (below), never a verdict.
+            setup_failure = await self._prepare_tree(detail, feature)
+            failure = None if setup_failure else await self._run_local_gate(detail, feature)
         finally:
             await worktree.remove_worktree(repo, detail)
         # #490: did the gate reach a verdict, or degrade to "pass" (timeout, killed,
@@ -1797,7 +1806,44 @@ class ReconcileMixin:
         no_verdict = self.__dict__.get("_gate_no_verdict", set())
         judged = detail not in no_verdict
         no_verdict.discard(detail)
+        gate_infra = self.__dict__.setdefault("_gate_infra", {}).pop(detail, "")
+        infra = f"dependency install failed: {setup_failure}" if setup_failure else gate_infra
         short = base_sha[:_MERGED_VERIFIED_SHA_LEN]
+        streaks = self.__dict__.setdefault("_merged_verify_infra", {})
+        if infra:
+            # INFRA — the dependency tree, not the code. Retry next poll with nothing
+            # stamped and nothing spent, up to _MERGED_VERIFY_INFRA_MAX in a row; the last
+            # says so ONCE, labelled INFRA, and is recorded as a no-verdict run (stamped
+            # like a timed-out gate, one unit spent) so a broken install can't reinstall
+            # every poll forever. Never a block, never "the RESULT is broken".
+            streak = streaks.get(fid, 0) + 1
+            if streak < _MERGED_VERIFY_INFRA_MAX:
+                streaks[fid] = streak
+                log.warning(
+                    "[project_board] %s merged-state verify hit INFRA (%d/%d) — %s; not a verdict on the PR, "
+                    "nothing stamped or spent, next poll retries: %s",
+                    fid,
+                    streak,
+                    _MERGED_VERIFY_INFRA_MAX,
+                    infra,
+                    pr_url,
+                )
+                return False
+            streaks.pop(fid, None)
+            note = (
+                f"INFRA: the merged-state verify (branch + {base}@{short}) could not get a working dependency "
+                f"tree {streak} times in a row — latest: {infra}. This is NOT a verdict on the PR: its code was "
+                "never judged, and CI still gates. Check the project's setup_cmd / local_gate_cmd install in a "
+                "fresh worktree. Recorded as a no-verdict run; the board retries when base moves again."
+            )
+            log.warning("[project_board] %s %s (%s)", fid, note, pr_url)
+            try:
+                await asyncio.to_thread(store.comment, fid, note)
+            except Exception:  # noqa: BLE001 — the audit trail is best-effort
+                log.debug("[project_board] %s could not comment the INFRA note", fid, exc_info=True)
+            failure, judged = None, False
+        else:
+            streaks.pop(fid, None)
         if failure is None:
             # Green: the verdict still holds on the merged state. Stamp the SHORT sha,
             # then — and only then — spend a budget unit. The stamp is optional
@@ -1841,6 +1887,8 @@ class ReconcileMixin:
                 short,
             )
             return False
+        if await self._merged_verify_red_is_moot(store, fid, pr_url, repo, base, short, failure):
+            return True  # the card left review while the gate ran — nothing further this pass
         await self._budget_set(store, fid, "merged-verify", n + 1)
         await asyncio.to_thread(
             store.flag_blocked,
@@ -1851,6 +1899,71 @@ class ReconcileMixin:
         await worktree.reap_feature_worktree(repo, self.root, fid)
         log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, short)
         return True
+
+    async def _merged_verify_red_is_moot(
+        self, store, fid: str, pr_url: str, repo: str, base: str, short: str, failure: str
+    ) -> bool:
+        """A red merged-state gate is about to block — is the card still the one it judged?
+
+        The gate takes minutes, and ``_reconcile_pr`` read the PR as OPEN and the card as
+        in_review BEFORE it ran. Re-read both now. The block is for an OPEN PR on an
+        in_review card: it stops a merge that would land a broken result. Anything else
+        means the world moved under the gate, and a terminal block (which pages a human)
+        would be wrong:
+
+        - **PR merged / card done.** The merge happened while the gate ran (designSystem
+          ds-xof / ds-h5s, docs-only cards blocked after merging). Blocking cannot un-merge
+          the PR, and it rewrites a finished card into a "needs triage" one. The red is
+          still worth reporting, because if it is real, ``base`` is broken now. So it is
+          reported, as a WARNING and a comment on the card that carry the output, and the
+          card is left done. Repairing ``base`` is base CI's job (or a fix card / revert,
+          a human's call), not this card's.
+        - **PR closed.** The CLOSED edge triages it next poll with its own reason.
+        - **Card moved out of in_review** (requeued into a fix round, already blocked,
+          cancelled). The block would clobber a state someone else just set.
+
+        An unreadable PR state or card keeps the original behaviour (block): the verdict
+        is real and nothing says the card moved. Returns True when the block is moot."""
+        try:
+            card = await asyncio.to_thread(store.get_feature, fid) or {}
+        except Exception:  # noqa: BLE001 — unreadable card: nothing says it moved
+            card = {}
+        board_state = str(card.get("board_state") or "")
+        try:
+            state = await worktree.pr_state(pr_url, cwd=repo)
+        except Exception:  # noqa: BLE001 — pr_state is documented never to raise; belt and braces
+            state = ""
+        if state == "MERGED" or board_state == "done":
+            what = "the PR merged" if state == "MERGED" else "the card is done"
+            note = (
+                f"merged-state gate FAILED (branch + {base}@{short}), but {what} while the gate ran, so "
+                f"this finished card is NOT blocked: blocking cannot un-merge it. If the failure is real, "
+                f"{base} itself is now broken. Check {base}'s CI and open a fix card or revert: {pr_url}\n{failure}"
+            )
+            log.warning("[project_board] %s %s", fid, note.split("\n", 1)[0])
+            try:
+                await asyncio.to_thread(store.comment, fid, note)
+            except Exception:  # noqa: BLE001 — the audit trail is best-effort
+                log.debug("[project_board] %s could not comment the post-merge red", fid, exc_info=True)
+            return True
+        if state == "CLOSED":
+            log.info(
+                "[project_board] %s merged-state gate red, but the PR closed while it ran — the closed edge "
+                "triages it, not this one: %s",
+                fid,
+                pr_url,
+            )
+            return True
+        if board_state and board_state != "in_review":
+            log.info(
+                "[project_board] %s merged-state gate red, but the card moved to %s while it ran — not "
+                "blocking over that state: %s",
+                fid,
+                board_state,
+                pr_url,
+            )
+            return True
+        return False
 
     async def _reconcile_ci(self, store, fid: str, pr_url: str, repo: str, feature: dict | None = None):
         """Closed-loop verify edge: an OPEN ``in_review`` PR whose checks FAILED is
@@ -3140,7 +3253,9 @@ class ReconcileMixin:
 
         Returns ``None`` when the gate passes (exit 0), when no gate is configured,
         or when the gate itself couldn't run on a HEALTHY tree (timeout / unlaunchable
-        command) — a broken or flaky gate must never block otherwise-good work, so those
+        command / signal kill) or ran over a BROKEN DEPENDENCY TREE (output matching
+        ``broken_dependency_tree`` — recorded in ``_gate_infra`` too) — a broken or flaky
+        gate must never block otherwise-good work, so those
         degrade to "pass" (CI is still the real gate). Returns the captured output (tail,
         truncated to ``local_gate_output_chars``) on a CLEAN non-zero exit, so the
         caller can hand it to the coder to fix. Resolves the gate command from the
@@ -3158,6 +3273,7 @@ class ReconcileMixin:
         # return contract every other caller relies on.
         no_verdict = self.__dict__.setdefault("_gate_no_verdict", set())
         no_verdict.discard(wt)
+        self.__dict__.setdefault("_gate_infra", {}).pop(wt, None)
 
         def _gone(during: str) -> None:
             if not os.path.isdir(wt):
@@ -3214,6 +3330,21 @@ class ReconcileMixin:
                 no_verdict.add(wt)
                 return None
             text = (out or b"").decode("utf-8", "replace").strip()
+            broken = broken_dependency_tree(text)
+            if broken:
+                # The dependency tree under the gate is broken (a half-built node_modules,
+                # pnpm's reinstall prompt, an ERR_PNPM_* failure): the gate never reached
+                # the code, so this red is the toolchain's, not the repo's. Same posture as
+                # a kill: no verdict, CI still gates. Recorded separately so the merged-state
+                # re-verify can retry it as INFRA rather than stamp or block on it.
+                log.warning(
+                    "[project_board] pre-PR gate hit a broken dependency tree (INFRA, not a verdict on the "
+                    "code) — treating as pass, CI still gates: %s",
+                    broken,
+                )
+                no_verdict.add(wt)
+                self.__dict__.setdefault("_gate_infra", {})[wt] = f"broken dependency tree: {broken}"
+                return None
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             return text or f"gate command exited {proc.returncode} with no output"

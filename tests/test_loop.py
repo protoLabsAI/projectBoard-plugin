@@ -5200,6 +5200,7 @@ async def test_verify_merged_state_red_gate_blocks(monkeypatch):
         reaped.append(fid)
 
     monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))  # still open after the gate ran
     store = _VerifyStore({"id": "bd-1"})
     loop = _vloop()
     monkeypatch.setattr(loop, "_run_local_gate", _aret("1 failed: test_x"))
@@ -5391,6 +5392,7 @@ async def test_verify_merged_state_red_gate_spends_a_unit(monkeypatch):
     monkeypatch.setattr(worktree, "merged_state_worktree", _aret(("merged", "/wt")))
     monkeypatch.setattr(worktree, "remove_worktree", _aret(None))
     monkeypatch.setattr(worktree, "reap_feature_worktree", _aret(None))
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))  # still open after the gate ran
     store = _VerifyStore({"id": "bd-1"})
     loop = _vloop(merged_verify_max=5)
     monkeypatch.setattr(loop, "_run_local_gate", _aret("1 failed: test_x"))

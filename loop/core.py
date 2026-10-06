@@ -509,6 +509,13 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # verdict (timeout, signal kill, unlaunchable). The merged-state re-verify reads it:
         # only such a run spends the merged-verify budget, a real green resets it.
         self._gate_no_verdict: set[str] = set()
+        # The subset of those whose gate ran over a BROKEN DEPENDENCY TREE (wt → reason):
+        # infra, not a verdict on the code. The merged-state re-verify retries these.
+        self._gate_infra: dict[str, str] = {}
+        # Consecutive merged-state re-verifies that hit INFRA (a failed install or a
+        # broken dependency tree) per card (fid → count), bounded by
+        # _MERGED_VERIFY_INFRA_MAX before the loop stops retrying and says so.
+        self._merged_verify_infra: dict[str, int] = {}
         # ADR 0326: serializes the ONE-TIME merged-verify exhaustion sentinel write
         # (`_arm_merged_verify_exhaustion`) against the operator budget reset
         # (`_invalidate_merged_verify_budget`), which run on different threads (the async

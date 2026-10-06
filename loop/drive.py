@@ -3180,13 +3180,17 @@ class DriveMixin:
             return None
         return self._resolve_delegate(assignee, "acp") or self._resolve_delegate(assignee, "a2a")
 
-    async def _prepare_tree(self, wt: str, feature: dict | None) -> None:
+    async def _prepare_tree(self, wt: str, feature: dict | None) -> str:
         """Install a fresh worktree's dependencies (the project's ``setup_cmd``) before a
         coder or a gate runs in it. Best-effort: a failed or timed-out install is logged and
-        the work proceeds — the coder can install what it needs itself."""
+        the work proceeds — the coder can install what it needs itself.
+
+        Returns the failure reason (``""`` on success or with no ``setup_cmd``) so a caller
+        that must NOT proceed on a half-installed tree can tell: the merged-state re-verify
+        skips its gate on one rather than read the toolchain's failure as the code's."""
         cmd = self._setup_cmd_for(feature) if feature is not None else self.setup_cmd
         if not cmd:
-            return
+            return ""
         try:
             reason = await worktree.prepare_worktree(wt, cmd, env=self._child_env(), timeout=self.setup_timeout)
         except Exception as exc:  # noqa: BLE001 — a setup hiccup must never fail the build
@@ -3197,6 +3201,7 @@ class DriveMixin:
                 (feature or {}).get("id") or wt,
                 reason,
             )
+        return reason or ""
 
     async def _run_fixups(self, wt: str, feature: dict | None = None) -> None:
         """Run the repo's auto-fix command (``format_cmd``, e.g.

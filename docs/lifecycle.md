@@ -339,6 +339,38 @@ under it. The drive then fails clearly:
 
 A merged-state verify whose throwaway tree vanishes stamps nothing, and the next poll re-runs it.
 
+### A broken dependency tree is not a failed gate
+
+A gate that ran over a half-installed tree never reached the code. In September 2026 a
+designSystem merged-state verify ran into a pnpm "modules directories will be removed and
+reinstalled from scratch" prompt. `tsc` then died with `MODULE_NOT_FOUND` for
+`node_modules/typescript/bin/tsc`, and the board terminal-blocked two docs-only cards as
+*"the RESULT is broken"*. Their CI was green, and one had already merged. Now:
+
+- **The merged-state verify skips the gate when `setup_cmd` fails.** The run is INFRA, not a
+  verdict.
+- **Some gate output marks the tree as broken, and makes the run INFRA too:** a
+  `Cannot find module` naming a path under `node_modules/`, pnpm's reinstall prompt, or any
+  `ERR_PNPM_*` code except `ERR_PNPM_OUTDATED_LOCKFILE`. A stale lockfile is the repo's own
+  state, so it stays a verdict. So does a bare `Cannot find module 'x'` from the code's own
+  import. In the pre-PR gate such a run counts as a pass, like a timeout, and CI still gates.
+- **An INFRA merged-state run stamps nothing and spends no budget, and the next poll retries
+  it.** After three in a row the board stops. It logs one warning, labelled `INFRA`, and
+  comments it on the card. It records the run as a no-verdict run, the way it records a
+  timed-out gate. It never blocks the card.
+- **A red verdict re-reads the PR and the card before it blocks.** The block exists to stop
+  a broken result from landing. A card that changed during the minutes-long gate gets no block:
+  - **The PR merged or the card is done.** The red is reported in a warning and a card
+    comment with the gate output, because if it is real then base is broken now. Blocking
+    can't un-merge the PR, so the card stays done. Fixing base is a job for base's CI or a
+    new card.
+  - **The PR closed.** The closed edge handles the card on the next poll.
+  - **The card left `in_review`** (requeued, already blocked, or cancelled). Its new state
+    stands.
+
+  If the PR state or the card can't be read, nothing shows the card moved, so the card is
+  blocked as before.
+
 ### A gate is a process tree, and it dies as one
 
 The board runs every repo command — the pre-PR and merged-state gates, the preflight,
