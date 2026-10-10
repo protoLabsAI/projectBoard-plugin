@@ -58,45 +58,93 @@
   #drawer .dx:hover{color:var(--pl-color-fg)}
   #drawer .db{padding:var(--pl-space-3) var(--pl-space-4);overflow:auto;flex:1;overscroll-behavior:contain}
   body.drawer-open{overflow:hidden}
+  /* ── Gen card (monitor v2). ONE scroll: the drawer body. Every section takes its natural
+     height; long text clamps to a fading tail (newest at the bottom, no inner scrollbar)
+     behind a "Show all" toggle. Replaces the #226 lone-gen flex fill, which squeezed plan /
+     saying / tools into tiny competing scrollboxes that clipped mid-line. */
   .gen{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);
-    padding:var(--pl-space-3);margin-bottom:var(--pl-space-3)}
-  .gen .gh{display:flex;align-items:center;gap:var(--pl-space-2);margin-bottom:var(--pl-space-2);flex-wrap:wrap}
-  .gen .gh .gn{font-weight:600}
-  .gen .lbl{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted);
-    margin:var(--pl-space-2) 0 2px}
-  .gen .cur{font-family:var(--pl-font-mono);font-size:11.5px;word-break:break-word}
+    margin-bottom:var(--pl-space-3);background:var(--pl-color-bg)}
+  .gen .gh{display:flex;align-items:center;gap:var(--pl-space-2);flex-wrap:wrap;
+    padding:var(--pl-space-3) var(--pl-space-3) var(--pl-space-2)}
+  .gen .gh .gn{font-weight:600;font-size:13px}
+  .gen .gh .tier{font-family:var(--pl-font-mono);font-size:10.5px;color:var(--pl-color-fg-muted);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:999px;padding:0 7px}
+  .gen .gh-r{margin-left:auto;display:flex;align-items:center;gap:var(--pl-space-2);font-size:11px;color:var(--pl-color-fg-muted)}
+  .gen .gs{display:inline-flex;align-items:center;gap:5px}
+  .gen .gs.live{color:var(--pl-color-status-success)}
+  .gen .gs.stopped{color:var(--pl-color-status-warning)}
+  .gen .gs .dot{width:7px;height:7px;border-radius:50%;background:currentColor;animation:pl-pulse 1.6s ease-in-out infinite}
+  .gen .el{font-family:var(--pl-font-mono);font-variant-numeric:tabular-nums}
+  @keyframes pl-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  @media (prefers-reduced-motion:reduce){.gen .gs .dot{animation:none}}
+  .gen .meter{display:flex;align-items:center;gap:var(--pl-space-2);padding:0 var(--pl-space-3) var(--pl-space-2)}
+  .gen .meter .bar{flex:1;height:4px;border-radius:2px;background:var(--pl-color-border);overflow:hidden}
+  .gen .meter .fill{height:100%;background:var(--pl-color-accent)}
+  .gen .meter .fill.hot{background:var(--pl-color-status-warning)}
+  .gen .meter .mt{font-size:10.5px;color:var(--pl-color-fg-muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  /* Sections: a hairline between each, a header row (label · meta · chevron), a padded body. */
+  .gen .sec{border-top:var(--pl-border-width) solid var(--pl-color-border)}
+  .gen .sec-h{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:var(--pl-space-2);width:100%;
+    padding:var(--pl-space-2) var(--pl-space-3);cursor:pointer}
+  .gen .sec-h[tabindex="-1"]{cursor:default}
+  .gen .sec-h:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:-2px}
+  .gen .sec-l{text-transform:uppercase;letter-spacing:.06em;font-size:10px;font-weight:600;color:var(--pl-color-fg-muted)}
+  .gen .sec-m{font-size:10.5px;color:var(--pl-color-fg-muted);font-variant-numeric:tabular-nums}
+  .gen .chev{margin-left:auto;width:6px;height:6px;border-right:1.5px solid var(--pl-color-fg-muted);
+    border-bottom:1.5px solid var(--pl-color-fg-muted);transform:rotate(45deg);margin-right:3px}
+  .gen .sec.closed .chev{transform:rotate(-45deg)}
+  .gen .sec-b{padding:0 var(--pl-space-3) var(--pl-space-3)}
+  .gen code{font-family:var(--pl-font-mono);font-size:10.5px}
   .gen .loc{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px}
-  /* Multi-gen caps (#226-UX): with several gens stacked, each section stays bounded so
-     every gen is reachable by scrolling the body — but the old caps were cramped, so
-     they're bumped to be more generous (thought 120→200, plan 140→250, tools 150→300).
-     The lone-gen overrides below drop these entirely for the common single-build case. */
-  .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:11.5px;color:var(--pl-color-fg-muted);
-    max-height:200px;overflow:auto}
-  .gen ul.plan{list-style:none;margin:0;padding:0;max-height:250px;overflow:auto}
-  .gen ul.plan li{font-size:11.5px;padding:1px 0;color:var(--pl-color-fg-muted)}
+  .gen .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  /* Status dots: running (accent, pulsing), done (success), failed (danger). */
+  .gen .st{display:inline-block;flex:none;width:7px;height:7px;border-radius:50%;background:var(--pl-color-fg-muted)}
+  .gen .st-running{background:var(--pl-color-accent);animation:pl-pulse 1.6s ease-in-out infinite}
+  .gen .st-done{background:var(--pl-color-status-success)}
+  .gen .st-failed{background:var(--pl-color-status-error)}
+  @media (prefers-reduced-motion:reduce){.gen .st-running{animation:none}}
+  /* Now: one compact row — title on one line, the plain-words detail clamped to two; a click
+     expands it in place (the full command/args wrap instead). */
+  .gen .cur{display:flex;gap:var(--pl-space-2);align-items:baseline;cursor:pointer;padding:6px 8px;
+    border-radius:var(--pl-radius);background:var(--pl-color-bg-raised)}
+  .gen .cur .st{transform:translateY(-1px)}
+  .gen .cur-t{min-width:0;flex:1}
+  .gen .cur .cn{font-family:var(--pl-font-mono);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gen .inprev{color:var(--pl-color-fg-muted);font-family:var(--pl-font-mono);font-size:10.5px;margin-top:2px;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
+  .gen .cur.full .cn{white-space:normal;word-break:break-all}
+  .gen .cur.full .inprev{display:block;-webkit-line-clamp:unset;white-space:pre-wrap}
+  .gen .vrow{display:flex;align-items:center;gap:var(--pl-space-2);font-size:11.5px}
+  .gen .vrow code{color:var(--pl-color-fg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Plan: a checklist at natural height; the in-progress step stands out. */
+  .gen ul.plan{list-style:none;margin:0;padding:0;display:grid;gap:3px}
+  .gen ul.plan li{display:flex;gap:6px;font-size:12px;line-height:1.4;color:var(--pl-color-fg-muted)}
   .gen ul.plan li.pl-in_progress{color:var(--pl-color-fg);font-weight:600}
   .gen ul.plan li.pl-completed{opacity:.6}
-  .gen ul.plan .glyph{display:inline-block;width:12px;color:var(--pl-color-accent)}
-  /* Input preview stays short by nature — a peek at the current tool's args, not a log. */
-  .gen .inprev{color:var(--pl-color-fg-muted);font-size:10.5px;white-space:pre-wrap;word-break:break-all;
-    max-height:48px;overflow:hidden;margin-top:2px}
-  .gen ul.tools{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}
-  .gen ul.tools li{font-family:var(--pl-font-mono);font-size:10.5px;padding:1px 0;color:var(--pl-color-fg-muted);
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .gen ul.tools li .st{display:inline-block;min-width:4.5em}
-  .gen ul.tools li .tn{color:var(--pl-color-fg)}
-  /* #226-UX: a LONE gen fills the drawer. The common case is watching ONE live build,
-     so a solo gen card becomes a flex column owning the full drawer-body height
-     (margin-bottom:0 so it doesn't spill past 100% and re-introduce a body scroll), and
-     its recent-tools log — the primary thing the operator watches — grows into the
-     remaining space via flex:1 instead of stopping at a fixed cap, so no dead whitespace
-     is left below. Plan/thinking keep bounded-but-generous caps and can shrink+scroll
-     (min-height:0) when the log is long. With MULTIPLE gens :only-child stops matching,
-     so the capped rules above apply and every gen stays visible by scrolling the body. */
-  .gen:only-child{display:flex;flex-direction:column;height:100%;margin-bottom:0}
-  .gen:only-child ul.tools{flex:1 1 auto;max-height:none;min-height:80px}
-  .gen:only-child ul.plan{max-height:300px;min-height:0}
-  .gen:only-child .thought{max-height:280px;min-height:0}
+  .gen ul.plan .glyph{flex:none;width:12px;color:var(--pl-color-accent)}
+  .gen ul.plan li.fold{display:block}
+  .gen .gh[data-mon-toggle]{cursor:pointer}
+  .gen .gh[data-mon-toggle]:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:-2px;border-radius:var(--pl-radius)}
+  .gen.folded .chev{transform:rotate(-45deg)}
+  .gen.folded{opacity:.85}
+  .gen ul.plan li.pl-pending .glyph,.gen ul.plan li:not([class]) .glyph{color:var(--pl-color-fg-muted)}
+  /* Tail clamp: the newest text pinned to the bottom edge (flex-end), older lines fade out at
+     the top — no inner scrollbar. "Show all" lifts the clamp. */
+  .gen .tail{max-height:9.5em;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;
+    -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 2.2em);mask-image:linear-gradient(to bottom,transparent 0,#000 2.2em)}
+  .gen .tail.full{max-height:none;display:block;-webkit-mask-image:none;mask-image:none}
+  .gen .thought{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;color:var(--pl-color-fg-muted)}
+  .gen .more{all:unset;cursor:pointer;font-size:11px;color:var(--pl-color-accent);margin-top:6px;display:inline-block}
+  .gen .more:hover{text-decoration:underline}
+  .gen .more:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px;border-radius:2px}
+  /* Activity: newest first, one ellipsized line per call, repeats folded into ×N. */
+  .gen ul.tools{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+  .gen ul.tools li{display:flex;align-items:center;gap:var(--pl-space-2);font-family:var(--pl-font-mono);font-size:11px;
+    line-height:1.5;color:var(--pl-color-fg-muted);min-width:0}
+  .gen ul.tools li .tn{color:var(--pl-color-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .gen ul.tools li .loc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+  .gen ul.tools li .rep{flex:none;margin-left:auto;font-size:10px;color:var(--pl-color-fg-muted);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:999px;padding:0 5px}
   /* ── "saying" markdown (bd-p87t): the coder's answer_tail renders as markdown, not raw
      syntax. These style the rendered HTML INSIDE the .thought container, so it keeps the
      .thought scroll/overflow cap + the lone-gen fill above, scaled DOWN for the compact
