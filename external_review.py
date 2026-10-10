@@ -58,6 +58,11 @@ _FAILED_CHECK = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED"})
 _FAILED_STATUS = frozenset({"FAILURE", "ERROR"})
 # The marker verdicts that reject a head — protoAgent's `review_at_head.BLOCKING_VERDICTS`.
 BLOCKING_VERDICTS = frozenset({"FAIL", "BLOCK", "REJECT"})
+# The panel's check-run conclusion for an incomplete pass at an OPEN PR's head (pr-reviewer
+# `checks.py`, HOLD_INCOMPLETE → "Incomplete pass — not blocking"). GitHub reads it as passing.
+_INCOMPLETE_CHECK = "NEUTRAL"
+# The panel's own name for that hold, quoted in what the board says about it.
+HOLD_INCOMPLETE_COVERAGE = "hold:incomplete-coverage"
 
 # How much of a review body a bounce carries when no finding parses out of it.
 _BODY_EXCERPT_CHARS = 4000
@@ -157,6 +162,14 @@ class Verdict:
     body: str = ""
     # Human-readable evidence for each failing signal, e.g. "check run `QA panel` FAILURE".
     signals: list[str] = field(default_factory=list)
+    # The panel's latest word at this head is an INCOMPLETE pass: a finder did not run, so a
+    # clear verdict covers less than the whole diff. Read from the panel's ``QA panel`` check
+    # concluding ``neutral`` ("Incomplete pass — not blocking", the panel's
+    # ``hold:incomplete-coverage``) or the marked review carrying ``complete=false``. Not a
+    # FAIL and never blocking by itself; a project's ``require_complete_review`` holds the
+    # merge on it.
+    incomplete: bool = False
+    incomplete_signals: list[str] = field(default_factory=list)
 
     @property
     def has_findings_review(self) -> bool:
@@ -187,7 +200,10 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
     ``workflowName`` that is present: GitHub Actions runs always carry theirs, and the rollup
     names no app, so ``check_runs`` should name a check only the panel's App publishes),
     and a status only as a STATUS, so neither the board's own ``QA panel`` commit status nor
-    an Actions job that happens to be called ``QA panel`` can read as the panel's verdict."""
+    an Actions job that happens to be called ``QA panel`` can read as the panel's verdict.
+
+    The same read also sets ``incomplete`` (see ``_judge_coverage``): the panel's newest word
+    at this head is a pass that did not cover the whole diff. That never sets ``failed``."""
     head = str((view or {}).get("headRefOid") or "").strip()
     if not head:
         return None
@@ -196,6 +212,7 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
     # Chronological. `gh` returns them in submission order; sort anyway (stable), so a
     # reordered payload can't promote an older verdict over a newer one.
     reviews.sort(key=lambda r: str(r.get("submittedAt") or ""))
+    review_complete = True  # the latest marked review at this head did not say complete=false
     for r in reviews:
         if str(r.get("state") or "").upper() == "DISMISSED" or not cfg.is_reviewer(_author(r)):
             continue
@@ -203,10 +220,14 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
         if not attrs or not head_matches(attrs.get("head", ""), head):
             continue
         verdict.review_verdict = str(attrs.get("verdict") or "").strip().upper()
+        review_complete = str(attrs.get("complete") or "").strip().lower() != "false"
         verdict.review_at = str(r.get("submittedAt") or "")
         verdict.reviewer = _author(r)
         verdict.body = str(r.get("body") or "")
     blocking_review = verdict.review_verdict in BLOCKING_VERDICTS
+    # The panel's newest App check run at this head (by completion time; list order breaks a
+    # tie), for the incomplete-pass read below.
+    latest_check: dict | None = None
     if blocking_review:
         verdict.signals.append(f"review by {verdict.reviewer}: verdict={verdict.review_verdict} at {head[:12]}")
     cleared_at = verdict.review_at if verdict.review_verdict and not blocking_review else ""
@@ -221,6 +242,8 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
                 continue
             state, at, label = str(c.get("conclusion") or "").upper(), str(c.get("completedAt") or ""), "check run"
             name = c.get("name")
+            if latest_check is None or at >= str(latest_check.get("completedAt") or ""):
+                latest_check = c
             if state not in _FAILED_CHECK:
                 continue
         elif kind == "StatusContext" and str(c.get("context") or "") in cfg.statuses:
@@ -236,7 +259,40 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
             continue
         verdict.signals.append(f"{label} `{name}` {state}")
     verdict.failed = bool(verdict.signals)
+    _judge_coverage(verdict, latest_check, review_complete)
     return verdict
+
+
+def _judge_coverage(verdict: Verdict, latest_check: dict | None, review_complete: bool) -> None:
+    """Set ``verdict.incomplete``: is the panel's newest word at this head an incomplete pass?
+
+    * The newest App ``QA panel`` check run concluded ``neutral`` — unless a COMPLETE marked
+      review at this head was submitted after that check completed (a later full pass).
+    * The newest marked review at this head says ``complete=false`` — unless the newest App
+      check run concluded ``success`` after that review was submitted (a later full pass
+      cleared the head).
+
+    A FAIL is not an incomplete pass: it already blocks, by its own edge."""
+    if verdict.failed:
+        return
+    check_state = str((latest_check or {}).get("conclusion") or "").upper()
+    check_at = str((latest_check or {}).get("completedAt") or "")
+    review_at = verdict.review_at
+    if check_state == _INCOMPLETE_CHECK:
+        superseded = (
+            bool(verdict.review_verdict) and review_complete and review_at and check_at and review_at > check_at
+        )
+        if not superseded:
+            verdict.incomplete_signals.append(
+                f"check run `{latest_check.get('name')}` NEUTRAL (incomplete pass, {HOLD_INCOMPLETE_COVERAGE})"
+            )
+    if verdict.review_verdict and not review_complete:
+        superseded = check_state == "SUCCESS" and check_at and review_at and check_at > review_at
+        if not superseded:
+            verdict.incomplete_signals.append(
+                f"review by {verdict.reviewer}: verdict={verdict.review_verdict} complete=false at {verdict.head[:12]}"
+            )
+    verdict.incomplete = bool(verdict.incomplete_signals)
 
 
 def parse_findings(body: str) -> list[dict] | None:

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **29 of 80 keys are in this state, including `coders` and `projects`** —
+never renders it. **31 of 82 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -338,6 +338,8 @@ The gates between a green build and main.
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
 | `external_review` | `—` | reload **· YAML only** |
+| `require_complete_review` | `False` | reload **· YAML only** |
+| `review_summon_handle` | `"vera"` | reload **· YAML only** |
 | `auto_merge` | `False` | live |
 
 `ci_rerun_max` is how many times a red PR's failed GitHub Actions jobs are rerun per PR head
@@ -386,6 +388,26 @@ so the board would be reading itself. Don't list protoAgent's `Review at head` e
 Blocking marker verdicts are `FAIL`, `BLOCK` and `REJECT`, and a dismissed review never counts. The external fix rounds share `review_fix_max`, but they have their own
 count (`budget:ext-review-fix`), which the gate's clean verdicts don't reset. The check costs
 one `gh pr view` per in-review card per merge poll.
+
+**`require_complete_review`** — off by default. When on, the auto-merge edge will not merge
+while the external panel's pass at the PR's head is **incomplete**: the panel's `QA panel`
+check run concluded `neutral` (its "Incomplete pass — not blocking", the panel's
+`hold:incomplete-coverage`), or its marked review at the head carries `complete=false`. A
+finder did not run, so the clear verdict covers only part of the diff. GitHub treats `neutral`
+as passing, so without this setting an incomplete pass merges. The read is the same
+`gh pr view` the FAIL edge uses, taken again right before the merge. Instead of merging, the
+card stays `in_review` reading `awaiting complete review (panel pass was incomplete)` (a bead
+comment records it once per head), and the board posts one PR comment,
+`@<review_summon_handle> review — <reason>`, once per head. The comment carries a hidden
+per-head marker, so neither a 30-second tick nor a restart posts it twice. When a complete
+pass clears the head, or a push moves it, the normal merge path proceeds. An unreadable panel
+holds that pass only. Set it in a `projects:` entry (a project's value wins) or at the top
+level. It needs `external_review` on; with the panel check off there is nothing to read and
+the setting does nothing. The panel only answers a summon from a repo admin, so the board's
+`gh` identity must be one.
+
+**`review_summon_handle`** — the handle the re-review comment mentions, `vera` by default. A
+leading `@` is dropped, and blank means hold without posting anything.
 
 ## Publish gates and the release freeze
 

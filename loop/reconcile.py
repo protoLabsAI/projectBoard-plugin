@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from .. import external_review, merge_state_hold
+from .. import external_review, merge_state_hold, review_coverage_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
@@ -1173,6 +1173,7 @@ class ReconcileMixin:
                     continue
                 if state in ("MERGED", "CLOSED"):
                     merge_state_hold.clear_hold(fid)  # #495: a finished PR holds nothing
+                    review_coverage_hold.clear_hold(fid)
                 if state == "MERGED":
                     if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                         await worktree.reap_feature_worktree(repo, self.root, fid)
@@ -1449,6 +1450,7 @@ class ReconcileMixin:
         if feature is None:  # card deleted between the reconcile snapshot and this re-read
             log.debug("[project_board] %s vanished before auto-merge — nothing to merge", fid)
             return False
+        self._refresh_coverage_hold(fid, feature, view)
         why = await self._auto_merge_blockers(store, feature, pr_url, repo)
         self._note_merge_state_hold(fid, pr_url, why, view)
         if why:
@@ -1518,9 +1520,22 @@ class ReconcileMixin:
         # merge, and hold (no merge attempt spent) on a FAIL there. Unreadable → merge as
         # before: GitHub's own required-review rules still stand behind it.
         ext_cfg = self._external_review_cfg_for(feature)
+        require_complete = ext_cfg is not None and self._require_complete_review_for(feature)
+        if not require_complete:
+            review_coverage_hold.clear_hold(fid)
         if ext_cfg is not None:
             view = await worktree.pr_review_state(pr_url, cwd=repo)
             ext = external_review.evaluate(view, ext_cfg) if view else None
+            if ext is None and require_complete:
+                # `require_complete_review` asks for PROOF the head was fully reviewed; an
+                # unreadable panel is not that. Hold this pass (no attempt spent), re-ask next.
+                log.info(
+                    "[project_board] %s not merging: require_complete_review is on and the panel's "
+                    "verdict is unreadable this pass: %s",
+                    fid,
+                    pr_url,
+                )
+                return False
             if ext is not None and ext.failed and (not merge_head or ext.head == merge_head):
                 log.info(
                     "[project_board] %s not merging: the external review FAILED head %s (%s): %s",
@@ -1538,6 +1553,17 @@ class ReconcileMixin:
                     pr_url,
                 )
                 return False
+            if require_complete and ext is not None:
+                if ext.incomplete:
+                    await self._hold_incomplete_review(store, feature, pr_url, repo, ext)
+                    return False
+                if review_coverage_hold.clear_hold(fid):
+                    log.info(
+                        "[project_board] %s the panel's pass at %s is complete — the merge edge is open: %s",
+                        fid,
+                        ext.head[:12],
+                        pr_url,
+                    )
         ok, detail = await worktree.merge_pr(pr_url, method=self.merge_method, cwd=repo, expected_head=merge_head)
         if not ok:
             # gh's exit code is not the verdict — the merge may have landed and a
@@ -1576,6 +1602,79 @@ class ReconcileMixin:
                 "[project_board] %s auto-merge refused (attempt %d/%d): %s", fid, n, self.auto_merge_max, detail
             )
         return False
+
+    def _refresh_coverage_hold(self, fid: str, feature: dict, view: dict | None) -> None:
+        """Drop a stale incomplete-review hold from the pass's own read, no GitHub call: the
+        project turned ``require_complete_review`` off, the head moved, or the panel's word
+        at the head is no longer an incomplete pass. Only the merge edge's final check SETS
+        the hold (and summons), so a card held for another reason reads that reason."""
+        hold = review_coverage_hold.hold_for(fid)
+        if not hold:
+            return
+        ext_cfg = self._external_review_cfg_for(feature)
+        if ext_cfg is None or not self._require_complete_review_for(feature):
+            review_coverage_hold.clear_hold(fid)
+            return
+        ext = external_review.evaluate(view, ext_cfg) if view else None
+        if ext is None:
+            return  # nothing read this pass — keep what the last read said
+        if ext.head != hold["head"] or not ext.incomplete:
+            review_coverage_hold.clear_hold(fid)
+
+    async def _hold_incomplete_review(self, store, feature: dict, pr_url: str, repo: str, ext) -> None:
+        """Hold the merge on an incomplete panel pass at the head (``require_complete_review``)
+        and ask the panel, ONCE per head, to review it again.
+
+        The hold is process state (``review_coverage_hold``) that ``annotate_next_action``
+        projects as ``awaiting complete review (panel pass was incomplete)``; the card stays
+        in_review and no merge attempt is spent. The summon is a PR comment
+        ``@<handle> review — <reason>`` posted through ``worktree.post_or_update_pr_comment``
+        under a per-head marker. Two layers keep it to one per head: the hold remembers the
+        head it summoned for (a 30-second tick never re-posts), and the marker lets a
+        restarted process find the earlier comment (an unchanged body is a no-op, never a
+        PATCH). A failed post is retried on the next merge poll."""
+        fid = feature["id"]
+        head = ext.head
+        signals = list(ext.incomplete_signals)
+        if review_coverage_hold.set_hold(fid, head, signals, pr_url):
+            log.info(
+                "[project_board] %s auto-merge held: the panel's pass at %s was incomplete (%s) — "
+                "require_complete_review is on: %s",
+                fid,
+                head[:12],
+                "; ".join(signals),
+                pr_url,
+            )
+            try:
+                await asyncio.to_thread(
+                    store.comment,
+                    fid,
+                    f"auto-merge held: {review_coverage_hold.NEXT_ACTION} at {head[:12]} — "
+                    f"{'; '.join(signals)}. require_complete_review is on for this project, so the loop "
+                    f"merges only after a complete pass at the head: {pr_url}",
+                )
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
+                log.warning("[project_board] %s incomplete-review hold comment failed", fid, exc_info=True)
+        handle = self._review_summon_handle_for(feature)
+        if not handle or review_coverage_hold.summoned(fid, head):
+            return
+        posted = await worktree.post_or_update_pr_comment(
+            pr_url,
+            review_coverage_hold.summon_body(handle, head),
+            marker=review_coverage_hold.summon_marker(head),
+            cwd=repo,
+        )
+        if posted:
+            review_coverage_hold.mark_summoned(fid, head)
+            log.info("[project_board] %s requested a re-review (@%s) of head %s: %s", fid, handle, head[:12], pr_url)
+        else:
+            log.warning(
+                "[project_board] %s could not post the @%s re-review request for %s — retrying next poll: %s",
+                fid,
+                handle,
+                head[:12],
+                pr_url,
+            )
 
     def _note_draft_hold(self, store, fid: str, pr_url: str, why: list[str]) -> None:
         """ONE bead comment the first time the auto-merge edge holds on a draft (#207):

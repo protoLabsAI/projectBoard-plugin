@@ -73,6 +73,8 @@ _PROJECT_SETTING_KEYS = (
     "breadth_exclude",
     "hot_files",
     "preflight_cmd",
+    "require_complete_review",
+    "review_summon_handle",
 )
 # Card-authoring policy (#455, #458) that a top-level value sets for EVERY project, an
 # entry's own value overriding it — the `release_freeze` posture. (The execution keys
@@ -152,7 +154,7 @@ def resolve_projects(cfg: dict) -> dict[str, dict]:
     Each settings dict carries that project's full execution surface — `repo`,
     `base_branch`, `local_gate_cmd`, `coders`, every `coder_solve_*` knob, `gate_files`,
     `repo_conventions`, `worktrees_root`, `format_cmd`, `setup_cmd`, `env_passthrough`,
-    `release_freeze`, `preflight_cmd` — plus its own
+    `release_freeze`, `preflight_cmd`, `require_complete_review`, `review_summon_handle` — plus its own
     `name`. `repo` is required in every explicit entry and `~` paths are expanded; a
     missing `repo` raises ValueError (the board writes worktrees/branches/PRs, so it must
     never fall back to the server's cwd).

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 
+from .. import review_coverage_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .drive import DriveMixin
 from .preflight import PreflightMixin
@@ -738,6 +739,25 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         if "release_freeze" in pc:
             return pc.get("release_freeze")
         return self.cfg.get("release_freeze")
+
+    def _require_complete_review_for(self, feature: dict) -> bool:
+        """This feature's project's ``require_complete_review`` (default off), else the flat
+        top-level key. On, the auto-merge edge holds while the external panel's pass at the
+        PR head is incomplete (``review_coverage_hold``). A spelling that is not a boolean
+        reads as off, so a typo never wedges a merge edge."""
+        pc = self._project_cfg(feature)
+        src = pc if "require_complete_review" in pc else self.cfg
+        return _knob_bool(src, "require_complete_review", False, strict=False)
+
+    def _review_summon_handle_for(self, feature: dict) -> str:
+        """The handle the board mentions to ask the external panel for a re-review
+        (``review_summon_handle``, default ``vera``), project value first. Blank = never
+        post a summon; the merge still holds. A leading ``@`` is dropped."""
+        pc = self._project_cfg(feature)
+        raw = pc.get("review_summon_handle") if "review_summon_handle" in pc else self.cfg.get("review_summon_handle")
+        if raw is None:
+            return review_coverage_hold.DEFAULT_SUMMON_HANDLE
+        return str(raw).strip().lstrip("@").strip()
 
     def _npm_token(self) -> str:
         """The optional registry token for private-package publish gates (gates.npm_token)."""
