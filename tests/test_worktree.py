@@ -77,6 +77,71 @@ async def test_open_pr_raises_no_changes_on_an_empty_diff(monkeypatch):
     assert not git.ran("push")  # nothing to push → never reaches push
 
 
+class _RevListGit(FakeGit):
+    """FakeGit whose ``rev-list`` answer depends on the ref range it is asked about."""
+
+    def __init__(self, by_range, **kw):
+        super().__init__(**kw)
+        self.by_range = by_range
+
+    async def __call__(self, repo, *args, timeout=60):
+        if args and args[0] == "rev-list":
+            self.calls.append(args)
+            return self.by_range.get(args[-1], (128, "", "fatal: ambiguous argument"))
+        return await super().__call__(repo, *args, timeout=timeout)
+
+
+async def test_open_pr_counts_against_the_remote_base_first(monkeypatch):
+    git = _RevListGit({"origin/epic/x..HEAD": (0, "2", "")}, responses={"status": (0, "", "")})
+    _install(monkeypatch, git, FakeGh({"create": (0, "https://example/pr/7", "")}))
+    assert await worktree.open_pr("/wt", "feat/bd-1", base="epic/x", title="t") == "https://example/pr/7"
+    assert git.ran("rev-list")[0][-1] == "origin/epic/x..HEAD"
+
+
+async def test_open_pr_falls_back_to_the_local_base_without_a_remote_ref(monkeypatch):
+    git = _RevListGit({"main..HEAD": (0, "1", "")}, responses={"status": (0, "", "")})
+    _install(monkeypatch, git, FakeGh())
+    assert await worktree.open_pr("/wt", "feat/bd-1", base="main", title="t")
+    assert [a[-1] for a in git.ran("rev-list")] == ["origin/main..HEAD", "main..HEAD"]
+
+
+async def test_open_pr_an_unresolvable_base_is_infra_not_an_empty_diff(monkeypatch):
+    git = _RevListGit({}, responses={"status": (0, "", "")})  # every rev-list errors
+    _install(monkeypatch, git, FakeGh())
+    with pytest.raises(WorktreeError) as exc:
+        await worktree.open_pr("/wt", "feat/bd-1", base="epic/x", title="t")
+    assert not isinstance(exc.value, NoChangesError)
+    assert not git.ran("push")
+
+
+async def test_open_pr_real_git_finds_commits_vs_a_remote_only_base(monkeypatch, tmp_path):
+    """The REAL seam (no FakeGit): a base branch that exists only on the remote — an epic
+    branch the board's checkout never created locally — must still count the coder's commit."""
+    import subprocess
+
+    def sh(*cmd, cwd):
+        subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
+
+    origin, repo = tmp_path / "origin.git", tmp_path / "repo"
+    sh("git", "init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp_path)
+    sh("git", "clone", "-q", str(origin), str(repo), cwd=tmp_path)
+    for k, v in (("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        sh("git", "config", k, v, cwd=repo)
+    (repo / "a.txt").write_text("a\n")
+    sh("git", "add", "a.txt", cwd=repo)
+    sh("git", "commit", "-q", "-m", "init", cwd=repo)
+    sh("git", "push", "-q", "origin", "main", cwd=repo)
+    sh("git", "push", "-q", "origin", "main:refs/heads/epic/x", cwd=repo)  # remote-only branch
+    sh("git", "fetch", "-q", "origin", cwd=repo)
+    wt = tmp_path / "wt"
+    sh("git", "worktree", "add", "-q", "-b", "feat/bd-1", str(wt), "origin/epic/x", cwd=repo)
+    (wt / "b.txt").write_text("b\n")
+    sh("git", "add", "b.txt", cwd=wt)
+    sh("git", "commit", "-q", "-m", "work", cwd=wt)
+    monkeypatch.setattr(worktree, "_gh", FakeGh({"create": (0, "https://example/pr/9", "")}))
+    assert await worktree.open_pr(str(wt), "feat/bd-1", base="epic/x", title="t") == "https://example/pr/9"
+
+
 async def test_open_pr_reuses_an_existing_pr_on_redispatch(monkeypatch):
     git = FakeGit({"status": (0, "", ""), "rev-list": (0, "2", "")})
     gh = FakeGh(
