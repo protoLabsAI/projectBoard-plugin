@@ -51,7 +51,7 @@ from urllib.parse import urlparse
 
 from . import _TERMINAL_STATES, br_fetch, work_snapshot
 from . import gates as publish_gates
-from . import merge_state_hold, release_freeze
+from . import merge_state_hold, release_freeze, review_coverage_hold
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -5334,6 +5334,27 @@ def publish_gate_posture(feature: dict) -> dict:
     return out
 
 
+def review_coverage_hold_posture(feature: dict) -> dict | None:
+    """``{"next_action", "awaiting_merge", "next_action_hint"}`` for an ``auto-merge
+    pending`` card whose merge edge is holding on an INCOMPLETE external-panel pass at the
+    PR head (``require_complete_review``), else None. Process state the loop records
+    (``review_coverage_hold``), no GitHub call."""
+    hold = review_coverage_hold.hold_for(str(feature.get("id") or ""))
+    if not hold:
+        return None
+    n = pr_number(feature.get("pr_url", ""))
+    asked = "a re-review was requested on the PR" if hold.get("summoned") else "a re-review request is pending"
+    return {
+        "next_action": review_coverage_hold.NEXT_ACTION,
+        "awaiting_merge": False,
+        "next_action_hint": (
+            f"the QA panel's pass at {str(hold['head'])[:SHORT_SHA_LEN]} on {'#' + n if n else 'the PR'} was "
+            f"incomplete ({'; '.join(hold['signals'])}) and this project sets require_complete_review — "
+            f"{asked}; the loop merges once a complete pass clears the head, or a push re-reviews it"
+        ),
+    }
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — a coding ``in_review`` card from the board's config
@@ -5439,7 +5460,7 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
                     ),
                 }
             else:
-                posture = merge_state_hold_posture(f) or posture
+                posture = review_coverage_hold_posture(f) or merge_state_hold_posture(f) or posture
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]

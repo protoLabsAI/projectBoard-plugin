@@ -228,6 +228,20 @@ project_board:
                              # status report with "merge #N or turn auto_merge on" instead
                              # of re-offering a review. Label a card `merge-hold` to exempt it.
   merge_method: squash       # squash | merge | rebase
+  require_complete_review: false
+                             # OPT-IN, per project (set it in a `projects:` entry, or here as
+                             # the fallback). On: the auto-merge edge will NOT merge while the
+                             # external QA panel's pass at the PR head is INCOMPLETE — the
+                             # `QA panel` check concluded `neutral` ("Incomplete pass — not
+                             # blocking", `hold:incomplete-coverage`) or the panel's review
+                             # marker says `complete=false`. GitHub reads `neutral` as passing,
+                             # so without this an incomplete pass merges. The card stays
+                             # in_review reading "awaiting complete review (panel pass was
+                             # incomplete)", and the board comments `@vera review` on the PR
+                             # ONCE per head to ask for a full pass. A complete pass later →
+                             # the normal merge. Needs `external_review` on (the default).
+  review_summon_handle: vera # who that re-review comment mentions (`@<handle> review`).
+                             # Blank = hold without posting. Per project, like the above.
   merged_verify_max: 5       # sibling merges a held in_review card can survive (one gate run each,
                              # only when base moved) before its merged-state verdict stops being
                              # refreshed. 0 = unlimited. Exhaustion holds the auto-merge edge.
@@ -783,6 +797,7 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `gates.py` | publish gates (`waits_for`): spec grammar, a stdlib node-semver range matcher, the npm / `gh` evaluators, the shared per-spec cache |
 | `release_freeze.py` | the auto-merge edge's release-freeze guard: per-project patterns, the per-repo check, the per-card holds |
 | `external_review.py` | an external QA panel's verdict on a PR (#473): its config, the FAIL-at-head judge over one `gh pr view` read, and the findings a fix round leads with |
+| `review_coverage_hold.py` | `require_complete_review`: the per-card hold while the panel's pass at the head is incomplete, and the once-per-head `@vera review` summon |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
 | `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain` and `loop-retro` skills |
 | `__init__.py` | `register()` — wires it all |
