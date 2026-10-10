@@ -1,0 +1,9 @@
+- **The coder monitor is readable again: one scroll, sections at their natural height (monitor v2).** When only one gen was running, its card was stretched to fill the drawer, so plan, saying and tools each shrank into a small scrollbox of their own. Text clipped mid-line, and up to four scrollbars sat inside one another.
+  - **One scroll.** The drawer body is now the only thing that scrolls. Each section (Verify, Now, Plan, Saying, Thinking, Activity) takes the height it needs, and each has a header that collapses it.
+  - **Long text** ("saying", "thinking") clamps to a fading tail that keeps the newest lines in view, with a *Show all* toggle.
+  - **Current tool** is a single row; its detail is clamped to two lines and expands when clicked.
+  - **Plan** folds finished steps into one "N done" row once the list is long.
+  - **Activity** lists the newest call first, folds repeated calls into ×N, and shows 8 rows with *Show all*.
+  - **Header** shows elapsed time (`8m 12s`) and a token meter (`99.4k / 1M tokens · 10%`).
+  - **Finished gens** fold to a summary and sit below the live gen.
+  - **Polling.** Expanded and collapsed state survives the 3 s poll, an unchanged snapshot is not re-rendered, and a poll keeps your scroll position.

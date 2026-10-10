@@ -558,7 +558,7 @@ const MON_POLL_MS = 3000;
 // drawer is showing (null otherwise). The two are mutually exclusive — opening one
 // clears the other — and both fence writes to the shared #drawer-body (see pollMonitor
 // / syncTaskDrawer) so a stale async can't clobber a re-purposed drawer.
-let MON_FID = null, MON_TIMER = null, TASK_FID = null;
+let MON_FID = null, MON_TIMER = null, TASK_FID = null, MON_LAST_FID = null;
 // The single-card detail behind the OPEN task drawer (#312): the list projection the 10s
 // poll pulls (/features) never carries a task's full deliverable — only a small signal
 // (`delivered`, `deliverable_chars`, a short `deliverable_preview`, #399) — so the drawer
@@ -579,14 +579,27 @@ const TASK_DETAIL_SEQ = {};
 const TOOL_STATUS_WORD = {start: "running", running: "running", completed: "done", failed: "failed"};
 function toolLine(t){
   const raw = t.status || "";
-  const st = esc(raw === "start" ? "running" : raw);
   const word = esc(TOOL_STATUS_WORD[raw] || raw);
   const name = String(t.name || "tool");
   const locs = (t.locations || []).filter(l => l && name.indexOf(l) < 0 && name.indexOf(l.split("/").pop()) < 0);
   const loc = locs.length ? ' <span class="loc">'+esc(locs.join(", "))+'</span>' : "";
-  const full = word + " " + name + (locs.length ? " " + locs.join(", ") : "");
-  return '<li class="k-'+esc(t.kind||"")+'" title="'+esc(full)+'"><span class="st st-'+st+'">'+word+'</span> '
-    + '<span class="tn">'+esc(name)+'</span>'+loc+'</li>';
+  const rep = t.count > 1 ? '<span class="rep">×'+t.count+'</span>' : "";
+  const full = word + " " + name + (locs.length ? " " + locs.join(", ") : "") + (t.count > 1 ? " (×"+t.count+")" : "");
+  return '<li class="k-'+esc(t.kind||"")+'" title="'+esc(full)+'"><span class="st st-'+word+'"><span class="sr">'+word+'</span></span>'
+    + '<span class="tn">'+esc(name)+'</span>'+loc+rep+'</li>';
+}
+// Consecutive identical calls (four Edits of the same file, a run of bare `shell`s) read as
+// ONE row with a ×N count instead of a wall of repeats.
+function groupTools(rows){
+  const out = [];
+  for (const r of rows){
+    const prev = out[out.length - 1];
+    if (prev && prev.name === r.name && prev.status === r.status && String(prev.locations) === String(r.locations)){
+      prev.count = (prev.count || 1) + 1; continue;
+    }
+    out.push(Object.assign({}, r, {count: 1}));
+  }
+  return out;
 }
 // The feed lists every call ONCE: a call's end replaces its own start row in place (by
 // tool id, else by name for an older buffer without ids), so the drawer shows "done Edit
@@ -670,66 +683,161 @@ function enhanceSaying(root){
   if (MARKED) apply(MARKED);                              // already cached → upgrade synchronously
   else loadMarked().then(apply);
 }
-function genCard(g){
-  let h = '<div class="gen"><div class="gh"><span class="gn">gen '+esc(String(g.gen))+'</span>'
-    + (g.tier?'<span class="pl-badge">'+esc(g.tier)+'</span>':"")
-    + '<span class="pl-badge">'+esc(String(g.elapsed_s))+'s</span>'
-    + (g.usage?'<span class="pl-badge">'+esc(String(g.usage.used))+'/'+esc(String(g.usage.size))+' tok</span>':"")
-    + '</div>';
-  // The coder's own plan (ACP plan updates — its live todo list): the sharpest
-  // "where is it in the work" signal, rendered as a status-glyphed checklist.
-  if (g.plan && g.plan.length){
-    h += '<div class="lbl">plan</div><ul class="plan">'
-      + g.plan.map(e => {
-          const st = e.status||"";
-          const glyph = st==="completed" ? "✓" : (st==="in_progress" ? "▸" : "·");
-          return '<li class="pl-'+esc(st)+'"><span class="glyph">'+glyph+'</span> '+esc(e.content||"")+'</li>';
-        }).join("") + '</ul>';
+// ── Gen card layout (monitor v2): every section takes its NATURAL height and the drawer
+// body is the ONE scroll. The old lone-gen layout forced the card to 100% of the drawer as a
+// flex column, so plan / saying / tools each shrank into its own tiny scrollbox and clipped
+// mid-line. Long sections now clamp to a short tail (newest content visible, older content
+// fading out at the top, no inner scrollbar) behind a "show all" toggle, and the expansion
+// state survives the 3s re-render (MON_UI) — a poll never snaps an open section shut.
+const MON_UI = {};                       // "<gen>:<section>" → true (expanded) / false (collapsed)
+const ACTIVITY_ROWS = 8;
+function fmtDur(s){
+  s = Math.max(0, Math.round(Number(s) || 0));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+  return Math.floor(s / 3600) + "h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
+}
+function fmtTok(n){
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1).replace(/\.0$/, "") + "k";
+  return String(n);
+}
+function uiOpen(key, dflt){ return key in MON_UI ? MON_UI[key] : dflt; }
+// One section: a header button (label, a short meta, a chevron) over its body. `collapsible`
+// sections hide their body when closed; `clampKey` adds the tail clamp + show-all toggle.
+function section(gen, key, label, meta, body, opts){
+  opts = opts || {};
+  const k = gen + ":" + key;
+  const open = opts.collapsible ? uiOpen(k, opts.open !== false) : true;
+  let h = '<section class="sec sec-'+key+(open ? "" : " closed")+'">'
+    + '<button class="sec-h" type="button"'+(opts.collapsible ? ' data-mon-toggle="'+esc(k)+'" data-open="'+open+'" aria-expanded="'+open+'"' : ' tabindex="-1"')+'>'
+    + '<span class="sec-l">'+esc(label)+'</span>'
+    + (meta ? '<span class="sec-m">'+meta+'</span>' : "")
+    + (opts.collapsible ? '<span class="chev" aria-hidden="true"></span>' : "")
+    + '</button>';
+  if (open){
+    if (opts.clampKey){
+      const full = uiOpen(gen + ":" + opts.clampKey, false);
+      h += '<div class="sec-b"><div class="tail'+(full ? " full" : "")+'">'+body+'</div>'
+        + '<button class="more" type="button" data-mon-toggle="'+esc(gen + ":" + opts.clampKey)+'" data-open="'+full+'">'+(full ? "Show less" : "Show all")+'</button></div>';
+    } else h += '<div class="sec-b">'+body+'</div>';
   }
+  return h + '</section>';
+}
+function genCard(g){
+  const gen = String(g.gen);
+  const live = !g.done;
+  const state = live ? '<span class="gs live"><span class="dot"></span>running</span>'
+    : '<span class="gs '+(g.stop_reason && g.stop_reason !== "end_turn" ? "stopped" : "ended")+'">'
+      + esc(g.stop_reason && g.stop_reason !== "end_turn" ? "stopped · " + g.stop_reason : "finished")+'</span>';
+  // A finished gen folds to its summary (header, meter, verify) so the live one stays in
+  // view; its header expands it.
+  const body = uiOpen(gen + ":body", live);
+  let h = '<div class="gen'+(live ? " gen-live" : "")+(body ? "" : " folded")+'"><div class="gh"'
+    + (live ? "" : ' data-mon-toggle="'+esc(gen + ":body")+'" data-open="'+body+'" role="button" tabindex="0" aria-expanded="'+body+'"')+'>'
+    + '<span class="gn">Gen '+esc(gen)+'</span>'
+    + (g.tier ? '<span class="tier">'+esc(g.tier)+'</span>' : "")
+    + '<span class="gh-r">'+state+'<span class="el">'+esc(fmtDur(g.elapsed_s))+'</span>'
+    + (live ? "" : '<span class="chev" aria-hidden="true"></span>')+'</span></div>';
+  if (g.usage && g.usage.size){
+    const pct = Math.min(100, Math.round(100 * (Number(g.usage.used) || 0) / Number(g.usage.size)));
+    h += '<div class="meter" title="'+esc(String(g.usage.used))+' / '+esc(String(g.usage.size))+' tokens">'
+      + '<div class="bar"><div class="fill'+(pct >= 80 ? " hot" : "")+'" style="width:'+pct+'%"></div></div>'
+      + '<span class="mt">'+esc(fmtTok(g.usage.used))+' / '+esc(fmtTok(g.usage.size))+' tokens · '+pct+'%</span></div>';
+  }
+  if (g.verify){
+    h += section(gen, "verify", "Verify", "", '<div class="vrow"><span class="st st-'+(g.verify.passed ? "done" : "failed")+'"><span class="sr">'
+      + (g.verify.passed ? "passed" : "failed")+'</span></span><span class="vt">'+(g.verify.passed ? "passed" : "failed")+'</span> <code>'
+      + esc(g.verify.test_cmd||"")+'</code></div>');
+  }
+  if (!body) return h + '</div>';
+  // Now: the current call — its title, its file(s) unless the title names them, and ONE plain
+  // line of what it does (server-side `detail`), clamped to two lines; the row expands in place.
   const cur = g.current_tool;
-  // The current call: its title, its file(s) unless the title names them, and ONE plain
-  // line of what it does (the input's description/command/pattern, server-side `detail`)
-  // instead of the raw JSON args. An older buffer without `detail` keeps the raw preview.
-  let curHtml = "—";
   if (cur){
     const cname = String(cur.name || "");
     const clocs = (cur.locations || []).filter(l => l && cname.indexOf(l) < 0 && cname.indexOf(l.split("/").pop()) < 0);
     const detail = cur.detail !== undefined ? (cur.detail && cur.detail !== cname ? cur.detail : "") : (cur.input_preview || "");
-    curHtml = '<span class="st-'+esc(cur.status||"")+'">'+esc(cur.status||"")+'</span> '+esc(cname)
-      + (clocs.length ? ' <span class="loc">'+esc(clocs.join(", "))+'</span>' : "")
-      + (detail ? '<div class="inprev">'+esc(detail)+'</div>' : "");
+    const word = TOOL_STATUS_WORD[cur.status] || cur.status || "";
+    const wide = uiOpen(gen + ":cur-full", false);
+    const row = '<div class="cur'+(wide ? " full" : "")+'" data-mon-toggle="'+esc(gen + ":cur-full")+'" data-open="'+wide+'" title="'+esc(wide ? "Click to collapse" : "Click to expand")+'">'
+      + '<span class="st st-'+esc(word)+'"><span class="sr">'+esc(word)+'</span></span>'
+      + '<div class="cur-t"><div class="cn">'+esc(cname)+(clocs.length ? ' <span class="loc">'+esc(clocs.join(", "))+'</span>' : "")+'</div>'
+      + (detail ? '<div class="inprev">'+esc(detail)+'</div>' : "")+'</div></div>';
+    h += section(gen, "now", live && word === "running" ? "Now" : "Last tool", "", row);
   }
-  h += '<div class="lbl">current tool</div><div class="cur">' + curHtml + '</div>';
-  // "saying" is markdown — carry the raw source on data-md and render esc()'d text inline
-  // as the fallback; enhanceSaying() upgrades it to rendered markdown once marked loads.
-  // The .thought class is kept so it inherits the drawer's scroll/overflow cap + lone-gen
-  // fill (#218/#226-UX); .md-saying is the enhancement hook.
-  if (g.answer_tail){ h += '<div class="lbl">saying</div><div class="thought md-saying" data-md="'+esc(g.answer_tail)+'">'+esc(g.answer_tail)+'</div>'; }
-  // "thinking" stays plain esc()'d text — internal reasoning, not user-facing prose.
-  if (g.thought_tail){ h += '<div class="lbl">thinking</div><div class="thought">'+esc(g.thought_tail)+'</div>'; }
-  const rt = collapseTools(g.recent_tools||[]).slice(-30).reverse();
-  if (rt.length){ h += '<div class="lbl">recent tools</div><ul class="tools">'+rt.map(toolLine).join("")+'</ul>'; }
-  if (g.verify){ h += '<div class="lbl">verify</div><div class="cur"><span class="st-'
-    + (g.verify.passed?"completed":"failed")+'">'+(g.verify.passed?"passed":"failed")+'</span> '
-    + esc(g.verify.test_cmd||"")+'</div>'; }
+  // Plan: the coder's own live todo list. Finished steps fold into one "N done" row once the
+  // list is long, so the in-progress step is always on screen.
+  if (g.plan && g.plan.length){
+    const done = g.plan.filter(e => e.status === "completed").length;
+    const showDone = uiOpen(gen + ":plan-done", g.plan.length <= 6);
+    const li = (e) => {
+      const st = e.status || "";
+      const glyph = st === "completed" ? "✓" : (st === "in_progress" ? "▸" : "○");
+      return '<li class="pl-'+esc(st)+'"><span class="glyph">'+glyph+'</span><span>'+esc(e.content||"")+'</span></li>';
+    };
+    let items = g.plan;
+    let fold = "";
+    if (!showDone && done){
+      items = g.plan.filter(e => e.status !== "completed");
+      fold = '<li class="fold"><button class="more" type="button" data-mon-toggle="'+esc(gen + ":plan-done")+'" data-open="false">✓ '+done+' done — show</button></li>';
+    }
+    h += section(gen, "plan", "Plan", done + " / " + g.plan.length, '<ul class="plan">'+fold+items.map(li).join("")+'</ul>', {collapsible: true});
+  }
+  // "saying" is markdown — the raw source rides data-md and esc()'d text renders inline as the
+  // fallback; enhanceSaying() upgrades it once marked loads. The tail clamp keeps the NEWEST
+  // narration in view with no inner scrollbar.
+  if (g.answer_tail){
+    h += section(gen, "saying", "Saying", "", '<div class="thought md-saying" data-md="'+esc(g.answer_tail)+'">'+esc(g.answer_tail)+'</div>',
+      {collapsible: true, clampKey: "saying-full"});
+  }
+  // "thinking" stays plain esc()'d text (internal reasoning, not prose) and starts collapsed.
+  if (g.thought_tail){
+    h += section(gen, "thinking", "Thinking", "", '<div class="thought">'+esc(g.thought_tail)+'</div>',
+      {collapsible: true, open: false, clampKey: "thinking-full"});
+  }
+  const calls = collapseTools(g.recent_tools||[]);
+  if (calls.length){
+    const rows = groupTools(calls.slice().reverse());
+    const all = uiOpen(gen + ":tools-all", false);
+    const shown = all ? rows : rows.slice(0, ACTIVITY_ROWS);
+    const more = rows.length > ACTIVITY_ROWS
+      ? '<button class="more" type="button" data-mon-toggle="'+esc(gen + ":tools-all")+'" data-open="'+all+'">'+(all ? "Show less" : "Show all "+rows.length)+'</button>' : "";
+    h += section(gen, "tools", "Activity", calls.length + (calls.length === 1 ? " call" : " calls"),
+      '<ul class="tools">'+shown.map(toolLine).join("")+'</ul>'+more, {collapsible: true});
+  }
   return h + '</div>';
 }
-function renderMonitor(data){
+let MON_LAST = "";
+function renderMonitor(data, force){
   const gens = (data && data.gens) || [];
-  $("drawer-body").innerHTML = gens.length
-    ? gens.map(genCard).join("")
+  // An unchanged snapshot is not re-rendered: rebuilding innerHTML every 3s resets text
+  // selection and re-runs the markdown pass for nothing.
+  const sig = JSON.stringify(gens);
+  if (!force && sig === MON_LAST) return;
+  MON_LAST = sig;
+  const body = $("drawer-body");
+  const top = body.scrollTop;
+  body.innerHTML = gens.length
+    ? gens.slice().sort((a, b) => (a.done ? 1 : 0) - (b.done ? 1 : 0) || b.gen - a.gen).map(genCard).join("")
     : '<div class="pl-empty">No live coder run for this feature right now.</div>';
+  body.scrollTop = top;                 // a poll never yanks the reader back to the top
   enhanceSaying($("drawer-body"));   // upgrade "saying" plain text → rendered markdown (lazy, best-effort)
-  pinSayingToLatest($("drawer-body"));
 }
-// "saying" is a rolling TAIL — the newest narration is at the bottom, so the box opens
-// scrolled there (each poll re-renders it into a fresh node, which would start at the top
-// and clip the latest line mid-heading).
-function pinSayingToLatest(root){
-  const pin = () => root.querySelectorAll(".md-saying").forEach(el => { el.scrollTop = el.scrollHeight; });
-  pin();
-  if (!MARKED && MARKED_LOAD) MARKED_LOAD.then(pin);   // markdown upgrade changes the height
-}
+let MON_DATA = null;
+// Section toggles (headers, "show all", the current-tool row) flip MON_UI and re-render from
+// the last snapshot immediately — no wait for the next poll.
+$("drawer-body").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-mon-toggle]");
+  if (!t || !MON_FID) return;
+  MON_UI[t.getAttribute("data-mon-toggle")] = t.getAttribute("data-open") !== "true";
+  if (MON_DATA) renderMonitor(MON_DATA, true);
+});
+$("drawer-body").addEventListener("keydown", (e) => {
+  const t = e.target.closest('[data-mon-toggle][role="button"]');
+  if (t && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); t.click(); }
+});
 async function pollMonitor(){
   // Fence on the fid we START the request for: clearInterval stops FUTURE polls but
   // cannot cancel a request already in flight, so if the drawer is switched to a task
@@ -740,6 +848,7 @@ async function pollMonitor(){
   try {
     const data = await api("/api/plugins/project_board/features/"+encodeURIComponent(fid)+"/progress");
     if (MON_FID !== fid) return;
+    MON_DATA = data;
     renderMonitor(data);
   } catch (e) {
     if (MON_FID !== fid) return;
@@ -750,6 +859,8 @@ function openMonitor(fid){
   TASK_FID = null;                                               // switching drawer modes → not a task
   MON_FID = fid;
   $("drawer-title").textContent = "Coder monitor — " + fid;
+  if (fid !== MON_LAST_FID){ for (const k in MON_UI) delete MON_UI[k]; MON_LAST_FID = fid; }
+  MON_LAST = ""; MON_DATA = null;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
   document.body.classList.add("drawer-open");                    // lock page scroll behind the scrim
   $("drawer-body").innerHTML = '<div class="pl-empty">Loading…</div>';

@@ -302,63 +302,46 @@ def test_task_cards_share_lanes_and_ordering_with_coding_features():
     )
 
 
-# ── gen log fills the drawer's vertical space (#226-UX) ──────────────────────────
+# ── coder monitor v2: one scroll, natural-height sections ────────────────────────
 #
-# The coder monitor drawer already flex-fills the panel height (.db is flex:1;overflow:
-# auto), but each gen section had a small hard cap, leaving whitespace below a lone gen
-# — the common case, watching one live build. A solo gen card now becomes a flex column
-# owning the full body height, with its recent-tools log flexing into the remaining
-# space; several gens keep bounded (but larger) caps so all stay reachable by scrolling.
+# The #226 lone-gen fill made a single gen a 100%-height flex column, so plan / saying /
+# tools each shrank into its own tiny scrollbox and clipped mid-line. v2 drops the fill:
+# the drawer body is the ONE scroll, and long text clamps to a fading tail instead.
+# Behavior (sections, folding, grouping, state) is exercised in node by
+# tests/test_coder_monitor_v2.py; these pin the CSS contract.
 
 
-def test_lone_gen_becomes_a_flex_column_that_fills_the_drawer_body():
-    """A single gen (`.gen:only-child` — the sole child of the flex-filled .db) turns
-    into a flex column at 100% of the body height, with margin-bottom:0 so it doesn't
-    spill past 100% and re-introduce a body scroll."""
-    assert ".gen:only-child{display:flex;flex-direction:column;height:100%;margin-bottom:0}" in BOARD_PAGE
+def test_lone_gen_flex_fill_is_gone():
+    assert ".gen:only-child" not in BOARD_PAGE
 
 
-def test_lone_gen_tools_log_takes_the_remaining_space_uncapped():
-    """The recent-tools list is the primary log the operator watches, so in the lone-gen
-    layout it drops its cap (max-height:none) and grows into the leftover space (flex:1),
-    keeping a sensible floor (min-height) — no dead whitespace below the card."""
-    assert ".gen:only-child ul.tools{flex:1 1 auto;max-height:none;min-height:80px}" in BOARD_PAGE
+def test_no_gen_section_owns_a_scrollbar():
+    """Every .gen rule leaves overflow alone or hides it — none scrolls on its own. A
+    markdown code block (``.md-on pre``) is the one exception: it scrolls sideways so a long
+    line never widens the drawer."""
+    css = BOARD_PAGE.split("<style>", 1)[1].split("</style>", 1)[0]
+    gen_rules = [
+        r for r in css.split("}") if r.strip().startswith(".gen") and not r.strip().startswith(".gen .md-on pre")
+    ]
+    assert gen_rules
+    assert not [r for r in gen_rules if "overflow:auto" in r or "overflow:scroll" in r]
 
 
-def test_lone_gen_plan_and_thought_stay_bounded_but_can_shrink_and_scroll():
-    """Plan/thinking keep generous caps in the lone-gen layout so they don't crowd out
-    the tools log, and get min-height:0 so a long section shrinks+scrolls (its own
-    overflow:auto) instead of overflowing the fixed-height card."""
-    assert ".gen:only-child ul.plan{max-height:300px;min-height:0}" in BOARD_PAGE
-    assert ".gen:only-child .thought{max-height:280px;min-height:0}" in BOARD_PAGE
+def test_long_text_clamps_to_a_fading_tail_not_a_scrollbox():
+    assert (
+        ".gen .tail{max-height:9.5em;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;"
+        in BOARD_PAGE
+    )
+    assert ".gen .tail.full{max-height:none;" in BOARD_PAGE
 
 
-def test_multi_gen_caps_are_raised_but_still_bounded():
-    """With several gens the per-section caps stay finite (so every gen is reachable by
-    scrolling the body) but are more generous than the old cramped values — thought
-    120→200, plan 140→250, tools 150→300."""
-    # thought's raised cap, pinned in context so it can't collide with .deliv's 120px cap
-    assert "color:var(--pl-color-fg-muted);\n    max-height:200px;overflow:auto}" in BOARD_PAGE
-    assert ".gen ul.plan{list-style:none;margin:0;padding:0;max-height:250px;overflow:auto}" in BOARD_PAGE
-    assert ".gen ul.tools{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}" in BOARD_PAGE
-    # the old cramped plan/tools caps are gone (both values are unique to those rules)
-    assert "max-height:140px" not in BOARD_PAGE  # old plan
-    assert "max-height:150px" not in BOARD_PAGE  # old tools
-    # and the old thought cap is gone — .deliv keeps its own 120px, so pin thought's context
-    assert "color:var(--pl-color-fg-muted);\n    max-height:120px;overflow:auto}" not in BOARD_PAGE
-
-
-def test_input_preview_stays_compact():
-    """The input preview is a peek at the current tool's args, not a log — it keeps its
-    short cap in both the multi-gen and lone-gen layouts (no :only-child override)."""
-    assert "max-height:48px;overflow:hidden;margin-top:2px}" in BOARD_PAGE
-    assert ".gen:only-child .inprev" not in BOARD_PAGE
+def test_current_tool_detail_clamps_to_two_lines_and_expands_in_place():
+    assert "-webkit-line-clamp:2" in BOARD_PAGE
+    assert ".gen .cur.full .inprev{display:block;-webkit-line-clamp:unset;white-space:pre-wrap}" in BOARD_PAGE
 
 
 def test_lone_gen_fill_does_not_touch_the_drawer_body_scroll_contract():
-    """The fill is driven off .gen:only-child height:100% — the .db body rule that owns
-    the flex-fill + own-scroll-chain (#218) is left exactly as it was, so the body still
-    scrolls (and contains its scroll) when the content overflows."""
+    """The drawer body still owns the (only) scroll and contains its scroll chain (#218)."""
     assert (
         "#drawer .db{padding:var(--pl-space-3) var(--pl-space-4);"
         "overflow:auto;flex:1;overscroll-behavior:contain}" in BOARD_PAGE
@@ -394,7 +377,8 @@ def test_saying_carries_raw_markdown_and_a_plain_text_fallback():
 def test_thinking_section_stays_plain_escaped_text_not_markdown():
     """thought_tail (internal reasoning) is NOT markdown-rendered — it keeps the plain
     .thought div and plain esc()'d text, with no md-saying hook."""
-    assert 'thinking</div><div class="thought">\'+esc(g.thought_tail)' in BOARD_PAGE
+    assert 'section(gen, "thinking", "Thinking", "", \'<div class="thought">\'+esc(g.thought_tail)' in BOARD_PAGE
+    assert "md-saying" not in BOARD_PAGE.split('section(gen, "thinking"', 1)[1].split("\n", 1)[0]
 
 
 def test_markdown_renderer_loads_lazily_from_cdn_with_a_fallback():
