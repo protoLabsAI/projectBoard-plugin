@@ -2035,8 +2035,20 @@ async def open_pr(
     repo without draft support refuses; the caller checks ``isDraft`` and says so)."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
-    _rc, out, _err = await _git(worktree, "rev-list", "--count", f"{base}..HEAD")
-    n = int(out.strip()) if out.strip().isdigit() else 0
+    # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
+    # same order ``create_worktree`` branches from and ``commits_ahead`` measures by. A bare
+    # ``<base>`` alone fails on a checkout with no local branch of that name (an epic base
+    # that exists only on the remote), and reading that git error as "0 commits" threw
+    # finished work away as NoChangesError. A base that resolves nowhere is infra, not an
+    # empty diff.
+    n: int | None = None
+    for ref in (f"origin/{base}", base):
+        rc, out, _err = await _git(worktree, "rev-list", "--count", f"{ref}..HEAD")
+        if rc == 0:
+            n = int(out.strip()) if out.strip().isdigit() else 0
+            break
+    if n is None:
+        raise WorktreeError(f"cannot count commits vs base: neither origin/{base} nor {base} resolves in {worktree}")
     if n == 0:
         raise NoChangesError("coder produced no commits vs base — nothing to PR")
 
