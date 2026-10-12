@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
+from .. import host_friction
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
@@ -593,8 +594,11 @@ class DriveMixin:
             return
         try:
             await self._recover()
-        except Exception:  # noqa: BLE001 — recovery must never stop the loop from starting
+        except Exception as exc:  # noqa: BLE001 — recovery must never stop the loop from starting
             log.exception("[project_board] crash recovery failed")
+            host_friction.record(
+                f"board loop crash recovery failed ({type(exc).__name__})", str(exc)[:500], severity="major"
+            )
         log.info("[project_board] recovery done — entering tick loop")
         while not self._stop.is_set() and not self._shutting_down:
             # Re-check at every tick boundary: a gap that opens mid-run (br removed,
@@ -670,8 +674,14 @@ class DriveMixin:
             return "stalled", None
         except BoardError as exc:
             log.warning("[project_board] loop tick: %s failed, the rest of the tick continues: %s", phase, exc)
-        except Exception:  # noqa: BLE001 — a bad phase must never kill the loop
+            host_friction.record(f"board loop phase failed on a board store error: {phase}", str(exc)[:500])
+        except Exception as exc:  # noqa: BLE001 — a bad phase must never kill the loop
             log.exception("[project_board] loop tick: %s failed, the rest of the tick continues", phase)
+            host_friction.record(
+                f"board loop phase crashed: {phase} ({type(exc).__name__})",
+                str(exc)[:500],
+                severity="major",
+            )
         finally:
             self._tick_phase_now = None
         return "failed", None
@@ -1013,7 +1023,7 @@ class DriveMixin:
                 try:
                     # category=terminal → the blocked sweep escalates to the operator
                     # (not a self-healing class), making the stall visible (r6).
-                    await asyncio.to_thread(store.flag_blocked, fid, evidence, category="terminal")
+                    await asyncio.to_thread(self._flag_blocked, store, fid, evidence, category="terminal")
                 except Exception:  # noqa: BLE001 — bookkeeping must never kill the tick
                     log.warning("[project_board] %s ready-queue livelock flag_blocked failed", fid, exc_info=True)
         # Any card tracked from a prior tick but NOT seen this tick left the ready queue
@@ -1540,7 +1550,7 @@ class DriveMixin:
             return
         log.warning("[project_board] %s %s blocked: %s", fid, kind, reason)
         try:
-            await asyncio.to_thread(store.flag_blocked, fid, reason)
+            await asyncio.to_thread(self._flag_blocked, store, fid, reason)
         except BR_FAILURES as exc:
             log.warning("[project_board] %s %s could not be blocked: %s", fid, kind, exc)
 
@@ -1715,6 +1725,9 @@ class DriveMixin:
                         wt=wt,
                         branch=branch,
                         pr_url=pr_url,
+                        # Not a raised drive failure, so _friction_drive_failure never sees
+                        # it: a misconfigured coder is machinery friction, recorded here.
+                        friction=True,
                     )
                     return
                 try:
@@ -2225,6 +2238,9 @@ class DriveMixin:
                         log.info("[project_board] %s dispatch ended by operator cancel: %s", fid, exc)
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
+                    # Into the host's friction ledger, whatever happens to the card next: a
+                    # drive's failure happens outside any agent turn, so nothing else records it.
+                    self._friction_drive_failure(fid, exc, feature, base=base, branch=branch)
                     if isinstance(exc, worktree.StrandedWorkError):
                         # Stranded work that could not be saved to a branch (#405). Not a
                         # failure of this build — it never started — so no retry, no tier
@@ -2737,6 +2753,12 @@ class DriveMixin:
                 self._inflight.pop(fid, None)
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
             log.exception("[project_board] %s unexpected failure", fid)
+            host_friction.record(
+                f"coder drive crashed with an unexpected {type(exc).__name__}",
+                f"card {fid}: {str(exc)[:500]}",
+                severity="major",
+                key=f"drive-crash|{type(exc).__name__}|{fid}",
+            )
             if await self._block_or_stand_aside(
                 store, fid, f"unexpected: {type(exc).__name__}: {exc}", repo=repo, wt=wt, branch=branch, pr_url=pr_url
             ):
@@ -2781,7 +2803,7 @@ class DriveMixin:
             timeouts,
             f"split task {task_id}" if task_id else "no split task filed",
         )
-        await asyncio.to_thread(store.flag_blocked, fid, reason, category=TOO_WIDE_CLASS)
+        await asyncio.to_thread(self._flag_blocked, store, fid, reason, category=TOO_WIDE_CLASS)
         release = getattr(store, "mark_ready", None)
         if task_id and str(task.get("board_state") or "backlog") == "backlog" and callable(release):
             try:
@@ -2861,8 +2883,62 @@ class DriveMixin:
         state = str((f or {}).get("board_state") or "")
         return "" if state in ("", "in_progress") else state
 
+    def _friction_drive_failure(
+        self, fid: str, exc: BaseException, feature: dict, *, base: str = "", branch=None
+    ) -> None:
+        """Record a failed drive in the host's friction ledger (``host_friction``), under a
+        summary that names the KIND of failure and never the card: a hung or disconnected
+        coder, a worktree gone under the drive, no commits vs base, stranded work, an
+        unwinnable oracle. Each card is let through once per window per kind. Never raises."""
+        try:
+            msg = str(exc)
+            low = msg.lower()
+            if isinstance(exc, worktree.WorktreeMissing):
+                summary, severity = "a drive's worktree went missing under it", "major"
+            elif isinstance(exc, worktree.StrandedWorkError):
+                summary, severity = "stranded work in a worktree could not be saved to a branch", "major"
+            elif isinstance(exc, coder_seam.OracleTimeout):
+                summary, severity = "coder.solve() acceptance oracle timed out", "minor"
+            elif isinstance(exc, worktree.CoderTimeout):
+                summary, severity = "coder drive timed out and was killed (hung or too slow)", "major"
+            elif isinstance(exc, worktree.NoChangesError):
+                summary, severity = "coder produced no commits vs base (nothing to open a PR from)", "minor"
+            elif msg.startswith("coder dispatch failed"):
+                severity = "major"
+                if any(
+                    w in low
+                    for w in ("disconnect", "connection", "closed", "eof", "reset by peer", "broken pipe", "incomplete")
+                ):
+                    summary = "coder dispatch lost its connection (ACP or model stream dropped)"
+                elif "returned nonetype" in low or "empty" in low or "no result" in low:
+                    summary = "coder dispatch returned no result"
+                else:
+                    rest = msg[len("coder dispatch failed") :].lstrip(": ")
+                    summary = (
+                        f"coder dispatch failed: {host_friction.stable_phrase(rest, drop=(fid, str(branch or '')))}"
+                    )
+            else:
+                summary = f"drive failed: {host_friction.stable_phrase(msg, drop=(fid, str(branch or '')))}"
+                severity = "minor"
+            project = self._project_name(feature or {})
+            detail = f"card {fid} (project {project}, base {base or '?'}, branch {branch or '?'}): {msg[:400]}"
+            host_friction.record(summary, detail, severity=severity, key=f"{summary}|{fid}")
+        except Exception:  # noqa: BLE001 — a side channel must never change the drive's outcome
+            log.debug("[project_board] %s drive-failure friction record failed", fid, exc_info=True)
+
     async def _block_or_stand_aside(
-        self, store, fid: str, reason: str, *, repo: str, wt, branch, pr_url=None, category: str = "", refusal=""
+        self,
+        store,
+        fid: str,
+        reason: str,
+        *,
+        repo: str,
+        wt,
+        branch,
+        pr_url=None,
+        category: str = "",
+        refusal="",
+        friction: bool = False,
     ) -> bool:
         """THE way a drive blocks its card (#398): block it for this drive's own failure —
         unless it is no longer the drive's card, in which case the failure is recorded as a
@@ -2885,7 +2961,10 @@ class DriveMixin:
             )
             return False
         kwargs = {"category": category} if category else {}
-        await asyncio.to_thread(store.flag_blocked, fid, reason, **kwargs)
+        # A raised drive failure is already in the friction ledger by kind
+        # (_friction_drive_failure); a caller blocking for a machinery cause of its own
+        # (a coder delegate that isn't configured) passes friction=True.
+        await asyncio.to_thread(self._flag_blocked, store, fid, reason, friction=friction, **kwargs)
         return True
 
     async def _stand_aside(self, store, fid: str, moved_to: str, *, repo: str, wt, branch, pr_url, why: str) -> None:

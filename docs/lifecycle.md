@@ -412,6 +412,16 @@ non-answer. Now:
 - A timed-out project is logged once, and shown as `preflight.slow` on `/status` and in the
   setup advisories. The fix is a cheap `preflight_cmd`.
 
+**The loop's failures are friction (protoAgent#4164).** A failure in the loop happens
+outside any agent turn, so the agent's own `record_friction` never sees it. On a core with
+`graph.sdk.record_friction` and the friction plugin on, the loop records its failures as
+`harness` friction (source `plugin:project_board`): a failed or hung drive (by kind), a
+block caused by its own machinery (not a gate or review outcome), a red preflight (once per distinct failure), a merged-state verify
+that can't get a dependency tree, a failed PR reconcile, and a crashed loop phase.
+Summaries carry no ids, so repeats group in `friction_review`; the card and output are in
+the detail. Each is recorded at most once an hour per card, with at most 10 per summary and 60 an
+hour in total; details are secret-scrubbed.
+
 **A preflight hold says what broke.** A red preflight holds the project's ready cards
 (`blocked:preflight-hold`). The hold used to stamp only the output's last line, which for a
 pnpm chain is `Exit status 1`, and the full output went only to the daemon log. Now:

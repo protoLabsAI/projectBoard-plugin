@@ -43,6 +43,7 @@ from project_board.loop.preflight import (
     _and_chain_steps,
     _failing_step,
     _informative_line,
+    _key_text,
     _mark_steps,
     _output_tail,
     _preflight_hold_comment,
@@ -648,3 +649,72 @@ def test_more_secret_shapes_are_redacted(line, secret):
 )
 def test_prose_that_mentions_a_token_is_left_readable(prose):
     assert _redact_gate_output(prose) == prose
+
+
+# ── re-review of #523: lowercase assignments, digits inside identifiers ───────────────
+
+_PW = "hunter2" + "hunter2"
+
+
+@pytest.mark.parametrize(
+    ("line", "secret"),
+    [
+        ("pass" + "word=" + "hunter2", "hunter2"),
+        ("db_pass" + "word: " + _PW, _PW),
+        ("tok" + "en: " + "abcdef0123456789abcd", "abcdef0123456789abcd"),
+        ("DB_PASS" + "WORD: " + "hunter2", "hunter2"),
+        ("connect(auth" + "_token='" + "xyz123', retry=1)", "xyz123"),
+        ("export API_" + "KEY=" + "abc123", "abc123"),
+        ("client_sec" + "ret = " + '"s3cr3t value"', "s3cr3t value"),
+    ],
+)
+def test_a_credential_assignment_is_redacted_in_any_case(line, secret):
+    out = _redact_gate_output(line)
+    assert secret not in out and "[REDACTED]" in out
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "TokenExpiredError: jwt expired",
+        "GITHUB_TOKEN: set it in .env",
+        "GITHUB_TOKEN: Bad credentials",
+        "assert token == 'abc'",
+        "password: must be at least 8 characters",
+        "KeyError: 'API_KEY'",
+        "tokenizer: bpe",
+        "author=Josh",
+    ],
+)
+def test_prose_and_lookalikes_stay_readable(prose):
+    assert _redact_gate_output(prose) == prose
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("FAILED tests/test_x.py::test_case[1] - assert 0", "FAILED tests/test_x.py::test_case[2] - assert 0"),
+        ("FAIL tests/test_v1.py", "FAIL tests/test_v2.py"),
+        (
+            "ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL packages/pkg1 build",
+            "ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL packages/pkg2 build",
+        ),
+        ("error: node v18 is required", "error: node v20 is required"),
+    ],
+)
+def test_digits_inside_an_identifier_make_a_different_failure(a, b):
+    assert _key_text(a) != _key_text(b)
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("Tests: 1 failed, 41 passed, 42 total", "Tests: 3 failed, 39 passed, 42 total"),
+        ("src/x.ts(12,7): error TS2322: bad", "src/x.ts(14,9): error TS2322: bad"),
+        ("FAIL src/a.test.ts (6.2 s)", "FAIL src/a.test.ts (9.13 s)"),
+        ("bundle is 512 kB over budget", "bundle is 530 kB over budget"),
+        ("listen EADDRINUSE: address already in use :::3000", "listen EADDRINUSE: address already in use :::3001"),
+    ],
+)
+def test_counts_positions_durations_and_sizes_do_not(a, b):
+    assert _key_text(a) == _key_text(b)

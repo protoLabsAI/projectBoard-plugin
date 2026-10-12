@@ -17,6 +17,7 @@ import shlex
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
+from .. import host_friction
 from ..projects import orphaned_cards
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
@@ -72,8 +73,10 @@ _KEY_NOISE = (
     re.compile(r"\b\d\d:\d\d:\d\d(?:\.\d+)?\b"),
     re.compile(r"\b0x[0-9a-fA-F]+\b"),
     re.compile(r"(?:/private)?/(?:tmp|var/folders|var/tmp)/\S*|\S*_logs/\S*"),
-    re.compile(r"\(?\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min)\b\)?"),
-    re.compile(r"\d+"),
+    re.compile(r"\(?\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min|[kKMG]i?B|bytes)\b\)?"),
+    # A STANDALONE number (a count, a line:col, a port, an exit code). Digits inside an
+    # identifier stay: `test_case[1]`, `test_v2.py`, `pkg1`, `v18` name a different thing.
+    re.compile(r"(?<![\w.\[])\d+(?:\.\d+)*(?![\w\]])"),
 )
 
 
@@ -126,6 +129,27 @@ _SECRET_PATTERNS = (
 )
 
 
+#: A lowercase or mixed-case assignment of a credential-named key (``password=hunter2``,
+#: ``db_password: hunter2hunter2``, ``token: abc…``). ``key=value`` always counts (``==``
+#: does not). ``key: value`` counts only when the value is quoted or is the last word on its
+#: line, so prose after a colon (``TokenExpiredError: jwt expired``, ``GITHUB_TOKEN: set it
+#: in .env``, ``password: must be at least 8 characters``) stays readable.
+_ASSIGN_NAME = r"(?=[A-Za-z_])[\w.-]*?(?:password|passwd|secret|token|api[_-]?key|auth(?:orization)?(?![a-z]))[\w.-]*"
+_ASSIGN_EQ_RE = re.compile(r"(?i)\b(" + _ASSIGN_NAME + r")(\s*(?<![=!<>])=(?!=)\s*)(\"[^\"]*\"|'[^']*'|[^\s\"',;]+)")
+_ASSIGN_COLON_RE = re.compile(
+    r"(?im)\b(" + _ASSIGN_NAME + r")(\s*:\s+)(\"[^\"]*\"|'[^']*'|[^\s\"',;]+)(?=\s*[,;}]?\s*$)"
+)
+#: Names that only LOOK like credentials: exception and type names, tokenizer settings.
+_NOT_A_SECRET_NAME_RE = re.compile(r"(?i)(?:error|exception|warning|kind|type|izer|count|length|policy|expired?)$")
+
+
+def _redact_assignment(m: re.Match) -> str:
+    name, sep, value = m.group(1), m.group(2), m.group(3)
+    if _NOT_A_SECRET_NAME_RE.search(name) or value.startswith("[REDACTED"):
+        return m.group(0)
+    return f"{name}{sep}[REDACTED]"
+
+
 def _redact_gate_output(text: str) -> str:
     """``text`` with credential shapes replaced by ``[REDACTED]``. The plugin's own
     patterns always run; the host's audit redactor (which also knows the values its
@@ -134,6 +158,8 @@ def _redact_gate_output(text: str) -> str:
     s = str(text or "")
     for pattern, repl in _SECRET_PATTERNS:
         s = pattern.sub(repl, s)
+    for pattern in (_ASSIGN_EQ_RE, _ASSIGN_COLON_RE):
+        s = pattern.sub(_redact_assignment, s)
     try:
         from graph.middleware.redaction import redact as host_redact
     except Exception:  # noqa: BLE001 — host-free, or an older host
@@ -568,6 +594,7 @@ class PreflightMixin:
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
                 self._preflight_failed_at.pop(name, None)
                 self._preflight_detail.pop(name, None)
+                self._preflight_friction.pop(name, None)
                 self._preflight_state[name] = True
                 if sha:
                     self._preflight_sha[name] = sha
@@ -592,6 +619,7 @@ class PreflightMixin:
             self._preflight_detail[name] = _preflight_failure_detail(
                 text, step=step, exit_code=proc.returncode, cmd=cmd
             )
+            self._friction_preflight_hold(name)
             if self._record_preflight_failure(name, text):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
@@ -614,12 +642,34 @@ class PreflightMixin:
                 reason += "\n" + _missing_gate_command_hint(name, cmd, "")
             reason = _redact_gate_output(reason)
             self._preflight_detail[name] = _preflight_failure_detail(reason, step=None, exit_code=None, cmd=cmd)
+            self._friction_preflight_hold(name)
             if self._record_preflight_failure(name, reason):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
                     name,
                     self._preflight_state[name],
                 )
+
+    def _friction_preflight_hold(self, name: str) -> None:
+        """Record project ``name``'s red preflight in the host's friction ledger, once per
+        DISTINCT failure (the same key the hold's card comment dedupes on), so a project
+        re-checked every minute while it stays red adds one entry, not one per check."""
+        detail = self._preflight_detail.get(name) or {}
+        key = f"preflight|{name}|{detail.get('key', '')}"
+        if self._preflight_friction.get(name) == key:
+            return
+        self._preflight_friction[name] = key
+        where = (
+            f"step {detail['step_index']}/{detail['steps']} `{detail['step']}`"
+            if detail.get("step")
+            else f"`{detail.get('cmd') or 'the gate'}`"
+        )
+        host_friction.record(
+            "gate preflight fails on clean base, so the project's cards are held",
+            f"project {name}: {where} failed (exit {detail.get('exit_code')}): {detail.get('headline', '')}"[:600],
+            severity="major",
+            key=key,
+        )
 
     def _preflight_superseded(self, name: str, run: int | None) -> bool:
         """Whether this run was replaced by a newer one for the same project (#467 review).
