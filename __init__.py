@@ -1654,6 +1654,7 @@ def _board_tools(cfg: dict):
         try:
             store = get_store(**_store_kw_for(props.get("project", "")))
             missing: list[str] = []
+            total: int | None = None  # a capped listing's match count (#522)
             if props.get("ids"):
                 feats = []
                 for fid in props["ids"][:MAX_IDS]:
@@ -1671,7 +1672,7 @@ def _board_tools(cfg: dict):
                 feats = store.list_features(state=st or None)
                 if props.get("project"):
                     feats = [f for f in feats if str(f.get("project") or "") == props["project"]]
-                feats, _total = scope_cards(feats, st)
+                feats, total = scope_cards(feats, st)
                 # A listing row carries no block reason (only `br show` reads comments) —
                 # fill it for the first few blocked cards so the summary says WHY.
                 for f in [f for f in feats if f.get("blocked") and not f.get("blocked_reason")][:5]:
@@ -1680,7 +1681,7 @@ def _board_tools(cfg: dict):
         except BoardError as exc:
             return f"Error: {exc}"
         annotate_next_action(feats, cfg)  # labels + config only, no network
-        return summary_text(props, feats, missing) + component_tail(props)
+        return summary_text(props, feats, missing, total) + component_tail(props)
 
     tools = [
         board_create_epic,

@@ -36,7 +36,9 @@ FRAME = "component/board-cards.html"
 # the host to read on its behalf. `*` is exactly one path segment. The host serves declared
 # PATHS only — a `?query` is refused — so the state rides in the path: `cards/<state>` for a
 # state query, bare `cards` (open work) otherwise, `features/<id>` for explicit ids. Project
-# filtering is the frame's. Every one is bounded independent of board size (see cards_payload).
+# filtering is the frame's. EVERY read is bounded independent of board size: a `cards` /
+# `cards/<state>` listing returns at most OPEN_CAP (open work) or DONE_CAP (done/cancelled)
+# rows plus a `total` (see scope_cards), and `features/<id>` is one card.
 READS = ["cards", "cards/*", "features/*", "status"]
 
 SETUP_GAP_KEY = "board_cards"
@@ -194,19 +196,31 @@ def component_tail(props: dict) -> str:
 
 # ── the card projection (GET /cards, GET /cards/<state>) ──
 
-# A finished card never leaves the board (archiving only hides it), so a `done` listing would
-# grow forever: it is capped to the most recently closed DONE_CAP, with `total` saying how
-# many there are. Open work is the bare `cards` read and excludes done/cancelled entirely.
+# No card listing may grow with the board: a finished card never leaves it (archiving only
+# hides it) and a backlog can hold thousands. So every listing is capped and says how many
+# matched (`total`): done/cancelled to the DONE_CAP most recently closed; open work (bare
+# `cards`) and every other state to the OPEN_CAP most urgent — priority first (P0 before
+# P4), then the most recently updated.
 DONE_CAP = 50
+OPEN_CAP = 100
 _TERMINAL = ("done", "cancelled")
+
+
+def _urgency_key(f: dict) -> tuple:
+    try:
+        pri = int(f.get("priority", 2))
+    except (TypeError, ValueError):
+        pri = 2
+    return (pri,)  # recency within a priority comes from the earlier stable sort (scope_cards)
 
 
 def scope_cards(feats: list[dict], state: str = "") -> tuple[list[dict], int]:
     """The rows one card query shows, and how many matched before any cap.
 
-    ``state`` given → only that board state (``done`` capped to the ``DONE_CAP`` most recently
-    closed); no state → OPEN work only (no done/cancelled). So no query's size depends on how
-    much history the board has accumulated."""
+    ``state`` given → only that board state; no state → OPEN work only (no done/cancelled).
+    Every result is capped: done/cancelled to the ``DONE_CAP`` most recently closed, anything
+    else to the ``OPEN_CAP`` most urgent (priority, then most recently updated). ``total`` is
+    the count before the cap, so no read's size depends on the board's."""
     if state:
         rows = [f for f in feats if f.get("board_state") == state]
     else:
@@ -214,6 +228,10 @@ def scope_cards(feats: list[dict], state: str = "") -> tuple[list[dict], int]:
     total = len(rows)
     if state in _TERMINAL:
         rows = sorted(rows, key=lambda f: str(f.get("closed_at") or ""), reverse=True)[:DONE_CAP]
+    else:
+        # Two stable sorts: most recently updated first, then priority on top of it.
+        rows = sorted(rows, key=lambda f: str(f.get("updated_at") or f.get("created_at") or ""), reverse=True)
+        rows = sorted(rows, key=_urgency_key)[:OPEN_CAP]
     return rows, total
 
 
@@ -285,9 +303,13 @@ def header_line(props: dict, feats: list[dict]) -> str:
     return " · ".join(parts)
 
 
-def summary_text(props: dict, feats: list[dict], missing: list[str] | None = None) -> str:
-    """The model-facing text: a header, then one line per card (≤ 20)."""
+def summary_text(props: dict, feats: list[dict], missing: list[str] | None = None, total: int | None = None) -> str:
+    """The model-facing text: a header, then one line per card (≤ 20). ``total`` is how many
+    matched before a listing cap; when more matched than are listed the header says so."""
     lines = [header_line(props, feats)]
+    shown = min(len(feats), MAX_IDS)
+    if total is not None and total > shown:
+        lines[0] += f" · showing {shown} of {total}"
     for f in feats[:MAX_IDS]:
         state = "blocked" if f.get("blocked") else f.get("board_state", "")
         line = f"- {f.get('id')} · {f.get('title', '')} — {STATE_LABEL.get(state, state)}"
@@ -299,7 +321,7 @@ def summary_text(props: dict, feats: list[dict], missing: list[str] | None = Non
         if f.get("pr_url"):
             line += f" {f['pr_url']}"
         lines.append(line)
-    if len(feats) > MAX_IDS:
+    if len(feats) > MAX_IDS and total is None:
         lines.append(f"… and {len(feats) - MAX_IDS} more")
     if not feats and not missing:
         lines.append("(no cards match)")

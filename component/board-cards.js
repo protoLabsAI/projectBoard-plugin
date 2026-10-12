@@ -130,7 +130,7 @@
 
   // Host refusals that pass on their own (#4143): out of view, the per-frame rate limit, a
   // cancelled or dropped request. Keep what we had and try again soon — never a banner.
-  var TRANSIENT_RE = /^(paused|read rate limited|too many reads in flight|read cancelled|read failed)/;
+  var TRANSIENT_RE = /^(paused|read rate limited|too many reads in flight|read cancelled|read timed out|read failed)/;
 
   /** Classify a readResult: ok / unknown (404) / transient / board error (the route's
    *  non-2xx detail) / refused (the host said no) / unsupported (never answered). */

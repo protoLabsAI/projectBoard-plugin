@@ -4801,6 +4801,8 @@ class BeadsBoard:
             "closed_at": bead.get("closed_at", ""),
             # creation order — the shared-file gate's suggested chain runs earliest first (#458).
             "created_at": bead.get("created_at", ""),
+            # last change — the in-chat board cards order a capped listing by it (#522).
+            "updated_at": bead.get("updated_at", ""),
             "spec": bead.get("description", ""),
             "acceptance_criteria": bead.get("acceptance_criteria", ""),
             "design": bead.get("design", ""),

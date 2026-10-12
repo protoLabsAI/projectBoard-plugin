@@ -370,9 +370,9 @@ test("send and openLink echo the nonce", () => {
 test("a read refused for its nonce is shown as a refusal, not retried as transient", async () => {
   const h = harness();
   h.ctl.onMessage({ type: "protoComponent:init", props: { state: "blocked" }, theme: {}, nonce: "n-1" });
-  await h.answerAll(() => ({ ok: false, status: 0, error: "nonce mismatch" }));
+  await h.answerAll(() => ({ ok: false, status: 0, error: "missing or invalid nonce" }));
   const vm = h.renders.at(-1);
-  assert.match(vm.banner.text, /refused this card read: nonce mismatch/);
+  assert.match(vm.banner.text, /refused this card read: missing or invalid nonce/);
   assert.ok(h.ctl.state().scheduled);
   const n = h.reads().length;
   await h.advance(3000);
@@ -383,8 +383,8 @@ test("a refused send resolves (the button re-enables) with the host's verdict", 
   const posts = [];
   const bridge = BC.createBridge((m) => posts.push(m), () => 0, () => "n-1");
   const p = bridge.send("Unblock board card bd-b1");
-  bridge.onMessage({ type: "protoComponent:bridgeResult", cid: posts[0].cid, ok: false, error: "nonce mismatch" });
+  bridge.onMessage({ type: "protoComponent:bridgeResult", cid: posts[0].cid, ok: false, error: "missing or invalid nonce" });
   const r = await p;
   assert.equal(r.ok, false);
-  assert.equal(r.error, "nonce mismatch");
+  assert.equal(r.error, "missing or invalid nonce");
 });

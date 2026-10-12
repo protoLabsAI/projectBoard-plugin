@@ -434,27 +434,33 @@ def test_the_skill_names_every_proposal_and_its_tool():
 
 
 def test_no_card_read_grows_with_board_history(monkeypatch):
-    """A synthetic 2,000-card board, 1,800 of them done (a real board's history only grows):
-    every read the frame can make stays well under the host's 256 KB component-read cap."""
+    """A synthetic board with 2,000 backlog, 500 ready and 1,800 done cards (history only
+    grows, and a backlog can be huge): EVERY read the frame can make is capped, carries the
+    pre-cap `total`, and stays well under the host's 256 KB component-read cap."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from project_board.api import build_data_router
 
-    states = ["backlog", "ready", "in_progress", "in_review", "blocked"]
-    feats = [
-        _feat(
-            f"bd-{i:04x}.{i % 7}",
-            "done" if i < 1800 else states[i % len(states)],
-            title=f"A realistic card title for slice {i} of the board-cards epic",
-            pr_url=f"https://github.com/protoLabsAI/protoAgent/pull/{4000 + i}",
-            next_action="awaiting-merge (auto_merge off)",
-            next_action_hint="auto_merge is off — merge #4123 or turn it on in Settings ▸ Project Board",
-            closed_at=f"2026-09-{1 + i % 28:02d}T00:00:{i % 60:02d}Z" if i < 1800 else "",
-            spec="x" * 2000,  # never sent — card_row drops it
-        )
-        for i in range(2000)
-    ]
+    layout = [("backlog", 2000), ("ready", 500), ("done", 1800)]
+    feats, i = [], 0
+    for state, n in layout:
+        for _ in range(n):
+            feats.append(
+                _feat(
+                    f"bd-{i:04x}.{i % 7}",
+                    state,
+                    title=f"A realistic card title for slice {i} of the board-cards epic",
+                    priority=i % 5,
+                    pr_url=f"https://github.com/protoLabsAI/protoAgent/pull/{4000 + i}",
+                    next_action="awaiting-merge (auto_merge off)",
+                    next_action_hint="auto_merge is off — merge #4123 or turn it on in Settings ▸ Project Board",
+                    updated_at=f"2026-10-{1 + i % 28:02d}T00:{i % 60:02d}:00Z",
+                    closed_at=f"2026-09-{1 + i % 28:02d}T00:00:{i % 60:02d}Z" if state == "done" else "",
+                    spec="x" * 2000,  # never sent — card_row drops it
+                )
+            )
+            i += 1
     s = _Store(feats)
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: s)
     monkeypatch.setattr("project_board.api.get_store", lambda **_kw: s, raising=False)
@@ -462,16 +468,39 @@ def test_no_card_read_grows_with_board_history(monkeypatch):
     app.include_router(build_data_router({}), prefix="/api/plugins/project_board")
     c = TestClient(app)
 
-    cap = 256 * 1024
-    sizes = {}
+    sizes, bodies = {}, {}
     for path in ["cards", *(f"cards/{st}" for st in bc.STATES)]:
         r = c.get(f"/api/plugins/project_board/{path}")
         assert r.status_code == 200, path
-        sizes[path] = len(r.content)
-    assert max(sizes.values()) < cap // 2, sizes
-    done = c.get("/api/plugins/project_board/cards/done").json()
-    assert len(done["features"]) == bc.DONE_CAP and done["total"] == 1800
-    # the most recently closed first
-    closed = [f["id"] for f in sorted(feats[:1800], key=lambda f: f["closed_at"], reverse=True)[: bc.DONE_CAP]]
-    assert [f["id"] for f in done["features"]] == closed
-    assert all(f["board_state"] != "done" for f in c.get("/api/plugins/project_board/cards").json()["features"])
+        sizes[path], bodies[path] = len(r.content), r.json()
+    assert max(sizes.values()) < 128 * 1024, sizes
+    expect = {
+        "cards": (bc.OPEN_CAP, 2500),
+        "cards/backlog": (bc.OPEN_CAP, 2000),
+        "cards/ready": (bc.OPEN_CAP, 500),
+        "cards/done": (bc.DONE_CAP, 1800),
+        "cards/in_progress": (0, 0),
+    }
+    for path, (n, total) in expect.items():
+        assert (len(bodies[path]["features"]), bodies[path]["total"]) == (n, total), path
+    # done: the most recently closed first
+    closed = sorted((f for f in feats if f["board_state"] == "done"), key=lambda f: f["closed_at"], reverse=True)
+    assert [f["id"] for f in bodies["cards/done"]["features"]] == [f["id"] for f in closed[: bc.DONE_CAP]]
+    # open work: priority first, then the most recently updated
+    shown = bodies["cards/backlog"]["features"]
+    by_id = {f["id"]: f for f in feats}
+    keys = [(by_id[r["id"]]["priority"], by_id[r["id"]]["updated_at"]) for r in shown]
+    assert all(k[0] == 0 for k in keys), "the cap keeps the highest-priority cards"
+    assert [k[1] for k in keys] == sorted((k[1] for k in keys), reverse=True)
+    assert all(r["board_state"] not in ("done", "cancelled") for r in bodies["cards"]["features"])
+
+
+def test_tool_summary_says_showing_n_of_total_when_capped(monkeypatch, emit):
+    s = _Store(
+        [_feat(f"bd-b{i}", "backlog", priority=2, updated_at=f"2026-10-01T00:{i % 60:02d}:00Z") for i in range(150)]
+    )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: s)
+    text, _ = _split(_tool().invoke({"state": "backlog"}))
+    first = text.splitlines()[0]
+    assert first.endswith("· showing 20 of 150"), first
+    assert "… and" not in text
