@@ -323,6 +323,7 @@ class DriveMixin:
                         self._last_preflight,
                         self._preflight_dirty,
                         self._preflight_failed_at,
+                        self._preflight_detail,
                         # #456/#459: the per-commit cache, the slow flag and the gate timing
                         # describe the OLD command, and so does an oracle verdict built on it.
                         self._preflight_sha,
@@ -1206,6 +1207,15 @@ class DriveMixin:
         record["held"] = held
         if not held:
             return  # genuinely nothing waiting — a bare empty queue is the honest answer
+        preflight = held.get(f"blocked:{PREFLIGHT_HOLD_CLASS}")
+        if preflight is not None:
+            # What each held project's gate printed (redacted): the step that failed and
+            # the output's tail, so the agent can say what broke without a shell.
+            failures = health.preflight_snapshot()["failures"]
+            names = {self._project_name(f) for f in feats if f.get("blocked_class") == PREFLIGHT_HOLD_CLASS}
+            shown = {n: failures[n] for n in sorted(names) if n in failures}
+            if shown:
+                preflight["preflight_failures"] = shown
         total = sum(group["count"] for group in held.values())
         if record["outcome"] == "empty-queue":
             record["outcome"] = "held"

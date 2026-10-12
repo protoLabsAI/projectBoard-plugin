@@ -456,6 +456,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 
 
 def _board_tools(cfg: dict):
+    from .failures import PREFLIGHT_HOLD_CLASS
     from .projects import default_project as resolve_default_project
     from .projects import rehome_hint, resolve_projects, store_db_path, unresolved_project
     from .store import (
@@ -801,6 +802,16 @@ def _board_tools(cfg: dict):
         except BoardError as exc:
             return f"Error: {exc}"
 
+    def _preflight_failure_field(f: dict) -> dict:
+        """``{"preflight_failure": …}`` for a card held by its project's gate preflight,
+        from what the loop last published; ``{}`` otherwise (or when nothing is published)."""
+        if not f.get("blocked") or f.get("blocked_class") != PREFLIGHT_HOLD_CLASS:
+            return {}
+        from . import health
+
+        detail = health.preflight_failure(str(f.get("project") or "").strip() or default_proj)
+        return {"preflight_failure": detail} if detail else {}
+
     @tool
     def board_get_feature(feature_id: str) -> str:
         """Read a single feature's FULL detail as JSON — `title`, `spec`,
@@ -819,7 +830,13 @@ def _board_tools(cfg: dict):
         loop's cache, no network; board_check_gates re-checks) and `next_action` (e.g.
         `waiting on publish: npm @x/y containing o/r@bd-a1 (card bd-a1 not merged yet (#5))`,
         `held: release freeze (…)`,
-        when something other than a coder is what moves the card). A TASK (#217) also carries `deliverable` (the recorded
+        when something other than a coder is what moves the card). A BLOCKED card carries
+        `blocked_reason` and `blocked_class`; one held by its project's gate preflight
+        (`blocked_class: preflight-hold`) also carries `preflight_failure` — `{cmd, step,
+        step_index, steps, exit_code, headline, tail}`: which step of the project's gate
+        failed on its clean base checkout, the line that says what broke, and the last 30
+        lines of output (secrets redacted). That is an environment fault, not the card's:
+        report it to the operator; the loop lifts the hold once the gate passes. A TASK (#217) also carries `deliverable` (the recorded
         deliverable text — "" until board_deliver records one), `delivered_by`, and
         `open_requirements` (the ids of ledger items no delivery has closed) — what
         board_verify judges; open items are for the verifier to weigh, nothing refuses
@@ -862,6 +879,15 @@ def _board_tools(cfg: dict):
                     if f.get("next_action")
                     else {}
                 ),
+                # Why it is blocked. A preflight hold also carries what the project's gate
+                # printed: the agent has no shell and can't read the daemon log, so this
+                # read (and the hold's card comment) is where it learns what broke.
+                **(
+                    {"blocked_reason": f.get("blocked_reason", ""), "blocked_class": f.get("blocked_class", "")}
+                    if f.get("blocked")
+                    else {}
+                ),
+                **_preflight_failure_field(f),
                 # A task's work product (#399). Without it this "FULL detail" read showed a
                 # delivered task with no deliverable at all, and the PM agent reading it
                 # concluded the delivery was empty and set about "repairing" a card whose
@@ -1530,7 +1556,9 @@ def _board_tools(cfg: dict):
         `blocked-dependencies-closed`, `ready-waiting-on-dependencies`,
         `backlog-waiting-on-dependencies`, `waiting-on-publish` (a ready card whose `waits_for`
         publish gates are not all met), `blocked:<class>` — to its count, first few ids,
-        and the step that moves it); `at-capacity` (all `max_concurrent` drive slots are full);
+        and the step that moves it; `blocked:preflight-hold` also carries
+        `preflight_failures`, per held project the failing gate step, the line that says
+        what broke and the output's last lines, secrets redacted); `at-capacity` (all `max_concurrent` drive slots are full);
         `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
         task-type card was claimed to in_progress awaiting async delivery, holding no
         slot); `all-candidates-held` (every ready card was blocked/held, deferred by the

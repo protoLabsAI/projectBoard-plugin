@@ -10,12 +10,342 @@ so tests that monkeypatch ``project_board.loop.<name>`` still take effect.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import re
+import shlex
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from ..projects import orphaned_cards
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
+
+
+# ── preflight failure diagnostics (designSystem 2026-10-11) ───────────────────────
+# A held card used to carry only the LAST line of the gate's output. For a pnpm chain
+# that line is `Exit status 1`: it names no step and no package, and the full tail went
+# only to the daemon log, which the agent cannot read. These helpers find the failing
+# step, the line that says what broke, and a bounded, secret-scrubbed tail that the
+# card comment, `/status` and the board tools can show.
+
+#: The marker the preflight prints before each step of a plain `a && b && c` gate.
+_STEP_MARKER = "[pb-preflight] step"
+_STEP_MARKER_RE = re.compile(r"^\[pb-preflight\] step (\d+)/(\d+)(?::.*)?$")
+#: How much of the output a hold comment and the tool surfaces carry.
+PREFLIGHT_TAIL_LINES = 30
+_TAIL_LINE_CHARS = 300
+_TAIL_TOTAL_CHARS = 4000
+#: Lines that end a failing run but say nothing about WHAT failed: shell and package-manager
+#: sign-offs, and npm's boilerplate. npm's log-path lines carry a timestamp that changes on
+#: every run, so as a headline they would make every re-check look like a new failure.
+_NOISE_LINE_RE = re.compile(
+    r"^(?:exit status \d+|…\(truncated\)…|(?:\S+ )?elifecycle\s+command failed(?: with exit code \d+)?\.?"
+    r"|command failed with exit code \d+\.?|error: command failed with exit code \d+\.?|\s*"
+    r"|npm (?:ERR!|error)\s*"
+    r"|npm (?:ERR!|error)\s+(?:code|errno|path|workspace|location|command|syscall|signal|exit status)\b.*"
+    r"|.*a complete log of this run can be found in.*"
+    r"|.*_logs/\S*-debug(?:-\d+)?\.log\s*"
+    r"|npm (?:ERR!|error)\s+(?:this is probably not a problem with npm|there is likely additional logging).*"
+    r")$",
+    re.I,
+)
+#: Lines that say what broke, most telling first: a pnpm/npm error that names the failing
+#: package or script, or the #3585 missing-command hint; then a missing module, a failed
+#: test or a compiler error; then any error-looking line.
+_ERROR_LINE_TIERS = (
+    re.compile(r"ERR_PNPM_\w+|npm (?:ERR!|error)\s|\bERR!|^gate command not found:"),
+    re.compile(
+        r"Cannot find module|Module not found|Can't resolve|^FAIL(?:ED)?\b|\berror TS\d+|^E\s{2,}\S"
+        r"|^\w*(?:Syntax|Type|Reference|Import|ModuleNotFound|Assertion)Error\b"
+    ),
+    re.compile(
+        r"\berror\b|Error:|MODULE_NOT_FOUND|\bnot found\b|No such file or directory|Traceback|\bfailed\b|ELIFECYCLE",
+        re.I,
+    ),
+)
+#: What varies between two runs of the same failure, taken out of a headline before it is
+#: hashed into the failure key: timestamps, durations, hex addresses, temp and npm-log paths,
+#: and any remaining number.
+_KEY_NOISE = (
+    re.compile(r"\d{4}-\d\d-\d\d[T _]\d\d[:_]\d\d(?:[:_]\d\d(?:[._]\d+)?)?Z?"),
+    re.compile(r"\b\d\d:\d\d:\d\d(?:\.\d+)?\b"),
+    re.compile(r"\b0x[0-9a-fA-F]+\b"),
+    re.compile(r"(?:/private)?/(?:tmp|var/folders|var/tmp)/\S*|\S*_logs/\S*"),
+    re.compile(r"\(?\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min)\b\)?"),
+    re.compile(r"\d+"),
+)
+
+
+def _key_text(line: str) -> str:
+    """``line`` with everything that differs between two runs of the same failure taken out."""
+    s = str(line or "")
+    for pattern in _KEY_NOISE:
+        s = pattern.sub("#", s)
+    return " ".join(s.split())
+
+
+#: Credential shapes scrubbed from gate output before it reaches a card, a tool or the
+#: friction ledger. A key name only counts in an assignment or key/value shape, so prose
+#: that merely mentions a token (`TokenExpiredError: jwt expired`) stays readable.
+_SECRET_NAME = r"[\w-]*(?:password|passwd|secret|token|api[_-]?key|authorization|private[_-]?key|access[_-]?key)[\w-]*"
+_SECRET_PATTERNS = (
+    (
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
+        "[REDACTED PRIVATE KEY]",
+    ),
+    (re.compile(r"(?i)(authorization\s*[\"']?\s*:\s*[\"']?\s*(?:bearer|basic|token)\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\"" + _SECRET_NAME + r"\"\s*:\s*\")[^\"]*(\")"), r"\1[REDACTED]\2"),
+    (re.compile(r"(?i)(_authToken\s*=\s*)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key|access-key)(?:\s+|=))(?!-)\S+"), r"\1[REDACTED]"),
+    # userinfo: the password runs to the LAST `@` before the host, so `p@ss@db` is covered.
+    (re.compile(r"(://[^/\s:@]+:)[^\s/]*@"), r"\1[REDACTED]@"),
+    (
+        re.compile(
+            r"\b((?=[A-Z])[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)"
+            r"(\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"\b((?=[A-Z])[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)"
+            r"(:\s*)[\"']?[A-Za-z0-9_\-./+=]{12,}[\"']?"
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+"), "[REDACTED]"),
+    (
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_\-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|gh[pousr]_[A-Za-z0-9]{30,}"
+            r"|github_pat_[A-Za-z0-9_]{30,}|glpat-[A-Za-z0-9_\-]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}"
+            r"|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{20,}|ya29\.[A-Za-z0-9_\-]+|npm_[A-Za-z0-9]{30,})"
+        ),
+        "[REDACTED]",
+    ),
+)
+
+
+def _redact_gate_output(text: str) -> str:
+    """``text`` with credential shapes replaced by ``[REDACTED]``. The plugin's own
+    patterns always run; the host's audit redactor (which also knows the values its
+    secrets manager handed out) runs too when this is loaded inside protoAgent. Never
+    raises: the host redactor is optional and a failure there keeps the local result."""
+    s = str(text or "")
+    for pattern, repl in _SECRET_PATTERNS:
+        s = pattern.sub(repl, s)
+    try:
+        from graph.middleware.redaction import redact as host_redact
+    except Exception:  # noqa: BLE001 — host-free, or an older host
+        return s
+    try:
+        out = host_redact(s)
+        return out if isinstance(out, str) else s
+    except Exception:  # noqa: BLE001 — a redactor that errors must not lose the diagnostics
+        return s
+
+
+def _and_chain_steps(cmd: str) -> list[str]:
+    """The steps of a plain ``a && b && c`` command, or ``[]`` when it is one step or
+    anything more than a plain ``&&`` chain (``;``, ``||``, a subshell, a group, a
+    substitution, a background ``&``, a heredoc, a newline). Quoted text is never split.
+    Only a plain chain is marked: there, printing a marker before each step changes
+    neither which steps run nor the exit status, so the gate means what it meant."""
+    if os.name == "nt" or not cmd:
+        return []  # cmd.exe quoting differs; the steps stay unmarked there
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\":
+            buf.append(cmd[i : i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if cmd.startswith("&&", i):
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if c == "&":
+            # Only a redirection (`2>&1`, `&>file`) is fine; a lone `&` backgrounds a step.
+            if (i > 0 and cmd[i - 1] == ">") or (i + 1 < n and cmd[i + 1] == ">"):
+                buf.append(c)
+                i += 1
+                continue
+            return []
+        if c in ";`(){}\n\r" or cmd.startswith(("||", "<<", "[[", "]]"), i):
+            return []  # `[[ a && b ]]` keeps its `&&` inside the test: never split there
+        buf.append(c)
+        i += 1
+    if quote:
+        return []
+    parts.append("".join(buf))
+    steps = [p.strip() for p in parts]
+    if len(steps) < 2 or any(not s for s in steps):
+        return []
+    return steps
+
+
+def _mark_steps(cmd: str) -> tuple[str, list[str]]:
+    """``(command to run, steps)``. A plain ``&&`` chain gets a ``printf`` marker before
+    each step, so the output says which step was running when the chain stopped. The
+    markers are ``&&``-joined like the steps, so a failing step still stops the chain
+    with its own exit status. Anything else runs unchanged with no steps."""
+    steps = _and_chain_steps(cmd)
+    if not steps:
+        return cmd, []
+    total = len(steps)
+    run = " && ".join(
+        f"printf '%s\\n' {shlex.quote(f'{_STEP_MARKER} {i}/{total}: {step}')} && {step}"
+        for i, step in enumerate(steps, 1)
+    )
+    return run, steps
+
+
+def _failing_step(output: str, steps: list[str]) -> tuple[int, int, str] | None:
+    """``(index, total, step)`` of the last step whose marker the output shows — the
+    step the chain stopped in — or None when the steps were not marked."""
+    if not steps:
+        return None
+    last = 0
+    for line in (output or "").splitlines():
+        m = _STEP_MARKER_RE.match(line.strip())
+        if m and int(m.group(2)) == len(steps):
+            last = int(m.group(1))
+    if not 1 <= last <= len(steps):
+        return None
+    return last, len(steps), steps[last - 1]
+
+
+def _strip_step_markers(output: str) -> str:
+    """``output`` without the preflight's own step markers."""
+    return "\n".join(l for l in (output or "").splitlines() if not _STEP_MARKER_RE.match(l.strip()))
+
+
+def _informative_line(text: str) -> str:
+    """The one line of a failed gate's output that says the most about what broke.
+
+    The last line is usually the shell's or pnpm's sign-off (``Exit status 1``,
+    ``ELIFECYCLE Command failed``), which names nothing. Search from the bottom for a
+    line that names the failing unit (a pnpm/npm error code, a missing module, the
+    #3585 "gate command not found" hint), then for any error line, then for the last
+    line that is not a sign-off. The last line itself is the final fallback."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return ""
+    if lines[-1].startswith("gate command not found:"):
+        return lines[-1]  # the #3585 hint names the command and the fix
+    for tier in _ERROR_LINE_TIERS:
+        for line in reversed(lines):
+            if tier.search(line) and not _NOISE_LINE_RE.match(line):
+                return line
+    for line in reversed(lines):
+        if not _NOISE_LINE_RE.match(line):
+            return line
+    return lines[-1]
+
+
+def _output_tail(text: str, lines: int = PREFLIGHT_TAIL_LINES) -> str:
+    """The last ``lines`` lines of ``text``, each cut at ``_TAIL_LINE_CHARS`` and the
+    whole held to ``_TAIL_TOTAL_CHARS`` (oldest lines go first)."""
+    rows = [l.rstrip() for l in (text or "").splitlines()]
+    while rows and not rows[-1]:
+        rows.pop()
+    rows = [r if len(r) <= _TAIL_LINE_CHARS else r[: _TAIL_LINE_CHARS - 1] + "…" for r in rows[-lines:]]
+    while rows and sum(len(r) + 1 for r in rows) > _TAIL_TOTAL_CHARS:
+        rows.pop(0)
+    return "\n".join(rows)
+
+
+def _preflight_failure_detail(text: str, *, step: tuple[int, int, str] | None, exit_code: int | None, cmd: str) -> dict:
+    """What a held card, ``/status`` and the board tools show about a failed preflight.
+    ``text`` is already redacted. ``key`` identifies the failure (its step and the line
+    that says what broke) so the hold comments once per DISTINCT failure, not on every
+    re-check whose output differs only in timings."""
+    headline = _informative_line(text)
+    detail = {
+        "cmd": _redact_gate_output(cmd),
+        "step": step[2] if step else "",
+        "step_index": step[0] if step else 0,
+        "steps": step[1] if step else 0,
+        "exit_code": exit_code,
+        "headline": headline,
+        "tail": _output_tail(text),
+    }
+    # The key is built from the headline with timings, timestamps, addresses and numbers
+    # taken out, so a re-check of the SAME failure keeps its key (one comment per card).
+    raw_key = f"{detail['step_index']}|{detail['step']}|{exit_code}|{_key_text(headline)}"
+    detail["key"] = hashlib.sha1(raw_key.encode("utf-8", "replace")).hexdigest()[:12]
+    return detail
+
+
+def _preflight_hold_line(detail: dict | None, reason: str) -> str:
+    """The short text after the hold prefix on the card's ``blocked_reason``: the failing
+    step when known, then the most telling line (not just the last one), cut to fit."""
+    headline = (detail or {}).get("headline") or _informative_line(reason) or "gate failed with no output"
+    headline = headline[:200]
+    step = (detail or {}).get("step") or ""
+    if not step:
+        return headline
+    if len(step) > 80:
+        step = step[:79] + "…"
+    return f"step {detail['step_index']}/{detail['steps']} `{step}` failed: {headline}"
+
+
+def _preflight_hold_comment(name: str, detail: dict) -> str:
+    """The card comment a preflight hold posts once per distinct failure: which step
+    failed, the exit status, and the output's last lines. It does NOT start with
+    ``blocked:``, so boot recovery (#186) still reads the hold's own reason as current."""
+    if detail.get("step"):
+        what = f"step {detail['step_index']}/{detail['steps']} `{detail['step']}` failed"
+    else:
+        what = f"`{detail.get('cmd') or 'the gate'}` failed"
+    if detail.get("exit_code") is not None:
+        what += f" (exit {detail['exit_code']})"
+    tail = detail.get("tail") or "(no output)"
+    return (
+        f"gate preflight output (project {name!r}): {what} on the clean base checkout.\n"
+        "This card is held because its project's gate can't run there, not because of the card. "
+        "Nothing on the card needs to change: fix the project's gate environment (or local_gate_cmd), "
+        "and the loop releases the hold once the gate passes.\n"
+        f"Last {PREFLIGHT_TAIL_LINES} lines of output (secrets redacted):\n"
+        f"```\n{tail}\n```\n"
+        f"{_COMMENT_KEY_PREFIX}{detail.get('key', '')}"
+    )
+
+
+#: The last line of a hold comment: the failure key it was posted for. A restarted loop reads
+#: it back off the card, so the same failure is not commented twice across a restart.
+_COMMENT_KEY_PREFIX = "preflight-failure-key: "
+_COMMENT_HEAD = "gate preflight output (project "
+
+
+def _last_hold_comment_key(comments) -> str:
+    """The failure key of the newest preflight hold comment in ``comments`` (str or dict
+    rows, oldest first), or ``""``."""
+    for c in reversed(list(comments or [])):
+        text = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
+        if text.startswith(_COMMENT_HEAD):
+            last = text.rstrip().rsplit("\n", 1)[-1]
+            return last[len(_COMMENT_KEY_PREFIX) :].strip() if last.startswith(_COMMENT_KEY_PREFIX) else ""
+    return ""
 
 
 class PreflightMixin:
@@ -144,6 +474,7 @@ class PreflightMixin:
             self._preflight_dirty,
             slow=self._preflight_slow,
             oracle=self._oracle_unwinnable,
+            failures=self._preflight_detail,
         )
 
     async def _preflight(
@@ -185,9 +516,12 @@ class PreflightMixin:
         is_gate = cmd == self._local_gate_cmd_for({"project": name})
         started = time.monotonic()
         log.info("[project_board] preflight[%s]: smoking the gate on clean base — %s", name, cmd)
+        # A plain `a && b && c` chain prints a marker before each step, so a red run says
+        # which step stopped it. The chain, and so the gate's verdict, is unchanged.
+        run_cmd, steps = _mark_steps(cmd)
         try:
             proc = await worktree.spawn_shell(
-                cmd,
+                run_cmd,
                 cwd=repo,
                 env=self._child_env(),
                 stdout=asyncio.subprocess.PIPE,
@@ -233,13 +567,17 @@ class PreflightMixin:
                 if isinstance(self._preflight_state.get(name), str):
                     log.info("[project_board] preflight[%s] RECOVERED — gate runnable again, releasing held work", name)
                 self._preflight_failed_at.pop(name, None)
+                self._preflight_detail.pop(name, None)
                 self._preflight_state[name] = True
                 if sha:
                     self._preflight_sha[name] = sha
                 self._preflight_slow.pop(name, None)  # it finished in time on this commit
                 await asyncio.to_thread(self._release_preflight_holds, name)
                 return
-            text = (out or b"").decode("utf-8", "replace").strip()
+            raw = (out or b"").decode("utf-8", "replace")
+            # The step is read off the FULL output, before truncation can cut its marker.
+            step = _failing_step(raw, steps)
+            text = _strip_step_markers(raw).strip()
             if len(text) > self.local_gate_output_chars:
                 text = "…(truncated)…\n" + text[-self.local_gate_output_chars :]
             text = text or f"gate exited {proc.returncode} with no output"
@@ -247,6 +585,13 @@ class PreflightMixin:
                 # The gate never ran (#3585). Say so on the LAST line — the one the hold
                 # stamps on each card — instead of leaving a bare shell error there.
                 text += "\n" + _missing_gate_command_hint(name, cmd, text)
+            if step:
+                text = f"failing step {step[0]}/{step[1]}: {step[2]}\n{text}"
+            # The reason reaches /status, the card and the board tools: no credentials.
+            text = _redact_gate_output(text)
+            self._preflight_detail[name] = _preflight_failure_detail(
+                text, step=step, exit_code=proc.returncode, cmd=cmd
+            )
             if self._record_preflight_failure(name, text):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — the gate does not pass on clean base; "
@@ -267,6 +612,8 @@ class PreflightMixin:
             # command when the checkout is there.
             if isinstance(exc, FileNotFoundError) and repo and os.path.isdir(repo):
                 reason += "\n" + _missing_gate_command_hint(name, cmd, "")
+            reason = _redact_gate_output(reason)
+            self._preflight_detail[name] = _preflight_failure_detail(reason, step=None, exit_code=None, cmd=cmd)
             if self._record_preflight_failure(name, reason):
                 log.error(
                     "[project_board] PREFLIGHT[%s] FAILED — %s; HOLDING that project's work until fixed.",
@@ -362,7 +709,14 @@ class PreflightMixin:
         """Flag every ready feature whose PROJECT's preflight failed blocked with that
         project's reason (#90), so the hold shows on the board instead of a silent stall.
         Features in projects whose gate CAN run are left alone — a broken gate in project
-        A never holds project B."""
+        A never holds project B.
+
+        The card's ``blocked_reason`` names the failing step and the most telling line of
+        the output, not just its last line (a pnpm chain ends in ``Exit status 1``). Each
+        held card also gets ONE comment per distinct failure with the step, the exit status
+        and the output's last lines, secret-scrubbed: the agent has no shell and cannot read
+        the daemon log, so the card is where it must be able to read what broke. A card
+        already held when the failure CHANGES gets the new output as another comment."""
         store = self._store()
         for f in store.list_features(state="ready"):
             fid = f["id"]
@@ -373,8 +727,8 @@ class PreflightMixin:
             held = self._preflight_held.setdefault(name, set())
             if fid in held or f.get("blocked"):
                 continue
-            tail = reason.splitlines()[-1][:200]
-            short = f"{PREFLIGHT_BLOCK_PREFIX} — the coder environment can't run the gate: {tail}"
+            line = _preflight_hold_line(self._preflight_failure_for(name, reason), reason)
+            short = f"{PREFLIGHT_BLOCK_PREFIX} — the coder environment can't run the gate: {line}"
             try:
                 # Its own class (#3585), not whatever `classify()` makes of the gate's
                 # tail — that fell through to `terminal`, "needs a human, never clears",
@@ -384,6 +738,59 @@ class PreflightMixin:
                 log.info("[project_board] preflight hold: flagged %s blocked (project %s gate not runnable)", fid, name)
             except Exception:  # noqa: BLE001 — a hold that can't be recorded must not kill the tick
                 log.warning("[project_board] preflight hold: flag_blocked failed for %s", fid, exc_info=True)
+        self._comment_preflight_holds(store)
+
+    def _preflight_failure_for(self, name: str, reason: str) -> dict:
+        """Project ``name``'s failure detail, built from ``reason`` when the run that set
+        it recorded none (a verdict set some other way, as tests and older code paths do)."""
+        detail = self._preflight_detail.get(name)
+        if not detail:
+            detail = self._preflight_detail[name] = _preflight_failure_detail(
+                _redact_gate_output(reason), step=None, exit_code=None, cmd=self._preflight_cmd_for({"project": name})
+            )
+        return detail
+
+    @staticmethod
+    def _card_has_hold_comment(store, fid: str, key: str) -> bool:
+        """Whether the card's newest hold comment was posted for failure ``key``. Read only
+        for a card this process has not commented yet, i.e. after a restart; a store
+        without comment reads, or a failed read, answers False (post the comment)."""
+        read = getattr(store, "feature_comments", None)
+        if read is None:
+            return False
+        try:
+            return _last_hold_comment_key(read(fid)) == key
+        except Exception:  # noqa: BLE001 — a failed read costs at most one repeated comment
+            return False
+
+    def _comment_preflight_holds(self, store) -> None:
+        """Post the output comment on every card this loop holds for a failed preflight,
+        once per distinct failure per card (``detail["key"]``: the step and the line that
+        says what broke, so a re-check whose output differs only in timings stays quiet).
+        Best-effort: a write that raises is retried next tick (``store.comment`` itself
+        logs and swallows a failed ``br`` write), and the hold stands either way."""
+        sent = self._preflight_commented
+        for name, held in self._preflight_held.items():
+            reason = self._preflight_state.get(name)
+            if not held or not isinstance(reason, str):
+                continue
+            detail = self._preflight_failure_for(name, reason)
+            body = ""
+            for fid in sorted(held):
+                if sent.get(fid) == detail["key"]:
+                    continue
+                if fid not in sent and self._card_has_hold_comment(store, fid, detail["key"]):
+                    sent[fid] = detail["key"]  # posted before a restart: don't repeat it
+                    continue
+                body = body or _preflight_hold_comment(name, detail)
+                try:
+                    store.comment(fid, body)
+                except Exception:  # noqa: BLE001 — the diagnostics comment is best-effort
+                    log.warning(
+                        "[project_board] preflight hold: could not comment the output on %s", fid, exc_info=True
+                    )
+                    continue
+                sent[fid] = detail["key"]
 
     def _release_preflight_holds(self, name: str) -> None:
         """Clear the blocks this loop placed for project ``name``'s failed preflight (only
@@ -400,6 +807,7 @@ class PreflightMixin:
                 store.clear_blocked(fid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] preflight release: clear_blocked failed for %s", fid, exc_info=True)
+            self._preflight_commented.pop(fid, None)  # a later failure gets its own comment
         self._preflight_held.pop(name, None)
 
     # ── base-checkout freshness (#452) ───────────────────────────────────────────

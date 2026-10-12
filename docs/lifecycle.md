@@ -412,6 +412,22 @@ non-answer. Now:
 - A timed-out project is logged once, and shown as `preflight.slow` on `/status` and in the
   setup advisories. The fix is a cheap `preflight_cmd`.
 
+**A preflight hold says what broke.** A red preflight holds the project's ready cards
+(`blocked:preflight-hold`). The hold used to stamp only the output's last line, which for a
+pnpm chain is `Exit status 1`, and the full output went only to the daemon log. Now:
+
+- For a plain `a && b && c` gate, the preflight prints a marker before each step, so the
+  output shows the step the chain stopped in. The chain and its exit status are unchanged.
+  Anything other than a plain `&&` chain (`;`, `||`, a subshell, a group) runs unmarked.
+- The card's `blocked_reason` names that step and the most telling line of the output, such
+  as pnpm's `ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL @scope/pkg typecheck: …`, not the sign-off.
+- Each held card gets one `gate preflight output` comment per distinct failure. It carries
+  the step, the exit status and the last 30 lines of output, with credentials redacted. A
+  re-check that fails the same way adds no comment; a different failure adds one.
+- The same detail is on `/status` as `preflight.failures`, on `board_get_feature` as
+  `preflight_failure`, and in `board_dispatch`'s `held["blocked:preflight-hold"]` as
+  `preflight_failures`.
+
 **The coder.solve() oracle (#459).** Each candidate passes only if its acceptance command
 exits 0 inside `coder_solve_test_timeout_s`. With no `coder_solve_test_cmd` the command
 falls back to the gate, and a gate slower than that budget fails every candidate. bd-7aun
