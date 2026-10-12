@@ -14,6 +14,7 @@ import sys
 
 from .. import external_review, merge_state_hold, review_coverage_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
+from .. import host_friction
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
@@ -1195,7 +1196,7 @@ class ReconcileMixin:
                         log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                 elif state == "CLOSED":
                     await asyncio.to_thread(
-                        store.flag_blocked, fid, f"PR closed without merging — needs triage: {pr_url}"
+                        self._flag_blocked, store, fid, f"PR closed without merging — needs triage: {pr_url}"
                     )
                     await worktree.reap_feature_worktree(repo, self.root, fid)
                     self._ci_feedback.pop(fid, None)
@@ -1302,8 +1303,10 @@ class ReconcileMixin:
                         await self._maybe_auto_merge(store, fid, pr_url, repo, view=view)
             except store_mod.BoardTimeout:
                 raise  # a stalled store, not this PR's failure: stop the pass (#404)
-            except Exception:  # noqa: BLE001 — a reconcile error must never kill the loop
+            except Exception as exc:  # noqa: BLE001 — a reconcile error must never kill the loop
                 log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
+                summary = f"PR reconcile failed with {type(exc).__name__}"
+                host_friction.record(summary, f"card {fid} ({pr_url}): {str(exc)[:400]}", key=f"{summary}|{fid}")
 
     async def _auto_merge_blockers(self, store, feature: dict, pr_url: str, repo: str) -> list[str]:
         """Why this in_review PR must NOT be auto-merged right now — empty means every
@@ -1727,7 +1730,8 @@ class ReconcileMixin:
         n = await self._budget_get(store, fid, "rebase", feature)
         if n >= self.rebase_fix_max:
             await asyncio.to_thread(
-                store.flag_blocked,
+                self._flag_blocked,
+                store,
                 fid,
                 f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}",
             )
@@ -1936,6 +1940,12 @@ class ReconcileMixin:
                 "fresh worktree. Recorded as a no-verdict run; the board retries when base moves again."
             )
             log.warning("[project_board] %s %s (%s)", fid, note, pr_url)
+            host_friction.record(
+                "merged-state verify could not get a working dependency tree",
+                f"card {fid} ({pr_url}), {streak}x in a row against {base}@{short}: {infra[:400]}",
+                severity="major",
+                key=f"merged-verify-infra|{fid}",
+            )
             try:
                 await asyncio.to_thread(store.comment, fid, note)
             except Exception:  # noqa: BLE001 — the audit trail is best-effort
@@ -1990,7 +2000,8 @@ class ReconcileMixin:
             return True  # the card left review while the gate ran — nothing further this pass
         await self._budget_set(store, fid, "merged-verify", n + 1)
         await asyncio.to_thread(
-            store.flag_blocked,
+            self._flag_blocked,
+            store,
             fid,
             f"gate FAILED on the merged state (branch + {base}@{short}) — the PR merges clean "
             f"but the RESULT is broken; needs triage: {pr_url}\n{failure}",
@@ -2112,7 +2123,7 @@ class ReconcileMixin:
         self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
 
         async def _block(reason: str):
-            await asyncio.to_thread(store.flag_blocked, fid, reason)
+            await asyncio.to_thread(self._flag_blocked, store, fid, reason)
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             await self._budget_reset(store, fid, "ci-fix")
@@ -2814,7 +2825,8 @@ class ReconcileMixin:
             await asyncio.to_thread(lambda: store.record_review_bounce(fid, rendered, head=head))
             if n >= self.review_fix_max:
                 await asyncio.to_thread(
-                    store.flag_blocked,
+                    self._flag_blocked,
+                    store,
                     fid,
                     f"external review FAILED at head {short} ({signals}) after {n} review fix round(s) — "
                     f"needs human review: {pr_url}",
@@ -3010,7 +3022,8 @@ class ReconcileMixin:
                 # it here left an unblocked feature indistinguishable from a clean
                 # review, so its PR could merge un-reviewed.
                 await asyncio.to_thread(
-                    store.flag_blocked,
+                    self._flag_blocked,
+                    store,
                     fid,
                     f"review gate could not complete after {n} attempt(s) — {reason} — "
                     f"needs operator attention: {pr_url}",
@@ -3140,7 +3153,8 @@ class ReconcileMixin:
             # an operator unblock can't leave a dead-head marker for the reconcile (#328).
             await self._stamp_reviewed_head(store, fid, "")
             await asyncio.to_thread(
-                store.flag_blocked,
+                self._flag_blocked,
+                store,
                 fid,
                 f"review findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
             )

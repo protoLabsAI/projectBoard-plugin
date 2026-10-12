@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 
-from .. import review_coverage_hold
+from .. import host_friction, review_coverage_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .drive import DriveMixin
 from .preflight import PreflightMixin
@@ -328,6 +328,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # failure). See loop/preflight.py.
         self._preflight_detail: dict[str, dict] = {}
         self._preflight_commented: dict[str, str] = {}
+        # The failure key each held project was last recorded in the host's friction
+        # ledger with (once per distinct failure, like the card comment).
+        self._preflight_friction: dict[str, str] = {}
         # The working-state snapshot's refresher (#401): its task, when it last read, how many
         # reads in a row failed (its backoff), and whether a read is in flight (one at a time).
         # -inf, not 0.0: time.monotonic() starts near zero in a fresh container, and the first
@@ -600,6 +603,25 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
 
     def _store(self):
         return _loop.get_store(**self._store_kw)
+
+    def _flag_blocked(self, store, fid: str, reason: str, category: str = ""):
+        """``store.flag_blocked`` for the loop's own blocks, plus one host friction record
+        when the block is TERMINAL (a human must act). The loop's terminal blocks happen
+        outside any agent turn, so without this the agent's friction review never sees
+        them. A block a human sets (the tool, the API) does not come through here. The
+        call shape is ``store.flag_blocked``'s own: ``category`` is passed only when given."""
+        kwargs = {"category": category} if category else {}
+        out = store.flag_blocked(fid, reason, **kwargs)
+        cls = (str(category or "").strip() or classify(reason).category).lower().replace("_", "-")
+        if cls == "terminal":
+            summary = f"board loop terminal-blocked a card: {host_friction.stable_phrase(reason, drop=(fid,))}"
+            host_friction.record(
+                summary,
+                f"card {fid}: {reason[:500]}",
+                severity="major",
+                key=f"{summary}|{fid}",
+            )
+        return out
 
     # ── persisted fix budgets (#259): bead labels are truth, the dicts are caches ─
     def _budget_cache(self, kind: str) -> dict[str, int]:
