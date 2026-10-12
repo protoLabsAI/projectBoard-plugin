@@ -478,6 +478,7 @@ _MINIMAL_ARGS = {
 _NO_STORE_ARGS = {
     "board_dispatch": {},
     "board_salvage_feature": {"feature_id": "bd-1"},
+    "board_show_cards": {"ids": ["bd-1"]},
     "board_register_project": {"name": "x", "repo": "/nope"},
 }
 

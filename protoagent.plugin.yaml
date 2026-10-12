@@ -358,6 +358,13 @@ settings:
 views:
   - { id: board, label: "Board", icon: LayoutGrid, path: /plugins/project_board/board }
 
+# Board cards in chat (#522, ADR 0118 D5): the `board-cards` component renders in a
+# plugin-served page the console frames on an OPAQUE origin with no bearer, so the page
+# must be auth-exempt. It carries no board data — the cards arrive through the host's
+# mediated reads of the GATED /api/plugins/project_board routes (protoAgent#4143).
+public_paths:
+  - /plugins/project_board/component/
+
 # Declarative only (transparency in the console).
 capabilities:
   network: ["*"]            # br (beads) + gh pr create + delegate_to(reviewer) over A2A

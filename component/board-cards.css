@@ -1,0 +1,18 @@
+/* Board cards in chat (#522). DS classes (pl-card, pl-badge--*, pl-callout--warning,
+   pl-btn) carry the look; this sheet only lays them out, with --pl-* tokens throughout
+   so the frame follows the operator's theme. No hex values. */
+html, body { margin: 0; background: transparent; color: var(--pl-color-fg); font-family: var(--pl-font-sans); font-size: var(--pl-font-size-sm); }
+.bc { display: flex; flex-direction: column; gap: var(--pl-space-2); padding: var(--pl-space-1) 0; }
+.bc-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--pl-space-3); flex-wrap: wrap; }
+.bc-title { font-weight: var(--pl-font-weight-semibold); }
+.bc-note, .bc-muted { color: var(--pl-color-fg-muted); font-size: var(--pl-font-size-xs); }
+.bc-card { display: flex; flex-direction: column; gap: var(--pl-space-1); padding: var(--pl-space-2) var(--pl-space-3); }
+.bc-row { display: flex; align-items: center; gap: var(--pl-space-2); flex-wrap: wrap; min-width: 0; }
+.bc-id { font-family: var(--pl-font-mono); font-size: var(--pl-font-size-xs); color: var(--pl-color-fg-muted); }
+.bc-name { flex: 1 1 12rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: var(--pl-font-weight-medium); }
+.bc-next { color: var(--pl-color-fg-muted); }
+.bc-why { margin: 0; }
+.bc-foot { display: flex; align-items: center; gap: var(--pl-space-2); flex-wrap: wrap; }
+.bc-foot .pl-btn:first-of-type { margin-left: auto; }
+.bc-empty { color: var(--pl-color-fg-muted); padding: var(--pl-space-2) 0; }
+.bc-banner { margin: 0; }

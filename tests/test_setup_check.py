@@ -802,6 +802,11 @@ class _RegistryWithSeam(_Registry):
     def report_setup_gap(self, key, message):
         self.gaps.append((key, message))
 
+    # A current host (protoAgent#4143): the board-cards component registers, so its own
+    # `board_cards` gap (an older core's) stays out of these preflight assertions.
+    def register_component(self, name, validator, frame=None, reads=None):
+        pass
+
 
 def _pin_probes(monkeypatch, *, which, delegates):
     """Pin the preflight's live probes for register()/route tests (which otherwise

@@ -2,3 +2,5 @@
 # under view/. They are NOT .py files, so an sdist would drop them without this
 # include — keep both sandboxed pages renderable from an installed plugin.
 recursive-include view *.html *.css *.js
+
+recursive-include component *.html *.css *.js

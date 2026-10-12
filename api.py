@@ -223,6 +223,16 @@ def build_router(cfg: dict):
     async def _board():
         return HTMLResponse(BOARD_PAGE)
 
+    # ── board cards in chat (#522) — the `board-cards` frame component's page. PUBLIC
+    # (manifest `public_paths: /plugins/project_board/component/`): the console frames it
+    # in an opaque-origin sandbox that carries no bearer. It holds no board data — the
+    # cards arrive through the host-mediated read channel (protoAgent#4143).
+    @router.get("/component/board-cards.html", response_class=HTMLResponse)
+    async def _board_cards_component():
+        from .board_cards import CARDS_PAGE
+
+        return HTMLResponse(CARDS_PAGE)
+
     @router.get("/config/projects", response_class=HTMLResponse)
     async def _projects_config():
         """Public page chrome for the sandboxed Configure tab.
@@ -631,6 +641,44 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             return {"features": annotate_next_action(feats, cfg or {})}
 
         return await _guard(_list)
+
+    @router.get("/cards")
+    async def _cards():
+        """OPEN work as slim CARD rows (#522) — what the in-chat `board-cards` frame reads
+        through the console's mediated read channel (protoAgent#4143) for a query with no
+        state. No done/cancelled cards, so the payload tracks live work, not history. Each
+        row is ``board_cards.card_row`` (id, title, state, blocked, next_action, PR …) — no
+        spec/criteria/design. Query-free on purpose: the host serves declared read PATHS
+        only (a `?` is refused), so the frame filters by project itself."""
+        from .board_cards import cards_payload
+
+        return await _guard(lambda: cards_payload(annotate_next_action(store().list_features(), cfg or {})))
+
+    async def _scoped_cards(state: str, project: str = ""):
+        from .board_cards import STATES, cards_payload
+
+        if state != "open" and state not in STATES and state != "cancelled":
+            raise HTTPException(404, f"unknown board state {state!r}")
+        st = "" if state == "open" else state
+        return await _guard(
+            lambda: cards_payload(annotate_next_action(store().list_features(state=st or None), cfg or {}), st, project)
+        )
+
+    @router.get("/cards/{state}")
+    async def _cards_in_state(state: str):
+        """One board state's cards as slim rows (#522) — the frame's read for a state query
+        (``open`` = open work, the same as bare ``/cards``). ``done``/``cancelled`` are capped
+        to the most recently closed ``DONE_CAP``, any other state to the ``OPEN_CAP`` most
+        urgent; ``total`` says how many matched. 404 for anything that isn't a board state."""
+        return await _scoped_cards(state)
+
+    @router.get("/cards/{state}/{project}")
+    async def _cards_in_state_for_project(state: str, project: str):
+        """Like ``/cards/{state}``, for one project of a multi-project board (#522): the
+        project filter runs BEFORE the cap, so the cards shown are that project's most urgent
+        (or most recently closed) and ``total`` counts only that project's. ``open`` as the
+        state = the project's open work."""
+        return await _scoped_cards(state, project)
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):

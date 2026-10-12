@@ -104,6 +104,16 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — loop is best-effort; the API still serves
         log.exception("[project_board] registering loop surface failed")
 
+    # Board cards in chat (#522): the `board-cards` frame component board_show_cards emits.
+    # Feature-detected — a host without `register_component(..., reads=)` (protoAgent#4143)
+    # gets one setup gap and the tool answers in text only.
+    try:
+        from .board_cards import register_component as _register_board_cards
+
+        _register_board_cards(registry)
+    except Exception:  # noqa: BLE001 — chat cards are best-effort; the board runs without them
+        log.exception("[project_board] registering the board-cards component failed")
+
     # A few board tools so the agent (or A2A) can drive the board headlessly.
     for t in _board_tools(cfg):
         registry.register_tool(t)
@@ -1612,6 +1622,69 @@ def _board_tools(cfg: dict):
         except Exception as exc:  # noqa: BLE001 — never raise into the agent loop (mirror the store verbs)
             return f"Error: {type(exc).__name__}: {exc}"
 
+    @tool
+    def board_show_cards(ids: list[str] = [], state: str = "", project: str = "", title: str = "") -> str:
+        """Answer a status check-in with live board cards INLINE in the chat — "what's
+        blocked?", "how's the epic?", "status?", "where are we?" — instead of paragraphs.
+        Each card shows its current state, `next_action`, block reason, PR link and action
+        buttons, and re-reads itself every ~15s, so the answer stays current.
+
+        AFTER CALLING IT, WRITE AT MOST 2 LINES OF PROSE: only what the cards can't say
+        (the one thing that needs the operator, or your call). Never restate the cards as
+        bullets — the operator is looking at them.
+
+        "How's the board?" / "status?" / "check in" → call it with NO arguments: every open
+        card (all states but done), most urgent first. Otherwise pass `ids` (≤ 20 card ids,
+        e.g. an epic's cards) to show exactly those, OR a `state` (backlog/ready/in_progress/
+        in_review/blocked/done) and/or `project` for a live query (no state = open work; done
+        shows the most recent). `title` (≤ 80 chars) labels the
+        header ("Epic #4076"). Returns a short text summary (header + one line per card) for
+        you and text-only clients — read it, don't paste it back.
+
+        Do NOT call it for your own reasoning — board_list / board_get_feature are the
+        reads for that; this is for SHOWING the operator. Each card button proposes an
+        exact message the operator confirms (`Unblock board card bd-…`, `Why is board card
+        bd-… blocked?`, `Ask Vera to re-review board card bd-…`, `Merge board card bd-…`,
+        `Show the live coder run for board card bd-…`, `Dispatch board card bd-…`) — act
+        on it with the matching board_* tool (see the showing-board-cards skill)."""
+        from .board_cards import MAX_IDS, build_props, component_tail, summary_text, validate_props
+
+        props = build_props(ids, state=state, project=_strip_wrapping_quotes(project), title=title)
+        why = validate_props(props)
+        if why is not None:
+            return f"Error: {why}"
+        try:
+            store = get_store(**_store_kw_for(props.get("project", "")))
+            missing: list[str] = []
+            total: int | None = None  # a capped listing's match count (#522)
+            if props.get("ids"):
+                feats = []
+                for fid in props["ids"][:MAX_IDS]:
+                    f = store.get_feature(fid)
+                    if f is None:
+                        missing.append(fid)
+                    else:
+                        feats.append(f)
+            else:
+                # The same scope the cards read (board_cards.scope_cards): a state's cards
+                # (done capped to the most recent), or open work for a project-only query.
+                from .board_cards import scope_cards
+
+                st = props.get("state", "")
+                feats = store.list_features(state=st or None)
+                if props.get("project"):
+                    feats = [f for f in feats if str(f.get("project") or "") == props["project"]]
+                feats, total = scope_cards(feats, st)
+                # A listing row carries no block reason (only `br show` reads comments) —
+                # fill it for the first few blocked cards so the summary says WHY.
+                for f in [f for f in feats if f.get("blocked") and not f.get("blocked_reason")][:5]:
+                    full = store.get_feature(f["id"]) or {}
+                    f["blocked_reason"] = full.get("blocked_reason", "")
+        except BoardError as exc:
+            return f"Error: {exc}"
+        annotate_next_action(feats, cfg)  # labels + config only, no network
+        return summary_text(props, feats, missing, total) + component_tail(props)
+
     tools = [
         board_create_epic,
         board_create_feature,
@@ -1637,6 +1710,7 @@ def _board_tools(cfg: dict):
         board_check_gates,
         board_dispatch,
         board_salvage_feature,
+        board_show_cards,
     ]
 
     # Runtime project registration (#167). Appended rather than folded in above because

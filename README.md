@@ -794,12 +794,13 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `setup_check.py` | the setup preflight (`br`/`gh`/coder/repo) + the host gap reporter — can the board run at all? |
 | `br_fetch.py` | `br` fetched on first run: the pinned beads-rust release + sha256 table, the off-loop once-per-process fetch, `BR_BIN` > fetched > PATH resolution |
 | `board_view.py` | the Kanban/list console view |
+| `board_cards.py` + `component/` | board cards in chat (#522): the `board-cards` frame component, its validator and page |
 | `gates.py` | publish gates (`waits_for`): spec grammar, a stdlib node-semver range matcher, the npm / `gh` evaluators, the shared per-spec cache |
 | `release_freeze.py` | the auto-merge edge's release-freeze guard: per-project patterns, the per-repo check, the per-card holds |
 | `external_review.py` | an external QA panel's verdict on a PR (#473): its config, the FAIL-at-head judge over one `gh pr view` read, and the findings a fix round leads with |
 | `review_coverage_hold.py` | `require_complete_review`: the per-card hold while the panel's pass at the head is incomplete, and the once-per-head `@vera review` summon |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
-| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain` and `loop-retro` skills |
+| `subagents.py` + `skills/` | the `decompose`/`antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain`, `loop-retro` and `showing-board-cards` skills |
 | `__init__.py` | `register()` — wires it all |
 
 Ships **disabled**; nothing runs until you enable it, declare a coder delegate and name
