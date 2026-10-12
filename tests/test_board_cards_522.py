@@ -164,7 +164,7 @@ def test_registers_the_frame_kind_with_its_reads():
     assert bc.register_component(host) is True
     assert bc.EMIT is True
     assert host.calls == [
-        ("board-cards", bc.validate_props, "component/board-cards.html", ["cards", "features/*", "status"])
+        ("board-cards", bc.validate_props, "component/board-cards.html", ["cards", "cards/*", "features/*", "status"])
     ]
     assert host.gaps == []
 
@@ -378,9 +378,14 @@ def test_the_frame_page_and_its_reads_are_served(monkeypatch, store):
     # Every declared read is a served JSON GET under the plugin prefix (the frame reads these).
     slim = c.get("/api/plugins/project_board/cards")
     assert slim.status_code == 200 and slim.headers["content-type"].startswith("application/json")
-    rows = slim.json()["features"]
-    assert [r["id"] for r in rows] == ["bd-1", "bd-2", "bd-3", "bd-4"]
-    assert all("spec" not in r and "design" not in r for r in rows)
+    body = slim.json()
+    assert [r["id"] for r in body["features"]] == ["bd-1", "bd-2", "bd-3"], "open work only — no done"
+    assert body["total"] == 3
+    assert all("spec" not in r and "design" not in r for r in body["features"])
+    blocked = c.get("/api/plugins/project_board/cards/blocked").json()
+    assert [r["id"] for r in blocked["features"]] == ["bd-2"]
+    assert [r["id"] for r in c.get("/api/plugins/project_board/cards/done").json()["features"]] == ["bd-4"]
+    assert c.get("/api/plugins/project_board/cards/held").status_code == 404
 
     one = c.get("/api/plugins/project_board/features/bd-1")
     assert one.status_code == 200 and one.json()["id"] == "bd-1"
@@ -426,3 +431,47 @@ def test_the_skill_names_every_proposal_and_its_tool():
     ):
         assert phrase in text, phrase
     assert "When NOT to use it" in text
+
+
+def test_no_card_read_grows_with_board_history(monkeypatch):
+    """A synthetic 2,000-card board, 1,800 of them done (a real board's history only grows):
+    every read the frame can make stays well under the host's 256 KB component-read cap."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from project_board.api import build_data_router
+
+    states = ["backlog", "ready", "in_progress", "in_review", "blocked"]
+    feats = [
+        _feat(
+            f"bd-{i:04x}.{i % 7}",
+            "done" if i < 1800 else states[i % len(states)],
+            title=f"A realistic card title for slice {i} of the board-cards epic",
+            pr_url=f"https://github.com/protoLabsAI/protoAgent/pull/{4000 + i}",
+            next_action="awaiting-merge (auto_merge off)",
+            next_action_hint="auto_merge is off — merge #4123 or turn it on in Settings ▸ Project Board",
+            closed_at=f"2026-09-{1 + i % 28:02d}T00:00:{i % 60:02d}Z" if i < 1800 else "",
+            spec="x" * 2000,  # never sent — card_row drops it
+        )
+        for i in range(2000)
+    ]
+    s = _Store(feats)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: s)
+    monkeypatch.setattr("project_board.api.get_store", lambda **_kw: s, raising=False)
+    app = FastAPI()
+    app.include_router(build_data_router({}), prefix="/api/plugins/project_board")
+    c = TestClient(app)
+
+    cap = 256 * 1024
+    sizes = {}
+    for path in ["cards", *(f"cards/{st}" for st in bc.STATES)]:
+        r = c.get(f"/api/plugins/project_board/{path}")
+        assert r.status_code == 200, path
+        sizes[path] = len(r.content)
+    assert max(sizes.values()) < cap // 2, sizes
+    done = c.get("/api/plugins/project_board/cards/done").json()
+    assert len(done["features"]) == bc.DONE_CAP and done["total"] == 1800
+    # the most recently closed first
+    closed = [f["id"] for f in sorted(feats[:1800], key=lambda f: f["closed_at"], reverse=True)[: bc.DONE_CAP]]
+    assert [f["id"] for f in done["features"]] == closed
+    assert all(f["board_state"] != "done" for f in c.get("/api/plugins/project_board/cards").json()["features"])

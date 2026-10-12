@@ -644,17 +644,28 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     @router.get("/cards")
     async def _cards():
-        """The live board as slim CARD rows (#522) — what the in-chat `board-cards` frame
-        reads through the console's mediated read channel (protoAgent#4143). Query-free on
-        purpose: the host only serves declared read PATHS (no `?` — a query string is
-        refused), so the frame filters by state/project itself. Each row is
-        ``board_cards.card_row`` (id, title, state, blocked, next_action, PR …) — no
-        spec/criteria/design — so the whole board stays far under the host's 256 KB read
-        cap. Archived cards are excluded, like the default ``/features`` listing."""
-        from .board_cards import card_row
+        """OPEN work as slim CARD rows (#522) — what the in-chat `board-cards` frame reads
+        through the console's mediated read channel (protoAgent#4143) for a query with no
+        state. No done/cancelled cards, so the payload tracks live work, not history. Each
+        row is ``board_cards.card_row`` (id, title, state, blocked, next_action, PR …) — no
+        spec/criteria/design. Query-free on purpose: the host serves declared read PATHS
+        only (a `?` is refused), so the frame filters by project itself."""
+        from .board_cards import cards_payload
 
+        return await _guard(lambda: cards_payload(annotate_next_action(store().list_features(), cfg or {})))
+
+    @router.get("/cards/{state}")
+    async def _cards_in_state(state: str):
+        """One board state's cards as slim rows (#522) — the frame's read for a state query.
+        ``done``/``cancelled`` are capped to the most recently closed ``DONE_CAP`` (``total``
+        says how many matched), so the size never depends on how much history the board
+        holds. 404 for anything that isn't a board state."""
+        from .board_cards import STATES, cards_payload
+
+        if state not in STATES and state != "cancelled":
+            raise HTTPException(404, f"unknown board state {state!r}")
         return await _guard(
-            lambda: {"features": [card_row(f) for f in annotate_next_action(store().list_features(), cfg or {})]}
+            lambda: cards_payload(annotate_next_action(store().list_features(state=state), cfg or {}), state)
         )
 
     @router.get("/features/{fid}")

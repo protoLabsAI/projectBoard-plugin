@@ -99,8 +99,9 @@ test("Merge shows only when the gates the read returns are green", () => {
 
 test("reads: one per id, or the slim board for a query — never a query string (#4143)", () => {
   assert.deepEqual(BC.readPathsFor({ ids: ["bd-a1", "bd-vbyd.24"] }), ["features/bd-a1", "features/bd-vbyd.24"]);
-  assert.deepEqual(BC.readPathsFor({ state: "blocked" }), ["cards"]);
-  assert.deepEqual(BC.readPathsFor({ state: "in_review", project: "protoAgent" }), ["cards"]);
+  assert.deepEqual(BC.readPathsFor({ state: "blocked" }), ["cards/blocked"]);
+  assert.deepEqual(BC.readPathsFor({ state: "in_review", project: "protoAgent" }), ["cards/in_review"]);
+  assert.deepEqual(BC.readPathsFor({ project: "protoAgent" }), ["cards"], "no state ⇒ open work");
   // Every path is plain segments the host's read matcher accepts.
   for (const p of [...BC.readPathsFor({ ids: ["bd-a1", "bd-vbyd.24"] }), ...BC.readPathsFor({ project: "x" })]) {
     assert.ok(p.split("/").every((seg) => /^[A-Za-z0-9._~:@+=,-]+$/.test(seg)), p);
@@ -175,7 +176,7 @@ test("refreshes every ~15s, pauses out of view, and catches up on return", async
   const ok = () => ({ ok: true, status: 200, json: { features: [card({ id: "bd-x", board_state: "ready" })] } });
   await h.answerAll(ok);
   assert.equal(h.reads().length, 1);
-  assert.equal(h.reads()[0].path, "cards");
+  assert.equal(h.reads()[0].path, "cards/blocked");
   assert.ok(h.ctl.state().scheduled);
   await h.advance(BC.REFRESH_MS - 1000);
   assert.equal(h.reads().length, 1, "not before ~15s");
@@ -251,11 +252,11 @@ test("a listing's blocked cards get their reason from a single-card read", async
   const h = harness();
   h.ctl.onMessage({ type: "protoComponent:init", props: { state: "blocked" }, theme: {} });
   await h.answerAll((p) =>
-    p === "cards"
+    p === "cards/blocked"
       ? { ok: true, status: 200, json: { features: [card({ id: "bd-b", board_state: "blocked", blocked: true }), card({ id: "bd-r", board_state: "ready" })] } }
       : { ok: true, status: 200, json: card({ id: "bd-b", board_state: "blocked", blocked: true, blocked_reason: "secret missing" }) },
   );
-  assert.deepEqual(h.reads().map((m) => m.path), ["cards", "features/bd-b"]);
+  assert.deepEqual(h.reads().map((m) => m.path), ["cards/blocked", "features/bd-b"]);
   assert.equal(h.renders.at(-1).rows[0].blockedReason, "secret missing");
 });
 
@@ -288,6 +289,16 @@ test("a transient host refusal (paused, rate-limited) keeps the last cards and r
   assert.equal(h.reads().length, n + 1, "retried within seconds, not 15s");
 });
 
+test("a capped done listing says how many more there are", async () => {
+  const h = harness();
+  h.ctl.onMessage({ type: "protoComponent:init", props: { state: "done" }, theme: {} });
+  const feats = Array.from({ length: 50 }, (_, i) => card({ id: "bd-d" + i, board_state: "done" }));
+  await h.answerAll(() => ({ ok: true, status: 200, json: { features: feats, total: 1800 } }));
+  const vm = h.renders.at(-1);
+  assert.equal(vm.rows.length, 20);
+  assert.equal(vm.more, 1780);
+});
+
 test("a readResult for an unknown cid is ignored", async () => {
   const h = harness();
   h.ctl.onMessage({ type: "protoComponent:readResult", cid: 999, ok: true, json: {} });
@@ -317,4 +328,63 @@ test("theme: curated keys map onto --pl-* tokens; --pl-* pass through; mode sets
   BC.applyThemeTo(el, { bg: "#111", brand: "#a0f", "--pl-space-2": "6px", "color-scheme": "light", junk: "x", fg: "" });
   assert.deepEqual(set, { "--pl-color-bg": "#111", "--pl-color-accent": "#a0f", "--pl-space-2": "6px" });
   assert.equal(el.style.colorScheme, "light");
+});
+
+// ── the per-mount nonce (protoAgent#4172) ────────────────────────────────────────────
+
+test("every read echoes the init nonce; a re-init with a new nonce takes over", async () => {
+  const h = harness();
+  h.ctl.onMessage({ type: "protoComponent:init", props: { ids: ["bd-1"] }, theme: {}, nonce: "n-1" });
+  await h.flush();
+  assert.equal(h.reads()[0].nonce, "n-1");
+  await h.answerAll((p) => ({ ok: true, status: 200, json: card({ id: p.split("/")[1] }) }));
+  h.ctl.onMessage({ type: "protoComponent:init", props: { ids: ["bd-1"] }, theme: {}, nonce: "n-2" });
+  h.ctl.onMessage({ type: "protoComponent:theme", theme: {} });
+  await h.flush();
+  assert.equal(h.reads().at(-1).nonce, "n-2");
+  assert.equal(h.ctl.nonce(), "n-2");
+});
+
+test("an older host with no nonce gets requests without the field", async () => {
+  const h = harness();
+  h.ctl.onMessage({ type: "protoComponent:init", props: { ids: ["bd-1"] }, theme: {} });
+  await h.flush();
+  assert.ok(!("nonce" in h.reads()[0]));
+});
+
+test("send and openLink echo the nonce", () => {
+  const posts = [];
+  let nonce = "n-9";
+  const bridge = BC.createBridge((m) => posts.push(m), () => 0, () => nonce);
+  bridge.send("Dispatch board card bd-d1");
+  bridge.openLink("https://github.com/o/r/pull/1");
+  assert.equal(posts[0].type, "protoComponent:send");
+  assert.equal(posts[0].nonce, "n-9");
+  assert.equal(posts[1].type, "protoComponent:openLink");
+  assert.equal(posts[1].nonce, "n-9");
+  nonce = null;
+  bridge.send("x");
+  assert.ok(!("nonce" in posts[2]));
+});
+
+test("a read refused for its nonce is shown as a refusal, not retried as transient", async () => {
+  const h = harness();
+  h.ctl.onMessage({ type: "protoComponent:init", props: { state: "blocked" }, theme: {}, nonce: "n-1" });
+  await h.answerAll(() => ({ ok: false, status: 0, error: "nonce mismatch" }));
+  const vm = h.renders.at(-1);
+  assert.match(vm.banner.text, /refused this card read: nonce mismatch/);
+  assert.ok(h.ctl.state().scheduled);
+  const n = h.reads().length;
+  await h.advance(3000);
+  assert.equal(h.reads().length, n, "no 3s transient retry for a refusal");
+});
+
+test("a refused send resolves (the button re-enables) with the host's verdict", async () => {
+  const posts = [];
+  const bridge = BC.createBridge((m) => posts.push(m), () => 0, () => "n-1");
+  const p = bridge.send("Unblock board card bd-b1");
+  bridge.onMessage({ type: "protoComponent:bridgeResult", cid: posts[0].cid, ok: false, error: "nonce mismatch" });
+  const r = await p;
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "nonce mismatch");
 });

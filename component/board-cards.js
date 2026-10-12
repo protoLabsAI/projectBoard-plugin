@@ -2,13 +2,14 @@
 //
 // The console frames this page (ADR 0118 D5) in a sandbox="allow-scripts" iframe on an
 // OPAQUE origin with no bearer. Everything it knows arrives over postMessage:
-//   host → frame  protoComponent:init {props, theme}   the validated props (pointers only)
+//   host → frame  protoComponent:init {props, theme, nonce}   the validated props (pointers only)
+//                 + a per-mount nonce (protoAgent#4172) every frame → host request echoes
 //                 protoComponent:theme {theme}         a live re-theme
 //                 protoComponent:readResult {cid, ok, status, json | error}   (protoAgent#4143)
 //                 protoComponent:bridgeResult {cid, ok, text?, error?}       (send/openLink verdict)
-//   frame → host  protoComponent:read {cid, path}      a GET of one of the kind's declared reads
-//                 protoComponent:send {cid, text}      a PROPOSAL — the host shows a confirm chip
-//                 protoComponent:openLink {cid, url}   a link proposal (https only)
+//   frame → host  protoComponent:read {cid, path, nonce}      a GET of one of the kind's declared reads
+//                 protoComponent:send {cid, text, nonce}      a PROPOSAL — the host shows a confirm chip
+//                 protoComponent:openLink {cid, url, nonce}   a link proposal (https only)
 //                 protoComponent:height {height}       our content height
 //
 // The logic is a factory with every side effect injected (post, timers, clock, render), so
@@ -112,9 +113,10 @@
     if (Array.isArray(props.ids) && props.ids.length) {
       return props.ids.map(function (id) { return "features/" + encodeURIComponent(id); });
     }
-    // The host serves declared PATHS only (a `?query` is refused, #4143), so a state/project
-    // query reads the slim live board and filters here (matchesQuery).
-    return ["cards"];
+    // The host serves declared PATHS only (a `?query` is refused, #4143), so the state rides
+    // in the path — `cards/<state>` — and a project-only query reads open work (`cards`).
+    // Project filtering is ours (matchesQuery). Neither read grows with board history.
+    return [props.state ? "cards/" + encodeURIComponent(props.state) : "cards"];
   }
 
   /** The `/features?state=&project=` filter, applied in the frame: board state equality,
@@ -278,6 +280,7 @@
     var pumpTimer = null;
     var everAnswered = false;
     var generation = 0; // a props change invalidates an in-flight refresh
+    var nonce = null; // the host's per-mount nonce from init (#4172), echoed on every request
 
     function pump() {
       pumpTimer = null;
@@ -300,7 +303,7 @@
         resolve: job.resolve,
         timer: setT(function () { settle(cid, { ok: false, timeout: true }); }, READ_TIMEOUT_MS),
       };
-      post({ type: "protoComponent:read", cid: cid, path: job.path });
+      post(withNonce({ type: "protoComponent:read", cid: cid, path: job.path }, nonce));
     }
 
     function settle(cid, res) {
@@ -411,7 +414,10 @@
         var all = (c.json && Array.isArray(c.json.features) && c.json.features) || [];
         var feats = all.filter(function (f) { return matchesQuery(props, f); });
         var shown = feats.slice(0, 20);
-        next.more = Math.max(0, feats.length - shown.length);
+        // `total` counts a capped done listing's full size; with a project filter we only
+        // know what we were sent.
+        var total = !props.project && c.json && typeof c.json.total === "number" ? c.json.total : feats.length;
+        next.more = Math.max(0, total - shown.length);
         next.rows = shown.map(function (f) { return { id: f.id, card: f }; });
         // A listing carries no block reason (only a single-card read has comments): look up
         // the first few blocked cards so their reason shows, within the read budget.
@@ -442,6 +448,9 @@
     function onMessage(m) {
       if (!m || typeof m !== "object") return;
       if (m.type === "protoComponent:init") {
+        // The mount's nonce rides on every request we make (#4172); a re-init carries the
+        // current one, so always take the latest.
+        if (typeof m.nonce === "string" && m.nonce) nonce = m.nonce;
         applyTheme(m.theme);
         var key = JSON.stringify(m.props || {});
         if (props && key === propsKey) return; // the host re-posts init on a schedule — idempotent
@@ -471,15 +480,24 @@
       setVisible: setVisible,
       paint: paint,
       read: read,
+      nonce: function () { return nonce; },
       state: function () {
         return { props: props, data: data, visible: visible, refreshing: refreshing, scheduled: !!refreshTimer, inFlight: inFlight, queued: queue.length };
       },
     };
   }
 
+  /** Stamp the mount's nonce on a frame → host request (#4172). An older host that sent none
+   *  gets the message without the field. */
+  function withNonce(msg, nonce) {
+    if (typeof nonce === "string" && nonce) msg.nonce = nonce;
+    return msg;
+  }
+
   /** The send/openLink bridge: each call is a PROPOSAL the host turns into a confirm chip.
-   *  Resolves with the host's bridgeResult (or a timeout). */
-  function createBridge(post, setT) {
+   *  Resolves with the host's bridgeResult (or a timeout). `getNonce` returns the mount's
+   *  nonce from init, echoed on every request. */
+  function createBridge(post, setT, getNonce) {
     setT = setT || setTimeout;
     var nextCid = 100000; // disjoint from read cids — they share the bridgeResult/readResult space only by type
     var waiters = {};
@@ -492,7 +510,7 @@
         }, 120000);
         var msg = { type: type, cid: cid };
         msg[field] = value;
-        post(msg);
+        post(withNonce(msg, getNonce ? getNonce() : null));
       });
     }
     return {
@@ -549,8 +567,9 @@
     function reportHeight() {
       postUp({ type: "protoComponent:height", height: Math.ceil(doc.documentElement.scrollHeight) });
     }
-    var bridge = createBridge(postUp);
-    var ctl = createController({
+    var ctl = null;
+    var bridge = createBridge(postUp, setTimeout, function () { return ctl ? ctl.nonce() : null; });
+    ctl = createController({
       post: postUp,
       applyTheme: function (t) { applyThemeTo(doc.documentElement, t); },
       render: function (vm) {
@@ -613,6 +632,7 @@
     renderHTML: renderHTML,
     createController: createController,
     createBridge: createBridge,
+    withNonce: withNonce,
     applyThemeTo: applyThemeTo,
     start: start,
   };

@@ -1,10 +1,11 @@
 ---
 name: showing-board-cards
 description: >-
-  Use when the operator checks in on board work: "what's blocked?", "how's epic X?",
-  "where are we on bd-…?", "what's in review?". Answer with the live cards themselves:
-  call board_show_cards scoped to the epic or the cards in question, then write at most
-  two lines of prose. Also use when a message arrives from a card button, like "Unblock
+  Use for any status check-in on board work: "what's blocked?", "how's the epic?", "how's
+  epic X going?", "status?", "status update", "check in", "where are we?", "what's in
+  review?", "what's left?", "progress on bd-…?". Answer with the live cards themselves:
+  call board_show_cards scoped to the epic or the cards in question, then write AT MOST
+  TWO LINES of prose — never restate the cards. Also use when a message arrives from a card button, like "Unblock
   board card bd-…", "Why is board card bd-… blocked?", "Ask Vera to re-review board card
   bd-…", "Merge board card bd-…", "Show the live coder run for board card bd-…" or
   "Dispatch board card bd-…". Each one maps to a board_* tool below. Not for your own

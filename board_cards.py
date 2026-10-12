@@ -34,9 +34,10 @@ COMPONENT = "board-cards"
 FRAME = "component/board-cards.html"
 # The plugin's own GET routes (relative to /api/plugins/project_board/) the frame may ask
 # the host to read on its behalf. `*` is exactly one path segment. The host serves declared
-# PATHS only — a `?query` is refused — so a state/project query reads the slim `cards`
-# listing and filters in the frame; a single card reads `features/<id>`.
-READS = ["cards", "features/*", "status"]
+# PATHS only — a `?query` is refused — so the state rides in the path: `cards/<state>` for a
+# state query, bare `cards` (open work) otherwise, `features/<id>` for explicit ids. Project
+# filtering is the frame's. Every one is bounded independent of board size (see cards_payload).
+READS = ["cards", "cards/*", "features/*", "status"]
 
 SETUP_GAP_KEY = "board_cards"
 SETUP_GAP_MESSAGE = (
@@ -191,7 +192,36 @@ def component_tail(props: dict) -> str:
     return "\n" + encode_component(COMPONENT, props)
 
 
-# ── the card projection (GET /cards) ──
+# ── the card projection (GET /cards, GET /cards/<state>) ──
+
+# A finished card never leaves the board (archiving only hides it), so a `done` listing would
+# grow forever: it is capped to the most recently closed DONE_CAP, with `total` saying how
+# many there are. Open work is the bare `cards` read and excludes done/cancelled entirely.
+DONE_CAP = 50
+_TERMINAL = ("done", "cancelled")
+
+
+def scope_cards(feats: list[dict], state: str = "") -> tuple[list[dict], int]:
+    """The rows one card query shows, and how many matched before any cap.
+
+    ``state`` given → only that board state (``done`` capped to the ``DONE_CAP`` most recently
+    closed); no state → OPEN work only (no done/cancelled). So no query's size depends on how
+    much history the board has accumulated."""
+    if state:
+        rows = [f for f in feats if f.get("board_state") == state]
+    else:
+        rows = [f for f in feats if f.get("board_state") not in _TERMINAL]
+    total = len(rows)
+    if state in _TERMINAL:
+        rows = sorted(rows, key=lambda f: str(f.get("closed_at") or ""), reverse=True)[:DONE_CAP]
+    return rows, total
+
+
+def cards_payload(feats: list[dict], state: str = "") -> dict:
+    """``{"features": [slim rows], "total": n}`` — the body of ``GET /cards[/<state>]``."""
+    rows, total = scope_cards(feats, state)
+    return {"features": [card_row(f) for f in rows], "total": total}
+
 
 _CARD_KEYS = (
     "id",

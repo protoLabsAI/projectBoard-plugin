@@ -1624,14 +1624,20 @@ def _board_tools(cfg: dict):
 
     @tool
     def board_show_cards(ids: list[str] = [], state: str = "", project: str = "", title: str = "") -> str:
-        """Show board cards INLINE in the chat — live cards with their current state,
-        `next_action`, block reason, PR link and action buttons — for a status check-in
-        ("what's blocked?", "how's epic X?"). Pass `ids` (≤ 20 card ids, e.g. an epic's
-        cards) to show exactly those, OR a `state` (backlog/ready/in_progress/in_review/
-        blocked/done) and/or `project` for a live query; `title` (≤ 80 chars) labels the
-        header ("Epic #4076"). The cards re-read themselves every ~15s, so an old answer
-        shows the CURRENT state. Returns a short text summary (header + one line per
-        card) that you and a text-only client read; then add at most two lines of prose.
+        """Answer a status check-in with live board cards INLINE in the chat — "what's
+        blocked?", "how's the epic?", "status?", "where are we?" — instead of paragraphs.
+        Each card shows its current state, `next_action`, block reason, PR link and action
+        buttons, and re-reads itself every ~15s, so the answer stays current.
+
+        AFTER CALLING IT, WRITE AT MOST 2 LINES OF PROSE: only what the cards can't say
+        (the one thing that needs the operator, or your call). Never restate the cards as
+        bullets — the operator is looking at them.
+
+        Pass `ids` (≤ 20 card ids, e.g. an epic's cards) to show exactly those, OR a `state`
+        (backlog/ready/in_progress/in_review/blocked/done) and/or `project` for a live query
+        (no state = open work; done shows the most recent). `title` (≤ 80 chars) labels the
+        header ("Epic #4076"). Returns a short text summary (header + one line per card) for
+        you and text-only clients — read it, don't paste it back.
 
         Do NOT call it for your own reasoning — board_list / board_get_feature are the
         reads for that; this is for SHOWING the operator. Each card button proposes an
@@ -1657,10 +1663,15 @@ def _board_tools(cfg: dict):
                     else:
                         feats.append(f)
             else:
-                st = props.get("state")
+                # The same scope the cards read (board_cards.scope_cards): a state's cards
+                # (done capped to the most recent), or open work for a project-only query.
+                from .board_cards import scope_cards
+
+                st = props.get("state", "")
                 feats = store.list_features(state=st or None)
                 if props.get("project"):
                     feats = [f for f in feats if str(f.get("project") or "") == props["project"]]
+                feats, _total = scope_cards(feats, st)
                 # A listing row carries no block reason (only `br show` reads comments) —
                 # fill it for the first few blocked cards so the summary says WHY.
                 for f in [f for f in feats if f.get("blocked") and not f.get("blocked_reason")][:5]:
