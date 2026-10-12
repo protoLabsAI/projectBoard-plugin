@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board cards</title>
+<script>
+// Slug-aware base (ADR 0042): "" on the host window, "/agents/<slug>" under the fleet
+// proxy. The DS kit stylesheet is public (/_ds/), so this opaque-origin, bearer-less
+// frame can load it; the --pl-* tokens it reads are re-pointed by the host's theme.
+(function () {
+  var base = location.pathname.split("/plugins/")[0];
+  var l = document.createElement("link");
+  l.rel = "stylesheet";
+  l.href = base + "/_ds/plugin-kit.css";
+  document.head.appendChild(l);
+})();
+</script>
+<style>
+__CARDS_CSS__</style>
+</head><body>
+<div id="cards" class="bc" aria-live="polite"></div>
+<script>
+__CARDS_JS__
+BoardCards.start(window, document);
+</script>
+</body></html>

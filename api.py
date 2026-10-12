@@ -223,6 +223,16 @@ def build_router(cfg: dict):
     async def _board():
         return HTMLResponse(BOARD_PAGE)
 
+    # ── board cards in chat (#522) — the `board-cards` frame component's page. PUBLIC
+    # (manifest `public_paths: /plugins/project_board/component/`): the console frames it
+    # in an opaque-origin sandbox that carries no bearer. It holds no board data — the
+    # cards arrive through the host-mediated read channel (protoAgent#4143).
+    @router.get("/component/board-cards.html", response_class=HTMLResponse)
+    async def _board_cards_component():
+        from .board_cards import CARDS_PAGE
+
+        return HTMLResponse(CARDS_PAGE)
+
     @router.get("/config/projects", response_class=HTMLResponse)
     async def _projects_config():
         """Public page chrome for the sandboxed Configure tab.
@@ -609,7 +619,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
-    async def _features(state: str | None = None, include_archived: bool = False, project: str | None = None):
+    async def _features(
+        state: str | None = None, include_archived: bool = False, project: str | None = None, fields: str | None = None
+    ):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
         # actionable BoardError message — an escaped BoardError is a text/plain 500
@@ -622,13 +634,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # Every row carries `next_action` / `awaiting_merge` / `next_action_hint`
         # (#208) — derived from labels + the board's auto_merge/review_gate config,
         # no per-row network — so the console can chip "awaiting merge".
+        # ?fields=card (#522) returns the slim card rows the in-chat board cards render (id,
+        # title, state, blocked, next_action, PR …) — no spec/criteria/design, so a listing
+        # stays well under the host's 256 KB component-read cap on any board size.
         want = str(project or "").strip()
+        slim = str(fields or "").strip() == "card"
 
         def _list():
             feats = store().list_features(state=state, include_archived=include_archived)
             if want:
                 feats = [f for f in feats if str(f.get("project") or "") == want]
-            return {"features": annotate_next_action(feats, cfg or {})}
+            feats = annotate_next_action(feats, cfg or {})
+            if slim:
+                from .board_cards import card_row
+
+                feats = [card_row(f) for f in feats]
+            return {"features": feats}
 
         return await _guard(_list)
 
