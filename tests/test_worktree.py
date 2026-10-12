@@ -1380,8 +1380,10 @@ class _HangingProc:
     def __init__(self):
         self.killed = False
         self.returncode = None
+        self.running = asyncio.Event()  # set once the caller is inside communicate()
 
     async def communicate(self):
+        self.running.set()
         await asyncio.Event().wait()
 
     def kill(self):
@@ -1403,8 +1405,7 @@ async def test_task_cancel_mid_subprocess_kills_the_child_and_propagates(monkeyp
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     coro = worktree._gh("pr", "create", cwd="/wt") if runner == "_gh" else worktree._git("/wt", "push")
     task = asyncio.create_task(coro)
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(proc.running.wait(), timeout=5)  # the child runs; no tick counting
     assert spawned and not proc.killed
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1424,8 +1425,7 @@ async def test_kill_on_cancel_tolerates_an_already_exited_child(monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     task = asyncio.create_task(worktree._gh("pr", "close", cwd="/wt"))
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(proc.running.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):  # the cancel still propagates; no ProcessLookupError leak
         await task

@@ -283,6 +283,23 @@ _SMOKE_OUTPUT_BYTES = _SMOKE_OUTPUT_CHARS * 4
 _SMOKE_REAP_TIMEOUT_S = 5.0
 
 
+def _worktree_module():
+    """``worktree``, behind the dual import this module needs (it is loaded both as a
+    package submodule and as a top-level module in tests)."""
+    try:
+        from . import worktree
+    except ImportError:
+        from project_board import worktree
+    return worktree
+
+
+async def _spawn_gate_shell(cmd: str, repo: str) -> asyncio.subprocess.Process:
+    """Launch the gate smoke through ``worktree.spawn_shell``, output merged into stdout."""
+    return await _worktree_module().spawn_shell(
+        cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+
+
 async def _base_checkout_dirt(repo: str, base: str) -> str:
     """``worktree.base_checkout_dirt`` behind the dual import this module needs (it is
     loaded both as a package submodule and as a top-level module in tests). Any failure
@@ -367,16 +384,13 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
     # dirt that predates the gate may downgrade its verdict.
     dirt = await _base_checkout_dirt(repo, base)
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=repo,
-            stdin=asyncio.subprocess.DEVNULL,  # #423: never the server's stdin
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            # Own process group, so a timeout can kill the whole gate tree — not just
-            # the shell while its descendants keep our stdout pipe (and the PUT) open.
-            start_new_session=True,
-        )
+        # `worktree.spawn_shell`: no stdin (#423), and its own process group, so a timeout
+        # can kill the whole gate tree, not just the shell while its descendants keep our
+        # stdout pipe (and the PUT) open. A cancel that lands while the spawn is still in
+        # flight kills and reaps that group too, which a bare create_subprocess_shell
+        # could not: asyncio's cleanup there killed only the shell and then waited on the
+        # pipe its children held.
+        proc = await _spawn_gate_shell(cmd, repo)
         try:
             # Bounded read (not `communicate()`, which buffers the whole stream before any
             # truncation could apply): only the tail stays resident while the gate runs.

@@ -199,6 +199,7 @@ MAX_UNCOVERED_HOST = 1
 # FAILS rather than skips. #353 and #356 were both caught by adding to it.
 STORE_SEAMS: dict[str, str] = {
     "_create": "UNCOVERED",
+    "_create_feature": "REAL",  # create_feature's body, run under the hot-file chain lock; real `br` (test_card_authoring_455.py)
     "_find_by_external_ref": "UNCOVERED",
     "_open_blockers": "REAL",
     "_prepare_ready": "UNCOVERED",
@@ -216,7 +217,6 @@ STORE_SEAMS: dict[str, str] = {
     "clear_budgets": "REAL",
     "clear_verified_candidate": "UNCOVERED",
     "comment": "UNCOVERED",
-    "create_feature": "REAL",
     "create_from_plan": "UNCOVERED",
     "delete_feature": "UNCOVERED",
     "escalate": "REAL",

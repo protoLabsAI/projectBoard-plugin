@@ -169,18 +169,16 @@ class BranchCheckedOutError(WorktreeError):
 async def _git(repo: str, *args: str, timeout: float = 60, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run a git command in ``repo``; return (rc, stdout, stderr). ``env`` ADDS to the
     inherited environment — the one use is a private ``GIT_INDEX_FILE``."""
-    proc = await asyncio.create_subprocess_exec(
+    proc = await spawn_exec(
         "git",
         "-C",
         repo,
         *args,
         # No stdin, own process group (#423): `git commit` runs the repo's hooks, and a
         # hook is a shell tree (husky → pnpm → lint-staged) that must neither read the
-        # server's stdin nor outlive a kill.
-        stdin=asyncio.subprocess.DEVNULL,
+        # server's stdin nor outlive a kill — a cancel mid-spawn included.
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
         env={**os.environ, **env} if env else None,
     )
     try:
@@ -225,16 +223,65 @@ async def spawn_shell(cmd: str, *, cwd: str, env: dict | None = None, stdout=Non
 
     ``stdout``/``stderr`` pass straight through (``PIPE`` / ``STDOUT`` / ``DEVNULL``).
     Pair it with :func:`communicate_or_kill` (or :func:`kill_tree` + :func:`reap`) so a
-    timeout or cancel takes the whole tree down, not just the shell."""
-    return await asyncio.create_subprocess_shell(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=stdout,
-        stderr=stderr,
-        start_new_session=True,
+    timeout or cancel takes the whole tree down, not just the shell.
+
+    A cancel that lands WHILE the spawn is in flight kills the tree too. The process
+    exists as soon as ``Popen`` returns, but ``create_subprocess_shell`` keeps awaiting
+    its pipe hookup after that; cancelled there, asyncio's own cleanup SIGKILLs only the
+    shell and then waits for the pipes to close. If the shell had already forked (any
+    ``a && b``, or a loaded box where it got that far first), the child kept the
+    stdout pipe, so the cancel blocked for the child's whole run and left it orphaned.
+    A Max-Mode sibling cancel lands here whenever the failing tree raises before the
+    others finish spawning (a reaped tree fails at launch, so it usually does). So the spawn runs shielded, and a cancel waits for it to
+    finish (milliseconds: local pipes), kills the group, and reaps it, then re-raises."""
+    return await _spawn_killable(
+        asyncio.create_subprocess_shell(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
     )
+
+
+async def spawn_exec(program: str, *args: str, cwd=None, env: dict | None = None, stdout=None, stderr=None):
+    """``create_subprocess_exec`` with :func:`spawn_shell`'s guarantees: no stdin, its own
+    process group, and a cancel that lands mid-spawn kills and reaps the group. ``git``
+    runs hooks and spawns ``ssh``; ``gh`` runs auth helpers and extensions, so an exec'd
+    program is a tree too."""
+    return await _spawn_killable(
+        asyncio.create_subprocess_exec(
+            program,
+            *args,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    )
+
+
+async def _spawn_killable(spawn_coro):
+    """Await an asyncio subprocess spawn whose child leads its own group; if the await is
+    cancelled, let the spawn finish, then kill the group and reap it before re-raising
+    (see :func:`spawn_shell` for why asyncio's own cleanup there is not enough)."""
+    spawn = asyncio.ensure_future(spawn_coro)
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        await asyncio.wait({spawn}, timeout=_REAP_TIMEOUT_S)
+        if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
+            proc = spawn.result()
+            kill_tree(proc)
+            await asyncio.shield(reap(proc))
+        else:
+            spawn.cancel()
+        raise
 
 
 def kill_tree(proc) -> None:
@@ -1864,7 +1911,7 @@ async def _lsof_cwds() -> dict[int, str] | None:
     if not exe:
         return None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_exec(
             exe,
             "-w",
             "-n",
@@ -1873,10 +1920,8 @@ async def _lsof_cwds() -> dict[int, str] | None:
             "cwd",
             "-F",
             "pn",
-            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
         )
         out, _ = await communicate_or_kill(proc, timeout=_CWD_PROBE_TIMEOUT_S)
     except (OSError, asyncio.TimeoutError):
@@ -1970,14 +2015,12 @@ async def dispatch_coder(
 
 
 async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
+    proc = await spawn_exec(
         "gh",
         *args,
-        cwd=cwd,
-        stdin=asyncio.subprocess.DEVNULL,  # #423: never the server's stdin
+        cwd=cwd,  # spawn_exec: no stdin (#423), own group, killed if cancelled mid-spawn
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)

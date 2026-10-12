@@ -253,6 +253,80 @@ async def test_communicate_or_kill_reaps_the_tree_before_it_raises(tmp_path):
     assert proc.returncode is not None, "communicate_or_kill raised before the killed shell was reaped"
 
 
+def _spawn_gate(tmp_path, pidfile):
+    return worktree.spawn_shell(
+        _TREE.format(pidfile=pidfile),
+        cwd=str(tmp_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+
+def _registry_smoke(tmp_path, pidfile):
+    from project_board import project_registry
+
+    return project_registry._smoke_gate_on_clean_base("p", _TREE.format(pidfile=pidfile), str(tmp_path), "main")
+
+
+def _git_alias(tmp_path, pidfile):
+    # A `!` alias is git forking a shell, the shape of a hook or an ssh transport.
+    return worktree._git(str(tmp_path), "-c", f"alias.tree=!{_TREE.format(pidfile=pidfile)}", "tree")
+
+
+def _gh_tree(tmp_path, pidfile):
+    return worktree._gh(str(pidfile), cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("spawner", [_spawn_gate, _registry_smoke, _git_alias, _gh_tree], ids=lambda f: f.__name__)
+async def test_a_cancel_during_the_spawn_kills_the_tree_and_returns(tmp_path, monkeypatch, spawner):
+    """A cancel can land inside `create_subprocess_shell`/`_exec` after the process exists
+    but before the pipes are hooked up. A Max-Mode sibling cancel does whenever the failing
+    tree raises before its siblings finish spawning. asyncio's own cleanup there kills only
+    the direct child and then waits for the pipe, so a grandchild it had already forked kept
+    the cancel waiting for its whole run and outlived it. CI hit this as a 15 s TimeoutError
+    (PR #524, run 38202519726). Every spawn that can be cancelled goes through the guarded
+    spawn: the loop's gates (`spawn_shell`), the registration gate smoke, `git`, and `gh`.
+
+    Whether the child forks before the kill is a scheduling race. The test pins the losing
+    order: `Popen` returns only once the grandchild has recorded its pid, the way a loaded
+    runner can let the child get that far before the event loop runs the cancel, and the
+    cancel is queued from inside the spawn, so it lands exactly where the sibling's does.
+    Only the spawn that names the pidfile is held; any other (the smoke's dirt probe) runs
+    untouched."""
+    import subprocess
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text('#!/bin/sh\nsleep 300 & echo $! > "$1"; wait\n')
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    pidfile = tmp_path / "grandchild.pid"
+    real_popen = subprocess.Popen
+    task: list[asyncio.Future] = []
+
+    class _ChildForksFirst(real_popen):
+        def __init__(self, args, *a, **kw):
+            super().__init__(args, *a, **kw)
+            if str(pidfile) not in str(args):
+                return
+            deadline = time.monotonic() + 10
+            while not (pidfile.exists() and pidfile.read_text().strip()) and time.monotonic() < deadline:
+                time.sleep(0.01)  # blocks the loop on purpose: the cancel cannot run yet
+            asyncio.get_running_loop().call_soon(task[0].cancel)
+
+    monkeypatch.setattr(subprocess, "Popen", _ChildForksFirst)
+    task.append(asyncio.ensure_future(spawner(tmp_path, pidfile)))
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task[0], timeout=10)
+    pid = await _pid_from(pidfile)
+    assert time.monotonic() - started < 5, "the cancel waited on the orphaned grandchild's pipe"
+    assert await _gone(pid), "the grandchild outlived a cancel that landed during the spawn"
+
+
 async def test_a_descendant_that_escapes_the_group_cannot_hang_the_caller(tmp_path, monkeypatch):
     """The one case the reap BOUND exists for: a descendant that re-`setsid`s survives the
     group kill and keeps our stdout pipe open. The caller must get its timeout anyway."""
