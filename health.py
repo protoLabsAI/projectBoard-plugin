@@ -44,24 +44,39 @@ def _attach() -> dict:
 _health: dict = _attach()
 
 
-def publish_preflight(state: dict, dirty: dict, *, slow: dict | None = None, oracle: dict | None = None) -> None:
+def publish_preflight(
+    state: dict,
+    dirty: dict,
+    *,
+    slow: dict | None = None,
+    oracle: dict | None = None,
+    failures: dict | None = None,
+) -> None:
     """Called by the loop after each preflight pass with its live maps:
     ``state`` (project -> True | reason-string | None), ``dirty``
     (project -> why the checkout wasn't at base), ``slow`` (project -> {cmd, timeout_s,
-    sha}: a preflight command that can't finish inside ``preflight_timeout_s``, #456) and
-    ``oracle`` (project -> why its coder.solve() oracle is unwinnable, #459)."""
+    sha}: a preflight command that can't finish inside ``preflight_timeout_s``, #456),
+    ``oracle`` (project -> why its coder.solve() oracle is unwinnable, #459) and
+    ``failures`` (project -> {cmd, step, step_index, steps, exit_code, headline, tail}:
+    what a held project's failed gate said, redacted). Only HELD projects keep a failure."""
+    held = {n: r for n, r in state.items() if isinstance(r, str)}
     _health["preflight"] = {
-        "held": {n: r for n, r in state.items() if isinstance(r, str)},
+        "held": held,
         "dirty": dict(dirty),
         "slow": {n: dict(v) for n, v in (slow or {}).items()},
         "unwinnable_oracle": dict(oracle or {}),
+        "failures": {
+            n: {k: v for k, v in dict(d).items() if k != "key"} for n, d in (failures or {}).items() if n in held
+        },
     }
 
 
 def preflight_snapshot() -> dict:
     """``{held: {project: reason}, dirty: {project: why}, slow: {project: {cmd,
-    timeout_s, sha}}, unwinnable_oracle: {project: why}}``. Held projects are the ones
-    whose ready work is frozen behind a red gate. Slow ones run a preflight that can't
+    timeout_s, sha}}, unwinnable_oracle: {project: why}, failures: {project: {cmd, step,
+    step_index, steps, exit_code, headline, tail}}}``. Held projects are the ones whose
+    ready work is frozen behind a red gate; ``failures`` says which step of their gate
+    failed and shows the last lines of its output (secrets redacted). Slow ones run a preflight that can't
     finish in its timeout, so their verdict is only "indeterminate" (#456). An unwinnable
     oracle means that project's cards skip coder.solve() (#459). Empty before the first
     preflight pass (and on a board whose loop is off), which reads correctly as "nothing
@@ -72,7 +87,14 @@ def preflight_snapshot() -> dict:
         "dirty": dict(snap.get("dirty") or {}),
         "slow": {n: dict(v) for n, v in (snap.get("slow") or {}).items()},
         "unwinnable_oracle": dict(snap.get("unwinnable_oracle") or {}),
+        "failures": {n: dict(v) for n, v in (snap.get("failures") or {}).items()},
     }
+
+
+def preflight_failure(project: str) -> dict | None:
+    """Held project ``project``'s preflight failure detail, or None when it is not held
+    (or the loop has not published one)."""
+    return preflight_snapshot()["failures"].get(project)
 
 
 def advisory_hint() -> str:

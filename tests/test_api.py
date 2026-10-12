@@ -2104,6 +2104,7 @@ def test_status_reports_nothing_held_before_any_preflight_has_run(monkeypatch):
         "dirty": {},
         "slow": {},
         "unwinnable_oracle": {},
+        "failures": {},
     }
 
 

@@ -320,6 +320,12 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # once per DISTINCT reason, and identical repeats collapse to a one-line
         # "still held (Ns)" WARNING (see _record_preflight_failure).
         self._preflight_failed_at: dict[str, float] = {}
+        # Each held project's failure detail (the failing step, the line that says what
+        # broke, a redacted output tail) for the card comment, /status and the board tools;
+        # and, per held card, the failure key it was last commented with (once per DISTINCT
+        # failure). See loop/preflight.py.
+        self._preflight_detail: dict[str, dict] = {}
+        self._preflight_commented: dict[str, str] = {}
         # The working-state snapshot's refresher (#401): its task, when it last read, how many
         # reads in a row failed (its backoff), and whether a read is in flight (one at a time).
         # -inf, not 0.0: time.monotonic() starts near zero in a fresh container, and the first
