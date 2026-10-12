@@ -34,12 +34,13 @@ COMPONENT = "board-cards"
 FRAME = "component/board-cards.html"
 # The plugin's own GET routes (relative to /api/plugins/project_board/) the frame may ask
 # the host to read on its behalf. `*` is exactly one path segment. The host serves declared
-# PATHS only — a `?query` is refused — so the state rides in the path: `cards/<state>` for a
-# state query, bare `cards` (open work) otherwise, `features/<id>` for explicit ids. Project
-# filtering is the frame's. EVERY read is bounded independent of board size: a `cards` /
+# PATHS only — a `?query` is refused — so the query rides in the path: bare `cards` (open
+# work), `cards/<state>`, `cards/<state>/<project>` (`open` as the state for a project-only
+# query) and `features/<id>` for explicit ids. The SERVER filters by project before it caps,
+# so the frame and the tool's summary show the same cards. EVERY read is bounded independent of board size: a `cards` /
 # `cards/<state>` listing returns at most OPEN_CAP (open work) or DONE_CAP (done/cancelled)
 # rows plus a `total` (see scope_cards), and `features/<id>` is one card.
-READS = ["cards", "cards/*", "features/*", "status"]
+READS = ["cards", "cards/*", "cards/*/*", "features/*", "status"]
 
 SETUP_GAP_KEY = "board_cards"
 SETUP_GAP_MESSAGE = (
@@ -54,9 +55,10 @@ TITLE_MAX = 80
 PROJECT_MAX = 128
 # A bead id: `<prefix>-<hash>[.<n>…]`, e.g. `bd-vbyd.24`. One path segment by
 # construction (no `/`, `?`, `#`, whitespace), because the page reads `features/<id>`.
-_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# fullmatch, never `$` — `$` also matches before a trailing newline ("bd-abc\n").
+_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}-[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Same shape the project registry accepts for a `projects:` entry name.
-_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_PROJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _PROPS = {"ids", "state", "project", "title"}
 
 # Set by register_component(): True only when the host accepted the frame kind WITH reads.
@@ -83,7 +85,7 @@ def validate_props(props: dict) -> str | None:
         if len(ids) > MAX_IDS:
             return f"board-cards ids may name at most {MAX_IDS} cards"
         for i in ids:
-            if not isinstance(i, str) or not _ID_RE.match(i) or ".." in i:
+            if not isinstance(i, str) or not _ID_RE.fullmatch(i) or ".." in i:
                 return f"board-cards id {i!r} is not a board card id (e.g. bd-a1b2)"
         if len(set(ids)) != len(ids):
             return "board-cards ids must not repeat"
@@ -91,7 +93,7 @@ def validate_props(props: dict) -> str | None:
     if state is not None and state not in STATES:
         return f"board-cards state must be one of: {', '.join(STATES)}"
     project = props.get("project")
-    if project is not None and (not isinstance(project, str) or not _PROJECT_RE.match(project)):
+    if project is not None and (not isinstance(project, str) or not _PROJECT_RE.fullmatch(project)):
         return "board-cards project must be a project name (letters, digits, - and _)"
     title = props.get("title")
     if title is not None and (not isinstance(title, str) or len(title) > TITLE_MAX or "\n" in title):
@@ -99,8 +101,8 @@ def validate_props(props: dict) -> str | None:
     has_query = state is not None or project is not None
     if ids is not None and has_query:
         return "board-cards takes ids OR a state/project query, not both"
-    if ids is None and not has_query:
-        return "board-cards needs ids, or a state and/or project"
+    # Neither ids nor a query (`{}` or just a title) is the whole board's OPEN work — the
+    # "how's the board?" check-in (bare `cards`, capped like every listing).
     return None
 
 
@@ -214,13 +216,16 @@ def _urgency_key(f: dict) -> tuple:
     return (pri,)  # recency within a priority comes from the earlier stable sort (scope_cards)
 
 
-def scope_cards(feats: list[dict], state: str = "") -> tuple[list[dict], int]:
+def scope_cards(feats: list[dict], state: str = "", project: str = "") -> tuple[list[dict], int]:
     """The rows one card query shows, and how many matched before any cap.
 
     ``state`` given → only that board state; no state → OPEN work only (no done/cancelled).
     Every result is capped: done/cancelled to the ``DONE_CAP`` most recently closed, anything
     else to the ``OPEN_CAP`` most urgent (priority, then most recently updated). ``total`` is
-    the count before the cap, so no read's size depends on the board's."""
+    the count before the cap, so no read's size depends on the board's. ``project`` filters
+    BEFORE the cap, so a big board's other projects can't crowd this one's cards out."""
+    if project:
+        feats = [f for f in feats if str(f.get("project") or "") == project]
     if state:
         rows = [f for f in feats if f.get("board_state") == state]
     else:
@@ -235,9 +240,9 @@ def scope_cards(feats: list[dict], state: str = "") -> tuple[list[dict], int]:
     return rows, total
 
 
-def cards_payload(feats: list[dict], state: str = "") -> dict:
-    """``{"features": [slim rows], "total": n}`` — the body of ``GET /cards[/<state>]``."""
-    rows, total = scope_cards(feats, state)
+def cards_payload(feats: list[dict], state: str = "", project: str = "") -> dict:
+    """``{"features": [slim rows], "total": n}`` — the body of ``GET /cards[/<state>[/<project>]]``."""
+    rows, total = scope_cards(feats, state, project)
     return {"features": [card_row(f) for f in rows], "total": total}
 
 
@@ -293,7 +298,7 @@ def header_line(props: dict, feats: list[dict]) -> str:
             )
             if x
         )
-        or "Board cards"
+        or "Open work"
     )
     n_open = sum(1 for f in feats if _is_open(f))
     n_blocked = sum(1 for f in feats if f.get("blocked") or f.get("board_state") == "blocked")

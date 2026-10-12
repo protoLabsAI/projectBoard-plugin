@@ -1633,9 +1633,11 @@ def _board_tools(cfg: dict):
         (the one thing that needs the operator, or your call). Never restate the cards as
         bullets — the operator is looking at them.
 
-        Pass `ids` (≤ 20 card ids, e.g. an epic's cards) to show exactly those, OR a `state`
-        (backlog/ready/in_progress/in_review/blocked/done) and/or `project` for a live query
-        (no state = open work; done shows the most recent). `title` (≤ 80 chars) labels the
+        "How's the board?" / "status?" / "check in" → call it with NO arguments: every open
+        card (all states but done), most urgent first. Otherwise pass `ids` (≤ 20 card ids,
+        e.g. an epic's cards) to show exactly those, OR a `state` (backlog/ready/in_progress/
+        in_review/blocked/done) and/or `project` for a live query (no state = open work; done
+        shows the most recent). `title` (≤ 80 chars) labels the
         header ("Epic #4076"). Returns a short text summary (header + one line per card) for
         you and text-only clients — read it, don't paste it back.
 

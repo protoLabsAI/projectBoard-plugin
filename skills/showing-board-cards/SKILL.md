@@ -30,7 +30,10 @@ themselves every ~15 s, so an answer stays true after you've finished writing it
 
 ## Answering a check-in
 
-1. **Scope it.** Show the cards the question is about, not the whole board.
+1. **Scope it.** Show the cards the question is about.
+   - "How's the board?", "status?", "check in", "where are we?" → `board_show_cards()` with
+     **no arguments**: all open work (every state but done), most urgent first. Don't split
+     it into one call per state — that drops the blocked and queued cards.
    - "What's blocked?" → `board_show_cards(state="blocked")`.
    - "What's in review on protoAgent?" → `board_show_cards(state="in_review", project="protoAgent")`.
    - "How's epic #4076?" → find the epic's cards with `board_list` (match the epic's
@@ -73,5 +76,7 @@ card's current state. If the card has moved on, say so in one line instead of ac
 | `Show the live coder run for board card bd-…` | `board_get_feature` (state, attempt) and the latest `board_comments` (the coder-monitor notes). Summarize where the run is in two lines. The Board view's monitor drawer has the live tool feed; point there for more. |
 | `Dispatch board card bd-…` | A `backlog` card: `board_check_ready`, fix what it lists or report it, then `board_mark_ready`. Then `board_dispatch`. It claims by priority and capacity, so report its `outcome` honestly. If it claimed a different card, or was `at-capacity` / `held`, say so. |
 
-After acting, reply in one or two lines. The card on screen shows the new state on
-its next refresh.
+**After acting, always confirm in ONE line** — never end the turn on tool calls alone. Say
+what happened and the card's new state, e.g. "Unblocked bd-6k3; it's back in backlog." or
+"Didn't unblock bd-6k3: its project's gate is failing on base (ruff F841)." The card on
+screen shows the new state on its next refresh.

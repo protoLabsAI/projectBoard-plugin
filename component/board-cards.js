@@ -2,8 +2,12 @@
 //
 // The console frames this page (ADR 0118 D5) in a sandbox="allow-scripts" iframe on an
 // OPAQUE origin with no bearer. Everything it knows arrives over postMessage:
+//   handshake     the host loads us at `<frame_url>#pair=<hex>`; we post
+//                 protoComponent:ready {pair} ONCE (see handshake()) and it answers with ONE
 //   host → frame  protoComponent:init {props, theme, nonce}   the validated props (pointers only)
-//                 + a per-mount nonce (protoAgent#4172) every frame → host request echoes
+//                 + a per-mount 32-hex nonce (protoAgent#4172) every frame → host request echoes.
+//                 No `#pair=` ⇒ a pre-handshake host (no ready; its init arrives anyway);
+//                 an init with no nonce ⇒ an older core with no reads (fallback banner).
 //                 protoComponent:theme {theme}         a live re-theme
 //                 protoComponent:readResult {cid, ok, status, json | error}   (protoAgent#4143)
 //                 protoComponent:bridgeResult {cid, ok, text?, error?}       (send/openLink verdict)
@@ -24,11 +28,18 @@
   "use strict";
 
   var REFRESH_MS = 15000; // re-read every ~15 s while visible
-  var READ_TIMEOUT_MS = 6000; // no readResult by then ⇒ the host can't serve reads (older core)
+  // Longer than the host's own 10 s read timeout (#4172), so the host's verdict normally lands
+  // first. A frame-side timeout is TRANSIENT (retry with backoff) — never "older core": that is
+  // decided by the handshake alone (no `#pair=`, or an init with no nonce).
+  var READ_TIMEOUT_MS = 15000;
   var READ_SPACING_MS = 260; // ≤ 4 reads/s per frame — the host's limit (#4143)
   var MAX_IN_FLIGHT = 2; // the host's in-flight cap
   var REASON_LOOKUPS = 5; // a query listing has no block reasons — fetch at most this many
-  var RETRY_MS = 3000; // after a transient refusal (paused, rate-limited), try again this soon
+  var RETRY_MS = 3000; // after a transient refusal (paused, rate-limited, timed out) — doubling
+  var RETRY_MAX_MS = 60000; // …up to this
+  // A real board card id (`bd-<hash>[.<n>…]`). Checked on the id the READ returned before any
+  // proposal text is built from it, so a malformed id can never smuggle words into a send.
+  var CARD_ID_RE = /^bd-[a-z0-9]+(\.[0-9]+)*$/;
 
   var STATE_LABEL = {
     backlog: "backlog",
@@ -89,7 +100,7 @@
 
   /** The buttons a card shows — each only in its state. */
   function actionsFor(card) {
-    if (!card || !card.id) return [];
+    if (!card || typeof card.id !== "string" || !CARD_ID_RE.test(card.id)) return [];
     var id = card.id;
     var st = cardState(card);
     var out = [];
@@ -113,31 +124,34 @@
     if (Array.isArray(props.ids) && props.ids.length) {
       return props.ids.map(function (id) { return "features/" + encodeURIComponent(id); });
     }
-    // The host serves declared PATHS only (a `?query` is refused, #4143), so the state rides
-    // in the path — `cards/<state>` — and a project-only query reads open work (`cards`).
-    // Project filtering is ours (matchesQuery). Neither read grows with board history.
-    return [props.state ? "cards/" + encodeURIComponent(props.state) : "cards"];
+    // The host serves declared PATHS only (a `?query` is refused, #4143), so the query rides
+    // in the path and the SERVER filters and caps it (so the cap counts this project's cards):
+    //   no state, no project → `cards` (open work)       state → `cards/<state>`
+    //   project only         → `cards/open/<project>`    both  → `cards/<state>/<project>`
+    var state = props.state ? encodeURIComponent(props.state) : "";
+    var project = props.project ? encodeURIComponent(props.project) : "";
+    if (project) return ["cards/" + (state || "open") + "/" + project];
+    return [state ? "cards/" + state : "cards"];
   }
 
-  /** The `/features?state=&project=` filter, applied in the frame: board state equality,
-   *  as the store's listing filter does. */
-  function matchesQuery(props, f) {
-    if (!f) return false;
-    if (props.state && f.board_state !== props.state) return false;
-    if (props.project && String(f.project || "") !== props.project) return false;
-    return true;
+  /** Read `#pair=<hex>` (protoAgent#4172) from a location hash, or null on a pre-handshake host. */
+  function readPair(hash) {
+    var m = /^#(?:.*&)?pair=([0-9a-fA-F]{16,128})(?:&|$)/.exec(String(hash || ""));
+    return m ? m[1] : null;
   }
+
+  var NONCE_RE = /^[0-9a-fA-F]{32}$/;
 
   // Host refusals that pass on their own (#4143): out of view, the per-frame rate limit, a
   // cancelled or dropped request. Keep what we had and try again soon — never a banner.
   var TRANSIENT_RE = /^(paused|read rate limited|too many reads in flight|read cancelled|read timed out|read failed)/;
 
   /** Classify a readResult: ok / unknown (404) / transient / board error (the route's
-   *  non-2xx detail) / refused (the host said no) / unsupported (never answered). */
+   *  non-2xx detail) / refused (the host said no). A frame-side timeout is transient. */
   function classify(res) {
     if (!res) return { kind: "refused", error: "no answer" };
     if (res.ok) return { kind: "ok", json: res.json };
-    if (res.timeout) return { kind: "unsupported", error: "no answer from the console" };
+    if (res.timeout) return { kind: "transient", error: "read timed out" }; // slow, not absent
     var status = typeof res.status === "number" ? res.status : 0;
     if (!status && TRANSIENT_RE.test(String(res.error || ""))) return { kind: "transient", error: res.error };
     if (status === 404) return { kind: "unknown" };
@@ -153,7 +167,7 @@
     var parts = [];
     if (props && props.project) parts.push("project " + props.project);
     if (props && props.state) parts.push(STATE_LABEL[props.state] || props.state);
-    return parts.length ? parts.join(" · ") : "Board cards";
+    return parts.length ? parts.join(" · ") : "Open work";
   }
 
   function ago(ms) {
@@ -278,9 +292,11 @@
     var inFlight = 0;
     var lastSentAt = -Infinity;
     var pumpTimer = null;
-    var everAnswered = false;
     var generation = 0; // a props change invalidates an in-flight refresh
     var nonce = null; // the host's per-mount nonce from init (#4172), echoed on every request
+    var unsupported = false; // decided by the handshake ONLY (an init with no nonce), never a timeout
+    var transientStreak = 0; // consecutive transient refreshes → the retry backoff
+    var timedOut = {}; // cid → true for reads we gave up on; a late answer means the host is alive
 
     function pump() {
       pumpTimer = null;
@@ -312,14 +328,8 @@
       delete pending[cid];
       clearT(p.timer);
       inFlight--;
+      if (res && res.timeout) timedOut[cid] = true;
       p.resolve(res);
-      if (res && res.timeout && !everAnswered) {
-        // The host never answered a read: it can't serve them (an older core). Fail the
-        // rest of the queue now instead of timing each one out in turn.
-        var rest = queue.splice(0);
-        rest.forEach(function (job) { job.resolve({ ok: false, timeout: true }); });
-        return;
-      }
       if (queue.length && !pumpTimer) pump();
     }
 
@@ -343,7 +353,7 @@
     }
 
     function refresh() {
-      if (!props || refreshing || !visible) return Promise.resolve();
+      if (!props || refreshing || !visible || unsupported) return Promise.resolve();
       refreshing = true;
       var gen = generation;
       var ids = Array.isArray(props.ids) && props.ids.length ? props.ids : null;
@@ -353,20 +363,22 @@
         refreshing = false;
         if (gen !== generation) return refresh(); // props changed mid-read — start over
         if (next.transient) {
-          // The host paused or rate-limited us: keep the last good state and its age, and
-          // come back soon rather than in 15 s.
+          // The host paused, rate-limited or was slow: keep the last good state and its age,
+          // and come back soon — backing off while it keeps happening.
+          transientStreak++;
           next.loaded = data.loaded;
           next.lastRefreshed = data.lastRefreshed;
           data = next;
           paint();
-          schedule(RETRY_MS);
+          schedule(Math.min(RETRY_MAX_MS, RETRY_MS * Math.pow(2, transientStreak - 1)));
           return;
         }
+        transientStreak = 0;
         next.loaded = true;
         next.lastRefreshed = now();
         data = next;
         paint();
-        if (!next.unsupported) schedule(REFRESH_MS); // nothing to poll on a host that can't read
+        schedule(REFRESH_MS);
       });
     }
 
@@ -379,7 +391,6 @@
     function refreshIds(ids, paths) {
       return Promise.all(paths.map(read)).then(function (results) {
         var next = { rows: [] };
-        var unsupported = 0;
         results.forEach(function (res, i) {
           var c = classify(res);
           if (c.kind === "ok" && c.json && typeof c.json === "object") {
@@ -389,13 +400,11 @@
             var prev = previousCard(ids[i]);
             next.rows.push(prev ? { id: ids[i], card: prev } : { id: ids[i], status: "pending" });
           } else {
-            if (c.kind === "unsupported") unsupported++;
             if (c.kind === "refused" && !next.refused) next.refused = c.error;
             if (c.kind === "error" && !next.error) next.error = c.error;
             next.rows.push({ id: ids[i], status: c.kind === "unknown" ? "unknown" : "unavailable" });
           }
         });
-        if (unsupported && !everAnswered) next.unsupported = true;
         return next;
       });
     }
@@ -406,17 +415,14 @@
         var next = { rows: [] };
         if (c.kind !== "ok") {
           if (c.kind === "transient") return { rows: data.rows || [], more: data.more || 0, transient: true };
-          if (c.kind === "unsupported" && !everAnswered) next.unsupported = true;
-          else if (c.kind === "error") next.error = c.error;
+          if (c.kind === "error") next.error = c.error;
           else next.refused = c.error || "refused";
           return next;
         }
-        var all = (c.json && Array.isArray(c.json.features) && c.json.features) || [];
-        var feats = all.filter(function (f) { return matchesQuery(props, f); });
+        var feats = (c.json && Array.isArray(c.json.features) && c.json.features) || [];
         var shown = feats.slice(0, 20);
-        // `total` counts a capped done listing's full size; with a project filter we only
-        // know what we were sent.
-        var total = !props.project && c.json && typeof c.json.total === "number" ? c.json.total : feats.length;
+        // `total`: how many matched on the server before its cap (it filtered by project first).
+        var total = c.json && typeof c.json.total === "number" ? c.json.total : feats.length;
         next.more = Math.max(0, total - shown.length);
         next.rows = shown.map(function (f) { return { id: f.id, card: f }; });
         // A listing carries no block reason (only a single-card read has comments): look up
@@ -448,18 +454,20 @@
     function onMessage(m) {
       if (!m || typeof m !== "object") return;
       if (m.type === "protoComponent:init") {
-        // The mount's nonce rides on every request we make (#4172); a re-init carries the
-        // current one, so always take the latest.
-        if (typeof m.nonce === "string" && m.nonce) nonce = m.nonce;
+        // The mount's nonce rides on every request we make (#4172). An init WITHOUT one is an
+        // older core: it serves no reads, so show the pointers with a notice and never poll.
+        // (A pre-handshake host re-posts init on a schedule; a re-init is idempotent.)
+        nonce = typeof m.nonce === "string" && NONCE_RE.test(m.nonce) ? m.nonce : null;
+        unsupported = !nonce;
         applyTheme(m.theme);
         var key = JSON.stringify(m.props || {});
-        if (props && key === propsKey) return; // the host re-posts init on a schedule — idempotent
+        if (props && key === propsKey) return;
         props = m.props && typeof m.props === "object" ? m.props : {};
         propsKey = key;
         generation++;
-        data = { rows: (props.ids || []).map(function (id) { return { id: id, status: "pending" }; }), loaded: false, lastRefreshed: 0 };
+        data = { rows: (props.ids || []).map(function (id) { return { id: id, status: unsupported ? "unavailable" : "pending" }; }), loaded: unsupported, lastRefreshed: 0, unsupported: unsupported };
         paint();
-        refresh(); // immediately on mount
+        refresh(); // immediately on mount (a no-op on an older core)
       } else if (m.type === "protoComponent:theme") {
         applyTheme(m.theme);
         if (props) {
@@ -468,9 +476,19 @@
           refresh(); // and immediately on re-theme
         }
       } else if (m.type === "protoComponent:readResult") {
-        if (typeof m.cid !== "number" || !pending[m.cid]) return;
-        everAnswered = true;
-        settle(m.cid, m);
+        if (typeof m.cid !== "number") return;
+        if (pending[m.cid]) {
+          settle(m.cid, m);
+        } else if (timedOut[m.cid]) {
+          // A read we had given up on answered after all: the host is alive, just slow.
+          // Re-read now instead of waiting out the backoff.
+          delete timedOut[m.cid];
+          if (m.ok && !refreshing && visible) {
+            if (refreshTimer) clearT(refreshTimer);
+            refreshTimer = null;
+            refresh();
+          }
+        }
       }
     }
 
@@ -481,6 +499,7 @@
       paint: paint,
       read: read,
       nonce: function () { return nonce; },
+      unsupported: function () { return unsupported; },
       state: function () {
         return { props: props, data: data, visible: visible, refreshing: refreshing, scheduled: !!refreshTimer, inFlight: inFlight, queued: queue.length };
       },
@@ -555,6 +574,27 @@
     });
   }
 
+  /** The #4172 handshake. The host loads us at `<frame_url>#pair=<hex>` (fresh per mount); we
+   *  post `protoComponent:ready {pair}` EXACTLY ONCE (a second ready revokes the mount) and it
+   *  answers with ONE `protoComponent:init {props, theme, nonce}`. No `#pair=` ⇒ a
+   *  pre-handshake host: send nothing and wait for its init the old way. The pair is then
+   *  cleared from the URL (best effort — an opaque-origin frame may refuse replaceState).
+   *  Returns the pair it sent, or null. Call AFTER the message listener is registered. */
+  function handshake(win, post) {
+    if (win.__boardCardsReady) return null; // never twice, whatever calls this
+    var pair = readPair(win.location && win.location.hash);
+    if (!pair) return null;
+    win.__boardCardsReady = true;
+    post({ type: "protoComponent:ready", pair: pair });
+    try {
+      var loc = win.location;
+      win.history.replaceState(null, "", loc.pathname + loc.search);
+    } catch (_) {
+      /* sandboxed opaque origin — the fragment stays; it is only good for this one ready */
+    }
+    return pair;
+  }
+
   /** Boot in the browser: wire the controller to the DOM and the host. */
   function start(win, doc) {
     win = win || window;
@@ -583,6 +623,7 @@
       ctl.onMessage(e.data);
       bridge.onMessage(e.data);
     });
+    handshake(win, postUp); // listening first, so the one init can't be missed
     mount.addEventListener("click", function (e) {
       var t = e.target && e.target.closest ? e.target.closest("[data-send],[data-open]") : null;
       if (!t) return;
@@ -626,7 +667,8 @@
     mergeGreen: mergeGreen,
     actionsFor: actionsFor,
     readPathsFor: readPathsFor,
-    matchesQuery: matchesQuery,
+    readPair: readPair,
+    CARD_ID_RE: CARD_ID_RE,
     classify: classify,
     viewModel: viewModel,
     renderHTML: renderHTML,
@@ -634,6 +676,7 @@
     createBridge: createBridge,
     withNonce: withNonce,
     applyThemeTo: applyThemeTo,
+    handshake: handshake,
     start: start,
   };
 });

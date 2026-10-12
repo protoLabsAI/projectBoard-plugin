@@ -654,19 +654,31 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         return await _guard(lambda: cards_payload(annotate_next_action(store().list_features(), cfg or {})))
 
-    @router.get("/cards/{state}")
-    async def _cards_in_state(state: str):
-        """One board state's cards as slim rows (#522) — the frame's read for a state query.
-        ``done``/``cancelled`` are capped to the most recently closed ``DONE_CAP`` (``total``
-        says how many matched), so the size never depends on how much history the board
-        holds. 404 for anything that isn't a board state."""
+    async def _scoped_cards(state: str, project: str = ""):
         from .board_cards import STATES, cards_payload
 
-        if state not in STATES and state != "cancelled":
+        if state != "open" and state not in STATES and state != "cancelled":
             raise HTTPException(404, f"unknown board state {state!r}")
+        st = "" if state == "open" else state
         return await _guard(
-            lambda: cards_payload(annotate_next_action(store().list_features(state=state), cfg or {}), state)
+            lambda: cards_payload(annotate_next_action(store().list_features(state=st or None), cfg or {}), st, project)
         )
+
+    @router.get("/cards/{state}")
+    async def _cards_in_state(state: str):
+        """One board state's cards as slim rows (#522) — the frame's read for a state query
+        (``open`` = open work, the same as bare ``/cards``). ``done``/``cancelled`` are capped
+        to the most recently closed ``DONE_CAP``, any other state to the ``OPEN_CAP`` most
+        urgent; ``total`` says how many matched. 404 for anything that isn't a board state."""
+        return await _scoped_cards(state)
+
+    @router.get("/cards/{state}/{project}")
+    async def _cards_in_state_for_project(state: str, project: str):
+        """Like ``/cards/{state}``, for one project of a multi-project board (#522): the
+        project filter runs BEFORE the cap, so the cards shown are that project's most urgent
+        (or most recently closed) and ``total`` counts only that project's. ``open`` as the
+        state = the project's open work."""
+        return await _scoped_cards(state, project)
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):
