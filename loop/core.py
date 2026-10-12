@@ -8,6 +8,7 @@ sibling modules, so a change confined to one edge lands there — not on this su
 
 from __future__ import annotations
 
+import re
 import sys
 
 from .. import host_friction, review_coverage_hold
@@ -17,7 +18,19 @@ from .preflight import PreflightMixin
 from .prompt import PromptMixin
 from .reconcile import ReconcileMixin
 
-_loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
+_loop = sys.modules[__package__]
+
+#: The block causes that are the board's machinery failing, each with its stable friction
+#: summary. Everything else the loop blocks on is a gate or review OUTCOME (or a human's
+#: act), which ``_flag_blocked`` never records as friction.
+_FRICTION_BLOCK_CAUSES = (
+    (re.compile(r"^ready-queue livelock"), "a ready card livelocked in the queue (never claimed)"),
+    (re.compile(r"^review gate could not complete"), "the review gate could not complete (reviewer failing)"),
+    (re.compile(r"coder dispatch failed|delegate .*not (?:configured|reachable)", re.I), "the coder dispatch failed"),
+    (re.compile(r"\btimed out after\b", re.I), "a dispatch timed out"),
+    (re.compile(r"worktree (?:is )?missing|worktree .*(?:gone|vanished)", re.I), "a worktree went missing"),
+)
+# the loop package, for monkeypatch-visible seams
 
 
 class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
@@ -604,23 +617,32 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
     def _store(self):
         return _loop.get_store(**self._store_kw)
 
-    def _flag_blocked(self, store, fid: str, reason: str, category: str = ""):
+    def _flag_blocked(self, store, fid: str, reason: str, category: str = "", *, friction: bool = True):
         """``store.flag_blocked`` for the loop's own blocks, plus one host friction record
-        when the block is TERMINAL (a human must act). The loop's terminal blocks happen
-        outside any agent turn, so without this the agent's friction review never sees
-        them. A block a human sets (the tool, the API) does not come through here. The
-        call shape is ``store.flag_blocked``'s own: ``category`` is passed only when given."""
+        when the block's CAUSE is the board's machinery failing (``_FRICTION_BLOCK_CAUSES``):
+        a livelocked ready card, a review gate that could not run, a dispatch the loop could
+        not make. A block that is a gate doing its job (a red merged-state gate, review
+        findings that persist, an external review FAIL, a rebase conflict) or a human's act
+        (a PR closed unmerged) is an outcome, not friction, and is never recorded. A drive's
+        own failure is recorded by kind where it happens (``_friction_drive_failure``), so
+        ``_block_or_stand_aside`` passes ``friction=False``. A block a human sets (the tool,
+        the API) does not come through here. The store call is unchanged: ``category`` is
+        passed only when given."""
         kwargs = {"category": category} if category else {}
         out = store.flag_blocked(fid, reason, **kwargs)
-        cls = (str(category or "").strip() or classify(reason).category).lower().replace("_", "-")
-        if cls == "terminal":
-            summary = f"board loop terminal-blocked a card: {host_friction.stable_phrase(reason, drop=(fid,))}"
-            host_friction.record(
-                summary,
-                f"card {fid}: {reason[:500]}",
-                severity="major",
-                key=f"{summary}|{fid}",
-            )
+        if friction:
+            # The cause is in the reason's FIRST line; what follows is gate or tool output,
+            # whose words ("timed out after") say nothing about why the loop blocked.
+            first = (str(reason or "").splitlines() or [""])[0]
+            for pattern, summary in _FRICTION_BLOCK_CAUSES:
+                if pattern.search(first):
+                    host_friction.record(
+                        f"board loop blocked a card: {summary}",
+                        f"card {fid}: {reason[:500]}",
+                        severity="major",
+                        key=f"{summary}|{fid}",
+                    )
+                    break
         return out
 
     # ── persisted fix budgets (#259): bead labels are truth, the dicts are caches ─

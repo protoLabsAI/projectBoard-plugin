@@ -106,6 +106,10 @@ def test_a_seam_that_raises_never_reaches_the_loop(monkeypatch):
             "CI failing at the top model tier after N same-tier fix",
         ),
         ("unexpected: KeyError: 'x'", (), "unexpected"),
+        ("dependency bd-qq12 is not merged yet", (), "dependency is not merged yet"),
+        ("error: pathspec 'src/Foo Bar.ts' did not match any file", (), "error: pathspec … did not match any file"),
+        ("git push of feat/bd-1-x to origin refused by src/x/y.py hook", (), "git push of to origin refused by hook"),
+        ("merged-state verify re-run needed", (), "merged-state verify re-run needed"),
         ("", (), "unclassified failure"),
     ],
 )
@@ -178,15 +182,73 @@ class _BlockStore:
         return {"id": fid}
 
 
-def test_a_terminal_block_is_recorded_and_a_transient_one_is_not(ledger):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "PR closed without merging — needs triage: https://github.com/o/r/pull/9",
+        "external review FAILED at head abc1234 (QA panel) after 2 review fix round(s) — needs human review: https://x/pull/1",
+        "review findings persist after 3 fix attempt(s) — needs human review: https://x/pull/2",
+        "gate FAILED on the merged state (branch + main@abc1234) — the PR merges clean but the RESULT is broken; "
+        "needs triage: https://x/pull/3\nE   pytest timed out after 30s",
+        "rebase conflict with main after 3 attempt(s) — needs a manual rebase: https://x/pull/4",
+        "CI failing at the top model tier after 2 same-tier fix(es) — needs triage: https://x/pull/5",
+    ],
+)
+def test_a_gate_or_review_outcome_block_is_not_friction(ledger, reason):
+    """A block that is a gate doing its job, or a human's act, is not the board's machinery
+    getting in the way: it never reaches the friction ledger (the output's own words, like
+    `timed out after` in a failing test, don't count either)."""
     lp = BoardLoop({})
     store = _BlockStore()
-    lp._flag_blocked(store, "bd-1", "PR closed without merging — needs triage: https://github.com/o/r/pull/9")
-    lp._flag_blocked(store, "bd-2", "rate limit 429 from the gateway", category="transient")
-    assert [c[0] for c in store.calls] == ["bd-1", "bd-2"]
-    assert store.calls[1][2] == "transient" and store.calls[0][2] == ""  # the store call is unchanged
-    assert ledger.summaries() == ["board loop terminal-blocked a card: PR closed without merging"]
-    assert ledger.rows[0]["severity"] == "major" and "bd-1" in ledger.rows[0]["detail"]
+    lp._flag_blocked(store, "bd-1", reason)
+    assert store.calls == [("bd-1", reason, "")]  # the block itself is unchanged
+    assert ledger.rows == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "summary"),
+    [
+        (
+            "ready-queue livelock: skipped 30 consecutive ticks as 'hot-file' and never claimed",
+            "board loop blocked a card: a ready card livelocked in the queue (never claimed)",
+        ),
+        (
+            "review gate could not complete after 3 attempt(s) — reviewer 'quinn' did not answer — needs operator attention",
+            "board loop blocked a card: the review gate could not complete (reviewer failing)",
+        ),
+        (
+            "coder dispatch failed: delegate 'proto' not configured",
+            "board loop blocked a card: the coder dispatch failed",
+        ),
+    ],
+)
+def test_a_machinery_block_is_friction(ledger, reason, summary):
+    lp = BoardLoop({})
+    store = _BlockStore()
+    lp._flag_blocked(store, "bd-1", reason, category="terminal")
+    assert store.calls == [("bd-1", reason, "terminal")]
+    assert ledger.summaries() == [summary] and ledger.rows[0]["severity"] == "major"
+
+
+def test_a_drive_block_is_not_recorded_twice(ledger):
+    """A drive's failure is recorded by kind where it happens; its block passes friction=False."""
+    lp = BoardLoop({})
+    lp._flag_blocked(_BlockStore(), "bd-1", "coder dispatch failed: ACP connection closed", friction=False)
+    assert ledger.rows == []
+
+
+def test_one_summary_cannot_use_up_the_window(ledger, monkeypatch):
+    monkeypatch.setattr(host_friction, "MAX_PER_SUMMARY", 3)
+    for i in range(10):
+        host_friction.record("coder drive timed out", key=f"x|bd-{i}")
+    assert len(ledger.rows) == 3
+    assert host_friction.record("a worktree went missing")  # another kind still gets through
+
+
+def test_details_and_summaries_are_redacted(ledger):
+    leak = "NPM_" + "TOKEN=" + "npm" + "_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+    host_friction.record("drive failed", "card bd-1: " + leak)
+    assert "abcdefghij" not in ledger.rows[0]["detail"] and "[REDACTED]" in ledger.rows[0]["detail"]
 
 
 async def test_a_crashed_loop_phase_is_recorded(ledger):

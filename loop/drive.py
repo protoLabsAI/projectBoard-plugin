@@ -2947,7 +2947,8 @@ class DriveMixin:
             )
             return False
         kwargs = {"category": category} if category else {}
-        await asyncio.to_thread(self._flag_blocked, store, fid, reason, **kwargs)
+        # The drive's failure is already in the friction ledger by kind (_friction_drive_failure).
+        await asyncio.to_thread(self._flag_blocked, store, fid, reason, friction=False, **kwargs)
         return True
 
     async def _stand_aside(self, store, fid: str, moved_to: str, *, repo: str, wt, branch, pr_url, why: str) -> None:
