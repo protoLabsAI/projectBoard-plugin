@@ -44,7 +44,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # the operator sees (setup_check), never a phantom delegate name that exists on
         # one machine and blocks every feature with "delegate not configured" elsewhere.
         self.coder_name = str(self.cfg.get("coder") or "").strip()
-        self.reviewer_name = self.cfg.get("reviewer", "quinn")
+        # Coerced and stripped like `coder`. A blank `reviewer` stays blank (no review
+        # dispatch), as it always did; only an absent key takes the default.
+        self.reviewer_name = str(self.cfg.get("reviewer", "quinn") or "").strip()
         # Review dispatch is OPT-IN (default off). The fleet's PR-review pipeline
         # already reviews PRs the moment they're opened, so the loop doesn't need to
         # `delegate_to(reviewer)` — it just opens the PR and lets the pipeline + CI +

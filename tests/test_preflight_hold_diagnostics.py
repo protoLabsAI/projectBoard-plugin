@@ -154,21 +154,29 @@ def test_the_hold_line_picks_the_most_telling_line(output, want):
 # ── what the comment shows, and what it never shows ───────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "secret_line",
-    [
-        "NPM_TOKEN=npm_abcdefghijklmnopqrstuvwxyz0123456789",
-        "//registry.npmjs.org/:_authToken=s3cr3tvalue",
-        "fetching https://bot:hunter2pass@git.example.com/repo.git",
-        "token ghp_abcdefghijklmnopqrstuvwxyz0123456789AB in env",
-        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
-        "OPENAI key sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-    ],
-)
+# Built by concatenation so the source never holds a literal token shape: a reviewer's
+# diff redactor (protoreview) rewrites such literals, closing quote included, and then
+# reads the test as a syntax error. The runtime values still exercise the redactor.
+_FAKE = "abcdefghijklmnopqrstuvwxyz0123456789"
+_NPM = "npm" + "_" + _FAKE
+_GHP = "gh" + "p_" + _FAKE + "AB"
+_SKK = "s" + "k-" + _FAKE.upper()
+_JWT = "ey" + "J" + "hbGciOiJIUzI1NiJ9" + ".payload.sig"
+_SECRET_LINES = [
+    "NPM_TOKEN=" + _NPM,
+    "//registry.npmjs.org/:_auth" + "Token=s3cr3tvalue",
+    "fetching https://bot:" + "hunter2pass" + "@git.example.com/repo.git",
+    "token " + _GHP + " in env",
+    "Authorization: " + "Bearer " + _JWT,
+    "OPENAI key " + _SKK,
+]
+
+
+@pytest.mark.parametrize("secret_line", _SECRET_LINES)
 def test_gate_output_is_redacted(secret_line):
-    out = _redact_gate_output(f"step\n{secret_line}\nExit status 1")
+    out = _redact_gate_output("step\n" + secret_line + "\nExit status 1")
     assert "[REDACTED]" in out
-    for secret in ("npm_abcdefghij", "s3cr3tvalue", "hunter2pass", "ghp_abcdef", "eyJhbGci", "sk-ABCDEF"):
+    for secret in (_NPM[:12], "s3cr3tvalue", "hunter2pass", _GHP[:10], _JWT[:8], _SKK[:9]):
         assert secret not in out
 
 
@@ -303,13 +311,13 @@ async def test_status_serves_the_failure_redacted(fake, monkeypatch):
     store = _Store(["bd-1"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     lp = BoardLoop({"local_gate_cmd": "pnpm -r test", "preflight": True})
-    fake.append((1, b"GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789AB\n" + _PNPM_RECURSIVE_FAIL.encode()))
+    fake.append((1, ("GH_TOKEN=" + _GHP + "\n" + _PNPM_RECURSIVE_FAIL).encode()))
     await lp._preflight("default", "pnpm -r test", "/repo")
     lp._publish_preflight_health()
 
     failure = health.preflight_snapshot()["failures"]["default"]
     assert failure["exit_code"] == 1 and failure["headline"].startswith("ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL")
-    assert "ghp_abcdef" not in failure["tail"] and "ghp_abcdef" not in health.preflight_snapshot()["held"]["default"]
+    assert _GHP[:10] not in failure["tail"] and _GHP[:10] not in health.preflight_snapshot()["held"]["default"]
     assert "key" not in failure  # the dedupe key is internal
 
     fake.append((0, b""))
@@ -424,3 +432,47 @@ async def test_the_marked_chain_keeps_the_gates_verdict(board, tmp_path):
     assert reason.startswith("failing step 1/2: false")
     assert "never" not in reason
     assert lp._preflight_detail["default"]["exit_code"] == 1
+
+
+def test_reviewer_name_is_coerced_and_stripped_like_coder():
+    assert BoardLoop({"reviewer": "  vera \n"}).reviewer_name == "vera"
+    assert BoardLoop({}).reviewer_name == "quinn"
+    assert BoardLoop({"reviewer": ""}).reviewer_name == ""  # blank stays blank: no review dispatch
+    assert BoardLoop({"reviewer": None}).reviewer_name == ""
+
+
+def test_status_resyncs_the_gap_reporter_and_serves_the_preflight_failure(monkeypatch):
+    """GET /status re-reports the setup preflight through the shared ``gap_reporter`` (the
+    host warning can clear on a board whose loop is off), and in the same response serves
+    the held project's gate-preflight failure detail."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from project_board import api
+
+    class _Reporter:
+        def __init__(self):
+            self.reports = []
+
+        def report(self, setup):
+            self.reports.append(setup)
+
+    class _EmptyStore:
+        def list_features(self, **_kw):
+            return []
+
+    detail = {"cmd": _DS_GATE, "step": "pnpm -r typecheck", "step_index": 2, "steps": 3, "exit_code": 1}
+    detail.update(headline="ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL", tail=_PNPM_RECURSIVE_FAIL, key="k")
+    health.publish_preflight({"ds": "failing step 2/3: pnpm -r typecheck\n…"}, {}, failures={"ds": detail})
+    rep = _Reporter()
+    monkeypatch.setattr(api, "get_store", lambda **_kw: _EmptyStore())
+    app = FastAPI()
+    app.include_router(api.build_data_router({}, gap_reporter=rep), prefix="/api/plugins/project_board")
+    try:
+        body = TestClient(app).get("/api/plugins/project_board/status").json()
+    finally:
+        health.publish_preflight({}, {})
+    assert len(rep.reports) == 1 and rep.reports[0] == body["setup"]
+    assert body["held_projects"] == ["ds"]
+    failure = body["preflight"]["failures"]["ds"]
+    assert failure["step"] == "pnpm -r typecheck" and failure["exit_code"] == 1 and "key" not in failure
