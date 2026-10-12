@@ -182,16 +182,13 @@ async def _git(repo: str, *args: str, timeout: float = 60, env: dict[str, str] |
         env={**os.environ, **env} if env else None,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        # communicate_or_kill: ANY exit but a normal one kills and reaps the tree. #211: a
+        # task cancel (the operator's cancel verb) while the child runs must not let a
+        # `git push` finish and land the branch on the remote; a read error must not leave
+        # a hook's children running either.
+        out, err = await communicate_or_kill(proc, timeout=timeout)
     except asyncio.TimeoutError:
-        kill_tree(proc)
-        raise WorktreeError(f"git {' '.join(args)} timed out after {timeout}s")
-    except asyncio.CancelledError:
-        # #211: a task cancel (the operator's cancel verb) while the child runs —
-        # wait_for re-raises it but does NOT kill the child, so a `git push` would
-        # finish anyway and the branch land on the remote. Kill, then propagate.
-        kill_tree(proc)
-        raise
+        raise WorktreeError(f"git {' '.join(args)} timed out after {timeout}s") from None
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -319,16 +316,27 @@ async def reap(proc, *, timeout: float | None = None) -> None:
 
 
 async def communicate_or_kill(proc, *, timeout: float | None) -> tuple[bytes | None, bytes | None]:
-    """``proc.communicate()`` on a hard ``timeout``. On timeout OR cancel, kill the whole
-    tree and reap it before re-raising (``asyncio.TimeoutError`` / ``CancelledError``),
+    """``proc.communicate()`` on a hard ``timeout``. On ANY exit but a normal return — a
+    timeout, a cancel (a caller's own ``wait_for`` expiring included), a read or decode
+    error, an ``OSError`` from a pipe — kill the whole tree and reap it before re-raising,
     so no caller can leave a gate running behind it. A cancel used to leave the tree
-    running untouched — every drive cancel and shutdown mid-gate leaked one."""
+    running untouched — every drive cancel and shutdown mid-gate leaked one — and any
+    other error still did until every exit shared this one cleanup path."""
     try:
         return await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        kill_tree(proc)
-        await asyncio.shield(reap(proc))
+    except BaseException as exc:
+        await _kill_and_reap(proc, exc)
         raise
+
+
+async def _kill_and_reap(proc, exc: BaseException) -> None:
+    """The one cleanup for a spawned tree whose read did not finish normally: SIGKILL the
+    group, then reap it on a bound, shielded so a second cancel cannot cut the reap short.
+    A coroutine being closed (``GeneratorExit``) must not await, so it only kills."""
+    kill_tree(proc)
+    if isinstance(exc, GeneratorExit):
+        return
+    await asyncio.shield(reap(proc))
 
 
 # Paths the coder writes as its OWN session scratch — the ACP/`proto` coder's private
@@ -2023,16 +2031,13 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        # #211: same as _git — a cancel (or any other abnormal exit) mid-`gh pr create`
+        # kills the tree, so the child cannot finish and open a PR nobody owns. (If it
+        # already did, the drive's cancel path finds it by branch — pr_url_for_branch —
+        # and closes it.)
+        out, err = await communicate_or_kill(proc, timeout=timeout)
     except asyncio.TimeoutError:
-        kill_tree(proc)
-        raise WorktreeError(f"gh {' '.join(args)} timed out after {timeout}s")
-    except asyncio.CancelledError:
-        # #211: same as _git — a cancel mid-`gh pr create` must not let the child
-        # finish and open a PR nobody owns. (If it already did, the drive's cancel
-        # path finds it by branch — pr_url_for_branch — and closes it.)
-        kill_tree(proc)
-        raise
+        raise WorktreeError(f"gh {' '.join(args)} timed out after {timeout}s") from None
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 

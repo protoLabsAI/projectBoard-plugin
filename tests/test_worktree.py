@@ -1389,6 +1389,9 @@ class _HangingProc:
     def kill(self):
         self.killed = True
 
+    async def wait(self):  # the reap after the kill
+        return self.returncode
+
 
 @pytest.mark.parametrize("runner", ["_gh", "_git"])
 async def test_task_cancel_mid_subprocess_kills_the_child_and_propagates(monkeypatch, runner):

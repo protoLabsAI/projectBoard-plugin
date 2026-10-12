@@ -368,3 +368,99 @@ async def test_a_worktree_install_never_reads_the_servers_stdin(tmp_path, server
     )
     assert reason == ""
     assert (tmp_path / "seen.txt").read_text() == ""
+
+
+# ── a read error mid-run kills the tree too (#526 review) ─────────────────────────────
+# Every spawn-and-read path shares one cleanup: ANY exit but a normal return kills the
+# group and reaps it. Before, only a timeout or a cancel did; an OSError or a decode error
+# raised while reading the child's output left the whole tree running.
+
+
+def _poison_reads(monkeypatch, pidfile, exc: BaseException, *, names=("spawn_shell", "spawn_exec")):
+    """Wrap the guarded spawns so the child's stdout read raises ``exc`` — but only once
+    the grandchild has recorded its pid, so the tree is really there when the read fails."""
+
+    def _wrap(real):
+        async def _spawn(*args, **kw):
+            proc = await real(*args, **kw)
+
+            async def _read(*_a, **_kw):
+                await _pid_from(pidfile)
+                raise exc
+
+            proc.stdout.read = _read
+            return proc
+
+        return _spawn
+
+    for name in names:
+        monkeypatch.setattr(worktree, name, _wrap(getattr(worktree, name)))
+
+
+def _fake_on_path(tmp_path, monkeypatch, name: str, pidfile) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / name
+    fake.write_text("#!/bin/sh\n" + _TREE.format(pidfile=pidfile) + "\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+async def _read_err_gate(tmp_path, pidfile, monkeypatch):
+    return await _gate_loop(_TREE.format(pidfile=pidfile), timeout=300)._run_local_gate(str(tmp_path))
+
+
+async def _read_err_preflight(tmp_path, pidfile, monkeypatch):
+    loop = BoardLoop({"coder": "proto"})
+    loop.preflight_timeout = 300
+    return await loop._preflight("p", _TREE.format(pidfile=pidfile), str(tmp_path))
+
+
+async def _read_err_registry_smoke(tmp_path, pidfile, monkeypatch):
+    from project_board import project_registry
+
+    return await project_registry._smoke_gate_on_clean_base("p", _TREE.format(pidfile=pidfile), str(tmp_path), "main")
+
+
+async def _read_err_git(tmp_path, pidfile, monkeypatch):
+    return await worktree._git(str(tmp_path), "-c", f"alias.tree=!{_TREE.format(pidfile=pidfile)}", "tree")
+
+
+async def _read_err_gh(tmp_path, pidfile, monkeypatch):
+    _fake_on_path(tmp_path, monkeypatch, "gh", pidfile)
+    return await worktree._gh("pr", "list", cwd=str(tmp_path))
+
+
+async def _read_err_lsof(tmp_path, pidfile, monkeypatch):
+    _fake_on_path(tmp_path, monkeypatch, "lsof", pidfile)
+    return await worktree._lsof_cwds()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [OSError(5, "Input/output error"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")],
+    ids=["oserror", "decode_error"],
+)
+@pytest.mark.parametrize(
+    "runner",
+    [_read_err_gate, _read_err_preflight, _read_err_registry_smoke, _read_err_git, _read_err_gh, _read_err_lsof],
+    ids=lambda f: f.__name__.removeprefix("_read_err_"),
+)
+async def test_a_read_error_mid_run_kills_the_tree(tmp_path, monkeypatch, runner, exc):
+    """A pipe read that raises (an OSError on a broken fd, a decode error) is no timeout and
+    no cancel, so it used to skip the kill: the registry's gate smoke fell through to its
+    outer ``except OSError``, and ``_git``/``_gh`` caught only the two. Whatever the caller
+    then does with the error (raise it, fail open, return None), no grandchild survives."""
+    pidfile = tmp_path / "grandchild.pid"
+    _poison_reads(monkeypatch, pidfile, exc)
+
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(runner(tmp_path, pidfile, monkeypatch), timeout=15)
+    except asyncio.TimeoutError:
+        pytest.fail("the read error left the caller waiting on the tree")
+    except Exception:  # noqa: BLE001 — raising is fine; leaking is not
+        pass
+    pid = await _pid_from(pidfile)
+    assert time.monotonic() - started < 10
+    assert await _gone(pid), "the grandchild outlived a read error on its parent's pipe"

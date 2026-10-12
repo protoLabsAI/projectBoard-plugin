@@ -415,13 +415,16 @@ async def _smoke_gate_on_clean_base(name: str, cmd: str, repo: str, base: str, *
                 _SMOKE_TIMEOUT_S,
             )
             return
-        except asyncio.CancelledError:
-            # A cancelled PUT (client gone, shutdown) must not leave the gate running in
-            # the operator's base checkout (#423) — the timeout path above always killed
-            # the tree; a cancel left it untouched.
+        except BaseException as exc:
+            # Every other exit — a cancelled PUT (client gone, shutdown), an OSError from a
+            # pipe read, a decode error — must not leave the gate running in the operator's
+            # base checkout (#423). The timeout path above always killed the tree; a cancel
+            # left it untouched, and a read error still did (it fell through to the outer
+            # `except OSError`, which never killed). A closing coroutine may not await.
             _kill_gate_tree(proc)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=_SMOKE_REAP_TIMEOUT_S))
+            if not isinstance(exc, GeneratorExit):
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=_SMOKE_REAP_TIMEOUT_S))
             raise
     except (OSError, subprocess.SubprocessError) as exc:
         if force:
