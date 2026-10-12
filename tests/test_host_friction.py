@@ -296,3 +296,16 @@ async def test_a_preflight_hold_is_recorded_once_per_distinct_failure(ledger, mo
     outputs.append((0, b""))
     await lp._preflight("ds", "pnpm -r typecheck", "/repo")  # recovered: a later failure is new again
     assert "ds" not in lp._preflight_friction
+
+
+async def test_a_coder_delegate_that_is_not_configured_is_friction(ledger):
+    """Not a raised drive failure, so only the block itself can record it: the drive's
+    block passes friction=True for this one machinery cause."""
+    lp = BoardLoop({})
+    store = _BlockStore()
+    lp._moved_under_drive = lambda *_a, **_k: ""
+    blocked = await lp._block_or_stand_aside(
+        store, "bd-1", "coder delegate 'proto' not configured/enabled", repo="/r", wt=None, branch=None, friction=True
+    )
+    assert blocked and store.calls == [("bd-1", "coder delegate 'proto' not configured/enabled", "")]
+    assert ledger.summaries() == ["board loop blocked a card: the coder dispatch failed"]

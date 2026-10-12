@@ -1725,6 +1725,9 @@ class DriveMixin:
                         wt=wt,
                         branch=branch,
                         pr_url=pr_url,
+                        # Not a raised drive failure, so _friction_drive_failure never sees
+                        # it: a misconfigured coder is machinery friction, recorded here.
+                        friction=True,
                     )
                     return
                 try:
@@ -2924,7 +2927,18 @@ class DriveMixin:
             log.debug("[project_board] %s drive-failure friction record failed", fid, exc_info=True)
 
     async def _block_or_stand_aside(
-        self, store, fid: str, reason: str, *, repo: str, wt, branch, pr_url=None, category: str = "", refusal=""
+        self,
+        store,
+        fid: str,
+        reason: str,
+        *,
+        repo: str,
+        wt,
+        branch,
+        pr_url=None,
+        category: str = "",
+        refusal="",
+        friction: bool = False,
     ) -> bool:
         """THE way a drive blocks its card (#398): block it for this drive's own failure —
         unless it is no longer the drive's card, in which case the failure is recorded as a
@@ -2947,8 +2961,10 @@ class DriveMixin:
             )
             return False
         kwargs = {"category": category} if category else {}
-        # The drive's failure is already in the friction ledger by kind (_friction_drive_failure).
-        await asyncio.to_thread(self._flag_blocked, store, fid, reason, friction=False, **kwargs)
+        # A raised drive failure is already in the friction ledger by kind
+        # (_friction_drive_failure); a caller blocking for a machinery cause of its own
+        # (a coder delegate that isn't configured) passes friction=True.
+        await asyncio.to_thread(self._flag_blocked, store, fid, reason, friction=friction, **kwargs)
         return True
 
     async def _stand_aside(self, store, fid: str, moved_to: str, *, repo: str, wt, branch, pr_url, why: str) -> None:
