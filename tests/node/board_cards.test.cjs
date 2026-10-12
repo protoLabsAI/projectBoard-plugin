@@ -97,11 +97,23 @@ test("Merge shows only when the gates the read returns are green", () => {
   }
 });
 
-test("reads: one per id, or one slim listing for a query", () => {
+test("reads: one per id, or the slim board for a query — never a query string (#4143)", () => {
   assert.deepEqual(BC.readPathsFor({ ids: ["bd-a1", "bd-vbyd.24"] }), ["features/bd-a1", "features/bd-vbyd.24"]);
-  assert.deepEqual(BC.readPathsFor({ state: "blocked" }), ["features?state=blocked&fields=card"]);
-  assert.deepEqual(BC.readPathsFor({ state: "in_review", project: "protoAgent" }), ["features?state=in_review&project=protoAgent&fields=card"]);
-  assert.deepEqual(BC.readPathsFor({ project: "x" }), ["features?project=x&fields=card"]);
+  assert.deepEqual(BC.readPathsFor({ state: "blocked" }), ["cards"]);
+  assert.deepEqual(BC.readPathsFor({ state: "in_review", project: "protoAgent" }), ["cards"]);
+  // Every path is plain segments the host's read matcher accepts.
+  for (const p of [...BC.readPathsFor({ ids: ["bd-a1", "bd-vbyd.24"] }), ...BC.readPathsFor({ project: "x" })]) {
+    assert.ok(p.split("/").every((seg) => /^[A-Za-z0-9._~:@+=,-]+$/.test(seg)), p);
+  }
+});
+
+test("a query filters the board in the frame, by state and project", () => {
+  const f = card({ board_state: "blocked", project: "a" });
+  assert.ok(BC.matchesQuery({ state: "blocked" }, f));
+  assert.ok(BC.matchesQuery({ state: "blocked", project: "a" }, f));
+  assert.ok(!BC.matchesQuery({ state: "blocked", project: "b" }, f));
+  assert.ok(!BC.matchesQuery({ state: "ready" }, f));
+  assert.ok(BC.matchesQuery({ project: "a" }, f));
 });
 
 // ── render ───────────────────────────────────────────────────────────────────────────
@@ -163,7 +175,7 @@ test("refreshes every ~15s, pauses out of view, and catches up on return", async
   const ok = () => ({ ok: true, status: 200, json: { features: [card({ id: "bd-x", board_state: "ready" })] } });
   await h.answerAll(ok);
   assert.equal(h.reads().length, 1);
-  assert.equal(h.reads()[0].path, "features?state=blocked&fields=card");
+  assert.equal(h.reads()[0].path, "cards");
   assert.ok(h.ctl.state().scheduled);
   await h.advance(BC.REFRESH_MS - 1000);
   assert.equal(h.reads().length, 1, "not before ~15s");
@@ -221,7 +233,7 @@ test("a refused read shows the refusal, not a stale or empty board", async () =>
 test("a board error (JSON detail) is shown as the board's answer", async () => {
   const h = harness();
   h.ctl.onMessage({ type: "protoComponent:init", props: { state: "blocked" }, theme: {} });
-  await h.answerAll(() => ({ ok: false, status: 400, json: { detail: "no repo bound" } }));
+  await h.answerAll(() => ({ ok: false, status: 400, error: "no repo bound" }));
   assert.match(h.renders.at(-1).banner.text, /couldn't answer: no repo bound/);
 });
 
@@ -239,11 +251,11 @@ test("a listing's blocked cards get their reason from a single-card read", async
   const h = harness();
   h.ctl.onMessage({ type: "protoComponent:init", props: { state: "blocked" }, theme: {} });
   await h.answerAll((p) =>
-    p.startsWith("features?")
-      ? { ok: true, status: 200, json: { features: [card({ id: "bd-b", board_state: "blocked", blocked: true })] } }
+    p === "cards"
+      ? { ok: true, status: 200, json: { features: [card({ id: "bd-b", board_state: "blocked", blocked: true }), card({ id: "bd-r", board_state: "ready" })] } }
       : { ok: true, status: 200, json: card({ id: "bd-b", board_state: "blocked", blocked: true, blocked_reason: "secret missing" }) },
   );
-  assert.deepEqual(h.reads().map((m) => m.path), ["features?state=blocked&fields=card", "features/bd-b"]);
+  assert.deepEqual(h.reads().map((m) => m.path), ["cards", "features/bd-b"]);
   assert.equal(h.renders.at(-1).rows[0].blockedReason, "secret missing");
 });
 
@@ -257,6 +269,23 @@ test("older core: no readResult ever ⇒ the fallback banner, fast, and no polli
   assert.equal(h.reads().length, 2, "the queued reads fail at once instead of timing out one by one");
   assert.deepEqual(vm.rows.map((r) => r.status), ["unavailable", "unavailable", "unavailable", "unavailable"]);
   assert.equal(h.ctl.state().scheduled, false, "nothing to poll on a host that can't read");
+});
+
+test("a transient host refusal (paused, rate-limited) keeps the last cards and retries soon", async () => {
+  const h = harness();
+  h.ctl.onMessage({ type: "protoComponent:init", props: { state: "ready" }, theme: {} });
+  await h.answerAll(() => ({ ok: true, status: 200, json: { features: [card({ id: "bd-r", board_state: "ready" }), card({ id: "bd-x", board_state: "done" })] } }));
+  assert.deepEqual(h.renders.at(-1).rows.map((r) => r.id), ["bd-r"], "filtered to the query");
+  const refreshedAt = h.ctl.state().data.lastRefreshed;
+  await h.advance(BC.REFRESH_MS);
+  await h.answerAll(() => ({ ok: false, status: 0, error: "paused: the component is not visible" }));
+  const vm = h.renders.at(-1);
+  assert.equal(vm.banner, null, "no banner for a pause");
+  assert.deepEqual(vm.rows.map((r) => r.id), ["bd-r"], "the last good cards stay");
+  assert.equal(h.ctl.state().data.lastRefreshed, refreshedAt, "not claimed as refreshed");
+  const n = h.reads().length;
+  await h.advance(3000);
+  assert.equal(h.reads().length, n + 1, "retried within seconds, not 15s");
 });
 
 test("a readResult for an unknown cid is ignored", async () => {
@@ -285,7 +314,7 @@ test("a button sends its exact text as a protoComponent:send proposal; a PR link
 test("theme: curated keys map onto --pl-* tokens; --pl-* pass through; mode sets color-scheme", () => {
   const set = {};
   const el = { style: { setProperty: (k, v) => (set[k] = v), colorScheme: "" } };
-  BC.applyThemeTo(el, { bg: "#111", brand: "#a0f", "--pl-space-2": "6px", mode: "light", junk: "x", fg: "" });
+  BC.applyThemeTo(el, { bg: "#111", brand: "#a0f", "--pl-space-2": "6px", "color-scheme": "light", junk: "x", fg: "" });
   assert.deepEqual(set, { "--pl-color-bg": "#111", "--pl-color-accent": "#a0f", "--pl-space-2": "6px" });
   assert.equal(el.style.colorScheme, "light");
 });

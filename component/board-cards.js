@@ -27,6 +27,7 @@
   var READ_SPACING_MS = 260; // ≤ 4 reads/s per frame — the host's limit (#4143)
   var MAX_IN_FLIGHT = 2; // the host's in-flight cap
   var REASON_LOOKUPS = 5; // a query listing has no block reasons — fetch at most this many
+  var RETRY_MS = 3000; // after a transient refusal (paused, rate-limited), try again this soon
 
   var STATE_LABEL = {
     backlog: "backlog",
@@ -111,20 +112,32 @@
     if (Array.isArray(props.ids) && props.ids.length) {
       return props.ids.map(function (id) { return "features/" + encodeURIComponent(id); });
     }
-    var q = [];
-    if (props.state) q.push("state=" + encodeURIComponent(props.state));
-    if (props.project) q.push("project=" + encodeURIComponent(props.project));
-    q.push("fields=card");
-    return ["features?" + q.join("&")];
+    // The host serves declared PATHS only (a `?query` is refused, #4143), so a state/project
+    // query reads the slim live board and filters here (matchesQuery).
+    return ["cards"];
   }
 
-  /** Classify a readResult: ok / unknown (404) / board error (a JSON error from the
-   *  route) / refused (the host said no, or never answered). */
+  /** The `/features?state=&project=` filter, applied in the frame: board state equality,
+   *  as the store's listing filter does. */
+  function matchesQuery(props, f) {
+    if (!f) return false;
+    if (props.state && f.board_state !== props.state) return false;
+    if (props.project && String(f.project || "") !== props.project) return false;
+    return true;
+  }
+
+  // Host refusals that pass on their own (#4143): out of view, the per-frame rate limit, a
+  // cancelled or dropped request. Keep what we had and try again soon — never a banner.
+  var TRANSIENT_RE = /^(paused|read rate limited|too many reads in flight|read cancelled|read failed)/;
+
+  /** Classify a readResult: ok / unknown (404) / transient / board error (the route's
+   *  non-2xx detail) / refused (the host said no) / unsupported (never answered). */
   function classify(res) {
     if (!res) return { kind: "refused", error: "no answer" };
     if (res.ok) return { kind: "ok", json: res.json };
     if (res.timeout) return { kind: "unsupported", error: "no answer from the console" };
     var status = typeof res.status === "number" ? res.status : 0;
+    if (!status && TRANSIENT_RE.test(String(res.error || ""))) return { kind: "transient", error: res.error };
     if (status === 404) return { kind: "unknown" };
     var detail = res.json && typeof res.json.detail === "string" ? res.json.detail : "";
     if (status >= 400 && status < 600 && status !== 401 && status !== 403) {
@@ -336,12 +349,28 @@
       return work.then(function (next) {
         refreshing = false;
         if (gen !== generation) return refresh(); // props changed mid-read — start over
+        if (next.transient) {
+          // The host paused or rate-limited us: keep the last good state and its age, and
+          // come back soon rather than in 15 s.
+          next.loaded = data.loaded;
+          next.lastRefreshed = data.lastRefreshed;
+          data = next;
+          paint();
+          schedule(RETRY_MS);
+          return;
+        }
         next.loaded = true;
         next.lastRefreshed = now();
         data = next;
         paint();
         if (!next.unsupported) schedule(REFRESH_MS); // nothing to poll on a host that can't read
       });
+    }
+
+    function previousCard(id) {
+      var rows = data.rows || [];
+      for (var i = 0; i < rows.length; i++) if (rows[i].id === id && rows[i].card) return rows[i].card;
+      return null;
     }
 
     function refreshIds(ids, paths) {
@@ -352,6 +381,10 @@
           var c = classify(res);
           if (c.kind === "ok" && c.json && typeof c.json === "object") {
             next.rows.push({ id: ids[i], card: c.json });
+          } else if (c.kind === "transient") {
+            next.transient = true;
+            var prev = previousCard(ids[i]);
+            next.rows.push(prev ? { id: ids[i], card: prev } : { id: ids[i], status: "pending" });
           } else {
             if (c.kind === "unsupported") unsupported++;
             if (c.kind === "refused" && !next.refused) next.refused = c.error;
@@ -369,12 +402,14 @@
         var c = classify(res);
         var next = { rows: [] };
         if (c.kind !== "ok") {
+          if (c.kind === "transient") return { rows: data.rows || [], more: data.more || 0, transient: true };
           if (c.kind === "unsupported" && !everAnswered) next.unsupported = true;
           else if (c.kind === "error") next.error = c.error;
           else next.refused = c.error || "refused";
           return next;
         }
-        var feats = (c.json && Array.isArray(c.json.features) && c.json.features) || [];
+        var all = (c.json && Array.isArray(c.json.features) && c.json.features) || [];
+        var feats = all.filter(function (f) { return matchesQuery(props, f); });
         var shown = feats.slice(0, 20);
         next.more = Math.max(0, feats.length - shown.length);
         next.rows = shown.map(function (f) { return { id: f.id, card: f }; });
@@ -489,6 +524,10 @@
       var v = theme[key];
       if (v == null || v === "") return;
       v = String(v);
+      if (key === "color-scheme" || key === "colorScheme") {
+        if (v === "light" || v === "dark") rootEl.style.colorScheme = v;
+        return;
+      }
       if (key === "mode") {
         if (v === "light" || v === "dark") rootEl.style.colorScheme = v;
         return;
@@ -568,6 +607,7 @@
     mergeGreen: mergeGreen,
     actionsFor: actionsFor,
     readPathsFor: readPathsFor,
+    matchesQuery: matchesQuery,
     classify: classify,
     viewModel: viewModel,
     renderHTML: renderHTML,

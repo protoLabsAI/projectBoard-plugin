@@ -164,7 +164,7 @@ def test_registers_the_frame_kind_with_its_reads():
     assert bc.register_component(host) is True
     assert bc.EMIT is True
     assert host.calls == [
-        ("board-cards", bc.validate_props, "component/board-cards.html", ["features", "features/*", "status"])
+        ("board-cards", bc.validate_props, "component/board-cards.html", ["cards", "features/*", "status"])
     ]
     assert host.gaps == []
 
@@ -375,10 +375,12 @@ def test_the_frame_page_and_its_reads_are_served(monkeypatch, store):
     assert "__CARDS_" not in page.text and "BoardCards.start(window, document)" in page.text
     assert "/_ds/plugin-kit.css" in page.text
 
-    slim = c.get("/api/plugins/project_board/features", params={"state": "blocked", "fields": "card"})
-    assert slim.status_code == 200
-    (row,) = slim.json()["features"]
-    assert row["id"] == "bd-2" and "spec" not in row
+    # Every declared read is a served JSON GET under the plugin prefix (the frame reads these).
+    slim = c.get("/api/plugins/project_board/cards")
+    assert slim.status_code == 200 and slim.headers["content-type"].startswith("application/json")
+    rows = slim.json()["features"]
+    assert [r["id"] for r in rows] == ["bd-1", "bd-2", "bd-3", "bd-4"]
+    assert all("spec" not in r and "design" not in r for r in rows)
 
     one = c.get("/api/plugins/project_board/features/bd-1")
     assert one.status_code == 200 and one.json()["id"] == "bd-1"

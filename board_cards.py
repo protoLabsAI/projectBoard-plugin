@@ -33,8 +33,10 @@ COMPONENT = "board-cards"
 # `public_paths` must cover it, because the opaque-origin frame sends no bearer.
 FRAME = "component/board-cards.html"
 # The plugin's own GET routes (relative to /api/plugins/project_board/) the frame may ask
-# the host to read on its behalf. `*` is exactly one path segment.
-READS = ["features", "features/*", "status"]
+# the host to read on its behalf. `*` is exactly one path segment. The host serves declared
+# PATHS only — a `?query` is refused — so a state/project query reads the slim `cards`
+# listing and filters in the frame; a single card reads `features/<id>`.
+READS = ["cards", "features/*", "status"]
 
 SETUP_GAP_KEY = "board_cards"
 SETUP_GAP_MESSAGE = (
@@ -189,7 +191,7 @@ def component_tail(props: dict) -> str:
     return "\n" + encode_component(COMPONENT, props)
 
 
-# ── the card projection (shared by the tool summary and GET /features?fields=card) ──
+# ── the card projection (GET /cards) ──
 
 _CARD_KEYS = (
     "id",

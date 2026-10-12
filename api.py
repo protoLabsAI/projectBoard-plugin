@@ -619,9 +619,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     # ── features ──────────────────────────────────────────────────────────────
     @router.get("/features")
-    async def _features(
-        state: str | None = None, include_archived: bool = False, project: str | None = None, fields: str | None = None
-    ):
+    async def _features(state: str | None = None, include_archived: bool = False, project: str | None = None):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
         # actionable BoardError message — an escaped BoardError is a text/plain 500
@@ -634,24 +632,30 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # Every row carries `next_action` / `awaiting_merge` / `next_action_hint`
         # (#208) — derived from labels + the board's auto_merge/review_gate config,
         # no per-row network — so the console can chip "awaiting merge".
-        # ?fields=card (#522) returns the slim card rows the in-chat board cards render (id,
-        # title, state, blocked, next_action, PR …) — no spec/criteria/design, so a listing
-        # stays well under the host's 256 KB component-read cap on any board size.
         want = str(project or "").strip()
-        slim = str(fields or "").strip() == "card"
 
         def _list():
             feats = store().list_features(state=state, include_archived=include_archived)
             if want:
                 feats = [f for f in feats if str(f.get("project") or "") == want]
-            feats = annotate_next_action(feats, cfg or {})
-            if slim:
-                from .board_cards import card_row
-
-                feats = [card_row(f) for f in feats]
-            return {"features": feats}
+            return {"features": annotate_next_action(feats, cfg or {})}
 
         return await _guard(_list)
+
+    @router.get("/cards")
+    async def _cards():
+        """The live board as slim CARD rows (#522) — what the in-chat `board-cards` frame
+        reads through the console's mediated read channel (protoAgent#4143). Query-free on
+        purpose: the host only serves declared read PATHS (no `?` — a query string is
+        refused), so the frame filters by state/project itself. Each row is
+        ``board_cards.card_row`` (id, title, state, blocked, next_action, PR …) — no
+        spec/criteria/design — so the whole board stays far under the host's 256 KB read
+        cap. Archived cards are excluded, like the default ``/features`` listing."""
+        from .board_cards import card_row
+
+        return await _guard(
+            lambda: {"features": [card_row(f) for f in annotate_next_action(store().list_features(), cfg or {})]}
+        )
 
     @router.get("/features/{fid}")
     async def _feature(fid: str):
