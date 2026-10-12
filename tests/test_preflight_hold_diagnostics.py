@@ -161,7 +161,7 @@ _FAKE = "abcdefghijklmnopqrstuvwxyz0123456789"
 _NPM = "npm" + "_" + _FAKE
 _GHP = "gh" + "p_" + _FAKE + "AB"
 _SKK = "s" + "k-" + _FAKE.upper()
-_JWT = "ey" + "J" + "hbGciOiJIUzI1NiJ9" + ".payload.sig"
+_JWT = "ey" + "J" + "hbGciOiJIUzI1NiJ9" + ".payload" + ".signature"
 _SECRET_LINES = [
     "NPM_TOKEN=" + _NPM,
     "//registry.npmjs.org/:_auth" + "Token=s3cr3tvalue",
@@ -476,3 +476,175 @@ def test_status_resyncs_the_gap_reporter_and_serves_the_preflight_failure(monkey
     assert body["held_projects"] == ["ds"]
     failure = body["preflight"]["failures"]["ds"]
     assert failure["step"] == "pnpm -r typecheck" and failure["exit_code"] == 1 and "key" not in failure
+
+
+# ── review of #523: a stable failure key, `[[ ]]`, restarts, redaction ─────────────────
+
+_NPM8_FAIL = """\
+> ds-site@1.0.0 build /repo
+> webpack --mode production
+
+ERROR in ./src/index.js
+Module not found: Error: Can't resolve './missing' in '/repo/src'
+npm ERR! code ELIFECYCLE
+npm ERR! errno 2
+npm ERR! ds-site@1.0.0 build: `webpack --mode production`
+npm ERR! Exit status 2
+npm ERR!
+npm ERR! Failed at the ds-site@1.0.0 build script.
+npm ERR! This is probably not a problem with npm. There is likely additional logging output above.
+
+npm ERR! A complete log of this run can be found in:
+npm ERR!     /root/.npm/_logs/{stamp}-debug.log"""
+
+_NPM10_FAIL = """\
+ERROR in ./src/index.js {took}
+Module not found: Error: Can't resolve './missing' in '/repo/src'
+npm error Lifecycle script `build` failed with error:
+npm error code 2
+npm error path /repo
+npm error workspace ds-site@1.0.0
+npm error location /repo
+npm error command failed
+npm error command sh -c webpack --mode production
+npm error A complete log of this run can be found in: /root/.npm/_logs/{stamp}-debug-0.log"""
+
+_JEST_FAIL = """\
+FAIL src/tokens.test.ts ({took} s)
+  ● tokens › resolves the brand colour
+    expect(received).toBe(expected)
+Tests: 1 failed, 41 passed, 42 total
+Time: {took} s"""
+
+_PYTEST_FAIL = """\
+FAILED tests/test_x.py::test_y - assert <Foo object at {addr}> == 3
+1 failed, 9 passed in {took}s"""
+
+
+def _stamp(i: int) -> dict:
+    return {
+        "stamp": f"2026-10-11T18_{i:02d}_33_{100 + i}Z",
+        "took": f"{3 + i}.{i}",
+        "addr": f"0x7f{i:02x}a3b9c0d0",
+    }
+
+
+@pytest.mark.parametrize(
+    ("template", "headline"),
+    [
+        (_NPM8_FAIL, "npm ERR! Failed at the ds-site@1.0.0 build script."),
+        (_NPM10_FAIL, "npm error Lifecycle script `build` failed with error:"),
+        (_JEST_FAIL, "FAIL src/tokens.test.ts"),
+        (_PYTEST_FAIL, "FAILED tests/test_x.py::test_y"),
+    ],
+)
+async def test_an_unchanged_failure_comments_once_per_card_across_many_rechecks(fake, monkeypatch, template, headline):
+    """The review measured 30 comments in 10 re-checks with 3 cards: npm's timestamped
+    log path won the headline, so the key changed every minute. Ten re-checks of one
+    failure, with timestamps, durations and addresses varying, now give ONE comment per
+    card, and the headline names the failure, never the log file."""
+    store = _Store(["bd-1", "bd-2", "bd-3"])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    lp = BoardLoop({"local_gate_cmd": "npm run build"})
+    keys = set()
+    for i in range(10):
+        fake.append((1, template.format(**_stamp(i)).encode()))
+        await lp._preflight("default", "npm run build", "/repo")
+        lp._hold_ready_for_preflight()
+        keys.add(lp._preflight_detail["default"]["key"])
+        assert lp._preflight_detail["default"]["headline"].startswith(headline)
+        assert "_logs/" not in lp._preflight_detail["default"]["headline"]
+    assert len(keys) == 1
+    assert sorted(c[1] for c in store.comments()) == ["bd-1", "bd-2", "bd-3"]
+    blocked = [c[2] for c in store.calls if c[0] == "flag_blocked"]
+    assert all("_logs/" not in r and "A complete log" not in r for r in blocked)
+
+
+def test_npm_boilerplate_never_wins_the_headline():
+    out = _NPM8_FAIL.format(**_stamp(1)).replace("npm ERR! Failed at the ds-site@1.0.0 build script.\n", "")
+    assert _informative_line(out).startswith("npm ERR! ds-site@1.0.0 build:")
+
+
+@posix_only
+def test_a_double_bracket_test_is_never_split():
+    cmd = "[[ -d . && -f /etc/hosts ]] && echo ok"
+    assert _and_chain_steps(cmd) == []
+    assert _mark_steps(cmd) == (cmd, [])
+
+
+@posix_only
+@requires_br
+async def test_a_double_bracket_gate_still_passes(board):
+    """Split inside `[[ ]]`, the marked command exited 2 on bash's /bin/sh and held a
+    healthy project. Unmarked, it runs exactly as written. (`/bin/sh` without `[[` support
+    fails the original too, so the verdict is compared against the original.)"""
+    import subprocess
+
+    cmd = "[[ -d . && -f /etc/hosts ]] && echo ok"
+    want = subprocess.run(["/bin/sh", "-c", cmd], cwd=board.repo, capture_output=True).returncode
+    lp = BoardLoop({"coder": "proto", "repo": board.repo, "local_gate_cmd": cmd})
+    await lp._preflight("default", cmd, board.repo)
+    assert (lp._preflight_state["default"] is True) == (want == 0)
+
+
+async def test_a_restart_does_not_repeat_the_comment(fake, monkeypatch):
+    """Boot recovery releases the holds and the first red re-check re-holds them; the
+    comment state was in memory, so every restart re-posted the same output. The key is
+    now the comment's last line, and a fresh loop reads it back before posting."""
+    store = _Store(["bd-1"])
+    store.feature_comments = lambda fid: [c[2] for c in store.calls if c[0] == "comment" and c[1] == fid]
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    first = BoardLoop({"local_gate_cmd": "pnpm -r typecheck"})
+    fake.append((1, _PNPM_RECURSIVE_FAIL.encode()))
+    await first._preflight("default", "pnpm -r typecheck", "/repo")
+    first._hold_ready_for_preflight()
+    assert len(store.comments()) == 1
+    assert store.comments()[0][2].rstrip().endswith(first._preflight_detail["default"]["key"])
+
+    store.ready = [{"id": "bd-1", "board_state": "ready", "blocked": False}]  # boot recovery released it
+    second = BoardLoop({"local_gate_cmd": "pnpm -r typecheck"})
+    fake.append((1, b"Scope: 4 of 5 (took 9.9s)\n" + _PNPM_RECURSIVE_FAIL.encode()))
+    await second._preflight("default", "pnpm -r typecheck", "/repo")
+    second._hold_ready_for_preflight()
+    assert len([c for c in store.calls if c[0] == "flag_blocked"]) == 2  # re-held, as before
+    assert len(store.comments()) == 1  # but the output is not posted again
+
+    # A different failure after the restart is posted.
+    fake.append((1, b"Error: Cannot find module 'left-pad'\nExit status 1"))
+    await second._preflight("default", "pnpm -r typecheck", "/repo")
+    second._hold_ready_for_preflight()
+    assert len(store.comments()) == 2
+
+
+_PEM = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEow" + "IBAAKCAQEA\nabcdef\n-----END " + "RSA PRIVATE KEY-----"
+_MORE_SECRETS = [
+    ('{"pass' + 'word": "hunter2pass"}', "hunter2pass"),
+    ('"author' + 'ization": "Bea' + 'rer abcdefghijkl"', "abcdefghijkl"),
+    ("mysql --pass" + "word hunter2pass -h db", "hunter2pass"),
+    ("token " + "ey" + "JhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxIn0" + ".c2lnbmF0dXJl" + " in header", "c2lnbmF0dXJl"),
+    ("key:\n" + _PEM + "\nnext line", "MIIEow"),
+    ("stripe " + "sk" + "_live_" + "abcdefghijklmnop", "abcdefghijklmnop"),
+    ("gitlab " + "gl" + "pat-" + "abcdefghijklmnopqrstu", "abcdefghijklmnopqrstu"),
+    ("postgres://user:" + "p@ss" + "@db.example.com/app", "p@ss"),
+    ("SECRET_" + 'KEY="a b c"', "a b c"),
+]
+
+
+@pytest.mark.parametrize(("line", "secret"), _MORE_SECRETS)
+def test_more_secret_shapes_are_redacted(line, secret):
+    out = _redact_gate_output("step\n" + line + "\nExit status 1")
+    assert secret not in out and "[REDACTED" in out
+    assert "next line" in out or "next line" not in line  # a PEM block is cut, not the rest
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "TokenExpiredError: jwt expired",
+        "TokenizerError: unexpected character",
+        "Missing env var GITHUB_TOKEN: set it in .env",
+        "assert token == 'abc'",
+    ],
+)
+def test_prose_that_mentions_a_token_is_left_readable(prose):
+    assert _redact_gate_output(prose) == prose

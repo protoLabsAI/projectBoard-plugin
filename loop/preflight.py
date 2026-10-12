@@ -36,40 +36,90 @@ _STEP_MARKER_RE = re.compile(r"^\[pb-preflight\] step (\d+)/(\d+)(?::.*)?$")
 PREFLIGHT_TAIL_LINES = 30
 _TAIL_LINE_CHARS = 300
 _TAIL_TOTAL_CHARS = 4000
-#: Lines that end a failing run but say nothing about WHAT failed.
+#: Lines that end a failing run but say nothing about WHAT failed: shell and package-manager
+#: sign-offs, and npm's boilerplate. npm's log-path lines carry a timestamp that changes on
+#: every run, so as a headline they would make every re-check look like a new failure.
 _NOISE_LINE_RE = re.compile(
     r"^(?:exit status \d+|…\(truncated\)…|(?:\S+ )?elifecycle\s+command failed(?: with exit code \d+)?\.?"
-    r"|command failed with exit code \d+\.?|error: command failed with exit code \d+\.?|\s*)$",
+    r"|command failed with exit code \d+\.?|error: command failed with exit code \d+\.?|\s*"
+    r"|npm (?:ERR!|error)\s*"
+    r"|npm (?:ERR!|error)\s+(?:code|errno|path|workspace|location|command|syscall|signal|exit status)\b.*"
+    r"|.*a complete log of this run can be found in.*"
+    r"|.*_logs/\S*-debug(?:-\d+)?\.log\s*"
+    r"|npm (?:ERR!|error)\s+(?:this is probably not a problem with npm|there is likely additional logging).*"
+    r")$",
     re.I,
 )
-#: Lines that say what broke, most telling first: a pnpm/npm error code (it carries the
-#: failing package and script) or the #3585 missing-command hint; then a missing module, a
-#: failed test or a compiler error; then any error-looking line.
+#: Lines that say what broke, most telling first: a pnpm/npm error that names the failing
+#: package or script, or the #3585 missing-command hint; then a missing module, a failed
+#: test or a compiler error; then any error-looking line.
 _ERROR_LINE_TIERS = (
-    re.compile(r"ERR_PNPM_\w+|npm ERR!|\bERR!|^gate command not found:"),
-    re.compile(r"Cannot find module|^FAIL(?:ED)?\b|\berror TS\d+|^E\s{2,}\S"),
+    re.compile(r"ERR_PNPM_\w+|npm (?:ERR!|error)\s|\bERR!|^gate command not found:"),
+    re.compile(
+        r"Cannot find module|Module not found|Can't resolve|^FAIL(?:ED)?\b|\berror TS\d+|^E\s{2,}\S"
+        r"|^\w*(?:Syntax|Type|Reference|Import|ModuleNotFound|Assertion)Error\b"
+    ),
     re.compile(
         r"\berror\b|Error:|MODULE_NOT_FOUND|\bnot found\b|No such file or directory|Traceback|\bfailed\b|ELIFECYCLE",
         re.I,
     ),
 )
-#: Credential shapes scrubbed from gate output before it reaches a card or a tool.
+#: What varies between two runs of the same failure, taken out of a headline before it is
+#: hashed into the failure key: timestamps, durations, hex addresses, temp and npm-log paths,
+#: and any remaining number.
+_KEY_NOISE = (
+    re.compile(r"\d{4}-\d\d-\d\d[T _]\d\d[:_]\d\d(?:[:_]\d\d(?:[._]\d+)?)?Z?"),
+    re.compile(r"\b\d\d:\d\d:\d\d(?:\.\d+)?\b"),
+    re.compile(r"\b0x[0-9a-fA-F]+\b"),
+    re.compile(r"(?:/private)?/(?:tmp|var/folders|var/tmp)/\S*|\S*_logs/\S*"),
+    re.compile(r"\(?\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min)\b\)?"),
+    re.compile(r"\d+"),
+)
+
+
+def _key_text(line: str) -> str:
+    """``line`` with everything that differs between two runs of the same failure taken out."""
+    s = str(line or "")
+    for pattern in _KEY_NOISE:
+        s = pattern.sub("#", s)
+    return " ".join(s.split())
+
+
+#: Credential shapes scrubbed from gate output before it reaches a card, a tool or the
+#: friction ledger. A key name only counts in an assignment or key/value shape, so prose
+#: that merely mentions a token (`TokenExpiredError: jwt expired`) stays readable.
+_SECRET_NAME = r"[\w-]*(?:password|passwd|secret|token|api[_-]?key|authorization|private[_-]?key|access[_-]?key)[\w-]*"
 _SECRET_PATTERNS = (
-    (re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+"), r"\1[REDACTED]"),
+    (
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
+        "[REDACTED PRIVATE KEY]",
+    ),
+    (re.compile(r"(?i)(authorization\s*[\"']?\s*:\s*[\"']?\s*(?:bearer|basic|token)\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\"" + _SECRET_NAME + r"\"\s*:\s*\")[^\"]*(\")"), r"\1[REDACTED]\2"),
     (re.compile(r"(?i)(_authToken\s*=\s*)\S+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(://[^/\s:@]+:)[^@\s/]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key|access-key)(?:\s+|=))(?!-)\S+"), r"\1[REDACTED]"),
+    # userinfo: the password runs to the LAST `@` before the host, so `p@ss@db` is covered.
+    (re.compile(r"(://[^/\s:@]+:)[^\s/]*@"), r"\1[REDACTED]@"),
     (
         re.compile(
-            r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)"
-            r"(\s*[=:]\s*)[\"']?[^\s\"']+"
+            r"\b((?=[A-Z])[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)"
+            r"(\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
         ),
         r"\1\2[REDACTED]",
     ),
     (
         re.compile(
-            r"\b(?:sk-[A-Za-z0-9_\-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}"
-            r"|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{20,}|ya29\.[A-Za-z0-9_\-]+"
-            r"|npm_[A-Za-z0-9]{30,})"
+            r"\b((?=[A-Z])[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)"
+            r"(:\s*)[\"']?[A-Za-z0-9_\-./+=]{12,}[\"']?"
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+"), "[REDACTED]"),
+    (
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_\-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|gh[pousr]_[A-Za-z0-9]{30,}"
+            r"|github_pat_[A-Za-z0-9_]{30,}|glpat-[A-Za-z0-9_\-]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}"
+            r"|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{20,}|ya29\.[A-Za-z0-9_\-]+|npm_[A-Za-z0-9]{30,})"
         ),
         "[REDACTED]",
     ),
@@ -140,8 +190,8 @@ def _and_chain_steps(cmd: str) -> list[str]:
                 i += 1
                 continue
             return []
-        if c in ";`(){}\n\r" or cmd.startswith("||", i) or cmd.startswith("<<", i):
-            return []
+        if c in ";`(){}\n\r" or cmd.startswith(("||", "<<", "[[", "]]"), i):
+            return []  # `[[ a && b ]]` keeps its `&&` inside the test: never split there
         buf.append(c)
         i += 1
     if quote:
@@ -239,7 +289,9 @@ def _preflight_failure_detail(text: str, *, step: tuple[int, int, str] | None, e
         "headline": headline,
         "tail": _output_tail(text),
     }
-    raw_key = f"{detail['step_index']}|{detail['step']}|{exit_code}|{headline}"
+    # The key is built from the headline with timings, timestamps, addresses and numbers
+    # taken out, so a re-check of the SAME failure keeps its key (one comment per card).
+    raw_key = f"{detail['step_index']}|{detail['step']}|{exit_code}|{_key_text(headline)}"
     detail["key"] = hashlib.sha1(raw_key.encode("utf-8", "replace")).hexdigest()[:12]
     return detail
 
@@ -274,8 +326,26 @@ def _preflight_hold_comment(name: str, detail: dict) -> str:
         "Nothing on the card needs to change: fix the project's gate environment (or local_gate_cmd), "
         "and the loop releases the hold once the gate passes.\n"
         f"Last {PREFLIGHT_TAIL_LINES} lines of output (secrets redacted):\n"
-        f"```\n{tail}\n```"
+        f"```\n{tail}\n```\n"
+        f"{_COMMENT_KEY_PREFIX}{detail.get('key', '')}"
     )
+
+
+#: The last line of a hold comment: the failure key it was posted for. A restarted loop reads
+#: it back off the card, so the same failure is not commented twice across a restart.
+_COMMENT_KEY_PREFIX = "preflight-failure-key: "
+_COMMENT_HEAD = "gate preflight output (project "
+
+
+def _last_hold_comment_key(comments) -> str:
+    """The failure key of the newest preflight hold comment in ``comments`` (str or dict
+    rows, oldest first), or ``""``."""
+    for c in reversed(list(comments or [])):
+        text = (c.get("text") or c.get("body") or c.get("content") or "") if isinstance(c, dict) else str(c or "")
+        if text.startswith(_COMMENT_HEAD):
+            last = text.rstrip().rsplit("\n", 1)[-1]
+            return last[len(_COMMENT_KEY_PREFIX) :].strip() if last.startswith(_COMMENT_KEY_PREFIX) else ""
+    return ""
 
 
 class PreflightMixin:
@@ -680,6 +750,19 @@ class PreflightMixin:
             )
         return detail
 
+    @staticmethod
+    def _card_has_hold_comment(store, fid: str, key: str) -> bool:
+        """Whether the card's newest hold comment was posted for failure ``key``. Read only
+        for a card this process has not commented yet, i.e. after a restart; a store
+        without comment reads, or a failed read, answers False (post the comment)."""
+        read = getattr(store, "feature_comments", None)
+        if read is None:
+            return False
+        try:
+            return _last_hold_comment_key(read(fid)) == key
+        except Exception:  # noqa: BLE001 — a failed read costs at most one repeated comment
+            return False
+
     def _comment_preflight_holds(self, store) -> None:
         """Post the output comment on every card this loop holds for a failed preflight,
         once per distinct failure per card (``detail["key"]``: the step and the line that
@@ -695,6 +778,9 @@ class PreflightMixin:
             body = ""
             for fid in sorted(held):
                 if sent.get(fid) == detail["key"]:
+                    continue
+                if fid not in sent and self._card_has_hold_comment(store, fid, detail["key"]):
+                    sent[fid] = detail["key"]  # posted before a restart: don't repeat it
                     continue
                 body = body or _preflight_hold_comment(name, detail)
                 try:
