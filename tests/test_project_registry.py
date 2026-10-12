@@ -363,7 +363,10 @@ async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monke
         plugin_config={
             "project_board": {
                 "projects": {
-                    "alpha": {"repo": str(repo), "coders": {"smart": "proto"}, "local_gate_cmd": "old"},
+                    # A value no tmp path can contain: the leak check below searches the
+                    # whole result, which includes the repo path. "proto" failed it whenever
+                    # the tmp dir did, e.g. a --basetemp under a protoAgent scratchpad.
+                    "alpha": {"repo": str(repo), "coders": {"smart": "file-only-coder"}, "local_gate_cmd": "old"},
                     "beta": {"repo": "/b"},
                 }
             }
@@ -380,11 +383,11 @@ async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monke
 
     projects = cfg.plugin_config["project_board"]["projects"]
     assert set(projects) == {"alpha", "beta"}
-    assert projects["alpha"]["coders"] == {"smart": "proto"}
+    assert projects["alpha"]["coders"] == {"smart": "file-only-coder"}
     assert "local_gate_cmd" not in projects["alpha"]
     assert result["entry"]["extra_fields"] == ["coders"]
     assert "coders" not in result["entry"]
-    assert "proto" not in str(result)
+    assert "file-only-coder" not in str(result)
 
 
 def test_registry_snapshot_names_but_does_not_return_file_only_values(monkeypatch):

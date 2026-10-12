@@ -225,16 +225,39 @@ async def spawn_shell(cmd: str, *, cwd: str, env: dict | None = None, stdout=Non
 
     ``stdout``/``stderr`` pass straight through (``PIPE`` / ``STDOUT`` / ``DEVNULL``).
     Pair it with :func:`communicate_or_kill` (or :func:`kill_tree` + :func:`reap`) so a
-    timeout or cancel takes the whole tree down, not just the shell."""
-    return await asyncio.create_subprocess_shell(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=stdout,
-        stderr=stderr,
-        start_new_session=True,
+    timeout or cancel takes the whole tree down, not just the shell.
+
+    A cancel that lands WHILE the spawn is in flight kills the tree too. The process
+    exists as soon as ``Popen`` returns, but ``create_subprocess_shell`` keeps awaiting
+    its pipe hookup after that; cancelled there, asyncio's own cleanup SIGKILLs only the
+    shell and then waits for the pipes to close. If the shell had already forked (any
+    ``a && b``, or a loaded box where it got that far first), the child kept the
+    stdout pipe, so the cancel blocked for the child's whole run and left it orphaned.
+    A Max-Mode sibling cancel lands here whenever the failing tree raises before the
+    others finish spawning (a reaped tree fails at launch, so it usually does). So the spawn runs shielded, and a cancel waits for it to
+    finish (milliseconds: local pipes), kills the group, and reaps it, then re-raises."""
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_shell(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
     )
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        await asyncio.wait({spawn}, timeout=_REAP_TIMEOUT_S)
+        if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
+            proc = spawn.result()
+            kill_tree(proc)
+            await asyncio.shield(reap(proc))
+        else:
+            spawn.cancel()
+        raise
 
 
 def kill_tree(proc) -> None:

@@ -34,6 +34,7 @@ Notes on `br` quirks pinned down empirically (br 0.1.x):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -1466,9 +1467,11 @@ class BeadsBoard:
         # mutate the policy under us.
         self.max_files_by_difficulty = dict(max_files_by_difficulty or MAX_FILES_BY_DIFFICULTY)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
-        # Serialises the hot-file chain's read-tail → add-edge (#458): two racing creates
-        # must not both chain onto the same tail, or onto each other.
-        self._chain_lock = threading.Lock()
+        # Serialises hot-file creates through their chain's read-tail → add-edge (#458):
+        # two racing creates must not both chain onto the same tail, or onto each other.
+        # Reentrant: a hot-file create holds it from `br create` through the chain step,
+        # which takes it again (see create_feature).
+        self._chain_lock = threading.RLock()
 
     def reconfigure_projects(self, projects: dict | None, default_project: str = "") -> None:
         """Replace the live multi-project routing map without rebuilding the board.
@@ -1747,6 +1750,75 @@ class BeadsBoard:
         files_to_modify (see `_prepare_ready`); `assignee` pre-assigns the bead (else it
         starts unassigned and the puller claims it). `waits_for` names publish gates
         (gates.py grammar) that must ALL hold before the loop claims the card."""
+        # A card on a hot file is created AND chained under the chain lock (#458). Chaining
+        # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
+        # a racing card could chain while an older one was still invisible (or created but
+        # not yet chained), and both then hung off the same tail, unordered, so the Ready
+        # gate's shared-file check refused one of them. Holding the lock from `br create`
+        # to the last edge makes in-process creation order and chain order the same thing.
+        # Only hot-file cards pay for it; every other create stays parallel.
+        hot = chain_hot_files and issue_type != LABEL_TASK and self._names_hot_file(project, files_to_modify)
+        with self._chain_lock if hot else contextlib.nullcontext():
+            return self._create_feature(
+                title,
+                spec=spec,
+                acceptance_criteria=acceptance_criteria,
+                design=design,
+                files_to_modify=files_to_modify,
+                parent=parent,
+                priority=priority,
+                difficulty=difficulty,
+                depends_on=depends_on,
+                foundation=foundation,
+                source_issue=source_issue,
+                project=project,
+                issue_type=issue_type,
+                assignee=assignee,
+                waits_for=waits_for,
+                chain_hot_files=chain_hot_files,
+            )
+
+    def _names_hot_file(self, project: str, files_to_modify) -> bool:
+        """Whether a card for ``project`` naming ``files_to_modify`` touches a `hot_files`
+        entry. A policy that cannot be read answers False here; the chain step logs it."""
+        f = {"project": normalize_project(project or self.default_project)}
+        try:
+            return bool(self._hot_paths(f, [str(p).strip() for p in files_to_modify or ()]))
+        except Exception:  # noqa: BLE001 — the create must not fail on the chain policy
+            return False
+
+    def _hot_paths(self, f: dict, files_to_modify) -> list[str]:
+        """The ``files_to_modify`` entries of ``f`` that match its project's `hot_files`,
+        `(new)` markers stripped, sorted."""
+        hot = self.hot_files_for(f)
+        return sorted(
+            {
+                strip_new_marker(p)
+                for p in files_to_modify or []
+                if str(p).strip() and any(path_matches_glob(p, g) for g in hot)
+            }
+        )
+
+    def _create_feature(
+        self,
+        title: str,
+        *,
+        spec: str,
+        acceptance_criteria: str,
+        design: str,
+        files_to_modify,
+        parent: str,
+        priority: int,
+        difficulty: str,
+        depends_on,
+        foundation: bool,
+        source_issue: str,
+        project: str,
+        issue_type: str,
+        assignee: str,
+        waits_for,
+        chain_hot_files: bool,
+    ) -> dict:
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
@@ -1876,22 +1948,16 @@ class BeadsBoard:
         created breaks a tie) and add ``fid depends_on <it>`` — unless the two are already
         ordered, in either direction. Each edge is noted on the card.
 
-        Creates racing each other are serialised by a per-board lock around read-tail →
-        add-edge, and "created before" keeps two racing cards from each picking the other
-        as its tail. Across processes that isn't enough: `br` refuses an edge that would
+        Creates racing each other in this process are serialised by a per-board lock held
+        from `br create` to the last edge (see create_feature), so "created before" is also
+        "chained before", and two racing cards cannot each pick the other as its tail.
+        Across processes that isn't enough: `br` refuses an edge that would
         close a cycle, and the edge is then reported with its ``error``. Returns
         ``[{depends_on, files[, error]}]``. Never raises: a failed edge is reported, and the
         Ready gate's shared-file check still stands behind it."""
         fid = f["id"]
         try:
-            hot = self.hot_files_for(f)
-            mine = sorted(
-                {
-                    strip_new_marker(p)
-                    for p in f.get("files_to_modify") or []
-                    if str(p).strip() and any(path_matches_glob(p, g) for g in hot)
-                }
-            )
+            mine = self._hot_paths(f, f.get("files_to_modify"))
         except Exception:  # noqa: BLE001 — a bad policy must not fail a create that landed
             log.warning("[project_board] %s hot-file chaining could not read its policy (skipped)", fid, exc_info=True)
             return []

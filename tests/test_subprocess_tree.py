@@ -253,6 +253,52 @@ async def test_communicate_or_kill_reaps_the_tree_before_it_raises(tmp_path):
     assert proc.returncode is not None, "communicate_or_kill raised before the killed shell was reaped"
 
 
+async def test_a_cancel_during_the_spawn_kills_the_tree_and_returns(tmp_path, monkeypatch):
+    """A cancel can land inside `create_subprocess_shell` after the process exists but
+    before the pipes are hooked up. A Max-Mode sibling cancel always does: the failing tree
+    raises before its siblings finish spawning. asyncio's own cleanup there kills only the
+    shell and then waits for the pipe, so a grandchild the shell had already forked kept
+    the cancel waiting for its whole run and outlived it. CI hit this as a 15 s TimeoutError
+    (PR #524, run 38202519726).
+
+    Whether the shell forks before the kill is a scheduling race. The test pins the losing
+    order: `Popen` returns only once the grandchild has recorded its pid, the way a loaded
+    runner can let the shell get that far before the event loop runs the cancel, and the
+    cancel is queued from inside the spawn, so it lands exactly where the sibling's does."""
+    import subprocess
+
+    pidfile = tmp_path / "grandchild.pid"
+    real_popen = subprocess.Popen
+    spawn: list[asyncio.Future] = []
+
+    class _ShellForksFirst(real_popen):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            deadline = time.monotonic() + 10
+            while not (pidfile.exists() and pidfile.read_text().strip()) and time.monotonic() < deadline:
+                time.sleep(0.01)  # blocks the loop on purpose: the cancel cannot run yet
+            asyncio.get_running_loop().call_soon(spawn[0].cancel)
+
+    monkeypatch.setattr(subprocess, "Popen", _ShellForksFirst)
+    spawn.append(
+        asyncio.ensure_future(
+            worktree.spawn_shell(
+                _TREE.format(pidfile=pidfile),
+                cwd=str(tmp_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        )
+    )
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(spawn[0], timeout=10)
+    pid = await _pid_from(pidfile)
+    assert time.monotonic() - started < 5, "the cancel waited on the orphaned grandchild's pipe"
+    assert await _gone(pid), "the grandchild outlived a cancel that landed during the spawn"
+
+
 async def test_a_descendant_that_escapes_the_group_cannot_hang_the_caller(tmp_path, monkeypatch):
     """The one case the reap BOUND exists for: a descendant that re-`setsid`s survives the
     group kill and keeps our stdout pipe open. The caller must get its timeout anyway."""

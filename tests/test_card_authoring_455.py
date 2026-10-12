@@ -641,3 +641,33 @@ def test_concurrent_creates_on_a_hot_file_form_one_chain_through_real_br(real_bo
     assert not [e for f in made for e in f.get("hot_file_chain") or [] if "error" in e]
     for card in (first, *made):
         assert real_board.ready_check(card["id"])["ok"], real_board.ready_check(card["id"])["refusals"]
+
+
+@requires_br
+def test_a_hot_file_create_holds_the_chain_lock_from_br_create_on(real_board, monkeypatch):
+    """The race behind the test above: chaining orders cards by `created_at`, but parallel
+    `br create`s commit out of that order, so a newer card could chain while an older one
+    was not yet visible (or not yet chained), and both hung off the same tail, unordered
+    (CI, PR #524 run 38202519726; ~13% of runs under load locally). A hot-file card is
+    therefore minted under the chain lock; a card on no hot file still creates in parallel."""
+    import threading
+
+    held_during_create: list[bool] = []
+    real_create = real_board._create
+
+    def _create(*a, **kw):
+        probe = threading.Thread(target=lambda: held_during_create.append(not _try(real_board._chain_lock)))
+        probe.start()
+        probe.join()
+        return real_create(*a, **kw)
+
+    def _try(lock) -> bool:
+        if lock.acquire(blocking=False):
+            lock.release()
+            return True
+        return False
+
+    monkeypatch.setattr(real_board, "_create", _create)
+    _mk(real_board, "hot", ["package.json"])
+    _mk(real_board, "cold", ["src/a.ts (new)"])
+    assert held_during_create == [True, False]
