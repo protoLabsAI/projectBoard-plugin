@@ -18,6 +18,7 @@ from project_board.loop import (
     _inject_source_issue_line,
     _sanitize_pr_title,
     _slice_work_uncaptured,
+    _source_issue,
     _source_issue_has_open_sibling,
 )
 
@@ -220,9 +221,26 @@ def test_sanitize_strips_slice_tag_even_when_digits_match_own():
 
 def test_sanitize_keeps_clean_own_reference():
     """r4: a card whose own clean source issue appears in its title is unchanged —
-    the last open slice is meant to close it."""
+    the sole / last open slice is meant to close it (refs_only off, the default)."""
     title = "fix #6 the login bug"
     assert _sanitize_pr_title(title, ("", 6)) == title
+
+
+def test_sanitize_refs_only_neutralises_own_clean_reference():
+    """Review finding: in refs_only mode the squash subject must not close the shared
+    issue either, so even the card's OWN clean `#n` is dropped — otherwise a non-last
+    slice titled `fix #6 login part` gets `Refs #6` in its body but a subject that still
+    closes #6 while siblings are coding."""
+    assert _sanitize_pr_title("fix #6 the login bug", ("", 6), refs_only=True) == "fix 6 the login bug"
+    assert "#6" not in _sanitize_pr_title("fix #6 the login bug", ("", 6), refs_only=True)
+    # A conventional-commit prefix lead is neutralised the same way.
+    assert _sanitize_pr_title("feat: #6 slice one", ("", 6), refs_only=True) == "feat: 6 slice one"
+
+
+def test_sanitize_refs_only_still_ignores_non_closing_lead():
+    # refs_only only governs a `#n` that FOLLOWS a closing/CC lead. A `#n` with no such
+    # lead was never a closing ref, so it is left alone even in refs_only mode.
+    assert _sanitize_pr_title("add support for #6 handling", ("", 6), refs_only=True) == "add support for #6 handling"
 
 
 def test_sanitize_strips_foreign_clean_reference():
@@ -267,8 +285,10 @@ async def test_with_source_issue_ref_refs_when_open_sibling(monkeypatch):
         ]
     )
     loop = _loop_with_store(monkeypatch, store)
-    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
-    assert out == "## Summary\n\nRefs #6"
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert body == "## Summary\n\nRefs #6"
+    # The flag is returned so the caller sanitises the PR title the same way (r4 wiring).
+    assert refs_only is True
 
 
 async def test_with_source_issue_ref_fixes_when_sole_open(monkeypatch):
@@ -281,8 +301,9 @@ async def test_with_source_issue_ref_fixes_when_sole_open(monkeypatch):
         ]
     )
     loop = _loop_with_store(monkeypatch, store)
-    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
-    assert out == "## Summary\n\nFixes #6"
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert body == "## Summary\n\nFixes #6"
+    assert refs_only is False
 
 
 async def test_with_source_issue_ref_fixes_when_sibling_in_review(monkeypatch):
@@ -298,16 +319,18 @@ async def test_with_source_issue_ref_fixes_when_sibling_in_review(monkeypatch):
         ]
     )
     loop = _loop_with_store(monkeypatch, store)
-    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
-    assert out == "## Summary\n\nFixes #6"
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert body == "## Summary\n\nFixes #6"
+    assert refs_only is False
 
 
 async def test_with_source_issue_ref_refs_on_store_error(monkeypatch):
     """r3 end-to-end: a store read error while checking siblings ⇒ Refs #6."""
     feature = {"id": "bd-1", "source_issue": "#6"}
     loop = _loop_with_store(monkeypatch, _BoomStore())
-    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
-    assert out == "## Summary\n\nRefs #6"
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert body == "## Summary\n\nRefs #6"
+    assert refs_only is True
 
 
 async def test_with_source_issue_ref_cross_repo_refs_url(monkeypatch):
@@ -321,5 +344,52 @@ async def test_with_source_issue_ref_cross_repo_refs_url(monkeypatch):
         ]
     )
     loop = _loop_with_store(monkeypatch, store)
-    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
-    assert out == "## Summary\n\nRefs https://github.com/other/repo/issues/9"
+    body, _refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert body == "## Summary\n\nRefs https://github.com/other/repo/issues/9"
+
+
+# ── the two closing paths agree: body `Refs` ⇒ the title (squash subject) can't close ─
+
+
+def _pr_title(feature: dict, refs_only: bool) -> str:
+    """Mirror of the drive/reconcile title build (`feat: {sanitised}`) so the wiring is
+    exercised: the title is sanitised with the SAME refs_only the body is stamped with."""
+    return f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
+
+
+async def test_split_slice_title_and_body_both_withhold_the_close(monkeypatch):
+    """The review's end-to-end case: a non-last slice titled `fix #6 ...` whose body is
+    `Refs #6` must NOT close #6 via its squash subject. The body's refs_only is threaded
+    into the title build, so the title drops the own `#6` too — neither path closes #6
+    while a sibling is still coding."""
+    feature = {"id": "bd-1", "title": "fix #6 the login bug", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "ready", "source_issue": "#6"},  # still coding
+        ]
+    )
+    loop = _loop_with_store(monkeypatch, store)
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert refs_only is True
+    assert body.endswith("Refs #6")
+    title = _pr_title(feature, refs_only)
+    assert "#6" not in title  # the subject can't close #6 either
+    assert title == "feat: fix 6 the login bug"
+
+
+async def test_last_slice_title_keeps_the_close(monkeypatch):
+    """The mirror: once every sibling's work is captured in a PR, this last slice gets
+    `Fixes #6` in the body AND keeps `#6` in the subject — the issue is meant to close."""
+    feature = {"id": "bd-1", "title": "fix #6 the login bug", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "in_review", "source_issue": "#6", "pr_url": "https://x/2"},
+        ]
+    )
+    loop = _loop_with_store(monkeypatch, store)
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert refs_only is False
+    assert body.endswith("Fixes #6")
+    assert _pr_title(feature, refs_only) == "feat: fix #6 the login bug"

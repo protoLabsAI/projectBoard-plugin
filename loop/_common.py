@@ -857,29 +857,40 @@ _TITLE_CLOSING_RE = re.compile(
 )
 
 
-def _sanitize_pr_title(title: str, own: tuple[str, int] | None) -> str:
-    """Neutralise a foreign closing reference in a PR title (#533).
+def _sanitize_pr_title(title: str, own: tuple[str, int] | None, refs_only: bool = False) -> str:
+    """Neutralise a closing reference in a PR title (#533).
 
     The squash commit subject is ``feat: {title}``; a title like ``fix: #6.3 address
     review`` makes GitHub read ``#6`` from the subject and close issue #6 on merge —
     even when the PR body already says ``Refs #6``. For every ``#n`` that follows a
     closing keyword or a conventional-commit prefix, drop the ``#`` (``#6.3`` → ``6.3``)
-    so the subject can't close it. The card's OWN same-repo source issue, written as a
-    clean ``#n`` (no slice tag), is left intact — that reference is legitimate and the
-    last open slice is meant to close it.
+    so the subject can't close it.
 
-    ``own`` is the parsed ``(slug, n)`` of this card's source issue. Only a bare /
-    same-repo own issue (empty slug) is protected: a bare ``#n`` in a title can never
-    name a cross-repo issue, so when the source lives elsewhere every ``#n`` is foreign."""
+    ``own`` is the parsed ``(slug, n)`` of this card's source issue. By default the
+    card's OWN same-repo source issue, written as a clean ``#n`` (no slice tag), is left
+    intact — that reference is legitimate and the sole / last open slice is meant to
+    close it. Only a bare / same-repo own issue (empty slug) is protected: a bare ``#n``
+    in a title can never name a cross-repo issue, so when the source lives elsewhere every
+    ``#n`` is foreign.
+
+    ``refs_only`` (#533) is the split-card switch — this slice must NOT close its shared
+    source issue because another slice is still being coded. drive.py builds the body with
+    ``Refs #n`` in that mode, but the squash subject is a SECOND closing path: a title like
+    ``fix #6 login part`` would still close #6 on merge. So in ``refs_only`` mode even the
+    card's OWN clean ``#n`` is neutralised — the subject matches the body and nothing closes
+    the issue early. The flag is threaded from the same ``_source_issue_has_open_sibling``
+    scan that decides ``Fixes`` vs ``Refs`` for the body, so the two always agree."""
     own_n = own[1] if (own is not None and not own[0]) else None
 
     def _repl(m: re.Match) -> str:
         n = int(m.group("n"))
         rest = m.group("rest") or ""
         # A clean ``#own`` (no ``.<digits>`` slice tag) is the legitimate self-reference →
-        # keep. A slice tag like ``#6.3`` is never clean — GitHub reads the leading ``#6``
-        # and closes it — so it is neutralised even when its digits match the own issue.
-        if not rest and own_n is not None and n == own_n:
+        # keep it, UNLESS this slice must not close the issue (``refs_only``): then the
+        # subject would close it just as a bare ``Fixes #n`` body line would, so the own
+        # reference is neutralised too. A slice tag like ``#6.3`` is never clean — GitHub
+        # reads the leading ``#6`` and closes it — so it is neutralised either way.
+        if not refs_only and not rest and own_n is not None and n == own_n:
             return m.group(0)
         return f"{m.group('lead')}{m.group('n')}{rest}"
 
