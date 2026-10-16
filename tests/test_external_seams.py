@@ -244,8 +244,10 @@ STORE_SEAMS: dict[str, str] = {
     "request_decomposition": "REAL",
     "record_verification": "REAL",
     "record_verified_candidate": "REAL",
+    "release_merge_hold": "REAL",  # #532: label drop + audit comment, real `br` in tests/test_integration.py
     "remove_dependency": "UNCOVERED",
     "requeue": "REAL",
+    "set_merge_hold": "REAL",  # #532: label add + audit comment, real `br` in tests/test_integration.py
     "set_requirements": "UNCOVERED",
     "set_review_substate": "REAL",
     "update_feature": "REAL",

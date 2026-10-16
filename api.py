@@ -893,6 +893,24 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         )
         return {**f, "review": side}
 
+    @router.post("/features/{fid}/merge-hold")
+    async def _merge_hold(fid: str, body: dict = Body(default={})):
+        """Place the operator's per-card auto-merge veto (`merge-hold`, #532) — the REST
+        twin of ``board_hold_merge``. The loop never auto-merges a held card however green
+        it is; a human merges it by hand. Body: ``{reason}`` (required). Valid in any
+        non-terminal state; 400 on a done/cancelled card, an unknown id, or a blank reason.
+        Idempotent: re-holding a held card writes no second audit comment."""
+        reason = str((body or {}).get("reason", "")).strip()
+        return await _guard(lambda: store().set_merge_hold(fid, reason))
+
+    @router.delete("/features/{fid}/merge-hold")
+    async def _release_merge_hold(fid: str):
+        """Lift the operator's per-card auto-merge veto — the inverse of POST
+        …/merge-hold (#532). Removes the `merge-hold` label and records an audit comment so
+        the auto-merge edge can resume; 400 on an unknown id, idempotent on a card that is
+        not held."""
+        return await _guard(lambda: store().release_merge_hold(fid))
+
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):
         """Cancel a feature created in error — the second terminal edge (#47). Closes
