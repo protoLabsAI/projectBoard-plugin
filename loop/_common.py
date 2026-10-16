@@ -50,7 +50,17 @@ import threading
 import time
 import types
 
-from .. import br_fetch, coder_seam, config, health, release_freeze, setup_check, work_snapshot, worktree
+from .. import (
+    _TERMINAL_STATES,
+    br_fetch,
+    coder_seam,
+    config,
+    health,
+    release_freeze,
+    setup_check,
+    work_snapshot,
+    worktree,
+)
 from .. import gates as publish_gates
 from ..failures import (
     ORACLE_TIMEOUT_CLASS,
@@ -789,7 +799,7 @@ def _source_issue(feature: dict) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
-def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: str) -> str:
+def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: str, refs_only: bool = False) -> str:
     """Append the source-issue reference to ``body`` (idempotently).
 
     Same-repo (the issue's ``owner/repo`` equals the PR's ``target_repo``, or the
@@ -797,6 +807,11 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     ``Refs <full-url>`` — a bare ``#n`` can't refer to another repo's issue, and an
     unresolvable ``target_repo`` (``repo_slug`` failed open) degrades to the safe
     ``Refs`` link rather than a possibly-wrong ``Fixes``.
+
+    ``refs_only`` (#533) makes the SAME-repo line ``Refs #n`` instead of ``Fixes #n``:
+    an issue split across several cards must NOT be closed by the first merged slice,
+    so every slice but the last open one references rather than closes it. Cross-repo
+    is always a ``Refs`` link, so the flag is a no-op there.
 
     Suppression is scope-aware: a full-URL reference to THIS issue (``\\b``-bounded, so
     ``issues/12`` never matches ``issues/123``) suppresses in either case; the
@@ -806,6 +821,18 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     same_repo = (not issue_slug) or (bool(target_repo) and issue_slug.lower() == target_repo.lower())
     url_present = bool(url) and re.search(rf"https://github\.com/{re.escape(issue_slug)}/issues/{n}\b", body)
     if same_repo:
+        if refs_only:
+            # This slice must NOT close the issue, so a ``Fixes/Closes #n`` already in the
+            # body (a coder wrote one into their summary) is REWRITTEN to ``Refs #n`` — not
+            # left in place, which would still close the issue on merge and defeat the whole
+            # point. After that rewrite a bare ``Refs #n`` (our own output, re-stamped) or
+            # the full URL already references without closing, so nothing more is appended.
+            if re.search(rf"{_CLOSING_KW}\s+#{n}\b", body, re.I):
+                body = re.sub(rf"{_CLOSING_KW}(\s+#{n}\b)", r"Refs\1", body, flags=re.I)
+            bare_ref = re.search(rf"Refs\s+#{n}\b", body, re.I)
+            if bare_ref or url_present:
+                return body
+            return f"{body.rstrip()}\n\nRefs #{n}"
         shorthand = re.search(rf"{_CLOSING_KW}\s+#{n}\b", body, re.I)
         if shorthand or url_present:
             return body
@@ -813,6 +840,61 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     if url_present:
         return body
     return f"{body.rstrip()}\n\nRefs {url}"
+
+
+# A conventional-commit type prefix (``feat:``/``fix:``/…) — the leading token the drive
+# prepends to a squash subject, and a common card-title opener. Kept next to _CLOSING_KW:
+# together they are the two leads before which a ``#n`` in a PR title would make GitHub
+# read the squash commit subject as a closing reference (#533).
+_CC_PREFIX = r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
+# A ``#n`` in a PR title that a squash subject could read as a closing reference: it
+# follows a closing keyword (``fixes #6``) or a conventional-commit prefix (``fix: #6``),
+# either with an optional colon. The digit run is captured as ``n``; a trailing
+# ``.<digits>`` slice tag (``#6.3``) is captured as ``rest`` so only the ``#`` is dropped.
+_TITLE_CLOSING_RE = re.compile(
+    rf"(?P<lead>\b(?:{_CLOSING_KW}|{_CC_PREFIX})\s*:?\s+)#(?P<n>\d+)(?P<rest>\.\d+)?",
+    re.I,
+)
+
+
+def _sanitize_pr_title(title: str, own: tuple[str, int] | None, refs_only: bool = False) -> str:
+    """Neutralise a closing reference in a PR title (#533).
+
+    The squash commit subject is ``feat: {title}``; a title like ``fix: #6.3 address
+    review`` makes GitHub read ``#6`` from the subject and close issue #6 on merge —
+    even when the PR body already says ``Refs #6``. For every ``#n`` that follows a
+    closing keyword or a conventional-commit prefix, drop the ``#`` (``#6.3`` → ``6.3``)
+    so the subject can't close it.
+
+    ``own`` is the parsed ``(slug, n)`` of this card's source issue. By default the
+    card's OWN same-repo source issue, written as a clean ``#n`` (no slice tag), is left
+    intact — that reference is legitimate and the sole / last open slice is meant to
+    close it. Only a bare / same-repo own issue (empty slug) is protected: a bare ``#n``
+    in a title can never name a cross-repo issue, so when the source lives elsewhere every
+    ``#n`` is foreign.
+
+    ``refs_only`` (#533) is the split-card switch — this slice must NOT close its shared
+    source issue because another slice is still being coded. drive.py builds the body with
+    ``Refs #n`` in that mode, but the squash subject is a SECOND closing path: a title like
+    ``fix #6 login part`` would still close #6 on merge. So in ``refs_only`` mode even the
+    card's OWN clean ``#n`` is neutralised — the subject matches the body and nothing closes
+    the issue early. The flag is threaded from the same ``_source_issue_has_open_sibling``
+    scan that decides ``Fixes`` vs ``Refs`` for the body, so the two always agree."""
+    own_n = own[1] if (own is not None and not own[0]) else None
+
+    def _repl(m: re.Match) -> str:
+        n = int(m.group("n"))
+        rest = m.group("rest") or ""
+        # A clean ``#own`` (no ``.<digits>`` slice tag) is the legitimate self-reference →
+        # keep it, UNLESS this slice must not close the issue (``refs_only``): then the
+        # subject would close it just as a bare ``Fixes #n`` body line would, so the own
+        # reference is neutralised too. A slice tag like ``#6.3`` is never clean — GitHub
+        # reads the leading ``#6`` and closes it — so it is neutralised either way.
+        if not refs_only and not rest and own_n is not None and n == own_n:
+            return m.group(0)
+        return f"{m.group('lead')}{m.group('n')}{rest}"
+
+    return _TITLE_CLOSING_RE.sub(_repl, title)
 
 
 async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
@@ -880,6 +962,70 @@ def _issue_closed_by_board_sibling(store, feature: dict) -> bool:
         # skip self, and skip a done card that never opened a PR (nothing of its
         # could have carried the closing `Fixes #N`).
         if s.get("id") == fid or not s.get("pr_url"):
+            continue
+        if _source_issue(s) == parsed:
+            return True
+    return False
+
+
+def _slice_work_uncaptured(s: dict) -> bool:
+    """Does this sibling card still hold WORK that is not yet captured in a PR (#533)?
+
+    This is the only state that must keep a shared source issue OPEN: a slice whose
+    change is still being coded. The three ways a slice's work is already captured —
+    and so no longer blocks the close — are:
+
+    * terminal (``done``/``cancelled``) — merged, or abandoned;
+    * ``in_review`` — its PR is open and merely awaiting review/merge;
+    * it carries a ``pr_url`` — its work is in a PR regardless of lane.
+
+    Using "captured in a PR" rather than "non-terminal" is the fix for the review
+    finding: counting an ``in_review`` sibling as still-open made two slices that reach
+    review at the same time BOTH stamp ``Refs`` — then neither closes the issue and it
+    stays open after all slices merge. An in-review slice's work is done; only the
+    still-coding slices may keep the issue open (``Refs``), and once they are all in a
+    PR the last one to publish stamps ``Fixes``."""
+    if s.get("board_state") in _TERMINAL_STATES or s.get("board_state") == "in_review":
+        return False
+    if s.get("pr_url"):
+        return False
+    return True
+
+
+def _source_issue_has_open_sibling(store, feature: dict) -> bool:
+    """Does this feature's source issue have ANOTHER slice whose work is not yet in a
+    PR (#533)?
+
+    The mirror of ``_issue_closed_by_board_sibling``: that one looks at DONE siblings
+    after a merge, to avoid cancelling the rest of a split; this one looks BEFORE
+    stamping the PR body, to decide ``Fixes`` vs ``Refs``. When an issue is split across
+    several cards, a slice must carry ``Refs #N`` (not ``Fixes #N``) while ANY other
+    slice is still coding, so the first merged PR does not close the umbrella issue out
+    from under a sibling that hasn't shipped yet (nerdsville-site#6 closed by slice PR
+    #39). Once every other slice's work is captured in a PR (``in_review``/``done``, or a
+    ``pr_url`` present), the next slice to publish carries ``Fixes`` and closes it.
+
+    A blocking sibling is another card (not self) whose parsed source issue matches and
+    whose work is still uncaptured (``_slice_work_uncaptured``). Returns True when such a
+    sibling exists ⇒ the caller stamps ``Refs``. Fails SAFE: a store read error returns
+    True (⇒ ``Refs``), because closing a shared issue on an uncertain read is the
+    unrecoverable mistake — the opposite fail direction from the fail-OPEN guards above,
+    on purpose. Returns False only when the store was read cleanly and named no still-
+    coding sibling (⇒ this is the sole or last-to-publish slice ⇒ ``Fixes``). Source
+    issues are compared in parsed ``(slug, n)`` form so a URL, an ``owner/repo#N`` and a
+    bare ``#N`` for the same issue all match."""
+    parsed = _source_issue(feature)
+    if parsed is None:
+        return False  # no resolvable source issue → nothing a sibling could share
+    try:
+        siblings = store.list_features()
+    except Exception:  # noqa: BLE001 — store read failed → fail SAFE (stamp Refs, never close)
+        return True
+    fid = feature.get("id")
+    for s in siblings:
+        # Skip self, and any sibling whose work is already in a PR (terminal, in_review,
+        # or pr_url present): only a slice still being coded needs the issue left open.
+        if s.get("id") == fid or not _slice_work_uncaptured(s):
             continue
         if _source_issue(s) == parsed:
             return True
@@ -1766,8 +1912,11 @@ __all__ = [
     "_CLOSING_KW",
     "_source_issue",
     "_inject_source_issue_line",
+    "_sanitize_pr_title",
     "_source_issue_still_open",
     "_issue_closed_by_board_sibling",
+    "_slice_work_uncaptured",
+    "_source_issue_has_open_sibling",
     "LIVE_KNOBS",
     "LIVE_KNOB_FLOORS",
     "LIVE_BOOL_KNOBS",

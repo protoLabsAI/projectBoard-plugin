@@ -330,13 +330,16 @@ class ReconcileMixin:
         body = _pr_body("", f) + (f"\n\n{note}" if note else "")
         if gate_out is not None:
             body += "\n\n" + _gate_failure_block(gate_out)
-        body = await self._with_source_issue_ref(f, wt, body)
+        body, refs_only = await self._with_source_issue_ref(f, wt, body)
         as_draft = {"draft": True} if gate_out is not None else {}
         return await worktree.open_pr(
             wt,
             branch,
             base=self._base_branch_for(f),
-            title=f"feat: {f.get('title') or fid}",
+            # #533: the title is the squash subject — sanitise it with the SAME refs_only
+            # the body was stamped with, so a split-card slice can't close a shared issue
+            # via the subject while its body only says `Refs #n`.
+            title=f"feat: {_sanitize_pr_title(f.get('title') or fid, _source_issue(f), refs_only=refs_only)}",
             body=body,
             promote_draft=not f.get("pr_url") and not as_draft,
             **as_draft,

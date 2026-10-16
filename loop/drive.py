@@ -1633,7 +1633,15 @@ class DriveMixin:
         repo = self._repo_for(feature)
         base = self._base_branch_for(feature)
         coders = self._coders_for(feature)
-        title = f"feat: {feature['title']}"
+        # #533: strip any `#n` the squash subject could read as a closing ref — a foreign
+        # `fix: #6.3` → `fix: 6.3`, and in `refs_only` mode (another slice of this card's
+        # source issue is still being coded) the card's OWN clean `#n` too, so the subject
+        # can't close a shared issue early. This title seeds the solve offload's commit
+        # message (another squash-subject source); `refs_only` is computed from the board
+        # here (no worktree needed) and recomputed at PR-open for the body + final title,
+        # since siblings ship during the coding run.
+        refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, store, feature)
+        title = f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
         tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
@@ -2202,13 +2210,21 @@ class DriveMixin:
                                 f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
                                 "the bounce was about; nothing new to push or review"
                             )
-                    body = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
+                    body, refs_only = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
+                    # #533: the PR title IS the squash subject, so sanitise it with the SAME
+                    # refs_only the body was stamped with (recomputed just now, not the drive-
+                    # start value — a sibling may have shipped during the coding run). In
+                    # refs_only mode the card's own `#n` is dropped from the subject too, so it
+                    # can't close a shared issue while the body only says `Refs #n`.
+                    pr_title = (
+                        f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
+                    )
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that
                     # already owns its PR (CI-fail bounce) leaves a draft alone: that is
                     # the operator's hold on the loop's own PR, not the coder's.
                     pr_url = await worktree.open_pr(
-                        wt, branch, base=base, title=title, body=body, promote_draft=not feature.get("pr_url")
+                        wt, branch, base=base, title=pr_title, body=body, promote_draft=not feature.get("pr_url")
                     )
                     # …and again after: a move that landed during the push/create. A cancel
                     # closes the PR it just opened (#211); any other move keeps the PR and
@@ -3092,18 +3108,31 @@ class DriveMixin:
             return target
         return ""
 
-    async def _with_source_issue_ref(self, feature: dict, wt: str, body: str) -> str:
+    async def _with_source_issue_ref(self, feature: dict, wt: str, body: str) -> tuple[str, bool]:
         """Stamp the feature's source issue onto the PR body — ``Fixes #n`` when the
         issue is in the PR's own target repo, ``Refs <url>`` cross-repo. No source
         issue ⇒ body unchanged (and no ``gh`` round-trip). ``worktree.repo_slug`` fails
         open, so an unresolvable target repo degrades to a ``Refs`` link — never a
-        wrong ``Fixes`` and never a blocked PR."""
+        wrong ``Fixes`` and never a blocked PR.
+
+        Split-aware (#533): if ANY other slice of the same source issue still has work not
+        yet captured in a PR (a card still being coded — see ``_source_issue_has_open_sibling``),
+        stamp ``Refs #n`` rather than ``Fixes #n`` — only the last slice to publish closes
+        the shared issue. The sibling scan fails SAFE to ``Refs`` on a store read error, so
+        an uncertain read never closes an issue early.
+
+        Returns ``(body, refs_only)``: the caller sanitises the PR title with the SAME
+        ``refs_only`` the body was stamped with, so the squash subject (the second closing
+        path) agrees with the body and neither closes a shared issue early. ``refs_only`` is
+        False when there is no source issue (nothing to close, so the title's foreign-ref
+        pass is a no-op anyway)."""
         parsed = _source_issue(feature)
         if not parsed:
-            return body
+            return body, False
         issue_slug, n = parsed
         target_repo = await worktree.repo_slug(cwd=wt)
-        return _inject_source_issue_line(body, issue_slug, n, target_repo)
+        refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, self._store(), feature)
+        return _inject_source_issue_line(body, issue_slug, n, target_repo, refs_only=refs_only), refs_only
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _use_coder_solve(self, feature: dict) -> bool:
