@@ -336,7 +336,7 @@ class ReconcileMixin:
             wt,
             branch,
             base=self._base_branch_for(f),
-            title=f"feat: {f.get('title') or fid}",
+            title=f"feat: {_sanitize_pr_title(f.get('title') or fid, _source_issue(f))}",  # #533: no foreign closing ref
             body=body,
             promote_draft=not f.get("pr_url") and not as_draft,
             **as_draft,

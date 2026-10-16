@@ -1633,7 +1633,9 @@ class DriveMixin:
         repo = self._repo_for(feature)
         base = self._base_branch_for(feature)
         coders = self._coders_for(feature)
-        title = f"feat: {feature['title']}"
+        # #533: strip any foreign `#n` the squash subject could read as a closing ref
+        # (`fix: #6.3` → `fix: 6.3`); the card's own clean `#n` stays intact.
+        title = f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature))}"
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
         tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
@@ -3097,13 +3099,19 @@ class DriveMixin:
         issue is in the PR's own target repo, ``Refs <url>`` cross-repo. No source
         issue ⇒ body unchanged (and no ``gh`` round-trip). ``worktree.repo_slug`` fails
         open, so an unresolvable target repo degrades to a ``Refs`` link — never a
-        wrong ``Fixes`` and never a blocked PR."""
+        wrong ``Fixes`` and never a blocked PR.
+
+        Split-aware (#533): if ANY other open card on the board carries the same source
+        issue, stamp ``Refs #n`` rather than ``Fixes #n`` — only the last open slice
+        closes the shared issue. The sibling scan fails SAFE to ``Refs`` on a store read
+        error, so an uncertain read never closes an issue early."""
         parsed = _source_issue(feature)
         if not parsed:
             return body
         issue_slug, n = parsed
         target_repo = await worktree.repo_slug(cwd=wt)
-        return _inject_source_issue_line(body, issue_slug, n, target_repo)
+        refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, self._store(), feature)
+        return _inject_source_issue_line(body, issue_slug, n, target_repo, refs_only=refs_only)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _use_coder_solve(self, feature: dict) -> bool:

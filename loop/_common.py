@@ -50,7 +50,17 @@ import threading
 import time
 import types
 
-from .. import br_fetch, coder_seam, config, health, release_freeze, setup_check, work_snapshot, worktree
+from .. import (
+    _TERMINAL_STATES,
+    br_fetch,
+    coder_seam,
+    config,
+    health,
+    release_freeze,
+    setup_check,
+    work_snapshot,
+    worktree,
+)
 from .. import gates as publish_gates
 from ..failures import (
     ORACLE_TIMEOUT_CLASS,
@@ -789,7 +799,7 @@ def _source_issue(feature: dict) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
-def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: str) -> str:
+def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: str, refs_only: bool = False) -> str:
     """Append the source-issue reference to ``body`` (idempotently).
 
     Same-repo (the issue's ``owner/repo`` equals the PR's ``target_repo``, or the
@@ -797,6 +807,11 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     ``Refs <full-url>`` — a bare ``#n`` can't refer to another repo's issue, and an
     unresolvable ``target_repo`` (``repo_slug`` failed open) degrades to the safe
     ``Refs`` link rather than a possibly-wrong ``Fixes``.
+
+    ``refs_only`` (#533) makes the SAME-repo line ``Refs #n`` instead of ``Fixes #n``:
+    an issue split across several cards must NOT be closed by the first merged slice,
+    so every slice but the last open one references rather than closes it. Cross-repo
+    is always a ``Refs`` link, so the flag is a no-op there.
 
     Suppression is scope-aware: a full-URL reference to THIS issue (``\\b``-bounded, so
     ``issues/12`` never matches ``issues/123``) suppresses in either case; the
@@ -806,6 +821,14 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     same_repo = (not issue_slug) or (bool(target_repo) and issue_slug.lower() == target_repo.lower())
     url_present = bool(url) and re.search(rf"https://github\.com/{re.escape(issue_slug)}/issues/{n}\b", body)
     if same_repo:
+        if refs_only:
+            # A bare ``Refs #n`` already present (our own output, re-stamped) suppresses;
+            # so does the full URL. A ``Fixes #n`` is NOT treated as a dedup match here —
+            # it would close the issue, which is exactly what this slice must avoid.
+            bare_ref = re.search(rf"Refs\s+#{n}\b", body, re.I)
+            if bare_ref or url_present:
+                return body
+            return f"{body.rstrip()}\n\nRefs #{n}"
         shorthand = re.search(rf"{_CLOSING_KW}\s+#{n}\b", body, re.I)
         if shorthand or url_present:
             return body
@@ -813,6 +836,50 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     if url_present:
         return body
     return f"{body.rstrip()}\n\nRefs {url}"
+
+
+# A conventional-commit type prefix (``feat:``/``fix:``/…) — the leading token the drive
+# prepends to a squash subject, and a common card-title opener. Kept next to _CLOSING_KW:
+# together they are the two leads before which a ``#n`` in a PR title would make GitHub
+# read the squash commit subject as a closing reference (#533).
+_CC_PREFIX = r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
+# A ``#n`` in a PR title that a squash subject could read as a closing reference: it
+# follows a closing keyword (``fixes #6``) or a conventional-commit prefix (``fix: #6``),
+# either with an optional colon. The digit run is captured as ``n``; a trailing
+# ``.<digits>`` slice tag (``#6.3``) is captured as ``rest`` so only the ``#`` is dropped.
+_TITLE_CLOSING_RE = re.compile(
+    rf"(?P<lead>\b(?:{_CLOSING_KW}|{_CC_PREFIX})\s*:?\s+)#(?P<n>\d+)(?P<rest>\.\d+)?",
+    re.I,
+)
+
+
+def _sanitize_pr_title(title: str, own: tuple[str, int] | None) -> str:
+    """Neutralise a foreign closing reference in a PR title (#533).
+
+    The squash commit subject is ``feat: {title}``; a title like ``fix: #6.3 address
+    review`` makes GitHub read ``#6`` from the subject and close issue #6 on merge —
+    even when the PR body already says ``Refs #6``. For every ``#n`` that follows a
+    closing keyword or a conventional-commit prefix, drop the ``#`` (``#6.3`` → ``6.3``)
+    so the subject can't close it. The card's OWN same-repo source issue, written as a
+    clean ``#n`` (no slice tag), is left intact — that reference is legitimate and the
+    last open slice is meant to close it.
+
+    ``own`` is the parsed ``(slug, n)`` of this card's source issue. Only a bare /
+    same-repo own issue (empty slug) is protected: a bare ``#n`` in a title can never
+    name a cross-repo issue, so when the source lives elsewhere every ``#n`` is foreign."""
+    own_n = own[1] if (own is not None and not own[0]) else None
+
+    def _repl(m: re.Match) -> str:
+        n = int(m.group("n"))
+        rest = m.group("rest") or ""
+        # A clean ``#own`` (no ``.<digits>`` slice tag) is the legitimate self-reference →
+        # keep. A slice tag like ``#6.3`` is never clean — GitHub reads the leading ``#6``
+        # and closes it — so it is neutralised even when its digits match the own issue.
+        if not rest and own_n is not None and n == own_n:
+            return m.group(0)
+        return f"{m.group('lead')}{m.group('n')}{rest}"
+
+    return _TITLE_CLOSING_RE.sub(_repl, title)
 
 
 async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
@@ -880,6 +947,45 @@ def _issue_closed_by_board_sibling(store, feature: dict) -> bool:
         # skip self, and skip a done card that never opened a PR (nothing of its
         # could have carried the closing `Fixes #N`).
         if s.get("id") == fid or not s.get("pr_url"):
+            continue
+        if _source_issue(s) == parsed:
+            return True
+    return False
+
+
+def _source_issue_has_open_sibling(store, feature: dict) -> bool:
+    """Is this feature's source issue shared with ANOTHER still-open card (#533)?
+
+    The mirror of ``_issue_closed_by_board_sibling``: that one looks at DONE siblings
+    after a merge, to avoid cancelling the rest of a split; this one looks at OPEN
+    siblings BEFORE stamping the PR body, to decide ``Fixes`` vs ``Refs``. When an
+    issue is split across several cards, only the LAST open slice may carry the closing
+    ``Fixes #N`` — every earlier slice gets ``Refs #N`` so the first merged PR does not
+    close the umbrella issue out from under its siblings (nerdsville-site#6 closed by
+    slice PR #39).
+
+    An open sibling is another card (not self) whose parsed source issue matches and
+    whose ``board_state`` is not terminal (not done/cancelled). Returns True when such a
+    sibling exists ⇒ the caller stamps ``Refs``. Fails SAFE: a store read error returns
+    True (⇒ ``Refs``), because closing a shared issue on an uncertain read is the
+    unrecoverable mistake — the opposite fail direction from the fail-OPEN guards above,
+    on purpose. Returns False only when the store was read cleanly and named no open
+    sibling (⇒ this is the sole or last open slice ⇒ ``Fixes``). Source issues are
+    compared in parsed ``(slug, n)`` form so a URL, an ``owner/repo#N`` and a bare ``#N``
+    for the same issue all match."""
+    parsed = _source_issue(feature)
+    if parsed is None:
+        return False  # no resolvable source issue → nothing a sibling could share
+    try:
+        siblings = store.list_features()
+    except Exception:  # noqa: BLE001 — store read failed → fail SAFE (stamp Refs, never close)
+        return True
+    fid = feature.get("id")
+    for s in siblings:
+        # Skip self, and any already-terminal card (done/cancelled): a done sibling's
+        # merged PR is the `_issue_closed_by_board_sibling` case, not an open slice that
+        # still needs the issue left open.
+        if s.get("id") == fid or s.get("board_state") in _TERMINAL_STATES:
             continue
         if _source_issue(s) == parsed:
             return True
@@ -1766,8 +1872,10 @@ __all__ = [
     "_CLOSING_KW",
     "_source_issue",
     "_inject_source_issue_line",
+    "_sanitize_pr_title",
     "_source_issue_still_open",
     "_issue_closed_by_board_sibling",
+    "_source_issue_has_open_sibling",
     "LIVE_KNOBS",
     "LIVE_KNOB_FLOORS",
     "LIVE_BOOL_KNOBS",
