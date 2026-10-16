@@ -3101,10 +3101,11 @@ class DriveMixin:
         open, so an unresolvable target repo degrades to a ``Refs`` link — never a
         wrong ``Fixes`` and never a blocked PR.
 
-        Split-aware (#533): if ANY other open card on the board carries the same source
-        issue, stamp ``Refs #n`` rather than ``Fixes #n`` — only the last open slice
-        closes the shared issue. The sibling scan fails SAFE to ``Refs`` on a store read
-        error, so an uncertain read never closes an issue early."""
+        Split-aware (#533): if ANY other slice of the same source issue still has work not
+        yet captured in a PR (a card still being coded — see ``_source_issue_has_open_sibling``),
+        stamp ``Refs #n`` rather than ``Fixes #n`` — only the last slice to publish closes
+        the shared issue. The sibling scan fails SAFE to ``Refs`` on a store read error, so
+        an uncertain read never closes an issue early."""
         parsed = _source_issue(feature)
         if not parsed:
             return body

@@ -17,6 +17,7 @@ from project_board.loop import (
     BoardLoop,
     _inject_source_issue_line,
     _sanitize_pr_title,
+    _slice_work_uncaptured,
     _source_issue_has_open_sibling,
 )
 
@@ -62,6 +63,21 @@ def test_inject_refs_only_is_noop_cross_repo():
     # Cross-repo is always a Refs <url> link; the flag changes nothing there (r5).
     out = _inject_source_issue_line("body", "other/repo", 9, "acme/widgets", refs_only=True)
     assert out == "body\n\nRefs https://github.com/other/repo/issues/9"
+
+
+def test_inject_refs_only_rewrites_existing_fixes_to_refs():
+    # A coder-written `Fixes #6` in the body would STILL close the issue on merge — in
+    # refs_only mode it is rewritten to `Refs #6`, not left in place, and no extra line
+    # is appended. This is what makes refs_only actually prevent the close.
+    body = "## Summary\n\nDid the thing. Fixes #6 for real."
+    out = _inject_source_issue_line(body, "acme/widgets", 6, "acme/widgets", refs_only=True)
+    assert "Fixes #6" not in out
+    assert out == "## Summary\n\nDid the thing. Refs #6 for real."
+
+
+def test_inject_refs_only_rewrites_closes_keyword():
+    out = _inject_source_issue_line("Closes #6", "acme/widgets", 6, "acme/widgets", refs_only=True)
+    assert out == "Refs #6"
 
 
 # ── _source_issue_has_open_sibling ───────────────────────────────────────────────
@@ -117,6 +133,64 @@ def test_has_open_sibling_normalises_reference_forms():
 
 def test_has_open_sibling_false_when_no_source_issue():
     assert _source_issue_has_open_sibling(_FakeStore([]), {"id": "bd-1", "title": "no issue"}) is False
+
+
+def test_has_open_sibling_false_when_sibling_in_review():
+    """Review fix: a sibling already ``in_review`` has its work captured in an OPEN PR and
+    must NOT block the close. Counting it as open made two slices that reach review at the
+    same time BOTH stamp ``Refs`` — then neither closed the issue and it stayed open after
+    all slices merged. The slice building its PR here is the last one still coding, so it
+    carries ``Fixes``."""
+    feature = {"id": "bd-1", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "in_review", "source_issue": "#6", "pr_url": "https://x/2"},
+        ]
+    )
+    assert _source_issue_has_open_sibling(store, feature) is False
+
+
+def test_has_open_sibling_false_when_sibling_has_pr_url():
+    """Belt-and-braces: any sibling carrying a ``pr_url`` has its work in a PR regardless
+    of its lane, so it never blocks the close."""
+    feature = {"id": "bd-1", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "blocked", "source_issue": "#6", "pr_url": "https://x/2"},
+        ]
+    )
+    assert _source_issue_has_open_sibling(store, feature) is False
+
+
+def test_has_open_sibling_true_when_coding_sibling_alongside_in_review():
+    """A mix: one sibling is in_review (captured, non-blocking) but another is still being
+    coded (no PR) ⇒ that still-coding slice keeps the issue open ⇒ ``Refs``."""
+    feature = {"id": "bd-1", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "in_review", "source_issue": "#6", "pr_url": "https://x/2"},
+            {"id": "bd-3", "board_state": "ready", "source_issue": "#6"},
+        ]
+    )
+    assert _source_issue_has_open_sibling(store, feature) is True
+
+
+def test_slice_work_uncaptured_classification():
+    """``_slice_work_uncaptured`` is the one predicate the open-sibling scan turns on:
+    only a still-coding slice (non-terminal, not in_review, no pr_url) is uncaptured."""
+    assert _slice_work_uncaptured({"board_state": "in_progress"}) is True
+    assert _slice_work_uncaptured({"board_state": "ready"}) is True
+    assert _slice_work_uncaptured({"board_state": "backlog"}) is True
+    assert _slice_work_uncaptured({"board_state": "blocked"}) is True
+    # Captured: PR open, merged, abandoned, or a pr_url present on any lane.
+    assert _slice_work_uncaptured({"board_state": "in_review", "pr_url": "https://x/2"}) is False
+    assert _slice_work_uncaptured({"board_state": "in_review"}) is False
+    assert _slice_work_uncaptured({"board_state": "done", "pr_url": "https://x/1"}) is False
+    assert _slice_work_uncaptured({"board_state": "cancelled"}) is False
+    assert _slice_work_uncaptured({"board_state": "in_progress", "pr_url": "https://x/3"}) is False
 
 
 def test_has_open_sibling_fails_safe_on_store_error():
@@ -204,6 +278,23 @@ async def test_with_source_issue_ref_fixes_when_sole_open(monkeypatch):
         [
             {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
             {"id": "bd-2", "board_state": "done", "source_issue": "#6", "pr_url": "https://x/1"},
+        ]
+    )
+    loop = _loop_with_store(monkeypatch, store)
+    out = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert out == "## Summary\n\nFixes #6"
+
+
+async def test_with_source_issue_ref_fixes_when_sibling_in_review(monkeypatch):
+    """Review fix, end-to-end: the one remaining sibling is already in_review (its PR is
+    open), so the slice building its PR here is the last one still coding and gets
+    ``Fixes #6`` — not ``Refs``. The old behaviour left BOTH slices on ``Refs`` and the
+    issue never closed."""
+    feature = {"id": "bd-1", "source_issue": "#6"}
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "in_review", "source_issue": "#6", "pr_url": "https://x/2"},
         ]
     )
     loop = _loop_with_store(monkeypatch, store)

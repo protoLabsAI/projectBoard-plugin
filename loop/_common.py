@@ -822,9 +822,13 @@ def _inject_source_issue_line(body: str, issue_slug: str, n: int, target_repo: s
     url_present = bool(url) and re.search(rf"https://github\.com/{re.escape(issue_slug)}/issues/{n}\b", body)
     if same_repo:
         if refs_only:
-            # A bare ``Refs #n`` already present (our own output, re-stamped) suppresses;
-            # so does the full URL. A ``Fixes #n`` is NOT treated as a dedup match here —
-            # it would close the issue, which is exactly what this slice must avoid.
+            # This slice must NOT close the issue, so a ``Fixes/Closes #n`` already in the
+            # body (a coder wrote one into their summary) is REWRITTEN to ``Refs #n`` — not
+            # left in place, which would still close the issue on merge and defeat the whole
+            # point. After that rewrite a bare ``Refs #n`` (our own output, re-stamped) or
+            # the full URL already references without closing, so nothing more is appended.
+            if re.search(rf"{_CLOSING_KW}\s+#{n}\b", body, re.I):
+                body = re.sub(rf"{_CLOSING_KW}(\s+#{n}\b)", r"Refs\1", body, flags=re.I)
             bare_ref = re.search(rf"Refs\s+#{n}\b", body, re.I)
             if bare_ref or url_present:
                 return body
@@ -953,26 +957,52 @@ def _issue_closed_by_board_sibling(store, feature: dict) -> bool:
     return False
 
 
+def _slice_work_uncaptured(s: dict) -> bool:
+    """Does this sibling card still hold WORK that is not yet captured in a PR (#533)?
+
+    This is the only state that must keep a shared source issue OPEN: a slice whose
+    change is still being coded. The three ways a slice's work is already captured —
+    and so no longer blocks the close — are:
+
+    * terminal (``done``/``cancelled``) — merged, or abandoned;
+    * ``in_review`` — its PR is open and merely awaiting review/merge;
+    * it carries a ``pr_url`` — its work is in a PR regardless of lane.
+
+    Using "captured in a PR" rather than "non-terminal" is the fix for the review
+    finding: counting an ``in_review`` sibling as still-open made two slices that reach
+    review at the same time BOTH stamp ``Refs`` — then neither closes the issue and it
+    stays open after all slices merge. An in-review slice's work is done; only the
+    still-coding slices may keep the issue open (``Refs``), and once they are all in a
+    PR the last one to publish stamps ``Fixes``."""
+    if s.get("board_state") in _TERMINAL_STATES or s.get("board_state") == "in_review":
+        return False
+    if s.get("pr_url"):
+        return False
+    return True
+
+
 def _source_issue_has_open_sibling(store, feature: dict) -> bool:
-    """Is this feature's source issue shared with ANOTHER still-open card (#533)?
+    """Does this feature's source issue have ANOTHER slice whose work is not yet in a
+    PR (#533)?
 
     The mirror of ``_issue_closed_by_board_sibling``: that one looks at DONE siblings
-    after a merge, to avoid cancelling the rest of a split; this one looks at OPEN
-    siblings BEFORE stamping the PR body, to decide ``Fixes`` vs ``Refs``. When an
-    issue is split across several cards, only the LAST open slice may carry the closing
-    ``Fixes #N`` — every earlier slice gets ``Refs #N`` so the first merged PR does not
-    close the umbrella issue out from under its siblings (nerdsville-site#6 closed by
-    slice PR #39).
+    after a merge, to avoid cancelling the rest of a split; this one looks BEFORE
+    stamping the PR body, to decide ``Fixes`` vs ``Refs``. When an issue is split across
+    several cards, a slice must carry ``Refs #N`` (not ``Fixes #N``) while ANY other
+    slice is still coding, so the first merged PR does not close the umbrella issue out
+    from under a sibling that hasn't shipped yet (nerdsville-site#6 closed by slice PR
+    #39). Once every other slice's work is captured in a PR (``in_review``/``done``, or a
+    ``pr_url`` present), the next slice to publish carries ``Fixes`` and closes it.
 
-    An open sibling is another card (not self) whose parsed source issue matches and
-    whose ``board_state`` is not terminal (not done/cancelled). Returns True when such a
+    A blocking sibling is another card (not self) whose parsed source issue matches and
+    whose work is still uncaptured (``_slice_work_uncaptured``). Returns True when such a
     sibling exists ⇒ the caller stamps ``Refs``. Fails SAFE: a store read error returns
     True (⇒ ``Refs``), because closing a shared issue on an uncertain read is the
     unrecoverable mistake — the opposite fail direction from the fail-OPEN guards above,
-    on purpose. Returns False only when the store was read cleanly and named no open
-    sibling (⇒ this is the sole or last open slice ⇒ ``Fixes``). Source issues are
-    compared in parsed ``(slug, n)`` form so a URL, an ``owner/repo#N`` and a bare ``#N``
-    for the same issue all match."""
+    on purpose. Returns False only when the store was read cleanly and named no still-
+    coding sibling (⇒ this is the sole or last-to-publish slice ⇒ ``Fixes``). Source
+    issues are compared in parsed ``(slug, n)`` form so a URL, an ``owner/repo#N`` and a
+    bare ``#N`` for the same issue all match."""
     parsed = _source_issue(feature)
     if parsed is None:
         return False  # no resolvable source issue → nothing a sibling could share
@@ -982,10 +1012,9 @@ def _source_issue_has_open_sibling(store, feature: dict) -> bool:
         return True
     fid = feature.get("id")
     for s in siblings:
-        # Skip self, and any already-terminal card (done/cancelled): a done sibling's
-        # merged PR is the `_issue_closed_by_board_sibling` case, not an open slice that
-        # still needs the issue left open.
-        if s.get("id") == fid or s.get("board_state") in _TERMINAL_STATES:
+        # Skip self, and any sibling whose work is already in a PR (terminal, in_review,
+        # or pr_url present): only a slice still being coded needs the issue left open.
+        if s.get("id") == fid or not _slice_work_uncaptured(s):
             continue
         if _source_issue(s) == parsed:
             return True
@@ -1875,6 +1904,7 @@ __all__ = [
     "_sanitize_pr_title",
     "_source_issue_still_open",
     "_issue_closed_by_board_sibling",
+    "_slice_work_uncaptured",
     "_source_issue_has_open_sibling",
     "LIVE_KNOBS",
     "LIVE_KNOB_FLOORS",
