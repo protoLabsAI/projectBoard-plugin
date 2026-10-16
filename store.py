@@ -3963,6 +3963,59 @@ class BeadsBoard:
             self.comment(fid, "unblocked — cleared " + ", ".join(classes))
         return self.get_feature(fid)
 
+    # ── merge-hold: the operator's per-card auto-merge veto (#532) ─────────────
+    def set_merge_hold(self, fid: str, reason: str, *, actor: str = "") -> dict:
+        """Place the operator's per-card merge veto (``LABEL_MERGE_HOLD``) so the
+        auto-merge edge holds this card for a HUMAN even when every gate is green — a
+        console layout change, a risky migration the operator wants to QA by hand.
+
+        Valid in ANY non-terminal state (backlog / ready / in_progress / in_review /
+        blocked) so a hold can be set BEFORE the card is ever dispatched; refuses a
+        done/cancelled card (the merge edge is already behind it) and an unknown id
+        (``_require`` → ``unknown feature``), altering NOTHING in either case. ``reason``
+        is required — a veto with no stated reason is unauditable. IDEMPOTENT: a card
+        already held returns ok with NO second audit comment.
+
+        The merge edge itself is untouched: ``merge_posture`` / the loop's
+        ``_auto_merge_blockers`` already read the label back as ``merge-hold (operator
+        veto)`` — this is only the setter that was missing (nobody but a human running
+        ``br label add`` could place one). ``actor`` names who set it for the audit
+        trail, defaulting to the store actor."""
+        reason = str(reason or "").strip()
+        if not reason:
+            raise BoardError(f"{fid}: a merge-hold needs a reason — say why this card must be merged by hand")
+        f = self._require(fid)  # unknown id → BoardError; nothing changed
+        state = f.get("board_state")
+        if state in _TERMINAL_STATES:
+            raise BoardError(
+                f"{fid} is {state} — merge-hold vetoes the auto-merge edge, which a {state} card is already past"
+            )
+        if LABEL_MERGE_HOLD in (f.get("labels") or []):
+            return f  # already held — idempotent, no duplicate comment
+        who = str(actor or self.actor or "operator").strip() or "operator"
+        # The REASON first (as flag_blocked does), and allowed to raise: a failed write
+        # leaves the card UN-held with the caller told, never held with no audit trail.
+        self._run("comments", "add", fid, f"merge-hold set: {reason}", actor=who)
+        self._run("update", fid, "--add-label", LABEL_MERGE_HOLD, actor=who)
+        return self.get_feature(fid)
+
+    def release_merge_hold(self, fid: str, *, actor: str = "") -> dict:
+        """Lift the operator's merge veto (``LABEL_MERGE_HOLD``) — the inverse of
+        ``set_merge_hold`` (#532). Removes the label and records a ``merge-hold released``
+        audit comment, so the auto-merge edge can resume for this card.
+
+        Refuses an unknown id (``_require``). IDEMPOTENT: a card that is NOT held returns
+        ok with no comment. ``actor`` names who lifted it, defaulting to the store actor."""
+        f = self._require(fid)  # unknown id → BoardError; nothing changed
+        if LABEL_MERGE_HOLD not in (f.get("labels") or []):
+            return f  # not held — idempotent, no comment
+        who = str(actor or self.actor or "operator").strip() or "operator"
+        # Drop the label FIRST: if the audit comment then fails the card is correctly
+        # released (never a "released" note sitting over a label that is still present).
+        self._run("update", fid, "--remove-label", LABEL_MERGE_HOLD, actor=who)
+        self._run("comments", "add", fid, "merge-hold released", actor=who)
+        return self.get_feature(fid)
+
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at
     #    all) lives in the loop, which only escalates when distinct per-tier coders
     #    are configured. With a single coder these are simply never called, so a
@@ -4813,6 +4866,10 @@ class BeadsBoard:
             "pr_url": bead.get("external_ref", ""),
             "assignee": bead.get("assignee", ""),
             "blocked": LABEL_BLOCKED in labels,
+            # The operator's per-card auto-merge veto (#532): the `merge-hold` label, read
+            # here so the merge edge (merge_posture), the tool payload and the API all see
+            # the same bool. The loop never sets or clears it — set_merge_hold does.
+            "merge_hold": LABEL_MERGE_HOLD in labels,
             "cancelled": LABEL_CANCELLED in labels,
             # archived is VISIBILITY, not a state: the feature stays done/cancelled;
             # the label only drops it from the default list_features projection (#115).

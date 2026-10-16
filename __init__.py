@@ -825,7 +825,9 @@ def _board_tools(cfg: dict):
     @tool
     def board_get_feature(feature_id: str) -> str:
         """Read a single feature's FULL detail as JSON — `title`, `spec`,
-        `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `difficulty`,
+        `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `merge_hold`
+        (true when the operator has placed a per-card auto-merge veto, #532 —
+        board_hold_merge sets it, board_release_merge_hold lifts it), `difficulty`,
         `files_to_modify`, `foundation`, `priority`, `source_issue`, `project`
         (the entry in the board's `projects:` map this feature builds in, #90),
         `requirements`
@@ -871,6 +873,10 @@ def _board_tools(cfg: dict):
                 "state": f["board_state"],
                 "labels": f.get("labels", []),
                 "pr_url": f["pr_url"],
+                # The operator's per-card auto-merge veto (#532): true when the card
+                # carries `merge-hold`, so a reader can see the hold without re-decoding
+                # `labels`. board_hold_merge sets it, board_release_merge_hold lifts it.
+                "merge_hold": f.get("merge_hold", False),
                 "difficulty": f["difficulty"],
                 "files_to_modify": f.get("files_to_modify", []),
                 "foundation": f.get("foundation", False),
@@ -1329,6 +1335,42 @@ def _board_tools(cfg: dict):
         return json.dumps({"id": f["id"], "state": f["board_state"], "review": side})
 
     @tool
+    def board_hold_merge(feature_id: str, reason: str) -> str:
+        """Place the operator's per-card auto-merge veto (the `merge-hold` label, #532) —
+        the loop never auto-merges a held card however green it is, so a human merges it by
+        hand. Use it for a change you want to QA yourself before it lands: a console layout
+        change, a risky migration. It only vetoes the MERGE edge; the card still builds,
+        verifies and gets reviewed as usual.
+
+        `reason` is REQUIRED (say why it must be merged by hand) and is stripped of any
+        literal wrapping double quotes before storage (same hygiene as board_create_feature).
+        Valid in any non-terminal state (backlog/ready/in_progress/in_review/blocked), so a
+        hold can be set before the card is ever dispatched; a done or cancelled card, or an
+        unknown id, returns an `Error:` and changes nothing. Idempotent: re-holding an
+        already-held card is a no-op with no second audit comment. Lift it with
+        board_release_merge_hold."""
+        try:
+            reason = _strip_wrapping_quotes(reason).strip()
+            if not reason:
+                return "Error: a merge-hold needs a reason — say why this card must be merged by hand"
+            f = get_store(**store_kw).set_merge_hold(feature_id, reason)
+            return json.dumps({"id": f["id"], "state": f["board_state"], "merge_hold": f.get("merge_hold", False)})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_release_merge_hold(feature_id: str) -> str:
+        """Lift the operator's per-card auto-merge veto (the `merge-hold` label) — the
+        inverse of board_hold_merge (#532). Removes the label and records an audit comment,
+        so the auto-merge edge can resume for this card. An unknown id returns an `Error:`;
+        idempotent on a card that is not held (a no-op with no comment)."""
+        try:
+            f = get_store(**store_kw).release_merge_hold(feature_id)
+            return json.dumps({"id": f["id"], "state": f["board_state"], "merge_hold": f.get("merge_hold", False)})
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_reset_merged_verify_budget(feature_id: str) -> str:
         """Reset ONE feature's merged-state re-verify budget (ADR 0326, #326) — the
         supported way to un-stick an in_review card whose `next_action` reads `auto-merge
@@ -1704,6 +1746,8 @@ def _board_tools(cfg: dict):
         board_requeue_ci_fix,
         board_block_feature,
         board_unblock_feature,
+        board_hold_merge,
+        board_release_merge_hold,
         board_reset_merged_verify_budget,
         board_list,
         board_retro,

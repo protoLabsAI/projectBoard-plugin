@@ -464,6 +464,8 @@ _MINIMAL_ARGS = {
     "board_requeue_ci_fix": {"feature_id": "bd-1", "ci_failure": "ci failed"},
     "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
     "board_unblock_feature": {"feature_id": "bd-1"},
+    "board_hold_merge": {"feature_id": "bd-1", "reason": "r"},
+    "board_release_merge_hold": {"feature_id": "bd-1"},
     "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
     "board_list": {},
     "board_retro": {},

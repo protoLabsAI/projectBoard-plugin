@@ -43,6 +43,7 @@ from project_board import store as store_mod
 from project_board.loop import _MERGED_VERIFIED_SHA_LEN
 from project_board.store import (
     LABEL_GENS_PREFIX,
+    LABEL_MERGE_HOLD,
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_READY,
     LABEL_VERIFIED_PREFIX,
@@ -188,6 +189,32 @@ def test_budget_labels_land_replace_and_clear_through_real_br(board):
     got = board.clear_budgets(fid)  # the merge edge's full clear
     assert got["budgets"] == {}
     assert all(len(label) <= BEADS_LABEL_CAP for label in board.get_feature(fid)["labels"] or [])
+
+
+@requires_br
+def test_merge_hold_set_and_release_round_trip_through_real_br(board):
+    """#532: the `merge-hold` operator veto lands and clears through the REAL `br`
+    label validator (not the fake `_run`), projects back as `merge_hold`, and the audit
+    comments the verbs write are accepted by real `br comments add`. The refusal on a
+    terminal card is pinned here too — the store reads state out of real `br show`."""
+    f = board.create_feature("Merge-hold target", spec="s")
+    fid = f["id"]
+
+    held = board.set_merge_hold(fid, "QA the console layout by hand")
+    assert LABEL_MERGE_HOLD in (held["labels"] or []) and held["merge_hold"] is True
+    assert len(LABEL_MERGE_HOLD) <= BEADS_LABEL_CAP  # the label fits beads' validator
+    # idempotent: re-holding leaves exactly one `merge-hold` label, not a duplicate
+    reheld = board.set_merge_hold(fid, "again")
+    assert [label for label in reheld["labels"] if label == LABEL_MERGE_HOLD] == [LABEL_MERGE_HOLD]
+
+    released = board.release_merge_hold(fid)
+    assert LABEL_MERGE_HOLD not in (released["labels"] or []) and released["merge_hold"] is False
+
+    # a terminal card is refused, and nothing is written — the state read is real `br`
+    board.cancel_feature(fid, "scope cut")
+    with pytest.raises(BoardError):
+        board.set_merge_hold(fid, "too late")
+    assert LABEL_MERGE_HOLD not in (board.get_feature(fid)["labels"] or [])
 
 
 # ── `--json` output shape: one test per want_json=True call site in store.py (#138) ──
