@@ -713,6 +713,31 @@ def replace_prefixed_label_args(labels, prefix: str, desired: str) -> list[str]:
     return args
 
 
+def _terminal_stale_labels(labels) -> list[str]:
+    """The LIVE-state labels a card must SHED when it reaches a terminal edge (#536):
+    ``blocked``, the single ``blocked-class:<cls>`` class label (a class with no
+    ``blocked`` flag is a stale class, not a live block — #401), and the open-review
+    sub-states ``in-review`` / ``review-pending`` / ``changes-requested``. A done card
+    that kept these read as a live block or an open review — operators were paged for
+    cards whose PR had already merged (bd-g1d3 after #4184, bd-b93u after #4177), and
+    a merged card still showed ``blocked: true`` (protoAgent bd-b4pr).
+
+    DELIBERATELY leaves everything else: the ``cancelled`` tag, the ``review-clean``
+    verdict, and audit labels (``verified:``, ``merged-verified:``, ``self-verified``,
+    ``review-clean-sha:``, ``notified:``) are provenance, not live state.
+
+    Returns the labels ACTUALLY present (in label order), so a caller that emits a
+    ``--remove-label`` per entry writes nothing for an already-clean card and the
+    enclosing update stays byte-for-byte its prior self — the remove-only-what-differs
+    idiom ``replace_prefixed_label_args`` and the blocked-class sites already use."""
+    stale = {LABEL_BLOCKED, LABEL_IN_REVIEW, LABEL_REVIEW_PENDING, LABEL_CHANGES_REQUESTED}
+    return [
+        s
+        for s in (str(existing) for existing in labels or [])
+        if s in stale or s.startswith(LABEL_BLOCKED_CLASS_PREFIX)
+    ]
+
+
 def _decompose_ac(text) -> list[dict]:
     """Split acceptance-criteria prose into requirement items (#113): each markdown
     bullet becomes one `{id, text, status: "open"}` item (a non-bullet line continues
@@ -3698,9 +3723,12 @@ class BeadsBoard:
             # its change shipped — and `br close` refuses while open blocker edges remain
             # (the #145 class cancel already handles) — so clear the blocked label and
             # drop open incoming edges FIRST, or a blocked card whose PR merged sticks in
-            # `blocked` forever and needs a hand-unblock.
-            if LABEL_BLOCKED in (f.get("labels") or []):
-                self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+            # `blocked` forever and needs a hand-unblock. The same write also sheds the
+            # stale class and open-review labels (#536) so a done card never reads as a
+            # live block or an open review.
+            stale = _terminal_stale_labels(f.get("labels"))
+            if stale:
+                self._run("update", fid, *[a for label in stale for a in ("--remove-label", label)])
             for blocker_id in self._open_blockers(fid):
                 try:
                     self.remove_dependency(fid, blocker_id)
@@ -3745,9 +3773,11 @@ class BeadsBoard:
         fid = f["id"]
         # Same as record_merge: whatever blocked the card is moot once its work shipped —
         # clear the blocked label and drop open incoming edges FIRST, or `br close` refuses
-        # and a blocked card stays stuck in `blocked` forever needing a hand-unblock.
-        if LABEL_BLOCKED in (f.get("labels") or []):
-            self._run("update", fid, "--remove-label", LABEL_BLOCKED)
+        # and a blocked card stays stuck in `blocked` forever needing a hand-unblock. The
+        # same write sheds the stale class and open-review labels too (#536).
+        stale = _terminal_stale_labels(f.get("labels"))
+        if stale:
+            self._run("update", fid, *[a for label in stale for a in ("--remove-label", label)])
         for blocker_id in self._open_blockers(fid):
             try:
                 self.remove_dependency(fid, blocker_id)
@@ -3835,13 +3865,15 @@ class BeadsBoard:
         revived id could be re-claimed. Idempotent-ish: re-cancelling a cancelled feature
         just re-closes it.
 
-        TERMINAL-STATE CLEANUP (#325): a cancel is a terminal edge, so the card can't stay
-        a live blocker — the `blocked` label is dropped alongside the `cancelled` tag (the
-        same terminal-state invariant record_merge / mark_done enforce). board_state already
+        TERMINAL-STATE CLEANUP (#325, #536): a cancel is a terminal edge, so the card can't
+        stay a live blocker — the `blocked` label is dropped alongside the `cancelled` tag
+        (the same terminal-state invariant record_merge / mark_done enforce), together with
+        the stale `blocked-class:*` class and the `in-review` / `review-pending` /
+        `changes-requested` open-review labels (`_terminal_stale_labels`). board_state already
         reads a closed+cancelled bead as `cancelled`, but the projected `blocked` flag rides
         the LABEL, so a cancelled card that kept it would still count as blocked and float to
         the top of the sort. The `cancelled` tag + audit reason are preserved; only the stale
-        flag drops.
+        live-state labels drop.
 
         ATOMIC-OR-CLEAN (#106): the tag/unassign write lands BEFORE `br close`, so a failing
         close (a reason `br` can't parse, contention outlasting the retries, …) would strand
@@ -3852,13 +3884,13 @@ class BeadsBoard:
         half-cancel."""
         f = self._require(fid)
         prior_assignee = f.get("assignee", "")
-        # Fold the blocked-label drop (#325) into the same atomic tag write so a cancelled
-        # card never stays a live blocker; only add the flag when the card actually carries
-        # it, so an unblocked cancel is byte-for-byte its prior single-label write.
-        was_blocked = LABEL_BLOCKED in (f.get("labels") or [])
+        # Fold the terminal stale-label cleanup (#325, #536) into the same atomic tag write
+        # so a cancelled card never stays a live blocker or reads as an open review; strip
+        # ONLY labels actually present, so an already-clean cancel is byte-for-byte its prior
+        # single-label write.
+        stale = _terminal_stale_labels(f.get("labels"))
         tag = ["update", fid, "--add-label", LABEL_CANCELLED, "--assignee", ""]
-        if was_blocked:
-            tag += ["--remove-label", LABEL_BLOCKED]
+        tag += [a for label in stale for a in ("--remove-label", label)]
         self._run(*tag)
         # Drop open incoming `blocks` edges before closing (#145): `br close` refuses
         # when blockers are unresolved, but a cancel is a scope-cut — prerequisites
@@ -3882,10 +3914,9 @@ class BeadsBoard:
                     blocker_id,
                 )
         undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
-        # Re-add the blocked label we dropped, so a blocked card rolls back to blocked —
-        # not a half-cancelled, now-silently-unblocked zombie.
-        if was_blocked:
-            undo += ["--add-label", LABEL_BLOCKED]
+        # Re-add every live-state label we stripped, so a card rolls back to its EXACT
+        # pre-cancel labels — not a half-cancelled, now-silently-unblocked/unreviewed zombie.
+        undo += [a for label in stale for a in ("--add-label", label)]
         # Only rewrite the assignee if there was one — a bead that was already
         # unassigned needs no restore (and `--assignee ""` would be a redundant write).
         if prior_assignee:

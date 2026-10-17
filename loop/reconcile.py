@@ -905,6 +905,9 @@ class ReconcileMixin:
                     # under a block is news in the same way (#406), so it is part of the
                     # identity too — ONE more alert, when the last one closes.
                     incident=f"{cls}|{reason}|{spent}" + ("|deps-closed" if stranded else ""),
+                    # Re-read through the SAME store the sweep is driving, so a card that
+                    # shipped between the scan and the alert drops it (#536).
+                    store=store,
                 )
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] blocked sweep for %s failed", fid, exc_info=True)
@@ -2686,7 +2689,7 @@ class ReconcileMixin:
             store.comment(fid, f"auto-merge held: {why}")
         except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
             log.warning("[project_board] %s gate-override hold comment failed", fid, exc_info=True)
-        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"gate-override|{head}")
+        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"gate-override|{head}", store=store)
 
     # ── the external QA panel's FAIL at the current head (#473) ───────────────
     def _external_review_cfg_for(self, feature: dict):
@@ -2710,7 +2713,7 @@ class ReconcileMixin:
             store.comment(fid, f"auto-merge held: {why}")
         except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
             log.warning("[project_board] %s external-review hold comment failed", fid, exc_info=True)
-        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"external-review|{head}")
+        self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"external-review|{head}", store=store)
 
     async def _reconcile_external_review(
         self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
