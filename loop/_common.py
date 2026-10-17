@@ -663,17 +663,43 @@ _BROKEN_TREE_SIGNATURES = (
 )
 
 
-def broken_dependency_tree(output: str | bytes | None) -> str:
-    """The first line of gate output that shows the dependency tree itself was broken
-    (so the gate reached NO verdict on the code), or ``""`` when nothing matches.
+# A gate that failed because the HOST ran out of a resource reached NO verdict about the
+# code either — exactly like the broken dependency tree above, and the same asymmetry
+# applies. Seen 2026-10 on nerdsville-site (card bd-ufs / PR #77): the merged-state
+# re-verify ran 194/194 green, then vitest died with `ENOSPC: no space left on device`
+# while writing its output. The board read it as "the PR merges clean but the RESULT is
+# broken", spent 2 retries and terminal-blocked a card whose PR CI was green.
+#
+# These are signatures of the ENVIRONMENT failing, not the repo's code: the disk is full
+# (ENOSPC / "no space left on device"), the filesystem is read-only (EROFS / "read-only
+# file system"), or the OS denied a filesystem syscall (EACCES). EACCES is kept NARROW on
+# purpose — only an errno-style line naming a filesystem syscall AND a quoted path counts
+# (`EACCES: permission denied, open '…'`), never arbitrary test output that merely
+# contains the word "EACCES": a permission *assertion* a coder wrote is a real, fixable
+# verdict and must stay red. ENOSPC/EROFS are rare enough as tokens to match on the code
+# or its phrase; the spelled-out phrases are matched case-insensitively (Node emits them
+# lowercase).
+_ENV_FAULT_SIGNATURES = (
+    re.compile(r"\bENOSPC\b|no space left on device", re.IGNORECASE),
+    re.compile(r"\bEROFS\b|read-only file system", re.IGNORECASE),
+    re.compile(r"\bEACCES: permission denied, (?:open|mkdir|unlink|rename) ['\"]"),
+)
 
-    Same asymmetry as ``killed_by_signal``: calling a toolchain failure red states
-    something false about the code and blocks; calling it no-verdict only re-runs it
-    (and CI still gates)."""
+
+def broken_dependency_tree(output: str | bytes | None) -> str:
+    """The first line of gate output that shows the gate reached NO verdict on the code —
+    the dependency tree itself was broken (#516: a half-built ``node_modules``, pnpm's
+    reinstall prompt, an ``ERR_PNPM_*`` failure) or the HOST hit an environment fault
+    (#535: a full disk, a read-only filesystem, an errno-style EACCES) — or ``""`` when
+    nothing matches.
+
+    Same asymmetry as ``killed_by_signal``: calling a toolchain/environment failure red
+    states something false about the code and blocks; calling it no-verdict only re-runs
+    it (and CI still gates)."""
     if not output:
         return ""
     text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output)
-    for pat in _BROKEN_TREE_SIGNATURES:
+    for pat in (*_BROKEN_TREE_SIGNATURES, *_ENV_FAULT_SIGNATURES):
         m = pat.search(text)
         if m:
             start = text.rfind("\n", 0, m.start()) + 1
