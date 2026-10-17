@@ -354,11 +354,11 @@ def test_manifest_min_host_version_covers_tabbed_plugin_config():
 
 
 def test_readme_documents_the_task_lane_self_verification_posture():
-    """The README must describe the landed #316 field/badge accurately: the task
+    """docs/task-lane.md must describe the landed #316 field/badge accurately: the task
     Done edge, that self-verification is RECORDED and flagged (never blocked), the
     user-visible provenance posture WITHOUT overclaiming identity/auth, and the
     deliberate API-`operator` vs tool/store-actor default split."""
-    flat = " ".join((ROOT / "README.md").read_text().split())
+    flat = " ".join((ROOT / "docs" / "task-lane.md").read_text().split())
 
     # The task lane + its Done edge (a task ships a deliverable, verified not merged).
     assert "The task lane" in flat and "deliverables, not PRs" in flat
