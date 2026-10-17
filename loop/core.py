@@ -184,6 +184,13 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # and asking on the first one would file a decompose task for every slow build.
         # 0 disables the ask entirely (the card just blocks, as it did before).
         self.decompose_after_timeouts = int(self.cfg.get("decompose_after_timeouts", 2))
+        # YAML-only difficulty overrides (#549); invalid values leave the global fallback.
+        thresholds = self.cfg.get("decompose_after_timeouts_by_difficulty", {})
+        self.decompose_after_timeouts_by_difficulty = {
+            str(key).strip().lower(): value
+            for key, value in (thresholds.items() if isinstance(thresholds, dict) else ())
+            if type(value) is int
+        }
         # CI-feedback edge (closed-loop verify): poll in_review PRs' check-runs and,
         # on a FAILING rollup, bounce the feature back to the coder with the failure
         # injected as feedback (vs the old open-loop: a red PR sat in_review forever).
