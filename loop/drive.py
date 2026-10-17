@@ -2681,7 +2681,7 @@ class DriveMixin:
                     if isinstance(exc, worktree.CoderTimeout) and not reusing and not feature.get("pr_url"):
                         timeouts = await self._budget_get(store, fid, "timeout") + 1
                         await self._budget_set(store, fid, "timeout", timeouts)
-                        threshold = self.decompose_after_timeouts  # 0 = never park (block as before)
+                        threshold = self._too_wide_threshold(feature)  # 0 = never park (block as before)
                         if threshold and timeouts >= threshold:
                             # Parking blocks the card and files its split — never over a card
                             # someone else has moved on (#398): a held card is not re-blocked
@@ -2849,6 +2849,10 @@ class DriveMixin:
                 # to take it along (#405).
                 await self._discard_tree(store, fid, repo, wt, branch, base=base)
                 self._inflight.pop(fid, None)
+
+    def _too_wide_threshold(self, feature: dict) -> int:
+        difficulty = str(feature.get("difficulty", "")).strip().lower()
+        return self.decompose_after_timeouts_by_difficulty.get(difficulty, self.decompose_after_timeouts)
 
     async def _park_for_split(self, store, fid: str, timeouts: int, exc: Exception) -> None:
         """Park a card whose fresh builds keep timing out, and hand its split to the board's

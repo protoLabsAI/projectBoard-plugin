@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **31 of 82 keys are in this state, including `coders` and `projects`** —
+never renders it. **32 of 83 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -461,6 +461,7 @@ blank.
 | `archive_after_days` | `7` | reload **· YAML only** |
 | `base_refresh` | `True` | **restart** |
 | `decompose_after_timeouts` | `2` | **restart** |
+| `decompose_after_timeouts_by_difficulty` | `{}` | **restart · YAML only** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
@@ -469,6 +470,21 @@ blank.
 timeout on a fresh build is a **size** signal, not a capability one. It produces no diff and no
 CI output, so a retry re-sends a near-identical prompt, and climbing the model ladder spends a
 stronger model on a card that was never model-limited.
+
+`decompose_after_timeouts` remains the global fallback (default `2`). The YAML-only
+`decompose_after_timeouts_by_difficulty` mapping (default `{}`) overrides it for matching
+card difficulties. Keys and card difficulties are trimmed and lower-cased; non-integer
+values (including booleans) are ignored. Missing difficulties use the global fallback.
+A per-difficulty `0` disables parking for that difficulty, retaining the ordinary timeout
+path even when the global threshold is nonzero.
+
+Recommended: split medium and large cards after their first fresh-build timeout:
+
+```yaml
+decompose_after_timeouts_by_difficulty: {medium: 1, large: 1}
+```
+
+Small cards still use the global threshold of `2` with this setting.
 
 Only those timeouts count:
 
