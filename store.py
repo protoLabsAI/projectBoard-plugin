@@ -1174,11 +1174,31 @@ def _feature_branches(repo: str, fid: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
 
 
-# How long ONE `git fetch` of a dependency's open-PR branch may run in the Ready gate's
-# stacked-card check (#537) before it is abandoned. Short on purpose: the gate is interactive,
-# and a stacked path that can't be confirmed in a few seconds simply stays a phantom — exactly
-# the pre-#537 refusal — rather than holding the gate open on a slow network.
+# How long ONE `git` call in the Ready gate's stacked-card check (#537) — the fetch of a
+# dependency's open-PR branch, or a ref/path read — may run before it is abandoned. Short on
+# purpose: the gate is interactive, and a stacked path that can't be confirmed in a few seconds
+# simply stays a phantom — exactly the pre-#537 refusal — rather than holding the gate open on
+# a slow network.
 _DEP_FETCH_TIMEOUT_S = 10.0
+
+
+def _run_git(repo: str, *args: str):
+    """Run ``git -C <repo> <args>`` bounded, with no stdin, and return the completed process —
+    or ``None`` on any failure (git missing, timeout, spawn error). NEVER raises (#537): a git
+    call we can't complete counts as "not found", which leaves the phantom-path refusal in
+    place. The caller still checks ``returncode`` for a clean non-zero exit."""
+    if not repo or not os.path.isdir(repo):
+        return None
+    try:
+        return subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True,
+            text=True,
+            timeout=_DEP_FETCH_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _git_ref_has_path(repo: str, ref: str, path: str) -> bool:
@@ -1186,57 +1206,54 @@ def _git_ref_has_path(repo: str, ref: str, path: str) -> bool:
     purely LOCAL read (no network). Any failure — bad ref, missing path, not a checkout, git
     not installed, timeout — is False, NEVER an exception (#537): a path we cannot confirm is
     simply "not found", which leaves the existing phantom-path refusal in place."""
-    if not ref or not path or not os.path.isdir(repo):
+    if not ref or not path:
         return False
-    try:
-        proc = subprocess.run(
-            ["git", "-C", repo, "cat-file", "-e", f"{ref}:{path}"],
-            capture_output=True,
-            text=True,
-            timeout=_DEP_FETCH_TIMEOUT_S,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0
+    proc = _run_git(repo, "cat-file", "-e", f"{ref}:{path}")
+    return proc is not None and proc.returncode == 0
+
+
+def _dep_branch_refs(repo: str, dep_id: str) -> list[str]:
+    """The git refs under ``repo`` that hold dependency ``dep_id``'s build branch — the branch
+    ``worktree.branch_name`` creates, ``feat/<dep_id>`` or ``feat/<dep_id>-<slug>``, as local
+    heads and as ``origin`` remote-tracking refs. A LOCAL ``for-each-ref`` (no network); ``[]``
+    when there is none or git can't be read. Anchored at a ``/`` boundary and a ``-`` so the
+    patterns match ``feat/<dep_id>`` and ``feat/<dep_id>-<slug>`` but never bleed into a
+    different card whose id merely starts the same (``feat/<dep_id>x``)."""
+    if not dep_id:
+        return []
+    bases = [f"refs/heads/feat/{dep_id}", f"refs/remotes/origin/feat/{dep_id}"]
+    patterns = bases + [f"{b}-*" for b in bases]
+    proc = _run_git(repo, "for-each-ref", "--format=%(refname:short)", *patterns)
+    if proc is None or proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
 def _paths_on_dep_branch(repo: str, dep_id: str, paths: list[str], *, has_pr: bool) -> list[str]:
     """Which of ``paths`` exist on dependency ``dep_id``'s branch in ``repo`` (#537, stacked
     cards). Returns the subset found; ``[]`` on anything missing or any git error.
 
-    WHICH REF, AND WHY. An open PR reflects what has been PUSHED, so origin's copy of the
-    branch — not whatever happens to be checked out locally — is the authoritative view of
-    what that card will deliver once it merges. So when the dependency has an open PR
-    (``has_pr``) we refresh origin's branch with ONE bounded ``git fetch`` (the ONLY network
-    call, made once per dependency, never once per path) and read the remote-tracking ref
-    ``refs/remotes/origin/feat-<dep>``. When there is no open PR — or the fetch cannot run
-    (no remote, offline, git error) — NO fetch is done and we read the branch refs already
-    present locally (``_feature_branches``: ``feat-<dep>`` and its worktree variants). A
-    dependency with neither an open PR nor any local branch is skipped. Every git call is
-    bounded and a failure counts as "not found"; this never raises."""
+    WHICH REF, AND WHY. The build branch is ``feat/<dep_id>[-<slug>]`` (``worktree.branch_name``
+    — slash, not the ``feat-<dep_id>`` hyphen the worktree DIRECTORY uses). An open PR reflects
+    what has been PUSHED, so origin's copy of that branch — not whatever happens to be checked
+    out locally — is the authoritative view of what the card will deliver once it merges. So
+    when the dependency has an open PR (``has_pr``) we refresh origin with ONE bounded
+    ``git fetch`` of a WILDCARD refspec (``refs/heads/feat/<dep_id>*`` → its remote-tracking
+    ref): the ONLY network call, made once per dependency and never once per path, slug-agnostic
+    so the exact branch name need not be known, and — being a wildcard — a no-op (exit 0) rather
+    than fatal when the branch is absent. Then every matching local head AND the just-refreshed
+    remote-tracking ref is read. When there is no open PR — or the fetch can't run (no remote,
+    offline, git error) — NO fetch is done and only the branch refs already present locally are
+    read. A dependency with neither an open PR nor any discoverable branch is skipped. Every git
+    call is bounded and any failure counts as "not found"; this never raises."""
     if not dep_id or not repo or not os.path.isdir(repo):
         return []
-    local = _feature_branches(repo, dep_id)
-    if not has_pr and not local:
-        return []
-    refs: list[str] = []
     if has_pr:
-        branch = f"feat-{dep_id}"
-        try:
-            proc = subprocess.run(
-                ["git", "-C", repo, "fetch", "--quiet", "origin", branch],
-                capture_output=True,
-                text=True,
-                timeout=_DEP_FETCH_TIMEOUT_S,
-                stdin=subprocess.DEVNULL,
-            )
-            if proc.returncode == 0:
-                refs = [f"refs/remotes/origin/{branch}"]
-        except (OSError, subprocess.SubprocessError):
-            refs = []
-    if not refs:  # no fetch was done (no open PR, or the fetch failed) → local refs only
-        refs = local
+        # ONE bounded fetch, wildcard refspec: refreshes origin's copy of feat/<dep_id>[-slug]
+        # into its remote-tracking ref without needing the exact slug, and a wildcard that
+        # matches nothing exits 0 (an exact refspec for a missing branch would be fatal).
+        _run_git(repo, "fetch", "--quiet", "origin", f"refs/heads/feat/{dep_id}*:refs/remotes/origin/feat/{dep_id}*")
+    refs = _dep_branch_refs(repo, dep_id)
     if not refs:
         return []
     found: list[str] = []
@@ -2583,7 +2600,7 @@ class BeadsBoard:
         card's branch carries it instead of forcing the author to mislabel it ``(new)``.
         Returns ``(still_phantom, advisories)``.
 
-        Only ``depends_on`` cards with an open ``pr_url`` or an existing ``feat-<id>`` branch
+        Only ``depends_on`` cards with an open ``pr_url`` or an existing ``feat/<id>`` branch
         are consulted. ``_paths_on_dep_branch`` makes at most ONE bounded fetch per dependency
         (never one per path) and a git failure counts as "not found" — the path stays phantom
         and nothing raises — so a stacked card that can't be confirmed gets the normal

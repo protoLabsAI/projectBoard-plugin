@@ -7,11 +7,13 @@ file is brand new when it is really about to arrive from the dependency.
 
 Now, for a path missing from the base checkout, the gate consults each depends_on card that
 has an open `pr_url` or a feature branch and checks whether the path exists on that card's
-branch (`git cat-file -e <ref>:<path>`). WHICH REF: an open PR reflects what is PUSHED, so
-origin's copy is authoritative — the gate refreshes it with ONE bounded `git fetch` and reads
-the remote-tracking ref `refs/remotes/origin/feat-<dep>`; with no open PR (or no remote) it
-reads the local branch refs. A git error counts as "not found" (the normal refusal), never an
-exception.
+branch (`git cat-file -e <ref>:<path>`). The branch is the one `worktree.branch_name` builds:
+`feat/<dep_id>` or `feat/<dep_id>-<slug>` — a SLASH, which is why these fixtures create real
+`feat/dep-a-<slug>` branches rather than a hand-made `feat-dep-a`. WHICH REF: an open PR
+reflects what is PUSHED, so origin's copy is authoritative — the gate refreshes it with ONE
+bounded wildcard `git fetch` and reads the remote-tracking ref; with no open PR (or no remote)
+it reads the local branch refs. A git error counts as "not found" (the normal refusal), never
+an exception.
 
 These run REAL git against a bare origin plus a clone, because what `git fetch` /
 `git cat-file` see on a branch is exactly the behaviour under test — a faked git cannot show it.
@@ -66,14 +68,21 @@ def _wire(monkeypatch, board, cards):
     monkeypatch.setattr(board, "list_features", lambda *a, **k: list(cards))
 
 
+# The real build branches `worktree.branch_name` makes for these dependency cards: a SLASH
+# after `feat`, then `<id>-<slug>`. The gate must find these; a `feat-dep-a` would not be one.
+DEP_A_BRANCH = "feat/dep-a-open-pr-slug"
+DEP_B_BRANCH = "feat/dep-b-local-slug"
+
+
 @pytest.fixture
 def stack(tmp_path: Path):
     """A clone (the project checkout, on `main`) wired to a bare origin, with two dependency
     branches set up to exercise both ref paths:
 
-    - ``feat-dep-a`` carries ``alpha.py`` and lives ONLY on origin (local branch and remote-
-      tracking ref removed), so it is reachable only after a fetch — the open-PR path.
-    - ``feat-dep-b`` carries ``beta.py`` as a LOCAL branch, never pushed — the no-fetch path.
+    - ``feat/dep-a-<slug>`` carries ``alpha.py`` and lives ONLY on origin (local branch and
+      remote-tracking ref removed), so it is reachable only after a fetch — the open-PR path.
+    - ``feat/dep-b-<slug>`` carries ``beta.py`` as a LOCAL branch, never pushed — the no-fetch
+      path.
 
     The working tree stays on ``main`` (``base.py`` only), so neither stacked file exists in
     the base checkout."""
@@ -88,22 +97,22 @@ def stack(tmp_path: Path):
     _git("-C", clone, "remote", "add", "origin", origin)
     _git("-C", clone, "push", "-u", "origin", "main")
 
-    # feat-dep-a: alpha.py, pushed to origin, then removed locally so only the fetch can see it.
-    _git("-C", clone, "checkout", "-q", "-b", "feat-dep-a")
+    # dep-a's branch: alpha.py, pushed to origin, then removed locally so only the fetch sees it.
+    _git("-C", clone, "checkout", "-q", "-b", DEP_A_BRANCH)
     Path(clone, "alpha.py").write_text("alpha\n")
     _git("-C", clone, "add", "-A")
     _git("-C", clone, "commit", "-m", "alpha on dep-a")
-    _git("-C", clone, "push", "-q", "origin", "feat-dep-a")
+    _git("-C", clone, "push", "-q", "origin", DEP_A_BRANCH)
     _git("-C", clone, "checkout", "-q", "main")
-    _git("-C", clone, "branch", "-qD", "feat-dep-a")
+    _git("-C", clone, "branch", "-qD", DEP_A_BRANCH)
     subprocess.run(  # drop the remote-tracking ref so the fetch, not a leftover ref, restores it
-        ["git", "-C", clone, "update-ref", "-d", "refs/remotes/origin/feat-dep-a"],
+        ["git", "-C", clone, "update-ref", "-d", f"refs/remotes/origin/{DEP_A_BRANCH}"],
         capture_output=True,
         text=True,
     )
 
-    # feat-dep-b: beta.py, a local branch never pushed.
-    _git("-C", clone, "checkout", "-q", "-b", "feat-dep-b")
+    # dep-b's branch: beta.py, a local branch never pushed.
+    _git("-C", clone, "checkout", "-q", "-b", DEP_B_BRANCH)
     Path(clone, "beta.py").write_text("beta\n")
     _git("-C", clone, "add", "-A")
     _git("-C", clone, "commit", "-m", "beta on dep-b")
@@ -114,8 +123,9 @@ def stack(tmp_path: Path):
 
 @requires_git
 def test_path_on_an_open_pr_dep_branch_is_accepted_via_the_fetched_remote_ref(stack, make_board, monkeypatch):
-    """r1/r4: B depends on dep-a; alpha.py exists only on dep-a's pushed branch. ready_check
-    and mark_ready both accept B, with an advisory naming dep-a."""
+    """r1/r4: B depends on dep-a; alpha.py exists only on dep-a's pushed branch, reachable
+    solely via the fetch. ready_check and mark_ready both accept B, with an advisory naming
+    dep-a."""
     b = make_board(lambda *a, **k: [] if k.get("want_json") else "", repo=stack)
     dep = _card("dep-a", ["base.py"], state="in_review", pr_url="https://github.com/o/r/pull/56")
     nxt = _card("bd-8ac", ["alpha.py"], deps=["dep-a"])
@@ -125,6 +135,9 @@ def test_path_on_an_open_pr_dep_branch_is_accepted_via_the_fetched_remote_ref(st
     assert check["ok"], check["refusals"]
     advice = " ".join(a["message"] for a in check["advisories"])
     assert "dep-a" in advice and "path from dep-a's branch" in advice
+
+    # The fetch really restored the remote-tracking ref it read — proof the slash branch matched.
+    assert _git("-C", stack, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{DEP_A_BRANCH}")
 
     # mark_ready is the same verdict — it must not raise.
     b.mark_ready("bd-8ac")
