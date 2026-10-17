@@ -462,12 +462,15 @@ class DriveMixin:
         with "no worktree of <id> has changes". Keeping it lets the salvage ship that work.
 
         The ``coder.solve`` offload builds and reaps its OWN candidate worktrees, so the
-        drive's ``wt`` is usually None here even when a verified tree was left on disk — so
-        fall back to whatever the card still owns (``feature_worktrees``), the same trees a
-        salvage publishes from. Best-effort, like every trail: the tree is safe where it is,
-        this is only the pointer (the reaper skips a blocked card, and ``oracle-timeout`` is
-        not self-healing, so the blocked sweep never requeues or removes it)."""
-        trees = [(wt, branch or "")] if wt else list(worktree.feature_worktrees(repo, self.root, fid))
+        drive's ``wt`` is None here — the tree that survived is the ONE candidate
+        ``coder_seam.dispatch`` chose to keep, handed up on ``OracleTimeout.kept`` and passed
+        straight in as ``wt``. We name EXACTLY that tree (guarded by ``tree_exists``). We do
+        NOT scan ``feature_worktrees`` for a fallback: that would surface a stale ``feat-<id>``
+        tree an earlier run left on disk and wrongly report it as this run's green build
+        (#538). Best-effort, like every trail: the tree is safe where it is, this is only the
+        pointer (the reaper skips a blocked card, and ``oracle-timeout`` is not self-healing,
+        so the blocked sweep never requeues or removes it)."""
+        trees = [(wt, branch or "")] if wt else []
         kept = [(p, b) for p, b in trees if p and worktree.tree_exists(p)]
         salvage = f"board_salvage_feature (POST /features/{fid}/salvage)"
         if kept:
@@ -2355,7 +2358,13 @@ class DriveMixin:
                         # healing, so the blocked sweep neither requeues nor removes it — it waits
                         # for a human to salvage or cancel (the same keep-the-tree stance the
                         # closed-source-issue guard takes, protoAgent#3832).
-                        await self._keep_tree_for_salvage(store, fid, repo, wt, branch, base=base)
+                        #
+                        # The solve offload reaps its OWN candidate trees, so the drive's `wt`
+                        # is None here — the surviving tree is the ONE candidate dispatch() kept,
+                        # handed up on `exc.kept` (path, branch). Name exactly it; never scan for
+                        # a stale `feat-<fid>` an earlier run left (#538).
+                        kept_wt, kept_branch = exc.kept if exc.kept is not None else (wt, branch)
+                        await self._keep_tree_for_salvage(store, fid, repo, kept_wt, kept_branch, base=base)
                         self._inflight.pop(fid, None)
                         return
                     if isinstance(exc, worktree.WorktreeMissing):

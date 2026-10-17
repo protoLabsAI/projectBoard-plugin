@@ -81,9 +81,16 @@ async def test_oracle_timeout_keeps_the_worktree_and_points_at_salvage(tmp_path,
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())  # solve is importable
 
     async def _dispatch(**kw):
-        # The solve offload built a (green) candidate, then the oracle timed out on it.
-        _feature_worktree(kw["repo"], kw["fid"], root=kw["root"])
-        _oracle_timeout(**kw)
+        # The solve offload built a (green) candidate, then the oracle timed out on it — and,
+        # as the REAL dispatch now does (#538), kept that tree and handed it up on the
+        # exception's `.kept`, so the drive names EXACTLY it (never a scan). The real path is
+        # exercised end-to-end in tests/test_oracle_timeout_keep_tree.py.
+        wt = _feature_worktree(kw["repo"], kw["fid"], root=kw["root"])
+        try:
+            _oracle_timeout(**kw)
+        except coder_seam.OracleTimeout as exc:
+            exc.kept = (wt, f"feat/{kw['fid']}")
+            raise
 
     monkeypatch.setattr(coder_seam, "dispatch", _dispatch)
 

@@ -1640,6 +1640,14 @@ class OracleTimeout(SolveExhausted):
         super().__init__(message)
         self.test_cmd = test_cmd
         self.timeout = timeout
+        # #538: the ONE candidate worktree ``dispatch()`` KEPT (did not reap) so
+        # ``feature_worktrees``/``board_salvage_feature`` can publish the build the oracle
+        # never finished judging — ``(worktree_path, branch)``, or ``None`` when no candidate
+        # survived to keep. A timeout is not a verdict on the code (bd-b4pr: a green dependency
+        # bump), so unlike every other ``SolveExhausted`` this one does NOT reap everything.
+        # The drive reads this to name EXACTLY the tree it kept, never a stale ``feat-<fid>``
+        # tree an earlier run left on disk.
+        self.kept: tuple[str, str] | None = None
 
 
 # ── path-scoped acceptance oracles (#459) ─────────────────────────────────────────────
@@ -2480,8 +2488,25 @@ async def dispatch(
             fusion_k=fusion_k,
         )
     except Exception as exc:
+        # #538: an oracle TIMEOUT is not a verdict on the code — the build the oracle never
+        # finished judging is often green (bd-b4pr: a dependency bump whose own build and
+        # tests passed). So, ALONE among the exceptions here, keep ONE candidate (and its
+        # branch) on disk so `feature_worktrees`/`board_salvage_feature` can find and publish
+        # it, and reap only the rest. Record that tree on the exception so the drive names
+        # EXACTLY it — never a stale `feat-<fid>` an earlier run left behind. Every other
+        # failure (SolveExhausted, CoderTimeout, a worktree op erroring) still reaps every
+        # candidate, unchanged: a capability failure never leaves an unverified tree around.
+        keep: tuple[str, str] | None = None
+        if isinstance(exc, OracleTimeout):
+            keep = await _pick_salvage_candidate(repo, base, adapter.candidates)
+            exc.kept = keep
         for wt, branch in adapter.candidates:
+            if keep is not None and wt == keep[0]:
+                continue  # #538: the salvageable candidate stays
             await worktree.remove_worktree(repo, wt, branch)
+        # The kept candidate still has its branch checked out, so `_sweep_candidate_branches`
+        # (which never touches a branch a live worktree holds) leaves that branch alone while
+        # reaping the reaped losers' leftover branches as before.
         await _sweep_candidate_branches(repo, fid)
         if record_gens is not None and adapter.generations:
             # `solve()` never got to return a `gens_spent` count — the attempted
@@ -2492,10 +2517,12 @@ async def dispatch(
             # reaped and the original exception below is what the loop must see —
             # a transient `br` failure recording the spend must never mask it.
             _record_gens_best_effort(record_gens, fid, adapter.generations)
+        reaped = len(adapter.candidates) - (1 if keep is not None else 0)
         log.warning(
-            "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
+            "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped%s): %s",
             fid,
-            len(adapter.candidates),
+            reaped,
+            f", kept {keep[0]} for salvage" if keep is not None else "",
             exc,
         )
         raise
@@ -2560,6 +2587,29 @@ async def dispatch(
         adapter._replies.get(win_wt) or f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
     )
     return canon_wt, canon_branch, result_text
+
+
+async def _pick_salvage_candidate(repo: str, base: str, candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """#538: among an oracle-timed-out run's candidate worktrees, pick the ONE to KEEP so
+    ``board_salvage_feature`` can publish the (often green) build the oracle never finished
+    judging. An oracle timeout gives no verdict to rank candidates by, so prefer the LAST
+    candidate that still holds work vs ``base`` — generated latest, with the most sibling
+    feedback behind it — and fall back to the last candidate on disk when none reads as
+    changed (git unreadable, or a bare tree). Returns ``(worktree, branch)``, or ``None``
+    when no candidate survives on disk at all, so the caller reaps everything exactly as
+    every other failure does."""
+    fallback: tuple[str, str] | None = None
+    chosen: tuple[str, str] | None = None
+    for wt, branch in candidates:
+        if not worktree.tree_exists(wt):
+            continue
+        fallback = (wt, branch)
+        try:
+            if await worktree.unpublished_work(wt, branch=branch, base=base):
+                chosen = (wt, branch)
+        except Exception:  # noqa: BLE001 — an unreadable tree still counts as keepable work
+            chosen = (wt, branch)
+    return chosen or fallback
 
 
 async def _sweep_candidate_branches(repo: str, fid: str) -> None:
