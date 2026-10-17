@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="t d">
+  <title id="t">Project Board</title>
+  <desc id="d">A board with five lanes — backlog, ready, in progress, in review, done — with cards moving left to right and a blocked flag on one card.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1226"/><stop offset="1" stop-color="#1b1f45"/></linearGradient>
+    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+    <style>
+      text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+      .lane{fill:#161a38;stroke:#2c3263;stroke-width:1.5}
+      .lh{fill:#9aa3d9;font-size:15px;font-weight:600;letter-spacing:.06em}
+      .card{fill:#232852;stroke:#3a4285;stroke-width:1.2}
+      .bar{fill:#3a4285}
+      .ok{fill:#34d399}.warn{fill:#fbbf24}.hot{fill:#f87171}.acc{fill:url(#ac)}
+    </style>
+  </defs>
+  <rect width="1200" height="420" rx="20" fill="url(#bg)"/>
+  <text x="60" y="88" font-size="46" font-weight="700" fill="#fff">Project Board</text>
+  <text x="60" y="126" font-size="20" fill="#b7bff0">From an idea to merged PRs — a board, a loop and a coder.</text>
+  <rect x="60" y="142" width="120" height="4" rx="2" class="acc"/>
+  <g transform="translate(60,176)">
+    <g>
+      <rect class="lane" width="204" height="204" rx="12"/><text class="lh" x="16" y="30">BACKLOG</text>
+      <rect class="card" x="14" y="46" width="176" height="44" rx="8"/><rect class="bar" x="26" y="60" width="112" height="7" rx="3.5"/><rect class="bar" x="26" y="74" width="72" height="6" rx="3"/>
+      <rect class="card" x="14" y="100" width="176" height="44" rx="8"/><rect class="bar" x="26" y="114" width="96" height="7" rx="3.5"/><rect class="bar" x="26" y="128" width="130" height="6" rx="3"/>
+    </g>
+    <g transform="translate(224,0)">
+      <rect class="lane" width="204" height="204" rx="12"/><text class="lh" x="16" y="30">READY</text>
+      <rect class="card" x="14" y="46" width="176" height="44" rx="8"/><rect class="bar" x="26" y="60" width="128" height="7" rx="3.5"/><rect class="bar" x="26" y="74" width="84" height="6" rx="3"/><circle cx="172" cy="68" r="6" class="ok"/>
+    </g>
+    <g transform="translate(448,0)">
+      <rect class="lane" width="204" height="204" rx="12"/><text class="lh" x="16" y="30">IN PROGRESS</text>
+      <rect class="card" x="14" y="46" width="176" height="44" rx="8"/><rect class="bar" x="26" y="60" width="104" height="7" rx="3.5"/><rect class="bar" x="26" y="74" width="140" height="6" rx="3"/>
+      <rect class="card" x="14" y="100" width="176" height="44" rx="8" style="stroke:#f87171"/><rect class="bar" x="26" y="114" width="88" height="7" rx="3.5"/><rect class="bar" x="26" y="128" width="110" height="6" rx="3"/><rect x="120" y="108" width="62" height="16" rx="8" class="hot"/><text x="151" y="120" font-size="10" font-weight="700" fill="#2b0a0a" text-anchor="middle">BLOCKED</text>
+    </g>
+    <g transform="translate(672,0)">
+      <rect class="lane" width="204" height="204" rx="12"/><text class="lh" x="16" y="30">IN REVIEW</text>
+      <rect class="card" x="14" y="46" width="176" height="44" rx="8"/><rect class="bar" x="26" y="60" width="120" height="7" rx="3.5"/><rect class="bar" x="26" y="74" width="90" height="6" rx="3"/><circle cx="172" cy="68" r="6" class="warn"/>
+    </g>
+    <g transform="translate(896,0)">
+      <rect class="lane" width="204" height="204" rx="12"/><text class="lh" x="16" y="30">DONE</text>
+      <rect class="card" x="14" y="46" width="176" height="44" rx="8"/><rect class="bar" x="26" y="60" width="100" height="7" rx="3.5"/><rect class="bar" x="26" y="74" width="120" height="6" rx="3"/><circle cx="172" cy="68" r="6" class="ok"/>
+      <rect class="card" x="14" y="100" width="176" height="44" rx="8"/><rect class="bar" x="26" y="114" width="126" height="7" rx="3.5"/><rect class="bar" x="26" y="128" width="80" height="6" rx="3"/><circle cx="172" cy="122" r="6" class="ok"/>
+      <rect class="card" x="14" y="154" width="176" height="36" rx="8"/><rect class="bar" x="26" y="168" width="90" height="7" rx="3.5"/><circle cx="172" cy="172" r="6" class="ok"/>
+    </g>
+  </g>
+</svg>

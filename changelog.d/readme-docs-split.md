@@ -1,0 +1,1 @@
+- **The README is now a one-screen quick start; the detail moved to `docs/`.** A hero image and badges were added, and the install, annotated config, mechanics, usage, task lane, gate, setup preflight and development notes each got their own page, indexed from `docs/README.md`.

@@ -264,7 +264,7 @@ config:
                             # board kept its cards IN the repo's .beads/: the setup
                             # preflight flags a repo still carrying one; point db_path
                             # at that .beads/<file>.db to keep reading those cards
-                            # (see README "Upgrading a pre-D3 board").
+                            # (see docs/annotated-config.md "Upgrading a pre-D3 board").
   webhook_secret: ""        # HMAC secret for every public mutation: /webhook/pr,
                             # /features/<id>/ci, and /review. Blank → all three fail
                             # closed (503). Or set PROJECT_BOARD_WEBHOOK_SECRET.
@@ -285,7 +285,7 @@ settings_tabs:
 # Console settings. `restart: true` is deliberate: only LIVE_KNOBS are re-applied by
 # BoardLoop.reload; every other exposed scalar is useful/operator-safe but remains the
 # boot-time value until the member restarts. Structural routing lives in Projects, and
-# machine/internal tuning stays file-only (documented in README).
+# machine/internal tuning stays file-only (documented in docs/configuration.md).
 settings:
   - { key: loop_enabled, label: "Run orchestration loop", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Start the background puller after the member restarts. Off keeps the board and tools available without dispatching work." }

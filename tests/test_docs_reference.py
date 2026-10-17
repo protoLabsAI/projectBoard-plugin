@@ -88,14 +88,14 @@ def test_every_agent_tool_is_in_the_tools_reference():
 def test_the_readme_layout_table_matches_the_real_files():
     """The Layout table is the first thing a contributor reads to find their way around,
     and it was stale within a day of the #268 package split."""
-    readme = (_ROOT / "README.md").read_text()
+    readme = (_ROOT / "docs" / "development.md").read_text()
     layout = readme.split("## Layout", 1)
-    assert len(layout) == 2, "README lost its Layout section"
+    assert len(layout) == 2, "docs/development.md lost its Layout section"
     body = layout[1].split("\n## ", 1)[0]
     for name in re.findall(r"^\| `([a-z_/.]+)` \|", body, re.M):
         target = _ROOT / name
         assert target.exists(), (
-            f"README's Layout table names `{name}`, which does not exist. #268 renamed "
+            f"docs/development.md's Layout table names `{name}`, which does not exist. #268 renamed "
             f"loop.py → loop/ and the table kept the old name — that is exactly the drift "
             f"this catches."
         )
@@ -229,7 +229,7 @@ def test_the_readme_never_documents_a_nonexistent_server_subcommand():
     the subcommands that actually exist. It is a coarse guard (it does not run the host)
     but it catches the failure that occurred: a plausible verb that was never implemented.
     """
-    readme = (_ROOT / "README.md").read_text()
+    readme = (_ROOT / "README.md").read_text() + (_ROOT / "docs" / "install.md").read_text()
     claimed = set(re.findall(r"python -m server plugin ([a-z][a-z-]*)", readme))
     # The real subcommand list, from `python -m server plugin --help` on protoAgent 0.155.x.
     real = {
