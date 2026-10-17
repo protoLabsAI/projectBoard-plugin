@@ -10,6 +10,7 @@ so tests that monkeypatch ``project_board.loop.<name>`` still take effect.
 
 from __future__ import annotations
 
+import inspect
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
@@ -2869,7 +2870,18 @@ class DriveMixin:
         3. RELEASE the task, only now: the agent that picks it up ends by cancelling this card,
            which must never be found still in flight."""
         ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
-        task = await asyncio.to_thread(ask, fid, timeouts=timeouts) if callable(ask) else None
+        try:
+            learned = self._timeout_escalation_context(fid)
+        except Exception:  # noqa: BLE001 — timeout context must never prevent the park
+            learned = ""
+        task = None
+        if callable(ask):
+            try:
+                inspect.signature(ask).bind(fid, timeouts=timeouts, learned=learned)
+            except (TypeError, ValueError):  # older/stub or uninspectable store: retain the old call
+                task = await asyncio.to_thread(ask, fid, timeouts=timeouts)
+            else:
+                task = await asyncio.to_thread(ask, fid, timeouts=timeouts, learned=learned)
         task_id = str((task or {}).get("id") or "")
         retry = "raise coder_timeout_s and unblock it (unblocking resets its timeout count)"
         if task_id:

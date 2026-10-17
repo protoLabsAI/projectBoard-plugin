@@ -3109,7 +3109,7 @@ class BeadsBoard:
     # (#378) — so the ask happens ONCE per card, never on every subsequent timeout.
     LABEL_DECOMPOSE_ASKED = "decompose-asked"
 
-    def request_decomposition(self, fid: str, *, timeouts: int) -> dict | None:
+    def request_decomposition(self, fid: str, *, timeouts: int, learned: str = "") -> dict | None:
         """Ask the board's own agent to split an oversized card (#378).
 
         A repeated ``CoderTimeout`` is the one failure class that teaches the next attempt
@@ -3175,6 +3175,13 @@ class BeadsBoard:
                 f"ORIGINAL ACCEPTANCE CRITERIA\n{f.get('acceptance_criteria') or '(none)'}\n\n"
                 f"ORIGINAL files_to_modify ({len(files)})\n"
                 + ("\n".join(f"- {p}" for p in files) or "- (none)")
+                + (
+                    "\n\nWHAT THE FAILED ATTEMPT(S) LEARNED\n"
+                    + learned[:4000]
+                    + "\nPut the part the attempt was stuck on into its own slice."
+                    if learned
+                    else ""
+                )
                 + f"\n\nCARDS THAT DEPEND ON {fid}\n"
                 + ("\n".join(f"- {d}" for d in dependents) or "- (none)")
                 + "\n\nDO IT IN THIS ORDER — each step is what lets the next one pass the board's gates:\n\n"
