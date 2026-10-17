@@ -43,6 +43,34 @@ was created, refused, fixed, refused again for a different reason, and finally s
   nothing. Dependency sanity rides along as an advisory that refuses nothing: an edge onto a
   cancelled card released without its work ever landing.
 
+**Advisories ride beside the refusals — they warn, they never block.** They land in
+`ready_check(...)["advisories"]` (surfaced automatically at `board_create_feature` /
+`board_update_feature`), each with the same `{gate, message, fix}` shape as a refusal, but
+`ready_check(...)["ok"]` stays True and `mark_ready` still promotes the card.
+
+| Advisory | Warns when | Fix |
+|---|---|---|
+| `dependency` | a `depends_on` edge points at a cancelled card | re-point the edge |
+| `spec-width` | the spec itself reads wide — see below | consider splitting into cards that each deliver one concern |
+
+**Spec width is a second, softer breadth signal (#548).** The `breadth` *gate* above counts
+`files_to_modify`, but a card can be conceptually wide while naming few files: ds-syt
+(protoContent#609) had 4 files at difficulty medium and still timed out twice at 1800s,
+because one spec packed a radio-menu composition + theme-safe portals for menu AND submenu +
+a focus handoff. The `spec-width` advisory reads that width out of the spec itself, from three
+independent signals — it names every one that tripped with its measured value and threshold
+(all tunable via the `SPEC_WIDTH_*` constants beside `max_files_by_difficulty`):
+
+- **spec length** over `SPEC_WIDTH_MAX_CHARS` (2500 chars),
+- **acceptance-criteria count** over `SPEC_WIDTH_MAX_CRITERIA` (6 items, counted the same way
+  the requirement ledger decomposes them), and
+- **concern joins** over `SPEC_WIDTH_MAX_JOINS` (3) — "and also"-style phrases (`and also`,
+  `as well as`, `additionally`, `plus`, `; also`) that tack a second concern onto a sentence.
+
+It is advisory, never a refusal — prose heuristics are too soft to gate a promotion on — so
+it only nudges the author to split. Task-type beads ship a deliverable rather than an
+implementation, so it skips them, and it runs even when a card names no files.
+
 **Shared files are serialised by a path, not an edge (#458).** Two cards editing one file
 must not build in parallel off the same base, so one must wait for the other to merge. Any
 `depends_on` path through open cards does that, in either direction: in a chain
