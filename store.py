@@ -3709,6 +3709,44 @@ class BeadsBoard:
         self.comment(fid, f"blocked: escalation exhausted: {reason}" if reason else "blocked: escalation exhausted")
         return self.get_feature(fid)
 
+    def _close_restoring_stale(self, fid: str, stale: list[str], *close_args: str) -> None:
+        """`br close` after a terminal edge already stripped ``stale`` (#536), ATOMIC-OR-CLEAN
+        exactly as cancel_feature does its tag write: a close that FAILS — or whose outcome is
+        UNKNOWN — re-adds the labels that were stripped, so a still-OPEN card lands back in its
+        pre-close state.
+
+        This is the point of the rollback: the merge/CI poll and the blocked sweep only retry
+        ``in_review`` / ``blocked`` cards. The first #536 cut stripped ``in-review`` (and the
+        ``blocked-class`` / review sub-states) before the close with no undo, so a failed close
+        dropped the card to plain ``in_progress`` — out of BOTH retry sets, never re-closed,
+        recoverable only by the orphan sweep. Re-adding every stripped label keeps the card in
+        whichever lane was retrying it.
+
+        BoardTimeout is the one case we must not undo blind (#404): a stalled close may have
+        committed and then hung, and re-adding ``blocked`` / ``in-review`` to a bead that DID
+        close (now ``done``) would make it read as a live block / open review again — the very
+        bug #536 fixes. So on a timeout we LOOK: a closed bead means the close landed and the
+        strip stands; an open one gets the undo and the error; a re-read that itself fails
+        touches nothing and says the outcome is unknown."""
+        try:
+            self._run("close", fid, *close_args)
+        except BoardTimeout:
+            try:
+                now = self.get_feature(fid)
+            except BoardError:
+                raise BoardTimeout(
+                    f"close {fid}: `br close` timed out and the card could not be re-read — it may "
+                    "or may not be closed; check it before retrying"
+                ) from None
+            if (now or {}).get("bead_status") != "closed":
+                if stale:
+                    self._run("update", fid, *[a for label in stale for a in ("--add-label", label)])
+                raise
+        except BoardError:
+            if stale:
+                self._run("update", fid, *[a for label in stale for a in ("--add-label", label)])
+            raise
+
     # ── the ONE Done edge for coding features (invariant #2) ──────────────────
     def record_merge(self, *, pr_url: str) -> dict | None:
         """Close the feature whose PR merged — the ONLY path to `done` for a coding
@@ -3725,7 +3763,8 @@ class BeadsBoard:
             # drop open incoming edges FIRST, or a blocked card whose PR merged sticks in
             # `blocked` forever and needs a hand-unblock. The same write also sheds the
             # stale class and open-review labels (#536) so a done card never reads as a
-            # live block or an open review.
+            # live block or an open review — re-added atomically if the close fails, so a
+            # still-open card keeps the `in_review`/`blocked` label the merge poll retries on.
             stale = _terminal_stale_labels(f.get("labels"))
             if stale:
                 self._run("update", fid, *[a for label in stale for a in ("--remove-label", label)])
@@ -3739,7 +3778,7 @@ class BeadsBoard:
                         fid,
                         blocker_id,
                     )
-            self._run("close", fid, "-r", f"merged: {pr_url}")
+            self._close_restoring_stale(fid, stale, "-r", f"merged: {pr_url}")
         return self.get_feature(f["id"])
 
     # ── the MANUAL Done edge (#228): shipped outside the board's PR lifecycle ──
@@ -3774,7 +3813,9 @@ class BeadsBoard:
         # Same as record_merge: whatever blocked the card is moot once its work shipped —
         # clear the blocked label and drop open incoming edges FIRST, or `br close` refuses
         # and a blocked card stays stuck in `blocked` forever needing a hand-unblock. The
-        # same write sheds the stale class and open-review labels too (#536).
+        # same write sheds the stale class and open-review labels too (#536) — re-added
+        # atomically if the close fails, so a still-open card keeps the `in_review`/`blocked`
+        # label the merge/blocked poll retries on.
         stale = _terminal_stale_labels(f.get("labels"))
         if stale:
             self._run("update", fid, *[a for label in stale for a in ("--remove-label", label)])
@@ -3792,7 +3833,7 @@ class BeadsBoard:
         # last write, so the comment lands even if a later projection read hiccups).
         if reason:
             self.comment(fid, f"done: {reason}")
-        self._run("close", fid, "-r", f"done: {reason}" if reason else "done (manual)")
+        self._close_restoring_stale(fid, stale, "-r", f"done: {reason}" if reason else "done (manual)")
         return self.get_feature(fid)
 
     # ── the task Done edge (#217): verify, not merge ──────────────────────────

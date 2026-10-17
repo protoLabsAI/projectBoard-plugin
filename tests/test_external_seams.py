@@ -198,6 +198,7 @@ MAX_UNCOVERED_HOST = 1
 # a version matrix (0.1.23 / 0.2.16 / 0.3.2) with PB_REQUIRE_BR=1 so an absent binary
 # FAILS rather than skips. #353 and #356 were both caught by adding to it.
 STORE_SEAMS: dict[str, str] = {
+    "_close_restoring_stale": "REAL",  # #536: the shared `br close` (+ atomic undo) for record_merge/mark_done; real `br` in tests/test_stale_alerts_536.py
     "_create": "UNCOVERED",
     "_create_feature": "REAL",  # create_feature's body, run under the hot-file chain lock; real `br` (test_card_authoring_455.py)
     "_find_by_external_ref": "UNCOVERED",

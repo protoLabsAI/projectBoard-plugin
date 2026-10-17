@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import threading
 import types
 
 import pytest
@@ -30,7 +31,7 @@ import pytest
 from project_board import store as store_mod
 import project_board.loop as loop_mod
 from project_board.loop import BoardLoop
-from project_board.store import BeadsBoard, BoardError
+from project_board.store import BeadsBoard, BoardError, BoardTimeout
 
 requires_br = pytest.mark.skipif(
     shutil.which(store_mod.BR) is None,
@@ -121,6 +122,47 @@ def test_the_reread_falls_back_to_the_loops_own_store(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_store", lambda: _Card("done"))
     loop._notify_operator("bd-x", "Board card bd-x is blocked")
     assert added == []
+
+
+class _ThreadRecordingBlockedStore:
+    """A blocked lane the sweep can drive, recording the thread each ``get_feature`` ran on.
+    The #536 guard re-reads the card inside ``_notify_operator`` with a blocking ``br show``
+    (store single-flight lock, up to the br timeout), so ``_recover_blocked`` must drive the
+    whole notify through ``asyncio.to_thread`` — the read must land on a WORKER thread."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.read_on_main: list[bool] = []  # one bool per get_feature: ran on the main thread?
+
+    def list_features(self, state=None, **_kw):
+        return list(self._rows) if state == "blocked" else []
+
+    def get_feature(self, fid):
+        self.read_on_main.append(threading.current_thread() is threading.main_thread())
+        return next((dict(r) for r in self._rows if r["id"] == fid), None)
+
+
+async def test_the_blocked_sweep_re_reads_state_off_the_event_loop(monkeypatch, tmp_path):
+    """The stale-alert guard's re-read is a BLOCKING ``br show``, so ``_recover_blocked`` drives
+    ``_notify_operator`` through ``asyncio.to_thread`` — an inline call ran the read on the
+    event-loop thread, stalling every coroutine and logging the #258 warning for each escalated
+    card on every sweep. pytest-asyncio runs the loop on the main thread, so a re-read recorded
+    on the main thread means it blocked the loop. The alert still fires for a live block."""
+    added = _install_inbox(monkeypatch, tmp_path)
+    row = {
+        "id": "bd-x",
+        "board_state": "blocked",
+        "blocked": True,
+        "blocked_class": "auth",  # not self-healing → escalates → notifies
+        "blocked_reason": "403 forbidden",
+        "title": "A card",
+        "labels": [],
+    }
+    store = _ThreadRecordingBlockedStore([row])
+    await BoardLoop({"coder": "proto"})._recover_blocked(store)
+    assert added and "bd-x" in added[0]["text"], "a still-blocked card is still alerted"
+    assert store.read_on_main, "the guard must re-read the card before alerting"
+    assert not any(store.read_on_main), "the re-read ran on the event-loop thread (#258/#536)"
 
 
 # ── 2: the close edges shed every stale live-state label (#536) ──────────────────────────
@@ -232,6 +274,85 @@ def test_cancel_feature_rollback_re_adds_every_stale_label(make_board, monkeypat
         b.cancel_feature("bd-9", "scope cut")
     undo = next(c for c in br.calls if c[0] == "update" and "cancelled" in _removed(c))
     assert _added(undo) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+
+
+def _timeout_on_close(args):
+    raise BoardTimeout("`br close` timed out")
+
+
+def test_record_merge_close_failure_re_adds_every_stripped_label(make_board):
+    """The strip lands BEFORE `br close`, so a failed close must not drop the card out of the
+    merge poll's retry set (it scans only `in_review`/`blocked`). On a close that raises, the
+    undo re-adds EXACTLY the stripped labels, so a still-open card keeps its `in-review` /
+    `blocked` label and the next poll retries it — the pre-#536 retry behaviour, kept."""
+    url = "https://example/pr/4184"
+    labels = ["blocked", "blocked-class:terminal", "in-review", "review-pending", "merged-verified:abc"]
+    rows = [{"id": "bd-g1d3", "external_ref": url, "status": "in_progress", "labels": labels}]
+    br = Br({"list": rows, "close": _raise_on_close})
+    b = make_board(br)
+    with pytest.raises(BoardError, match="failed"):
+        b.record_merge(pr_url=url)
+    strip = next(c for c in br.calls if c[0] == "update" and "--remove-label" in c)
+    assert _removed(strip) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
+    assert _added(undo) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+
+
+def test_mark_done_close_failure_re_adds_every_stripped_label(make_board, monkeypatch):
+    """Manual mark_done gets the SAME atomic-or-clean rollback: a close that raises re-adds the
+    stripped live-state labels so the still-open card stays in the lane that was retrying it."""
+    labels = ["blocked", "blocked-class:transient", "in-review", "review-pending", "verified:me"]
+    br = Br(returns={"close": _raise_on_close})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "labels": labels})
+    with pytest.raises(BoardError, match="failed"):
+        b.mark_done("bd-1", reason="shipped off-board")
+    strip = next(c for c in br.calls if c[0] == "update" and "--remove-label" in c)
+    assert _removed(strip) == {"blocked", "blocked-class:transient", "in-review", "review-pending"}
+    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
+    assert _added(undo) == {"blocked", "blocked-class:transient", "in-review", "review-pending"}
+
+
+def test_close_timeout_that_actually_closed_keeps_the_labels_shed(make_board, monkeypatch):
+    """A `br close` that TIMES OUT may have committed then hung (#404), so the edge LOOKS before
+    undoing: a card the close actually shut (now `done`) keeps its stale labels SHED — re-adding
+    `blocked`/`in-review` blind would make a done card read as a live block again, the very #536
+    bug. No undo add-label, and mark_done returns the closed/done card."""
+    labels = ["blocked", "in-review", "verified:me"]
+    reads = {"n": 0}
+
+    def _gf(fid):
+        reads["n"] += 1
+        if reads["n"] == 1:  # _require: the pre-close in_review card
+            return {"id": fid, "board_state": "in_review", "labels": labels}
+        # after the timed-out close (and the final projection): a closed+done bead
+        return {"id": fid, "bead_status": "closed", "board_state": "done", "blocked": False, "labels": ["verified:me"]}
+
+    br = Br(returns={"close": _timeout_on_close})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _gf)
+    result = b.mark_done("bd-1", reason="shipped")
+    assert result["board_state"] == "done" and result["blocked"] is False
+    assert any(c[0] == "update" and "--remove-label" in c for c in br.calls), "the strip must have run"
+    assert not any(c[0] == "update" and "--add-label" in c for c in br.calls), "a closed card must NOT be re-labelled"
+
+
+def test_close_timeout_still_open_undoes_the_strip_and_raises(make_board, monkeypatch):
+    """The other timeout branch: a close that timed out and left the card OPEN undoes the strip
+    (re-adds the stripped labels) and re-raises, so an open card is never a half-closed zombie
+    that silently dropped its `in-review`/`blocked` label."""
+    labels = ["blocked", "in-review", "review-pending"]
+
+    def _gf(fid):  # the card is STILL open on every read — the close never landed
+        return {"id": fid, "bead_status": "open", "board_state": "in_review", "labels": labels}
+
+    br = Br(returns={"close": _timeout_on_close})
+    b = make_board(br)
+    monkeypatch.setattr(b, "get_feature", _gf)
+    with pytest.raises(BoardTimeout):
+        b.mark_done("bd-1", reason="shipped")
+    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
+    assert _added(undo) == {"blocked", "in-review", "review-pending"}
 
 
 # ── 3: board_list(state="blocked") is left alone — the FLAG is the live block (#401) ─────

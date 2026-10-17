@@ -889,7 +889,13 @@ class ReconcileMixin:
                     if cls == PREFLIGHT_HOLD_CLASS
                     else f"Board card {fid} is blocked and will not clear itself ({why})"
                 )
-                self._notify_operator(
+                # OFF the event loop: the #536 stale-alert guard re-reads the card with a
+                # blocking `br show` (store single-flight lock, up to the br timeout) right
+                # before the inbox row, so the whole notify — read, dedup and write — goes
+                # through to_thread like every other store call in this pass. Calling it
+                # inline stalled every coroutine on each escalated card, every sweep.
+                await asyncio.to_thread(
+                    self._notify_operator,
                     fid,
                     f"{head}: "
                     f"{reason or 'no reason recorded'}"
