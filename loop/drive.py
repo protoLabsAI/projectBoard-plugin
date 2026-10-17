@@ -454,6 +454,39 @@ class DriveMixin:
             await self._comment(store, fid, text)
         return trail
 
+    async def _keep_tree_for_salvage(self, store, fid: str, repo: str, wt, branch, *, base: str = "") -> None:
+        """#538: the oracle-timeout block's answer to ``_discard_tree`` — KEEP the card's
+        worktree and tell the operator where it is and how to publish it. An oracle timeout
+        says nothing about the code, so the kept tree is often green; discarding it forced a
+        rebuild, and ``board_salvage_feature`` (which publishes from a LIVE worktree) refused
+        with "no worktree of <id> has changes". Keeping it lets the salvage ship that work.
+
+        The ``coder.solve`` offload builds and reaps its OWN candidate worktrees, so the
+        drive's ``wt`` is usually None here even when a verified tree was left on disk — so
+        fall back to whatever the card still owns (``feature_worktrees``), the same trees a
+        salvage publishes from. Best-effort, like every trail: the tree is safe where it is,
+        this is only the pointer (the reaper skips a blocked card, and ``oracle-timeout`` is
+        not self-healing, so the blocked sweep never requeues or removes it)."""
+        trees = [(wt, branch or "")] if wt else list(worktree.feature_worktrees(repo, self.root, fid))
+        kept = [(p, b) for p, b in trees if p and worktree.tree_exists(p)]
+        salvage = f"board_salvage_feature (POST /features/{fid}/salvage)"
+        if kept:
+            where = "; ".join(f"{p} (branch {b or '?'})" for p, b in kept)
+            text = (
+                f"Blocked {ORACLE_TIMEOUT_CLASS}: the acceptance oracle timed out, which is not a verdict on the "
+                f"code — this build is often green. Its worktree is KEPT, not discarded, at {where}. "
+                f"Publish that work with {salvage} once the oracle is sized (a faster coder_solve_test_cmd, a "
+                f"coder_solve_test_paths map, or a larger coder_solve_test_timeout_s), or cancel the card if the "
+                "work is unwanted."
+            )
+        else:
+            text = (
+                f"Blocked {ORACLE_TIMEOUT_CLASS}: the acceptance oracle timed out (not a verdict on the code). No "
+                f"worktree of {fid} survived to keep; unblocking rebuilds it, or salvage it with {salvage} if one "
+                "reappears."
+            )
+        await self._comment(store, fid, text)
+
     async def _comment(self, store, fid: str, text: str) -> None:
         """A best-effort card comment — the trail must never break an edge."""
         log.info("[project_board] %s %s", fid, text.splitlines()[0])
@@ -2313,7 +2346,16 @@ class DriveMixin:
                             pr_url=pr_url,
                         ):
                             return
-                        await self._discard_tree(store, fid, repo, wt, branch, base=base)
+                        # #538: a timeout is not a verdict on the CODE — the build it judged is
+                        # often green (bd-b4pr: a dependency bump whose build and tests passed).
+                        # So, alone among the block classes, KEEP the worktree instead of
+                        # `_discard_tree`ing it, and point the operator at the salvage that can
+                        # publish it. Nothing reaps it meanwhile: the health sweep's reaper only
+                        # takes done/cancelled/gone trees, and `oracle-timeout` is not self-
+                        # healing, so the blocked sweep neither requeues nor removes it — it waits
+                        # for a human to salvage or cancel (the same keep-the-tree stance the
+                        # closed-source-issue guard takes, protoAgent#3832).
+                        await self._keep_tree_for_salvage(store, fid, repo, wt, branch, base=base)
                         self._inflight.pop(fid, None)
                         return
                     if isinstance(exc, worktree.WorktreeMissing):
