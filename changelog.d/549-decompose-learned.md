@@ -1,0 +1,1 @@
+- Decomposition tasks now carry up to 4000 characters of timeout context (elapsed time, last tool, and thought tail), with instructions to isolate the part the attempt was stuck on into its own slice. Empty context preserves the original spec, and older stores and failed context reads still allow parking. Refs #549.
