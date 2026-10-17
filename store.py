@@ -437,6 +437,21 @@ ADR_REF_RE = re.compile(r"(?i)\badr[\s/_-]{0,2}\d{1,4}\b|docs/adr/\d{4}-")
 # thing. Configurable via the `max_files_by_difficulty` config key (threaded to BeadsBoard
 # through store_kw, beside repo/base_branch); a None override keeps this default.
 MAX_FILES_BY_DIFFICULTY = {"small": 4, "medium": 4, "large": 6}
+# Spec-width advisory (#548): the breadth cap above measures a card by its COUNTED
+# files_to_modify, but a card can be conceptually wide while naming few files — ds-syt
+# (protoContent#609) had 4 files at difficulty medium, yet its spec asked for a radio-menu
+# composition + theme-safe portals for menu AND submenu + a focus handoff, and it timed out
+# twice at 1800s. Width in the SPEC, not just the file list, is what predicts those
+# timeouts. These thresholds trip a non-blocking advisory (it can never refuse — prose
+# heuristics are too soft to gate on); they live here beside the breadth cap so both knobs
+# are tuned in one place. They are deliberately per-difficulty-free (one threshold each).
+SPEC_WIDTH_MAX_CHARS = 2500  # spec prose longer than this looks like several concerns
+SPEC_WIDTH_MAX_CRITERIA = 6  # more acceptance-criteria items than this (counted via _decompose_ac)
+SPEC_WIDTH_MAX_JOINS = 3  # more "and also"-style concern joins than this
+# Case-insensitive phrases that tack a second concern onto a spec sentence. Counted as plain
+# substrings of the lower-cased spec; leading/trailing spaces keep them from matching inside
+# a word (" plus " won't fire on "plushie"; " additionally" catches "additionally," too).
+SPEC_WIDTH_JOINERS = (" and also ", " as well as ", " additionally", " plus ", "; also")
 # Files nobody AUTHORS don't count toward the breadth cap (#455). A one-token change in a
 # changesets monorepo touches tokens.js + dist/tokens.css + dist/tokens.json (built and
 # committed) + a mandatory `.changeset/*.md` — four files, already at the medium cap, for
@@ -2810,6 +2825,42 @@ class BeadsBoard:
                             "cite it (e.g. 'ADR 0077') so the rationale outlives this feature."
                         ),
                         "fix": f"Add the ADR reference to the design: board_update_feature(feature_id={fid!r}, design=…).",
+                    }
+                )
+
+        # SPEC-WIDTH advisory (#548): the breadth cap above judges a card by its file COUNT,
+        # but a card can be conceptually wide while naming few files — ds-syt (protoContent#609)
+        # had 4 files at medium and timed out twice at 1800s because its spec packed a
+        # composition + two theme-safe portals + a focus handoff into one card. This reads the
+        # width out of the SPEC itself. It is advisory, NEVER a refusal: prose heuristics are
+        # too soft to block mark_ready on, so it only nudges the author toward a split. Three
+        # independent signals (tunable via the SPEC_WIDTH_* constants beside MAX_FILES_BY_DIFFICULTY),
+        # each reporting its measured value and threshold; the message names every one that tripped.
+        # Task-type beads ship a deliverable, not an implementation, so the heuristic skips them
+        # — like the file-keyed checks above. This runs BEFORE the early return below so a card
+        # with no files_to_modify and no depends_on is still measured.
+        if f.get("issue_type") != LABEL_TASK:
+            spec = str(f.get("spec", "") or "")
+            width_signals: list[str] = []
+            if len(spec) > SPEC_WIDTH_MAX_CHARS:
+                width_signals.append(f"spec is {len(spec)} chars (over {SPEC_WIDTH_MAX_CHARS})")
+            n_criteria = len(_decompose_ac(f.get("acceptance_criteria", "")))
+            if n_criteria > SPEC_WIDTH_MAX_CRITERIA:
+                width_signals.append(f"{n_criteria} acceptance criteria (over {SPEC_WIDTH_MAX_CRITERIA})")
+            lowered = spec.lower()
+            n_joins = sum(lowered.count(j) for j in SPEC_WIDTH_JOINERS)
+            if n_joins > SPEC_WIDTH_MAX_JOINS:
+                width_signals.append(f"{n_joins} concern-joining phrases (over {SPEC_WIDTH_MAX_JOINS})")
+            if width_signals:
+                advisories.append(
+                    {
+                        "gate": "spec-width",
+                        "message": (
+                            f"feature {fid!r} looks wide: {'; '.join(width_signals)} — a conceptually "
+                            "wide card times out before it lands even when it names few files, the same "
+                            "failure the breadth cap guards against by file count."
+                        ),
+                        "fix": "consider splitting into cards that each deliver one concern",
                     }
                 )
 
