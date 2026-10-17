@@ -1174,6 +1174,96 @@ def _feature_branches(repo: str, fid: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
 
 
+# How long ONE `git` call in the Ready gate's stacked-card check (#537) — the fetch of a
+# dependency's open-PR branch, or a ref/path read — may run before it is abandoned. Short on
+# purpose: the gate is interactive, and a stacked path that can't be confirmed in a few seconds
+# simply stays a phantom — exactly the pre-#537 refusal — rather than holding the gate open on
+# a slow network.
+_DEP_FETCH_TIMEOUT_S = 10.0
+
+
+def _run_git(repo: str, *args: str):
+    """Run ``git -C <repo> <args>`` bounded, with no stdin, and return the completed process —
+    or ``None`` on any failure (git missing, timeout, spawn error). NEVER raises (#537): a git
+    call we can't complete counts as "not found", which leaves the phantom-path refusal in
+    place. The caller still checks ``returncode`` for a clean non-zero exit."""
+    if not repo or not os.path.isdir(repo):
+        return None
+    try:
+        return subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True,
+            text=True,
+            timeout=_DEP_FETCH_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_ref_has_path(repo: str, ref: str, path: str) -> bool:
+    """True iff ``path`` exists in ``ref`` of ``repo`` — ``git cat-file -e <ref>:<path>``, a
+    purely LOCAL read (no network). Any failure — bad ref, missing path, not a checkout, git
+    not installed, timeout — is False, NEVER an exception (#537): a path we cannot confirm is
+    simply "not found", which leaves the existing phantom-path refusal in place."""
+    if not ref or not path:
+        return False
+    proc = _run_git(repo, "cat-file", "-e", f"{ref}:{path}")
+    return proc is not None and proc.returncode == 0
+
+
+def _dep_branch_refs(repo: str, dep_id: str) -> list[str]:
+    """The git refs under ``repo`` that hold dependency ``dep_id``'s build branch — the branch
+    ``worktree.branch_name`` creates, ``feat/<dep_id>`` or ``feat/<dep_id>-<slug>``, as local
+    heads and as ``origin`` remote-tracking refs. A LOCAL ``for-each-ref`` (no network); ``[]``
+    when there is none or git can't be read. Anchored at a ``/`` boundary and a ``-`` so the
+    patterns match ``feat/<dep_id>`` and ``feat/<dep_id>-<slug>`` but never bleed into a
+    different card whose id merely starts the same (``feat/<dep_id>x``)."""
+    if not dep_id:
+        return []
+    bases = [f"refs/heads/feat/{dep_id}", f"refs/remotes/origin/feat/{dep_id}"]
+    patterns = bases + [f"{b}-*" for b in bases]
+    proc = _run_git(repo, "for-each-ref", "--format=%(refname:short)", *patterns)
+    if proc is None or proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _paths_on_dep_branch(repo: str, dep_id: str, paths: list[str], *, has_pr: bool) -> list[str]:
+    """Which of ``paths`` exist on dependency ``dep_id``'s branch in ``repo`` (#537, stacked
+    cards). Returns the subset found; ``[]`` on anything missing or any git error.
+
+    WHICH REF, AND WHY. The build branch is ``feat/<dep_id>[-<slug>]`` (``worktree.branch_name``
+    — slash, not the ``feat-<dep_id>`` hyphen the worktree DIRECTORY uses). An open PR reflects
+    what has been PUSHED, so origin's copy of that branch — not whatever happens to be checked
+    out locally — is the authoritative view of what the card will deliver once it merges. So
+    when the dependency has an open PR (``has_pr``) we refresh origin with ONE bounded
+    ``git fetch`` of a WILDCARD refspec (``refs/heads/feat/<dep_id>*`` → its remote-tracking
+    ref): the ONLY network call, made once per dependency and never once per path, slug-agnostic
+    so the exact branch name need not be known, and — being a wildcard — a no-op (exit 0) rather
+    than fatal when the branch is absent. Then every matching local head AND the just-refreshed
+    remote-tracking ref is read. When there is no open PR — or the fetch can't run (no remote,
+    offline, git error) — NO fetch is done and only the branch refs already present locally are
+    read. A dependency with neither an open PR nor any discoverable branch is skipped. Every git
+    call is bounded and any failure counts as "not found"; this never raises."""
+    if not dep_id or not repo or not os.path.isdir(repo):
+        return []
+    if has_pr:
+        # ONE bounded fetch, wildcard refspec: refreshes origin's copy of feat/<dep_id>[-slug]
+        # into its remote-tracking ref without needing the exact slug, and a wildcard that
+        # matches nothing exits 0 (an exact refspec for a missing branch would be fatal).
+        _run_git(repo, "fetch", "--quiet", "origin", f"refs/heads/feat/{dep_id}*:refs/remotes/origin/feat/{dep_id}*")
+    refs = _dep_branch_refs(repo, dep_id)
+    if not refs:
+        return []
+    found: list[str] = []
+    for p in paths:
+        clean = strip_new_marker(p)
+        if any(_git_ref_has_path(repo, ref, clean) for ref in refs):
+            found.append(p)
+    return found
+
+
 def normalize_project(raw) -> str:
     """Normalize + validate a project name for the `project:<name>` label (#90).
 
@@ -2458,6 +2548,13 @@ class BeadsBoard:
             )
             repo = str((self.projects.get(target) or {}).get("repo") or "").strip() or self.repo
             phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+            # #537: a path absent from the target checkout may exist on a depends_on card's
+            # open-PR branch there, same as the Ready gate — accept those so a stacked card
+            # isn't blocked from rehoming. Gated on depends_on so the common no-dep move pays
+            # no board read.
+            if phantom and f.get("depends_on"):
+                dep_rows = {r["id"]: r for r in self.list_features() if r.get("id")}
+                phantom, _ = self._accept_stacked_paths(f, repo, phantom, dep_rows)
             if phantom:
                 return (
                     f"it is ready, and these files_to_modify don't exist in {target!r} ({os.path.abspath(repo)}): "
@@ -2492,6 +2589,47 @@ class BeadsBoard:
         """The `hot_files` globs for ``f``'s project (#458) — files nearly every card in
         that repo touches, which the board chains automatically at create. Empty by default."""
         return parse_glob_list(self._project_entry(f).get("hot_files"), ())
+
+    def _accept_stacked_paths(
+        self, f: dict, repo: str, phantom: list[str], dep_rows: dict
+    ) -> tuple[list[str], list[dict]]:
+        """Stacked-card relief for the phantom-path check (#537). A ``files_to_modify`` path
+        missing from ``repo``'s base checkout may already exist on a ``depends_on`` card's
+        OPEN-PR branch — e.g. bd-8ac depends on bd-0d4, and bd-0d4's open PR #56 creates the
+        files bd-8ac edits. Such a path is real, not a typo, so accept it and advise which
+        card's branch carries it instead of forcing the author to mislabel it ``(new)``.
+        Returns ``(still_phantom, advisories)``.
+
+        Only ``depends_on`` cards with an open ``pr_url`` or an existing ``feat/<id>`` branch
+        are consulted. ``_paths_on_dep_branch`` makes at most ONE bounded fetch per dependency
+        (never one per path) and a git failure counts as "not found" — the path stays phantom
+        and nothing raises — so a stacked card that can't be confirmed gets the normal
+        phantom-path refusal. See ``_paths_on_dep_branch`` for which ref is read and why."""
+        remaining = list(phantom)
+        advisories: list[dict] = []
+        for dep in f.get("depends_on") or []:
+            if not remaining:
+                break
+            dep = str(dep)
+            row = dep_rows.get(dep)
+            has_pr = bool(row is not None and str(row.get("pr_url") or "").strip())
+            on_branch = _paths_on_dep_branch(repo, dep, remaining, has_pr=has_pr)
+            if not on_branch:
+                continue
+            paths = ", ".join(strip_new_marker(p) for p in on_branch)
+            advisories.append(
+                {
+                    "gate": "phantom-paths",
+                    "message": (
+                        f"feature {f['id']!r}: {paths} {'is' if len(on_branch) == 1 else 'are'} not "
+                        f"in the base checkout but exist on {dep!r}'s open branch — accepted "
+                        f"(path from {dep}'s branch)."
+                    ),
+                    "fix": "",
+                }
+            )
+            remaining = [p for p in remaining if p not in on_branch]
+        return remaining, advisories
 
     def _ready_findings(self, f: dict, rows: list[dict] | None = None) -> dict:
         """Every Ready-gate check that can be judged from the card and the board alone, ALL
@@ -2552,6 +2690,16 @@ class BeadsBoard:
         # own repo; a card with no project falls back to the instance repo.
         repo = self._repo_for(f)
         phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+        # STACKED cards (#537): a path missing from the base checkout may already exist on a
+        # depends_on card's open-PR branch (bd-8ac depends on bd-0d4, whose open PR creates the
+        # files bd-8ac edits). Before refusing, consult each depends_on card that has an open
+        # pr_url or a feature branch and accept any such path, with an advisory naming the card.
+        if phantom and f.get("depends_on"):
+            if rows is None:
+                rows = self.list_features()
+            dep_rows = {r["id"]: r for r in rows if r.get("id")}
+            phantom, stacked = self._accept_stacked_paths(f, repo, phantom, dep_rows)
+            advisories.extend(stacked)
         if phantom:
             refusals.append(
                 {
