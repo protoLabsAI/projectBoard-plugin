@@ -171,6 +171,108 @@ async def test_real_dispatch_keeps_one_candidate_on_oracle_timeout(tmp_path, mon
     assert any(os.path.abspath(p) == os.path.abspath(kept_path) for p, _b in owned)
 
 
+# ── the review fix: keep by VERIFY OUTCOME, never a sibling that failed outright ──────
+#
+# PR-head #545's `_pick_salvage_candidate` kept the LAST candidate with changes, ignoring
+# each candidate's verify verdict — so a sibling that DEFINITIVELY FAILED (generated last)
+# was kept while the timed-out, possibly-green candidate was reaped, and `board_salvage`
+# then published the known-bad build. These drive the REAL `adapter.verify` (a real oracle
+# subprocess, not a stub) so the pass/timeout/fail classification is produced for real.
+
+
+def _fake_coder_modes(monkeypatch, modes: list[str]) -> list[str]:
+    """Each candidate (keyed by its gen) writes a real, salvageable diff PLUS a ``mode`` file
+    that the shared oracle below branches on — so gen N's verify follows ``modes[N-1]``."""
+    seen: list[str] = []
+
+    async def _tapped(coder, wt, prompt, *, fid=None, gen=0, tier="", timeout=None, env_passthrough=(), **_kw):
+        seen.append(wt)
+        Path(wt, "impl.py").write_text(f"# candidate {gen}\nVALUE = {gen}\n")
+        Path(wt, "mode").write_text(modes[(gen - 1) % len(modes)])
+        return f"## Summary\n\n- implemented the thing in candidate {gen}"
+
+    monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _tapped)
+    return seen
+
+
+# A shell oracle (``spawn_shell`` runs it through the shell) that TIMES OUT on a ``mode`` of
+# "timeout" and FAILS FAST, non-zero, on "fail". A plain non-assertion failure, so the #146
+# circuit breaker's signature never matches it. The real ``adapter.verify`` runs this.
+_MODE_ORACLE = (
+    "m=$(cat mode 2>/dev/null); "
+    'if [ "$m" = timeout ]; then sleep 30; '
+    'elif [ "$m" = fail ]; then echo "boom: tests failed"; exit 1; '
+    "else exit 0; fi"
+)
+
+
+async def _dispatch_verified(repo: str, fid: str, modes: list[str]):
+    """Run the REAL ``coder_seam.dispatch`` whose ``solve`` generates one candidate per entry
+    in ``modes`` and VERIFIES each through the real adapter (a real oracle subprocess), then
+    raises ``OracleTimeout`` — so the except block picks a salvage candidate from genuine
+    recorded verdicts, not from generation order."""
+
+    async def _solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        for i in range(len(modes)):
+            wt = await generate(task, feedback=None if i == 0 else "a sibling already ran")
+            await verify(wt)  # REAL adapter.verify → records pass/timeout/fail for this wt
+        raise _oracle_timeout()
+
+    return await coder_seam.dispatch(
+        task="do the thing",
+        coder=object(),
+        repo=repo,
+        base="main",
+        root=".worktrees",
+        fid=fid,
+        dispatch_timeout=None,
+        test_cmd=_MODE_ORACLE,
+        test_timeout=2,  # the "timeout" candidate sleeps 30 → killed here
+        budget=6,
+        k=len(modes),
+        tree_depth=2,
+        _solve=_solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+
+
+@posix_only
+async def test_oracle_timeout_keeps_the_timed_out_candidate_not_a_failed_sibling(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    # g1 TIMES OUT (unjudged, often green); g2 — generated LAST, the one PR-head would keep —
+    # DEFINITIVELY FAILS its tests. The fix must keep g1 and reap the known-bad g2.
+    created = _fake_coder_modes(monkeypatch, ["timeout", "fail"])
+
+    with pytest.raises(coder_seam.OracleTimeout) as ei:
+        await _dispatch_verified(repo, "bd-1", ["timeout", "fail"])
+    exc = ei.value
+    timed_out, failed = created[0], created[1]
+
+    assert exc.kept is not None, "a timed-out candidate must be kept"
+    kept_path, _kept_branch = exc.kept
+    assert os.path.abspath(kept_path) == os.path.abspath(timed_out), (
+        "must keep the TIMED-OUT candidate, not the last-generated one"
+    )
+    assert os.path.isdir(timed_out), "the timed-out (possibly-green) candidate survives"
+    assert not os.path.isdir(failed), "the definitively-FAILED sibling is reaped, never salvaged"
+
+
+@posix_only
+async def test_oracle_timeout_keeps_nothing_when_every_survivor_failed(tmp_path, monkeypatch):
+    """If the only candidates still on disk FAILED their tests outright (no timed-out or
+    passing build to preserve), keep nothing — a known-bad build must never reach salvage."""
+    repo = _repo(tmp_path / "repo")
+    created = _fake_coder_modes(monkeypatch, ["fail", "fail"])
+
+    with pytest.raises(coder_seam.OracleTimeout) as ei:
+        await _dispatch_verified(repo, "bd-1", ["fail", "fail"])
+
+    assert ei.value.kept is None, "no timed-out/passing candidate → keep nothing"
+    assert created and all(not os.path.isdir(p) for p in created), "every failed candidate is reaped"
+    assert not worktree.feature_worktrees(repo, ".worktrees", "bd-1")
+
+
 # ── r2 / r6: board_salvage_feature publishes the kept tree instead of refusing ────────
 
 
