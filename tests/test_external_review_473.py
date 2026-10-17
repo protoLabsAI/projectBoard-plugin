@@ -361,7 +361,7 @@ def _loop(monkeypatch, store, *, view=None, cfg=None):
     monkeypatch.setattr(loop, "_verify_merged_state", _edge("merged-verify"))
     monkeypatch.setattr(loop, "_reconcile_ci", _edge("ci"))
     monkeypatch.setattr(loop, "_maybe_auto_merge", _edge("auto-merge"))
-    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, incident="": ran.append("notify"))
+    monkeypatch.setattr(loop, "_notify_operator", lambda fid, text, incident="", **_kw: ran.append("notify"))
     loop.ran, loop.reads = ran, reads
     return loop
 

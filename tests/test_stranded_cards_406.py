@@ -79,7 +79,7 @@ async def _sweep(monkeypatch, board, alerts):
     monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
     loop = BoardLoop({"coder": "proto", "repo": board.repo})
     monkeypatch.setattr(
-        loop, "_notify_operator", lambda fid, text, *, incident="": alerts.append((fid, text, incident))
+        loop, "_notify_operator", lambda fid, text, *, incident="", **_kw: alerts.append((fid, text, incident))
     )
     await loop._sweep()
     return loop

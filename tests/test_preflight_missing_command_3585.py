@@ -151,7 +151,7 @@ async def test_the_sweep_neither_requeues_a_preflight_hold_nor_calls_it_stuck(bo
 
     alerts: list = []
     monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
-    monkeypatch.setattr(lp, "_notify_operator", lambda f, text, *, incident="": alerts.append((f, text)))
+    monkeypatch.setattr(lp, "_notify_operator", lambda f, text, *, incident="", **_kw: alerts.append((f, text)))
     await lp._sweep()
 
     f = board.get_feature(fid)

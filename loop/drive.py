@@ -469,7 +469,7 @@ class DriveMixin:
         ``worktree`` logged when it saved the tree still names the branch."""
         await self._comment(store, fid, worktree.preserved_note(repo, saved, base=base))
 
-    def _notify_operator(self, fid: str, text: str, *, incident: str = "") -> None:
+    def _notify_operator(self, fid: str, text: str, *, incident: str = "", store=None) -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
 
         Dedup is the whole difficulty here, and it is deliberately NOT solved with state
@@ -497,7 +497,22 @@ class DriveMixin:
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
-        silence a block used to leave."""
+        silence a block used to leave.
+
+        STALE-ALERT GUARD (#536): a sweep can decide to alert and only then find the card
+        already shipped — operators were paged for cards whose PR had merged minutes earlier
+        (bd-g1d3 after #4184, bd-b93u after #4177, nerdsville bd-5go after #41). So right
+        before the inbox row the card is re-read (through ``store``, else ``self._store()``)
+        and a ``done`` / ``cancelled`` card drops the alert at debug. FAIL OPEN: a read that
+        raises never hides a real block — the alert still goes out with whatever is known."""
+        try:
+            now = (store or self._store()).get_feature(fid)
+            state = str((now or {}).get("board_state") or "")
+            if state in ("done", "cancelled"):
+                log.debug("[project_board] %s is %s — dropping stale block alert", fid, state)
+                return
+        except Exception:  # noqa: BLE001 — a re-read we can't make must never swallow the alert
+            log.debug("[project_board] %s: could not re-read state before alerting; sending anyway", fid, exc_info=True)
         key = f"blocked:{fid}"
         if incident.strip():
             key += ":" + hashlib.sha1(incident.encode("utf-8", "replace")).hexdigest()[:12]
