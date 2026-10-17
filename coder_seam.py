@@ -1640,6 +1640,14 @@ class OracleTimeout(SolveExhausted):
         super().__init__(message)
         self.test_cmd = test_cmd
         self.timeout = timeout
+        # #538: the ONE candidate worktree ``dispatch()`` KEPT (did not reap) so
+        # ``feature_worktrees``/``board_salvage_feature`` can publish the build the oracle
+        # never finished judging — ``(worktree_path, branch)``, or ``None`` when no candidate
+        # survived to keep. A timeout is not a verdict on the code (bd-b4pr: a green dependency
+        # bump), so unlike every other ``SolveExhausted`` this one does NOT reap everything.
+        # The drive reads this to name EXACTLY the tree it kept, never a stale ``feat-<fid>``
+        # tree an earlier run left on disk.
+        self.kept: tuple[str, str] | None = None
 
 
 # ── path-scoped acceptance oracles (#459) ─────────────────────────────────────────────
@@ -1819,6 +1827,21 @@ _ORACLE_TIMEOUT_PREFIX = "acceptance tests timed out after"
 _FAILED_TEST_RE = re.compile(r"^FAILED\s+(\S+::\S+)", re.MULTILINE)
 _ASSERTION_LINE_RE = re.compile(r"AssertionError:[^\n]*")
 
+# #538: each candidate's LAST verify outcome, recorded by `verify()` keyed by its worktree,
+# so an oracle-timeout salvage keeps the right tree. A timeout is not a verdict on the code
+# (bd-b4pr: a green dependency bump), but a non-timeout FAILURE is — so `_pick_salvage_
+# candidate` must never keep a definitively-failed sibling over the possibly-green timed-out
+# candidate the salvage exists to publish.
+_VERDICT_PASS = "pass"
+_VERDICT_TIMEOUT = "timeout"
+_VERDICT_FAIL = "fail"
+# Salvage preference among candidates still on disk, lowest first: a PASSing build (rare on
+# this path — a sibling that passed while another timed out) beats the TIMED-OUT (unjudged,
+# often green) build, which beats one the oracle never judged at all; a FAILED build is never
+# a salvage target and is excluded outright.
+_SALVAGE_RANK = {_VERDICT_PASS: 0, _VERDICT_TIMEOUT: 1}
+_SALVAGE_RANK_UNVERIFIED = 2
+
 
 def _failure_signature(output: str) -> str | None:
     """Extract a stable failure signature from a candidate's verify output — the
@@ -1915,6 +1938,10 @@ class _WorktreeSolveAdapter:
         self._timeouts: dict[str, int] = {}
         self._timeout_round_end: dict[str, float] = {}
         self._verify_span: dict[str, tuple[float, float]] = {}
+        # #538: candidate worktree → its LAST verify outcome (`_VERDICT_PASS`/`_TIMEOUT`/
+        # `_FAIL`). An oracle-timeout salvage reads this (`_pick_salvage_candidate`) so it
+        # keeps the possibly-green TIMED-OUT build and never a sibling that FAILED outright.
+        self._verdict_by_wt: dict[str, str] = {}
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         # The gate's env_passthrough whitelist (#86), threaded from the loop so the
         # acceptance-test (verify) subprocess sees the SAME allowlist environment the
@@ -2165,6 +2192,17 @@ class _WorktreeSolveAdapter:
 
     async def verify(self, candidate_wt: str):
         verdict = await self._run_acceptance_tests(candidate_wt)
+        # #538: classify THIS candidate's outcome before any breaker raise below, so an
+        # oracle-timeout salvage keeps the possibly-green TIMED-OUT build, not a sibling
+        # that FAILED outright. Recorded even for the candidate that trips the timeout
+        # breaker — `_run_acceptance_tests` has already returned its (timed-out) verdict.
+        _out = getattr(verdict, "output", "") or ""
+        if bool(getattr(verdict, "passed", False)):
+            self._verdict_by_wt[candidate_wt] = _VERDICT_PASS
+        elif _out.startswith(_ORACLE_TIMEOUT_PREFIX):
+            self._verdict_by_wt[candidate_wt] = _VERDICT_TIMEOUT
+        else:
+            self._verdict_by_wt[candidate_wt] = _VERDICT_FAIL
         # Record the per-gen verify outcome (#84) for the live monitor — which test
         # command ran + a tail of its output — keyed by the candidate's worktree →
         # its gen. Best-effort; a no-op off a live board run (progress_fid None).
@@ -2480,8 +2518,25 @@ async def dispatch(
             fusion_k=fusion_k,
         )
     except Exception as exc:
+        # #538: an oracle TIMEOUT is not a verdict on the code — the build the oracle never
+        # finished judging is often green (bd-b4pr: a dependency bump whose own build and
+        # tests passed). So, ALONE among the exceptions here, keep ONE candidate (and its
+        # branch) on disk so `feature_worktrees`/`board_salvage_feature` can find and publish
+        # it, and reap only the rest. Record that tree on the exception so the drive names
+        # EXACTLY it — never a stale `feat-<fid>` an earlier run left behind. Every other
+        # failure (SolveExhausted, CoderTimeout, a worktree op erroring) still reaps every
+        # candidate, unchanged: a capability failure never leaves an unverified tree around.
+        keep: tuple[str, str] | None = None
+        if isinstance(exc, OracleTimeout):
+            keep = await _pick_salvage_candidate(adapter, base)
+            exc.kept = keep
         for wt, branch in adapter.candidates:
+            if keep is not None and wt == keep[0]:
+                continue  # #538: the salvageable candidate stays
             await worktree.remove_worktree(repo, wt, branch)
+        # The kept candidate still has its branch checked out, so `_sweep_candidate_branches`
+        # (which never touches a branch a live worktree holds) leaves that branch alone while
+        # reaping the reaped losers' leftover branches as before.
         await _sweep_candidate_branches(repo, fid)
         if record_gens is not None and adapter.generations:
             # `solve()` never got to return a `gens_spent` count — the attempted
@@ -2492,10 +2547,12 @@ async def dispatch(
             # reaped and the original exception below is what the loop must see —
             # a transient `br` failure recording the spend must never mask it.
             _record_gens_best_effort(record_gens, fid, adapter.generations)
+        reaped = len(adapter.candidates) - (1 if keep is not None else 0)
         log.warning(
-            "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped): %s",
+            "[project_board] %s coder.solve raised mid-ladder (%d candidate(s) reaped%s): %s",
             fid,
-            len(adapter.candidates),
+            reaped,
+            f", kept {keep[0]} for salvage" if keep is not None else "",
             exc,
         )
         raise
@@ -2560,6 +2617,40 @@ async def dispatch(
         adapter._replies.get(win_wt) or f"[coder.solve rung={result.rung} gens={result.gens_spent}] {result.note}"
     )
     return canon_wt, canon_branch, result_text
+
+
+async def _pick_salvage_candidate(adapter: "_WorktreeSolveAdapter", base: str) -> tuple[str, str] | None:
+    """#538: among an oracle-timed-out run's candidate worktrees, pick the ONE to KEEP so
+    ``board_salvage_feature`` can publish the (often green) build the oracle never finished
+    judging. Rank by each candidate's recorded verify outcome (``adapter._verdict_by_wt``),
+    NOT by generation order: a sibling that FAILED its tests outright is a real verdict on the
+    code — keeping it would let the salvage publish a known-bad build — so it is EXCLUDED, and
+    the timed-out (unjudged, often green) candidate the salvage exists to preserve is kept
+    instead. Preference, best first: PASSED (a sibling that passed while another timed out) >
+    TIMED-OUT > never-judged (verify was cancelled mid-run, or git made the outcome
+    unreadable); ties break toward the LAST such candidate (generated latest, with the most
+    sibling feedback behind it). A candidate must still hold work vs ``base`` to be keepable
+    — salvage can publish nothing from an empty tree — and an unreadable tree counts as work
+    (fails toward keeping it). Returns ``(worktree, branch)``, or ``None`` when no keepable
+    candidate survives on disk, so the caller reaps everything exactly as every other failure
+    does."""
+    best: tuple[str, str] | None = None
+    best_rank = _SALVAGE_RANK_UNVERIFIED + 1  # worse than any keepable candidate
+    for wt, branch in adapter.candidates:
+        if not worktree.tree_exists(wt):
+            continue
+        if adapter._verdict_by_wt.get(wt) == _VERDICT_FAIL:
+            continue  # a definitively-failed build is a real verdict — never salvage it
+        try:
+            has_work = bool(await worktree.unpublished_work(wt, branch=branch, base=base))
+        except Exception:  # noqa: BLE001 — an unreadable tree still counts as keepable work
+            has_work = True
+        if not has_work:
+            continue
+        rank = _SALVAGE_RANK.get(adapter._verdict_by_wt.get(wt), _SALVAGE_RANK_UNVERIFIED)
+        if rank <= best_rank:  # <= so a later candidate of equal rank (the latest) wins
+            best, best_rank = (wt, branch), rank
+    return best
 
 
 async def _sweep_candidate_branches(repo: str, fid: str) -> None:
