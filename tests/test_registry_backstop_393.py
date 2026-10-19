@@ -33,6 +33,9 @@ class _Store:
     def list_features(self, state=None, include_archived=False):
         return []  # every ready card of the project is held (blocked) → nothing ready
 
+    def get_feature(self, fid):
+        return {"id": fid, "blocked_class": "preflight-hold"}
+
     def clear_blocked(self, fid):
         self.calls.append(("clear_blocked", fid))
         return {"id": fid}

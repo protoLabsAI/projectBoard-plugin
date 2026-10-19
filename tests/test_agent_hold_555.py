@@ -77,7 +77,8 @@ async def test_snapshot_and_operator_alerts(monkeypatch, category):
 
 
 @requires_br
-async def test_real_hold_lists_and_stays_unclaimable_until_explicit_release(tmp_path, monkeypatch):
+@pytest.mark.parametrize("preflight_first", [False, True])
+async def test_real_hold_lists_and_stays_unclaimable_until_explicit_release(tmp_path, monkeypatch, preflight_first):
     board = store_mod.BeadsBoard(repo=str(tmp_path), actor="test")
     monkeypatch.setattr(store_mod, "get_store", lambda **kw: board)
     (tmp_path / "target.py").write_text("x = 1\n")
@@ -88,9 +89,19 @@ async def test_real_hold_lists_and_stays_unclaimable_until_explicit_release(tmp_
         files_to_modify=["target.py"],
     )["id"]
     board.mark_ready(fid)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_store", lambda: board)
+    if preflight_first:
+        loop._preflight_state = {"default": "gate exited 1"}
+        loop._hold_ready_for_preflight()
+        assert board.get_feature(fid)["blocked_class"] == "preflight-hold"
+        assert fid in loop._preflight_held["default"]
     reason = "waiting for network rebase; agent will release"
     _tool("board_block_feature").invoke({"feature_id": fid, "reason": reason, "owner": "agent"})
-    loop = BoardLoop({"coder": "proto"})
+    if preflight_first:
+        loop._preflight_state["default"] = True
+        loop._release_preflight_holds("default")
+        assert loop._preflight_held == {}
     for _ in range(3):
         await loop._recover_blocked(board)
     row = next(r for r in json.loads(_tool("board_list").invoke({})) if r["id"] == fid)
@@ -102,6 +113,41 @@ async def test_real_hold_lists_and_stays_unclaimable_until_explicit_release(tmp_
     _tool("board_unblock_feature").invoke({"feature_id": fid})
     assert board.get_feature(fid)["blocked_class"] == ""
     assert board.claim(fid)["board_state"] == "in_progress"
+
+
+@pytest.mark.parametrize("category", ["preflight-hold", "agent-hold", "terminal", "auth", ""])
+def test_preflight_release_checks_current_block_class(monkeypatch, category):
+    board = Mock()
+    board.get_feature.return_value = {"id": "bd-a", "blocked_class": category}
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_store", lambda: board)
+    loop._preflight_held = {"default": {"bd-a"}}
+    loop._preflight_commented = {"bd-a": "old failure"}
+
+    loop._release_preflight_holds("default")
+
+    board.get_feature.assert_called_once_with("bd-a")
+    if category == "preflight-hold":
+        board.clear_blocked.assert_called_once_with("bd-a")
+    else:
+        board.clear_blocked.assert_not_called()
+    assert loop._preflight_held == {}
+    assert loop._preflight_commented == {}
+
+
+@pytest.mark.parametrize("read_fails", [False, True])
+def test_preflight_release_does_not_clear_without_current_card(monkeypatch, read_fails):
+    board = Mock()
+    board.get_feature.return_value = None
+    if read_fails:
+        board.get_feature.side_effect = store_mod.BoardError("read failed")
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_store", lambda: board)
+    loop._preflight_held = {"default": {"bd-a"}}
+
+    loop._release_preflight_holds("default")
+
+    board.clear_blocked.assert_not_called()
 
 
 def test_agent_hint_preserves_dependency_release_guidance():
