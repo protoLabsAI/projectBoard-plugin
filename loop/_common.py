@@ -43,7 +43,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import sys
 import threading
@@ -62,7 +61,11 @@ from .. import (
     worktree,
 )
 from .. import gates as publish_gates
+
+# Shared with the solve oracle; coder_seam never imports the loop.
+from ..coder_seam import _GATE_NOT_FOUND_EXITS, _MISSING_CMD_RE, _missing_gate_command_hint
 from ..failures import (
+    ORACLE_MISSING_CLASS,
     ORACLE_TIMEOUT_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
     PREFLIGHT_HOLD_CLASS,
@@ -164,40 +167,6 @@ PREFLIGHT_HOLD_STEP = (
     "fix the project's gate environment (local_gate_cmd); the loop releases the hold itself "
     "once the gate runs on clean base"
 )
-# Exit statuses a shell gives a command it could not find (#3585): POSIX `sh` 127, and
-# cmd.exe's 9009. A gate that exits so never ran at all, which is a config/environment fault.
-_GATE_NOT_FOUND_EXITS = frozenset({127, 9009})
-# The missing name, as `sh`/`bash`/`zsh`/`dash` report it:
-#   /bin/sh: /x/.venv/bin/python: No such file or directory
-#   sh: 1: tsc: not found            zsh: command not found: pnpm
-_MISSING_CMD_RE = re.compile(
-    r"(?m)^\S*sh: (?:line \d+: |\d+: )?(?:command not found: (?P<a>\S+)|(?P<b>[^:\n]+): "
-    r"(?:command )?not found|(?P<c>[^:\n]+): No such file or directory)"
-)
-
-
-def _missing_gate_command_hint(project: str, cmd: str, output: str) -> str:
-    """One line naming the gate command that could not be found, and the fix (#3585).
-
-    A preflight that exits 127 did not run the gate, so its tail (``/bin/sh: …: No such
-    file or directory``) reads like a broken repo when the fault is the configured
-    command. The classic case: ``local_gate_cmd`` pins an absolute interpreter such as
-    ``<checkout>/.venv/bin/python``, and that venv was removed or never created. Kept
-    short: the hold stamps only the LAST line of the reason on the card."""
-    m = _MISSING_CMD_RE.search(output or "")
-    missing = next((g for g in (m.groups() if m else ()) if g), "")
-    if not missing:
-        try:
-            missing = shlex.split(cmd or "")[0]
-        except (ValueError, IndexError):
-            missing = ""
-    missing = missing.strip() or "its command"
-    where = "absolute path, now missing" if os.path.isabs(missing) else "not on PATH"
-    if len(missing) > 60:  # keep the tail: `…/.venv/bin/python` says more than the root does
-        missing = "…" + missing[-59:]
-    return f"gate command not found: {missing} ({where}) — fix project {project[:30]!r}'s local_gate_cmd"
-
-
 # `flag_blocked` records its reason as a `blocked: <reason>` bead comment (the same
 # format retro.py mines); the LAST such comment is the card's CURRENT block reason.
 _BLOCKED_COMMENT_RE = re.compile(r"^\s*blocked:\s*(.*)", re.I | re.S)
@@ -1866,6 +1835,7 @@ __all__ = [
     "release_freeze",
     "RELEASE_FREEZE_BLOCKER",
     "WAITING_ON_PUBLISH",
+    "ORACLE_MISSING_CLASS",
     "ORACLE_TIMEOUT_CLASS",
     "PRE_MODEL_DISPATCH_CLASS",
     "PREFLIGHT_HOLD_CLASS",
@@ -1903,6 +1873,7 @@ __all__ = [
     "PREFLIGHT_BLOCK_PREFIX",
     "PREFLIGHT_HOLD_STEP",
     "_GATE_NOT_FOUND_EXITS",
+    "_MISSING_CMD_RE",
     "_missing_gate_command_hint",
     "_BLOCKED_COMMENT_RE",
     "_last_block_reason",

@@ -91,6 +91,7 @@ import sys
 import threading
 import time
 import types
+import hashlib
 from collections import OrderedDict, deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -1619,6 +1620,71 @@ def _fusion_prompt(
     return "\n".join(parts)
 
 
+# Exit statuses a shell gives a command it could not find (#3585): POSIX `sh` 127, and
+# cmd.exe's 9009. A gate that exits so never ran at all, which is a config/environment fault.
+_GATE_NOT_FOUND_EXITS = frozenset({127, 9009})
+# The missing name, as `sh`/`bash`/`zsh`/`dash` report it:
+#   /bin/sh: /x/.venv/bin/python: No such file or directory
+#   sh: 1: tsc: not found            zsh: command not found: pnpm
+_MISSING_CMD_RE = re.compile(
+    r"(?m)^\S*sh: (?:line \d+: |\d+: )?(?:command not found: (?P<a>\S+)|(?P<b>[^:\n]+): "
+    r"(?:command )?not found|(?P<c>[^:\n]+): No such file or directory)"
+)
+
+
+def _missing_gate_command_hint(project: str, cmd: str, output: str) -> str:
+    """One line naming the gate command that could not be found, and the fix (#3585).
+
+    A preflight that exits 127 did not run the gate, so its tail (``/bin/sh: …: No such
+    file or directory``) reads like a broken repo when the fault is the configured
+    command. The classic case: ``local_gate_cmd`` pins an absolute interpreter such as
+    ``<checkout>/.venv/bin/python``, and that venv was removed or never created. Kept
+    short: the hold stamps only the LAST line of the reason on the card."""
+    m = _MISSING_CMD_RE.search(output or "")
+    missing = next((g for g in (m.groups() if m else ()) if g), "")
+    if not missing:
+        try:
+            missing = shlex.split(cmd or "")[0]
+        except (ValueError, IndexError):
+            missing = ""
+    missing = missing.strip() or "its command"
+    where = "absolute path, now missing" if os.path.isabs(missing) else "not on PATH"
+    if len(missing) > 60:  # keep the tail: `…/.venv/bin/python` says more than the root does
+        missing = "…" + missing[-59:]
+    return f"gate command not found: {missing} ({where}) — fix project {project[:30]!r}'s local_gate_cmd"
+
+
+def _oracle_command_missing(returncode: int | None, output: str) -> bool:
+    """Did the acceptance oracle fail because the shell could not FIND its command
+    (#542), as opposed to running it through to a genuine test failure? Only the former
+    stops solve as an infrastructure fault; the latter is an ordinary candidate failure
+    the generation/tier ladder must stay free to repair.
+
+    Decides the way preflight does (loop/preflight.py): the exit code is the authority.
+      * exit 0 — the command ran and the tests passed; NEVER an infrastructure failure,
+        even when an earlier optional step left a stale ``command not found`` line in the
+        merged output.
+      * exit 127 (POSIX ``sh``) / 9009 (``cmd.exe``) — the shell found nothing to run.
+      * any OTHER nonzero exit — only when the shell's ``<cmd>: not found`` diagnostic is
+        the TAIL of the output (the last non-empty line), i.e. what actually ended the
+        run. This catches a wrapper that swallows 127 into its own exit while still
+        printing the diagnostic last.
+
+    The diagnostic is matched ONLY against the tail, never the whole merged log. An
+    earlier OPTIONAL step with a working ``|| true`` fallback can leave a stale
+    ``command not found`` line and then let the real oracle run and FAIL its tests
+    (exit 1) — that trailing test report is an ordinary failure, so the stale line must
+    not be read as a missing oracle and abort the search. Requiring the diagnostic at the
+    tail is what keeps a recovered optional command from aborting a real candidate search
+    (the regression an adversarial review caught in slice 1)."""
+    if returncode == 0:
+        return False
+    if returncode in _GATE_NOT_FOUND_EXITS:
+        return True
+    tail = next((ln for ln in reversed((output or "").splitlines()) if ln.strip()), "")
+    return _MISSING_CMD_RE.search(tail) is not None
+
+
 class SolveExhausted(worktree.WorktreeError):
     """``coder.solve()`` spent its whole generation budget against this feature's
     acceptance tests and no candidate passed. A CAPABILITY failure for the CURRENT
@@ -1626,6 +1692,21 @@ class SolveExhausted(worktree.WorktreeError):
     "no diff" — but the loop treats it exactly like ``NoChangesError``/
     ``CoderTimeout``: escalate a configured tier ladder, or block. Never opens a PR
     on an unverified best-partial (ADR 0064's honest-degrade contract)."""
+
+
+class OracleMissingCommand(worktree.WorktreeError):
+    """The oracle could not run: stop solve and preserve its candidate for repair."""
+
+    def __init__(self, *, test_cmd: str, returncode: int, output: str, candidate_wt: str):
+        super().__init__(
+            f"acceptance oracle infrastructure failure: command `{test_cmd}` "
+            f"(exit {returncode}) could not run: {output}"
+        )
+        self.test_cmd = test_cmd
+        self.returncode = returncode
+        self.output = output
+        self.candidate_wt = candidate_wt
+        self.kept: tuple[str, str] | None = None
 
 
 class OracleTimeout(SolveExhausted):
@@ -1739,21 +1820,55 @@ def select_oracle(test_paths: list[tuple[str, str]], changed: list[str] | None, 
     return cmds, note
 
 
+class _ComposedOracle(str):
+    """Shell script retaining each oracle's output and status for classification."""
+
+    def __new__(cls, script: str, cmds: list[str], marker: str):
+        obj = super().__new__(cls, script)
+        obj.commands = tuple(cmds)
+        obj.marker = marker
+        return obj
+
+    def results(self, output: str):
+        for i, cmd in enumerate(self.commands):
+            match = re.search(
+                rf"{self.marker}:{i}:start\n(.*?)\n{self.marker}:{i}:exit:(\d+)",
+                output,
+                re.DOTALL,
+            )
+            if match:
+                yield cmd, int(match[2]), match[1].strip()
+
+
 def compose_oracle(cmds: list[str]) -> str:
     """One shell command that runs ``cmds`` in order, each in its own subshell, so a
     ``cd`` in one can't leak into the next. Every command runs even after an earlier one
     fails, so the output shows all the failures. The exit status is non-zero if ANY
-    command failed. A single command is returned as it is. The whole sequence runs under
-    ONE ``coder_solve_test_timeout_s``, so the budget must cover every command a
+    command failed, and it is 127 if ANY command could not be FOUND (exit 127/9009):
+    a later component's output can push that command's diagnostic off the tail, so
+    the composed exit code has to carry it for ``_oracle_command_missing`` (#542).
+    Component output/status boundaries also preserve wrapped missing-command failures
+    for classification before later output can obscure their diagnostic.
+    A single command is returned as it is. The whole sequence runs under ONE
+    ``coder_solve_test_timeout_s``, so the budget must cover every command a
     candidate can pick together."""
     if len(cmds) == 1:
         return cmds[0]
+    # The script is also the timeout-breaker key: identical selections must
+    # retain their identity across candidates while keeping output boundaries distinct.
+    marker = "__oracle_" + hashlib.sha256(json.dumps(cmds).encode()).hexdigest()
     lines = ["__oracle_rc=0"]
-    for c in cmds:
+    for i, c in enumerate(cmds):
         lines.append(f"echo {shlex.quote('== oracle: ' + c)}")
-        lines.append(f"( {c}\n) || __oracle_rc=1")
+        lines.append(f"printf '%s\\n' {marker}:{i}:start")
+        lines.append("__c=0")
+        lines.append(
+            f'( {c}\n) || {{ __c=$?; if [ "$__c" = 127 ] || [ "$__c" = 9009 ]; then __oracle_rc=127; '
+            'elif [ "$__oracle_rc" = 0 ]; then __oracle_rc=1; fi; }'
+        )
+        lines.append(f'printf "\\n%s:%s\\n" {marker}:{i}:exit "$__c"')
     lines.append("exit $__oracle_rc")
-    return "\n".join(lines)
+    return _ComposedOracle("\n".join(lines), cmds, marker)
 
 
 def _import_solve():
@@ -2343,6 +2458,17 @@ class _WorktreeSolveAdapter:
             )
         text = (out or b"").decode("utf-8", "replace").strip()
         ok = proc.returncode == 0
+        # Classify each path-scoped oracle independently, including successful ones:
+        # a recovered diagnostic in a passing component must not inherit another's
+        # failure status, and later output must not hide a wrapped missing command.
+        results = cmd.results(text) if isinstance(cmd, _ComposedOracle) else [(cmd, proc.returncode, text)]
+        for component, returncode, output in results:
+            if _oracle_command_missing(returncode, output):
+                raise OracleMissingCommand(
+                    test_cmd=component, returncode=returncode, output=output, candidate_wt=candidate_wt
+                )
+        if isinstance(cmd, _ComposedOracle):
+            text = re.sub(rf"(?m)^{cmd.marker}:\d+:(?:start|exit:\d+)\n?", "", text).strip()
         return Verdict(
             passed=ok,
             total=1,
@@ -2518,8 +2644,8 @@ async def dispatch(
             fusion_k=fusion_k,
         )
     except Exception as exc:
-        # #538: an oracle TIMEOUT is not a verdict on the code — the build the oracle never
-        # finished judging is often green (bd-b4pr: a dependency bump whose own build and
+        # #538/#542: an oracle timeout or missing command is not a verdict on the code.
+        # The build the oracle never finished judging is often green (bd-b4pr: a dependency bump whose own build and
         # tests passed). So, ALONE among the exceptions here, keep ONE candidate (and its
         # branch) on disk so `feature_worktrees`/`board_salvage_feature` can find and publish
         # it, and reap only the rest. Record that tree on the exception so the drive names
@@ -2529,6 +2655,9 @@ async def dispatch(
         keep: tuple[str, str] | None = None
         if isinstance(exc, OracleTimeout):
             keep = await _pick_salvage_candidate(adapter, base)
+            exc.kept = keep
+        elif isinstance(exc, OracleMissingCommand):
+            keep = next((candidate for candidate in adapter.candidates if candidate[0] == exc.candidate_wt), None)
             exc.kept = keep
         for wt, branch in adapter.candidates:
             if keep is not None and wt == keep[0]:
