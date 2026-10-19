@@ -9,6 +9,9 @@ name: CI fixture (always fails)
 # `PB_GH_FIXTURE_FAILED_RUN`. The real tier reruns that run's failed job and asserts a new
 # attempt starts (it fails again, by design — each rerun costs one ~5 s job).
 #
+# Before the pinned run reaches the 50-rerun cap, test setup dispatches a fresh
+# run of this workflow and checks the rerun seam against that replacement.
+#
 # Never triggered by push/PR: dispatch only. Don't delete it or its pinned run.
 
 on:

@@ -359,7 +359,8 @@ async def test_untagged_release_head_on_a_real_tagged_release_commit(real_seams)
 # with `actions: write`. Its fixture is a run of .github/workflows/ci-fixture-fails.yml — a
 # dispatch-only workflow whose one job always fails — pinned in the repo variable
 # PB_GH_FIXTURE_FAILED_RUN. Each rerun costs one ~5 s job and fails again by design, so the
-# run stays a FAILED run forever. Gated like the tier's other writes (PB_GH_ALLOW_WRITES,
+# run stays failed, but GitHub caps reruns at 50; setup refreshes it before that cap.
+# Gated like the tier's other writes (PB_GH_ALLOW_WRITES,
 # empty on fork PRs, whose GITHUB_TOKEN is read-only); with writes allowed under
 # PB_REQUIRE_GH, a missing run id FAILS instead of skipping.
 FAILED_RUN = (os.environ.get("PB_GH_FIXTURE_FAILED_RUN") or "").strip()
@@ -397,6 +398,53 @@ async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> i
     return attempt
 
 
+async def _rerunnable_fixture(run_id: str) -> tuple[str, int]:
+    """Use the pinned fixture until it approaches GitHub's 50-rerun limit.
+
+    Dispatch only the dedicated fixture workflow on the default branch. Compare
+    against a pre-dispatch snapshot so old runs cannot satisfy setup. Concurrent
+    dispatches are equivalent failed fixtures. No repository variable is changed.
+    """
+    attempt = await _wait_for_completed_fixture(run_id)
+    if attempt < 45:
+        return run_id, attempt
+
+    def gh(*args):
+        proc = subprocess.run(["gh", *args, "--repo", PLUGIN_SLUG], capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"fixture setup failed: {(proc.stderr or proc.stdout).strip()}"
+        return proc.stdout
+
+    def runs():
+        return {
+            str(row["databaseId"])
+            for row in json.loads(
+                gh(
+                    "run",
+                    "list",
+                    "--workflow",
+                    "ci-fixture-fails.yml",
+                    "--event",
+                    "workflow_dispatch",
+                    "--json",
+                    "databaseId",
+                    "--limit",
+                    "100",
+                )
+            )
+        }
+
+    previous = runs()
+    gh("workflow", "run", "ci-fixture-fails.yml")
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        fresh = runs() - previous - {run_id}
+        if fresh:
+            replacement = max(fresh, key=int)
+            return replacement, await _wait_for_completed_fixture(replacement)
+        await asyncio.sleep(5)
+    raise AssertionError("fresh failed fixture run did not appear within 600s after dispatch")
+
+
 @requires_gh
 async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
     """A real `gh run rerun --failed` of the fixture run starts a NEW attempt. The call returns
@@ -413,19 +461,17 @@ async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
             pytest.fail("PB_REQUIRE_GH and PB_GH_ALLOW_WRITES are set but PB_GH_FIXTURE_FAILED_RUN is not")
         pytest.skip("PB_GH_FIXTURE_FAILED_RUN is not set to the pinned failed fixture run")
 
-    before = await _wait_for_completed_fixture(FAILED_RUN)
+    run_id, before = await _rerunnable_fixture(FAILED_RUN)
 
-    reran = await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=[FAILED_RUN], slug=PLUGIN_SLUG)
-    assert reran in ([FAILED_RUN], []), reran
+    reran = await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=[run_id], slug=PLUGIN_SLUG)
+    assert reran in ([run_id], []), reran
 
     after = before
     deadline = time.monotonic() + 60
     while after <= before and time.monotonic() < deadline:
         await asyncio.sleep(2)
-        _status, after = _run_facts(FAILED_RUN)
-    assert after > before, (
-        f"`gh run rerun {FAILED_RUN} --failed` returned {reran} but the run is still on attempt {before}"
-    )
+        _status, after = _run_facts(run_id)
+    assert after > before, f"`gh run rerun {run_id} --failed` returned {reran} but the run is still on attempt {before}"
 
 
 @requires_gh
