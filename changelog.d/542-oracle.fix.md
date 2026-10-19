@@ -1,0 +1,1 @@
+Stop solve immediately when an acceptance oracle command is missing (exit 127/9009 or shell diagnostic). Block with infrastructure evidence and a project local_gate_cmd repair hint, preserving the candidate for recovery without spending another generation or tier. Ordinary test failures retain the existing search behavior. Refs #542; the preflight claim gate follows separately.

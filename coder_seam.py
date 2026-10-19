@@ -1619,6 +1619,40 @@ def _fusion_prompt(
     return "\n".join(parts)
 
 
+# Exit statuses a shell gives a command it could not find (#3585): POSIX `sh` 127, and
+# cmd.exe's 9009. A gate that exits so never ran at all, which is a config/environment fault.
+_GATE_NOT_FOUND_EXITS = frozenset({127, 9009})
+# The missing name, as `sh`/`bash`/`zsh`/`dash` report it:
+#   /bin/sh: /x/.venv/bin/python: No such file or directory
+#   sh: 1: tsc: not found            zsh: command not found: pnpm
+_MISSING_CMD_RE = re.compile(
+    r"(?m)^\S*sh: (?:line \d+: |\d+: )?(?:command not found: (?P<a>\S+)|(?P<b>[^:\n]+): "
+    r"(?:command )?not found|(?P<c>[^:\n]+): No such file or directory)"
+)
+
+
+def _missing_gate_command_hint(project: str, cmd: str, output: str) -> str:
+    """One line naming the gate command that could not be found, and the fix (#3585).
+
+    A preflight that exits 127 did not run the gate, so its tail (``/bin/sh: …: No such
+    file or directory``) reads like a broken repo when the fault is the configured
+    command. The classic case: ``local_gate_cmd`` pins an absolute interpreter such as
+    ``<checkout>/.venv/bin/python``, and that venv was removed or never created. Kept
+    short: the hold stamps only the LAST line of the reason on the card."""
+    m = _MISSING_CMD_RE.search(output or "")
+    missing = next((g for g in (m.groups() if m else ()) if g), "")
+    if not missing:
+        try:
+            missing = shlex.split(cmd or "")[0]
+        except (ValueError, IndexError):
+            missing = ""
+    missing = missing.strip() or "its command"
+    where = "absolute path, now missing" if os.path.isabs(missing) else "not on PATH"
+    if len(missing) > 60:  # keep the tail: `…/.venv/bin/python` says more than the root does
+        missing = "…" + missing[-59:]
+    return f"gate command not found: {missing} ({where}) — fix project {project[:30]!r}'s local_gate_cmd"
+
+
 class SolveExhausted(worktree.WorktreeError):
     """``coder.solve()`` spent its whole generation budget against this feature's
     acceptance tests and no candidate passed. A CAPABILITY failure for the CURRENT
@@ -1626,6 +1660,21 @@ class SolveExhausted(worktree.WorktreeError):
     "no diff" — but the loop treats it exactly like ``NoChangesError``/
     ``CoderTimeout``: escalate a configured tier ladder, or block. Never opens a PR
     on an unverified best-partial (ADR 0064's honest-degrade contract)."""
+
+
+class OracleMissingCommand(worktree.WorktreeError):
+    """The oracle could not run: stop solve and preserve its candidate for repair."""
+
+    def __init__(self, *, test_cmd: str, returncode: int, output: str, candidate_wt: str):
+        super().__init__(
+            f"acceptance oracle infrastructure failure: command `{test_cmd}` "
+            f"(exit {returncode}) could not run: {output}"
+        )
+        self.test_cmd = test_cmd
+        self.returncode = returncode
+        self.output = output
+        self.candidate_wt = candidate_wt
+        self.kept: tuple[str, str] | None = None
 
 
 class OracleTimeout(SolveExhausted):
@@ -2342,6 +2391,8 @@ class _WorktreeSolveAdapter:
                 output=f"{_ORACLE_TIMEOUT_PREFIX} {self.test_timeout:.0f}s",
             )
         text = (out or b"").decode("utf-8", "replace").strip()
+        if proc.returncode in _GATE_NOT_FOUND_EXITS or _MISSING_CMD_RE.search(text):
+            raise OracleMissingCommand(test_cmd=cmd, returncode=proc.returncode, output=text, candidate_wt=candidate_wt)
         ok = proc.returncode == 0
         return Verdict(
             passed=ok,
@@ -2518,8 +2569,8 @@ async def dispatch(
             fusion_k=fusion_k,
         )
     except Exception as exc:
-        # #538: an oracle TIMEOUT is not a verdict on the code — the build the oracle never
-        # finished judging is often green (bd-b4pr: a dependency bump whose own build and
+        # #538/#542: an oracle timeout or missing command is not a verdict on the code.
+        # The build the oracle never finished judging is often green (bd-b4pr: a dependency bump whose own build and
         # tests passed). So, ALONE among the exceptions here, keep ONE candidate (and its
         # branch) on disk so `feature_worktrees`/`board_salvage_feature` can find and publish
         # it, and reap only the rest. Record that tree on the exception so the drive names
@@ -2529,6 +2580,9 @@ async def dispatch(
         keep: tuple[str, str] | None = None
         if isinstance(exc, OracleTimeout):
             keep = await _pick_salvage_candidate(adapter, base)
+            exc.kept = keep
+        elif isinstance(exc, OracleMissingCommand):
+            keep = next((candidate for candidate in adapter.candidates if candidate[0] == exc.candidate_wt), None)
             exc.kept = keep
         for wt, branch in adapter.candidates:
             if keep is not None and wt == keep[0]:

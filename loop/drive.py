@@ -455,8 +455,10 @@ class DriveMixin:
             await self._comment(store, fid, text)
         return trail
 
-    async def _keep_tree_for_salvage(self, store, fid: str, repo: str, wt, branch, *, base: str = "") -> None:
-        """#538: the oracle-timeout block's answer to ``_discard_tree`` — KEEP the card's
+    async def _keep_tree_for_salvage(
+        self, store, fid: str, repo: str, wt, branch, *, base: str = "", missing_command: bool = False
+    ) -> None:
+        """#538/#542: an oracle infrastructure block's answer to ``_discard_tree`` — KEEP the card's
         worktree and tell the operator where it is and how to publish it. An oracle timeout
         says nothing about the code, so the kept tree is often green; discarding it forced a
         rebuild, and ``board_salvage_feature`` (which publishes from a LIVE worktree) refused
@@ -464,7 +466,7 @@ class DriveMixin:
 
         The ``coder.solve`` offload builds and reaps its OWN candidate worktrees, so the
         drive's ``wt`` is None here — the tree that survived is the ONE candidate
-        ``coder_seam.dispatch`` chose to keep, handed up on ``OracleTimeout.kept`` and passed
+        ``coder_seam.dispatch`` chose to keep, handed up on the oracle exception's ``kept`` field and passed
         straight in as ``wt``. We name EXACTLY that tree (guarded by ``tree_exists``). We do
         NOT scan ``feature_worktrees`` for a fallback: that would surface a stale ``feat-<id>``
         tree an earlier run left on disk and wrongly report it as this run's green build
@@ -474,6 +476,17 @@ class DriveMixin:
         trees = [(wt, branch or "")] if wt else []
         kept = [(p, b) for p, b in trees if p and worktree.tree_exists(p)]
         salvage = f"board_salvage_feature (POST /features/{fid}/salvage)"
+        if missing_command:
+            where = "; ".join(f"{p} (branch {b or '?'})" for p, b in kept)
+            detail = f"Its worktree is KEPT at {where}." if kept else "No candidate worktree survived to keep."
+            await self._comment(
+                store,
+                fid,
+                f"Blocked {PREFLIGHT_HOLD_CLASS}: the acceptance oracle command is missing; "
+                f"the build is unverified. {detail} Repair the project's local_gate_cmd environment "
+                f"and verify the candidate before publishing with {salvage}.",
+            )
+            return
         if kept:
             where = "; ".join(f"{p} (branch {b or '?'})" for p, b in kept)
             text = (
@@ -2328,6 +2341,30 @@ class DriveMixin:
                             pr_url=pr_url,
                         ):
                             self._inflight.pop(fid, None)
+                        return
+                    if isinstance(exc, coder_seam.OracleMissingCommand):
+                        project = self._project_name(feature)
+                        reason = (
+                            f"acceptance oracle infrastructure failure for project {project!r}: "
+                            f"command `{exc.test_cmd}` (exit {exc.returncode})\n{exc.output}\n"
+                            + _missing_gate_command_hint(project, exc.test_cmd, exc.output)
+                        )
+                        if not await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            reason,
+                            category=PREFLIGHT_HOLD_CLASS,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                        ):
+                            return
+                        kept_wt, kept_branch = exc.kept if exc.kept is not None else (wt, branch)
+                        await self._keep_tree_for_salvage(
+                            store, fid, repo, kept_wt, kept_branch, base=base, missing_command=True
+                        )
+                        self._inflight.pop(fid, None)
                         return
                     if isinstance(exc, coder_seam.OracleTimeout):
                         # #459: the acceptance ORACLE can't finish, whatever the candidates
