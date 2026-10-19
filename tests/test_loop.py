@@ -8601,6 +8601,7 @@ async def test_preflight_recovery_releases_holds(monkeypatch):
     # No ready work left (the held cards dropped out of `ready`) — recovery must STILL
     # fire for a project still marked failed, else the holds never release.
     store = _PreflightStore(ready=[])
+    monkeypatch.setattr(store, "get_feature", lambda fid: {"id": fid, "blocked_class": "preflight-hold"}, raising=False)
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _shell(*a, **k):

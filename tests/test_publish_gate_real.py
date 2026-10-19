@@ -380,6 +380,52 @@ def _run_facts(run_id: str) -> tuple[str, int]:
     return str(facts.get("status") or ""), int(facts.get("attempt") or 0)
 
 
+async def _fresh_failed_fixture_run() -> str:
+    """Dispatch a fresh fixture: GitHub can refuse retries of old shared runs.
+
+    This workflow is dispatch-only. Concurrent tests may discover the same fresh
+    run; the attempt-increase assertion below already handles that race.
+    """
+
+    def runs():
+        proc = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                PLUGIN_SLUG,
+                "--workflow",
+                "ci-fixture-fails.yml",
+                "--limit",
+                "100",
+                "--json",
+                "databaseId",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"fixture run listing failed: {proc.stderr or proc.stdout}"
+        return [str(run["databaseId"]) for run in json.loads(proc.stdout)]
+
+    before = max(map(int, runs()), default=0)
+    proc = subprocess.run(
+        ["gh", "workflow", "run", "ci-fixture-fails.yml", "--repo", PLUGIN_SLUG],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"fixture dispatch failed: {proc.stderr or proc.stdout}"
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        for run_id in runs():
+            if int(run_id) > before:
+                return run_id
+        await asyncio.sleep(2)
+    pytest.fail("dispatched failed fixture run did not appear within 120s")
+
+
 async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> int:
     """Wait for the shared fixture to be rerunnable and return its latest attempt.
 
@@ -497,3 +543,50 @@ async def test_rerun_failed_ci_refuses_a_bogus_run_best_effort(real_seams):
     """A `gh` refusal is logged and dropped, never raised into the loop: a run id GitHub does
     not know reruns nothing (a real 404 from the real API)."""
     assert await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=["1"], slug=PLUGIN_SLUG) == []
+
+
+async def _rerunnable_fixture(run_id: str) -> tuple[str, int]:
+    """Use the pinned fixture until it approaches GitHub's 50-rerun limit.
+
+    Dispatch only the dedicated fixture workflow on the default branch. Compare
+    against a pre-dispatch snapshot so old runs cannot satisfy setup. Concurrent
+    dispatches are equivalent failed fixtures. No repository variable is changed.
+    """
+    attempt = await _wait_for_completed_fixture(run_id)
+    if attempt < 45:
+        return run_id, attempt
+
+    def gh(*args):
+        proc = subprocess.run(["gh", *args, "--repo", PLUGIN_SLUG], capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"fixture setup failed: {(proc.stderr or proc.stdout).strip()}"
+        return proc.stdout
+
+    def runs():
+        return {
+            str(row["databaseId"])
+            for row in json.loads(
+                gh(
+                    "run",
+                    "list",
+                    "--workflow",
+                    "ci-fixture-fails.yml",
+                    "--event",
+                    "workflow_dispatch",
+                    "--json",
+                    "databaseId",
+                    "--limit",
+                    "100",
+                )
+            )
+        }
+
+    previous = runs()
+    gh("workflow", "run", "ci-fixture-fails.yml")
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        fresh = runs() - previous - {run_id}
+        if fresh:
+            replacement = max(fresh, key=int)
+            return replacement, await _wait_for_completed_fixture(replacement)
+        await asyncio.sleep(5)
+    raise AssertionError("fresh failed fixture run did not appear within 600s after dispatch")

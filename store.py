@@ -282,7 +282,7 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
-# The class a block set BY HAND always carries (#406): the board_block_feature tool and
+# The default class for a block set BY HAND (#406): the board_block_feature tool and
 # POST /features/{fid}/block, a person or the PM parking a card on something outside the
 # board. `flag_blocked` otherwise infers a class from the reason with the coder-failure
 # classifier, and that classifier reads prose as an error message: "waiting on the network
@@ -291,6 +291,8 @@ LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
 # block is a decision, not a failure; only its author knows when it is over, so it is
 # never self-healing.
 MANUAL_BLOCK_CLASS = "terminal"
+# Explicit agent-owned holds require release, never failure recovery.
+AGENT_HOLD_CLASS = "agent-hold"
 # A SECOND terminal edge (#47): a feature closed because it was created in error
 # (bad decomposition, duplicate, scope cut) — closed like `done`, but tagged so the
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
@@ -4166,6 +4168,8 @@ class BeadsBoard:
         #
         # A TRANSIENT block stays lenient on purpose: the sweep clears it on its own, so a
         # missing reason costs a retry rather than a permanent park.
+        if cls == AGENT_HOLD_CLASS and not str(reason or "").strip():
+            raise BoardError(f"{fid}: an agent hold needs a reason — release it explicitly with board_unblock_feature")
         if cls == "terminal" and not str(reason or "").strip():
             raise BoardError(
                 f"{fid}: a terminal block needs a reason — it is never auto-cleared, so "
@@ -5867,6 +5871,15 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]
+    # Add ownership after the lane-specific posture so dependency-release guidance survives.
+    for f in feats:
+        if f.get("blocked") and f.get("blocked_class") == AGENT_HOLD_CLASS:
+            reason = str(f.get("blocked_reason") or "").strip() or "no reason recorded"
+            prior = f.get("next_action_hint", "")
+            hint = f"held by agent ({AGENT_HOLD_CLASS}): {reason}; release with board_unblock_feature({f['id']})"
+            f["next_action_hint"] = f"{hint}. {prior}" if prior and not prior.startswith("held by agent (") else hint
+            f["next_action"] = f.get("next_action") or "held by agent"
+            f["awaiting_merge"] = False
     return feats
 
 

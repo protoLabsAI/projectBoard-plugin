@@ -864,7 +864,11 @@ class PreflightMixin:
         store = self._store()
         for fid in list(held):
             try:
-                store.clear_blocked(fid)
+                # Tracking records the original hold, not current ownership. An
+                # explicit agent/operator hold may have replaced it since then.
+                feature = store.get_feature(fid)
+                if feature and feature.get("blocked_class") == PREFLIGHT_HOLD_CLASS:
+                    store.clear_blocked(fid)
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] preflight release: clear_blocked failed for %s", fid, exc_info=True)
             self._preflight_commented.pop(fid, None)  # a later failure gets its own comment
