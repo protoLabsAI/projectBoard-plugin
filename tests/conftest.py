@@ -239,6 +239,26 @@ def _no_provider_down_marks():
 
 
 @pytest.fixture(autouse=True)
+def _no_leaked_pending_feedback():
+    """``_PENDING_FEEDBACK`` is the cross-instance review-bounce bridge (#256): a
+    process-stable dict keyed by feature id, drained by ``_build_prompt`` — which
+    OVERWRITES ``self._ci_feedback[fid]`` with whatever it finds. This suite reuses
+    the same handful of ids ("bd-1", "bd-9") everywhere, and the tests that prove a
+    bounce was queued legitimately leave an entry behind. So one test's queued
+    findings could replace another test's in-loop review feedback in the prompt it
+    was asserting on, depending on which tests shared an xdist worker — a load-order
+    flake that failed `test_review_gate_bounces_with_findings_in_the_retry_prompt`
+    (and blocked a release card) while every test passed on its own. Start and end
+    every test with an empty bridge; clear in place, because the dict object IS the
+    slot every view shares."""
+    from project_board.loop import _common
+
+    _common._PENDING_FEEDBACK.clear()
+    yield
+    _common._PENDING_FEEDBACK.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_preflight_health():
     """The loop publishes its preflight verdicts to process-stable health state, and the
     setup check reads the slow-preflight and unwinnable-oracle advisories back from it
