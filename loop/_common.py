@@ -65,6 +65,7 @@ from .. import gates as publish_gates
 # Shared with the solve oracle; coder_seam never imports the loop.
 from ..coder_seam import _GATE_NOT_FOUND_EXITS, _MISSING_CMD_RE, _missing_gate_command_hint
 from ..failures import (
+    ORACLE_MISSING_CLASS,
     ORACLE_TIMEOUT_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
     PREFLIGHT_HOLD_CLASS,
@@ -1834,6 +1835,7 @@ __all__ = [
     "release_freeze",
     "RELEASE_FREEZE_BLOCKER",
     "WAITING_ON_PUBLISH",
+    "ORACLE_MISSING_CLASS",
     "ORACLE_TIMEOUT_CLASS",
     "PRE_MODEL_DISPATCH_CLASS",
     "PREFLIGHT_HOLD_CLASS",

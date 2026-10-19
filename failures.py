@@ -134,6 +134,15 @@ PREFLIGHT_HOLD_CLASS = "preflight-hold"
 # `coder_solve_test_cmd`, a `coder_solve_test_paths` map, or a longer timeout.
 ORACLE_TIMEOUT_CLASS = "oracle-timeout"
 
+# The `blocked-class:` of a card whose acceptance ORACLE could not RUN (#542): the shell
+# could not find its command (exit 127/9009, or a not-found diagnostic at the tail). The
+# loop's own class. Deliberately NOT a `preflight-hold`: a preflight that passes says
+# nothing about the oracle when `coder_solve_test_cmd` / `coder_solve_test_paths` differ
+# from `local_gate_cmd`, so releasing on a clean preflight would re-dispatch into the same
+# missing command and spend generations again. Absent from the self-healing set: the
+# operator repairs the environment, then unblocks the card.
+ORACLE_MISSING_CLASS = "oracle-missing"
+
 # The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
 # and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
 # WorktreeError and every watchdog kill to `coder timed out after …`, so a message that

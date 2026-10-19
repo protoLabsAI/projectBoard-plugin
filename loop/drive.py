@@ -482,9 +482,9 @@ class DriveMixin:
             await self._comment(
                 store,
                 fid,
-                f"Blocked {PREFLIGHT_HOLD_CLASS}: the acceptance oracle command is missing; "
+                f"Blocked {ORACLE_MISSING_CLASS}: the acceptance oracle command is missing; "
                 f"the build is unverified. {detail} Repair the project's local_gate_cmd environment "
-                f"and verify the candidate before publishing with {salvage}.",
+                f"and verify the candidate, then unblock the card or publish it with {salvage}.",
             )
             return
         if kept:
@@ -2344,8 +2344,10 @@ class DriveMixin:
                         return
                     if isinstance(exc, coder_seam.OracleMissingCommand):
                         project = self._project_name(feature)
+                        # Not PREFLIGHT_BLOCK_PREFIX: restart recovery re-adopts blocks with that
+                        # prefix as preflight holds, which a clean preflight then releases.
                         reason = (
-                            f"{PREFLIGHT_BLOCK_PREFIX} — acceptance oracle infrastructure failure for project {project!r}: "
+                            f"acceptance oracle could not run — infrastructure failure for project {project!r}: "
                             f"command `{exc.test_cmd}` (exit {exc.returncode})\n{exc.output}\n"
                             + _missing_gate_command_hint(project, exc.test_cmd, exc.output)
                         )
@@ -2353,17 +2355,13 @@ class DriveMixin:
                             store,
                             fid,
                             reason,
-                            category=PREFLIGHT_HOLD_CLASS,
+                            category=ORACLE_MISSING_CLASS,
                             repo=repo,
                             wt=wt,
                             branch=branch,
                             pr_url=pr_url,
                         ):
                             return
-                        self._preflight_held.setdefault(project, set()).add(fid)
-                        # A cached pass on this commit must not suppress the repair check.
-                        self._preflight_state.pop(project, None)
-                        self._last_preflight.pop(project, None)
                         kept_wt, kept_branch = exc.kept if exc.kept is not None else (wt, branch)
                         await self._keep_tree_for_salvage(
                             store, fid, repo, kept_wt, kept_branch, base=base, missing_command=True

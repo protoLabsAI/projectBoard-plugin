@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from project_board import coder_seam, worktree
-from project_board.failures import PREFLIGHT_HOLD_CLASS
+from project_board.failures import ORACLE_MISSING_CLASS
 from test_loop import FEATURE, FakeLoopStore, _drive_with
 from project_board.loop import BoardLoop
 from test_oracle_timeout_keep_tree import _FakeBudget, _FakeResult, _FakeVerdict, _fake_coder, _repo
@@ -295,7 +295,7 @@ async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch,
         feature={**FEATURE, "acceptance_criteria": "WHEN x THE SYSTEM SHALL y"},
     )
     blocks = [call for call in store.calls if call[0] == "flag_blocked"]
-    assert len(blocks) == 1 and blocks[0][3] == PREFLIGHT_HOLD_CLASS
+    assert len(blocks) == 1 and blocks[0][3] == ORACLE_MISSING_CLASS
     reason = blocks[0][2]
     assert f"project {loop._project_name(FEATURE)!r}" in reason and "infrastructure" in reason
     assert "env missing-tool --check" in reason
@@ -305,8 +305,12 @@ async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch,
     assert kept == [("/candidate", "feat/bd-1.g1")]
     assert not any(call[0] in ("escalate", "open_review") for call in store.calls)
 
+    # Review on #557: the card must NOT ride the preflight hold. A preflight that passes
+    # says nothing about an oracle command that differs from it, so neither a clean
+    # preflight nor restart recovery may release it — the operator unblocks after repair.
     project = loop._project_name(FEATURE)
-    assert loop._preflight_held[project] == {FEATURE["id"]}
+    assert FEATURE["id"] not in loop._preflight_held.get(project, set())
+    assert not reason.startswith("gate preflight failed")
     cleared = []
     store.clear_blocked = cleared.append
     if recovery == "restart":
@@ -316,20 +320,9 @@ async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch,
         ]
         BoardLoop({})._recover_preflight_holds(store)
     else:
-        # No ready cards: the held-card registry must schedule a new check even
-        # though this project previously passed on the same checkout.
-        monkeypatch.setattr(loop, "_ready_projects", lambda store: [])
-        checked = []
-
-        async def repaired(name, cmd, repo, base):
-            checked.append(name)
-            loop._release_preflight_holds(name)
-
-        monkeypatch.setattr(loop, "_start_preflight", repaired)
-        await loop._maybe_preflight()
-        assert checked == [project]
-        assert project not in loop._preflight_held
-    assert cleared == [FEATURE["id"]]
+        loop._preflight_state[project] = True
+        loop._release_preflight_holds(project)
+    assert cleared == []
 
 
 async def test_recovery_comment_names_missing_command_not_timeout(tmp_path):
@@ -338,7 +331,7 @@ async def test_recovery_comment_names_missing_command_not_timeout(tmp_path):
     await loop._keep_tree_for_salvage(store, "bd-1", str(tmp_path), str(tmp_path), "feat/bd-1.g1", missing_command=True)
     comments = [call[2] for call in store.calls if call[0] == "comment"]
     assert len(comments) == 1
-    assert "preflight-hold" in comments[0] and "unverified" in comments[0]
+    assert "oracle-missing" in comments[0] and "unverified" in comments[0]
     assert str(tmp_path) in comments[0] and "local_gate_cmd" in comments[0]
     assert "timed out" not in comments[0] and "oracle-timeout" not in comments[0]
 
