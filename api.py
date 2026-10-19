@@ -657,6 +657,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         ``br``), because it is the beads database's own file state, not an in-process
         counter. No ``br`` call, no store read — so it answers even while ``br`` is slow."""
         db = store_kw.get("db") or default_db_path()
+        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
+            db = os.path.join(str(store_kw.get("repo") or "."), db)
         return {"rev": store_rev(db)}
 
     @router.get("/features")
@@ -690,7 +692,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # board is a 304 with no body to parse and nothing to re-render.
         body = await _guard(_list)
         tag = features_etag(body)
-        if tag in [t.strip() for t in request.headers.get("if-none-match", "").split(",")]:
+        # A proxy may weaken the tag (W/"…"); If-None-Match uses the weak comparison.
+        if tag in [t.strip().removeprefix("W/") for t in request.headers.get("if-none-match", "").split(",")]:
             return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
         return JSONResponse(jsonable_encoder(body), headers={"ETag": tag, "Cache-Control": "no-cache"})
 

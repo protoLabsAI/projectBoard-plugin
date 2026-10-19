@@ -377,7 +377,11 @@ async function load(){
     const res = await kit.apiFetch("/api/plugins/project_board/features",
       FEATURES_ETAG ? {headers: {"if-none-match": FEATURES_ETAG}} : undefined);
     if (seq !== LOAD_SEQ) return;
-    if (res.status !== 304){
+    if (res.status === 304){
+      // Unchanged on the server — but a move may have settled since the last paint.
+      const next = fromServer();
+      if (JSON.stringify(next) !== JSON.stringify(FEATURES)){ FEATURES = next; render(); }
+    } else {
       const r = await res.json().catch(() => { throw new Error("HTTP " + res.status + " (non-JSON response)"); });
       if (!res.ok) throw new Error(r.detail || "HTTP " + res.status);
       if (seq !== LOAD_SEQ) return;
@@ -386,7 +390,8 @@ async function load(){
       // blocked floats first (#201), in_progress second (#223) — matching list_features —
       // then priority asc, id tiebreak (sortFeatures). A move still in flight keeps its
       // optimistic patch over the fresh rows (withPending).
-      FEATURES = withPending(sortFeatures((r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))));
+      SERVER_ROWS = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}));
+      FEATURES = withPending(sortFeatures(SERVER_ROWS.slice()));
       render();
     }
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
@@ -410,6 +415,7 @@ async function load(){
     else if (s && s.setup && (s.setup.loop_cfg_stale || s.setup.db_override_ignored || s.setup.legacy_store_hint)) renderLoopStale(s.setup);
     else $("err").hidden = true;
   } catch (e) {
+    if (seq !== LOAD_SEQ) return;              // a superseded read's error is stale too
     // First-run tell (#unbound): a board never bound to a repo (shipped default
     // repo "." + no db_path) fails every read — that is missing SETUP, not an
     // error. /status is a pure config read, so it answers even when the store
@@ -881,6 +887,10 @@ const PENDING = new Map();                  // fid → patch applied over every 
 function sortFeatures(list){
   return list.sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));
 }
+// The rows the server last sent, untouched by optimistic patches — what a rollback and a
+// 304 re-derive the board from.
+let SERVER_ROWS = [];
+function fromServer(){ return withPending(sortFeatures(SERVER_ROWS.slice())); }
 function withPending(list){
   if (!PENDING.size) return list;
   return sortFeatures(list.map(f => PENDING.has(f.id) ? {...f, ...PENDING.get(f.id)} : f));
@@ -895,7 +905,7 @@ async function apiSend(method, p, body){
 const VERB_LABEL = {ready: "mark ready", priority: "change priority", block: "block", unblock: "unblock"};
 const VERB_DONE = {ready: " is on deck", priority: " re-ranked", block: " blocked", unblock: " unblocked"};
 async function runMove(f, plan, extra){
-  const fid = f.id, prev = FEATURES;
+  const fid = f.id;
   const patch = plan.verb === "ready" ? {state: "ready", board_state: "ready"}
     : plan.verb === "block" ? {blocked: true, blocked_reason: extra || "", blocked_class: "terminal"}
     : plan.verb === "unblock" ? {blocked: false, blocked_reason: "", blocked_class: ""} : {};
@@ -905,19 +915,25 @@ async function runMove(f, plan, extra){
   render();
   const node = CARD_NODES.get(fid);
   if (node) node.classList.add("card--pending");
+  let ranked = false;
   try {
     const url = FEAT + encodeURIComponent(fid);
+    // Re-rank FIRST: a backlog card is still editable, but once /ready lands the loop
+    // may claim it, and PATCH refuses an in_progress card.
+    if (plan.priority != null){ await apiSend("PATCH", url, {priority: plan.priority}); ranked = true; }
     if (plan.verb === "ready") await apiPost(url + "/ready", {});
     else if (plan.verb === "block") await apiPost(url + "/block", {reason: extra || ""});
     else if (plan.verb === "unblock") await apiPost(url + "/unblock", {});
-    if (plan.priority != null) await apiSend("PATCH", url, {priority: plan.priority});
     PENDING.delete(fid);
     toast(fid + (VERB_DONE[plan.verb] || " moved") + (plan.priority != null ? " · P" + plan.priority : ""), "ok");
   } catch (e) {
+    // Roll back to the server's last word with every OTHER move still in flight kept —
+    // never to a snapshot, which could be older than a read that landed meanwhile.
     PENDING.delete(fid);
-    FEATURES = prev;                          // roll back — the card animates home
+    FEATURES = fromServer();                  // roll back — the card animates home
     render();
-    toast("Couldn't " + (VERB_LABEL[plan.verb] || "move") + " " + fid + ": " + ((e && e.message) || e), "error");
+    toast("Couldn't " + (VERB_LABEL[plan.verb] || "move") + " " + fid + ": " + ((e && e.message) || e)
+      + (ranked && plan.verb !== "priority" ? " (its priority did change to P" + plan.priority + ")" : ""), "error");
   } finally {
     const n = CARD_NODES.get(fid);
     if (n) n.classList.remove("card--pending");
@@ -1015,11 +1031,14 @@ function startDrag(e, f, n){
     el.classList.toggle("lane--drop-no", !ok);
     LANES[state].why.textContent = ok ? "" : planMove(f, state, [], 0).why;
   });
-  try { n.setPointerCapture(e.pointerId); } catch (_e) { /* the card may have re-rendered */ }
+  // Capture on a node that never moves (the card itself is re-parented as it slides,
+  // which releases capture), so a release anywhere still ends the drag.
+  try { document.documentElement.setPointerCapture(e.pointerId); } catch (_e) { /* best effort */ }
   dragMove(e);
 }
 function dragMove(e){
   const d = DRAG;
+  if (e.buttons === 0){ endDrag(false); return; }   // the release happened somewhere we never heard
   d.ghost.style.transform = "translate("+(e.clientX - d.dx - parseFloat(d.ghost.style.left))+"px,"
     +(e.clientY - d.dy - parseFloat(d.ghost.style.top))+"px) rotate(1.5deg)";
   const over = laneAt(e.clientX, e.clientY);
@@ -1068,6 +1087,9 @@ function settleGhost(d){
 }
 function onPointerUp(e){
   document.body.classList.remove("is-pressing");
+  // A gesture that ends without a click (a touch pan → pointercancel) must not leave the
+  // next click — or a keyboard Enter's synthetic click — swallowed.
+  if (SUPPRESS_CLICK) setTimeout(() => { SUPPRESS_CLICK = false; }, 0);
   if (PRESS && e.pointerId === PRESS.pid) PRESS = null;
   if (DRAG) endDrag(e.type === "pointerup");
 }
@@ -1075,6 +1097,8 @@ document.addEventListener("pointerdown", onPointerDown);
 document.addEventListener("pointermove", onPointerMove);
 document.addEventListener("pointerup", onPointerUp);
 document.addEventListener("pointercancel", onPointerUp);
+document.documentElement.addEventListener("lostpointercapture", () => { if (DRAG) endDrag(false); });
+window.addEventListener("blur", () => { if (DRAG) endDrag(false); });
 // A drag (or a refused drag) ends in a click on the card — swallow exactly that one.
 document.addEventListener("click", (e) => {
   if (!SUPPRESS_CLICK) return;
@@ -1174,7 +1198,7 @@ $("move-menu").addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown" || e.key === "ArrowUp"){
     e.preventDefault();
     if (items.length) items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
-  } else if (e.key === "Tab"){ closeMenu(true); }
+  } else if (e.key === "Tab" && !$("move-menu").querySelector(".mm-form")){ closeMenu(true); }
 });
 document.addEventListener("pointerdown", (e) => { if (!e.target.closest("#move-menu,[data-card-menu]")) closeMenu(false); });
 document.addEventListener("keydown", (e) => {
@@ -1182,6 +1206,7 @@ document.addEventListener("keydown", (e) => {
   if (!n || !$("kanban").contains(n) || e.target !== n) return;
   const f = featureById(n.dataset.id);
   if (!f) return;
+  if (e.metaKey || e.ctrlKey) return;               // leave Cmd/Ctrl chords to the browser/host
   if (e.key === "m" || e.key === "M" || e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")){
     e.preventDefault(); openMenu(f.id, n.querySelector("[data-card-menu]") || n); return;
   }

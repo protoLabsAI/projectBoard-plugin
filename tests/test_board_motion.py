@@ -85,7 +85,10 @@ def test_drag_and_drop_uses_pointer_events_never_html5_dnd():
         assert f'document.addEventListener("{ev}"' in BOARD_PAGE
     for html5 in ("draggable", "dragstart", "dragover", "ondrop", "dataTransfer"):
         assert html5 not in BOARD_PAGE
-    assert "n.setPointerCapture(e.pointerId)" in BOARD_PAGE
+    # capture on a node that never moves, and a lost release can't strand a drag
+    assert "document.documentElement.setPointerCapture(e.pointerId)" in BOARD_PAGE
+    assert "if (e.buttons === 0){ endDrag(false); return; }" in BOARD_PAGE
+    assert '"lostpointercapture", () => { if (DRAG) endDrag(false); }' in BOARD_PAGE
     assert "const DRAG_THRESHOLD = 6;" in BOARD_PAGE
     # a drag is never also a click on the card
     assert "SUPPRESS_CLICK = true;" in BOARD_PAGE
@@ -111,7 +114,12 @@ def test_every_drag_has_a_keyboard_twin():
 def test_moves_are_optimistic_with_rollback():
     body = BOARD_PAGE[BOARD_PAGE.index("async function runMove(") : BOARD_PAGE.index("// ── Toasts")]
     assert body.index("render();") < body.index("await apiPost(")  # shows before the call
-    assert "FEATURES = prev;                          // roll back" in body
+    assert "FEATURES = fromServer();                  // roll back" in body
+    # a re-rank lands BEFORE /ready (PATCH refuses a card the loop claimed meanwhile)
+    assert body.index('apiSend("PATCH", url') < body.index('apiPost(url + "/ready"')
+    # a rollback re-derives from the server rows, so a 304 can't lock a stale paint in
+    assert "function fromServer(){ return withPending(sortFeatures(SERVER_ROWS.slice())); }" in BOARD_PAGE
+    assert "if (res.status === 304){" in BOARD_PAGE
     assert "PENDING.delete(fid);" in body
     # an in-flight patch survives a poll
     assert "FEATURES = withPending(sortFeatures(" in BOARD_PAGE
@@ -121,7 +129,6 @@ def test_live_refresh_polls_the_change_stamp_with_an_etag_full_read():
     assert 'kit.apiFetch("/api/plugins/project_board/rev")' in BOARD_PAGE
     assert "const REV_POLL_MS = 2000, FULL_REFRESH_MS = 15000, SLOW_POLL_MS = 10000;" in BOARD_PAGE
     assert '{headers: {"if-none-match": FEATURES_ETAG}}' in BOARD_PAGE
-    assert "if (res.status !== 304){" in BOARD_PAGE
     assert "if (r.status === 404) REV_OK = false;" in BOARD_PAGE  # older plugin → slow poll
     assert 'document.addEventListener("visibilitychange"' in BOARD_PAGE
     # a poll that lands mid-drag waits for the drop
@@ -360,3 +367,25 @@ def test_features_etag_answers_304_when_unchanged(client):
     changed = c.get("/api/plugins/project_board/features", headers={"If-None-Match": tag})
     assert changed.status_code == 200 and changed.headers["etag"] != tag
     assert changed.json()["features"][0]["priority"] == 1
+
+
+def test_rev_resolves_a_relative_db_path_against_the_repo(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".beads").mkdir(parents=True)
+    db = repo / ".beads" / "beads.db"
+    db.write_bytes(b"x")
+    monkeypatch.setattr(api, "get_store", lambda **_kw: _Store(str(db)))
+    app = FastAPI()
+    app.include_router(
+        api.build_data_router({"db_path": ".beads/beads.db", "repo": str(repo)}), prefix="/api/plugins/project_board"
+    )
+    c = TestClient(app)
+    a = c.get("/api/plugins/project_board/rev").json()["rev"]
+    db.write_bytes(b"xy")
+    assert c.get("/api/plugins/project_board/rev").json()["rev"] != a
+
+
+def test_a_weakened_etag_still_matches(client):
+    c, _store, _db = client
+    tag = c.get("/api/plugins/project_board/features").headers["etag"]
+    assert c.get("/api/plugins/project_board/features", headers={"If-None-Match": "W/" + tag}).status_code == 304
