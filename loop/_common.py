@@ -892,6 +892,33 @@ def _sanitize_pr_title(title: str, own: tuple[str, int] | None, refs_only: bool 
     return _TITLE_CLOSING_RE.sub(_repl, title)
 
 
+# A title that ALREADY opens with a conventional-commit type (``chore: release v0.67.0``,
+# ``docs: …``) — matched at the start only, with the colon required, so an ordinary card
+# whose summary merely mentions one of those words ("fix the login race") is not treated
+# as pre-typed.
+_CC_PREFIXED_RE = re.compile(rf"^\s*{_CC_PREFIX}(?:\([^)]*\))?!?\s*:", re.I)
+
+
+def pr_title_for(title: str, own: tuple[str, int] | None, refs_only: bool = False) -> str:
+    """The PR title AND the branch commit subject for a card (one string, two uses — the
+    drive seeds the solve offload's commit message with it).
+
+    ``feat: `` is prepended only when the sanitised title does not already carry a
+    conventional-commit type. An unconditional prefix double-typed any card the author
+    wrote as ``chore:``/``fix:``/``docs:`` — and that is not cosmetic (#566): the squash
+    subject of a release card became ``feat: chore: release v0.67.0``, which
+    ``release.yml``'s ``startsWith(…, 'chore: release v')`` guard does not match, so the
+    push-triggered run was SKIPPED. A green merge, no release, no error. Correcting the PR
+    title by hand does not help either: these PRs carry ONE commit, and GitHub's default
+    ``squash_merge_commit_title`` (``COMMIT_OR_PR_TITLE``) takes a single-commit PR's
+    subject from the COMMIT, not the PR title.
+
+    Sanitisation (#533) runs first and is unchanged, so a ``#n`` the subject could read as
+    a closing reference is still neutralised whichever branch is taken."""
+    clean = _sanitize_pr_title(title, own, refs_only=refs_only)
+    return clean if _CC_PREFIXED_RE.match(clean) else f"feat: {clean}"
+
+
 async def _source_issue_still_open(source_issue_raw: str, cwd: str) -> bool:
     """Re-check the source issue's state before opening a PR (#166).
 
@@ -1910,6 +1937,7 @@ __all__ = [
     "_source_issue",
     "_inject_source_issue_line",
     "_sanitize_pr_title",
+    "pr_title_for",
     "_source_issue_still_open",
     "_issue_closed_by_board_sibling",
     "_slice_work_uncaptured",
