@@ -351,6 +351,22 @@ def test_queue_review_feedback_survives_a_plugin_reload():
     assert "bd-1" not in reloaded._PENDING_FEEDBACK  # …and both views agree
 
 
+def test_pending_feedback_bridge_is_isolated_per_test(request):
+    """Bridge hygiene, not behaviour: the autouse conftest fixture must hand EVERY test
+    an EMPTY bridge. ``_build_prompt`` drains the bridge into ``_ci_feedback``, so an
+    entry a sibling test left behind (this suite reuses "bd-1" nearly everywhere)
+    silently REPLACES the feedback the reading test is asserting on. That is invisible
+    under ``-p no:xdist`` and real under ``-n`` ``--dist load``, where which tests share
+    a worker varies per run: it failed
+    ``test_review_gate_bounces_with_findings_in_the_retry_prompt`` on the board's
+    release gate while the whole suite passed on the next run. Pinning the fixture BY
+    NAME makes deleting it a deterministic failure instead of a returning flake."""
+    from project_board.loop import _common
+
+    assert "_no_leaked_pending_feedback" in request.fixturenames
+    assert _common._PENDING_FEEDBACK == {}
+
+
 # ── repo standing gate files (#108) ──────────────────────────────────────────────
 
 
