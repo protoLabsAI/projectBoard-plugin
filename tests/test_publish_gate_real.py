@@ -379,6 +379,24 @@ def _run_facts(run_id: str) -> tuple[str, int]:
     return str(facts.get("status") or ""), int(facts.get("attempt") or 0)
 
 
+async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> int:
+    """Wait for the shared fixture to be rerunnable and return its latest attempt.
+
+    The job itself is short, but runner scheduling and Actions status propagation
+    can exceed three minutes. Keep a bounded ten-minute setup window; an active
+    run is never evidence of a successful rerun by the seam under test.
+    """
+    deadline = time.monotonic() + timeout
+    status, attempt = _run_facts(run_id)
+    while status != "completed" and time.monotonic() < deadline:
+        await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+        status, attempt = _run_facts(run_id)
+    assert status == "completed", (
+        f"fixture run {run_id} never finished its last attempt within {timeout}s (status={status}, attempt={attempt})"
+    )
+    return attempt
+
+
 @requires_gh
 async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
     """A real `gh run rerun --failed` of the fixture run starts a NEW attempt. The call returns
@@ -395,12 +413,7 @@ async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
             pytest.fail("PB_REQUIRE_GH and PB_GH_ALLOW_WRITES are set but PB_GH_FIXTURE_FAILED_RUN is not")
         pytest.skip("PB_GH_FIXTURE_FAILED_RUN is not set to the pinned failed fixture run")
 
-    deadline = time.monotonic() + 180
-    status, before = _run_facts(FAILED_RUN)
-    while status != "completed" and time.monotonic() < deadline:
-        await asyncio.sleep(5)
-        status, before = _run_facts(FAILED_RUN)
-    assert status == "completed", f"fixture run {FAILED_RUN} never finished its last attempt ({status})"
+    before = await _wait_for_completed_fixture(FAILED_RUN)
 
     reran = await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=[FAILED_RUN], slug=PLUGIN_SLUG)
     assert reran in ([FAILED_RUN], []), reran
