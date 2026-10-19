@@ -444,6 +444,24 @@ async def _fresh_failed_fixture_run() -> str:
     pytest.fail("dispatched failed fixture run did not appear within 120s")
 
 
+async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> int:
+    """Wait for the shared fixture to be rerunnable and return its latest attempt.
+
+    The job itself is short, but runner scheduling and Actions status propagation
+    can exceed three minutes. Keep a bounded ten-minute setup window; an active
+    run is never evidence of a successful rerun by the seam under test.
+    """
+    deadline = time.monotonic() + timeout
+    status, attempt = _run_facts(run_id)
+    while status != "completed" and time.monotonic() < deadline:
+        await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+        status, attempt = _run_facts(run_id)
+    assert status == "completed", (
+        f"fixture run {run_id} never finished its last attempt within {timeout}s (status={status}, attempt={attempt})"
+    )
+    return attempt
+
+
 @requires_gh
 async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
     """A real `gh run rerun --failed` of a fresh fixture run starts a NEW attempt. The call returns

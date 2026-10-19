@@ -49,3 +49,27 @@ async def test_fixture_discovery_has_a_deadline(monkeypatch):
     )
     with pytest.raises(pytest.fail.Exception, match="did not appear"):
         await tier._fresh_failed_fixture_run()
+
+
+async def test_rerun_waits_for_the_fresh_fixture(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    fresh = AsyncMock(return_value="501")
+    wait = AsyncMock(return_value=1)
+    rerun = AsyncMock(return_value=["501"])
+    monkeypatch.setattr(tier, "_WRITES_ALLOWED", True)
+    monkeypatch.setattr(tier, "FAILED_RUN", "499")
+    monkeypatch.setattr(tier, "_fresh_failed_fixture_run", fresh)
+    monkeypatch.setattr(tier, "_wait_for_completed_fixture", wait)
+    monkeypatch.setattr(tier.worktree, "rerun_failed_ci", rerun)
+    monkeypatch.setattr(tier.asyncio, "sleep", AsyncMock())
+
+    def facts(run_id):
+        assert run_id == "501"
+        return "completed", 2
+
+    monkeypatch.setattr(tier, "_run_facts", facts)
+    await tier.test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(None)
+    fresh.assert_awaited_once_with()
+    wait.assert_awaited_once_with("501")
+    rerun.assert_awaited_once_with(cwd=str(tier.ROOT), run_ids=["501"], slug=tier.PLUGIN_SLUG)
