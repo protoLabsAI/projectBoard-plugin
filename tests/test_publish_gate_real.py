@@ -358,8 +358,8 @@ async def test_untagged_release_head_on_a_real_tagged_release_commit(real_seams)
 # `worktree.rerun_failed_ci` shells `gh run rerun <id> --failed`, a WRITE that needs a token
 # with `actions: write`. Its fixture is a run of .github/workflows/ci-fixture-fails.yml — a
 # dispatch-only workflow whose one job always fails — pinned in the repo variable
-# PB_GH_FIXTURE_FAILED_RUN. Each rerun costs one ~5 s job and fails again by design, so the
-# run stays failed, but GitHub caps reruns at 50; setup refreshes it before that cap.
+# PB_GH_FIXTURE_FAILED_RUN. That variable remains the fixture provisioning guard. Tests
+# dispatch fresh runs to avoid exhausted retries; each job fails again by design.
 # Gated like the tier's other writes (PB_GH_ALLOW_WRITES,
 # empty on fork PRs, whose GITHUB_TOKEN is read-only); with writes allowed under
 # PB_REQUIRE_GH, a missing run id FAILS instead of skipping.
@@ -380,6 +380,52 @@ def _run_facts(run_id: str) -> tuple[str, int]:
     return str(facts.get("status") or ""), int(facts.get("attempt") or 0)
 
 
+async def _fresh_failed_fixture_run() -> str:
+    """Dispatch a fresh fixture: GitHub can refuse retries of old shared runs.
+
+    This workflow is dispatch-only. Concurrent tests may discover the same fresh
+    run; the attempt-increase assertion below already handles that race.
+    """
+
+    def runs():
+        proc = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                PLUGIN_SLUG,
+                "--workflow",
+                "ci-fixture-fails.yml",
+                "--limit",
+                "100",
+                "--json",
+                "databaseId",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"fixture run listing failed: {proc.stderr or proc.stdout}"
+        return [str(run["databaseId"]) for run in json.loads(proc.stdout)]
+
+    before = max(map(int, runs()), default=0)
+    proc = subprocess.run(
+        ["gh", "workflow", "run", "ci-fixture-fails.yml", "--repo", PLUGIN_SLUG],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"fixture dispatch failed: {proc.stderr or proc.stdout}"
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        for run_id in runs():
+            if int(run_id) > before:
+                return run_id
+        await asyncio.sleep(2)
+    pytest.fail("dispatched failed fixture run did not appear within 120s")
+
+
 async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> int:
     """Wait for the shared fixture to be rerunnable and return its latest attempt.
 
@@ -396,6 +442,43 @@ async def _wait_for_completed_fixture(run_id: str, *, timeout: float = 600) -> i
         f"fixture run {run_id} never finished its last attempt within {timeout}s (status={status}, attempt={attempt})"
     )
     return attempt
+
+
+@requires_gh
+async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
+    """A real `gh run rerun --failed` of a fresh fixture run starts a NEW attempt. The call returns
+    the run id only when GitHub accepted it, and the run's `run_attempt` goes up.
+
+    Another CI run of this test may have rerun the fixture moments ago, and GitHub refuses to
+    rerun a run that is still running. So the test first waits (bounded) for the run to finish;
+    if a concurrent rerun still beats it, the seam returns ``[]`` (refused, logged, never
+    raised), and the run's attempt rising anyway is the same evidence that reruns work."""
+    if not _WRITES_ALLOWED:
+        pytest.skip("PB_GH_ALLOW_WRITES is not set — rerunning a workflow run needs a write-capable token")
+    if not FAILED_RUN:
+        if os.environ.get("PB_REQUIRE_GH"):
+            pytest.fail("PB_REQUIRE_GH and PB_GH_ALLOW_WRITES are set but PB_GH_FIXTURE_FAILED_RUN is not")
+        pytest.skip("PB_GH_FIXTURE_FAILED_RUN is not set to the pinned failed fixture run")
+
+    run_id = await _fresh_failed_fixture_run()
+    before = await _wait_for_completed_fixture(run_id)
+
+    reran = await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=[run_id], slug=PLUGIN_SLUG)
+    assert reran in ([run_id], []), reran
+
+    after = before
+    deadline = time.monotonic() + 60
+    while after <= before and time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        _status, after = _run_facts(run_id)
+    assert after > before, f"`gh run rerun {run_id} --failed` returned {reran} but the run is still on attempt {before}"
+
+
+@requires_gh
+async def test_rerun_failed_ci_refuses_a_bogus_run_best_effort(real_seams):
+    """A `gh` refusal is logged and dropped, never raised into the loop: a run id GitHub does
+    not know reruns nothing (a real 404 from the real API)."""
+    assert await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=["1"], slug=PLUGIN_SLUG) == []
 
 
 async def _rerunnable_fixture(run_id: str) -> tuple[str, int]:
@@ -443,39 +526,3 @@ async def _rerunnable_fixture(run_id: str) -> tuple[str, int]:
             return replacement, await _wait_for_completed_fixture(replacement)
         await asyncio.sleep(5)
     raise AssertionError("fresh failed fixture run did not appear within 600s after dispatch")
-
-
-@requires_gh
-async def test_rerun_failed_ci_reruns_the_pinned_failed_fixture_run(real_seams):
-    """A real `gh run rerun --failed` of the fixture run starts a NEW attempt. The call returns
-    the run id only when GitHub accepted it, and the run's `run_attempt` goes up.
-
-    Another CI run of this test may have rerun the fixture moments ago, and GitHub refuses to
-    rerun a run that is still running. So the test first waits (bounded) for the run to finish;
-    if a concurrent rerun still beats it, the seam returns ``[]`` (refused, logged, never
-    raised), and the run's attempt rising anyway is the same evidence that reruns work."""
-    if not _WRITES_ALLOWED:
-        pytest.skip("PB_GH_ALLOW_WRITES is not set — rerunning a workflow run needs a write-capable token")
-    if not FAILED_RUN:
-        if os.environ.get("PB_REQUIRE_GH"):
-            pytest.fail("PB_REQUIRE_GH and PB_GH_ALLOW_WRITES are set but PB_GH_FIXTURE_FAILED_RUN is not")
-        pytest.skip("PB_GH_FIXTURE_FAILED_RUN is not set to the pinned failed fixture run")
-
-    run_id, before = await _rerunnable_fixture(FAILED_RUN)
-
-    reran = await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=[run_id], slug=PLUGIN_SLUG)
-    assert reran in ([run_id], []), reran
-
-    after = before
-    deadline = time.monotonic() + 60
-    while after <= before and time.monotonic() < deadline:
-        await asyncio.sleep(2)
-        _status, after = _run_facts(run_id)
-    assert after > before, f"`gh run rerun {run_id} --failed` returned {reran} but the run is still on attempt {before}"
-
-
-@requires_gh
-async def test_rerun_failed_ci_refuses_a_bogus_run_best_effort(real_seams):
-    """A `gh` refusal is logged and dropped, never raised into the loop: a run id GitHub does
-    not know reruns nothing (a real 404 from the real API)."""
-    assert await worktree.rerun_failed_ci(cwd=str(ROOT), run_ids=["1"], slug=PLUGIN_SLUG) == []
