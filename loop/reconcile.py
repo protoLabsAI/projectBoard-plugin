@@ -692,6 +692,8 @@ class ReconcileMixin:
                     if cls in _SELF_HEALING_BLOCKS
                     else f"held until {PREFLIGHT_HOLD_STEP} ({cls})"
                     if cls == PREFLIGHT_HOLD_CLASS
+                    else f"held by agent ({cls})"
+                    if cls == store_mod.AGENT_HOLD_CLASS
                     else f"needs a human ({cls or 'unclassified'})"
                 )
                 f["next_action_hint"] = f"{who}: {reason}"
@@ -797,7 +799,8 @@ class ReconcileMixin:
         and dependent cards sat `ready` forever waiting on a blocker that would never
         arrive. That is the failure mode this pass exists to end.
 
-        Two outcomes, never zero:
+        Agent-owned holds stay parked silently until explicit unblock. Other blocks
+        have two outcomes, never zero:
 
         * the block classifies as self-healing (`rate-limit` / `transient` /
           `merge-conflict`) and the card has retries left → clear it, requeue it, spend
@@ -821,6 +824,8 @@ class ReconcileMixin:
                 continue  # reserved — an operator salvage is publishing it (#427); leave it be
             try:
                 cls = str(f.get("blocked_class") or "").strip()
+                if cls == store_mod.AGENT_HOLD_CLASS:
+                    continue  # Explicit release only; no terminal operator inbox alert.
                 # The reason rides a COMMENT. `br list` carries none, but since #416 the
                 # listing copies the thread across for blocked rows, so it is normally
                 # here already. If it is still empty, the one card being escalated is
