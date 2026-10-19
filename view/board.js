@@ -754,10 +754,16 @@ function flip(first, entered){
 function leave(n, r, animate){
   if (!animate || !r){ n.remove(); return; }
   n.classList.remove("card--flying");
+  const accent = laneAccent(n);
   n.style.cssText = "position:fixed;margin:0;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px;transition:none;transform:none";
+  if (accent) n.style.setProperty("--lane", accent);   // off its lane, keep the lane's accent
   n.classList.add("card--leave");
   $("fx").appendChild(n);
   setTimeout(() => n.remove(), LEAVE_MS + 40);
+}
+function laneAccent(n){
+  const lane = n.closest && n.closest(".lane");
+  return lane ? getComputedStyle(lane).getPropertyValue("--lane").trim() : "";
 }
 // The moment a card lands in done: a check and a brief glow. Once per arrival.
 function land(n){
@@ -996,6 +1002,8 @@ function startDrag(e, f, n){
   ghost.classList.add("card--ghost");
   ghost.removeAttribute("data-mon"); ghost.removeAttribute("data-task"); ghost.removeAttribute("tabindex");
   ghost.style.cssText = "position:fixed;margin:0;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px";
+  const accent = laneAccent(n);
+  if (accent) ghost.style.setProperty("--lane", accent);
   $("fx").appendChild(ghost);
   const home = {lane: f.state, index: [...LANES[f.state].list.children].indexOf(n)};
   DRAG = {f, n, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, home, over: f.state, ok: dropLanes(f)};
