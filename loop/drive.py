@@ -2948,6 +2948,8 @@ class DriveMixin:
             timeouts,
             f"split task {task_id}" if task_id else "no split task filed",
         )
+        # Keep the exception in the diagnostic reason: TOO_WIDE_CLASS tells
+        # _flag_blocked this park is an outcome, not a second machinery failure (#556).
         await asyncio.to_thread(self._flag_blocked, store, fid, reason, category=TOO_WIDE_CLASS)
         release = getattr(store, "mark_ready", None)
         if task_id and str(task.get("board_state") or "backlog") == "backlog" and callable(release):
