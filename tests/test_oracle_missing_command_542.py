@@ -156,6 +156,95 @@ async def test_ordinary_test_failure_continues_search(tmp_path, monkeypatch):
     assert all(not Path(wt).exists() for wt in generated)
 
 
+# The output of the slice-1 review's regression: an optional pre-step whose command is
+# missing but whose `|| true` fallback recovers, THEN the real oracle runs its tests and
+# genuinely fails (exit 1). The stale `command not found` line is buried before a full
+# test-failure report, so it is NOT the tail — an ordinary candidate failure the ladder
+# must stay free to repair, not a missing oracle.
+_RECOVERED_OPTIONAL_THEN_REAL_FAILURE = (
+    "bash: line 1: optional-formatter: command not found\n"
+    "using fallback formatter\n"
+    "============ test session starts ============\n"
+    "collected 3 items\n"
+    "tests/test_x.py::test_a FAILED\n"
+    "=================== FAILURES ===================\n"
+    "E   assert 1 == 2\n"
+    "============ 1 failed, 2 passed in 0.31s ============"
+)
+
+
+@pytest.mark.parametrize(
+    "returncode,output,expected",
+    [
+        # Exit-code authority: the shell found nothing to run.
+        (127, "", True),
+        (127, "bash: line 1: missing-tool: command not found", True),
+        (9009, "'missing-tool' is not recognized as an internal or external command", True),
+        # A wrapper swallowed 127 but printed the diagnostic LAST — still the missing oracle.
+        (1, "sh: 1: missing-tool: not found", True),
+        (1, "/bin/sh: /gone/.venv/bin/python: No such file or directory", True),
+        # Exit 0 ALWAYS wins: the command ran and the tests passed, even with a stale line.
+        (0, "bash: optional-tool: command not found\nall tests passed", False),
+        # An ordinary failing run (no diagnostic at all) — repairable, not infrastructure.
+        (1, "E   assert 1 == 2\n1 failed", False),
+        # THE regression: stale recovered diagnostic followed by a real test-failure report.
+        (1, _RECOVERED_OPTIONAL_THEN_REAL_FAILURE, False),
+    ],
+)
+def test_oracle_command_missing_classifier_is_tail_scoped(returncode, output, expected):
+    assert coder_seam._oracle_command_missing(returncode, output) is expected
+
+
+async def test_recovered_optional_then_real_failure_continues_search(tmp_path, monkeypatch):
+    """The slice-1 regression an adversarial review caught: an EARLIER optional step whose
+    command is missing but recovers (`|| true`), then the real oracle runs and FAILS its
+    tests (exit 1). The stale `command not found` line sits before a full test-failure
+    report, so it must NOT abort the search as a missing oracle. Dispatch keeps searching
+    and exhausts (SolveExhausted) — it never raises OracleMissingCommand and reaps every
+    candidate like any ordinary capability failure."""
+    repo = _repo(tmp_path / "repo")
+    generated = _fake_coder(monkeypatch)
+    verdicts = []
+
+    async def spawn(cmd, **kwargs):
+        async def communicate():
+            return _RECOVERED_OPTIONAL_THEN_REAL_FAILURE.encode(), None
+
+        return SimpleNamespace(returncode=1, communicate=communicate)
+
+    monkeypatch.setattr(worktree, "spawn_shell", spawn)
+
+    async def solve(task, *, generate, verify, **kwargs):
+        for _ in range(2):
+            candidate = await generate(task)
+            verdict = await verify(candidate)
+            assert not verdict.passed
+            verdicts.append(verdict)
+        return _FakeResult(None, False, "best-of-k", 2, 2, verdict)
+
+    with pytest.raises(coder_seam.SolveExhausted):
+        await coder_seam.dispatch(
+            task="implement",
+            coder=object(),
+            repo=repo,
+            base="main",
+            root=".worktrees",
+            fid="bd-1",
+            dispatch_timeout=None,
+            test_cmd="optional-formatter --check || true; run-tests",
+            test_timeout=10,
+            budget=6,
+            k=2,
+            tree_depth=2,
+            _solve=solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+    assert len(generated) == 2
+    assert len(verdicts) == 2 and all("1 failed" in v.output for v in verdicts)
+    assert all(not Path(wt).exists() for wt in generated)
+
+
 async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch):
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     dispatched = []

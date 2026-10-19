@@ -1653,6 +1653,37 @@ def _missing_gate_command_hint(project: str, cmd: str, output: str) -> str:
     return f"gate command not found: {missing} ({where}) — fix project {project[:30]!r}'s local_gate_cmd"
 
 
+def _oracle_command_missing(returncode: int | None, output: str) -> bool:
+    """Did the acceptance oracle fail because the shell could not FIND its command
+    (#542), as opposed to running it through to a genuine test failure? Only the former
+    stops solve as an infrastructure fault; the latter is an ordinary candidate failure
+    the generation/tier ladder must stay free to repair.
+
+    Decides the way preflight does (loop/preflight.py): the exit code is the authority.
+      * exit 0 — the command ran and the tests passed; NEVER an infrastructure failure,
+        even when an earlier optional step left a stale ``command not found`` line in the
+        merged output.
+      * exit 127 (POSIX ``sh``) / 9009 (``cmd.exe``) — the shell found nothing to run.
+      * any OTHER nonzero exit — only when the shell's ``<cmd>: not found`` diagnostic is
+        the TAIL of the output (the last non-empty line), i.e. what actually ended the
+        run. This catches a wrapper that swallows 127 into its own exit while still
+        printing the diagnostic last.
+
+    The diagnostic is matched ONLY against the tail, never the whole merged log. An
+    earlier OPTIONAL step with a working ``|| true`` fallback can leave a stale
+    ``command not found`` line and then let the real oracle run and FAIL its tests
+    (exit 1) — that trailing test report is an ordinary failure, so the stale line must
+    not be read as a missing oracle and abort the search. Requiring the diagnostic at the
+    tail is what keeps a recovered optional command from aborting a real candidate search
+    (the regression an adversarial review caught in slice 1)."""
+    if returncode == 0:
+        return False
+    if returncode in _GATE_NOT_FOUND_EXITS:
+        return True
+    tail = next((ln for ln in reversed((output or "").splitlines()) if ln.strip()), "")
+    return _MISSING_CMD_RE.search(tail) is not None
+
+
 class SolveExhausted(worktree.WorktreeError):
     """``coder.solve()`` spent its whole generation budget against this feature's
     acceptance tests and no candidate passed. A CAPABILITY failure for the CURRENT
@@ -2393,16 +2424,16 @@ class _WorktreeSolveAdapter:
         text = (out or b"").decode("utf-8", "replace").strip()
         ok = proc.returncode == 0
         # The oracle could not RUN (#542): a shell that cannot find the command exits 127
-        # (POSIX) / 9009 (cmd.exe), or prints a `…: not found` diagnostic for it. Stop solve
-        # and preserve the candidate — another generation or tier cannot conjure a command
-        # the environment is missing. Gated on a FAILING run, mirroring preflight's own
-        # success-first ordering (it returns on ``returncode == 0`` BEFORE classifying the
-        # tail): a PASSING oracle (exit 0) ran the command and the acceptance tests passed,
-        # so it is never an infrastructure failure — even when an earlier optional step with
-        # a working shell fallback left a stale ``command not found`` line in the merged
-        # output. Classifying that as a missing oracle would abort a green build and block
-        # publication (the regression an adversarial review caught in slice 1).
-        if not ok and (proc.returncode in _GATE_NOT_FOUND_EXITS or _MISSING_CMD_RE.search(text)):
+        # (POSIX) / 9009 (cmd.exe), or a wrapper swallows that exit but prints the shell's
+        # `…: not found` diagnostic LAST. Stop solve and preserve the candidate — another
+        # generation or tier cannot conjure a command the environment is missing.
+        # ``_oracle_command_missing`` decides the way preflight does (exit code first) and
+        # matches the diagnostic ONLY against the tail: a PASSING oracle (exit 0) ran the
+        # command, and an ORDINARY failing run (exit 1) whose merged output carries a stale
+        # ``command not found`` line from an earlier recovered optional step followed by a
+        # real test-failure report is a candidate failure the ladder repairs — neither is an
+        # infrastructure fault (the regression an adversarial review caught in slice 1).
+        if _oracle_command_missing(proc.returncode, text):
             raise OracleMissingCommand(test_cmd=cmd, returncode=proc.returncode, output=text, candidate_wt=candidate_wt)
         return Verdict(
             passed=ok,
