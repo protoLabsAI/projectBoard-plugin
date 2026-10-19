@@ -555,16 +555,20 @@ def test_r1_task_cards_render_no_inline_form_or_action_controls():
     assert ".tsub>td" not in BOARD_PAGE  # its dead CSS rule is removed too
     # taskExtra now has exactly two sites: its definition + the one taskDetail call
     assert BOARD_PAGE.count("taskExtra(f)") == 2
-    # the Kanban card closes summary-only (title row + meta row, no task extra after it)
-    assert "+ flags(f)+' '+taskFoot(f)+'</div></div>';" in BOARD_PAGE
+    # the Kanban card closes summary-only (its last row is the chips/footer meta row, no
+    # task extra after it)
+    assert "const meta = (flags(f)+' '+taskFoot(f)).trim();" in BOARD_PAGE
+    assert "+ (meta ? '<div class=\"m\">'+meta+'</div>' : '');" in BOARD_PAGE
 
 
 def test_r1_r2_task_cards_and_rows_are_clickable_via_a_data_task_handle():
     """r1/r2: every task card (Kanban) and row (list) carries a data-task handle so a
     delegated click opens the drawer — two sites, one per projection — and both use the
     same isTask ternary that stamps the handle only onto task cards/rows."""
-    assert BOARD_PAGE.count("data-task=\"'+esc(f.id)+'\"") == 2
-    assert BOARD_PAGE.count("(isTask(f)?' data-task=\"'+esc(f.id)+'\"':\"\")") == 2
+    # the list row stamps it in markup; the keyed Kanban card node sets it as an attribute
+    assert BOARD_PAGE.count("data-task=\"'+esc(f.id)+'\"") == 1
+    assert BOARD_PAGE.count("(isTask(f)?' data-task=\"'+esc(f.id)+'\"':\"\")") == 1
+    assert 'setData(n, "task", isTask(f) ? f.id : null);' in BOARD_PAGE
     # clickable cursor + hover cue extends to task cards/rows, not only the monitor ones
     assert ".card--live,.card--task{cursor:pointer}" in BOARD_PAGE
     assert ".card--live:hover,.card--task:hover{border-color:var(--pl-color-accent)}" in BOARD_PAGE
@@ -626,9 +630,9 @@ def test_r3_monitor_stays_coding_only_and_tasks_never_poll():
         "MON_FID = null;\n  if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }\n  TASK_FID = fid;"
         in BOARD_PAGE
     )
-    # only two setInterval sites exist — the monitor poll + the 10s board reload; openTask
-    # adds no third (tasks don't poll)
-    assert BOARD_PAGE.count("setInterval(") == 2
+    # only one setInterval site exists — the monitor poll (the board's live refresh is a
+    # self-scheduling setTimeout); openTask adds no second (tasks don't poll)
+    assert BOARD_PAGE.count("setInterval(") == 1
 
 
 def test_r3_pollmonitor_fences_a_late_poll_from_clobbering_a_repurposed_drawer():
@@ -719,7 +723,7 @@ def test_r3_no_deliverable_and_coding_cards_are_unaffected():
     # the merge falls back to the bare list `f` when nothing has been fetched
     assert "? {...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;" in BOARD_PAGE
     # the poll still pulls the plain list route — deliverable is NOT added there
-    assert 'const r = await api("/api/plugins/project_board/features");' in BOARD_PAGE
+    assert 'kit.apiFetch("/api/plugins/project_board/features",' in BOARD_PAGE
     # openTask drops the prior task's fetched detail
     assert "TASK_DETAIL = null;" in BOARD_PAGE
 

@@ -1,21 +1,167 @@
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
     font-family:var(--pl-font-sans);font-size:13px}
-  .wrap{max-width:1240px;margin:0 auto;padding:var(--pl-space-4) var(--pl-space-6)}
+  .wrap{max-width:1680px;margin:0 auto;padding:var(--pl-space-4) var(--pl-space-6)}
   .top{display:flex;align-items:center;gap:var(--pl-space-3);margin-bottom:var(--pl-space-4)}
   h1{font-size:17px;margin:0;color:var(--pl-color-accent);letter-spacing:.2px}
   .sub{color:var(--pl-color-fg-muted);font-size:12px;margin:0;flex:1}
-  /* Kanban — no DS primitive for cards/columns; token-driven. */
-  .board{display:grid;grid-template-columns:repeat(5,1fr);gap:var(--pl-space-3)}
-  .col{background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
-    border-radius:var(--pl-radius);padding:var(--pl-space-2);min-height:120px}
-  .col .pl-panel-header{padding:2px 4px var(--pl-space-2);text-transform:uppercase;
-    letter-spacing:.06em;font-size:11px}
-  .card{background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
-    border-left:3px solid var(--pl-color-accent);
-    border-radius:var(--pl-radius);padding:9px 10px;margin-bottom:var(--pl-space-2)}
-  .card .t{font-size:12.5px;line-height:1.35;margin-bottom:6px}
-  .card .m{display:flex;gap:var(--pl-space-2);align-items:center;flex-wrap:wrap;font-size:10.5px;color:var(--pl-color-fg-muted)}
+  /* ── Kanban — no DS primitive for lanes/cards; token-driven throughout (every colour
+     is a --pl-* token or a color-mix of them), so it follows all theme families, light
+     and dark. Each lane names its accent once (--lane); cards inherit it. */
+  .board{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:var(--pl-space-3);align-items:start}
+  .lane{--lane:var(--pl-color-fg-muted);position:relative;display:flex;flex-direction:column;min-width:0;
+    background:color-mix(in srgb,var(--pl-color-bg-raised) 55%,var(--pl-color-bg));
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius-lg,8px);
+    padding:var(--pl-space-2);min-height:160px;transition:background-color .2s ease,opacity .2s ease,box-shadow .2s ease}
+  .lane[data-lane="ready"]{--lane:var(--pl-color-status-success)}
+  .lane[data-lane="in_progress"]{--lane:var(--pl-color-accent)}
+  .lane[data-lane="in_review"]{--lane:var(--pl-color-status-info)}
+  .lane[data-lane="done"]{--lane:var(--pl-color-status-success)}
+  .lane-h{display:flex;align-items:center;gap:7px;padding:3px 4px 6px;text-transform:uppercase;
+    letter-spacing:.07em;font-size:11px;font-weight:var(--pl-font-weight-semibold,600);color:var(--pl-color-fg)}
+  .lane-dot{width:8px;height:8px;border-radius:50%;background:var(--lane);flex:none;
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--lane) 18%,transparent)}
+  .lane[data-lane="in_progress"] .lane-dot{animation:pl-pulse 1.6s ease-in-out infinite}
+  .lane-t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lane-n{margin-left:auto;min-width:22px;text-align:center;padding:1px 7px;border-radius:999px;
+    font-size:11px;font-variant-numeric:tabular-nums;letter-spacing:0;color:var(--pl-color-fg);
+    background:color-mix(in srgb,var(--lane) 16%,transparent);border:var(--pl-border-width) solid color-mix(in srgb,var(--lane) 30%,transparent)}
+  .lane-n--tick{animation:lane-tick .5s cubic-bezier(.2,.8,.2,1)}
+  @keyframes lane-tick{0%{transform:scale(1)}35%{transform:scale(1.3);background:color-mix(in srgb,var(--lane) 45%,transparent)}100%{transform:scale(1)}}
+  .lane-lock{display:inline-flex;color:var(--pl-color-fg-muted);cursor:help}
+  .lane-bar{height:2px;border-radius:2px;background:var(--pl-color-border);overflow:hidden;margin:0 4px var(--pl-space-2)}
+  .lane-bar i{display:block;height:100%;width:0;background:var(--lane);border-radius:2px;transition:width .45s cubic-bezier(.2,.8,.2,1)}
+  .lane-list{display:flex;flex-direction:column;gap:var(--pl-space-2);min-height:44px}
+  .lane-empty{margin-top:2px;padding:14px 10px;text-align:center;font-size:11.5px;line-height:1.45;color:var(--pl-color-fg-muted);
+    border:var(--pl-border-width) dashed var(--pl-color-border);border-radius:var(--pl-radius)}
+  .lane-list:not(:empty)+.lane-empty{display:none}
+  .lane-why{display:none}
+  /* Drag: lanes the card can go to outline in their accent, the one under the pointer
+     tints; lanes it can't dim and say why. */
+  body.is-dragging,body.is-pressing{user-select:none;-webkit-user-select:none}
+  body.is-dragging{cursor:grabbing}
+  .lane--drop-ok{box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--lane) 55%,transparent)}
+  .lane--drop-ok.lane--over{background:color-mix(in srgb,var(--lane) 10%,var(--pl-color-bg-raised))}
+  .lane--drop-no{opacity:.5}
+  .lane--drop-no .lane-why{display:block;margin:0 4px var(--pl-space-2);padding:5px 7px;font-size:10.5px;line-height:1.35;
+    color:var(--pl-color-fg-muted);background:var(--pl-color-bg);border-radius:var(--pl-radius)}
+  .lane--drop-no.lane--over .lane-why{color:var(--pl-color-fg);opacity:1}
+  /* Cards: id/priority row, title, a one-line spec, then chips. */
+  .card{--card-accent:var(--lane);position:relative;background:var(--pl-color-bg-raised);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-left:3px solid var(--card-accent);
+    border-radius:var(--pl-radius);padding:8px 10px 9px 10px;
+    box-shadow:0 1px 2px color-mix(in srgb,var(--pl-color-fg) 7%,transparent);
+    transition:border-color .15s ease,box-shadow .2s ease,opacity .2s ease;outline:none}
+  .card--movable{cursor:grab;touch-action:pan-y}
+  .card--blocked{--card-accent:var(--pl-color-status-error)}
+  .card--waiting{--card-accent:var(--pl-color-status-warning)}
+  .lane[data-lane="backlog"] .card:not(.card--blocked):not(.card--waiting){--card-accent:var(--pl-color-border-strong,var(--pl-color-fg-muted))}
+  .card:hover{box-shadow:0 3px 10px color-mix(in srgb,var(--pl-color-fg) 10%,transparent)}
+  .card:focus-visible{box-shadow:0 0 0 2px var(--pl-color-focus,var(--pl-color-accent))}
+  .card .c-top{display:flex;align-items:center;gap:6px;min-height:18px;margin-bottom:3px;color:var(--pl-color-fg-muted)}
+  .card .c-sp{flex:1}
+  .card .pri{font-family:var(--pl-font-mono);font-size:9.5px;font-weight:600;padding:0 5px;border-radius:4px;line-height:15px;
+    color:var(--pl-color-fg-muted);background:color-mix(in srgb,var(--pl-color-fg) 7%,transparent)}
+  .card .pri-0{color:var(--pl-color-status-error);background:color-mix(in srgb,var(--pl-color-status-error) 14%,transparent)}
+  .card .pri-1{color:var(--pl-color-status-warning);background:color-mix(in srgb,var(--pl-color-status-warning) 14%,transparent)}
+  .card .proj{font-size:10px;max-width:9em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .card .proj::before{content:"· "}
+  .card .c-check{display:inline-flex;color:var(--pl-color-status-success)}
+  .card .c-menu{all:unset;cursor:pointer;width:20px;height:18px;margin:-2px -4px -2px 0;text-align:center;border-radius:4px;
+    font-size:14px;line-height:16px;color:var(--pl-color-fg-muted);opacity:0;transition:opacity .15s ease}
+  .card:hover .c-menu,.card:focus-within .c-menu,.card .c-menu:focus-visible{opacity:1}
+  .card .c-menu:hover,.card .c-menu:focus-visible{color:var(--pl-color-fg);background:var(--pl-color-bg-hover,var(--pl-color-bg))}
+  .card .t{font-size:12.5px;line-height:1.35;font-weight:var(--pl-font-weight-medium,500);color:var(--pl-color-fg);
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+  .card .spec{margin-top:3px;font-size:11.5px;line-height:1.4;color:var(--pl-color-fg-muted);
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+  .card .m{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:7px;font-size:10.5px;color:var(--pl-color-fg-muted)}
+  .card .why{display:flex;gap:6px;align-items:baseline;margin-top:6px;font-size:11px;line-height:1.35;color:var(--pl-color-fg-muted)}
+  .card .why-t{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+  .heal{flex:none;font-size:9.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:0 5px;border-radius:4px;line-height:15px;
+    color:var(--pl-color-fg-muted);background:color-mix(in srgb,var(--pl-color-fg) 8%,transparent)}
+  .heal--auto{color:var(--pl-color-status-info);background:color-mix(in srgb,var(--pl-color-status-info) 14%,transparent)}
+  .heal--you{color:var(--pl-color-status-error);background:color-mix(in srgb,var(--pl-color-status-error) 14%,transparent)}
+  /* The live "building" strip on in_progress coding cards. */
+  .card--live{box-shadow:0 0 0 1px color-mix(in srgb,var(--pl-color-accent) 30%,transparent),0 4px 14px color-mix(in srgb,var(--pl-color-accent) 12%,transparent)}
+  .bld{margin-top:7px;padding:6px 8px 0;border-radius:var(--pl-radius);overflow:hidden;
+    background:color-mix(in srgb,var(--pl-color-accent) 8%,var(--pl-color-bg-raised));
+    border:var(--pl-border-width) solid color-mix(in srgb,var(--pl-color-accent) 22%,transparent)}
+  .bld-row{display:flex;align-items:center;gap:6px;font-size:11px;min-width:0}
+  .bld-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--pl-color-accent);
+    box-shadow:0 0 0 0 color-mix(in srgb,var(--pl-color-accent) 55%,transparent);animation:bld-ping 1.8s ease-out infinite}
+  @keyframes bld-ping{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--pl-color-accent) 55%,transparent)}80%,100%{box-shadow:0 0 0 7px transparent}}
+  .bld-who{font-weight:600;color:var(--pl-color-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .bld-gen{font-family:var(--pl-font-mono);font-size:10px;color:var(--pl-color-fg-muted);white-space:nowrap}
+  .bld-el{margin-left:auto;font-family:var(--pl-font-mono);font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--pl-color-accent);white-space:nowrap}
+  .bld-act{margin-top:2px;font-family:var(--pl-font-mono);font-size:10.5px;color:var(--pl-color-fg-muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bld-bar{position:relative;height:2px;margin:6px -8px 0;background:color-mix(in srgb,var(--pl-color-accent) 14%,transparent);overflow:hidden}
+  .bld-bar i{position:absolute;top:0;bottom:0;left:0;width:40%;
+    background:linear-gradient(90deg,transparent,var(--pl-color-accent),transparent);animation:bld-sweep 1.8s ease-in-out infinite}
+  @keyframes bld-sweep{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
+  /* Motion. Enter / leave / fly / land / flash — and a refused drag shakes its head. */
+  #fx{position:fixed;inset:0;pointer-events:none;z-index:30}
+  .card--enter{animation:card-in .36s cubic-bezier(.2,.8,.2,1) both}
+  @keyframes card-in{from{opacity:0;transform:translateY(8px) scale(.96)}to{opacity:1;transform:none}}
+  .card--leave{animation:card-out .26s ease-in forwards}
+  @keyframes card-out{to{opacity:0;transform:scale(.94)}}
+  .card--flying{z-index:5;box-shadow:0 10px 28px color-mix(in srgb,var(--pl-color-fg) 22%,transparent)}
+  .card--landed{animation:card-land 1.8s ease-out}
+  .card--landed .c-check{animation:check-pop .5s cubic-bezier(.2,1.6,.4,1) .25s both}
+  @keyframes card-land{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--pl-color-status-success) 60%,transparent)}
+    25%{box-shadow:0 0 0 5px color-mix(in srgb,var(--pl-color-status-success) 28%,transparent),0 0 22px color-mix(in srgb,var(--pl-color-status-success) 35%,transparent)}
+    100%{box-shadow:0 0 0 0 transparent}}
+  @keyframes check-pop{from{transform:scale(0) rotate(-30deg);opacity:0}to{transform:none;opacity:1}}
+  .card--flash{animation:card-flash .9s ease-out}
+  @keyframes card-flash{from{background-color:color-mix(in srgb,var(--pl-color-accent) 20%,var(--pl-color-bg-raised))}to{background-color:var(--pl-color-bg-raised)}}
+  .card--refuse{animation:card-refuse .32s ease}
+  @keyframes card-refuse{25%{transform:translateX(-4px)}50%{transform:translateX(4px)}75%{transform:translateX(-2px)}}
+  .card--placeholder{opacity:.4;border-style:dashed;box-shadow:none}
+  .card--placeholder>*{visibility:hidden}
+  .card--ghost{z-index:50;pointer-events:none;cursor:grabbing;opacity:.97;
+    box-shadow:0 16px 36px color-mix(in srgb,var(--pl-color-fg) 28%,transparent),0 0 0 1px color-mix(in srgb,var(--pl-color-accent) 40%,transparent)}
+  .card--ghost-drop{box-shadow:0 2px 6px color-mix(in srgb,var(--pl-color-fg) 12%,transparent)}
+  .card--pending{opacity:.85}
+  .card--pending::after{content:"";position:absolute;left:0;right:0;top:-1px;height:2px;border-radius:2px;
+    background:linear-gradient(90deg,transparent,var(--pl-color-accent),transparent);background-size:50% 100%;
+    background-repeat:no-repeat;animation:pending-sweep 1.1s linear infinite}
+  @keyframes pending-sweep{from{background-position:-50% 0}to{background-position:150% 0}}
+  @media (prefers-reduced-motion:reduce){
+    .lane[data-lane="in_progress"] .lane-dot,.bld-dot,.card--enter,.card--leave,.card--landed,.card--landed .c-check,
+    .card--refuse,.lane-n--tick,.card--pending::after{animation:none}
+    .bld-bar i{animation:none;width:100%;opacity:.5}
+    .lane-bar i,.lane{transition:none}
+  }
+  /* The keyboard twin of every drag: a card's action menu. */
+  #move-menu{position:fixed;z-index:60;min-width:230px;max-width:320px;padding:4px;
+    background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius-md,6px);
+    box-shadow:var(--pl-shadow-popover,0 10px 30px color-mix(in srgb,var(--pl-color-fg) 22%,transparent))}
+  #move-menu .mm-h{padding:5px 8px 4px;font-family:var(--pl-font-mono);font-size:10.5px;color:var(--pl-color-fg-muted)}
+  #move-menu .mm-i{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:var(--pl-space-3);width:100%;
+    padding:6px 8px;border-radius:4px;font-size:12px;color:var(--pl-color-fg);cursor:pointer}
+  #move-menu .mm-i span{flex:1}
+  #move-menu .mm-i:hover,#move-menu .mm-i:focus-visible{background:var(--pl-color-bg-hover,var(--pl-color-bg))}
+  #move-menu .mm-i[aria-disabled="true"]{color:var(--pl-color-fg-muted);cursor:not-allowed;font-size:11.5px}
+  #move-menu kbd{font-family:var(--pl-font-mono);font-size:10px;color:var(--pl-color-fg-muted);
+    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:3px;padding:0 4px}
+  #move-menu .mm-form{display:flex;flex-direction:column;gap:6px;padding:4px 6px 6px}
+  /* Toasts: what a move did, or why it couldn't. */
+  .toast{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:70;max-width:min(560px,calc(100vw - 32px));
+    padding:8px 12px;border-radius:var(--pl-radius-md,6px);font-size:12px;line-height:1.4;white-space:pre-wrap;
+    color:var(--pl-color-fg);background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
+    border-left:3px solid var(--pl-color-status-info);box-shadow:var(--pl-shadow-popover,0 8px 24px color-mix(in srgb,var(--pl-color-fg) 20%,transparent));
+    opacity:0;transform:translate(-50%,10px);pointer-events:none;transition:opacity .2s ease,transform .2s ease}
+  .toast--on{opacity:1;transform:translate(-50%,0)}
+  .toast--ok{border-left-color:var(--pl-color-status-success)}
+  .toast--error{border-left-color:var(--pl-color-status-error)}
+  /* The live indicator beside the title. */
+  .live{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--pl-color-fg-muted);white-space:nowrap}
+  .live::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--pl-color-status-success);animation:pl-pulse 2s ease-in-out infinite}
+  .live--off::before{background:var(--pl-color-fg-muted);animation:none}
+  .hint{font-size:11px;color:var(--pl-color-fg-muted);white-space:nowrap}
+  .hint kbd{font-family:var(--pl-font-mono);font-size:10px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:3px;padding:0 4px}
+  @media (prefers-reduced-motion:reduce){.live::before{animation:none}}
   .id{font-family:var(--pl-font-mono);font-size:10px}
   a.pr{color:var(--pl-color-status-info);text-decoration:none}
   a.pr:hover{text-decoration:underline}
@@ -48,9 +194,9 @@
   #scrim.open{opacity:1;pointer-events:auto}
   #drawer{position:fixed;top:0;right:0;height:100%;width:min(460px,92vw);z-index:41;
     background:var(--pl-color-bg-raised);border-left:var(--pl-border-width) solid var(--pl-color-border);
-    box-shadow:-8px 0 24px rgba(0,0,0,.25);transform:translateX(100%);transition:transform .18s ease;
+    transform:translateX(100%);transition:transform .18s ease,box-shadow .18s ease;
     display:flex;flex-direction:column;overflow:hidden}
-  #drawer.open{transform:translateX(0)}
+  #drawer.open{transform:translateX(0);box-shadow:-8px 0 24px rgba(0,0,0,.25)}
   #drawer .dh{display:flex;align-items:center;gap:var(--pl-space-2);padding:var(--pl-space-3) var(--pl-space-4);
     border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
   #drawer .dh h2{font-size:14px;margin:0;flex:1;color:var(--pl-color-accent)}
@@ -223,4 +369,5 @@
   .treq .id{margin-right:4px}
   .treq .why{font-style:italic}
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
-  @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} }
+  @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} .hint{display:none} }
+  @media (max-width:1100px){ .hint{display:none} }

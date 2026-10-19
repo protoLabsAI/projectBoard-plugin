@@ -16,6 +16,8 @@ var BASE = location.pathname.split("/plugins/")[0];
   <div class="top">
     <h1>Board</h1>
     <p class="sub" id="sub">project_board — a projection over beads</p>
+    <span class="hint">drag backlog → on deck · focus a card, <kbd>M</kbd> for actions</span>
+    <span class="live" id="live" title="Live — the board re-reads whenever the store changes">live</span>
     <div class="pl-tabs">
       <button id="tk" class="pl-tab pl-tab--active" onclick="setView('kanban')">Kanban</button>
       <button id="tl" class="pl-tab" onclick="setView('list')">List</button>
@@ -34,5 +36,9 @@ var BASE = location.pathname.split("/plugins/")[0];
     <button class="dx" id="drawer-close" aria-label="Close">✕</button></div>
   <div class="db" id="drawer-body"></div>
 </div>
+<!-- The motion layer (leaving cards, the drag ghost), the card action menu, the toast. -->
+<div id="fx" aria-hidden="true"></div>
+<div id="move-menu" role="menu" aria-label="Card actions" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script type="module">
 __BOARD_JS__</script></body></html>

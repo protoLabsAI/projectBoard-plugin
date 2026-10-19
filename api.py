@@ -392,6 +392,34 @@ def build_router(cfg: dict):
     return router
 
 
+def store_rev(db: str) -> str:
+    """A cheap change stamp for the beads store at ``db``: the size + mtime of the
+    database, its WAL and the ``.beads`` JSONL exports. Every ``br`` write lands in one of
+    them, so the stamp moves on any write by any process — and reading it is a few
+    ``stat`` calls. A missing file contributes ``-``; an unreadable directory is skipped."""
+    parts: list[str] = []
+    paths = [db, db + "-wal"]
+    beads_dir = os.path.dirname(db)
+    try:
+        paths += sorted(os.path.join(beads_dir, n) for n in os.listdir(beads_dir) if n.endswith(".jsonl"))
+    except OSError:
+        pass
+    for path in paths:
+        try:
+            st = os.stat(path)
+            parts.append(f"{st.st_size}.{st.st_mtime_ns}")
+        except OSError:
+            parts.append("-")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def features_etag(body: dict) -> str:
+    """A strong ETag for a ``/features`` body: a hash of its canonical JSON, so the same
+    listing always carries the same tag and any change in any row changes it."""
+    raw = json.dumps(body, sort_keys=True, default=str, separators=(",", ":"))
+    return '"' + hashlib.sha1(raw.encode()).hexdigest()[:20] + '"'
+
+
 def build_data_router(cfg: dict, *, gap_reporter=None):
     """The operator CRUD/transition routes — mounted under
     ``/api/plugins/project_board`` so they inherit the operator bearer gate
@@ -404,7 +432,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     host warning clears when the operator fixes the gap even on a board whose loop
     is off (no tick to re-check) — the board page polls /status while open."""
     from fastapi import APIRouter, Body, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.responses import JSONResponse, Response
+
+    from .store import default_db_path
 
     router = APIRouter()
     store_kw = _store_kw(cfg)
@@ -618,8 +649,23 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         )
 
     # ── features ──────────────────────────────────────────────────────────────
+    @router.get("/rev")
+    async def _rev():
+        """The board store's change stamp — what the board view polls every few seconds so
+        an idle board costs a ``stat``, not a ``br`` listing. ``{"rev": "<stamp>"}`` changes
+        whenever ANY writer touches the store (the loop, a tool, this API, or a hand-run
+        ``br``), because it is the beads database's own file state, not an in-process
+        counter. No ``br`` call, no store read — so it answers even while ``br`` is slow."""
+        db = store_kw.get("db") or default_db_path()
+        return {"rev": store_rev(db)}
+
     @router.get("/features")
-    async def _features(state: str | None = None, include_archived: bool = False, project: str | None = None):
+    async def _features(
+        request: Request,
+        state: str | None = None,
+        include_archived: bool = False,
+        project: str | None = None,
+    ):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
         # actionable BoardError message — an escaped BoardError is a text/plain 500
@@ -640,7 +686,13 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 feats = [f for f in feats if str(f.get("project") or "") == want]
             return {"features": annotate_next_action(feats, cfg or {})}
 
-        return await _guard(_list)
+        # An ETag over the listing, so the view's periodic full refresh of an unchanged
+        # board is a 304 with no body to parse and nothing to re-render.
+        body = await _guard(_list)
+        tag = features_etag(body)
+        if tag in [t.strip() for t in request.headers.get("if-none-match", "").split(",")]:
+            return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+        return JSONResponse(jsonable_encoder(body), headers={"ETag": tag, "Cache-Control": "no-cache"})
 
     @router.get("/cards")
     async def _cards():

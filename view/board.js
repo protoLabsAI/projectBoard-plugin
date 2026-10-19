@@ -22,10 +22,6 @@ const STATE_LABEL = {
   blocked: "blocked",
   cancelled: "cancelled",
 };
-// State → DS status token. (blocked → error, dag/deps → warning handled in flags.)
-const STATE_COLOR = {backlog:"var(--pl-color-fg-muted)", ready:"var(--pl-color-status-success)",
-  in_progress:"var(--pl-color-accent)", in_review:"var(--pl-color-status-info)",
-  done:"var(--pl-color-fg-muted)", blocked:"var(--pl-color-status-error)"};
 // Slug-aware authed fetch via the kit (rules 2+3) — pass a bare /api/... path.
 // Errors become READABLE: a JSON error body surfaces its `detail` (the actionable
 // BoardError message), a non-JSON body its HTTP status — never a raw parse error.
@@ -324,30 +320,10 @@ function showAllBtn(total){
 }
 
 function render(){
+  // A drag owns the board while it runs — a poll that lands mid-drag is painted after it.
+  if (DRAG){ RENDER_DEFERRED = true; return; }
   if (VIEW === "kanban"){
-    $("kanban").innerHTML = COLS.map(state => {
-      let items = FEATURES.filter(f => f.state === state), total = items.length;
-      if (state === "done"){ const d = doneSlice(items); items = d.items; total = d.total; }  // cap Done (#115)
-      const cards = items.map(f => {
-        const color = f.blocked ? "var(--pl-color-status-error)" : (f.dag_blocked ? "var(--pl-color-status-warning)" : (STATE_COLOR[state]||"var(--pl-color-accent)"));
-        // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
-        // A task never dispatches a coder, so it never opens the MONITOR (#217); it opens
-        // the same drawer showing its detail + controls (bd-rdmh) via a data-task handle,
-        // with no polling. The card itself is summary-only — no inline form/controls.
-        const live = state === "in_progress";
-        const mon = live && !isTask(f);
-        return '<div class="card'+(mon?" card--live":"")+(isTask(f)?" card--task":"")+'"'
-          + (mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':"")
-          + ' style="border-left-color:'+color+'">'
-          + '<div class="t">'+docIco(f)+esc(f.title)+'</div>'
-          + '<div class="m"><span class="id">'+esc(f.id)+'</span><span>P'+f.priority+'</span>'
-          + flags(f)+' '+taskFoot(f)+'</div></div>';
-      }).join("") || '<div class="pl-empty">—</div>';
-      const more = total > items.length ? showAllBtn(total) : "";
-      return '<div class="col"><div class="pl-panel-header pl-panel-header--compact">'
-        + '<span class="pl-panel-header__title">'+(STATE_LABEL[state] || state.replace("_"," "))+'</span>'
-        + '<span class="pl-badge">'+total+'</span></div>'+cards+more+'</div>';
-    }).join("");
+    renderKanban();
   } else {
     // List: group rows under a collapsible per-state header (COLS order + blocked +
     // cancelled), mirroring the Kanban's grouping so a dense board stays scannable (#26).
@@ -390,16 +366,30 @@ function render(){
   syncTaskDrawer();
 }
 
+// Every full read carries the listing's ETag back as If-None-Match, so the periodic
+// refresh of an unchanged board is an empty 304 — nothing to parse, nothing to paint.
+// LOAD_SEQ drops a slow response that a newer read already overtook.
+let FEATURES_ETAG = "", LAST_FULL = 0, LOAD_SEQ = 0;
 async function load(){
+  const seq = ++LOAD_SEQ;
+  LAST_FULL = Date.now();
   try {
-    const r = await api("/api/plugins/project_board/features");
-    // the /features API field is `board_state`; normalize to `state` for the views.
-    // blocked floats first (#201), in_progress second (#223) — matching list_features —
-    // then priority asc, id tiebreak.
-    FEATURES = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))
-      .sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));
+    const res = await kit.apiFetch("/api/plugins/project_board/features",
+      FEATURES_ETAG ? {headers: {"if-none-match": FEATURES_ETAG}} : undefined);
+    if (seq !== LOAD_SEQ) return;
+    if (res.status !== 304){
+      const r = await res.json().catch(() => { throw new Error("HTTP " + res.status + " (non-JSON response)"); });
+      if (!res.ok) throw new Error(r.detail || "HTTP " + res.status);
+      if (seq !== LOAD_SEQ) return;
+      FEATURES_ETAG = res.headers.get("etag") || "";
+      // the /features API field is `board_state`; normalize to `state` for the views.
+      // blocked floats first (#201), in_progress second (#223) — matching list_features —
+      // then priority asc, id tiebreak (sortFeatures). A move still in flight keeps its
+      // optimistic patch over the fresh rows (withPending).
+      FEATURES = withPending(sortFeatures((r.features || []).map(f => ({...f, state: f.board_state ?? f.state}))));
+      render();
+    }
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
-    render();
     // The board READS fine but may still be unable to RUN (no coder, no gh, br
     // vanished): the setup preflight on /status says which check fails and how
     // to fix it — a warning card above the board, never a silent green.
@@ -547,6 +537,661 @@ function renderSetup(e, setup){
     + '<div style="opacity:.65;margin-top:6px;font-size:12px">Underlying error: ' + esc(String(e)) + '</div>';
   $("sub").textContent = "project_board — not bound to a repo yet";
 }
+
+// ── Kanban: keyed render + motion ─────────────────────────────────────────────────
+// The Kanban used to rebuild #kanban via innerHTML on every poll, so nothing could
+// animate. It now keeps ONE DOM node per card id (CARD_NODES), reused across renders: a
+// render re-writes a card's markup only when it changed, moves the node with
+// insertBefore, and animates the move with FLIP — measure every card (First), mutate
+// the DOM (Last), apply the inverse transform (Invert), transition it away (Play).
+// prefers-reduced-motion gets no movement at all: an instant update plus a brief
+// highlight on what changed.
+const CARD_NODES = new Map();               // card id → its element, reused across renders
+const LANES = {};                           // state → {el, list, count, bar, empty, more}
+const RM = window.matchMedia("(prefers-reduced-motion: reduce)");
+const MOVE_MS = 440, STAGGER_MS = 55, STAGGER_MAX = 6, ENTER_MS = 360, LEAVE_MS = 260, LAND_MS = 1800;
+const EASE = "cubic-bezier(.2,.8,.2,1)";
+let FIRST_PAINT = true;
+function motionOK(){ return !RM.matches; }
+// Classes the motion layer owns — a re-render keeps them while their animation runs.
+const TRANSIENT = new Set(["card--enter", "card--flying", "card--landed", "card--flash", "card--placeholder", "card--pending"]);
+
+// Lanes the build loop owns: nothing an operator does here moves a card into or out of
+// them — the loop claims on-deck cards, opens the PR, and the merge webhook sets done.
+const LOOP_OWNED = new Set(["in_progress", "in_review", "done"]);
+const LOOP_WHY = {
+  in_progress: "Building — the build loop owns this card until it opens a PR. Read-only here.",
+  in_review: "In review — the PR, CI and the review gate move this card. Read-only here.",
+  done: "Done — set by the merge. Read-only here.",
+};
+const LANE_EMPTY = {
+  backlog: "Nothing in the backlog.",
+  ready: "Nothing on deck. Drag a backlog card here to mark it ready.",
+  in_progress: "No builds running.",
+  in_review: "Nothing waiting on review.",
+  done: "Nothing shipped yet.",
+};
+// The blocked sweep clears these on its own (loop/_common._SELF_HEALING_BLOCKS); every
+// other class waits on a person — the card says which.
+const SELF_HEALING = new Set(["rate-limit", "transient", "merge-conflict"]);
+const PRIORITY_MIN = 0, PRIORITY_MAX = 4;   // store.validate_priority's range
+const LOCK_ICON = '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor"'
+  + ' stroke-width="1.5" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/>'
+  + '<path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>';
+const CHECK_ICON = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor"'
+  + ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7"/></svg>';
+
+// The lane skeleton is built ONCE; renders only patch counts, bars and card lists.
+function ensureLanes(){
+  const root = $("kanban");
+  if (root.dataset.keyed) return;
+  root.dataset.keyed = "1";
+  root.innerHTML = COLS.map(state => {
+    const label = esc(STATE_LABEL[state] || state.replace("_"," "));
+    const owned = LOOP_OWNED.has(state);
+    return '<section class="lane" data-lane="'+state+'" aria-label="'+label+'">'
+      + '<header class="lane-h"><span class="lane-dot" aria-hidden="true"></span>'
+      + '<span class="lane-t">'+label+'</span><span class="lane-n" aria-label="cards">0</span>'
+      + (owned ? '<span class="lane-lock" title="'+esc(LOOP_WHY[state])+'">'+LOCK_ICON+'</span>' : '')
+      + '</header><div class="lane-bar" aria-hidden="true"><i></i></div>'
+      + '<div class="lane-why" aria-hidden="true"></div>'
+      + '<div class="lane-list" role="list"></div>'
+      + '<div class="lane-empty" hidden>'+esc(LANE_EMPTY[state] || "—")+'</div>'
+      + '<div class="lane-more"></div></section>';
+  }).join("");
+  root.querySelectorAll(".lane").forEach(el => {
+    LANES[el.dataset.lane] = {el, list: el.querySelector(".lane-list"), count: el.querySelector(".lane-n"),
+      bar: el.querySelector(".lane-bar i"), empty: el.querySelector(".lane-empty"), more: el.querySelector(".lane-more"),
+      why: el.querySelector(".lane-why")};
+  });
+}
+// The one-line spec summary under a card's title: the first prose line, markdown
+// heading/list markers dropped, clipped (CSS clamps it to two lines).
+function specLine(s){
+  const line = String(s || "").split("\n").map(l => l.replace(/^[\s#>*\-+]+/, "").trim()).find(Boolean) || "";
+  return line.length > 160 ? line.slice(0, 157) + "…" : line;
+}
+// The blocked card's "why" line: the reason, plus whether it clears itself.
+function blockedLine(f){
+  if (!f.blocked) return "";
+  const cls = String(f.blocked_class || "");
+  const heal = SELF_HEALING.has(cls)
+    ? '<span class="heal heal--auto" title="The blocked sweep clears this on its own">self-healing</span>'
+    : (cls === "agent-hold" ? '<span class="heal" title="An agent holds this card until it releases it">agent hold</span>'
+      : '<span class="heal heal--you" title="Nothing clears this automatically">needs you</span>');
+  const why = String(f.blocked_reason || "");
+  return '<div class="why">'+heal+(why ? '<span class="why-t" title="'+esc(why)+'">'+esc(why)+'</span>' : '')+'</div>';
+}
+function cardHTML(f, state){
+  const spec = specLine(f.spec);
+  const meta = (flags(f)+' '+taskFoot(f)).trim();
+  return '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
+    + '<span class="pri pri-'+esc(String(f.priority))+'" title="priority '+esc(String(f.priority))+' (0 = most urgent)">P'+esc(String(f.priority))+'</span>'
+    + (f.project ? '<span class="proj" title="project">'+esc(f.project)+'</span>' : '')
+    + '<span class="c-sp"></span>'
+    + (state === "done" ? '<span class="c-check" aria-label="done">'+CHECK_ICON+'</span>' : '')
+    + '<button class="c-menu" type="button" data-card-menu="'+esc(f.id)+'" aria-haspopup="menu"'
+    + ' aria-label="Actions for '+esc(f.id)+'" title="Actions (M)">⋯</button></div>'
+    + '<div class="t">'+docIco(f)+esc(f.title)+'</div>'
+    + (spec ? '<div class="spec">'+esc(spec)+'</div>' : '')
+    + (state === "in_progress" && !isTask(f) && !f.blocked ? '<div class="bld" data-bld></div>' : '')
+    + blockedLine(f)
+    + (meta ? '<div class="m">'+meta+'</div>' : '');
+}
+function setData(n, key, v){ if (v == null) n.removeAttribute("data-"+key); else n.setAttribute("data-"+key, v); }
+// Patch ONE reused card node to the feature's current state. The markup is rewritten
+// only when it changed, so a poll that changed nothing touches nothing.
+function updateCard(n, f, state){
+  // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
+  // A task never dispatches a coder, so it never opens the MONITOR (#217); it opens
+  // the same drawer showing its detail + controls (bd-rdmh) via a data-task handle.
+  const live = state === "in_progress";
+  const mon = live && !isTask(f);
+  const owned = LOOP_OWNED.has(state);
+  const keep = [...n.classList].filter(c => TRANSIENT.has(c));
+  n.className = "card"+(mon?" card--live":"")+(isTask(f)?" card--task":"")
+    + (f.blocked ? " card--blocked" : (f.dag_blocked ? " card--waiting" : ""))
+    + (owned ? " card--owned" : " card--movable") + (keep.length ? " " + keep.join(" ") : "");
+  n.dataset.id = f.id;
+  n.dataset.state = state;
+  setData(n, "mon", mon ? f.id : null);
+  setData(n, "task", isTask(f) ? f.id : null);
+  n.tabIndex = 0;
+  n.setAttribute("role", "listitem");
+  n.setAttribute("aria-keyshortcuts", "M Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown");
+  if (owned) n.title = LOOP_WHY[state]; else n.removeAttribute("title");
+  const html = cardHTML(f, state);
+  if (n._html !== html){ n.innerHTML = html; n._html = html; }
+  paintBuilding(n, f);
+}
+function paintLane(state, total, shown, share, ticks){
+  const lane = LANES[state];
+  if (lane.count.textContent !== String(total)){
+    lane.count.textContent = String(total);
+    if (ticks) restartClass(lane.count, "lane-n--tick");
+  }
+  lane.bar.style.width = share + "%";
+  lane.empty.hidden = shown > 0;
+  const more = total > shown ? showAllBtn(total) : "";
+  if (lane.more._html !== more){ lane.more.innerHTML = more; lane.more._html = more; }
+}
+function restartClass(el, cls){ el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+function kanbanVisible(){ return !$("kanban").classList.contains("hide"); }
+
+function renderKanban(){
+  ensureLanes();
+  const animate = motionOK() && !FIRST_PAINT && kanbanVisible() && !document.hidden;
+  const first = new Map();
+  if (animate) CARD_NODES.forEach((n, id) => { if (n.isConnected) first.set(id, n.getBoundingClientRect()); });
+  const focused = document.activeElement && document.activeElement.classList.contains("card") ? document.activeElement.dataset.id : null;
+  // Lane contents first, so each lane's bar can show its share of the whole board.
+  const lanes = COLS.map(state => {
+    let items = FEATURES.filter(f => f.state === state), total = items.length;
+    if (state === "done"){ const d = doneSlice(items); items = d.items; total = d.total; }  // cap Done (#115)
+    return {state, items, total};
+  });
+  const all = lanes.reduce((s, l) => s + l.total, 0) || 1;
+  const seen = new Set(), entered = [], changed = [], landed = [];
+  lanes.forEach(({state, items, total}) => {
+    const list = LANES[state].list;
+    items.forEach((f, i) => {
+      let n = CARD_NODES.get(f.id);
+      const isNew = !n;
+      if (isNew){ n = document.createElement("div"); CARD_NODES.set(f.id, n); }
+      const was = n.dataset.state;
+      updateCard(n, f, state);
+      if (list.children[i] !== n) list.insertBefore(n, list.children[i] || null);
+      seen.add(f.id);
+      if (isNew){ if (!FIRST_PAINT) entered.push(n); }
+      else if (was !== state){ changed.push(n); if (state === "done") landed.push(n); }
+    });
+    paintLane(state, total, items.length, Math.round(100 * total / all), !FIRST_PAINT);
+  });
+  CARD_NODES.forEach((n, id) => { if (!seen.has(id)){ CARD_NODES.delete(id); leave(n, first.get(id), animate); } });
+  // insertBefore re-parents a node, which drops its focus — hand it back.
+  const fn = focused && CARD_NODES.get(focused);
+  if (fn && document.activeElement !== fn) fn.focus({preventScroll: true});
+  if (animate) flip(first, entered);
+  else if (!FIRST_PAINT) entered.concat(changed).forEach(n => restartClass(n, "card--flash"));
+  landed.forEach(land);
+  FIRST_PAINT = false;
+}
+// FLIP: every card that moved since `first` was measured is put back where it was with
+// an inverse transform, then transitioned to its new place. A card that changed lane
+// flies above the rest; several at once are staggered so the eye can follow each one.
+function flip(first, entered){
+  const movers = [];
+  CARD_NODES.forEach((n, id) => {
+    const a = first.get(id);
+    if (!a || n.classList.contains("card--placeholder")) return;
+    const b = n.getBoundingClientRect();
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+    movers.push({n, dx, dy, far: Math.abs(dx) > 8});
+  });
+  movers.forEach(m => {
+    m.n.style.transition = "none";
+    m.n.style.transform = "translate("+m.dx+"px,"+m.dy+"px)";
+    if (m.far) m.n.classList.add("card--flying");
+  });
+  void document.body.offsetWidth;          // commit the inverted frame before playing it
+  let k = 0;
+  movers.forEach(m => {
+    const delay = m.far ? Math.min(k++, STAGGER_MAX) * STAGGER_MS : 0;
+    m.n.style.transition = "transform "+MOVE_MS+"ms "+EASE+" "+delay+"ms";
+    m.n.style.transform = "";
+    clearTimeout(m.n._settle);
+    m.n._settle = setTimeout(() => { m.n.style.transition = ""; m.n.classList.remove("card--flying"); }, MOVE_MS + delay + 40);
+  });
+  entered.forEach((n, i) => {
+    n.style.animationDelay = Math.min(i, STAGGER_MAX) * STAGGER_MS + "ms";
+    restartClass(n, "card--enter");
+    setTimeout(() => { n.classList.remove("card--enter"); n.style.animationDelay = ""; }, ENTER_MS + STAGGER_MAX * STAGGER_MS);
+  });
+}
+// A card that left the board fades out where it was, on the #fx layer, so the lane can
+// close the gap underneath it at the same time.
+function leave(n, r, animate){
+  if (!animate || !r){ n.remove(); return; }
+  n.classList.remove("card--flying");
+  n.style.cssText = "position:fixed;margin:0;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px;transition:none;transform:none";
+  n.classList.add("card--leave");
+  $("fx").appendChild(n);
+  setTimeout(() => n.remove(), LEAVE_MS + 40);
+}
+// The moment a card lands in done: a check and a brief glow. Once per arrival.
+function land(n){
+  restartClass(n, "card--landed");
+  clearTimeout(n._land);
+  n._land = setTimeout(() => n.classList.remove("card--landed"), LAND_MS);
+}
+
+// ── The live "building" strip on in_progress coding cards ──────────────────────────
+// Who is coding, for how long, and what it touched last — from the same per-feature
+// /progress snapshot the monitor drawer polls, read for the building cards only (an
+// in-process ring buffer, no br). The strip's nodes are built once and only their text
+// changes, so the elapsed clock can tick every second without restarting the shimmer.
+const PROGRESS = new Map();                 // fid → {data, at}
+const BUILD_POLL_MS = 4000;
+let LAST_BUILD_POLL = 0;
+function liveGen(snap){
+  const gens = ((snap && snap.gens) || []).slice().sort((a, b) => b.gen - a.gen);
+  return gens.find(g => !g.done) || gens[0] || null;
+}
+function lastLine(s){ const ls = String(s || "").trim().split("\n").filter(Boolean); return ls.length ? ls[ls.length - 1].slice(0, 120) : ""; }
+function buildInfo(f){
+  const p = PROGRESS.get(f.id), g = liveGen(p && p.data);
+  const who = f.assignee || "coder";
+  if (!g) return {who: who, gen: "", el: "", act: "starting…"};
+  const secs = (Number(g.elapsed_s) || 0) + (g.done ? 0 : (Date.now() - p.at) / 1000);
+  const recent = collapseTools(g.recent_tools || []);
+  const cur = g.current_tool || recent[recent.length - 1];
+  let act = cur ? String(cur.name || "") : (lastLine(g.answer_tail) || "thinking…");
+  const loc = cur && (cur.locations || []).find(l => l && act.indexOf(l.split("/").pop()) < 0);
+  if (loc) act += " " + loc.split("/").pop();
+  return {who: who, gen: g.tier ? g.tier : "gen " + g.gen, el: fmtDur(secs), act: act};
+}
+function setText(el, t){ if (el && el.textContent !== t) el.textContent = t; }
+function paintBuilding(n, f){
+  const b = n.querySelector("[data-bld]");
+  if (!b) return;
+  if (!b.firstChild) b.innerHTML = '<div class="bld-row"><span class="bld-dot" aria-hidden="true"></span>'
+    + '<span class="bld-who"></span><span class="bld-gen"></span><span class="bld-el"></span></div>'
+    + '<div class="bld-act"></div><div class="bld-bar" aria-hidden="true"><i></i></div>';
+  const i = buildInfo(f);
+  setText(b.querySelector(".bld-who"), i.who);
+  setText(b.querySelector(".bld-gen"), i.gen);
+  setText(b.querySelector(".bld-el"), i.el);
+  setText(b.querySelector(".bld-act"), i.act);
+  b.querySelector(".bld-act").title = i.act;
+}
+function paintAllBuilding(){
+  FEATURES.forEach(f => { if (f.state === "in_progress"){ const n = CARD_NODES.get(f.id); if (n) paintBuilding(n, f); } });
+}
+async function pollBuilding(){
+  LAST_BUILD_POLL = Date.now();
+  const ids = FEATURES.filter(f => f.state === "in_progress" && !isTask(f)).slice(0, 8).map(f => f.id);
+  for (const fid of ids){
+    try { PROGRESS.set(fid, {data: await api(FEAT + encodeURIComponent(fid) + "/progress"), at: Date.now()}); }
+    catch (e) { /* keep the last snapshot — the strip says "starting…" until one lands */ }
+  }
+  for (const k of [...PROGRESS.keys()]) if (!ids.includes(k)) PROGRESS.delete(k);
+  paintAllBuilding();
+}
+
+// ── Operator moves: the allowed-transition map ────────────────────────────────────
+// Only moves that ARE operator actions the API already has. Everything else is
+// refused with the reason — the loop owns building / in review / done, and there is
+// no un-ready route (a card leaves on deck only when the loop claims it).
+//   backlog → on deck   POST /features/{id}/ready   (the Ready gate; 400 names every failure)
+//   reorder in backlog / on deck   PATCH /features/{id} {priority}
+//   block / unblock (menu)   POST /features/{id}/block {reason} · POST …/unblock
+const MOVES = {
+  "backlog>ready": "ready",
+  "backlog>backlog": "priority",
+  "ready>ready": "priority",
+};
+const NO_UNREADY = "There is no un-ready action: a card leaves on deck only when the loop claims it. Block it to hold it instead.";
+// What dropping `f` into lane `to` would do. `lane` is that lane's cards in display
+// order WITHOUT `f`; `index` is the slot the drop lands in. → {ok, verb, priority?} or
+// {ok: false, why, noop?}.
+function planMove(f, to, lane, index){
+  const from = f.state;
+  if (LOOP_OWNED.has(from)) return {ok: false, why: LOOP_WHY[from]};
+  if (LOOP_OWNED.has(to)) return {ok: false, why: "The build loop moves cards into "+(STATE_LABEL[to] || to)+" — it claims on-deck cards itself."};
+  const verb = MOVES[from + ">" + to];
+  if (!verb) return {ok: false, why: from === "ready" && to === "backlog" ? NO_UNREADY : "Not a move the board supports."};
+  const p = dropPriority(f, lane || [], index || 0);
+  if (verb === "ready") return p === f.priority ? {ok: true, verb} : {ok: true, verb, priority: p};
+  if (p === f.priority) return {ok: false, noop: true, why: "Same priority — cards of one priority are ordered by id."};
+  return {ok: true, verb, priority: p};
+}
+// The priority a drop at `index` implies: moving up takes the rank of the card it lands
+// above, moving down (or to the end) the rank of the card it lands below — clamped to
+// the store's range. Blocked cards float first regardless of rank, so they don't count.
+function dropPriority(f, lane, index){
+  const ranked = lane.filter(x => !x.blocked);
+  const before = lane.slice(0, index).filter(x => !x.blocked);
+  const above = before[before.length - 1], below = ranked[before.length];
+  const cur = Number(f.priority);
+  let p = cur;
+  if (below && (!above || Number(below.priority) < cur)) p = Number(below.priority);
+  else if (above && Number(above.priority) > cur) p = Number(above.priority);
+  else if (above && below) p = Math.max(Number(above.priority), Math.min(cur, Number(below.priority)));
+  return Math.max(PRIORITY_MIN, Math.min(PRIORITY_MAX, p));
+}
+// The lanes a drag of `f` may drop into (its own lane counts when it can reorder there).
+function dropLanes(f){
+  return COLS.filter(to => !!MOVES[f.state + ">" + to] && !LOOP_OWNED.has(f.state));
+}
+
+// ── Optimistic writes with rollback ───────────────────────────────────────────────
+// A move shows at once: the card's new state/priority is patched into FEATURES and
+// re-rendered (so it animates), the API call runs, and on an error the board rolls back
+// to what it was — the card animates home — with the API's reason in a toast. While the
+// call is in flight its patch is re-applied over every poll, so a slow write can't
+// flicker the card back and forth.
+const PENDING = new Map();                  // fid → patch applied over every load
+function sortFeatures(list){
+  return list.sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));
+}
+function withPending(list){
+  if (!PENDING.size) return list;
+  return sortFeatures(list.map(f => PENDING.has(f.id) ? {...f, ...PENDING.get(f.id)} : f));
+}
+async function apiSend(method, p, body){
+  const r = await kit.apiFetch(p, {method: method, headers: {"content-type": "application/json"},
+    body: JSON.stringify(body || {})});
+  const d = await r.json().catch(() => { throw new Error("HTTP " + r.status + " (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+  return d;
+}
+const VERB_LABEL = {ready: "mark ready", priority: "change priority", block: "block", unblock: "unblock"};
+const VERB_DONE = {ready: " is on deck", priority: " re-ranked", block: " blocked", unblock: " unblocked"};
+async function runMove(f, plan, extra){
+  const fid = f.id, prev = FEATURES;
+  const patch = plan.verb === "ready" ? {state: "ready", board_state: "ready"}
+    : plan.verb === "block" ? {blocked: true, blocked_reason: extra || "", blocked_class: "terminal"}
+    : plan.verb === "unblock" ? {blocked: false, blocked_reason: "", blocked_class: ""} : {};
+  if (plan.priority != null) patch.priority = plan.priority;
+  PENDING.set(fid, patch);
+  FEATURES = withPending(FEATURES.slice());
+  render();
+  const node = CARD_NODES.get(fid);
+  if (node) node.classList.add("card--pending");
+  try {
+    const url = FEAT + encodeURIComponent(fid);
+    if (plan.verb === "ready") await apiPost(url + "/ready", {});
+    else if (plan.verb === "block") await apiPost(url + "/block", {reason: extra || ""});
+    else if (plan.verb === "unblock") await apiPost(url + "/unblock", {});
+    if (plan.priority != null) await apiSend("PATCH", url, {priority: plan.priority});
+    PENDING.delete(fid);
+    toast(fid + (VERB_DONE[plan.verb] || " moved") + (plan.priority != null ? " · P" + plan.priority : ""), "ok");
+  } catch (e) {
+    PENDING.delete(fid);
+    FEATURES = prev;                          // roll back — the card animates home
+    render();
+    toast("Couldn't " + (VERB_LABEL[plan.verb] || "move") + " " + fid + ": " + ((e && e.message) || e), "error");
+  } finally {
+    const n = CARD_NODES.get(fid);
+    if (n) n.classList.remove("card--pending");
+  }
+  await load();                               // the server's word is final either way
+}
+
+// ── Toasts ────────────────────────────────────────────────────────────────────────
+let TOAST_TIMER = null;
+function toast(msg, kind){
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast toast--" + (kind || "info") + " toast--on";
+  clearTimeout(TOAST_TIMER);
+  TOAST_TIMER = setTimeout(() => t.classList.remove("toast--on"), kind === "error" ? 7000 : 2600);
+}
+
+// ── Drag and drop — POINTER events, never HTML5 DnD (the desktop app's Tauri webview
+// swallows HTML5 drag-and-drop). Press, move past a small threshold, and the card lifts
+// into a ghost that follows the pointer; the card's own node stays behind as a
+// placeholder that slides (FLIP) into the slot the drop would take. Lanes the card can't
+// go to dim and say why; a refused or cancelled drop snaps the ghost back home.
+const DRAG_THRESHOLD = 6;
+let PRESS = null, DRAG = null, SUPPRESS_CLICK = false, RENDER_DEFERRED = false;
+function featureById(id){ return FEATURES.find(f => f.id === id); }
+function laneAt(x, y){
+  for (const state of COLS){
+    const r = LANES[state].el.getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return state;
+  }
+  return null;
+}
+function slotIndex(list, y, skip){
+  const cards = [...list.children].filter(n => n !== skip);
+  for (let i = 0; i < cards.length; i++){
+    const r = cards[i].getBoundingClientRect();
+    if (y < r.top + r.height / 2) return i;
+  }
+  return cards.length;
+}
+// FLIP for the cards in a few lanes around one DOM change (the placeholder sliding).
+function flipAround(mutate){
+  if (!motionOK()){ mutate(); return; }
+  const first = new Map();
+  CARD_NODES.forEach((n, id) => first.set(id, n.getBoundingClientRect()));
+  mutate();
+  CARD_NODES.forEach((n, id) => {
+    const a = first.get(id), b = n.getBoundingClientRect();
+    if (n.classList.contains("card--placeholder")) return;
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+    n.style.transition = "none"; n.style.transform = "translate("+dx+"px,"+dy+"px)";
+    void n.offsetWidth;
+    n.style.transition = "transform 200ms " + EASE; n.style.transform = "";
+  });
+}
+function onPointerDown(e){
+  if (e.button !== 0 || DRAG || VIEW !== "kanban") return;
+  const n = e.target.closest(".card");
+  if (!n || !$("kanban").contains(n) || e.target.closest("a,button,input,textarea")) return;
+  PRESS = {n, id: n.dataset.id, x: e.clientX, y: e.clientY, pid: e.pointerId};
+}
+function onPointerMove(e){
+  if (DRAG){ dragMove(e); return; }
+  if (!PRESS || e.pointerId !== PRESS.pid) return;
+  if (Math.hypot(e.clientX - PRESS.x, e.clientY - PRESS.y) < DRAG_THRESHOLD) return;
+  const f = featureById(PRESS.id), n = PRESS.n;
+  PRESS = null;
+  // A press that travels is a drag gesture, never a text selection.
+  document.body.classList.add("is-pressing");
+  const sel = window.getSelection && window.getSelection();
+  if (sel) sel.removeAllRanges();
+  SUPPRESS_CLICK = true;                      // a drag is never also a click
+  if (!f) return;
+  if (LOOP_OWNED.has(f.state)){ toast(LOOP_WHY[f.state], "info"); restartClass(n, "card--refuse"); return; }
+  startDrag(e, f, n);
+}
+function startDrag(e, f, n){
+  const r = n.getBoundingClientRect();
+  const ghost = n.cloneNode(true);
+  ghost.classList.remove("card--enter", "card--landed", "card--flash", "card--flying");
+  ghost.classList.add("card--ghost");
+  ghost.removeAttribute("data-mon"); ghost.removeAttribute("data-task"); ghost.removeAttribute("tabindex");
+  ghost.style.cssText = "position:fixed;margin:0;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px";
+  $("fx").appendChild(ghost);
+  const home = {lane: f.state, index: [...LANES[f.state].list.children].indexOf(n)};
+  DRAG = {f, n, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, home, over: f.state, ok: dropLanes(f)};
+  n.classList.add("card--placeholder");
+  document.body.classList.add("is-dragging");
+  COLS.forEach(state => {
+    const el = LANES[state].el, ok = DRAG.ok.includes(state);
+    el.classList.toggle("lane--drop-ok", ok);
+    el.classList.toggle("lane--drop-no", !ok);
+    LANES[state].why.textContent = ok ? "" : planMove(f, state, [], 0).why;
+  });
+  try { n.setPointerCapture(e.pointerId); } catch (_e) { /* the card may have re-rendered */ }
+  dragMove(e);
+}
+function dragMove(e){
+  const d = DRAG;
+  d.ghost.style.transform = "translate("+(e.clientX - d.dx - parseFloat(d.ghost.style.left))+"px,"
+    +(e.clientY - d.dy - parseFloat(d.ghost.style.top))+"px) rotate(1.5deg)";
+  const over = laneAt(e.clientX, e.clientY);
+  COLS.forEach(state => LANES[state].el.classList.toggle("lane--over", state === over));
+  d.over = over;
+  const target = over && d.ok.includes(over) ? over : d.home.lane;
+  const list = LANES[target].list;
+  const idx = target === over ? slotIndex(list, e.clientY, d.n) : d.home.index;
+  const cards = [...list.children].filter(x => x !== d.n);
+  const ref = cards[idx] || null;
+  if (d.n.parentNode !== list || d.n.nextSibling !== ref) flipAround(() => list.insertBefore(d.n, ref));
+}
+function endDrag(drop){
+  const d = DRAG;
+  if (!d) return;
+  DRAG = null;
+  document.body.classList.remove("is-dragging");
+  COLS.forEach(state => LANES[state].el.classList.remove("lane--drop-ok", "lane--drop-no", "lane--over"));
+  const to = d.n.parentNode && d.n.parentNode.parentNode && d.n.parentNode.parentNode.dataset.lane;
+  const lane = [...LANES[to].list.children].filter(x => x !== d.n).map(x => featureById(x.dataset.id)).filter(Boolean);
+  const index = [...LANES[to].list.children].indexOf(d.n);
+  const plan = drop && d.over === to ? planMove(d.f, to, lane, index) : {ok: false, noop: true};
+  if (drop && d.over && d.over !== to) toast(planMove(d.f, d.over, [], 0).why, "info");
+  else if (drop && !plan.ok && !plan.noop) toast(plan.why, "info");
+  if (plan.ok){
+    runMove(d.f, plan);                       // optimistic: re-renders at once (FLIP)
+  } else {
+    // Snap back: the placeholder returns to its home slot, then the ghost flies to it.
+    const home = LANES[d.home.lane].list, sib = [...home.children].filter(x => x !== d.n)[d.home.index] || null;
+    flipAround(() => home.insertBefore(d.n, sib));
+  }
+  if (RENDER_DEFERRED){ RENDER_DEFERRED = false; render(); }
+  settleGhost(d);
+}
+// The ghost glides onto wherever the card's node ended up, then hands back to it.
+function settleGhost(d){
+  const r = d.n.getBoundingClientRect();
+  const g = d.ghost;
+  const tx = r.left - parseFloat(g.style.left), ty = r.top - parseFloat(g.style.top);
+  const done = () => { g.remove(); d.n.classList.remove("card--placeholder"); restartClass(d.n, "card--flash"); };
+  if (!motionOK()){ done(); return; }
+  g.style.transition = "transform 260ms " + EASE + ", box-shadow 260ms " + EASE;
+  g.style.transform = "translate("+tx+"px,"+ty+"px)";
+  g.classList.add("card--ghost-drop");
+  setTimeout(done, 280);
+}
+function onPointerUp(e){
+  document.body.classList.remove("is-pressing");
+  if (PRESS && e.pointerId === PRESS.pid) PRESS = null;
+  if (DRAG) endDrag(e.type === "pointerup");
+}
+document.addEventListener("pointerdown", onPointerDown);
+document.addEventListener("pointermove", onPointerMove);
+document.addEventListener("pointerup", onPointerUp);
+document.addEventListener("pointercancel", onPointerUp);
+// A drag (or a refused drag) ends in a click on the card — swallow exactly that one.
+document.addEventListener("click", (e) => {
+  if (!SUPPRESS_CLICK) return;
+  SUPPRESS_CLICK = false;
+  if (e.target.closest(".card")) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+document.addEventListener("pointerdown", () => { SUPPRESS_CLICK = false; }, true);
+
+// ── The keyboard path: every drag has a menu/shortcut twin ─────────────────────────
+// Focus a card (Tab), then M (or the ⋯ button, or the context-menu key) opens its
+// action menu; Alt+→ marks it ready, Alt+↑/↓ raise/lower its priority. Arrow keys walk
+// the menu, Enter picks, Esc closes and hands focus back to the card.
+function menuItems(f){
+  const items = [];
+  if (LOOP_OWNED.has(f.state)) items.push({id: "owned", label: LOOP_WHY[f.state], disabled: true});
+  if (f.state === "backlog") items.push({id: "ready", label: "Mark ready → on deck", key: "Alt+→"});
+  if (f.state === "backlog" || f.state === "ready"){
+    items.push({id: "up", label: "Raise priority (P"+f.priority+" → P"+Math.max(PRIORITY_MIN, f.priority - 1)+")", key: "Alt+↑", disabled: f.priority <= PRIORITY_MIN});
+    items.push({id: "down", label: "Lower priority (P"+f.priority+" → P"+Math.min(PRIORITY_MAX, f.priority + 1)+")", key: "Alt+↓", disabled: f.priority >= PRIORITY_MAX});
+  }
+  if (f.state === "ready") items.push({id: "unready", label: "Back to backlog — no un-ready action", disabled: true, why: NO_UNREADY});
+  if (f.state !== "done" && f.state !== "cancelled") items.push(f.blocked ? {id: "unblock", label: "Unblock"} : {id: "block", label: "Block…"});
+  if (f.state === "in_progress" && !isTask(f)) items.push({id: "open", label: "Open coder monitor"});
+  else if (isTask(f)) items.push({id: "open", label: "Open task"});
+  return items;
+}
+function planFor(f, id){
+  if (id === "ready") return {ok: true, verb: "ready"};
+  if (id === "up" || id === "down"){
+    const p = Math.max(PRIORITY_MIN, Math.min(PRIORITY_MAX, f.priority + (id === "up" ? -1 : 1)));
+    return p === f.priority ? {ok: false, noop: true} : {ok: true, verb: "priority", priority: p};
+  }
+  if (id === "block" || id === "unblock") return {ok: true, verb: id};
+  return {ok: false, noop: true};
+}
+let MENU_FOR = null;
+function openMenu(fid, anchor){
+  const f = featureById(fid);
+  if (!f) return;
+  MENU_FOR = fid;
+  const m = $("move-menu");
+  m.innerHTML = '<div class="mm-h">'+esc(fid)+'</div>' + menuItems(f).map(it =>
+    '<button type="button" role="menuitem" class="mm-i" data-mm="'+it.id+'"'+(it.disabled ? ' aria-disabled="true"' : '')
+    + (it.why ? ' title="'+esc(it.why)+'"' : '')+'><span>'+esc(it.label)+'</span>'
+    + (it.key ? '<kbd>'+esc(it.key)+'</kbd>' : '')+'</button>').join("");
+  m.hidden = false;
+  const r = anchor.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw)) + "px";
+  m.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
+  const firstOn = m.querySelector('.mm-i:not([aria-disabled])') || m.querySelector(".mm-i");
+  if (firstOn) firstOn.focus();
+}
+function closeMenu(refocus){
+  const m = $("move-menu");
+  if (m.hidden) return false;
+  m.hidden = true;
+  const n = MENU_FOR && CARD_NODES.get(MENU_FOR);
+  MENU_FOR = null;
+  if (refocus && n) n.focus({preventScroll: true});
+  return true;
+}
+function blockForm(fid){
+  const m = $("move-menu");
+  m.innerHTML = '<div class="mm-h">Block '+esc(fid)+'</div><form class="mm-form" data-mm-block="'+esc(fid)+'">'
+    + '<input class="tin" name="reason" required placeholder="Why? (stays until someone unblocks it)" aria-label="Block reason">'
+    + '<div class="trow"><button class="tbtn tbtn--danger" type="submit">Block</button>'
+    + '<button class="tbtn" type="button" data-mm="cancel">Cancel</button></div></form>';
+  m.querySelector("input").focus();
+}
+function pickMenu(id){
+  const f = featureById(MENU_FOR);
+  if (!f) { closeMenu(false); return; }
+  if (id === "block"){ blockForm(f.id); return; }
+  if (id === "cancel"){ closeMenu(true); return; }
+  if (id === "open"){ closeMenu(false); if (isTask(f)) openTask(f.id); else openMonitor(f.id); return; }
+  closeMenu(true);
+  const plan = planFor(f, id);
+  if (plan.ok) runMove(f, plan);
+}
+$("move-menu").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-mm]");
+  if (!b || b.getAttribute("aria-disabled") === "true") return;
+  pickMenu(b.getAttribute("data-mm"));
+});
+$("move-menu").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const form = e.target.closest("[data-mm-block]");
+  const reason = form.querySelector("input").value.trim();
+  if (!reason) return;
+  const f = featureById(form.getAttribute("data-mm-block"));
+  closeMenu(true);
+  if (f) runMove(f, {ok: true, verb: "block"}, reason);
+});
+$("move-menu").addEventListener("keydown", (e) => {
+  const items = [...$("move-menu").querySelectorAll(".mm-i")];
+  const i = items.indexOf(document.activeElement);
+  if (e.key === "ArrowDown" || e.key === "ArrowUp"){
+    e.preventDefault();
+    if (items.length) items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+  } else if (e.key === "Tab"){ closeMenu(true); }
+});
+document.addEventListener("pointerdown", (e) => { if (!e.target.closest("#move-menu,[data-card-menu]")) closeMenu(false); });
+document.addEventListener("keydown", (e) => {
+  const n = e.target.closest && e.target.closest(".card");
+  if (!n || !$("kanban").contains(n) || e.target !== n) return;
+  const f = featureById(n.dataset.id);
+  if (!f) return;
+  if (e.key === "m" || e.key === "M" || e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")){
+    e.preventDefault(); openMenu(f.id, n.querySelector("[data-card-menu]") || n); return;
+  }
+  if (e.key === "Enter" || e.key === " "){
+    e.preventDefault();
+    if (n.hasAttribute("data-mon") || n.hasAttribute("data-task")) n.click();
+    else openMenu(f.id, n.querySelector("[data-card-menu]") || n);
+    return;
+  }
+  const shortcut = e.altKey && {ArrowRight: "ready", ArrowUp: "up", ArrowDown: "down"}[e.key];
+  if (shortcut){
+    e.preventDefault();
+    if (LOOP_OWNED.has(f.state)) { toast(LOOP_WHY[f.state], "info"); return; }
+    if (shortcut === "ready" && f.state !== "backlog") { toast(f.state === "ready" ? "Already on deck." : NO_UNREADY, "info"); return; }
+    const plan = planFor(f, shortcut);
+    if (plan.ok) runMove(f, plan);
+  }
+});
 
 // ── Live coder monitor drawer (#84) ────────────────────────────────────────────
 // Clicking an in_progress card/row opens a right-edge slide-over that polls the
@@ -944,6 +1589,9 @@ function closeMonitor(){
 // a [data-task] element (any task card/row) opens its detail drawer; the task action
 // buttons (#217) are delegated the same way, keyed on data-* verb.
 document.addEventListener("click", (e) => {
+  const mb = e.target.closest("[data-card-menu]");
+  if (mb) { if (MENU_FOR === mb.getAttribute("data-card-menu")) closeMenu(true); else openMenu(mb.getAttribute("data-card-menu"), mb); return; }
+  if (e.target.closest("#move-menu")) return;
   const el = e.target.closest("[data-mon]");
   if (el) { openMonitor(el.getAttribute("data-mon")); return; }
   const tel = e.target.closest("[data-task]");
@@ -957,7 +1605,13 @@ document.addEventListener("click", (e) => {
 });
 $("scrim").addEventListener("click", closeMonitor);              // click-away closes
 $("drawer-close").addEventListener("click", closeMonitor);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMonitor(); });  // Esc closes
+// Esc unwinds the innermost thing first: a drag (snaps back), the action menu, the drawer.
+function escapeLayer(){
+  if (DRAG) { endDrag(false); return; }
+  if (closeMenu(true)) return;
+  closeMonitor();
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") escapeLayer(); });
 
 // Module scripts are scoped — expose the inline onclick handlers (view toggle +
 // the list's per-state collapse + the Done cap's "show all").
@@ -968,7 +1622,56 @@ setView(VIEW);   // sync the toggle + visibility to the initial view (list on mo
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated /features pull authenticates) or a short timer
 // for the no-handshake case (standalone page / older host).
+//
+// Live, not just polled: the board polls the store's change stamp (GET /rev — a few
+// `stat`s server-side, no br) every REV_POLL_MS and re-reads /features only when it
+// moved, so a card the loop moves shows up within a couple of seconds while an idle board
+// costs next to nothing. A full read still runs every FULL_REFRESH_MS (an ETag'd 304 when
+// nothing changed) for what the stamp can't see — the CI / review chips come from
+// in-process caches, not the store. An older plugin with no /rev falls back to the plain
+// 10 s poll. Nothing polls while the page is hidden; coming back refreshes at once.
+const REV_POLL_MS = 2000, FULL_REFRESH_MS = 15000, SLOW_POLL_MS = 10000;
+let REV = null, REV_OK = true, LIVE_TIMER = null, TICKING = false;
+async function liveTick(){
+  if (TICKING) return;
+  TICKING = true;
+  clearTimeout(LIVE_TIMER);
+  try {
+    if (!document.hidden){
+      let changed = false;
+      if (REV_OK){
+        try {
+          const r = await kit.apiFetch("/api/plugins/project_board/rev");
+          if (r.status === 404) REV_OK = false;
+          else if (r.ok){
+            // The first stamp re-reads too: a write between the boot read and this tick
+            // would otherwise be baked into the baseline and wait for the full refresh.
+            const d = await r.json(); changed = REV === null || d.rev !== REV; REV = d.rev;
+          }
+        } catch (e) { /* transient — the next tick retries */ }
+      }
+      if (changed || !REV_OK || Date.now() - LAST_FULL >= FULL_REFRESH_MS) await load();
+      if (VIEW === "kanban" && Date.now() - LAST_BUILD_POLL >= BUILD_POLL_MS) await pollBuilding();
+    }
+  } finally {
+    TICKING = false;
+    $("live").classList.toggle("live--off", !REV_OK);
+    LIVE_TIMER = setTimeout(liveTick, REV_OK ? REV_POLL_MS : SLOW_POLL_MS);
+  }
+}
+// The building strips' elapsed clocks tick locally between /progress reads.
+function clockTick(){
+  if (!document.hidden && VIEW === "kanban") paintAllBuilding();
+  setTimeout(clockTick, 1000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) liveTick(); });
 let booted = false;
-function boot(){ if (booted) return; booted = true; load(); setInterval(load, 10000); }
+function boot(){
+  if (booted) return;
+  booted = true;
+  load().then(pollBuilding);
+  LIVE_TIMER = setTimeout(liveTick, REV_POLL_MS);
+  clockTick();
+}
 kit.initPluginView(boot);
 setTimeout(boot, 800);

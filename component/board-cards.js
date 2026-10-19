@@ -246,10 +246,12 @@
         h.push('<code class="bc-id">' + esc(r.id) + '</code><span class="bc-muted">' + esc(why) + "</span></div></div>");
         return;
       }
-      h.push('<div class="pl-card bc-card" data-card="' + esc(r.id) + '"><div class="bc-row">');
+      // data-state carries the lane accent the board view uses (a left stripe, a live dot
+      // while building) — the same visual language in chat as on the board.
+      h.push('<div class="pl-card bc-card" data-card="' + esc(r.id) + '" data-state="' + esc(r.state) + '"><div class="bc-row">');
       h.push('<code class="bc-id">' + esc(r.id) + "</code>");
       h.push('<span class="bc-name">' + esc(r.title) + "</span>");
-      h.push('<span class="pl-badge ' + esc(r.badge) + '">' + esc(r.stateLabel) + "</span>");
+      h.push('<span class="bc-dot" aria-hidden="true"></span><span class="pl-badge ' + esc(r.badge) + '">' + esc(r.stateLabel) + "</span>");
       if (r.project) h.push('<span class="bc-muted">' + esc(r.project) + "</span>");
       h.push("</div>");
       if (r.blockedReason) {

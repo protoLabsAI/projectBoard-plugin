@@ -35,3 +35,12 @@ Day-to-day operation: agent tools, skills, the HTTP surface and the console view
 - **Watch it:** the **Board** console view (left-rail) at
   `/plugins/project_board/board` — Kanban + list, live-refreshing, served by the
   same router as the API (so the declared view path is genuinely mounted).
+  Cards glide between lanes as the loop moves them (within ~2 s: the page polls the
+  store's change stamp, `GET …/rev`, and re-reads only when it moves), and a building
+  card shows who is coding, for how long and its last tool call. You can move a card
+  yourself where the API has an operator action for it: drag a backlog card onto
+  **on deck** (`POST …/ready` — a gate refusal rolls the card back with the reason),
+  drag within backlog or on deck to re-rank it (`PATCH …` `priority`), or focus a card
+  and press **M** for the same moves plus block / unblock (**Alt+→** marks ready,
+  **Alt+↑/↓** re-ranks). Building, in review and done belong to the loop and are
+  read-only; there is no un-ready route, so a card leaves on deck only when it is claimed.

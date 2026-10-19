@@ -16,3 +16,14 @@ html, body { margin: 0; background: transparent; color: var(--pl-color-fg); font
 .bc-foot .pl-btn:first-of-type { margin-left: auto; }
 .bc-empty { color: var(--pl-color-fg-muted); padding: var(--pl-space-2) 0; }
 .bc-banner { margin: 0; }
+/* The board view's lane language (view/board.css): each state's accent as a left stripe
+   and a dot in the state badge, pulsing while a coder is building. Tokens only. */
+.bc-card[data-state] { --bc-accent: var(--pl-color-border-strong, var(--pl-color-fg-muted)); border-left: 3px solid var(--bc-accent); }
+.bc-card[data-state="ready"], .bc-card[data-state="done"] { --bc-accent: var(--pl-color-status-success); }
+.bc-card[data-state="in_progress"] { --bc-accent: var(--pl-color-accent); }
+.bc-card[data-state="in_review"] { --bc-accent: var(--pl-color-status-info); }
+.bc-card[data-state="blocked"] { --bc-accent: var(--pl-color-status-error); }
+.bc-dot { display: inline-block; width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--bc-accent, currentColor); }
+.bc-card[data-state="in_progress"] .bc-dot { animation: bc-pulse 1.6s ease-in-out infinite; }
+@keyframes bc-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .bc-card[data-state="in_progress"] .bc-dot { animation: none; } }
