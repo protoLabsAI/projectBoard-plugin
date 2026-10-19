@@ -250,7 +250,15 @@ def _no_leaked_pending_feedback():
     flake that failed `test_review_gate_bounces_with_findings_in_the_retry_prompt`
     (and blocked a release card) while every test passed on its own. Start and end
     every test with an empty bridge; clear in place, because the dict object IS the
-    slot every view shares."""
+    slot every view shares.
+
+    Clear the module ALIAS, not ``_feedback_slot().pending``. ``_feedback_slot()`` is
+    called exactly once, at ``_common`` import, so the alias is the dict the queue and
+    the drain actually use. Re-resolving the slot would clear whatever a FRESH import
+    would get — the same object normally, but a different one if the holder were
+    swapped in ``sys.modules`` without reloading ``_common``, leaving the live dict
+    dirty. Resolving the attribute per call (not once at setup) already follows an
+    ``importlib.reload`` that rebinds it."""
     from project_board.loop import _common
 
     _common._PENDING_FEEDBACK.clear()
