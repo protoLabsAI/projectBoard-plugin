@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Iterable
+from contextvars import ContextVar
 
 from . import config
 from .projects import parse_github_remote
@@ -38,6 +39,36 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 class WorktreeError(Exception):
     """A git worktree / dispatch / PR failure. The loop turns it into Blocked."""
+
+
+class GhTimeout(WorktreeError):
+    """GitHub CLI did not answer within its deadline; not a git worktree failure."""
+
+
+# Task-local evidence preserves reader return contracts with concurrent cards.
+_gh_read_timeouts: ContextVar[list[GhTimeout] | None] = ContextVar("gh_read_timeouts", default=None)
+
+
+@contextlib.contextmanager
+def capture_gh_timeouts():
+    """Collect read timeout causes for one pass without changing PR metadata."""
+    evidence: list[GhTimeout] = []
+    token = _gh_read_timeouts.set(evidence)
+    try:
+        yield evidence
+    finally:
+        _gh_read_timeouts.reset(token)
+
+
+async def _gh_read(read) -> tuple[int, str, str]:
+    """Best-effort read: retain timeout cause separately from the failed-read result."""
+    try:
+        return await read
+    except GhTimeout as exc:
+        evidence = _gh_read_timeouts.get()
+        if evidence is not None:
+            evidence.append(exc)
+        return 1, "", str(exc)
 
 
 class NoChangesError(WorktreeError):
@@ -2037,7 +2068,7 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
         # and closes it.)
         out, err = await communicate_or_kill(proc, timeout=timeout)
     except asyncio.TimeoutError:
-        raise WorktreeError(f"gh {' '.join(args)} timed out after {timeout}s") from None
+        raise GhTimeout(f"gh {' '.join(args)} timed out after {timeout}s") from None
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -2189,7 +2220,7 @@ async def pr_state(pr_url: str, *, cwd: str = ".") -> str:
     failure (the next poll just retries; this never raises into the loop). The PR
     reconcile drives the board's Done/closed edges off this (the fallback to the
     webhook for deployments with no public webhook URL)."""
-    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd)
+    rc, out, _err = await _gh_read(_gh("pr", "view", pr_url, "--json", "state", "--jq", ".state", cwd=cwd))
     return out.strip() if rc == 0 else ""
 
 
@@ -2199,7 +2230,7 @@ async def pr_head_sha(pr_url: str, *, cwd: str = ".") -> str:
     review-gate reconcile (#328) reads this to tell whether an external/human push
     moved the head out from under a ``changes-requested`` verdict since the gate last
     reviewed it — the recorded-SHA identity a stale-verdict re-arm turns on."""
-    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid", cwd=cwd)
+    rc, out, _err = await _gh_read(_gh("pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid", cwd=cwd))
     return out.strip() if rc == 0 else ""
 
 
@@ -2213,8 +2244,8 @@ async def pr_identity(pr_url: str, *, cwd: str = ".") -> dict:
     Returns ``{}`` when gh fails, times out or isn't installed. It never raises, because a
     PR the board cannot read is one it will not adopt."""
     try:
-        rc, out, _err = await _gh(
-            "pr", "view", pr_url, "--json", "url,state,headRefName,baseRefName,isCrossRepository", cwd=cwd
+        rc, out, _err = await _gh_read(
+            _gh("pr", "view", pr_url, "--json", "url,state,headRefName,baseRefName,isCrossRepository", cwd=cwd)
         )
     except (WorktreeError, OSError):
         return {}
@@ -2244,7 +2275,7 @@ async def pr_merge_info(pr_url: str, *, cwd: str = ".") -> dict:
     unknown (gh failed / field absent). ``isDraft`` rides the same read (#207) because
     GitHub reports ``CLEAN`` for a draft whose checks pass, so the status alone never
     says "draft" — and ``gh pr merge`` on a draft fails. Never raises into the loop."""
-    rc, out, _err = await _gh("pr", "view", pr_url, "--json", "isDraft,mergeStateStatus", cwd=cwd)
+    rc, out, _err = await _gh_read(_gh("pr", "view", pr_url, "--json", "isDraft,mergeStateStatus", cwd=cwd))
     if rc != 0:
         return {"mergeStateStatus": "", "isDraft": None}
     try:
@@ -2477,7 +2508,7 @@ async def pr_diff(pr_url: str, *, cwd: str = ".", max_chars: int = PR_DIFF_MAX_C
 
     ``max_chars`` is a PROMPT budget, not a correctness one. Pass a large cap when the
     caller needs the diff to be complete (see ``DIFF_TRUNCATED_MARKER``)."""
-    rc, out, _err = await _gh("pr", "diff", pr_url, cwd=cwd)
+    rc, out, _err = await _gh_read(_gh("pr", "diff", pr_url, cwd=cwd))
     if rc != 0 or not out.strip():
         return ""
     return truncate_diff(out.strip(), max_chars)
@@ -2551,8 +2582,8 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     (CodeRabbit, a coverage bot) is ignored — it can't gate the merge, so it must not
     trigger a CI-bounce; the rollup reads ``passing`` when every blocking check is green
     even while an advisory one is red (bd-1zp)."""
-    rc, out, _err = await _gh(
-        "pr", "view", pr_url, "--json", "statusCheckRollup", "--jq", ".statusCheckRollup", cwd=cwd
+    rc, out, _err = await _gh_read(
+        _gh("pr", "view", pr_url, "--json", "statusCheckRollup", "--jq", ".statusCheckRollup", cwd=cwd)
     )
     if rc != 0 or not out.strip():
         return "none", ""
@@ -2588,7 +2619,7 @@ async def pr_ci_status(pr_url: str, *, cwd: str = ".", log_chars: int = 3000) ->
     if "/actions/runs/" in detail_url:
         run_id = detail_url.split("/actions/runs/", 1)[1].split("/", 1)[0]
     if run_id.isdigit():
-        lrc, lout, _le = await _gh("run", "view", run_id, "--log-failed", cwd=cwd, timeout=60)
+        lrc, lout, _le = await _gh_read(_gh("run", "view", run_id, "--log-failed", cwd=cwd, timeout=60))
         if lrc == 0 and lout.strip():
             summary += f"\n\nFailing log (truncated):\n{lout.strip()[-log_chars:]}"
     return "failing", summary
@@ -2853,7 +2884,9 @@ async def read_review_status_result(
     if not repo_slug or not head_sha:
         return (STATUS_READ_UNREADABLE, None)  # can't name a repo/commit → can't PROVE absence
     try:
-        rc, out, _err = await _gh("api", f"/repos/{repo_slug}/commits/{head_sha}/status", "--jq", ".statuses", cwd=cwd)
+        rc, out, _err = await _gh_read(
+            _gh("api", f"/repos/{repo_slug}/commits/{head_sha}/status", "--jq", ".statuses", cwd=cwd)
+        )
     except WorktreeError:
         return (STATUS_READ_UNREADABLE, None)
     if rc != 0 or not out.strip():
@@ -2909,7 +2942,9 @@ async def pr_review_state(pr_url: str, *, cwd: str = ".") -> dict | None:
     something that is not a JSON object carrying a head. Never raises into the loop: an
     unreadable review state is simply not a FAIL, and the reconcile carries on as before."""
     try:
-        rc, out, _err = await _gh("pr", "view", pr_url, "--json", "state,headRefOid,reviews,statusCheckRollup", cwd=cwd)
+        rc, out, _err = await _gh_read(
+            _gh("pr", "view", pr_url, "--json", "state,headRefOid,reviews,statusCheckRollup", cwd=cwd)
+        )
     except (WorktreeError, OSError):  # a timeout, no `gh`, a cwd that is gone
         return None
     if rc != 0 or not out.strip():
@@ -2929,7 +2964,9 @@ async def _find_marked_comment(repo_slug: str, number: str, marker: str, *, cwd:
     CREATEs. Best-effort; never raises. ``--paginate`` so a long comment thread doesn't hide
     the marked comment past the first page and cause a duplicate post."""
     try:
-        rc, out, _err = await _gh("api", "--paginate", f"/repos/{repo_slug}/issues/{number}/comments", cwd=cwd)
+        rc, out, _err = await _gh_read(
+            _gh("api", "--paginate", f"/repos/{repo_slug}/issues/{number}/comments", cwd=cwd)
+        )
     except WorktreeError:
         return "", ""
     if rc != 0 or not out.strip():
@@ -2992,7 +3029,7 @@ async def pr_url_for_branch(branch: str, *, cwd: str = ".") -> str:
     """The URL of the PR whose head is ``branch``, or ``""`` if there is none — used
     by crash recovery to tell a feature that already opened a PR (and just needs
     adopting → in_review) from one that needs a fresh rebuild."""
-    rc, out, _err = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=cwd)
+    rc, out, _err = await _gh_read(_gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=cwd))
     return out.strip() if rc == 0 else ""
 
 
@@ -3005,7 +3042,9 @@ async def repo_slug(*, cwd: str = ".") -> str:
     source-issue stamp) that can't learn the target repo simply degrades rather than
     blocking the PR. This never raises into the loop."""
     try:
-        rc, out, _err = await _gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner", cwd=cwd)
+        rc, out, _err = await _gh_read(
+            _gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner", cwd=cwd)
+        )
     except WorktreeError:
         return ""
     return out.strip() if rc == 0 else ""

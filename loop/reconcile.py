@@ -1176,149 +1176,179 @@ class ReconcileMixin:
                 continue
             # #90: reconcile each PR against ITS project's checkout, not the board default.
             repo = self._repo_for(f)
-            try:
-                # ONE read for the PR's state AND the external panel's verdict (#473): the
-                # state rides the same `gh pr view` as the head, reviews and checks. Unreadable
-                # → the plain state read, and no external verdict this pass (fail open).
-                view = None if known_state else await worktree.pr_review_state(pr_url, cwd=repo)
-                state = known_state or str((view or {}).get("state") or "") or await worktree.pr_state(pr_url, cwd=repo)
-                if f.get("board_state") == "blocked" and state != "MERGED":
-                    continue
-                if state in ("MERGED", "CLOSED"):
-                    merge_state_hold.clear_hold(fid)  # #495: a finished PR holds nothing
-                    review_coverage_hold.clear_hold(fid)
-                if state == "MERGED":
-                    if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
+            with worktree.capture_gh_timeouts() as timeouts:
+                try:
+                    # ONE read for the PR's state AND the external panel's verdict (#473): the
+                    # state rides the same `gh pr view` as the head, reviews and checks. Unreadable
+                    # → the plain state read, and no external verdict this pass (fail open).
+                    view = None if known_state else await worktree.pr_review_state(pr_url, cwd=repo)
+                    state = (
+                        known_state or str((view or {}).get("state") or "") or await worktree.pr_state(pr_url, cwd=repo)
+                    )
+                    if f.get("board_state") == "blocked" and state != "MERGED":
+                        continue
+                    if state in ("MERGED", "CLOSED"):
+                        merge_state_hold.clear_hold(fid)  # #495: a finished PR holds nothing
+                        review_coverage_hold.clear_hold(fid)
+                    if state == "MERGED":
+                        if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
+                            await worktree.reap_feature_worktree(repo, self.root, fid)
+                            self._ci_feedback.pop(fid, None)
+                            self._review_prior.pop(fid, None)
+                            # Merge edge: EVERY fix budget resets — cache and the bead's
+                            # `budget:` labels together (#259) — so a reopened/requeued
+                            # card starts with full budgets, exactly as pre-persistence.
+                            await self._budget_reset(store, fid)
+                            # A merge with the gate still unhappy is a human override —
+                            # reality wins, but it must be visible, not silent.
+                            if self.review_gate and LABEL_CHANGES_REQUESTED in (f.get("labels") or []):
+                                log.warning(
+                                    "[project_board] %s merged with review changes-requested still set "
+                                    "(human override): %s",
+                                    fid,
+                                    pr_url,
+                                )
+                            log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
+                    elif state == "CLOSED":
+                        await asyncio.to_thread(
+                            self._flag_blocked, store, fid, f"PR closed without merging — needs triage: {pr_url}"
+                        )
                         await worktree.reap_feature_worktree(repo, self.root, fid)
                         self._ci_feedback.pop(fid, None)
                         self._review_prior.pop(fid, None)
-                        # Merge edge: EVERY fix budget resets — cache and the bead's
-                        # `budget:` labels together (#259) — so a reopened/requeued
-                        # card starts with full budgets, exactly as pre-persistence.
+                        # Closed-unmerged is the other terminal edge: same full reset,
+                        # so a post-triage requeue starts with fresh budgets (#259).
                         await self._budget_reset(store, fid)
-                        # A merge with the gate still unhappy is a human override —
-                        # reality wins, but it must be visible, not silent.
-                        if self.review_gate and LABEL_CHANGES_REQUESTED in (f.get("labels") or []):
-                            log.warning(
-                                "[project_board] %s merged with review changes-requested still set "
-                                "(human override): %s",
-                                fid,
-                                pr_url,
-                            )
-                        log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
-                elif state == "CLOSED":
-                    await asyncio.to_thread(
-                        self._flag_blocked, store, fid, f"PR closed without merging — needs triage: {pr_url}"
-                    )
-                    await worktree.reap_feature_worktree(repo, self.root, fid)
-                    self._ci_feedback.pop(fid, None)
-                    self._review_prior.pop(fid, None)
-                    # Closed-unmerged is the other terminal edge: same full reset,
-                    # so a post-triage requeue starts with fresh budgets (#259).
-                    await self._budget_reset(store, fid)
-                    log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
-                elif state == "OPEN":
-                    # FIRST (#473): has the repo's own QA panel FAILED this PR at its current
-                    # head? Then the PR cannot merge as it stands, whatever the board's own gate
-                    # said. Bounce it into a fix round (or hold it for a human), and skip every
-                    # edge below: re-verifying the merged state, rebasing, bouncing on CI or
-                    # merging a PR the panel has rejected spends budget on nothing.
-                    if await self._reconcile_external_review(store, f, pr_url, repo, view=view):
-                        continue
-                    # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
-                    # sibling merge re-stales the others off the shared base, and a rebase
-                    # force-pushes + re-runs CI — so checking CI on the stale head first
-                    # would just be thrown away.
-                    if self.auto_rebase and await self._maybe_rebase(store, f, pr_url, repo):
-                        continue
-                    # The VERDICT half of the rebase edge (#131): a sibling merge
-                    # moved base under this still-CLEAN PR (no conflict, so the
-                    # rebase above left it alone) — the state that will actually
-                    # LAND was never gated. Re-run the gate on the merged state
-                    # (no push) and stamp the sha; only a red gate blocks.
-                    if self.auto_rebase and await self._verify_merged_state(store, f, pr_url, repo):
-                        continue  # blocked on a red merged-state gate (or the card left review) → nothing further
-                    if self.ci_poll:
-                        await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
-                    # The re-arm half of the review gate (#328): a direct/human push to
-                    # the branch of an in_review PR sitting in `changes-requested` moved
-                    # the head out from under a verdict the gate — which re-runs only on
-                    # `review-pending` — will never revisit. Left alone, the stale
-                    # rejection pins a dead head forever (or, labels cleared by hand, an
-                    # un-reviewed head merges). Re-arm the gate for the new head ONLY on a
-                    # demonstrable reviewed-head↔live-head mismatch; the resume edge below
-                    # then runs the fresh review. Fail-closed cases leave `changes-requested`
-                    # in place, so the merge edge still can't touch an un-reviewed head. The
-                    # board_state re-read guards against the CI reconcile having just
-                    # requeued the feature out of in_review this same pass.
-                    if (
-                        self.review_gate
-                        and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
-                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
-                        and await self._rearm_review_for_new_head(store, f, pr_url, repo)
-                    ):
-                        f = await asyncio.to_thread(store.get_feature, fid) or f
-                    # The INBOUND half of the review gate (#323/#512): a trusted EXTERNAL-panel
-                    # PASS for the PR's CURRENT head repairs a stale changes-requested or an
-                    # absent local review verdict to review-clean, so the ordinary merge gates
-                    # can proceed — unless the board's OWN gate FAILED that head, in which case
-                    # the strictest verdict wins and the card is held for an operator (#512).
-                    # Runs AFTER #328 (a genuine head move takes the fresh-internal-review
-                    # path, never this trust path — #328 flipped it to review-pending, which
-                    # this edge then skips) and BEFORE #340 (a proven current-head PASS
-                    # supersedes resuming an internal fix round; on a promotion the refreshed
-                    # snapshot drops changes-requested so #340 short-circuits this pass). Fails
-                    # closed on anything unproven, so the un-promoted card still can't merge.
-                    # The board_state re-read guards against #328 / the CI reconcile having
-                    # just moved the card out of in_review this same pass.
-                    if (
-                        self.review_gate
-                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
-                        and await self._reconcile_trusted_qa_pass(store, f, pr_url, repo)
-                    ):
-                        f = await asyncio.to_thread(store.get_feature, fid) or f
-                    # The RECOVERY half of the review gate (#340): a shutdown/restart can
-                    # abort a fix round mid-transition and leave the card in_review +
-                    # changes-requested with the review gate's requeue never landed — no
-                    # live drive survives, the gate re-runs only on review-pending, and
-                    # auto-merge needs review-clean, so the card sits in_review forever
-                    # while merged-state verify churns. DISTINCT from the #328 re-arm above:
-                    # the trigger is a dead drive, not a moved head — #328 ran FIRST, so a
-                    # head that actually moved is already re-armed off changes-requested by
-                    # here (a genuine external push takes that path, never this one). Requeue
-                    # to ready to resume the SAME PR's fix round; the re-read guards against
-                    # #328 / the CI reconcile having just moved the card this same pass.
-                    if (
-                        self.review_gate
-                        and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
-                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
-                        and await self._requeue_stranded_review_fix(store, f, pr_url, repo)
-                    ):
-                        continue  # requeued to ready — the next dispatch resumes the fix; nothing else this pass
-                    # The merge-edge half of the review gate (M5): an in_review PR still
-                    # marked review-pending had its gate interrupted (host restart, dead
-                    # workflow run) — finish it here so the gate can't silently lapse into
-                    # advisory. Skip when the CI reconcile just requeued the feature. A
-                    # gate that is merely still RUNNING (the drive's call, minutes long)
-                    # is not interrupted — _review_gate's in-flight guard makes this a
-                    # no-op for it (#205), so this edge never double-reviews a head.
-                    if (
-                        self.review_gate
-                        and LABEL_REVIEW_PENDING in (f.get("labels") or [])
-                        and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state") == "in_review"
-                    ):
-                        await self._review_gate(store, fid, pr_url, repo)
-                    # The MERGE edge — last, so it sees this pass's rebase / verify /
-                    # CI / review outcomes, and re-reads the feature rather than
-                    # trusting the snapshot those gates may have changed.
-                    if self.auto_merge:
-                        await self._maybe_auto_merge(store, fid, pr_url, repo, view=view)
-            except store_mod.BoardTimeout:
-                raise  # a stalled store, not this PR's failure: stop the pass (#404)
-            except Exception as exc:  # noqa: BLE001 — a reconcile error must never kill the loop
-                log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
-                summary = f"PR reconcile failed with {type(exc).__name__}"
-                host_friction.record(summary, f"card {fid} ({pr_url}): {str(exc)[:400]}", key=f"{summary}|{fid}")
+                        log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
+                    elif state == "OPEN":
+                        # FIRST (#473): has the repo's own QA panel FAILED this PR at its current
+                        # head? Then the PR cannot merge as it stands, whatever the board's own gate
+                        # said. Bounce it into a fix round (or hold it for a human), and skip every
+                        # edge below: re-verifying the merged state, rebasing, bouncing on CI or
+                        # merging a PR the panel has rejected spends budget on nothing.
+                        if await self._reconcile_external_review(store, f, pr_url, repo, view=view):
+                            continue
+                        # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
+                        # sibling merge re-stales the others off the shared base, and a rebase
+                        # force-pushes + re-runs CI — so checking CI on the stale head first
+                        # would just be thrown away.
+                        if self.auto_rebase and await self._maybe_rebase(store, f, pr_url, repo):
+                            continue
+                        # The VERDICT half of the rebase edge (#131): a sibling merge
+                        # moved base under this still-CLEAN PR (no conflict, so the
+                        # rebase above left it alone) — the state that will actually
+                        # LAND was never gated. Re-run the gate on the merged state
+                        # (no push) and stamp the sha; only a red gate blocks.
+                        if self.auto_rebase and await self._verify_merged_state(store, f, pr_url, repo):
+                            continue  # blocked on a red merged-state gate (or the card left review) → nothing further
+                        if self.ci_poll:
+                            await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
+                        # The re-arm half of the review gate (#328): a direct/human push to
+                        # the branch of an in_review PR sitting in `changes-requested` moved
+                        # the head out from under a verdict the gate — which re-runs only on
+                        # `review-pending` — will never revisit. Left alone, the stale
+                        # rejection pins a dead head forever (or, labels cleared by hand, an
+                        # un-reviewed head merges). Re-arm the gate for the new head ONLY on a
+                        # demonstrable reviewed-head↔live-head mismatch; the resume edge below
+                        # then runs the fresh review. Fail-closed cases leave `changes-requested`
+                        # in place, so the merge edge still can't touch an un-reviewed head. The
+                        # board_state re-read guards against the CI reconcile having just
+                        # requeued the feature out of in_review this same pass.
+                        if (
+                            self.review_gate
+                            and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
+                            and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state")
+                            == "in_review"
+                            and await self._rearm_review_for_new_head(store, f, pr_url, repo)
+                        ):
+                            f = await asyncio.to_thread(store.get_feature, fid) or f
+                        # The INBOUND half of the review gate (#323/#512): a trusted EXTERNAL-panel
+                        # PASS for the PR's CURRENT head repairs a stale changes-requested or an
+                        # absent local review verdict to review-clean, so the ordinary merge gates
+                        # can proceed — unless the board's OWN gate FAILED that head, in which case
+                        # the strictest verdict wins and the card is held for an operator (#512).
+                        # Runs AFTER #328 (a genuine head move takes the fresh-internal-review
+                        # path, never this trust path — #328 flipped it to review-pending, which
+                        # this edge then skips) and BEFORE #340 (a proven current-head PASS
+                        # supersedes resuming an internal fix round; on a promotion the refreshed
+                        # snapshot drops changes-requested so #340 short-circuits this pass). Fails
+                        # closed on anything unproven, so the un-promoted card still can't merge.
+                        # The board_state re-read guards against #328 / the CI reconcile having
+                        # just moved the card out of in_review this same pass.
+                        if (
+                            self.review_gate
+                            and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state")
+                            == "in_review"
+                            and await self._reconcile_trusted_qa_pass(store, f, pr_url, repo)
+                        ):
+                            f = await asyncio.to_thread(store.get_feature, fid) or f
+                        # The RECOVERY half of the review gate (#340): a shutdown/restart can
+                        # abort a fix round mid-transition and leave the card in_review +
+                        # changes-requested with the review gate's requeue never landed — no
+                        # live drive survives, the gate re-runs only on review-pending, and
+                        # auto-merge needs review-clean, so the card sits in_review forever
+                        # while merged-state verify churns. DISTINCT from the #328 re-arm above:
+                        # the trigger is a dead drive, not a moved head — #328 ran FIRST, so a
+                        # head that actually moved is already re-armed off changes-requested by
+                        # here (a genuine external push takes that path, never this one). Requeue
+                        # to ready to resume the SAME PR's fix round; the re-read guards against
+                        # #328 / the CI reconcile having just moved the card this same pass.
+                        if (
+                            self.review_gate
+                            and LABEL_CHANGES_REQUESTED in (f.get("labels") or [])
+                            and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state")
+                            == "in_review"
+                            and await self._requeue_stranded_review_fix(store, f, pr_url, repo)
+                        ):
+                            continue  # requeued to ready — the next dispatch resumes the fix; nothing else this pass
+                        # The merge-edge half of the review gate (M5): an in_review PR still
+                        # marked review-pending had its gate interrupted (host restart, dead
+                        # workflow run) — finish it here so the gate can't silently lapse into
+                        # advisory. Skip when the CI reconcile just requeued the feature. A
+                        # gate that is merely still RUNNING (the drive's call, minutes long)
+                        # is not interrupted — _review_gate's in-flight guard makes this a
+                        # no-op for it (#205), so this edge never double-reviews a head.
+                        if (
+                            self.review_gate
+                            and LABEL_REVIEW_PENDING in (f.get("labels") or [])
+                            and (await asyncio.to_thread(store.get_feature, fid) or {}).get("board_state")
+                            == "in_review"
+                        ):
+                            await self._review_gate(store, fid, pr_url, repo)
+                        # The MERGE edge — last, so it sees this pass's rebase / verify /
+                        # CI / review outcomes, and re-reads the feature rather than
+                        # trusting the snapshot those gates may have changed.
+                        if self.auto_merge:
+                            await self._maybe_auto_merge(store, fid, pr_url, repo, view=view)
+                except store_mod.BoardTimeout:
+                    raise  # a stalled store, not this PR's failure: stop the pass (#404)
+                except worktree.GhTimeout as exc:
+                    timeouts.append(exc)
+                except Exception as exc:  # noqa: BLE001 — a reconcile error must never kill the loop
+                    log.warning("[project_board] reconcile for %s failed", fid, exc_info=True)
+                    summary = f"PR reconcile failed with {type(exc).__name__}"
+                    host_friction.record(summary, f"card {fid} ({pr_url}): {str(exc)[:400]}", key=f"{summary}|{fid}")
+                finally:
+                    self._note_gh_timeouts(fid, pr_url, timeouts)
+
+    def _note_gh_timeouts(self, fid: str, pr_url: str, timeouts: list) -> None:
+        """One row after three consecutive affected passes, once per outage (#554)."""
+        streaks = getattr(self, "_gh_timeout_streaks", None)
+        if streaks is None:
+            streaks = self._gh_timeout_streaks = {}
+        if not timeouts:
+            streaks.pop(fid, None)
+            return
+        previous_url, count = streaks.get(fid, (pr_url, 0))
+        count = min(count + 1, 4) if previous_url == pr_url else 1
+        streaks[fid] = (pr_url, count)
+        if count == 3:
+            summary = "gh timed out during PR reconcile"
+            host_friction.record(
+                summary,
+                f"card {fid} ({pr_url}): three consecutive passes; {str(timeouts[0])[:400]}",
+                key=f"gh-timeout|{fid}",
+            )
 
     async def _auto_merge_blockers(self, store, feature: dict, pr_url: str, repo: str) -> list[str]:
         """Why this in_review PR must NOT be auto-merged right now — empty means every
