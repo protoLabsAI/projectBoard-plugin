@@ -91,6 +91,7 @@ import sys
 import threading
 import time
 import types
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -1819,6 +1820,26 @@ def select_oracle(test_paths: list[tuple[str, str]], changed: list[str] | None, 
     return cmds, note
 
 
+class _ComposedOracle(str):
+    """Shell script retaining each oracle's output and status for classification."""
+
+    def __new__(cls, script: str, cmds: list[str], marker: str):
+        obj = super().__new__(cls, script)
+        obj.commands = tuple(cmds)
+        obj.marker = marker
+        return obj
+
+    def results(self, output: str):
+        for i, cmd in enumerate(self.commands):
+            match = re.search(
+                rf"{self.marker}:{i}:start\n(.*?)\n{self.marker}:{i}:exit:(\d+)",
+                output,
+                re.DOTALL,
+            )
+            if match:
+                yield cmd, int(match[2]), match[1].strip()
+
+
 def compose_oracle(cmds: list[str]) -> str:
     """One shell command that runs ``cmds`` in order, each in its own subshell, so a
     ``cd`` in one can't leak into the next. Every command runs even after an earlier one
@@ -1826,20 +1847,26 @@ def compose_oracle(cmds: list[str]) -> str:
     command failed, and it is 127 if ANY command could not be FOUND (exit 127/9009):
     a later component's output can push that command's diagnostic off the tail, so
     the composed exit code has to carry it for ``_oracle_command_missing`` (#542).
+    Component output/status boundaries also preserve wrapped missing-command failures
+    for classification before later output can obscure their diagnostic.
     A single command is returned as it is. The whole sequence runs under ONE
     ``coder_solve_test_timeout_s``, so the budget must cover every command a
     candidate can pick together."""
     if len(cmds) == 1:
         return cmds[0]
+    marker = "__oracle_" + uuid.uuid4().hex
     lines = ["__oracle_rc=0"]
-    for c in cmds:
+    for i, c in enumerate(cmds):
         lines.append(f"echo {shlex.quote('== oracle: ' + c)}")
+        lines.append(f"printf '%s\\n' {marker}:{i}:start")
+        lines.append("__c=0")
         lines.append(
             f'( {c}\n) || {{ __c=$?; if [ "$__c" = 127 ] || [ "$__c" = 9009 ]; then __oracle_rc=127; '
             'elif [ "$__oracle_rc" = 0 ]; then __oracle_rc=1; fi; }'
         )
+        lines.append(f'printf "\\n%s:%s\\n" {marker}:{i}:exit "$__c"')
     lines.append("exit $__oracle_rc")
-    return "\n".join(lines)
+    return _ComposedOracle("\n".join(lines), cmds, marker)
 
 
 def _import_solve():
@@ -2429,18 +2456,17 @@ class _WorktreeSolveAdapter:
             )
         text = (out or b"").decode("utf-8", "replace").strip()
         ok = proc.returncode == 0
-        # The oracle could not RUN (#542): a shell that cannot find the command exits 127
-        # (POSIX) / 9009 (cmd.exe), or a wrapper swallows that exit but prints the shell's
-        # `…: not found` diagnostic LAST. Stop solve and preserve the candidate — another
-        # generation or tier cannot conjure a command the environment is missing.
-        # ``_oracle_command_missing`` decides the way preflight does (exit code first) and
-        # matches the diagnostic ONLY against the tail: a PASSING oracle (exit 0) ran the
-        # command, and an ORDINARY failing run (exit 1) whose merged output carries a stale
-        # ``command not found`` line from an earlier recovered optional step followed by a
-        # real test-failure report is a candidate failure the ladder repairs — neither is an
-        # infrastructure fault (the regression an adversarial review caught in slice 1).
-        if _oracle_command_missing(proc.returncode, text):
-            raise OracleMissingCommand(test_cmd=cmd, returncode=proc.returncode, output=text, candidate_wt=candidate_wt)
+        # Classify each path-scoped oracle independently, including successful ones:
+        # a recovered diagnostic in a passing component must not inherit another's
+        # failure status, and later output must not hide a wrapped missing command.
+        results = cmd.results(text) if isinstance(cmd, _ComposedOracle) else [(cmd, proc.returncode, text)]
+        for component, returncode, output in results:
+            if _oracle_command_missing(returncode, output):
+                raise OracleMissingCommand(
+                    test_cmd=component, returncode=returncode, output=output, candidate_wt=candidate_wt
+                )
+        if isinstance(cmd, _ComposedOracle):
+            text = re.sub(rf"(?m)^{cmd.marker}:\d+:(?:start|exit:\d+)\n?", "", text).strip()
         return Verdict(
             passed=ok,
             total=1,

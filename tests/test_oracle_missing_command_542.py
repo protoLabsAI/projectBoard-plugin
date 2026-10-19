@@ -309,3 +309,74 @@ async def test_recovery_comment_names_missing_command_not_timeout(tmp_path):
     assert "preflight-hold" in comments[0] and "unverified" in comments[0]
     assert str(tmp_path) in comments[0] and "local_gate_cmd" in comments[0]
     assert "timed out" not in comments[0] and "oracle-timeout" not in comments[0]
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("later_exit", [0, 1])
+async def test_wrapped_missing_path_oracle_stops_dispatch(tmp_path, monkeypatch, position, later_exit):
+    """Real shell wrappers must retain their own diagnostic across later oracles."""
+    repo = _repo(tmp_path / "repo")
+    generated = _fake_coder(monkeypatch)
+    missing = "sh -c 'no-such-oracle-542' || exit 1"
+    commands = ["printf earlier; exit 1", f"echo later output; exit {later_exit}"]
+    commands.insert(position, missing)
+
+    async def changed(*args):
+        return [f"part{i}/file" for i in range(3)]
+
+    monkeypatch.setattr(worktree, "changed_paths", changed)
+
+    async def solve(task, *, generate, verify, **kwargs):
+        for _ in range(6):
+            await verify(await generate(task))
+        pytest.fail("missing component must stop generation")
+
+    with pytest.raises(coder_seam.OracleMissingCommand) as caught:
+        await coder_seam.dispatch(
+            task="implement",
+            coder=object(),
+            repo=repo,
+            base="main",
+            root=".worktrees",
+            fid="bd-1",
+            dispatch_timeout=None,
+            test_cmd="exit 0",
+            test_paths=[(f"part{i}/*", cmd) for i, cmd in enumerate(commands)],
+            test_timeout=10,
+            budget=6,
+            k=2,
+            tree_depth=2,
+            _solve=solve,
+            _budget_cls=_FakeBudget,
+            _verdict_cls=_FakeVerdict,
+        )
+    assert len(generated) == 1
+    assert caught.value.test_cmd == missing
+    assert caught.value.returncode == 1
+    assert "no-such-oracle-542" in caught.value.output
+    assert "later output" not in caught.value.output
+    assert caught.value.kept[0] == generated[0]
+    assert Path(generated[0], "impl.py").exists()
+
+
+@pytest.mark.parametrize(
+    "commands,passed",
+    [
+        (["sh -c 'no-such-optional-542' || true", "echo tests failed; exit 1"], False),
+        (["echo tests failed; exit 1", "sh -c 'no-such-optional-542' || true"], False),
+        (["sh -c 'no-such-optional-542' || true; echo tests failed; exit 1", "echo later"], False),
+        (["sh -c 'no-such-optional-542' || true", "echo tests passed"], True),
+    ],
+)
+async def test_composed_recovered_optional_is_not_infrastructure(tmp_path, monkeypatch, commands, passed):
+    from test_preflight_oracle_456_459 import _adapter
+
+    adapter = _adapter(tmp_path, test_cmd="unused", test_timeout=10)
+
+    async def oracle(candidate_wt):
+        return coder_seam.compose_oracle(commands), ""
+
+    monkeypatch.setattr(adapter, "_oracle_for", oracle)
+    verdict = await adapter._run_acceptance_tests(str(tmp_path))
+    assert verdict.passed is passed
+    assert "__oracle_" not in verdict.output
