@@ -364,6 +364,34 @@ async def test_compose_oracle_runs_every_command_and_fails_if_any_does(tmp_path)
     assert f"{tmp_path}\n" in text  # and the first command's `cd` did not leak into it
 
 
+@posix_only
+@pytest.mark.parametrize(
+    "cmds",
+    [
+        ["no-such-oracle-cmd-542", "echo later output; echo more"],  # missing first, later passes
+        ["echo first; exit 1", "no-such-oracle-cmd-542", "echo tail noise"],  # missing in the middle
+        ["no-such-oracle-cmd-542", "echo later; exit 1"],  # a later ordinary failure can't reset it
+    ],
+)
+async def test_compose_oracle_carries_a_missing_command_past_later_output(tmp_path, cmds):
+    """#542 review: a missing command in one path-scoped oracle must still stop solve even
+    when a later oracle's output pushes the shell's diagnostic off the tail."""
+    cmd = coder_seam.compose_oracle(cmds)
+    proc = await worktree.spawn_shell(cmd, cwd=str(tmp_path), stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    assert proc.returncode == 127
+    assert coder_seam._oracle_command_missing(proc.returncode, out.decode())
+
+
+@posix_only
+async def test_compose_oracle_ordinary_failures_stay_ordinary(tmp_path):
+    cmd = coder_seam.compose_oracle(["echo one; exit 1", "echo two; exit 2"])
+    proc = await worktree.spawn_shell(cmd, cwd=str(tmp_path), stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    assert proc.returncode == 1
+    assert not coder_seam._oracle_command_missing(proc.returncode, out.decode())
+
+
 @dataclass
 class _Verdict:
     passed: bool

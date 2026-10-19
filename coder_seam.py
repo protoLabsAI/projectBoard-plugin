@@ -1823,15 +1823,21 @@ def compose_oracle(cmds: list[str]) -> str:
     """One shell command that runs ``cmds`` in order, each in its own subshell, so a
     ``cd`` in one can't leak into the next. Every command runs even after an earlier one
     fails, so the output shows all the failures. The exit status is non-zero if ANY
-    command failed. A single command is returned as it is. The whole sequence runs under
-    ONE ``coder_solve_test_timeout_s``, so the budget must cover every command a
+    command failed, and it is 127 if ANY command could not be FOUND (exit 127/9009):
+    a later component's output can push that command's diagnostic off the tail, so
+    the composed exit code has to carry it for ``_oracle_command_missing`` (#542).
+    A single command is returned as it is. The whole sequence runs under ONE
+    ``coder_solve_test_timeout_s``, so the budget must cover every command a
     candidate can pick together."""
     if len(cmds) == 1:
         return cmds[0]
     lines = ["__oracle_rc=0"]
     for c in cmds:
         lines.append(f"echo {shlex.quote('== oracle: ' + c)}")
-        lines.append(f"( {c}\n) || __oracle_rc=1")
+        lines.append(
+            f'( {c}\n) || {{ __c=$?; if [ "$__c" = 127 ] || [ "$__c" = 9009 ]; then __oracle_rc=127; '
+            'elif [ "$__oracle_rc" = 0 ]; then __oracle_rc=1; fi; }'
+        )
     lines.append("exit $__oracle_rc")
     return "\n".join(lines)
 
