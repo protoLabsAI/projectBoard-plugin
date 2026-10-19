@@ -20,6 +20,7 @@ from project_board.loop import (
     _slice_work_uncaptured,
     _source_issue,
     _source_issue_has_open_sibling,
+    pr_title_for,
 )
 
 
@@ -351,10 +352,58 @@ async def test_with_source_issue_ref_cross_repo_refs_url(monkeypatch):
 # ── the two closing paths agree: body `Refs` ⇒ the title (squash subject) can't close ─
 
 
+# ── pr_title_for: do not double-type an already-typed card title (#566) ──────────
+
+
+def test_pr_title_prefixes_an_untyped_title():
+    """The ordinary case, unchanged: a plain card summary gets the `feat: ` type."""
+    assert pr_title_for("add a retry to the fetch", None) == "feat: add a retry to the fetch"
+
+
+def test_pr_title_keeps_an_already_typed_title_verbatim():
+    """#566: the release-card case. An unconditional prefix produced
+    `feat: chore: release v0.67.0`, which `release.yml`'s
+    `startsWith(…, 'chore: release v')` guard does not match — the push-triggered run was
+    SKIPPED, so the merge was green and no release was cut. The subject must carry the
+    card author's own type."""
+    assert pr_title_for("chore: release v0.67.0", None) == "chore: release v0.67.0"
+    assert not pr_title_for("chore: release v0.67.0", None).startswith("feat:")
+
+
+def test_pr_title_accepts_every_conventional_type_with_scope_and_bang():
+    for title in (
+        "fix: drop the stale guard",
+        "docs: document the gate",
+        "ci: pin ruff",
+        "refactor(loop): split the drive",
+        "feat!: breaking seam change",
+        "chore(deps): bump br",
+        "CHORE: shouting is still a type",
+    ):
+        assert pr_title_for(title, None) == title, title
+
+
+def test_pr_title_prefixes_a_title_that_merely_mentions_a_type_word():
+    """The colon is required and anchored at the start, so a summary that happens to open
+    with one of those words is NOT read as pre-typed — it still gets `feat: `."""
+    for title in ("fix the login race", "test coverage for the gate", "revert of the old plan"):
+        assert pr_title_for(title, None) == f"feat: {title}", title
+
+
+def test_pr_title_sanitises_before_deciding():
+    """Sanitisation (#533) runs first on BOTH branches, so a `#n` the squash subject could
+    read as a closing reference is neutralised whether or not the title was pre-typed."""
+    assert pr_title_for("chore: #6.3 cut the release", None) == "chore: 6.3 cut the release"
+    assert pr_title_for("fix #6 the login bug", ("", 6), refs_only=True) == "feat: fix 6 the login bug"
+
+
 def _pr_title(feature: dict, refs_only: bool) -> str:
-    """Mirror of the drive/reconcile title build (`feat: {sanitised}`) so the wiring is
-    exercised: the title is sanitised with the SAME refs_only the body is stamped with."""
-    return f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
+    """The drive/reconcile title build itself (#566) — not a copy of it. This was a
+    hand-written mirror of the old `f"feat: {sanitised}"` expression, which would have
+    gone on passing after production stopped double-typing already-typed titles. Calling
+    the real helper keeps the wiring exercised: the title is sanitised with the SAME
+    refs_only the body is stamped with."""
+    return pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
 
 
 async def test_split_slice_title_and_body_both_withhold_the_close(monkeypatch):

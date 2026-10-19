@@ -1714,7 +1714,7 @@ class DriveMixin:
         # here (no worktree needed) and recomputed at PR-open for the body + final title,
         # since siblings ship during the coding run.
         refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, store, feature)
-        title = f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
+        title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
         tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
@@ -2289,9 +2289,7 @@ class DriveMixin:
                     # start value — a sibling may have shipped during the coding run). In
                     # refs_only mode the card's own `#n` is dropped from the subject too, so it
                     # can't close a shared issue while the body only says `Refs #n`.
-                    pr_title = (
-                        f"feat: {_sanitize_pr_title(feature['title'], _source_issue(feature), refs_only=refs_only)}"
-                    )
+                    pr_title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that
                     # already owns its PR (CI-fail bounce) leaves a draft alone: that is
