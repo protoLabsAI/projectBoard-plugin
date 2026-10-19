@@ -46,7 +46,20 @@ _RULES: tuple[tuple[str, Policy], ...] = (
         Policy("provider_unavailable", False, 0.0, 1),
     ),
     (
-        r"rate.?limit|\b429\b|quota|overloaded|too many requests|capacity",
+        # A spent allowance OR a throttle — one class, because the loop's response to both
+        # is the same: rotate to the rung's live sibling first (`_ROTATABLE_CATEGORIES`),
+        # and back off only when the rung has none.
+        # "usage limit" / "usageLimitExceeded" / "usage credits" are NOT redundant with
+        # "rate limit" or "quota" (#570): Codex's spent-weekly-quota error says
+        # `You've hit your usage limit … try again at Oct 26th` with
+        # `"codexErrorInfo": "usageLimitExceeded"` — no "rate limit" (it is a USAGE limit),
+        # no "quota", no 429, and no separator for `rate.?limit` to catch. It therefore fell
+        # through every rule to TERMINAL, so the drive never rotated and a card blocked with
+        # its Claude sibling idle beside it — the 09-10 dead-provider failure mode repeating
+        # with a new string. `usage credits` covers the Fable phrasing recorded in the board
+        # config ("out of usage credits · resets Aug 13"), which had the same gap.
+        r"rate.?limit|\b429\b|quota|overloaded|too many requests|capacity"
+        r"|usage ?limit|usagelimitexceeded|usage credits",
         Policy("rate_limit", True, 60.0, 5),
     ),
     (
