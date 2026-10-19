@@ -637,7 +637,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         passed only when given."""
         kwargs = {"category": category} if category else {}
         out = store.flag_blocked(fid, reason, **kwargs)
-        if friction:
+        # A too-wide park is a designed outcome. Its diagnostic exception may match
+        # the failure patterns even on the first line; the category is authoritative.
+        # The actual timeout is still recorded by _friction_drive_failure (#556).
+        if friction and category != TOO_WIDE_CLASS:
             # The cause is in the reason's FIRST line; what follows is gate or tool output,
             # whose words ("timed out after") say nothing about why the loop blocked.
             first = (str(reason or "").splitlines() or [""])[0]
