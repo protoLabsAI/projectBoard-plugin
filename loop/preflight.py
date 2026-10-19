@@ -374,6 +374,11 @@ def _last_hold_comment_key(comments) -> str:
     return ""
 
 
+# Bound the whole snapshot wait, not each project. Runs retain their own timeout
+# and continue between ticks so newly ready projects cannot starve (#542).
+_PREFLIGHT_SCAN_WAIT_S = 2.0
+
+
 class PreflightMixin:
     async def _maybe_preflight(self) -> None:
         """Re-run each project's gate preflight while it hasn't passed, throttled per
@@ -385,7 +390,9 @@ class PreflightMixin:
         commit. At most one preflight per project runs at a time. Runs for every project
         with ready work, every project still marked failed, AND every project this loop
         holds cards for. The last two cover a project whose ready work got HELD (and so
-        dropped out of `ready`): it still re-checks and can recover."""
+        dropped out of `ready`): it still re-checks and can recover. Start all checks
+        concurrently and bound the snapshot wait, so a slow run cannot starve the next
+        snapshot or the claim scan. Unknown projects remain ready until a verdict."""
         if not self.preflight:
             return
         store = self._store()
@@ -412,7 +419,7 @@ class PreflightMixin:
                 continue
             seen.add(name)
             names.append(name)
-        ran = False
+        pending = set()
         for name in names:
             feature = {"project": name}
             cmd = self._preflight_cmd_for(feature)
@@ -444,18 +451,21 @@ class PreflightMixin:
                 self._last_preflight[name] = now
                 self._start_preflight(name, cmd, repo, base, sha)
                 continue
-            # First check runs immediately (state is None); re-checks of a KNOWN-failed
-            # preflight are throttled so a slow gate isn't hammered every tick.
+            # Unknown verdicts run immediately; known failures retain their retry
+            # cadence. Share an in-flight run without resetting its clock.
+            task = self._preflight_tasks.get(name)
+            if task is not None and not task.done() and self._preflight_task_key.get(name) == (cmd, repo):
+                pending.add(task)
+                continue
             if state is not None and (now - self._last_preflight.get(name, 0.0)) < max(self.interval, 60.0):
                 continue
             self._last_preflight[name] = now
-            ran = True
-            # Single-flight (#456): a caller that finds a run already in flight for this
-            # project awaits it, rather than starting a second gate in the same checkout.
-            # Shielded, so a caller that is cancelled does not cancel the run the other
-            # caller is waiting on. stop() cancels runs still in flight.
-            await asyncio.shield(self._start_preflight(name, cmd, repo, base))
-        if ran:
+            pending.add(self._start_preflight(name, cmd, repo, base))
+        if pending:
+            # Start every project before waiting. A slow gate must not prevent the
+            # next ready snapshot or delay passed projects for its full timeout.
+            # wait() never cancels shared tasks on timeout or caller cancellation.
+            await asyncio.wait(pending, timeout=_PREFLIGHT_SCAN_WAIT_S)
             # Surface the verdicts on /status (#255) — a board that stops picking work
             # up must be able to say why without the operator reading the log.
             self._publish_preflight_health()
@@ -527,9 +537,9 @@ class PreflightMixin:
         So on dirt this records the dirt for ``/status``, logs, and returns WITHOUT
         touching ``_preflight_state`` or this project's holds: a project already held for
         a clean red stays held (only a clean green may release it), and one that was never
-        held is not newly held (state stays ``None``, so the claim scan keeps dispatching
-        — the posture a timeout already had). Fail-closed and fail-open both keep their
-        meaning, and each is decided only on evidence that supports it.
+        held is not newly held (state stays ``None``). The claim scan defers unknown
+        projects until a verdict is available (#542), without blaming their cards.
+        An existing pass retains its background-recheck semantics.
 
         ``sha`` is the checkout commit the verdict describes, read here when not given
         (#456). A non-failing verdict records it, and ``_maybe_preflight`` re-checks only
@@ -575,8 +585,8 @@ class PreflightMixin:
                 log.warning(
                     "[project_board] preflight[%s]: the checkout at %s is NOT at base (%s), so the gate "
                     "just ran against those local edits — no verdict either way. State and holds are "
-                    "left exactly as they were (a project held for a clean red stays held; an unheld one "
-                    "keeps dispatching). Commit or stash to get a real verdict. Gate exited %s.",
+                    "left exactly as they were (a clean red stays held; an unknown project waits for "
+                    "a verdict). Commit or stash to get a real verdict. Gate exited %s.",
                     name,
                     repo,
                     dirt,
