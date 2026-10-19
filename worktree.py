@@ -51,13 +51,16 @@ _gh_read_timeouts: ContextVar[list[GhTimeout] | None] = ContextVar("gh_read_time
 
 @contextlib.contextmanager
 def capture_gh_timeouts():
-    """Collect read timeout causes for one pass without changing PR metadata."""
+    """Collect read timeout causes; nested decision scopes also feed the enclosing pass."""
+    parent = _gh_read_timeouts.get()
     evidence: list[GhTimeout] = []
     token = _gh_read_timeouts.set(evidence)
     try:
         yield evidence
     finally:
         _gh_read_timeouts.reset(token)
+        if parent is not None:
+            parent.extend(evidence)
 
 
 async def _gh_read(read) -> tuple[int, str, str]:

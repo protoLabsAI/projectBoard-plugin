@@ -206,9 +206,12 @@ class ReconcileMixin:
                 if await self._still_orphaned_then(store, fid, store.requeue):
                     log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
             return
-        pr_url = await worktree.pr_url_for_branch(
-            worktree.branch_name(fid, feature.get("title") or ""), cwd=self._repo_for(feature)
-        )
+        branch = worktree.branch_name(fid, feature.get("title") or "")
+        with worktree.capture_gh_timeouts() as timeouts:
+            pr_url = await worktree.pr_url_for_branch(branch, cwd=self._repo_for(feature))
+        self._note_gh_timeouts(fid, branch, timeouts)
+        if timeouts:
+            return  # unknown PR presence cannot authorize salvage or a fresh rebuild
         if fid in self._inflight_files:
             return  # reserved during the gh read — an operator salvage owns the card now (#427)
         if pr_url:
@@ -3107,7 +3110,13 @@ class ReconcileMixin:
         # prompt budget, so the extra `gh pr diff` costs nothing.
         full_diff = ""
         if blocking:
-            full_diff = await worktree.pr_diff(pr_url, cwd=repo, max_chars=_GROUNDING_DIFF_MAX_CHARS)
+            with worktree.capture_gh_timeouts() as timeouts:
+                full_diff = await worktree.pr_diff(pr_url, cwd=repo, max_chars=_GROUNDING_DIFF_MAX_CHARS)
+            if timeouts:
+                # Missing evidence cannot refute findings. Keep pending and retry;
+                # the enclosing reconcile capture still receives the timeout cause.
+                log.warning("[project_board] %s grounding diff timed out — review remains pending", fid)
+                return
         if blocking and not full_diff.endswith(worktree.DIFF_TRUNCATED_MARKER):
             blocking, ungrounded = partition_by_grounding(blocking, full_diff)
             for f in ungrounded:

@@ -185,3 +185,68 @@ async def test_escaping_timeout_is_classified_by_cause(reconcile, monkeypatch):
     await loop._reconcile_pr(store, card)
     assert rows.call_count == 1
     assert "gh timed out" in rows.call_args.args[0]
+
+
+async def test_grounding_timeout_keeps_review_pending(monkeypatch):
+    loop = BoardLoop({"review_gate": True})
+    store = Mock()
+    finding = SimpleNamespace(verdict="confirmed", severity="major", evidence="broken()")
+    monkeypatch.setattr(loop, "_parse_findings", lambda output: [finding])
+    monkeypatch.setattr(loop, "_run_review_workflow", AsyncMock(return_value=("findings", "")))
+    monkeypatch.setattr(loop, "_budget_reset", AsyncMock())
+    monkeypatch.setattr(loop, "_publish_gate_verdict", AsyncMock())
+    monkeypatch.setattr(worktree, "pr_head_sha", AsyncMock(return_value="abc"))
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(side_effect=worktree.GhTimeout("gh pr diff timed out")))
+
+    with worktree.capture_gh_timeouts() as evidence:
+        await loop._review_gate(store, "card-a", PR, ".")
+
+    assert len(evidence) == 1  # nested grounding capture reaches the per-card classifier
+    store.set_review_substate.assert_called_once_with("card-a", "review-pending")
+    assert finding.verdict == "confirmed"
+    assert loop._publish_gate_verdict.call_args.kwargs["state"] == "pending"
+    loop._publish_gate_verdict.assert_awaited_once()
+    store.requeue.assert_not_called()
+    store.add_comment.assert_not_called()
+    assert "card-a" not in loop._review_inflight
+
+
+@pytest.mark.parametrize("recovered_url", ["", PR])
+async def test_orphan_timeout_defers_recovery_until_lookup_succeeds(monkeypatch, recovered_url):
+    loop = BoardLoop({})
+    store = Mock()
+    store.get_feature.return_value = {"id": "card-a", "title": "Feature", "board_state": "in_progress"}
+    monkeypatch.setattr(loop, "_store", lambda: store)
+    monkeypatch.setattr(loop, "_repo_for", lambda f: ".")
+    salvage = AsyncMock(return_value=False)
+    monkeypatch.setattr(loop, "_salvage_verified_candidate", salvage)
+    rows = Mock()
+    monkeypatch.setattr(host_friction, "record", rows)
+    gh = AsyncMock(side_effect=worktree.GhTimeout("gh pr view timed out"))
+    monkeypatch.setattr(worktree, "_gh", gh)
+
+    await loop._reconcile_orphan("card-a")
+    rows.assert_not_called()
+    for _ in range(5):
+        await loop._reconcile_orphan("card-a")
+    assert rows.call_count == 1
+    assert "gh timed out" in rows.call_args.args[0]
+    salvage.assert_not_awaited()
+    store.requeue.assert_not_called()
+    store.open_review.assert_not_called()
+
+    gh.side_effect = None
+    gh.return_value = (0, recovered_url, "") if recovered_url else (1, "", "no PR found")
+    await loop._reconcile_orphan("card-a")
+    assert "card-a" not in loop._gh_timeout_streaks
+    if recovered_url:
+        store.open_review.assert_called_once_with("card-a", pr_url=PR)
+        salvage.assert_not_awaited()
+        store.requeue.assert_not_called()
+    else:
+        salvage.assert_awaited_once_with(store, "card-a")
+        store.requeue.assert_called_once_with("card-a")
+
+    gh.side_effect = worktree.GhTimeout("gh pr view timed out")
+    await loop._reconcile_orphan("card-a")
+    assert rows.call_count == 1  # recovered read reset the consecutive-pass streak
