@@ -20,7 +20,7 @@ from test_oracle_timeout_keep_tree import _FakeBudget, _FakeResult, _FakeVerdict
         (1, "sh: 1: missing-tool: not found"),
         (1, "zsh: command not found: missing-tool"),
         (1, "/bin/sh: /gone/.venv/bin/python: No such file or directory"),
-        (0, "bash: line 1: missing-tool: command not found"),
+        (127, "bash: line 1: missing-tool: command not found"),
     ],
 )
 async def test_first_missing_command_stops_dispatch_and_keeps_candidate(tmp_path, monkeypatch, code, output):
@@ -73,6 +73,54 @@ async def test_first_missing_command_stops_dispatch_and_keeps_candidate(tmp_path
     assert exc.kept and exc.kept[0] == generated[0]
     assert Path(exc.kept[0], "impl.py").exists()
     assert verified == []
+
+
+async def test_passing_oracle_with_stale_diagnostic_publishes(tmp_path, monkeypatch):
+    """The slice-1 regression an adversarial review caught: a PASSING oracle (exit 0) whose
+    merged output carries a `command not found` line from an EARLIER optional step with a
+    working shell fallback must NOT be classified as a missing oracle. The command ran and
+    the acceptance tests passed, so dispatch promotes and publishes the candidate — it never
+    raises OracleMissingCommand and never aborts solve."""
+    repo = _repo(tmp_path / "repo")
+    generated = _fake_coder(monkeypatch)
+    verdicts = []
+
+    async def spawn(cmd, **kwargs):
+        async def communicate():
+            # Exit 0, but the output still carries a stale diagnostic from an optional
+            # pre-step whose shell fallback succeeded. The real test run then passed.
+            return b"bash: line 1: optional-tool: command not found\nusing fallback\nall tests passed", None
+
+        return SimpleNamespace(returncode=0, communicate=communicate)
+
+    monkeypatch.setattr(worktree, "spawn_shell", spawn)
+
+    async def solve(task, *, generate, verify, **kwargs):
+        candidate = await generate(task)
+        verdict = await verify(candidate)
+        verdicts.append(verdict)
+        return _FakeResult(candidate, True, "best-of-k", 1, 1, verdict)
+
+    canon_wt, canon_branch, _text = await coder_seam.dispatch(
+        task="implement",
+        coder=object(),
+        repo=repo,
+        base="main",
+        root=".worktrees",
+        fid="bd-1",
+        dispatch_timeout=None,
+        test_cmd="run-tests",
+        test_timeout=10,
+        budget=6,
+        k=2,
+        tree_depth=2,
+        _solve=solve,
+        _budget_cls=_FakeBudget,
+        _verdict_cls=_FakeVerdict,
+    )
+    assert len(generated) == 1
+    assert verdicts and verdicts[0].passed
+    assert Path(canon_wt, "impl.py").exists()
 
 
 async def test_ordinary_test_failure_continues_search(tmp_path, monkeypatch):

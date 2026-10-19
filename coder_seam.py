@@ -2391,9 +2391,19 @@ class _WorktreeSolveAdapter:
                 output=f"{_ORACLE_TIMEOUT_PREFIX} {self.test_timeout:.0f}s",
             )
         text = (out or b"").decode("utf-8", "replace").strip()
-        if proc.returncode in _GATE_NOT_FOUND_EXITS or _MISSING_CMD_RE.search(text):
-            raise OracleMissingCommand(test_cmd=cmd, returncode=proc.returncode, output=text, candidate_wt=candidate_wt)
         ok = proc.returncode == 0
+        # The oracle could not RUN (#542): a shell that cannot find the command exits 127
+        # (POSIX) / 9009 (cmd.exe), or prints a `…: not found` diagnostic for it. Stop solve
+        # and preserve the candidate — another generation or tier cannot conjure a command
+        # the environment is missing. Gated on a FAILING run, mirroring preflight's own
+        # success-first ordering (it returns on ``returncode == 0`` BEFORE classifying the
+        # tail): a PASSING oracle (exit 0) ran the command and the acceptance tests passed,
+        # so it is never an infrastructure failure — even when an earlier optional step with
+        # a working shell fallback left a stale ``command not found`` line in the merged
+        # output. Classifying that as a missing oracle would abort a green build and block
+        # publication (the regression an adversarial review caught in slice 1).
+        if not ok and (proc.returncode in _GATE_NOT_FOUND_EXITS or _MISSING_CMD_RE.search(text)):
+            raise OracleMissingCommand(test_cmd=cmd, returncode=proc.returncode, output=text, candidate_wt=candidate_wt)
         return Verdict(
             passed=ok,
             total=1,
