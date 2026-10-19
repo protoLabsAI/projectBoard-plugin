@@ -436,6 +436,8 @@ async def test_a_real_gate_subprocess_on_an_in_review_card_does_not_delay_a_clai
     the tick returns while it runs, and stop() takes the whole tree down."""
     store = _TickStore()
     loop, drove = _tick_loop(monkeypatch, store, local_gate_cmd="sleep 60", local_gate_timeout_s=600)
+    # The preflight phase is stubbed by _tick_loop; this tests already-cleared work.
+    loop._preflight_state["default"] = True
     gate_pids = []
     real_spawn = worktree.spawn_shell
 

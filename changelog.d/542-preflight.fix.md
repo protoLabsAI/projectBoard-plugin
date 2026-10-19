@@ -1,0 +1,1 @@
+Defer claims for projects without a preflight verdict, including projects becoming ready during a smoke run. Check projects concurrently with a bounded scan wait so slow gates cannot starve other projects; preserve disabled and no-command dispatch and existing failure repair diagnostics. Fixes #542.

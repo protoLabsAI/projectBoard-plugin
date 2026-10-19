@@ -42,7 +42,10 @@ _READY_SKIP_MAX_DEFAULT = 5
 #  - WAITING_ON_PUBLISH: the card waits on an external fact (a publish, a release, a
 #    merged PR — `waits_for`, gates.py) and says so on its next_action. Waiting days for
 #    a release is the design, not a stuck dispatch.
-_NON_LIVELOCK_SKIP_REASONS = frozenset({"hot-file", "blocked", "preflight-hold", "reserved", WAITING_ON_PUBLISH})
+# Waiting for a verdict is not a code failure or claim livelock.
+_NON_LIVELOCK_SKIP_REASONS = frozenset(
+    {"hot-file", "blocked", "preflight-hold", "preflight-pending", "reserved", WAITING_ON_PUBLISH}
+)
 
 
 def _is_livelock_skip_reason(reason: str) -> bool:
@@ -698,10 +701,9 @@ class DriveMixin:
             status, _ = await self._tick_phase(phase, step)
             if status == "stalled":
                 break
-        # The claim scan also stops after a FAILED preflight: the preflight is fail-closed
-        # (it holds a project whose gate cannot run), and a project it never got to smoke
-        # reads as runnable to the scan — so claiming now would dispatch exactly the work
-        # the preflight exists to hold. `dispatch_now` stops at the same point.
+        # Preserve the phase-failure guard: a failed preflight evaluation stops this
+        # tick's claim scan, as it does in dispatch_now. A successfully evaluated scan
+        # may leave runs in flight; the per-project claim barrier defers unknowns.
         if status != "stalled":
             status, _ = await self._tick_phase("gate preflight", self._maybe_preflight)
             if status == "ok":
@@ -889,6 +891,12 @@ class DriveMixin:
             pname = self._project_name(candidate)
             if isinstance(self._preflight_state.get(pname), str):
                 skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
+                continue
+            # A project can become ready after preflight's snapshot (#542). Defer
+            # unknown work to the next snapshot, without stopping healthy siblings.
+            # Disabled preflight and no command retain their dispatch semantics.
+            if self.preflight and self._preflight_state.get(pname) is not True and self._preflight_cmd_for(candidate):
+                skipped.append({"fid": cid, "reason": "preflight-pending", "project": pname})
                 continue
             # Publish gates (`waits_for`, gates.py): an external fact — a version on npm, a
             # GitHub release, a merged PR — the card needs before a coder can start. Checked
