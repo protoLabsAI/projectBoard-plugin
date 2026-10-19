@@ -1,5 +1,7 @@
 """Missing oracle commands stop search and preserve the unjudged candidate (#542)."""
 
+import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -245,7 +247,8 @@ async def test_recovered_optional_then_real_failure_continues_search(tmp_path, m
     assert all(not Path(wt).exists() for wt in generated)
 
 
-async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch):
+@pytest.mark.parametrize("recovery", ["recheck", "restart"])
+async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch, recovery):
     monkeypatch.setattr(coder_seam, "_import_solve", lambda: object())
     dispatched = []
     kept = []
@@ -273,6 +276,9 @@ async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch)
 
     def seed(loop):
         assert loop.escalation_on
+        project = loop._project_name(FEATURE)
+        loop._preflight_state[project] = True
+        loop._last_preflight[project] = time.monotonic()
         loop._keep_tree_for_salvage = keep
         loop._discard_tree = discard
 
@@ -298,6 +304,32 @@ async def test_drive_blocks_infrastructure_without_escalation_or_pr(monkeypatch)
     assert len(dispatched) == 1
     assert kept == [("/candidate", "feat/bd-1.g1")]
     assert not any(call[0] in ("escalate", "open_review") for call in store.calls)
+
+    project = loop._project_name(FEATURE)
+    assert loop._preflight_held[project] == {FEATURE["id"]}
+    cleared = []
+    store.clear_blocked = cleared.append
+    if recovery == "restart":
+        store.raw_features_with_comments = lambda **kwargs: [
+            {"id": FEATURE["id"], "comments": [f"blocked: {reason}"]},
+            {"id": "unrelated", "comments": ["blocked: ordinary test failure"]},
+        ]
+        BoardLoop({})._recover_preflight_holds(store)
+    else:
+        # No ready cards: the held-card registry must schedule a new check even
+        # though this project previously passed on the same checkout.
+        monkeypatch.setattr(loop, "_ready_projects", lambda store: [])
+        checked = []
+
+        async def repaired(name, cmd, repo, base):
+            checked.append(name)
+            loop._release_preflight_holds(name)
+
+        monkeypatch.setattr(loop, "_start_preflight", repaired)
+        await loop._maybe_preflight()
+        assert checked == [project]
+        assert project not in loop._preflight_held
+    assert cleared == [FEATURE["id"]]
 
 
 async def test_recovery_comment_names_missing_command_not_timeout(tmp_path):
@@ -380,3 +412,32 @@ async def test_composed_recovered_optional_is_not_infrastructure(tmp_path, monke
     verdict = await adapter._run_acceptance_tests(str(tmp_path))
     assert verdict.passed is passed
     assert "__oracle_" not in verdict.output
+
+
+async def test_recomposed_path_oracles_share_timeout_rounds(tmp_path, monkeypatch):
+    from test_preflight_oracle_456_459 import _adapter
+
+    async def changed(*args):
+        return ["a/file", "b/file"]
+
+    async def spawn(*args, **kwargs):
+        return object()
+
+    async def timed_out(*args, **kwargs):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(worktree, "changed_paths", changed)
+    monkeypatch.setattr(worktree, "spawn_shell", spawn)
+    monkeypatch.setattr(worktree, "communicate_or_kill", timed_out)
+    adapter = _adapter(
+        tmp_path,
+        test_cmd="fallback",
+        test_timeout=10,
+        test_paths=[("a/*", "test-a"), ("b/*", "test-b")],
+    )
+    assert not (await adapter.verify(str(tmp_path / "g1"))).passed
+    with pytest.raises(coder_seam.OracleTimeout):
+        await adapter.verify(str(tmp_path / "g2"))
+    assert len(adapter._timeouts) == 1
+    assert list(adapter._timeouts.values()) == [2]
+    assert coder_seam.compose_oracle(["test-a", "test-b"]) != coder_seam.compose_oracle(["test-b", "test-a"])

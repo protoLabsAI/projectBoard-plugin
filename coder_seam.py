@@ -91,7 +91,7 @@ import sys
 import threading
 import time
 import types
-import uuid
+import hashlib
 from collections import OrderedDict, deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -1854,7 +1854,9 @@ def compose_oracle(cmds: list[str]) -> str:
     candidate can pick together."""
     if len(cmds) == 1:
         return cmds[0]
-    marker = "__oracle_" + uuid.uuid4().hex
+    # The script is also the timeout-breaker key: identical selections must
+    # retain their identity across candidates while keeping output boundaries distinct.
+    marker = "__oracle_" + hashlib.sha256(json.dumps(cmds).encode()).hexdigest()
     lines = ["__oracle_rc=0"]
     for i, c in enumerate(cmds):
         lines.append(f"echo {shlex.quote('== oracle: ' + c)}")

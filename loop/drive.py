@@ -2345,7 +2345,7 @@ class DriveMixin:
                     if isinstance(exc, coder_seam.OracleMissingCommand):
                         project = self._project_name(feature)
                         reason = (
-                            f"acceptance oracle infrastructure failure for project {project!r}: "
+                            f"{PREFLIGHT_BLOCK_PREFIX} — acceptance oracle infrastructure failure for project {project!r}: "
                             f"command `{exc.test_cmd}` (exit {exc.returncode})\n{exc.output}\n"
                             + _missing_gate_command_hint(project, exc.test_cmd, exc.output)
                         )
@@ -2360,6 +2360,10 @@ class DriveMixin:
                             pr_url=pr_url,
                         ):
                             return
+                        self._preflight_held.setdefault(project, set()).add(fid)
+                        # A cached pass on this commit must not suppress the repair check.
+                        self._preflight_state.pop(project, None)
+                        self._last_preflight.pop(project, None)
                         kept_wt, kept_branch = exc.kept if exc.kept is not None else (wt, branch)
                         await self._keep_tree_for_salvage(
                             store, fid, repo, kept_wt, kept_branch, base=base, missing_command=True
