@@ -10,6 +10,7 @@ html, body { margin: 0; background: transparent; color: var(--pl-color-fg); font
 .bc-row { display: flex; align-items: center; gap: var(--pl-space-2); flex-wrap: wrap; min-width: 0; }
 .bc-id { font-family: var(--pl-font-mono); font-size: var(--pl-font-size-xs); color: var(--pl-color-fg-muted); }
 .bc-name { flex: 1 1 12rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: var(--pl-font-weight-medium); }
+.bc-ic { font-family: var(--pl-font-mono); font-size: 0.9em; padding: 0 0.3em; border-radius: 3px; background: var(--pl-color-bg); border: var(--pl-border-width) solid var(--pl-color-border); font-weight: normal; }
 .bc-next { color: var(--pl-color-fg-muted); }
 .bc-why { margin: 0; }
 .bc-foot { display: flex; align-items: center; gap: var(--pl-space-2); flex-wrap: wrap; }

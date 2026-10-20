@@ -45,6 +45,19 @@ const apiPost = async (p, body) => {
 };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// A card title / spec line with its inline code spans rendered: `undo` → <code>undo</code>.
+// Only single-backtick spans on one line — no other markdown. Titles are untrusted, so
+// EVERY piece (the text between spans and the span bodies) goes through esc(); the only
+// markup this emits is the <code> wrapper itself. An unpaired backtick stays literal.
+function inlineCode(s){
+  const str = String(s == null ? "" : s), re = /`([^`\n]+)`/g;
+  let out = "", at = 0, m;
+  while ((m = re.exec(str))) {
+    out += esc(str.slice(at, m.index)) + '<code class="ic">'+esc(m[1])+'</code>';
+    at = re.lastIndex;
+  }
+  return out + esc(str.slice(at));
+}
 
 // Narrow viewport → the 5-column Kanban doesn't fit, so default to the list.
 const NARROW = window.matchMedia("(max-width: 760px)");
@@ -332,7 +345,7 @@ function render(){
       // (bd-rdmh) via a data-task handle — no inline sub-row, no monitor poll (#84/#217).
       const mon = f.state==="in_progress" && !isTask(f);
       return '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':"")+'>'
-        + '<td class="id">'+esc(f.id)+'</td><td>'+docIco(f)+esc(f.title)+'</td>'
+        + '<td class="id">'+esc(f.id)+'</td><td>'+docIco(f)+inlineCode(f.title)+'</td>'
         + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
         + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
         + '<td>P'+f.priority+'</td><td>'+flags(f)+'</td><td>'+taskFoot(f)+'</td></tr>';
@@ -638,8 +651,8 @@ function cardHTML(f, state){
     + (state === "done" ? '<span class="c-check" aria-label="done">'+CHECK_ICON+'</span>' : '')
     + '<button class="c-menu" type="button" data-card-menu="'+esc(f.id)+'" aria-haspopup="menu"'
     + ' aria-label="Actions for '+esc(f.id)+'" title="Actions (M)">⋯</button></div>'
-    + '<div class="t">'+docIco(f)+esc(f.title)+'</div>'
-    + (spec ? '<div class="spec">'+esc(spec)+'</div>' : '')
+    + '<div class="t">'+docIco(f)+inlineCode(f.title)+'</div>'
+    + (spec ? '<div class="spec">'+inlineCode(spec)+'</div>' : '')
     + (state === "in_progress" && !isTask(f) && !f.blocked ? '<div class="bld" data-bld></div>' : '')
     + blockedLine(f)
     + (meta ? '<div class="m">'+meta+'</div>' : '');
@@ -1595,6 +1608,9 @@ function syncTaskDrawer(){
   if (!TASK_FID) return;
   const f = FEATURES.find(x => x.id === TASK_FID);
   if (!f) { $("drawer-body").innerHTML = '<div class="pl-empty">Task not found.</div>'; return; }
+  // The header names the task: its id, then its title (inline code rendered, escaped).
+  const dt = $("drawer-title"), dh = 'Task — '+esc(f.id)+(f.title ? '<span class="dt-name">'+inlineCode(f.title)+'</span>' : '');
+  if (dt.innerHTML !== dh) dt.innerHTML = dh;                     // unchanged → untouched (no reflow per poll)
   // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
   // action re-render still tracks in_progress → in_review → done; the comment-derived
   // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it

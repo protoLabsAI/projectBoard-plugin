@@ -182,7 +182,7 @@ def test_task_cards_are_marked_by_issue_type_with_a_document_icon():
     assert ".card--task{border-left-style:dashed}" in BOARD_PAGE
     assert '(isTask(f)?" card--task":"")' in BOARD_PAGE
     # the icon rides the title in both projections (Kanban card + list row)
-    assert BOARD_PAGE.count("docIco(f)+esc(f.title)") == 2
+    assert BOARD_PAGE.count("docIco(f)+inlineCode(f.title)") == 2
 
 
 def test_task_in_review_shows_deliverable_text_and_ref_not_a_pr_link():

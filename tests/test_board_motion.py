@@ -389,3 +389,48 @@ def test_a_weakened_etag_still_matches(client):
     c, _store, _db = client
     tag = c.get("/api/plugins/project_board/features").headers["etag"]
     assert c.get("/api/plugins/project_board/features", headers={"If-None-Match": "W/" + tag}).status_code == 304
+
+
+# ── inline code in card titles / spec lines ─────────────────────────────────────────
+
+
+def _inline(s: str) -> str:
+    js = "\n".join(
+        [
+            _block("const esc = "),
+            _block("function inlineCode("),
+            f"console.log(JSON.stringify(inlineCode({json.dumps(s)})));",
+        ]
+    )
+    out = subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+@node
+def test_inline_code_renders_backtick_spans():
+    assert _inline("Add an `undo` command") == 'Add an <code class="ic">undo</code> command'
+    assert _inline("`a` and `b`") == '<code class="ic">a</code> and <code class="ic">b</code>'
+    assert _inline("unpaired ` tick") == "unpaired ` tick"
+    assert _inline("no code") == "no code"
+
+
+@node
+def test_inline_code_keeps_hostile_titles_inert():
+    """Titles are untrusted: markup inside AND outside backticks is escaped, so the only
+    tag the helper can ever emit is its own <code> wrapper."""
+    got = _inline('<img src=x onerror=alert(1)> `<img src=x onerror=alert(2)>` "q"')
+    assert "<img" not in got.lower()
+    assert got == (
+        '&lt;img src=x onerror=alert(1)&gt; <code class="ic">&lt;img src=x onerror=alert(2)&gt;</code> &quot;q&quot;'
+    )
+
+
+def test_titles_and_spec_lines_render_through_inline_code():
+    """Kanban card title + spec line, list row, and the task drawer header all route the
+    title through inlineCode (never a bare esc(), never raw text into innerHTML)."""
+    assert "docIco(f)+inlineCode(f.title)+'</div>'" in BOARD_PAGE  # Kanban card
+    assert "'<div class=\"spec\">'+inlineCode(spec)+'</div>'" in BOARD_PAGE  # spec line
+    assert "docIco(f)+inlineCode(f.title)+'</td>'" in BOARD_PAGE  # list row
+    assert "'<span class=\"dt-name\">'+inlineCode(f.title)+'</span>'" in BOARD_PAGE  # drawer
+    assert "esc(f.title)" not in BOARD_PAGE
+    assert "code.ic{font-family:var(--pl-font-mono)" in BOARD_PAGE
