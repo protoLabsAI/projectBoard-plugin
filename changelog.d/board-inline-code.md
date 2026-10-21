@@ -1,0 +1,1 @@
+- **Card titles render inline code.** A title or spec line like "Add an `undo` command" shows `undo` as a mono code chip instead of raw backticks — on Kanban cards, list rows, the in-chat board cards, and the task drawer header (which now names the task's title under its id). Only single-backtick spans are rendered; every other character is still escaped.

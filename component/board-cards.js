@@ -68,6 +68,25 @@
     });
   }
 
+  /**
+   * A card title with its inline code spans rendered: `undo` → <code>undo</code>. Only
+   * single-backtick spans on one line — no other markdown. Titles are untrusted, so every
+   * piece (text between spans and span bodies alike) is esc()'d; the only markup emitted
+   * is the <code> wrapper. An unpaired backtick stays literal.
+   */
+  function inlineCode(s) {
+    var str = String(s == null ? "" : s);
+    var re = /`([^`\n]+)`/g;
+    var out = "";
+    var at = 0;
+    var m;
+    while ((m = re.exec(str))) {
+      out += esc(str.slice(at, m.index)) + '<code class="bc-ic">' + esc(m[1]) + "</code>";
+      at = re.lastIndex;
+    }
+    return out + esc(str.slice(at));
+  }
+
   /** The card's effective state: the blocked flag wins over the lane it is blocked in. */
   function cardState(card) {
     if (!card) return "";
@@ -246,10 +265,12 @@
         h.push('<code class="bc-id">' + esc(r.id) + '</code><span class="bc-muted">' + esc(why) + "</span></div></div>");
         return;
       }
-      h.push('<div class="pl-card bc-card" data-card="' + esc(r.id) + '"><div class="bc-row">');
+      // data-state carries the lane accent the board view uses (a left stripe, a live dot
+      // while building) — the same visual language in chat as on the board.
+      h.push('<div class="pl-card bc-card" data-card="' + esc(r.id) + '" data-state="' + esc(r.state) + '"><div class="bc-row">');
       h.push('<code class="bc-id">' + esc(r.id) + "</code>");
-      h.push('<span class="bc-name">' + esc(r.title) + "</span>");
-      h.push('<span class="pl-badge ' + esc(r.badge) + '">' + esc(r.stateLabel) + "</span>");
+      h.push('<span class="bc-name">' + inlineCode(r.title) + "</span>");
+      h.push('<span class="bc-dot" aria-hidden="true"></span><span class="pl-badge ' + esc(r.badge) + '">' + esc(r.stateLabel) + "</span>");
       if (r.project) h.push('<span class="bc-muted">' + esc(r.project) + "</span>");
       h.push("</div>");
       if (r.blockedReason) {
@@ -663,6 +684,7 @@
     MAX_IN_FLIGHT: MAX_IN_FLIGHT,
     PROPOSALS: PROPOSALS,
     esc: esc,
+    inlineCode: inlineCode,
     cardState: cardState,
     mergeGreen: mergeGreen,
     actionsFor: actionsFor,

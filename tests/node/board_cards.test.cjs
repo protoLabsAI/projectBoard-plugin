@@ -506,3 +506,32 @@ test("after the handshake, the init's nonce rides on read, send and openLink", a
   bridge.openLink("https://github.com/o/r/pull/1");
   assert.deepEqual(posts.map((m) => [m.type, m.nonce]), [["protoComponent:send", N2], ["protoComponent:openLink", N2]]);
 });
+
+// ── inline code in titles ────────────────────────────────────────────────────────────
+
+test("inlineCode renders backtick spans as <code> and escapes everything", () => {
+  assert.equal(BC.inlineCode("Add an `undo` command"), 'Add an <code class="bc-ic">undo</code> command');
+  assert.equal(BC.inlineCode("a `b` c `d`"), 'a <code class="bc-ic">b</code> c <code class="bc-ic">d</code>');
+  assert.equal(BC.inlineCode("unpaired ` tick"), "unpaired ` tick");
+  assert.equal(BC.inlineCode("``"), "``");
+  assert.equal(BC.inlineCode(null), "");
+  // XSS: markup inside AND outside the backticks stays inert text.
+  const evil = '<img src=x onerror=alert(1)> `<img src=x onerror=alert(2)>` "q"';
+  const out = BC.inlineCode(evil);
+  assert.ok(!/<img/i.test(out), out);
+  assert.equal(
+    out,
+    '&lt;img src=x onerror=alert(1)&gt; <code class="bc-ic">&lt;img src=x onerror=alert(2)&gt;</code> &quot;q&quot;',
+  );
+});
+
+test("render: a card title's inline code becomes <code>, a hostile one stays inert", () => {
+  const rows = [
+    { id: "bd-1", card: card({ id: "bd-1", board_state: "ready", title: "Add an `undo` command" }) },
+    { id: "bd-2", card: card({ id: "bd-2", board_state: "ready", title: "x `<img src=x onerror=alert(1)>` <script>y</script>" }) },
+  ];
+  const html = BC.renderHTML(BC.viewModel({ ids: ["bd-1", "bd-2"] }, { rows, loaded: true, lastRefreshed: 1 }, 2));
+  assert.match(html, /<span class="bc-name">Add an <code class="bc-ic">undo<\/code> command<\/span>/);
+  assert.ok(!/<img|<script/i.test(html), html);
+  assert.ok(!html.includes("`"), html);
+});
