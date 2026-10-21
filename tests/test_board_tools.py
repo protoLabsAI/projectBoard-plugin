@@ -451,6 +451,7 @@ _MINIMAL_ARGS = {
     "board_create_feature": {"title": "t"},
     "board_create_task": {"title": "t"},
     "board_update_feature": {"feature_id": "bd-1", "title": "t"},
+    "board_remove_dependency": {"feature_id": "bd-1", "depends_on": "bd-2"},
     "board_get_feature": {"feature_id": "bd-1"},
     "board_comments": {"feature_id": "bd-1"},
     "board_mark_ready": {"feature_id": "bd-1"},
@@ -814,3 +815,115 @@ def test_board_verify_forwards_by_on_the_rejection_path_too(monkeypatch):
 
     assert out == {"id": "bd-t", "state": "ready"}
     assert board.calls == [("record_verification", "bd-t", False, "misses the Q3 numbers", "quinn")]
+
+
+# ── board_remove_dependency → store.remove_dependency (the inverse of update(depends_on=…)) ──
+
+
+def _wire_deps(make_board, monkeypatch, *, depends_on, known):
+    """Wire a board where bd-1 carries `depends_on` blocking edges (all open), every id in
+    `known` is a real card, and anything else is unknown. remove_dependency / comment go
+    through the recording `_run`; a get_feature re-read reflects the `dep remove` calls
+    recorded so far, so the post-change `open_depends_on` drops what was torn down."""
+    br = _RecordingBr()
+    board = make_board(br)
+
+    def _gf(fid):
+        if fid == "bd-1":
+            gone = {c[3] for c in br.calls if c[:3] == ("dep", "remove", "bd-1")}
+            live = [d for d in depends_on if d not in gone]
+            return {"id": "bd-1", "board_state": "ready", "depends_on": live, "open_depends_on": live}
+        if fid in known:
+            return {"id": fid, "board_state": "ready"}
+        return None
+
+    monkeypatch.setattr(board, "get_feature", _gf)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+    return board, br
+
+
+def test_board_remove_dependency_is_registered():
+    assert "board_remove_dependency" in {t.name for t in pb._board_tools({})}
+
+
+def test_board_remove_dependency_removes_an_existing_edge(make_board, monkeypatch):
+    """r1: an existing edge calls store.remove_dependency(fid, blocker), lists it under
+    `removed`, and the post-change `open_depends_on` no longer carries it."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2", "bd-3"], known={"bd-2", "bd-3"})
+
+    out = json.loads(_get_tool("board_remove_dependency").invoke({"feature_id": "bd-1", "depends_on": "bd-2"}))
+
+    assert out == {"id": "bd-1", "removed": ["bd-2"], "not_found": [], "open_depends_on": ["bd-3"]}
+    # the tear-down went through store.remove_dependency → `br dep remove … --type blocks`.
+    assert ("dep", "remove", "bd-1", "bd-2", "--type", "blocks") in br.calls
+
+
+def test_board_remove_dependency_drops_several_and_reports_a_missing_edge(make_board, monkeypatch):
+    """r2: "a,b" removes both; a named id that is a real card but NOT an edge on bd-1 goes
+    to `not_found` ("no such edge") while the real edges are still removed."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2", "bd-3"], known={"bd-2", "bd-3", "bd-9"})
+
+    out = json.loads(
+        _get_tool("board_remove_dependency").invoke({"feature_id": "bd-1", "depends_on": "bd-2, bd-9, bd-3"})
+    )
+
+    assert out["removed"] == ["bd-2", "bd-3"]
+    assert out["not_found"] == ["bd-9"]
+    assert out["open_depends_on"] == []
+    removes = {c for c in br.calls if c[:3] == ("dep", "remove", "bd-1")}
+    assert ("dep", "remove", "bd-1", "bd-2", "--type", "blocks") in removes
+    assert ("dep", "remove", "bd-1", "bd-3", "--type", "blocks") in removes
+    # the non-edge was never torn down.
+    assert not any(c[3] == "bd-9" for c in br.calls if c[:3] == ("dep", "remove", "bd-1"))
+
+
+def test_board_remove_dependency_unknown_feature_errors_and_removes_nothing(make_board, monkeypatch):
+    """r3: an unknown feature id returns an Error string and nothing is torn down."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2"], known={"bd-2"})
+
+    out = _get_tool("board_remove_dependency").invoke({"feature_id": "bd-404", "depends_on": "bd-2"})
+
+    assert out == "Error: unknown feature 'bd-404'"
+    assert not any(c[:2] == ("dep", "remove") for c in br.calls)
+
+
+def test_board_remove_dependency_unknown_blocker_errors_before_removing_anything(make_board, monkeypatch):
+    """r3: every named blocker is validated BEFORE any removal — an unknown blocker id aborts
+    the whole call (all-or-nothing) so a real edge named alongside it is not half-removed."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2", "bd-3"], known={"bd-2", "bd-3"})
+
+    out = _get_tool("board_remove_dependency").invoke({"feature_id": "bd-1", "depends_on": "bd-2, bd-77"})
+
+    assert out == "Error: unknown feature 'bd-77'"
+    assert not any(c[:2] == ("dep", "remove") for c in br.calls)
+
+
+def test_board_remove_dependency_records_an_audit_comment(make_board, monkeypatch):
+    """r4: a single audit comment names the removed edges."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2", "bd-3"], known={"bd-2", "bd-3"})
+
+    _get_tool("board_remove_dependency").invoke({"feature_id": "bd-1", "depends_on": "bd-2, bd-3"})
+
+    (comment,) = [c for c in br.calls if c[:2] == ("comments", "add")]
+    assert comment == ("comments", "add", "bd-1", "removed dependency edges: bd-2, bd-3")
+
+
+def test_board_remove_dependency_writes_no_comment_when_nothing_removed(make_board, monkeypatch):
+    """A call that removes nothing (only `not_found`) writes no audit comment — the trail
+    records tear-downs, not no-ops."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2"], known={"bd-2", "bd-9"})
+
+    out = json.loads(_get_tool("board_remove_dependency").invoke({"feature_id": "bd-1", "depends_on": "bd-9"}))
+
+    assert out["removed"] == [] and out["not_found"] == ["bd-9"]
+    assert not any(c[:2] == ("comments", "add") for c in br.calls)
+
+
+def test_board_remove_dependency_strips_wrapping_quotes(make_board, monkeypatch):
+    """Inputs are de-quoted like the sibling tools, so a quoted id still resolves."""
+    _, br = _wire_deps(make_board, monkeypatch, depends_on=["bd-2"], known={"bd-2"})
+
+    out = json.loads(_get_tool("board_remove_dependency").invoke({"feature_id": '"bd-1"', "depends_on": '"bd-2"'}))
+
+    assert out["removed"] == ["bd-2"]
+    assert ("dep", "remove", "bd-1", "bd-2", "--type", "blocks") in br.calls

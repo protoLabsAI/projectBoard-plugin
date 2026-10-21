@@ -813,6 +813,65 @@ def _board_tools(cfg: dict):
         except BoardError as exc:
             return f"Error: {exc}"
 
+    @tool
+    def board_remove_dependency(feature_id: str, depends_on: str) -> str:
+        """Remove one or more `blocks` dependency edges from a feature — the INVERSE of
+        board_update_feature(depends_on=…), which ADDS edges. Use it to drop a WRONG
+        blocker the PM added (a mis-decomposed chain, an edge onto a cancelled card).
+        `depends_on` is a comma-separated list of blocker feature ids to unlink; each
+        existing edge is torn down via store.remove_dependency so the card is no longer
+        gated on that blocker.
+
+        Both the feature and every named blocker must be real cards on the board — an
+        unknown id returns `Error: unknown feature …` and removes NOTHING (the call is
+        all-or-nothing on validation). An id that IS a feature but is not actually a
+        blocking edge on this card is reported under `not_found` ("no such edge") — not an
+        error, and the other named edges are still removed. Returns JSON
+        `{id, removed: [...], not_found: [...], open_depends_on: [...]}` reflecting the
+        board AFTER the change (a removed blocker no longer appears in `open_depends_on`),
+        and records an audit comment on the card naming the removed edges. Inputs are
+        stripped of any literal wrapping double quotes first (same hygiene as
+        board_update_feature). Never raises — a store failure comes back as `Error: …`."""
+        try:
+            store = get_store(**store_kw)
+            feature_id = _strip_wrapping_quotes(feature_id).strip()
+            depends_on = _strip_wrapping_quotes(depends_on)
+            blockers = _split_list(depends_on)
+            f = store.get_feature(feature_id)
+            if f is None:
+                return f"Error: unknown feature {feature_id!r}"
+            # Validate EVERY named blocker exists before tearing down anything, so an
+            # unknown id aborts the whole call (nothing removed) rather than leaving some
+            # edges dropped and some not — the all-or-nothing contract the AC pins.
+            for b in blockers:
+                if store.get_feature(b) is None:
+                    return f"Error: unknown feature {b!r}"
+            existing = set(f.get("depends_on") or [])
+            removed: list[str] = []
+            not_found: list[str] = []
+            for b in blockers:
+                # Guard against a repeated blocker in the input: once removed, a second
+                # occurrence is "no such edge", not a double tear-down that would raise.
+                if b in existing:
+                    store.remove_dependency(feature_id, b)
+                    existing.discard(b)
+                    removed.append(b)
+                else:
+                    not_found.append(b)
+            if removed:
+                store.comment(feature_id, "removed dependency edges: " + ", ".join(removed))
+            after = store.get_feature(feature_id) or {}
+            return json.dumps(
+                {
+                    "id": feature_id,
+                    "removed": removed,
+                    "not_found": not_found,
+                    "open_depends_on": after.get("open_depends_on", []),
+                }
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+
     def _preflight_failure_field(f: dict) -> dict:
         """``{"preflight_failure": …}`` for a card held by its project's gate preflight,
         from what the loop last published; ``{}`` otherwise (or when nothing is published)."""
@@ -1741,6 +1800,7 @@ def _board_tools(cfg: dict):
         board_create_feature,
         board_create_task,
         board_update_feature,
+        board_remove_dependency,
         board_get_feature,
         board_comments,
         board_mark_ready,
