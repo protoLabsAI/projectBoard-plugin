@@ -23,6 +23,10 @@ from project_board.failures import (
         ("coder dispatch failed: 429 rate limit exceeded", "rate_limit", True),
         ("Error: you are being rate-limited, slow down", "rate_limit", True),
         ("model overloaded, try later", "rate_limit", True),
+        # #570: a SPENT ALLOWANCE says "usage limit", never "rate limit" or "quota"
+        ("You\u2019ve hit your usage limit. Visit \u2026 to purchase more credits", "rate_limit", True),
+        ('{"codexErrorInfo": "usageLimitExceeded"}', "rate_limit", True),
+        ("fable: out of usage credits \u00b7 resets Aug 13", "rate_limit", True),
         # transient infra
         ("git push failed: connection reset by peer", "transient", True),
         ("git fetch origin main timed out after 60s", "transient", True),
@@ -110,6 +114,57 @@ def test_unknown_falls_back_to_terminal():
 
 def test_empty_message_is_terminal():
     assert classify("").category == "terminal"
+
+
+# ── #570: a spent allowance must ROTATE, not block ──────────────────────────────────
+
+# The verbatim dispatch failure that blocked bd-uixx: Codex's spent weekly quota, wrapped
+# in a JSON-RPC Internal error. It contains no "rate limit", no "quota" and no 429 — the
+# words the rule used to need — so it classified as `terminal` and the drive never tried
+# the rung's Claude sibling.
+_CODEX_USAGE_LIMIT = (
+    "coder dispatch failed: Internal error (JSON-RPC -32603): "
+    '{"message": "You\u2019ve hit your usage limit. Visit '
+    "https://chatgpt.com/codex/settings/usage to purchase more credits or try again at "
+    'Oct 26th, 2026 3:34 AM.", "codexErrorInfo": "usageLimitExceeded"}'
+)
+
+
+def test_codex_usage_limit_is_a_rate_limit_not_terminal():
+    policy = classify(_CODEX_USAGE_LIMIT)
+    assert policy.category == "rate_limit", policy.category
+    assert policy.retryable
+
+
+def test_codex_usage_limit_is_rotatable_so_the_sibling_is_tried():
+    """The behaviour that actually matters: `_ROTATABLE_CATEGORIES` holds `rate_limit`, so
+    the drive rotates to the rung's live sibling instead of blocking the card terminal with
+    the sibling idle. Asserted through the drive's own predicate, not just `classify`."""
+    from project_board import worktree
+    from project_board.loop._common import provider_failure_category
+
+    assert provider_failure_category(worktree.WorktreeError(_CODEX_USAGE_LIMIT)) == "rate_limit"
+
+
+def test_a_straight_apostrophe_variant_classifies_the_same():
+    # The curly apostrophe was never the cause — pin that, so nobody "fixes" it by
+    # normalising quotes and leaves the real gap in place.
+    assert classify(_CODEX_USAGE_LIMIT.replace("\u2019", "'")).category == "rate_limit"
+
+
+def test_usage_words_do_not_swallow_unrelated_messages():
+    """The new alternatives are narrow: a message that merely mentions usage, or a limit
+    that is not an allowance, keeps the class it had. `usage ?limit` needs the two words
+    adjacent, so neither a CLI usage line nor the drive's own token-usage note matches."""
+    assert classify("usage: br list [options]").category == "terminal"
+    assert classify("token usage recorded for the attempt").category == "terminal"
+    # Claude's throttle ("You've hit your session limit · resets 1:30pm") reaches
+    # `rate_limit` only because its JSON carries `{"errorKind": "rate_limit"}`, which
+    # `rate.?limit` catches — the words "session limit" alone do not, and this change does
+    # not add them. Pinned so the asymmetry with Codex (whose payload says
+    # `codexErrorInfo: usageLimitExceeded` instead) is visible rather than surprising.
+    assert classify("session limit reached").category == "terminal"
+    assert classify('session limit \u00b7 {"errorKind": "rate_limit"}').category == "rate_limit"
 
 
 def test_first_match_wins():
