@@ -55,6 +55,10 @@ button. Colours come only from `--pl-*` tokens, and the kit classes (`pl-field`,
 `pl-select`, `pl-textarea`, `pl-btn pl-btn--primary`) theme everything. Author it `<style>`
 first, then markup that reads as finished before any script runs, then `<script>` last.
 
+**No `<form>` submission.** The inline frame is sandboxed without `allow-forms`, so the
+browser blocks a submit and the handler never runs: no confirm chip, nothing sent. Wrap the
+fields in a `<div>` and give the button `type="button"` with a `click` handler, as below.
+
 The button:
 
 - **Feature-detects** `window.protoArtifact?.send`. Without it, it shows the message text so
@@ -94,7 +98,7 @@ user's request; keep the values empty):
   .cf .note { color: var(--pl-color-fg-muted); font-size: 12px; }
   .cf [aria-invalid="true"] { border-color: var(--pl-color-status-error); }
 </style>
-<form class="cf pl-card" id="cf" novalidate>
+<div class="cf pl-card" id="cf">
   <div class="pl-eyebrow">New board card</div>
   <div class="row">
     <div class="pl-field"><label for="project">Project</label>
@@ -110,14 +114,13 @@ user's request; keep the values empty):
   <div class="pl-field"><label for="ac">Acceptance criteria <span class="note">(one per line)</span></label>
     <textarea id="ac" class="pl-textarea" rows="3" required placeholder="One testable result per line"></textarea></div>
   <div class="foot">
-    <button class="pl-btn pl-btn--primary" id="go" type="submit">Create card</button>
+    <button class="pl-btn pl-btn--primary" id="go" type="button">Create card</button>
     <span class="note" id="status" role="status"></span>
   </div>
-</form>
+</div>
 <script>
   const $ = (id) => document.getElementById(id);
-  $("cf").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  $("go").addEventListener("click", async () => {
     const v = { project: $("project").value, pri: $("pri").value, title: $("title").value.trim(),
       why: $("why").value.trim(),
       ac: $("ac").value.split("\n").map((l) => l.replace(/^[\s*-]+/, "").trim()).filter(Boolean) };
