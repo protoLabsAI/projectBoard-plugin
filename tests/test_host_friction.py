@@ -177,7 +177,7 @@ class _BlockStore:
     def __init__(self):
         self.calls = []
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append((fid, reason, category))
         return {"id": fid}
 

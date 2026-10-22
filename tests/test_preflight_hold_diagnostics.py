@@ -211,7 +211,7 @@ class _Store:
     def list_features(self, state=None):
         return [dict(f) for f in self.ready] if state == "ready" else []
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append(("flag_blocked", fid, reason))
         self.ready = [f for f in self.ready if f["id"] != fid]
 

@@ -793,7 +793,7 @@ class PreflightMixin:
                 # Its own class (#3585), not whatever `classify()` makes of the gate's
                 # tail — that fell through to `terminal`, "needs a human, never clears",
                 # on a card this loop releases itself once the gate runs again.
-                store.flag_blocked(fid, short, category=PREFLIGHT_HOLD_CLASS)
+                store.flag_blocked(fid, short, category=PREFLIGHT_HOLD_CLASS, automatic=True)
                 held.add(fid)
                 log.info("[project_board] preflight hold: flagged %s blocked (project %s gate not runnable)", fid, name)
             except Exception:  # noqa: BLE001 — a hold that can't be recorded must not kill the tick
