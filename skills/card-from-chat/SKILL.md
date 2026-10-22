@@ -35,8 +35,9 @@ time in prose.
 1. Call `board_projects` for the project names and the default.
 2. Call `show_artifact(kind="html", title="New board card", code=…)`. It renders inline in
    the chat by default (don't pass `placement="panel"`).
-3. Pre-fill what the user already told you: a draft title, the "what and why" in their words,
-   and the project if it's obvious. Leave the rest empty for them.
+3. Leave every text field **empty**: the user fills in the spec, so don't type a draft into
+   the values. Give each field a short `placeholder` instead, an example drawn from what
+   they said. The selects keep their defaults (the default project, P2).
 
 The form has these fields, in this order:
 
@@ -48,8 +49,8 @@ The form has these fields, in this order:
 | Acceptance criteria | `<textarea rows="3">` | required; one testable criterion per line |
 | Priority | `<select>` | optional; P0 to P4, default P2 |
 
-Keep it small and tidy, because it may be on camera. Use one `pl-card`, a single column at
-most ~460 px wide, compact spacing, no heading beyond a one-line `pl-eyebrow`, and one primary
+Keep it small and tidy, because it may be on camera. Use one `pl-card`, a single column that
+fills the card's width (each label stacked over a full-width field), compact spacing, no heading beyond a one-line `pl-eyebrow`, and one primary
 button. Colours come only from `--pl-*` tokens, and the kit classes (`pl-field`, `pl-input`,
 `pl-select`, `pl-textarea`, `pl-btn pl-btn--primary`) theme everything. Author it `<style>`
 first, then markup that reads as finished before any script runs, then `<script>` last.
@@ -79,12 +80,15 @@ The button:
   busy" or a rate limit is a quiet "Not sent: …" line, never an error. It disables itself
   while a send is in flight.
 
-A skeleton to adapt (swap in the real project options and the pre-filled values):
+A skeleton to adapt (swap in the real project options and placeholders drawn from the
+user's request; keep the values empty):
 
 ```html
 <style>
-  .cf { display: grid; gap: var(--pl-space-3); max-width: 460px; }
-  .cf .row { display: grid; grid-template-columns: 1fr 96px; gap: var(--pl-space-3); }
+  .cf { display: grid; gap: var(--pl-space-3); width: 100%; box-sizing: border-box; }
+  .cf .row { display: grid; grid-template-columns: 1fr 120px; gap: var(--pl-space-3); align-items: end; }
+  .cf .pl-field { display: grid; gap: var(--pl-space-1); min-width: 0; }
+  .cf .pl-input, .cf .pl-select, .cf .pl-textarea { width: 100%; box-sizing: border-box; }
   .cf textarea { resize: vertical; }
   .cf .foot { display: flex; align-items: center; gap: var(--pl-space-3); }
   .cf .note { color: var(--pl-color-fg-muted); font-size: 12px; }
@@ -100,11 +104,11 @@ A skeleton to adapt (swap in the real project options and the pre-filled values)
         <option selected>P2</option><option>P3</option><option>P4</option></select></div>
   </div>
   <div class="pl-field"><label for="title">Title</label>
-    <input id="title" class="pl-input" required value=""></div>
+    <input id="title" class="pl-input" required placeholder="e.g. Add an undo command"></div>
   <div class="pl-field"><label for="why">What and why</label>
-    <textarea id="why" class="pl-textarea" rows="3" required></textarea></div>
+    <textarea id="why" class="pl-textarea" rows="3" required placeholder="What should change, and why it matters"></textarea></div>
   <div class="pl-field"><label for="ac">Acceptance criteria <span class="note">(one per line)</span></label>
-    <textarea id="ac" class="pl-textarea" rows="3" required></textarea></div>
+    <textarea id="ac" class="pl-textarea" rows="3" required placeholder="One testable result per line"></textarea></div>
   <div class="foot">
     <button class="pl-btn pl-btn--primary" id="go" type="submit">Create card</button>
     <span class="note" id="status" role="status"></span>
@@ -133,8 +137,10 @@ A skeleton to adapt (swap in the real project options and the pre-filled values)
 </script>
 ```
 
-After `show_artifact`, write one short line at most ("Fill this in and press Create card.").
-Don't repeat the fields in prose.
+After `show_artifact`, write exactly one short line ("Fill this in and press Create card.") and
+nothing else: no caveats about projects or tools, no notes on what might fail, and no repeat of
+the fields in prose. Anything below the form pushes it up the screen. If something does go
+wrong, say so after the values come back.
 
 ## 2. When the values arrive
 

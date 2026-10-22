@@ -1848,11 +1848,17 @@ def _board_tools(cfg: dict, registry=None):
             ]
             default = snap.get("default_project") or ""
         except Exception:  # noqa: BLE001 — no live host config (a host-free run): the register-time map
+            rows, default = [], ""
+        if not rows:
+            # The registry is empty (or unreadable) on a flat single-repo board (`repo:`, no
+            # `projects:` map): its one project is the implicit one every card is stamped with
+            # (`project:default`). Without this the form's picker got nothing and the agent
+            # told the user creation might fail on a board that builds fine.
             rows = [
                 {"name": n, "repo": str(e.get("repo") or ""), "base_branch": str(e.get("base_branch") or "")}
                 for n, e in sorted(projects.items())
             ]
-            default = default_proj
+            default = default or default_proj
         return json.dumps({"projects": rows, "default_project": default})
 
     @tool
