@@ -4136,6 +4136,12 @@ class BeadsBoard:
                 log.warning("[project_board] archive pass: labeling %s failed (skipped this sweep)", f["id"])
         return archived
 
+    def _work_location_hold_reason(self, fid: str, reason: str, feature: dict) -> str:
+        try:
+            return work_locations.hold_reason(reason, feature.get("work_locations") or {})
+        except ValueError as exc:
+            raise BoardError(f"{fid}: {exc}") from exc
+
     # ── Blocked flag (not a lane) ─────────────────────────────────────────────
     def flag_blocked(self, fid: str, reason: str, category: str = "") -> dict:
         """Flag a feature blocked, recording WHY in two places: the human-readable
@@ -4194,6 +4200,7 @@ class BeadsBoard:
         # `blocked: <reason>` comment did not: a block with no reason, the exact state #414
         # forbids. Written first and allowed to raise, a failure leaves the card UNblocked
         # with the caller told, never blocked without saying why.
+        reason = self._work_location_hold_reason(fid, reason, f)
         if reason:
             self._run("comments", "add", fid, f"blocked: {reason}")
         self._run(*args)
@@ -4275,6 +4282,7 @@ class BeadsBoard:
             )
         if LABEL_MERGE_HOLD in (f.get("labels") or []):
             return f  # already held — idempotent, no duplicate comment
+        reason = self._work_location_hold_reason(fid, reason, f)
         who = str(actor or self.actor or "operator").strip() or "operator"
         # The REASON first (as flag_blocked does), and allowed to raise: a failed write
         # leaves the card UN-held with the caller told, never held with no audit trail.
@@ -4547,7 +4555,7 @@ class BeadsBoard:
                         "by"
                     ] == self.actor:
                         return current
-                elif old["path"] == state["path"]:
+                elif state["path"] and old["path"] == state["path"]:
                     raise BoardError(f"path already recorded as {old['id']!r}; retry or update using that id")
             if len(current["history"]) >= ledger.MAX_REVISIONS:
                 raise BoardError("work-location history limit reached; retain existing history and use another card")

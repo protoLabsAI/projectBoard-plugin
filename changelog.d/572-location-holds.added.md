@@ -1,0 +1,1 @@
+Git identities named in new blocks and merge holds now require a persisted matching work location or an explicit pushed report. Both store setters refuse missing evidence before writes and include resolved location and pushed state in their audit reasons, without filesystem or network probes. Refs #572.
