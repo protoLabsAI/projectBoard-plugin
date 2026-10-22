@@ -165,8 +165,10 @@ def publish(features, *, revision: int | None = None) -> None:
     try:
         live.sort(
             key=lambda f: (
-                -max((e["risk"] for e in contexts.get(f.get("id"), {}).get("locations", [])), default=0),
+                # Preserve board urgency under the cap; recovery risk prioritizes
+                # cards within a state without displacing blocked/in-flight work.
                 rank.get(str(f.get("board_state")), 99),
+                -max((e["risk"] for e in contexts.get(f.get("id"), {}).get("locations", [])), default=0),
                 str(f.get("id") or ""),
             )
         )

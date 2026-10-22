@@ -120,6 +120,44 @@ def test_cached_provider_no_io_and_risk_caps(monkeypatch):
     assert context["read_tool"]["name"] == "board_list_work_locations"
 
 
+@pytest.mark.parametrize("state", ["in_review", "in_progress", "ready", "backlog", "recovery"])
+@pytest.mark.parametrize("facts", [{}, {"status": "missing", "temporary": True, "ahead": 3}])
+def test_cached_recovery_risk_cannot_displace_blocked_card_at_cap(state, facts):
+    rows = []
+    for i in range(ws.MAX_ITEMS):
+        fid = f"bd-risk-{i:02d}"
+        ws.cache_location(fid, entry(), facts)
+        rows.append(card([], id=fid, board_state=state))
+    rows.append(card([], id="bd-blocked", board_state="blocked", next_action_hint="Needs operator"))
+
+    ws.publish(rows)
+    result = ws.provider()
+    assert len(result) == ws.MAX_ITEMS
+    assert result[0]["id"] == "bd-blocked"
+    assert result[0]["hint"] == "Needs operator"
+    assert result[1]["recovery_context"]["locations"][0]["risk"] > 0
+    assert result[-1]["omitted_cards"] == {
+        "count": 1,
+        "read_tool": "board_list; board_list_work_locations(feature_id)",
+    }
+
+
+def test_board_state_priority_precedes_recovery_risk():
+    states = ["blocked", "in_review", "in_progress", "ready", "backlog"]
+    rows = []
+    for state in reversed(states):
+        rows.extend(
+            [
+                card([], id=f"bd-{state}-safe", board_state=state, next_action="inspect"),
+                card(id=f"bd-{state}-risky", board_state=state),
+            ]
+        )
+    ws.publish(rows)
+    assert [row["id"] for row in ws.provider()] == [
+        f"bd-{state}-{risk}" for state in states for risk in ("risky", "safe")
+    ]
+
+
 @pytest.mark.parametrize("ledger", [None, Mock(), {"entries": Mock()}, {"entries": [None, "bad"]}])
 def test_malformed_ledger_is_inert(ledger):
     assert ws.recovery_context(card(work_locations=ledger)) == {}
