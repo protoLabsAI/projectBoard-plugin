@@ -23,6 +23,12 @@ Day-to-day operation: agent tools, skills, the HTTP surface and the console view
   adversarial pipeline and populates the board.
 - **Learn from the loop:** the `loop-retro` skill turns `board_retro`'s failure classes
   into written grounding, so a recurring failure becomes a rule instead of a habit.
+- **A card from chat:** the `card-from-chat` skill. Ask for a feature and the agent
+  answers with a small inline form (an ADR 0118 interactive answer: Project from
+  `board_projects`, Title, What and why, Acceptance criteria, Priority). **Create card**
+  proposes the filled values as your next message (the console's "Send to chat" confirm).
+  The agent then creates the card, marks it ready and calls `board_watch`, which opens the
+  Board on the main stage and follows the card lane by lane until it is done.
 - **HTTP API:** operator reads and mutations live under the bearer-gated
   `/api/plugins/project_board/*` prefix. The public prefix exposes only the board
   iframe plus `/webhook/pr`, `/features/{id}/ci`, and `/features/{id}/review` for

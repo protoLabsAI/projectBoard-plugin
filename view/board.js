@@ -573,7 +573,7 @@ const EASE = "cubic-bezier(.2,.8,.2,1)";
 let FIRST_PAINT = true;
 function motionOK(){ return !RM.matches; }
 // Classes the motion layer owns — a re-render keeps them while their animation runs.
-const TRANSIENT = new Set(["card--enter", "card--flying", "card--landed", "card--flash", "card--placeholder", "card--pending"]);
+const TRANSIENT = new Set(["card--enter", "card--flying", "card--landed", "card--flash", "card--placeholder", "card--pending", "card--follow-in"]);
 
 // Lanes the build loop owns: nothing an operator does here moves a card into or out of
 // them — the loop claims on-deck cards, opens the PR, and the merge webhook sets done.
@@ -644,7 +644,8 @@ function blockedLine(f){
 function cardHTML(f, state){
   const spec = specLine(f.spec);
   const meta = (flags(f)+' '+taskFoot(f)).trim();
-  return '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
+  return (isFollowed(f.id) ? '<span class="follow-tag">Following</span>' : '')
+    + '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
     + '<span class="pri pri-'+esc(String(f.priority))+'" title="priority '+esc(String(f.priority))+' (0 = most urgent)">P'+esc(String(f.priority))+'</span>'
     + (f.project ? '<span class="proj" title="project">'+esc(f.project)+'</span>' : '')
     + '<span class="c-sp"></span>'
@@ -670,7 +671,8 @@ function updateCard(n, f, state){
   const keep = [...n.classList].filter(c => TRANSIENT.has(c));
   n.className = "card"+(mon?" card--live":"")+(isTask(f)?" card--task":"")
     + (f.blocked ? " card--blocked" : (f.dag_blocked ? " card--waiting" : ""))
-    + (owned ? " card--owned" : " card--movable") + (keep.length ? " " + keep.join(" ") : "");
+    + (owned ? " card--owned" : " card--movable") + (isFollowed(f.id) ? " card--following" : "")
+    + (keep.length ? " " + keep.join(" ") : "");
   n.dataset.id = f.id;
   n.dataset.state = state;
   setData(n, "mon", mon ? f.id : null);
@@ -734,6 +736,7 @@ function renderKanban(){
   else if (!FIRST_PAINT) entered.concat(changed).forEach(n => restartClass(n, "card--flash"));
   landed.forEach(land);
   FIRST_PAINT = false;
+  followAfterRender();
 }
 // FLIP: every card that moved since `first` was measured is put back where it was with
 // an inverse transform, then transitioned to its new place. A card that changed lane
@@ -790,6 +793,91 @@ function land(n){
   clearTimeout(n._land);
   n._land = setTimeout(() => n.classList.remove("card--landed"), LAND_MS);
 }
+
+// ── Follow mode: board_watch (card-from-chat) ───────────────────────────────────────
+// The agent's board_watch tool publishes `project_board.focus {id}` and then navigates the
+// console to this view. The followed card gets an accent ring and a "Following" tag, and is
+// scrolled into view now and again after every lane move (once its FLIP has played, so the
+// scroll lands on where the card ends up). Follow ends when the card reaches done (after the
+// Done glow), or the moment the operator clicks, scrolls or keys around the board: their
+// hands win over the camera. A card the event names before the board has read it (the
+// agent just created it) is picked up by the next read; give up after FOLLOW_WAIT_MS.
+const FOCUS_TOPIC = "project_board.focus";
+const FOLLOW_WAIT_MS = 120000, FOLLOW_IN_MS = 1400;
+const FOLLOW_ID_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+let FOLLOW = null;                          // {id, at, state, scrollT, endT}
+function isFollowed(id){ return !!FOLLOW && FOLLOW.id === id; }
+function startFollow(id){
+  id = String(id || "").trim();
+  if (!FOLLOW_ID_RE.test(id)) return false;
+  if (FOLLOW) endFollow(true);
+  FOLLOW = {id, at: Date.now(), state: null, scrollT: 0, endT: 0};
+  if (VIEW !== "kanban" && !NARROW.matches) setView("kanban");
+  else render();
+  load();                                   // a brand-new card: read now, not on the next /rev tick
+  return true;
+}
+function endFollow(quiet){
+  if (!FOLLOW) return;
+  const id = FOLLOW.id;
+  clearTimeout(FOLLOW.scrollT); clearTimeout(FOLLOW.endT);
+  FOLLOW = null;
+  const n = CARD_NODES.get(id);
+  if (n && !quiet) render();
+  else if (n){ n.classList.remove("card--following"); n._html = null; }
+}
+function followAfterRender(){
+  if (!FOLLOW) return;
+  const f = featureById(FOLLOW.id), n = CARD_NODES.get(FOLLOW.id);
+  if (!f || !n || !n.isConnected){
+    // Not on the Kanban (yet): a new card the next read brings, or a done card past the cap.
+    if ((f && f.state === "done") || Date.now() - FOLLOW.at > FOLLOW_WAIT_MS) endFollow();
+    return;
+  }
+  if (f.state === FOLLOW.state) return;      // no lane move: leave the scroll alone
+  const first = FOLLOW.state === null;
+  FOLLOW.state = f.state;
+  if (first){
+    restartClass(n, "card--follow-in");
+    setTimeout(() => n.classList.remove("card--follow-in"), FOLLOW_IN_MS);
+  }
+  clearTimeout(FOLLOW.scrollT);
+  FOLLOW.scrollT = setTimeout(() => keepInView(n), first || !motionOK() ? 0 : MOVE_MS + STAGGER_MAX * STAGGER_MS);
+  if (f.state === "done"){
+    clearTimeout(FOLLOW.endT);
+    FOLLOW.endT = setTimeout(() => endFollow(), LAND_MS + 400);   // let the Done glow play first
+  }
+}
+// Scroll only when the card is not comfortably on screen, and then centre it — a move that
+// stays in view leaves the page still, so the camera never jitters.
+const FOLLOW_MARGIN = 48;
+function keepInView(n){
+  if (!FOLLOW || !n.isConnected) return;
+  const r = n.getBoundingClientRect(), vh = window.innerHeight, vw = window.innerWidth;
+  if (r.top >= FOLLOW_MARGIN && r.bottom <= vh - FOLLOW_MARGIN && r.left >= 0 && r.right <= vw) return;
+  n.scrollIntoView({block: "center", inline: "nearest", behavior: motionOK() ? "smooth" : "auto"});
+}
+// The operator takes over: any click, wheel, touch or scrolling key on the board ends follow.
+// Our own scrollIntoView fires none of these, so it never ends itself.
+const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End", " "]);
+function operatorTookOver(e){
+  if (!FOLLOW || !e.isTrusted) return;
+  if (e.type === "keydown" && !SCROLL_KEYS.has(e.key)) return;
+  endFollow();
+}
+["pointerdown", "wheel", "touchstart"].forEach(t => document.addEventListener(t, operatorTookOver, {capture: true, passive: true}));
+document.addEventListener("keydown", operatorTookOver, true);
+// The event bus across the sandbox (ADR 0039; protoAgent docs/reference/plugin-view-bridge.md
+// "Events"). One subscribe at load: when board_watch's navigate is what mounted this page,
+// the host answers it with a replay of the focus event published just before the navigate.
+let BUS_SEQ = null;
+window.addEventListener("message", (e) => {
+  const m = e.data;
+  if (!m || m.type !== "protoagent:event" || e.source !== window.parent) return;
+  if (typeof m.seq === "number"){ if (BUS_SEQ !== null && m.seq <= BUS_SEQ) return; BUS_SEQ = m.seq; }
+  if (m.topic === FOCUS_TOPIC) startFollow(m.data && m.data.id);
+});
+try { window.parent.postMessage({type: "protoagent:subscribe", patterns: [FOCUS_TOPIC]}, "*"); } catch (e) { /* no host */ }
 
 // ── The live "building" strip on in_progress coding cards ──────────────────────────
 // Who is coding, for how long, and what it touched last — from the same per-feature

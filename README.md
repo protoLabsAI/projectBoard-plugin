@@ -67,6 +67,7 @@ The board checks all of this itself and says what's missing instead of booting g
 | Plan a project | Ask for the `decompose-project` skill: "decompose \<idea\>" |
 | Onboard a repo | The `onboard-project` skill, before pointing the board at a new repo |
 | Learn from failures | The `loop-retro` skill |
+| Add a card from chat | The `card-from-chat` skill: ask for a feature, fill in the inline form it shows, and the Board opens following the new card (`board_projects`, `board_watch`) |
 
 More in [Using the board](docs/usage.md).
 

@@ -98,9 +98,14 @@ def test_plugin_view_handshake_survives_extraction():
     assert 'import(BASE + "/_ds/plugin-kit.js")' in BOARD_PAGE  # ESM dynamic import
     assert "kit.initPluginView(boot)" in BOARD_PAGE
     assert "kit.apiFetch" in BOARD_PAGE
-    # no hand-rolled theme :root map / message listener crept back in
+    # no hand-rolled theme :root map crept back in, and the one message listener is the
+    # event-bus relay board_watch's follow mode rides — never the kit's handshake
     assert ":root{" not in BOARD_PAGE and ":root {" not in BOARD_PAGE
-    assert 'addEventListener("message"' not in BOARD_PAGE
+    assert BOARD_PAGE.count('addEventListener("message"') == 1
+    listener = BOARD_PAGE[BOARD_PAGE.index('addEventListener("message"') :]
+    listener = listener[: listener.index("\n});") + 4]
+    assert '"protoagent:event"' in listener
+    assert "protoagent:init" not in listener and "protoagent:theme" not in listener
 
 
 # ── r10: the view/ assets are packaged (MANIFEST.in) ─────────────────────────────
