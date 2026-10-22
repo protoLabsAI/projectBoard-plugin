@@ -796,6 +796,25 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         return coder_seam.progress_snapshot(fid)
 
+    @router.get("/features/{fid}/changes")
+    async def _changes(fid: str):
+        """What the card's coder has changed so far, for the drawer's Code tab: per
+        worktree the card owns on disk, the files that differ from the branch's base
+        (committed, uncommitted and untracked), with capped diff bodies and secret-
+        looking paths listed without content (``changes.py``). ``{"worktrees": []}``
+        once the card's trees are reaped. Read-only."""
+        f = await _guard(lambda: store().get_feature(fid))
+        if f is None:
+            raise HTTPException(404, f"unknown feature {fid!r}")
+        from . import changes
+
+        repo = repo_for_feature(f, store_kw)
+        if not repo:
+            return {"worktrees": []}
+        base = base_branch_for_feature(f, store_kw)
+        root = worktrees_root_for_feature(f, store_kw, worktrees_root)
+        return await changes.feature_changes(repo, root, fid, base)
+
     @router.patch("/features/{fid}")
     async def _patch_feature(fid: str, body: dict = Body(default={})):
         """In-place spec edit — the REST complement of ``board_update_feature``.

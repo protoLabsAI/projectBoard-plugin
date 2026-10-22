@@ -31,9 +31,10 @@ var BASE = location.pathname.split("/plugins/")[0];
 </div>
 <!-- Live monitor drawer (#84): a slide-over over a click-away scrim. -->
 <div id="scrim"></div>
-<div id="drawer" role="dialog" aria-modal="true" aria-label="Coder monitor">
+<div id="drawer" role="dialog" aria-modal="true" aria-label="Card">
   <div class="dh"><h2 id="drawer-title">Coder monitor</h2>
     <button class="dx" id="drawer-close" aria-label="Close">✕</button></div>
+  <div class="pl-tabs dtabs" id="drawer-tabs" role="tablist" aria-label="Card views" hidden></div>
   <div class="db" id="drawer-body"></div>
 </div>
 <!-- The motion layer (leaving cards, the drag ghost), the card action menu, the toast. -->
