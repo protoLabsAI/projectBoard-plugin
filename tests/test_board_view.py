@@ -284,7 +284,7 @@ def test_parked_task_awaiting_deliverable_chips_on_the_card():
     assert '"awaiting deliverable": ["pl-badge--info", "awaiting deliverable"],' in BOARD_PAGE
     assert "function nextActionChip(f)" in BOARD_PAGE
     assert "const tip = nextActionTip(f);" in BOARD_PAGE
-    assert "f.next_action_hint !== f.next_action ? \" — \" + f.next_action_hint" in BOARD_PAGE
+    assert 'f.next_action_hint !== f.next_action ? " — " + f.next_action_hint' in BOARD_PAGE
     assert "title=\"'+esc(tip)+'\"" in BOARD_PAGE
     # flags() carries the chip and is rendered on both the Kanban card and the list row
     assert "out += nextActionChip(f);" in BOARD_PAGE
