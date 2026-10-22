@@ -283,11 +283,25 @@ def test_parked_task_awaiting_deliverable_chips_on_the_card():
     tooltip (the server text, esc()'d)."""
     assert '"awaiting deliverable": ["pl-badge--info", "awaiting deliverable"],' in BOARD_PAGE
     assert "function nextActionChip(f)" in BOARD_PAGE
-    assert "const hint = f.next_action_hint || f.next_action;" in BOARD_PAGE
-    assert "title=\"'+esc(hint)+'\"" in BOARD_PAGE
+    assert "const tip = nextActionTip(f);" in BOARD_PAGE
+    assert "f.next_action_hint !== f.next_action ? \" — \" + f.next_action_hint" in BOARD_PAGE
+    assert "title=\"'+esc(tip)+'\"" in BOARD_PAGE
     # flags() carries the chip and is rendered on both the Kanban card and the list row
     assert "out += nextActionChip(f);" in BOARD_PAGE
     assert BOARD_PAGE.count("flags(f)") == 3  # definition + Kanban card + list row
+
+
+def test_status_chips_stay_short_and_the_drawer_spells_them_out():
+    """A merge-state hold lists every check (`held: PR not clean on GitHub (BLOCKED) — lint:
+    in progress; …`); the chip says only what the checks add up to, an unmapped sentence is
+    cut to its lead clause, and the drawer carries the full status (no tooltip on touch)."""
+    assert 'const MERGE_STATE_HOLD_PREFIX = "held: PR not clean on GitHub";' in BOARD_PAGE
+    assert 'return ["pl-badge--error", "ci failing"];' in BOARD_PAGE
+    assert 'return ["pl-badge--info", "checks running"];' in BOARD_PAGE
+    assert 'return ["pl-badge--warning", "merge blocked"];' in BOARD_PAGE
+    assert 'NEXT_ACTION_CHIP[f.next_action] || ["", shortLabel(f.next_action)]' in BOARD_PAGE
+    assert "const CHIP_MAX = 32;" in BOARD_PAGE
+    assert "let h = nextActionDetail(f) + '<div class=\"tdlbl\">spec</div>'" in BOARD_PAGE
 
 
 def test_task_cards_share_lanes_and_ordering_with_coding_features():

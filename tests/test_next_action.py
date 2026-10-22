@@ -732,8 +732,8 @@ def test_board_page_chips_the_in_review_sub_state():
     assert '"ci failing": ["pl-badge--error", "ci failing"],' in BOARD_PAGE
     assert "function nextActionChip(f)" in BOARD_PAGE
     # the hint rides as the chip's tooltip, esc()'d — and `blocked` keeps its own chip
-    assert "const hint = f.next_action_hint || f.next_action;" in BOARD_PAGE
-    assert "title=\"'+esc(hint)+'\"" in BOARD_PAGE
+    assert "const tip = nextActionTip(f);" in BOARD_PAGE
+    assert "title=\"'+esc(tip)+'\"" in BOARD_PAGE
     assert 'f.next_action === "blocked") return "";' in BOARD_PAGE
     # wired into flags(), which both the Kanban card and the list row render
     assert "out += nextActionChip(f);" in BOARD_PAGE

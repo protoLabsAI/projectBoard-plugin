@@ -106,17 +106,37 @@ const NEXT_ACTION_PREFIX_CHIP = [
   ["waiting on publish", ["pl-badge--warning", "waiting on publish"]],
   ["held: release freeze", ["pl-badge--warning", "held: release freeze"]],
 ];
+// A merge-state hold (`held: PR not clean on GitHub (BLOCKED) — lint: in progress; …`)
+// lists every check, so its chip says only what the checks add up to.
+const MERGE_STATE_HOLD_PREFIX = "held: PR not clean on GitHub";
+function mergeStateHoldChip(text){
+  const checks = text.split(" — ").slice(1).join(" — ");
+  if (/:\s*(failure|error|cancelled|timed_out|action_required)\b/i.test(checks)) return ["pl-badge--error", "ci failing"];
+  if (/:\s*(in progress|pending|queued|waiting|requested)\b/i.test(checks)) return ["pl-badge--info", "checks running"];
+  return ["pl-badge--warning", "merge blocked"];
+}
+// An unmapped sentence still gets a short chip: its lead clause, capped.
+const CHIP_MAX = 32;
+function shortLabel(text){
+  const lead = text.split(" — ")[0].split(";")[0].trim();
+  return lead.length > CHIP_MAX ? lead.slice(0, CHIP_MAX - 1).trimEnd() + "…" : lead;
+}
+function nextActionTip(f){
+  return f.next_action + (f.next_action_hint && f.next_action_hint !== f.next_action ? " — " + f.next_action_hint : "");
+}
 function nextActionChip(f){
   if (!f.next_action || f.next_action === "blocked") return "";  // blocked has its own chip
+  const tip = nextActionTip(f);
   const byPrefix = NEXT_ACTION_PREFIX_CHIP.find(([p]) => f.next_action.startsWith(p));
-  if (byPrefix) {
-    const [cls, label] = byPrefix[1];
-    const tip = f.next_action + (f.next_action_hint ? " — " + f.next_action_hint : "");
-    return '<span class="pl-badge '+cls+'" title="'+esc(tip)+'">'+esc(label)+'</span>';
-  }
-  const [cls, label] = NEXT_ACTION_CHIP[f.next_action] || ["", f.next_action];
-  const hint = f.next_action_hint || f.next_action;
-  return '<span class="pl-badge '+cls+'" title="'+esc(hint)+'">'+esc(label)+'</span>';
+  const [cls, label] = f.next_action.startsWith(MERGE_STATE_HOLD_PREFIX) ? mergeStateHoldChip(f.next_action)
+    : byPrefix ? byPrefix[1]
+    : NEXT_ACTION_CHIP[f.next_action] || ["", shortLabel(f.next_action)];
+  return '<span class="pl-badge '+cls+'" title="'+esc(tip)+'">'+esc(label)+'</span>';
+}
+// The drawer spells the full status out: a chip's tooltip never shows on touch.
+function nextActionDetail(f){
+  if (!f.next_action || f.next_action === "blocked") return "";
+  return '<div class="tdlbl">status</div><div class="tdsec">'+esc(nextActionTip(f))+'</div>';
 }
 function flags(f){
   let out = "";
@@ -256,7 +276,7 @@ function taskRequirements(f){
 // never raw HTML.
 function taskDetail(f){
   const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
-  let h = '<div class="tdlbl">spec</div>' + prose(f.spec)
+  let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
   h += taskRequirements(f);
