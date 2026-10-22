@@ -1,0 +1,1 @@
+Inspect recorded external work locations on the health cadence, preserving bounded git evidence and notifying operators of unpushed, missing, temporary, or unverified work without changing checkouts or remote refs. Filesystem reach comes only from host-approved project roots. Refs #572.

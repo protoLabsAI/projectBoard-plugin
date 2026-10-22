@@ -15,7 +15,7 @@ VERSION = 1
 MAX_RECORD_BYTES = 16384
 MAX_ENTRIES = 100
 MAX_REVISIONS = 1000
-FIELDS = {"id", "path", "repo", "branch", "sha", "pushed", "purpose", "remote_ref", "session_id"}
+FIELDS = {"id", "path", "repo", "branch", "sha", "pushed", "purpose", "remote_ref", "session_id", "last_check"}
 
 
 def text(value, name: str, limit: int, *, required: bool = False) -> str:
@@ -56,6 +56,13 @@ def validate(entry: dict) -> dict:
     for key in ("remote_ref", "session_id"):
         if key in entry:
             result[key] = text(entry[key], key, 2048 if key == "remote_ref" else 256)
+    if "last_check" in entry:
+        check = entry["last_check"]
+        if not isinstance(check, dict) or len(json.dumps(check).encode()) > 4096:
+            raise ValueError("last_check must be a bounded evidence object")
+        if type(check.get("cycle", 0)) is not int or check.get("cycle", 0) < 0:
+            raise ValueError("last_check cycle must be a nonnegative integer")
+        result["last_check"] = check
     if len(json.dumps(result).encode()) > MAX_RECORD_BYTES - 1024:
         raise ValueError("entry is too large; shorten path, purpose or git references")
     return result
