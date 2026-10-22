@@ -118,6 +118,14 @@ def register(registry) -> None:
         _register_board_cards(registry)
     except Exception:  # noqa: BLE001 — chat cards are best-effort; the board runs without them
         log.exception("[project_board] registering the board-cards component failed")
+    # The new-card form (card-from-chat): the `board-card-form` frame component
+    # board_card_form emits. Feature-detected; without it the tool asks in plain chat.
+    try:
+        from .board_card_form import register_component as _register_card_form
+
+        _register_card_form(registry)
+    except Exception:  # noqa: BLE001 — the form is best-effort; the board runs without it
+        log.exception("[project_board] registering the board-card-form component failed")
 
     # A few board tools so the agent (or A2A) can drive the board headlessly.
     # `registry` rides along for board_watch (the one tool that drives the console: it
@@ -1835,12 +1843,8 @@ def _board_tools(cfg: dict, registry=None):
         annotate_next_action(feats, cfg)  # labels + config only, no network
         return summary_text(props, feats, missing, total) + component_tail(props)
 
-    @tool
-    def board_projects() -> str:
-        """List the board's registered projects (the names `board_create_feature(project=…)`
-        accepts) and the default a create falls back to. Read-only. Use it to fill a project
-        picker, e.g. the card-from-chat form, instead of guessing names. Returns JSON
-        `{projects: [{name, repo, base_branch}], default_project}`."""
+    def _project_rows() -> tuple[list[dict], str]:
+        """The board's registered projects and the default a create falls back to."""
         try:
             from .project_registry import project_registry_snapshot
 
@@ -1862,7 +1866,61 @@ def _board_tools(cfg: dict, registry=None):
                 for n, e in sorted(projects.items())
             ]
             default = default or default_proj
+        return rows, default
+
+    @tool
+    def board_projects() -> str:
+        """List the board's registered projects (the names `board_create_feature(project=…)`
+        accepts) and the default a create falls back to. Read-only. Use it instead of
+        guessing names. (The new-card form already carries them — see board_card_form.)
+        Returns JSON `{projects: [{name, repo, base_branch}], default_project}`."""
+        rows, default = _project_rows()
         return json.dumps({"projects": rows, "default_project": default})
+
+    @tool
+    def board_card_form(project: str = "", title_hint: str = "", why_hint: str = "") -> str:
+        """Show the operator the NEW BOARD CARD form inline in the chat — a fixed, ready-made
+        form (Project, Title, What & why, Acceptance criteria, Priority) with a Create card
+        button. Call it RIGHT AWAY when the user asks to add a feature, task, bug fix or idea
+        to the board ("add a feature for …", "put … on the board", "make a card for …").
+        Never write an HTML form for this yourself.
+
+        `title_hint` / `why_hint` (one line each, drawn from the request) become the empty
+        fields' placeholders; `project` preselects a project (the board's default
+        otherwise). The project picker lists the board's projects and is hidden when there
+        is only one.
+
+        AFTER CALLING IT, WRITE ONE SHORT LINE ("Fill this in and press Create card.") and
+        nothing else. When the user presses Create card and confirms, their next message
+        arrives as `Create board card · <title>` / `Project: … · Priority: P<n>` / `Why: …` /
+        `- <criterion>` lines — then create the card (card-from-chat skill)."""
+        from .board_card_form import EMIT, build_props, component_tail
+
+        rows, default = _project_rows()
+        names = [str(r.get("name") or "") for r in rows if r.get("name")]
+        props = build_props(
+            names,
+            project=_strip_wrapping_quotes(str(project or "")),
+            default_project=default,
+            title_hint=_strip_wrapping_quotes(str(title_hint or "")),
+            why_hint=_strip_wrapping_quotes(str(why_hint or "")),
+        )
+        tail = component_tail(props)
+        if not EMIT or not tail:
+            return (
+                "The new-card form can't render in this console (it needs frame components, "
+                "protoAgent ADR 0118 D5). Ask the user in ONE short message for the title, what "
+                "and why, the acceptance criteria (one per line) and a priority (P0-P4, default "
+                f"P2){'; projects: ' + ', '.join(names) if len(names) > 1 else ''}. Then create the "
+                "card as the card-from-chat skill says."
+            )
+        where = props.get("project", "")
+        picker = (
+            f"picker: {', '.join(props['projects'])}"
+            if len(props.get("projects", [])) > 1
+            else "one project, no picker"
+        )
+        return f"Showing the new-card form (project {where or 'default'}; {picker})." + tail
 
     @tool
     def board_watch(feature_id: str) -> str:
@@ -1928,6 +1986,7 @@ def _board_tools(cfg: dict, registry=None):
         board_salvage_feature,
         board_show_cards,
         board_projects,
+        board_card_form,
         board_watch,
     ]
 

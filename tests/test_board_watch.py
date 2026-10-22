@@ -1,8 +1,8 @@
 """card-from-chat: ``board_watch`` / ``board_projects``, the Board view's follow mode, and
 the ``card-from-chat`` skill.
 
-The demo flow: the user asks for a feature in chat, the agent answers with an inline form
-(an ADR 0118 interactive answer), the user sends it back, the agent creates and readies the
+The demo flow: the user asks for a feature in chat, the agent answers with the board's
+ready-made new-card form (``board_card_form``, tests/test_board_card_form.py), the user sends it back, the agent creates and readies the
 card, and ``board_watch`` opens the Board on the main stage following that card lane by lane.
 
 All host-free. The registry is the vendored testkit's ``FakeRegistry`` (which namespaces
@@ -229,28 +229,39 @@ def test_card_from_chat_skill_names_real_tools():
     names = {t.name for t in pb._board_tools({})}
     board_tools = [t for t in fm["tools"] if t.startswith("board_")]
     assert set(board_tools) <= names
-    for t in ("board_projects", "board_create_feature", "board_mark_ready", "board_watch", "show_artifact"):
+    for t in ("board_card_form", "board_create_feature", "board_mark_ready", "board_watch"):
         assert t in fm["tools"]
+    assert fm["tools"][0] == "board_card_form", "the form is the first thing the skill reaches for"
 
 
-def test_card_from_chat_skill_uses_the_adr_0118_send_bridge_not_hitl():
+def test_card_from_chat_skill_shows_the_predefined_form_never_model_written_html():
+    """The form is a plugin-served frame component now. The skill must never again tell the
+    model to write HTML (30–40 s of output, a look that varied per run, and the sandboxed
+    <form> submit that never fired)."""
     fm, text = _skill()
-    assert "window.protoArtifact.send(" in text
-    assert 'typeof window.protoArtifact?.send !== "function"' in text  # feature-detected
-    assert "request_user_input" not in fm["tools"]
-    assert "not** the" in text and "HITL" in text
-    # the button sends every value, in the shape step 2 reads back
-    for field in ("Create board card:", "Project:", "Title:", "Priority:", "What and why:", "Acceptance criteria:"):
-        assert field in text
-    # create → ready (the loop only claims ready cards) → watch
+    assert "show_artifact" not in fm["tools"] and "request_user_input" not in fm["tools"]
+    assert "```html" not in text and "<form" not in text and "<style" not in text
+    assert "window.protoArtifact" not in text and 'kind="html"' not in text
+    assert "Never write an HTML form" in fm["description"]
+    assert "right away" in text
+    show = text[text.index("## 1. Show the form") : text.index("## 2. When the values arrive")]
+    assert "board_card_form" in show and "title_hint" in show and "why_hint" in show
+
+
+def test_card_from_chat_skill_reads_back_the_forms_message_shape():
+    from project_board.board_card_form import MESSAGE_PREFIX
+
+    _, text = _skill()
     flow = text[text.index("## 2. When the values arrive") :]
+    assert MESSAGE_PREFIX + "<title>" in flow
+    assert "Project: <name> · Priority: P<n>" in flow and "Why: <what and why>" in flow
+    # follow-ups only when genuinely needed, BEFORE the create
+    assert "only** when the spec is genuinely" in flow
+    assert flow.index("Follow up only if you must") < flow.index("board_create_feature")
+    # files_to_modify worked out with read tools
+    assert "files_to_modify" in flow and "read tools" in flow
+    # no dependency edges the user didn't ask for (a stale backlog chain stalled the demo card)
+    assert "No unrequested dependencies" in flow and "unless the user asked" in flow
+    # create → ready (the loop only claims ready cards) → watch → one line
     assert flow.index("board_create_feature") < flow.index("board_mark_ready") < flow.index("board_watch")
-
-
-def test_card_form_skeleton_never_submits_a_form():
-    """The inline artifact frame is sandboxed without allow-forms: a <form> submit is blocked
-    and its handler never runs, so the confirm chip never appears. The skeleton must click."""
-    skill = (Path(pb.__file__).parent / "skills" / "card-from-chat" / "SKILL.md").read_text(encoding="utf-8")
-    assert "<form" not in skill.split("```html", 1)[1].split("```", 1)[0]
-    assert 'type="submit"' not in skill and 'addEventListener("submit"' not in skill
-    assert '$("go").addEventListener("click"' in skill
+    assert "Reply with one line" in flow

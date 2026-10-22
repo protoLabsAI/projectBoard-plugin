@@ -233,6 +233,15 @@ def build_router(cfg: dict):
 
         return HTMLResponse(CARDS_PAGE)
 
+    # The new-card form in chat — the `board-card-form` frame component's page. Public for
+    # the same reason (the opaque-origin frame sends no bearer); it holds no board data and
+    # makes no reads: its Create card button only PROPOSES a chat message.
+    @router.get("/component/board-card-form.html", response_class=HTMLResponse)
+    async def _board_card_form_component():
+        from .board_card_form import FORM_PAGE
+
+        return HTMLResponse(FORM_PAGE)
+
     @router.get("/config/projects", response_class=HTMLResponse)
     async def _projects_config():
         """Public page chrome for the sandboxed Configure tab.

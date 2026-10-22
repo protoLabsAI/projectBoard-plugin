@@ -1,0 +1,22 @@
+/* The new-card form in chat. DS kit classes (pl-card, pl-eyebrow, pl-field__label,
+   pl-input, pl-textarea, pl-select, pl-btn--primary) carry the look; this sheet only lays
+   them out in ONE column that fills the card: each label stacked over a full-width field.
+   --pl-* tokens only, so the frame follows the operator's theme. No hex values. */
+html, body { margin: 0; background: transparent; color: var(--pl-color-fg); font-family: var(--pl-font-sans); font-size: var(--pl-font-size-sm); }
+body { padding: 1px; }
+.cf { display: flex; flex-direction: column; gap: var(--pl-space-3); width: 100%; box-sizing: border-box; }
+.cf-eyebrow { margin: 0; }
+.cf-field { display: flex; flex-direction: column; gap: var(--pl-space-1_5); min-width: 0; }
+.cf-field .pl-field__label { margin: 0; }
+.cf-aside { text-transform: none; letter-spacing: 0; color: var(--pl-color-fg-subtle, var(--pl-color-fg-muted)); }
+.cf .pl-input { display: block; width: 100%; box-sizing: border-box; margin: 0; }
+.cf .pl-textarea { resize: vertical; }
+.cf .pl-input::placeholder { color: var(--pl-color-fg-subtle, var(--pl-color-fg-muted)); opacity: 1; }
+.cf .pl-input:focus-visible { border-color: var(--pl-color-border-strong); }
+.cf .pl-input[aria-invalid="true"] { border-color: var(--pl-color-status-error); }
+.cf .pl-input:disabled { opacity: 0.7; }
+.cf-err { color: var(--pl-color-status-error); font-size: var(--pl-font-size-xs); }
+.cf-err:empty { display: none; }
+.cf-foot { display: flex; align-items: center; gap: var(--pl-space-3); flex-wrap: wrap; padding-top: var(--pl-space-1); }
+.cf-foot .pl-btn:disabled { opacity: 0.6; cursor: default; }
+.cf-status { color: var(--pl-color-fg-muted); font-size: var(--pl-font-size-xs); }
