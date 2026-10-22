@@ -14,7 +14,7 @@ import inspect
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
-from .. import host_friction
+from .. import host_friction, work_location_sweep
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
@@ -392,7 +392,12 @@ class DriveMixin:
             health.publish_claim_stall("")  # a stopped loop is not a stalled one (#462)
         if self._task:
             setup_check.publish_loop_snapshot(None)  # no running loop → nothing to be stale against
-        for task in (self._task, self._snapshot_task, getattr(self, "_base_refresh_task", None)):
+        for task in (
+            self._task,
+            self._snapshot_task,
+            getattr(self, "_base_refresh_task", None),
+            getattr(self, "_location_sweep_task", None),
+        ):
             if task:
                 task.cancel()
                 try:
@@ -561,7 +566,9 @@ class DriveMixin:
         try:
             now = (store or self._store()).get_feature(fid)
             state = str((now or {}).get("board_state") or "")
-            if state in ("done", "cancelled"):
+            # Completion does not prove that external work was pushed or preserved.
+            # Keep the existing stale-block guard for every other incident class.
+            if state in ("done", "cancelled") and not incident.startswith("work-location:"):
                 log.debug("[project_board] %s is %s — dropping stale block alert", fid, state)
                 return
         except Exception:  # noqa: BLE001 — a re-read we can't make must never swallow the alert
@@ -696,11 +703,14 @@ class DriveMixin:
         # full timeout per call, while holding the single-flight lock every board read
         # queues behind (a wedged store made seven stalled calls in one tick). So the first
         # stall ends the tick, logged as a stall, and the next tick tries again.
+        sweep_before = self._last_sweep
         status = "ok"
         for phase, step in (("PR reconcile", self._maybe_reconcile), ("health sweep", self._maybe_sweep)):
             status, _ = await self._tick_phase(phase, step)
             if status == "stalled":
                 break
+        if status != "stalled" and self._last_sweep != sweep_before:
+            self._start_location_sweep()
         # Preserve the phase-failure guard: a failed preflight evaluation stops this
         # tick's claim scan, as it does in dispatch_now. A successfully evaluated scan
         # may leave runs in flight; the per-project claim barrier defers unknowns.
@@ -716,6 +726,24 @@ class DriveMixin:
                     self._last_claim_at = time.monotonic()
         self._check_claim_stall()
         return bool(spawned)
+
+    def _start_location_sweep(self):
+        if self._shutting_down:
+            return
+        task = getattr(self, "_location_sweep_task", None)
+        if task and not task.done():
+            return
+        sweep = getattr(self, "_location_sweep", None)
+        if sweep is None or sweep.stop.is_set():
+            sweep = self._location_sweep = work_location_sweep.Sweep()
+
+        async def run():
+            try:
+                await sweep.run(self._store(), self._notify_operator)
+            except Exception:
+                log.warning("[project_board] work-location sweep failed", exc_info=True)
+
+        self._location_sweep_task = asyncio.create_task(run())
 
     async def _tick_phase(self, phase: str, step) -> tuple[str, object]:
         """Run one phase of a tick, isolated from the rest (#404) — ``(status, result)``,
