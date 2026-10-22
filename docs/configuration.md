@@ -630,9 +630,9 @@ limit or on a provider that can't serve its model:
 
 ```yaml
 coders:
-  smart: [codex, sonnet]   # small/unset difficulty starts here
-  reasoning: opus          # medium/large start here
-  opus: opus               # architectural starts here
+  standard: [codex, sonnet]   # small/unset difficulty starts here
+  reasoning: opus            # medium/large start here
+  advanced: opus             # architectural starts here
 ```
 
 Climbing a rung means "a stronger model may succeed". Rotating within one means "this
@@ -669,7 +669,11 @@ that climbs. A climb after a timeout is a fresh build, so the stronger rung fans
 A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
 
 Rotation needs escalation on, and escalation needs at least two DISTINCT rungs — a map with
-a single rung (`coders: {smart: [codex, sonnet]}`) runs as a one-coder board using `coder`.
+a single rung (`coders: {standard: [codex, sonnet]}`) runs as a one-coder board using `coder`.
+
+Legacy tier names `smart` and `opus` are still accepted as `standard` and `advanced`.
+Canonical keys win conflicts; board config saves write the new names. Existing card
+labels remain unchanged and are read through the same aliases.
 
 **`projects`** — one board, several repos. Each entry carries that repo's own `repo`,
 `base_branch`, `local_gate_cmd` and `coders`, so a card is built and gated against the

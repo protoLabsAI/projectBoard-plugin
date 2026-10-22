@@ -383,7 +383,7 @@ async def test_editor_update_preserves_siblings_and_file_only_entry_fields(monke
 
     projects = cfg.plugin_config["project_board"]["projects"]
     assert set(projects) == {"alpha", "beta"}
-    assert projects["alpha"]["coders"] == {"smart": "file-only-coder"}
+    assert projects["alpha"]["coders"] == {"standard": "file-only-coder"}
     assert "local_gate_cmd" not in projects["alpha"]
     assert result["entry"]["extra_fields"] == ["coders"]
     assert "coders" not in result["entry"]

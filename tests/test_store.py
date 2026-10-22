@@ -337,11 +337,11 @@ def test_fresh_instance_two_projects_share_one_store_and_never_init_a_repo(monke
 
 def test_next_tier_walks_then_stops_at_the_top(make_board):
     b = make_board(Br())
-    # Ladder: smart → reasoning → opus (fast dropped — protolabs/fast too weak).
+    # Ladder: standard → reasoning → advanced (fast dropped — protolabs/fast too weak).
     assert b.next_tier("smart") == "reasoning"
-    assert b.next_tier("reasoning") == "opus"
+    assert b.next_tier("reasoning") == "advanced"
     assert b.next_tier("opus") is None  # top of the ladder → caller blocks
-    assert b.next_tier("nonsense") == store.TIER_LADDER[0]  # stale/unknown tier → floor (smart)
+    assert b.next_tier("nonsense") == store.TIER_LADDER[0]  # stale/unknown tier → floor (standard)
     assert b.next_tier("fast") == store.TIER_LADDER[0]  # a now-removed tier falls back to the floor
 
 

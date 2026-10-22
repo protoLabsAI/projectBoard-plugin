@@ -12,6 +12,7 @@ import re
 import sys
 
 from .. import host_friction, review_coverage_hold
+from ..projects import normalize_tier_config
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .drive import DriveMixin
 from .preflight import PreflightMixin
@@ -36,6 +37,7 @@ _FRICTION_BLOCK_CAUSES = (
 class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
     def __init__(self, cfg: dict, *, gap_reporter: setup_check.GapReporter | None = None):
         self.cfg = cfg or {}
+        tier_cfg = normalize_tier_config(self.cfg)
         # Setup preflight (v0.42.0): the host-gap reporter register() built around the
         # plugin registry (a no-op reporter when the host lacks the seam or — in the
         # suite — none is handed in), and the PATH probe the preflight uses. Both are
@@ -51,8 +53,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # returns THAT project's settings; every repo/gate/coder/preflight decision below
         # resolves through it, falling back to the instance-level knobs the flat config
         # parsed. `_default_project` is the fallback for a feature carrying no label.
-        self._projects = resolve_projects(self.cfg)
-        self._default_project = resolve_default_project(self.cfg)
+        self._projects = resolve_projects(tier_cfg)
+        self._default_project = resolve_default_project(tier_cfg)
         # NO default coder name (v0.42.0). An unset `coder` is "" — a preflight failure
         # the operator sees (setup_check), never a phantom delegate name that exists on
         # one machine and blocks every feature with "delegate not configured" elsewhere.
@@ -115,8 +117,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # (["codex", "sonnet"]) — see rung_delegates. Normalised to a list here so every
         # consumer sees one shape; a bare string stays a one-element rung, so existing
         # configs behave exactly as before.
-        self.coders = {str(k): rung_delegates(v) for k, v in (self.cfg.get("coders") or {}).items()}
-        self.escalation_on = escalation_enabled(self.cfg)
+        self.coders = {str(k): rung_delegates(v) for k, v in (tier_cfg.get("coders") or {}).items()}
+        self.escalation_on = escalation_enabled(tier_cfg)
         # Concurrency: drive up to `max_concurrent` features at once, each in its own
         # worktree. 1 (the default) = serial — the safe default for token + merge-
         # integration cost; raise it on a repo that parallelizes cleanly. LIVE: a

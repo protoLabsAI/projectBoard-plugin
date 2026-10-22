@@ -162,7 +162,7 @@ async def test_the_sweep_publishes_after_its_own_transitions(monkeypatch):
 def stalling_br(tmp_path, monkeypatch):
     """The real `br`, until told to stall, the way #404's stalls looked. ``PB_STALL=<verb>``
     hangs that verb before it runs, and ``PB_STALL_ONCE=<verb>`` only its first call;
-    ``PB_STALL_AFTER=<verb>`` RUNS it (its write commits) and then hangs. The timeout drops to 1s and the TERM grace to 0.3s, so a stall costs a second
+    ``PB_STALL_AFTER=<verb>`` RUNS it (its write commits) and then hangs. When a stall is requested, the timeout drops to 1s and the TERM grace to 0.3s, so a stall costs a second
     of #431's 45, and the store stops the child and raises ``BoardTimeout`` as it would live."""
     real = shutil.which(store_mod.BR)
     once = tmp_path / "stalled-once"
@@ -177,11 +177,17 @@ exec "{real}" "$@"
     )
     script.chmod(0o755)
     monkeypatch.setattr(store_mod, "BR", str(script))
-    monkeypatch.setattr(store_mod, "_BR_TIMEOUT_S", 1.0)
     monkeypatch.setattr(store_mod, "_BR_TERM_GRACE_S", 0.3)
     monkeypatch.delenv("PB_STALL", raising=False)
     monkeypatch.delenv("PB_STALL_AFTER", raising=False)
     monkeypatch.delenv("PB_STALL_ONCE", raising=False)
+
+    def stall(key, verb):
+        # Cold workspace setup must retain the normal deadline under parallel load.
+        monkeypatch.setattr(store_mod, "_BR_TIMEOUT_S", 1.0)
+        monkeypatch.setenv(key, verb)
+
+    return stall
 
 
 @requires_br
@@ -199,13 +205,13 @@ async def test_a_write_that_stalls_after_landing_still_marks_the_snapshot_stale(
     assert _cards(work_snapshot.provider()) == {fid: "ready"} and not _status_line(work_snapshot.provider())
 
     before = work_snapshot.board_revision()
-    monkeypatch.setenv("PB_STALL", "list")
+    stalling_br("PB_STALL", "list")
     with pytest.raises(store_mod.BoardTimeout):
         board.live_cards()
     assert work_snapshot.board_revision() == before  # a stalled read changes nothing
     monkeypatch.delenv("PB_STALL")
 
-    monkeypatch.setenv("PB_STALL_AFTER", "update")
+    stalling_br("PB_STALL_AFTER", "update")
     with pytest.raises(store_mod.BoardTimeout):
         board.flag_blocked(fid, "zombie drive: no process, no branch, no PR", category="terminal")
     monkeypatch.delenv("PB_STALL_AFTER")
@@ -290,7 +296,7 @@ async def test_a_stalled_refresher_read_does_not_cost_the_claim_scan(tmp_path, m
         dispatched.append(feature["id"])
 
     monkeypatch.setattr(loop, "_drive", _drive)
-    monkeypatch.setenv("PB_STALL_ONCE", "list")
+    stalling_br("PB_STALL_ONCE", "list")
 
     with caplog.at_level(logging.WARNING, logger=_LOG):
         refresher = asyncio.create_task(loop._keep_work_snapshot_current())

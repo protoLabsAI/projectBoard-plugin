@@ -68,7 +68,7 @@ import types
 from . import br_fetch
 from . import store as store_mod
 from .projects import default_project as resolve_default_project
-from .projects import parse_github_remote, resolve_projects
+from .projects import normalize_coder_tiers, normalize_tier_config, parse_github_remote, resolve_projects
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -475,7 +475,7 @@ def _loop_slot():
 
 def snapshot_of(cfg: dict) -> dict:
     """The restart-only keys of ``cfg`` (plus ``coder``), as the loop reads them."""
-    cfg = cfg or {}
+    cfg = normalize_tier_config(cfg)
     out = {k: cfg.get(k) for k in LOOP_RESTART_KEYS}
     out["coder"] = str(cfg.get("coder") or "").strip()
     return out
@@ -499,6 +499,7 @@ def stale_loop_keys(cfg: dict, snapshot: dict | None) -> list[str]:
     if not snapshot:
         return []
     want = snapshot_of(cfg)
+    snapshot = snapshot_of(snapshot)
     return [k for k in LOOP_RESTART_KEYS if want.get(k) != snapshot.get(k)]
 
 
@@ -513,7 +514,7 @@ def _rung_names(value) -> list[str]:
 def _normalize_coders(raw) -> dict[str, list[str]]:
     """Tier → its delegate names. Values are LISTS since #362; a string rung normalises
     to one element, so a pre-#362 config reads identically."""
-    return {str(k): _rung_names(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    return {str(k): _rung_names(v) for k, v in normalize_coder_tiers(raw).items()} if isinstance(raw, dict) else {}
 
 
 def uncovered_tiers(coders: dict) -> list[str]:
@@ -540,6 +541,7 @@ def coder_names(cfg: dict) -> list[str]:
                 out.append(name)
 
     _add(cfg.get("coder"))
+    cfg = normalize_tier_config(cfg)
     tiers = cfg.get("coders")
     if isinstance(tiers, dict):
         for v in tiers.values():
@@ -832,7 +834,7 @@ def setup_status(
     to make the no-coder hint followable; it defaults to the live roster only when
     ``delegates`` isn't injected either, so a test injecting one keeps the generic hint.
     """
-    cfg = cfg or {}
+    cfg = normalize_tier_config(cfg)
     which = which or shutil.which
     if acp_delegates is None and delegates is None:
         acp_delegates = _default_acp_delegate_names

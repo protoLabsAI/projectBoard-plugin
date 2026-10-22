@@ -27,8 +27,48 @@ entry says ``master`` — you'd get ``master``. Fix the registry entry, or leave
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+
+# Shared by config load/save and card-label reads.
+TIER_ALIASES = {"smart": "standard", "opus": "advanced"}
+log = logging.getLogger("protoagent.plugins.project_board")
+
+
+def canonical_tier(tier: str) -> str:
+    return TIER_ALIASES.get(tier, tier)
+
+
+def normalize_coder_tiers(raw):
+    """Rename tier keys without changing delegates, unknown keys, or the input."""
+    if not isinstance(raw, dict):
+        return raw
+    out = {}
+    conflicts = []
+    for key, value in raw.items():
+        tier = canonical_tier(str(key))
+        if key in TIER_ALIASES and tier in raw:
+            conflicts.append(f"{key} → {tier}")
+            continue
+        out[tier] = value
+    if conflicts:
+        log.warning("[project_board] duplicate legacy coder tiers (%s); canonical keys win", ", ".join(conflicts))
+    return out
+
+
+def normalize_tier_config(cfg: dict) -> dict:
+    """Copy a board section, canonicalizing every coder map at its boundaries."""
+    out = dict(cfg or {})
+    if "coders" in out:
+        out["coders"] = normalize_coder_tiers(out["coders"])
+    if isinstance(out.get("projects"), dict):
+        out["projects"] = {
+            name: normalize_tier_config(entry) if isinstance(entry, dict) else entry
+            for name, entry in out["projects"].items()
+        }
+    return out
+
 
 # The manifest's own defaults. A resolved config always carries these (the loader
 # falls back to `manifest.config`), so they double as "operator didn't choose".
@@ -87,6 +127,8 @@ def _copy_settings(src: dict) -> dict:
     """Lift the execution settings out of a raw entry/flat-config dict — the fixed
     keys plus every `coder_solve_*` knob."""
     entry = {k: src[k] for k in _PROJECT_SETTING_KEYS if k in src}
+    if "coders" in entry:
+        entry["coders"] = normalize_coder_tiers(entry["coders"])
     for k, v in src.items():
         if str(k).startswith(_CODER_SOLVE_PREFIX):
             entry[k] = v
@@ -237,10 +279,11 @@ def registry_projects() -> list[dict]:
 def resolve_project_cfg(cfg: dict) -> dict:
     """Layer the registry under the board's own repo settings.
 
-    No ``project:`` set ⇒ returns ``cfg`` untouched, so every existing config and
-    every older host behaves exactly as before. Raises ``ValueError`` when
+    No ``project:`` set ⇒ only canonicalizes coder tier aliases; existing config
+    and older hosts keep the same routing. Raises ``ValueError`` when
     ``project:`` names something the registry doesn't have (see module docstring).
     """
+    cfg = normalize_tier_config(cfg)
     name = str((cfg or {}).get("project") or "").strip()
     if not name:
         return dict(cfg or {})

@@ -53,6 +53,7 @@ from urllib.parse import urlparse
 from . import _TERMINAL_STATES, br_fetch, work_snapshot
 from . import gates as publish_gates
 from . import merge_state_hold, release_freeze, review_coverage_hold
+from .projects import canonical_tier, normalize_coder_tiers
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -968,8 +969,8 @@ def _listing_task_signal(f: dict) -> None:
 
 
 # difficulty → initial model tier (the escalation ladder's first rung, D10).
-DIFFICULTY_TIER = {"small": "smart", "medium": "reasoning", "large": "reasoning", "architectural": "opus"}
-TIER_LADDER = ["smart", "reasoning", "opus"]
+DIFFICULTY_TIER = {"small": "standard", "medium": "reasoning", "large": "reasoning", "architectural": "advanced"}
+TIER_LADDER = ["standard", "reasoning", "advanced"]
 
 # A plan-item `depends_on` entry that is a plain integer is a 0-based INDEX into the
 # plan. STRICT — a single optional leading '-' only. The old `lstrip('-').isdigit()`
@@ -4305,15 +4306,15 @@ class BeadsBoard:
     #    optional metadata). ───────────────────────────────────────────────────────
     def initial_tier(self, fid: str) -> str:
         f = self._require(fid)
-        return DIFFICULTY_TIER.get(f.get("difficulty", ""), "smart")
+        return DIFFICULTY_TIER.get(f.get("difficulty", ""), "standard")
 
     def current_tier(self, fid: str) -> str:
         """The highest tier this feature has been tried at (from `tier:` labels),
         else its difficulty-derived initial tier."""
         f = self._require(fid)
-        present = [l.split(":", 1)[1] for l in f.get("labels") or [] if l.startswith("tier:")]
+        present = [canonical_tier(l.split(":", 1)[1]) for l in f.get("labels") or [] if l.startswith("tier:")]
         idxs = [TIER_LADDER.index(t) for t in present if t in TIER_LADDER]
-        return TIER_LADDER[max(idxs)] if idxs else DIFFICULTY_TIER.get(f.get("difficulty", ""), "smart")
+        return TIER_LADDER[max(idxs)] if idxs else DIFFICULTY_TIER.get(f.get("difficulty", ""), "standard")
 
     def escalate(self, fid: str, reason: str) -> str | None:
         """Record the failed attempt at the current tier and advance to the next
@@ -4327,8 +4328,9 @@ class BeadsBoard:
 
     def record_attempt(self, fid: str, *, tier: str, outcome: str) -> dict:
         """Log an attempt (tier + outcome) as labels — `attempt:N` counts the tries;
-        the loop reads these to walk fast→smart→reasoning and stop at the top."""
+        the loop reads these to walk standard→reasoning→advanced and stop at the top."""
         f = self._require(fid)
+        tier = canonical_tier(tier)
         n = len([a for a in f.get("attempts", [])]) + 1
         self._run("update", fid, "--add-label", f"attempt:{n}", "--add-label", f"tier:{tier}")
         self.comment(fid, f"attempt {n} (tier={tier}): {outcome}")
@@ -4337,7 +4339,7 @@ class BeadsBoard:
     def next_tier(self, current: str) -> str | None:
         """The next rung up the ladder, or None at the top (→ caller blocks)."""
         try:
-            i = TIER_LADDER.index(current)
+            i = TIER_LADDER.index(canonical_tier(current))
         except ValueError:
             return TIER_LADDER[0]
         return TIER_LADDER[i + 1] if i + 1 < len(TIER_LADDER) else None
@@ -5888,7 +5890,7 @@ def escalation_enabled(cfg: dict) -> bool:
     delegate. A single ACP coder ⇒ no ladder (one dispatch then Blocked; CI fail
     parks for the operator), so difficulty/tier stay irrelevant — shared by the
     loop (initial dispatch) and the API (`/ci`) so they apply the same policy."""
-    coders = (cfg or {}).get("coders") or {}
+    coders = normalize_coder_tiers((cfg or {}).get("coders") or {})
     return len({str(v) for v in coders.values()}) > 1
 
 

@@ -157,11 +157,11 @@ def test_escalation_cost_and_difficulty_labels_land_at_realistic_values(board):
     f = board.create_feature("Ladder target", spec="s", acceptance_criteria="a", difficulty="architectural")
     fid = f["id"]
     assert "diff:architectural" in board.get_feature(fid)["labels"]  # the longest diff: value
-    # architectural starts at the TOP rung: escalate records the attempt at `opus`
+    # architectural starts at the TOP rung: escalate records the attempt at `advanced`
     # and returns None (ladder exhausted) — the realistic worst-case label set.
     assert board.escalate(fid, "gate failed: 2 tests red — see CI") is None
     labels = board.get_feature(fid)["labels"]
-    assert "tier:opus" in labels and "attempt:1" in labels
+    assert "tier:advanced" in labels and "attempt:1" in labels
     # gens: accumulates by REPLACING the single label (ADR 0064) — 40 then +2 = one gens:42
     board.record_gens_spent(fid, 40)
     got = board.record_gens_spent(fid, 2)
