@@ -1896,6 +1896,7 @@ function cardDetail(f){
   const fact = (k, v) => v === "" || v == null ? "" : '<div class="cf"><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>';
   const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts) || 0;
   let h = '<div class="cflags">'+flags({...f, difficulty: ""})+'</div>'          // difficulty is a fact below
+    + nextActionDetail(f)                                                       // the chip's full status
     + '<dl class="cfacts">'
     + fact("state", '<span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span><span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state || "")+'</span></span>')
     + fact("priority", f.priority == null ? "" : "P"+esc(String(f.priority)))

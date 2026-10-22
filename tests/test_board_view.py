@@ -303,6 +303,8 @@ def test_status_chips_stay_short_and_the_drawer_spells_them_out():
     assert 'NEXT_ACTION_CHIP[f.next_action] || ["", shortLabel(f.next_action)]' in BOARD_PAGE
     assert "const CHIP_MAX = 32;" in BOARD_PAGE
     assert "let h = nextActionDetail(f) + '<div class=\"tdlbl\">spec</div>'" in BOARD_PAGE
+    # …and a coding card's Card tab carries the same line under its chips
+    assert "+ nextActionDetail(f)" in BOARD_PAGE
 
 
 def test_task_cards_share_lanes_and_ordering_with_coding_features():
