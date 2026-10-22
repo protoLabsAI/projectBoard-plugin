@@ -132,6 +132,22 @@ def test_board_projects_lists_the_configured_map_with_its_default(monkeypatch, t
     assert out["default_project"] == "web"
 
 
+def test_board_projects_names_the_implicit_project_when_the_registry_is_empty(monkeypatch, tmp_path):
+    """A flat single-repo board (`repo:`, no `projects:` map) on a host whose project
+    registry answers with NOTHING: the registry snapshot succeeds but is empty. The board
+    still has one project, the implicit `default` every card is stamped with. It used to
+    come back empty, so the card-from-chat form had no project and the agent warned the
+    user that creation might fail."""
+    import importlib
+
+    reg = importlib.import_module(f"{pb.__name__}.project_registry")
+    monkeypatch.setattr(reg, "project_registry_snapshot", lambda: {"projects": [], "default_project": ""})
+    out = json.loads(_tools(monkeypatch, None, cfg={"repo": str(tmp_path)})["board_projects"].invoke({}))
+    assert [p["name"] for p in out["projects"]] == ["default"]
+    assert out["projects"][0]["repo"] == str(tmp_path)
+    assert out["default_project"] == "default"
+
+
 # ── the Board view's follow mode ─────────────────────────────────────────────────
 
 
