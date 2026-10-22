@@ -447,6 +447,7 @@ def test_board_create_feature_depends_on_open_but_not_in_review_is_allowed(monke
 # registered tool so the next unguarded one cannot ship.
 
 _MINIMAL_ARGS = {
+    "board_watch": {"feature_id": "bd-1"},
     "board_create_epic": {"title": "t"},
     "board_create_feature": {"title": "t"},
     "board_create_task": {"title": "t"},
@@ -480,6 +481,7 @@ _MINIMAL_ARGS = {
 # the NEVER-RAISE half of the contract.
 _NO_STORE_ARGS = {
     "board_dispatch": {},
+    "board_projects": {},  # a config read, no store
     "board_salvage_feature": {"feature_id": "bd-1"},
     "board_show_cards": {"ids": ["bd-1"]},
     "board_register_project": {"name": "x", "repo": "/nope"},

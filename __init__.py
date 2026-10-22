@@ -28,6 +28,11 @@ from langchain_core.tools import tool
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
+# board_watch (card-from-chat): the plugin event the Board view follows a card on (the bus
+# publishes it as `project_board.focus`) and the view `registry.navigate` opens.
+FOCUS_EVENT = "focus"
+BOARD_VIEW = "board"
+
 
 def register(registry) -> None:
     # Resolve `project:` against the host's ADR 0095 registry BEFORE anything reads
@@ -115,7 +120,9 @@ def register(registry) -> None:
         log.exception("[project_board] registering the board-cards component failed")
 
     # A few board tools so the agent (or A2A) can drive the board headlessly.
-    for t in _board_tools(cfg):
+    # `registry` rides along for board_watch (the one tool that drives the console: it
+    # publishes the Board view's `focus` event, then navigates to the view).
+    for t in _board_tools(cfg, registry=registry):
         registry.register_tool(t)
 
     # Reload-stability (#178): a hot-reload (`reload_plugins`, graph reload) imports
@@ -465,7 +472,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
     return None
 
 
-def _board_tools(cfg: dict):
+def _board_tools(cfg: dict, registry=None):
     from .failures import PREFLIGHT_HOLD_CLASS
     from .projects import default_project as resolve_default_project
     from .projects import rehome_hint, resolve_projects, store_db_path, unresolved_project
@@ -1795,6 +1802,61 @@ def _board_tools(cfg: dict):
         annotate_next_action(feats, cfg)  # labels + config only, no network
         return summary_text(props, feats, missing, total) + component_tail(props)
 
+    @tool
+    def board_projects() -> str:
+        """List the board's registered projects (the names `board_create_feature(project=…)`
+        accepts) and the default a create falls back to. Read-only. Use it to fill a project
+        picker, e.g. the card-from-chat form, instead of guessing names. Returns JSON
+        `{projects: [{name, repo, base_branch}], default_project}`."""
+        try:
+            from .project_registry import project_registry_snapshot
+
+            snap = project_registry_snapshot()
+            rows = [
+                {"name": r.get("name", ""), "repo": r.get("repo", ""), "base_branch": r.get("base_branch", "")}
+                for r in snap.get("projects") or []
+            ]
+            default = snap.get("default_project") or ""
+        except Exception:  # noqa: BLE001 — no live host config (a host-free run): the register-time map
+            rows = [
+                {"name": n, "repo": str(e.get("repo") or ""), "base_branch": str(e.get("base_branch") or "")}
+                for n, e in sorted(projects.items())
+            ]
+            default = default_proj
+        return json.dumps({"projects": rows, "default_project": default})
+
+    @tool
+    def board_watch(feature_id: str) -> str:
+        """Open the Board view on the console's main stage and FOLLOW one card. The card gets
+        an accent ring and a "Following" tag, and the view keeps it in view as the loop moves
+        it backlog → on deck → building → in review → done. Following ends at done, or when
+        the operator clicks or scrolls the board. Call it right after you create (and ready)
+        a card the operator wants to watch, as in the card-from-chat flow. Changes nothing
+        on the board. Returns one confirmation line."""
+        from .board_cards import _ID_RE
+
+        fid = _strip_wrapping_quotes(str(feature_id or "")).strip()
+        if not _ID_RE.fullmatch(fid):
+            return f"Error: {feature_id!r} is not a board card id (e.g. bd-a1b2)."
+        try:
+            f = get_store(**store_kw).get_feature(fid)
+        except BoardError as exc:
+            return f"Error: {exc}"
+        if f is None:
+            return f"Error: no board card {fid!r}."
+        emit = getattr(registry, "emit", None)
+        navigate = getattr(registry, "navigate", None)
+        if not callable(emit) or not callable(navigate):
+            return f"Error: this host can't drive the console. Open the Board view and find {fid} there."
+        # Publish, THEN navigate (protoAgent plugin-view-bridge "Events"): a Board view that is
+        # already open gets the event live; one the navigate mounts is caught up by the host's
+        # replay of what this plugin published just before it.
+        emit(FOCUS_EVENT, {"id": fid})
+        navigate(BOARD_VIEW)
+        state = str(f.get("board_state") or f.get("state") or "")
+        lane = {"ready": "on deck", "in_progress": "building", "in_review": "in review"}.get(state, state)
+        return f"Following {fid} on the Board ({lane or 'unknown lane'}); it stays in view until it lands in done."
+
     tools = [
         board_create_epic,
         board_create_feature,
@@ -1824,6 +1886,8 @@ def _board_tools(cfg: dict):
         board_dispatch,
         board_salvage_feature,
         board_show_cards,
+        board_projects,
+        board_watch,
     ]
 
     # Runtime project registration (#167). Appended rather than folded in above because

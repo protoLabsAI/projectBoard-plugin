@@ -79,7 +79,13 @@ def test_board_page_is_four_rules_compliant():
     assert "/api/plugins/project_board/features" in html
     # The kit owns theming + the handshake — no hand-rolled :root map or listener.
     assert ":root{" not in html and ":root {" not in html
-    assert 'addEventListener("message"' not in html
+    # One message listener is allowed: the event-bus relay board_watch's follow mode rides
+    # (`protoagent:event`). It must never take the handshake back from the kit.
+    assert html.count('addEventListener("message"') == 1
+    listener = html[html.index('addEventListener("message"') :]
+    listener = listener[: listener.index("\n});") + 4]
+    assert '"protoagent:event"' in listener
+    assert "protoagent:init" not in listener and "protoagent:theme" not in listener
 
 
 # ── the planning skill ──────────────────────────────────────────────────────────
