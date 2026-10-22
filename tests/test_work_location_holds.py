@@ -9,8 +9,8 @@ from project_board import store, work_locations as ledger
 SHA = "abc1234" + "d" * 33
 
 
-@pytest.fixture(params=["flag_blocked", "set_merge_hold"])
-def hold(request, make_board):
+@pytest.fixture
+def hold_board(make_board):
     bead = {"id": "bd-1", "title": "Work", "status": "open", "labels": [], "comments": []}
     calls = []
     failures = set()
@@ -33,6 +33,12 @@ def hold(request, make_board):
             pytest.fail(f"unexpected external operation: {args}")
 
     b = make_board(run)
+    return b, bead, calls, failures
+
+
+@pytest.fixture(params=["flag_blocked", "set_merge_hold"])
+def hold(request, hold_board):
+    b, bead, calls, failures = hold_board
     return b, lambda reason: getattr(b, request.param)("bd-1", reason), bead, calls, failures
 
 
@@ -186,3 +192,60 @@ def test_failed_ledger_write_cannot_authorize_hold(hold):
     with pytest.raises(store.BoardError, match="record_work_location"):
         set_hold(SHA)
     assert bead["labels"] == bead["comments"] == []
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "external review FAILED at head abc1234 after 2 review fix round(s)",
+        "merged-state gate failed: abc1234 on branch=feat/rescue",
+        "bd-1: sha 'abc1234' has no unambiguous recorded work location",
+    ],
+)
+def test_loop_failure_diagnostics_block_without_location(hold_board, reason):
+    from project_board.loop import BoardLoop
+
+    b, bead, calls, _ = hold_board
+    loop = BoardLoop({})
+    result = loop._flag_blocked(b, "bd-1", reason, category="terminal", friction=False)
+    assert result["blocked"]
+    assert bead["comments"][-1]["text"] == f"blocked: {reason}"
+    assert [c[0] for c in calls] == ["show", "comments", "update", "show"]
+
+
+@pytest.mark.parametrize("category", ["", "terminal", "agent-hold", "transient", "preflight-hold"])
+def test_category_cannot_bypass_explicit_hold_validation(hold_board, category):
+    b, bead, _, _ = hold_board
+    with pytest.raises(store.BoardError, match="record_work_location"):
+        b.flag_blocked("bd-1", "preserve abc1234", category=category)
+    assert bead["labels"] == bead["comments"] == []
+
+
+@pytest.mark.parametrize("command", ["comments", "update"])
+def test_automatic_block_still_requires_successful_audit_and_state_writes(hold_board, command):
+    from project_board.loop import BoardLoop
+
+    b, bead, _, failures = hold_board
+    failures.add(command)
+    with pytest.raises(store.BoardError, match="write failed"):
+        BoardLoop({})._flag_blocked(b, "bd-1", "gate failed at abc1234", friction=False)
+    assert bead["labels"] == []
+
+
+async def test_merged_gate_hash_failure_reaches_real_store_block(hold_board, monkeypatch):
+    from project_board import worktree
+    from tests.test_loop import _aret, _vloop
+    from tests.test_merged_verify_infra import _merged_tree
+
+    b, bead, _, _ = hold_board
+    bead["status"] = "in_progress"
+    bead["labels"] = ["in-review"]
+    _merged_tree(monkeypatch)
+    monkeypatch.setattr(worktree, "pr_state", _aret("OPEN"))
+    loop = _vloop(merged_verify_max=5)
+    failure = "FAILED test_result at abc1234 on branch=feat/rescue"
+    monkeypatch.setattr(loop, "_run_local_gate", _aret(failure))
+    assert await loop._verify_merged_state(b, b.get_feature("bd-1"), "pr", "/repo") is True
+    assert b.get_feature("bd-1")["blocked"]
+    assert bead["comments"][-1]["text"].endswith(failure)
+    assert "budget:merged-verify:1" in bead["labels"]

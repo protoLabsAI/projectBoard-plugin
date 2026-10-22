@@ -313,7 +313,7 @@ class _Store:
         self.state = "ready"
         return self._feature()
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append(("flag_blocked", reason, category))
         self.state = "blocked"
         return self._feature()
@@ -462,8 +462,30 @@ async def test_never_bounced_under_a_live_round(monkeypatch):
     assert store.state == "in_review" and not store.calls
 
 
-async def test_a_spent_budget_blocks_for_a_human_as_the_gate_does(monkeypatch):
+@pytest.mark.parametrize("real_block_setter", [False, True])
+async def test_a_spent_budget_blocks_for_a_human_as_the_gate_does(monkeypatch, make_board, real_block_setter):
     store = _Store(labels=["budget:ext-review-fix:2"])
+    if real_block_setter:
+
+        def run(*args, **kwargs):
+            if args[0] == "comments":
+                store.comments.append(args[3])
+            elif args[0] == "update":
+                store.state = "blocked"
+                store.labels.append("blocked")
+            else:
+                pytest.fail(f"unexpected operation: {args}")
+
+        board = make_board(run)
+        monkeypatch.setattr(board, "_require", lambda fid: store._feature())
+        monkeypatch.setattr(board, "get_feature", store.get_feature)
+
+        def block(fid, reason, category="", *, automatic=False):
+            result = board.flag_blocked(fid, reason, category, automatic=automatic)
+            store.calls.append(("flag_blocked", reason, category))
+            return result
+
+        monkeypatch.setattr(store, "flag_blocked", block)
     loop = _loop(monkeypatch, store, cfg={"review_fix_max": 2})
     await loop._reconcile_prs()
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
@@ -471,6 +493,8 @@ async def test_a_spent_budget_blocks_for_a_human_as_the_gate_does(monkeypatch):
     assert ("requeue",) not in store.calls
     assert any("useKeybindings.ts:55" in c for c in store.comments)  # the findings are on the bead
     assert "budget:ext-review-fix:2" not in store.labels  # reset, as the gate's exhaustion does
+    assert store.state == "blocked"
+    assert f"ext-review-bounced:{HEAD[:12]}" in store.labels
 
 
 async def test_the_gates_clean_verdict_does_not_refill_the_external_budget(monkeypatch):

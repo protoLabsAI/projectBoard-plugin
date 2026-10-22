@@ -67,7 +67,7 @@ class FakeLoopStore:
         self.calls.append(("open_review", fid, pr_url))
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append(("flag_blocked", fid, reason, category))
         return {"id": fid}
 
@@ -3265,7 +3265,7 @@ class _TaskStore:
         self.calls.append(("record_delivery", fid, text))
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append(("flag_blocked", fid, reason))
         return {"id": fid}
 
@@ -3998,7 +3998,7 @@ class _BlockRecorder:
     def __init__(self):
         self.blocked = []  # (fid, reason, category)
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.blocked.append((fid, reason, category))
         return {"id": fid}
 
@@ -4088,7 +4088,7 @@ class _AlwaysRaceStore(_ClaimStore):
     def claim(self, fid, assignee=""):
         return None  # never wins the race
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.blocked.append((fid, reason, category))
         for f in self._features:
             if f["id"] == fid:
@@ -4137,7 +4137,7 @@ async def test_ready_queue_transient_claim_race_resets_on_success(monkeypatch):
                 return None  # a one-off race on the first tick
             return super().claim(fid, assignee=assignee)
 
-        def flag_blocked(self, fid, reason, category=""):
+        def flag_blocked(self, fid, reason, category="", *, automatic=False):
             self.blocked.append((fid, reason))
             return {"id": fid}
 
@@ -4518,7 +4518,7 @@ class _ReconcileStore:
         self.merged.append(pr_url)
         return {"id": "x", "board_state": "done"}
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, *, automatic=False):
         self.blocked.append((fid, reason))
 
     def clear_budgets(self, fid, kinds=None):
@@ -4613,7 +4613,7 @@ class _CiStore:
         self.requeued.append(fid)
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, *, automatic=False):
         self.blocked.append((fid, reason))
 
     def escalate(self, fid, reason):
@@ -6673,7 +6673,7 @@ class _RoundTripStore(_GateStore):
             self.labels.append(f"reviewed-head:{sha}")
         return super().record_reviewed_head(fid, sha)
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, *, automatic=False):
         self.state = "blocked"
         return super().flag_blocked(fid, reason)
 
@@ -10198,7 +10198,7 @@ class _ThreadProbeStore:
         self._run("open_review")
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, *, automatic=False):
         self._run("flag_blocked")
         return {"id": fid}
 

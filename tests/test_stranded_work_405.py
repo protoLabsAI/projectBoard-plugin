@@ -576,7 +576,7 @@ class _Store:
     def list_features(self, state=None, include_archived=False):
         return []
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.calls.append(("flag_blocked", fid, reason, category))
         return {"id": fid}
 

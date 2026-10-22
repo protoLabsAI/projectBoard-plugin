@@ -848,7 +848,7 @@ class _GateStore:
     def comment(self, fid, text):
         self.comments.append((fid, text))
 
-    def flag_blocked(self, fid, reason, category=""):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         raise AssertionError(f"a publish wait must never be flagged as a livelock: {fid} {reason}")
 
 

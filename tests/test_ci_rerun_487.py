@@ -50,7 +50,7 @@ class _Store:
         self.requeued.append(fid)
         return {"id": fid}
 
-    def flag_blocked(self, fid, reason):
+    def flag_blocked(self, fid, reason, *, automatic=False):
         self.blocked.append((fid, reason))
 
     def escalate(self, fid, reason):

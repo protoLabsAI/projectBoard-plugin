@@ -635,10 +635,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         (a PR closed unmerged) is an outcome, not friction, and is never recorded. A drive's
         own failure is recorded by kind where it happens (``_friction_drive_failure``), so
         ``_block_or_stand_aside`` passes ``friction=False``. A block a human sets (the tool,
-        the API) does not come through here. The store call is unchanged: ``category`` is
-        passed only when given."""
+        the API) does not come through here. The store marks these as automatic failure diagnostics;
+        ``category`` is passed only when given."""
         kwargs = {"category": category} if category else {}
-        out = store.flag_blocked(fid, reason, **kwargs)
+        out = store.flag_blocked(fid, reason, automatic=True, **kwargs)
         # A too-wide park is a designed outcome. Its diagnostic exception may match
         # the failure patterns even on the first line; the category is authoritative.
         # The actual timeout is still recorded by _friction_drive_failure (#556).
