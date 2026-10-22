@@ -1,0 +1,1 @@
+Card reads, redispatch prompts and cached working state now expose bounded recovery location evidence, git identity, probe freshness and safe next steps while preserving review and merge holds. Read-only command suggestions are shell-quoted data; the working-state provider performs no I/O.

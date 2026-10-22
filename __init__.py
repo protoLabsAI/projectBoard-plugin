@@ -951,6 +951,7 @@ def _board_tools(cfg: dict, registry=None):
                 "source_issue": f.get("source_issue", ""),
                 "requirements": f.get("requirements", []),
                 "work_locations": f.get("work_locations", {}),
+                **({"recovery_context": f["recovery_context"]} if f.get("recovery_context") else {}),
                 "depends_on": f.get("depends_on", []),
                 "open_depends_on": f.get("open_depends_on", []),
                 # Which project (#90) this feature builds in — "" for a pre-#90 feature
@@ -1608,6 +1609,8 @@ def _board_tools(cfg: dict, registry=None):
                 "difficulty": f["difficulty"],
                 "project": f.get("project", ""),
             }
+            if f.get("recovery_context"):
+                row["recovery_context"] = f["recovery_context"]
             if f.get("blocked"):
                 row["blocked_class"] = f.get("blocked_class", "")
                 row["blocked_reason"] = f.get("blocked_reason", "")

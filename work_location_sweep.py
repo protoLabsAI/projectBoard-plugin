@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 
-from . import project_registry, work_locations
+from . import project_registry, work_locations, work_snapshot
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -255,7 +255,8 @@ class Sweep:
         # bumps on each transition so a recovered-then-recurring risk re-notifies past dedup.
         transition = risk != old.get("risks", [])
         cycle = old.get("cycle", 0) + int(transition)
-        check = {**facts, "risks": risk, "cycle": cycle}
+        check = {**facts, "risks": risk, "cycle": cycle, "checked_at": time.time()}
+        work_snapshot.cache_location(feature["id"], entry, check)
         # Never erase confirmed push evidence: an unverifiable probe (filesystem off, path
         # outside approved roots, non-HTTPS upstream, timeout) leaves pushed None and retains
         # the recorded verdict; only a verified probe overwrites it with a fresh True/False.

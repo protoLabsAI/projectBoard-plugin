@@ -4785,13 +4785,20 @@ class BeadsBoard:
                     # intact on the bead. The row gets a small signal, not the body — see
                     # `_listing_task_signal` below.
                     #
-                    # Only those rows, and only from the batch already fetched: this is
-                    # a poll-rate endpoint, and the comment thread is the largest field on
-                    # a bead. Copying it for every coding card, whose projection reads
-                    # nothing from it unless blocked, would buy nothing.
+                    # Ordinary coding rows need only recovery records, not the full
+                    # comment thread. Reuse the fetched batch without per-card reads.
                     labels = r.get("labels") or []
-                    if rid and rid in show_by_id and (LABEL_BLOCKED in labels or r.get("issue_type") == LABEL_TASK):
-                        r["comments"] = show_by_id[rid].get("comments")
+                    if rid and rid in show_by_id:
+                        if LABEL_BLOCKED in labels or r.get("issue_type") == LABEL_TASK:
+                            r["comments"] = show_by_id[rid].get("comments")
+                        else:
+                            locations = [
+                                c
+                                for c in show_by_id[rid].get("comments") or []
+                                if _comment_text(c).startswith(work_locations.PREFIX)
+                            ]
+                            if locations:
+                                r["comments"] = locations
         out = [self._project(r) for r in rows]
         for f in out:
             if f.get("issue_type") == LABEL_TASK:
@@ -5940,6 +5947,10 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
             f["next_action_hint"] = f"{hint}. {prior}" if prior and not prior.startswith("held by agent (") else hint
             f["next_action"] = f.get("next_action") or "held by agent"
             f["awaiting_merge"] = False
+    for f in feats:
+        context = work_snapshot.recovery_context(f)
+        if context:
+            f["recovery_context"] = context
     return feats
 
 
