@@ -133,9 +133,10 @@
   .card--following{outline:2px solid var(--pl-color-accent);outline-offset:2px;z-index:2;
     box-shadow:0 0 0 6px color-mix(in srgb,var(--pl-color-accent) 16%,transparent),0 6px 18px color-mix(in srgb,var(--pl-color-fg) 12%,transparent)}
   .card--following.card--flying{z-index:6}
-  .follow-tag{font-size:9.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;line-height:15px;
-    padding:0 6px;border-radius:999px;white-space:nowrap;color:var(--pl-color-accent-fg,var(--pl-color-accent));
-    background:color-mix(in srgb,var(--pl-color-accent) 16%,transparent);
+  .follow-tag{position:absolute;top:-9px;right:10px;z-index:1;pointer-events:none;
+    font-size:9.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;line-height:15px;
+    padding:0 7px;border-radius:999px;white-space:nowrap;color:var(--pl-color-accent-fg,var(--pl-color-accent));
+    background:color-mix(in srgb,var(--pl-color-accent) 16%,var(--pl-color-bg-raised));
     border:var(--pl-border-width) solid color-mix(in srgb,var(--pl-color-accent) 40%,transparent)}
   .card--follow-in{animation:follow-in 1.4s cubic-bezier(.2,.8,.2,1)}
   @keyframes follow-in{0%{outline-offset:10px;outline-color:transparent}

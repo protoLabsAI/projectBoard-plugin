@@ -644,11 +644,11 @@ function blockedLine(f){
 function cardHTML(f, state){
   const spec = specLine(f.spec);
   const meta = (flags(f)+' '+taskFoot(f)).trim();
-  return '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
+  return (isFollowed(f.id) ? '<span class="follow-tag">Following</span>' : '')
+    + '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
     + '<span class="pri pri-'+esc(String(f.priority))+'" title="priority '+esc(String(f.priority))+' (0 = most urgent)">P'+esc(String(f.priority))+'</span>'
     + (f.project ? '<span class="proj" title="project">'+esc(f.project)+'</span>' : '')
     + '<span class="c-sp"></span>'
-    + (isFollowed(f.id) ? '<span class="follow-tag">Following</span>' : '')
     + (state === "done" ? '<span class="c-check" aria-label="done">'+CHECK_ICON+'</span>' : '')
     + '<button class="c-menu" type="button" data-card-menu="'+esc(f.id)+'" aria-haspopup="menu"'
     + ' aria-label="Actions for '+esc(f.id)+'" title="Actions (M)">⋯</button></div>'
