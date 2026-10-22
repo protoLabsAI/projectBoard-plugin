@@ -1,0 +1,1 @@
+Persist versioned external-work locations and revision history on card beads, expose record/list tools and feature projections, and preserve unknown push state without probing paths or granting execution authority. Refs #572.

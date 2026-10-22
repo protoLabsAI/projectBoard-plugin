@@ -50,7 +50,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import _TERMINAL_STATES, br_fetch, work_snapshot
+from . import _TERMINAL_STATES, br_fetch, work_locations, work_snapshot
 from . import gates as publish_gates
 from . import merge_state_hold, release_freeze, review_coverage_hold
 from .projects import canonical_tier, normalize_coder_tiers
@@ -4525,6 +4525,49 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     # ── reads (the projection) ────────────────────────────────────────────────
+    def record_work_location(self, fid: str, entry: dict) -> dict:
+        """Append a caller report; paths confer no execution authority."""
+        from . import work_locations as ledger
+
+        try:
+            fid = ledger.feature_id(fid)
+            state = ledger.validate(entry)
+            revision = ledger.record(state, self.actor)
+        except (ValueError, TypeError) as exc:
+            raise BoardError(str(exc)) from exc
+        with self._card_lock(fid):
+            current = self._require(fid)["work_locations"]
+            if current["errors"]:
+                raise BoardError("work-location history is malformed; repair the listed bead comments before recording")
+            for old in current["entries"]:
+                if old["id"] == state["id"]:
+                    if old["path"] != state["path"]:
+                        raise BoardError("location id already names another path; use a new id for a distinct location")
+                    if {k: v for k, v in old.items() if k not in {"version", "by", "at"}} == state and old[
+                        "by"
+                    ] == self.actor:
+                        return current
+                elif old["path"] == state["path"]:
+                    raise BoardError(f"path already recorded as {old['id']!r}; retry or update using that id")
+            if len(current["history"]) >= ledger.MAX_REVISIONS:
+                raise BoardError("work-location history limit reached; retain existing history and use another card")
+            if len(current["entries"]) >= ledger.MAX_ENTRIES and not any(
+                e["id"] == state["id"] for e in current["entries"]
+            ):
+                raise BoardError("work-location entry limit reached; use another card")
+            # Unlike best-effort comment(), persistence failures must reach the caller.
+            self._run("comments", "add", fid, ledger.PREFIX + json.dumps(revision))
+            return self._require(fid)["work_locations"]
+
+    def list_work_locations(self, fid: str) -> dict:
+        from .work_locations import feature_id
+
+        try:
+            fid = feature_id(fid)
+        except ValueError as exc:
+            raise BoardError(str(exc)) from exc
+        return self._require(fid)["work_locations"]
+
     def get_feature(self, fid: str) -> dict | None:
         """The feature row, or None when ``fid`` does not exist.
 
@@ -5143,6 +5186,7 @@ class BeadsBoard:
             "spec": bead.get("description", ""),
             "acceptance_criteria": bead.get("acceptance_criteria", ""),
             "design": bead.get("design", ""),
+            "work_locations": work_locations.project([_comment_text(c) for c in bead.get("comments") or []]),
             "files_to_modify": files_to_modify,
             "priority": bead.get("priority", 2),
             "issue_type": bead.get("issue_type", ""),

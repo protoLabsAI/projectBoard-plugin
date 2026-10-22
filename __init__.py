@@ -943,6 +943,7 @@ def _board_tools(cfg: dict):
                 "priority": f.get("priority", 2),
                 "source_issue": f.get("source_issue", ""),
                 "requirements": f.get("requirements", []),
+                "work_locations": f.get("work_locations", {}),
                 "depends_on": f.get("depends_on", []),
                 "open_depends_on": f.get("open_depends_on", []),
                 # Which project (#90) this feature builds in — "" for a pre-#90 feature
@@ -980,6 +981,35 @@ def _board_tools(cfg: dict):
                 ),
             }
         )
+
+    @tool
+    def board_record_work_location(feature_id: str, entry: dict) -> str:
+        """Record external work. entry requires stable id, path and purpose; optional
+        repo, branch, sha, remote_ref and session_id are caller-reported references.
+        pushed is true/false/null (unknown); omitted git fields are empty for evidence
+        directories. Updates supply complete state with the same id and path.
+        Actor and timestamp are stamped by the store; identical retries add no history.
+        Paths never authorize filesystem access or pushing. No git probes run here.
+        """
+        from . import work_locations
+
+        try:
+            feature_id = work_locations.feature_id(feature_id)
+            entry = work_locations.validate(entry)
+            return json.dumps(get_store(**store_kw).record_work_location(feature_id, entry))
+        except (BoardError, ValueError, TypeError) as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_list_work_locations(feature_id: str) -> str:
+        """Read a card's durable external-work ledger, including history and parse errors."""
+        from .work_locations import feature_id as validate_id
+
+        try:
+            feature_id = validate_id(feature_id)
+            return json.dumps(get_store(**store_kw).list_work_locations(feature_id))
+        except (BoardError, ValueError, TypeError) as exc:
+            return f"Error: {exc}"
 
     @tool
     def board_comments(feature_id: str, page_size: int = 50, offset: int = 0) -> str:
@@ -1803,6 +1833,8 @@ def _board_tools(cfg: dict):
         board_remove_dependency,
         board_get_feature,
         board_comments,
+        board_record_work_location,
+        board_list_work_locations,
         board_mark_ready,
         board_check_ready,
         board_mark_designing,
