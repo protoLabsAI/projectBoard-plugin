@@ -202,7 +202,7 @@ def test_reload_only_touches_live_knobs():
     loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30, "coders": {"smart": "a"}})
     assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coders": {"smart": "b"}}) == {}
     assert (
-        loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"smart": ["a"]}
+        loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"standard": ["a"]}
     )  # a string rung normalises to a one-element list (#362)
 
 
@@ -1023,7 +1023,7 @@ async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatc
     attempt spent); only when the retry ALSO returns empty is the failure recorded
     and the normal escalation ladder climbed. The escalated tier gets its own fresh
     retry window; the ladder top still empty → Blocked, reason naming the class."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _create(repo, base, fid, root, title="", **_kw):
@@ -1066,7 +1066,7 @@ async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatc
     assert len(attempts) == 4
     assert "same_tier_retry" in attempts[0][3] and "same_tier_retry" in attempts[2][3]
     assert "same_tier_retry" not in attempts[1][3] and "same_tier_retry" not in attempts[3][3]
-    assert attempts[0][2] == "fast" and attempts[2][2] == "smart"  # the retry stays on-tier
+    assert attempts[0][2] == "fast" and attempts[2][2] == "standard"  # the retry stays on-tier
     # Ladder exhausted + still empty → blocked, reason naming the class.
     blocked = [c for c in store.calls if c[0] == "flag_blocked"]
     assert len(blocked) == 1 and "empty coder reply — no diff, no tool calls" in blocked[0][2]
@@ -1076,7 +1076,7 @@ async def test_drive_empty_result_retries_same_tier_before_the_ladder(monkeypatc
 async def test_drive_no_diff_with_tool_activity_still_escalates(monkeypatch):
     """The existing capability class is untouched (#198 narrows only the truly-empty
     case): a no-diff dispatch that DID run tools still climbs the ladder."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _create(repo, base, fid, root, title="", **_kw):
@@ -1125,7 +1125,7 @@ async def test_drive_pre_model_dispatch_failure_blocks_without_a_tier_climb(monk
     a pre-model infra failure. It must block DIRECTLY for triage — no smart→reasoning→
     opus climb, no `tier:` label, ONE dispatch — under the `dispatch-infra` class, with
     the original infra evidence preserved on the block reason."""
-    store = _EscalatingStore(tiers=["reasoning", "opus"])  # a real 2-rung ladder is available…
+    store = _EscalatingStore(tiers=["reasoning", "advanced"])  # a real 2-rung ladder is available…
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
 
     async def _create(repo, base, fid, root, title="", **_kw):
@@ -1224,7 +1224,7 @@ async def test_drive_dispatch_failure_after_model_work_still_escalates(monkeypat
     """The genuine model-capability case is PRESERVED: a dispatch failure that lands
     AFTER the model reached first token (tools/thoughts recorded) is model-reachable —
     it still climbs the tier ladder exactly as before, NOT a pre-model infra block."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -1280,7 +1280,7 @@ async def test_drive_pre_model_failure_on_a_keep_worktree_redispatch_still_block
     dispatch's activity and climbed the ladder; with run-scoping it correctly reads "no
     model work this dispatch" and blocks for infra triage — no tier climb (#339)."""
     coder_seam._progress.clear()
-    store = _EscalatingStore(tiers=["reasoning", "opus"])  # a real ladder is available…
+    store = _EscalatingStore(tiers=["reasoning", "advanced"])  # a real ladder is available…
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -2735,7 +2735,7 @@ async def test_drive_carries_timeout_context_into_the_escalated_prompt(monkeypat
     byte-identical prompt (#146): the escalated dispatch leads with the ring buffer's
     timeout context — elapsed time, that no diff was produced, and the last tool/thought
     tail — injected via `_ci_feedback` so it rides the normal prompt-building path."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -2813,7 +2813,7 @@ async def test_drive_tier_climb_grants_a_fresh_window_despite_stale_budget_label
     re-derived the exhausted count from the projection's unchanged labels and
     blocked at once: two dispatches, no goal-fix bounce, flag_blocked — instead of
     the three dispatches and clean PR asserted here."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -2877,7 +2877,7 @@ async def test_drive_ledger_gate_exhaustion_escalates_into_the_same_worktree(mon
     and climbs a tier re-dispatches into the SAME worktree — the verified impl is on
     disk — so NO fresh create_worktree runs, and the escalated tier still leads with the
     truthful gate feedback that the work is already in the worktree and the item is open."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -2941,7 +2941,7 @@ async def test_drive_non_keep_worktree_failure_rebuilds_and_drops_stale_feedback
     with tool activity) keeps the existing fresh-worktree escalation — a NEW worktree for
     the climbed tier — and does NOT carry the prior round's keep-worktree feedback/diff
     (which described a worktree that no longer exists) into the escalated prompt."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -3012,7 +3012,7 @@ async def test_drive_keep_worktree_exhaustion_clears_feedback_when_no_worktree(m
     carry forward (wt unset), the escalated dispatch is a from-scratch build — so both
     _ci_feedback and _ci_prior_diff are cleared before it, never leaving the fresh build
     told its work is already on disk."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr("project_board.loop.asyncio.sleep", _no_sleep)
 
@@ -4678,7 +4678,7 @@ async def test_reconcile_ci_escalates_through_tiers_then_blocks(monkeypatch):
     """With a coder ladder AND no same-tier budget (ci_fix_max=0), each CI failure
     climbs a tier (stronger model) carrying the prior diff; the top tier failing →
     Blocked (the ladder is the bound)."""
-    store = _CiStore({"id": "bd-esc", "pr_url": "https://example/pr/7"}, escalate_tiers=["smart", "reasoning"])
+    store = _CiStore({"id": "bd-esc", "pr_url": "https://example/pr/7"}, escalate_tiers=["standard", "reasoning"])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     await _stub_ci_worktree(monkeypatch, ci=("failing", "Failing checks:\n- Tests: FAILURE"), diff="- old\n+ new")
 
@@ -8279,7 +8279,7 @@ def test_feature_resolves_repo_gate_and_coders_from_its_project():
     assert lp._repo_for(feat) == "/repos/board-plugin"  # project repo, NOT the stamped instance one
     assert lp._base_branch_for(feat) == "develop"
     assert lp._local_gate_cmd_for(feat) == "ruff check ."
-    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "smart": ["bp-smart"]}
+    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "standard": ["bp-smart"]}
     # …and the instance defaults are genuinely DIFFERENT — proving we didn't read them.
     assert lp.local_gate_cmd == "instance-gate"
     assert lp.coders == {"fast": ["instance-coder"]}
@@ -8292,7 +8292,7 @@ def test_unlabeled_feature_resolves_to_the_default_project():
     feat = {"id": "bd-x"}  # no `project`
     assert lp._project_cfg(feat)["name"] == "board-plugin"
     assert lp._repo_for(feat) == "/repos/board-plugin"
-    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "smart": ["bp-smart"]}
+    assert lp._coders_for(feat) == {"fast": ["bp-fast"], "standard": ["bp-smart"]}
 
 
 def test_back_compat_no_projects_map_is_a_single_implicit_project():
@@ -9150,7 +9150,7 @@ async def test_drive_shutdown_suppresses_coder_timeout_escalation(monkeypatch):
 
         def escalate(self, fid, reason):
             self.escalated.append((fid, reason))
-            return "smart"  # would climb a tier without the shutdown guard
+            return "standard"  # would climb a tier without the shutdown guard
 
     store = _EscStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
@@ -10917,8 +10917,8 @@ async def test_a_capability_failure_climbs_the_rung_rather_than_rotating(monkeyp
         raise worktree.NoChangesError("coder produced no commits")
 
     loop, store = _ladder_drive_env(monkeypatch, _dispatch, tiers=["reasoning"])
-    loop.coders = {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}
-    monkeypatch.setattr(store, "current_tier", lambda fid: "smart", raising=False)
+    loop.coders = {"standard": ["codex", "sonnet"], "reasoning": ["opus"]}
+    monkeypatch.setattr(store, "current_tier", lambda fid: "standard", raising=False)
     monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
     monkeypatch.setattr(coder_seam, "dispatch_coder_tapped", _dispatch)
     await loop._drive({"id": "bd-2", "title": "t", "spec": "s"})
@@ -10937,7 +10937,7 @@ _DEAD_MODEL = (
 _LADDER = {"coders": {"smart": ["codex", "sonnet"], "reasoning": ["opus"]}}
 
 
-def _rung_env(monkeypatch, dispatch, *, cfg, start_tier="smart", tiers=(), cursor=0):
+def _rung_env(monkeypatch, dispatch, *, cfg, start_tier="standard", tiers=(), cursor=0):
     """A `_drive` harness over an explicit ladder: `cfg` builds the loop (its `coders`
     map is the ladder — the project config, not a reassigned `loop.coders`, is what the
     drive reads), the card starts at `start_tier`, `tiers` are the climbs `escalate`
@@ -11577,7 +11577,7 @@ _ONE_REQ = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "
 
 async def test_a_missing_ledger_gets_a_ledger_only_followup_not_an_escalation(monkeypatch):
     """The bd-neiz shape: silence → ask for the ledger alone. No tier climb, no req-fix."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     loop, prompts, creates = _ledger_drive_loop(
         monkeypatch,
         ["## Summary\nwip", "## Requirements\n- r1: done\n\n## Summary\nshipped"],
@@ -11606,7 +11606,7 @@ async def test_a_missing_ledger_gets_a_ledger_only_followup_not_an_escalation(mo
 
 async def test_the_ledger_only_followup_is_bounded_and_falls_through(monkeypatch):
     """Exhausted, it hands back to the ordinary req-fix bounce — no new terminal edge."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     loop, prompts, _ = _ledger_drive_loop(monkeypatch, ["## Summary\nwip"], store)
     await loop._drive(dict(_ONE_REQ))
 
@@ -11621,7 +11621,7 @@ async def test_the_ledger_only_followup_is_bounded_and_falls_through(monkeypatch
 
 async def test_a_partial_disposition_never_takes_the_ledger_only_path(monkeypatch):
     """Heading present + item open is a genuine unmet requirement — unchanged behaviour."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     loop, prompts, _ = _ledger_drive_loop(
         monkeypatch,
         ["## Requirements\n- r1: still working on it\n\n## Summary\nwip"],
@@ -11643,7 +11643,7 @@ async def test_ledger_only_followup_comment_failure_never_breaks_the_build(monke
         def comment(self, fid, text):
             raise RuntimeError("br is down")
 
-    store = _NoComment(tiers=["smart"])
+    store = _NoComment(tiers=["standard"])
     loop, _prompts, _ = _ledger_drive_loop(
         monkeypatch,
         ["## Summary\nwip", "## Requirements\n- r1: done\n\n## Summary\nshipped"],
@@ -11658,7 +11658,7 @@ async def test_ledger_only_followup_comment_failure_never_breaks_the_build(monke
 
 async def test_a_card_with_no_requirements_is_untouched_by_the_ledger_path(monkeypatch):
     """No ledger, no gate — a silent reply opens its PR exactly as before."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     loop, prompts, _ = _ledger_drive_loop(monkeypatch, ["## Summary\nshipped"], store)
     await loop._drive({**FEATURE, "requirements": []})
 
@@ -11672,7 +11672,7 @@ async def test_the_ledger_only_round_does_not_undo_a_no_test_declaration(monkeyp
     reply for `NO_TEST_NEEDED:` inside `## Summary`. A ledger-only round that dropped the
     summary would fail goal-verify and be told to add tests — inverting the fix. So the
     follow-up must ask for the summary back, and the round must still pass the gate."""
-    store = _EscalatingStore(tiers=["smart"])
+    store = _EscalatingStore(tiers=["standard"])
     summary = "## Summary\nrefactor only\nNO_TEST_NEEDED: pure refactor, no behavior change"
     prompts = []
     creates = []

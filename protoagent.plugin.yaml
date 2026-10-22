@@ -34,15 +34,16 @@ config:
                             # name that only resolves on one machine. LIVE (console field):
                             # a save applies to the running loop's next dispatch/check.
                             # Blank + a `coders` ladder below: the ladder must then cover
-                            # EVERY tier (smart/reasoning/opus) in every project map — an
+                            # EVERY tier (standard/reasoning/advanced) in every project map — an
                             # unmapped tier dispatches to '' and blocks the card.
   # Escalation is OPT-IN and only meaningful with >1 distinct coder. Leave this
   # out for a single-ACP-agent setup (no tier ladder, no redundant retries —
   # one dispatch, then Blocked on failure; `difficulty` is then ignored).
-  # coders:                 # tier → delegate; difficulty picks the starting rung. The
-  #   smart: proto          # rungs are smart → reasoning → opus (store.TIER_LADDER);
+  # Legacy tier names smart and opus are still accepted (standard and advanced).
+  # coders:                 # tier → delegate; difficulty picks the starting rung.
+  #   standard: proto       # rungs are standard → reasoning → advanced (store.TIER_LADDER);
   #   reasoning: proto-smart  # with `coder:` set it is the fallback for an unmapped rung,
-  #   opus: claude-acp      # with `coder:` blank every rung must be mapped.
+  #   advanced: claude-acp  # with `coder:` blank every rung must be mapped.
   reviewer: quinn           # a2a delegate for explicit PR review (review_dispatch, and the
                             # review_gate's fallback when the host has no workflow runner)
   review_dispatch: false    # OPT-IN, advisory. Off = rely on the fleet PR-review pipeline (it

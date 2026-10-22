@@ -188,8 +188,8 @@ def test_every_configured_coder_name_is_checked_but_only_the_base_coder_pauses(t
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "claude-acp"), run=_fake_run())
     assert s["coder"]["ok"] is True and s["coder"]["missing"] == ["proto-smart"]
     assert "coder" not in s["loop_blockers"]
-    assert s["coder"]["missing_rungs"] == [{"tier": "smart", "project": "", "names": ["proto-smart"]}]
-    assert "rung 'smart': 'proto-smart'" in s["coder_rungs_hint"] and "keeps running" in s["coder_rungs_hint"]
+    assert s["coder"]["missing_rungs"] == [{"tier": "standard", "project": "", "names": ["proto-smart"]}]
+    assert "rung 'standard': 'proto-smart'" in s["coder_rungs_hint"] and "keeps running" in s["coder_rungs_hint"]
     # a project's rung is named with its project
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto", "proto-smart"), run=_fake_run())
     assert s["coder"]["ok"] is True
@@ -231,7 +231,7 @@ def test_coders_ladder_alone_passes_only_when_every_tier_is_mapped(tmp_path):
         run=_fake_run(),
     )
     assert s["coder"]["ok"] is False
-    assert "`coder:` is unset and the coders ladder doesn't cover tier(s) opus" in s["coder"]["hint"]
+    assert "`coder:` is unset and the coders ladder doesn't cover tier(s) advanced" in s["coder"]["hint"]
     assert "set `coder:` as the fallback" in s["coder"]["hint"]
     assert "coder" in s["loop_blockers"]
     # `coder` SET → the ladder may have holes (the fallback covers them)
@@ -276,11 +276,11 @@ def test_blank_coder_requires_every_project_ladder_to_cover_every_tier(tmp_path)
     }
     s = setup_status(cfg, which=_which_all, delegates=_delegates("a", "b", "c"), run=_fake_run())
     assert s["coder"]["ok"] is False
-    assert "opus (project 'web')" in s["coder"]["hint"]
+    assert "advanced (project 'web')" in s["coder"]["hint"]
     cfg["projects"]["web"]["coders"]["opus"] = "c"
     s = setup_status(cfg, which=_which_all, delegates=_delegates("a", "b", "c"), run=_fake_run())
     assert s["coder"]["ok"] is True  # `api` has no map → falls back to the (full) instance map
-    assert setup_check.uncovered_tiers({"smart": "a", "opus": ""}) == ["reasoning", "opus"]
+    assert setup_check.uncovered_tiers({"smart": "a", "opus": ""}) == ["reasoning", "advanced"]
 
 
 def test_delegate_lookup_errors_count_as_unresolved(tmp_path):
@@ -1685,7 +1685,7 @@ def test_a_list_rung_is_not_reported_as_an_uncovered_tier():
     """The other half of the same bug: `uncovered_tiers` must see a populated list rung
     as COVERED, or the board reports a ladder gap and pauses on a perfectly valid config."""
     assert setup_check.uncovered_tiers({"smart": ["codex", "sonnet"], "reasoning": "opus", "opus": "opus"}) == []
-    assert "smart" in setup_check.uncovered_tiers({"smart": [], "reasoning": "opus", "opus": "opus"})
+    assert "standard" in setup_check.uncovered_tiers({"smart": [], "reasoning": "opus", "opus": "opus"})
 
 
 # ── #411: an EMPTY .beads/ strands nothing ───────────────────────────────────────────

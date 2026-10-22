@@ -165,7 +165,7 @@ def test_resolve_projects_parses_the_map_with_full_execution_settings():
     assert pa["repo"] == "/dev/protoAgent-team"
     assert pa["base_branch"] == "main"
     assert pa["local_gate_cmd"] == "make gate"
-    assert pa["coders"] == {"smart": "sonnet", "reasoning": "opus"}
+    assert pa["coders"] == {"standard": "sonnet", "reasoning": "opus"}
     assert pa["coder_solve_k"] == 3  # coder_solve_* carried by prefix, not a fixed key
     assert pa["gate_files"] == ["CHANGELOG.md"]
     assert pa["repo_conventions"] == "keep it terse"
@@ -220,7 +220,7 @@ def test_resolve_projects_synthesizes_an_implicit_project_from_flat_keys():
     assert entry["repo"] == "/dev/thing"
     assert entry["base_branch"] == "trunk"
     assert entry["local_gate_cmd"] == "pytest -q"
-    assert entry["coders"] == {"smart": "sonnet"}
+    assert entry["coders"] == {"standard": "sonnet"}
     assert entry["coder_solve_k"] == 4
     assert entry["gate_files"] == ["README.md"]
     assert entry["name"] == "default"

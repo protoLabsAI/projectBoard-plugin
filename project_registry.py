@@ -53,6 +53,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# This module is also used standalone by the host-free registry tools/tests.
+if __package__:
+    from .projects import TIER_ALIASES, normalize_tier_config
+else:
+    from projects import TIER_ALIASES, normalize_tier_config
+
 log = logging.getLogger("protoagent.plugins.project_board")
 
 #: Fields an operator writes by hand today, and the only ones this tool sets.
@@ -920,7 +926,7 @@ async def _apply_registry(
 
     def compute(live: Any) -> dict[str, Any]:
         outcome = plan(live, copy.deepcopy(projects)) if plan is not None else {}
-        board = outcome.get("projects", projects)
+        board = normalize_tier_config({"projects": outcome.get("projects", projects)})["projects"]
         host_updates = copy.deepcopy(outcome.get("host_updates") or {})
         _assert_host_superset(live, host_updates, outcome.get("absent") or outcome.get("moved_from"))
         decided.clear()
@@ -933,6 +939,14 @@ async def _apply_registry(
         for gone in absent or set():
             written[gone] = None
         section: dict[str, Any] = {"projects": written}
+        plugin_config = getattr(live, "plugin_config", None)
+        live_section = plugin_config.get("project_board") if isinstance(plugin_config, dict) else None
+        if live_section is None:
+            live_section = getattr(live, "project_board", None)
+        if isinstance(live_section, dict) and isinstance(live_section.get("coders"), dict):
+            section["coders"] = normalize_tier_config({"coders": live_section["coders"]})["coders"]
+            # Host merges section-member maps; None explicitly removes old keys.
+            section["coders"].update({key: None for key in TIER_ALIASES if key in live_section["coders"]})
         if default_project is not None:
             section["default_project"] = default_project
         return {**host_updates, "project_board": section}

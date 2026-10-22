@@ -73,7 +73,7 @@ def _blocks(store):
     return [c for c in store.calls if c[0] == "flag_blocked"]
 
 
-def _timing_out_board(monkeypatch, store, cfg, *, start_tier="smart", model_worked=True):
+def _timing_out_board(monkeypatch, store, cfg, *, start_tier="standard", model_worked=True):
     """A drive whose every dispatch times out — after real model work (a tool call reaches
     the ring buffer) unless `model_worked=False`, the pre-first-token infra timeout."""
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
@@ -114,7 +114,7 @@ async def test_the_second_timeout_asks_for_a_split_instead_of_climbing_again(mon
     on a card the loop has just concluded is too wide. The park names the task, and lands
     between filing it (backlog, invisible to the puller) and releasing it (ready): the
     agent that picks it up cancels this card, which must never be found in flight."""
-    store = _SplitStore(tiers=["reasoning", "opus"])
+    store = _SplitStore(tiers=["reasoning", "advanced"])
     loop, dispatched = _timing_out_board(monkeypatch, store, {"coders": {"smart": "a", "reasoning": "b", "opus": "c"}})
     await loop._drive(_CARD)
 

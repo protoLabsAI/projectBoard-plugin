@@ -66,7 +66,7 @@ def stallable_br(tmp_path, monkeypatch):
     - ``after`` — the verb RUNS (its write commits), then the process hangs;
     - ``tree`` — a shell that records a SIGTERM, with a TERM-immune grandchild.
 
-    Every invocation's argv is logged (``lines(verb)``). The timeout drops to 1s and the
+    Every invocation's argv is logged (``lines(verb)``). On requesting a stall, the timeout drops to 1s and the
     TERM grace to 0.3s, so a stall costs a second, not 45; `raising=False` keeps the
     fixture usable against a store without the knobs (the red-check run), and the first
     test fails if the timeout knob is dead, because its message would then say 45s."""
@@ -94,7 +94,6 @@ exec "{real}" "$@"
     )
     script.chmod(0o755)
     monkeypatch.setattr(store_mod, "BR", str(script))
-    monkeypatch.setattr(store_mod, "_BR_TIMEOUT_S", 1.0, raising=False)
     monkeypatch.setattr(store_mod, "_BR_TERM_GRACE_S", 0.3, raising=False)
     monkeypatch.delenv("PB_STALL", raising=False)
 
@@ -102,8 +101,13 @@ exec "{real}" "$@"
         text = calls.read_text() if calls.exists() else ""
         return [line.split() for line in text.splitlines() if line.split()[:1] == [verb]]
 
+    def stall(verb, mode="verb"):
+        # Cold workspace setup must retain the normal deadline under parallel load.
+        monkeypatch.setattr(store_mod, "_BR_TIMEOUT_S", 1.0, raising=False)
+        monkeypatch.setenv("PB_STALL", f"{mode}:{verb}")
+
     return SimpleNamespace(
-        stall=lambda verb, mode="verb": monkeypatch.setenv("PB_STALL", f"{mode}:{verb}"),
+        stall=stall,
         calm=lambda: monkeypatch.delenv("PB_STALL", raising=False),
         reset=lambda: calls.write_text(""),
         count=lambda: len([ln for ln in (calls.read_text() if calls.exists() else "").splitlines() if ln.strip()]),

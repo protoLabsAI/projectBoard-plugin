@@ -478,7 +478,7 @@ async def test_an_oracle_timeout_blocks_at_once_without_climbing_or_self_healing
     async def _open_pr(*_a, **_k):
         raise AssertionError("no PR for an unverified build")
 
-    store = _EscalatingStore(tiers=["reasoning", "opus"])
+    store = _EscalatingStore(tiers=["reasoning", "advanced"])
     loop, store = await _drive_with(
         monkeypatch,
         open_pr=_open_pr,
@@ -512,7 +512,7 @@ async def test_a_rung_with_a_deleted_delegate_runs_on_its_live_sibling_then_the_
     assert seen[0] == "sonnet"  # the live sibling at the same rung
     assert not any("not configured" in c[2] for c in store.calls if c[0] == "flag_blocked")
     assert loop._live_rung("reasoning", ["fable"], loop._coders_for({})) == ["opus"]  # whole rung gone → base coder
-    assert len([r for r in caplog.records if "'fable'" in r.getMessage() and "smart" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "'fable'" in r.getMessage() and "standard" in r.getMessage()]) == 1
 
 
 def test_a_rung_gone_with_no_base_coder_falls_to_the_nearest_live_rung():
@@ -614,7 +614,7 @@ async def test_R5_a_superseded_run_cannot_overwrite_the_new_verdict(tmp_path, mo
 def test_R6_a_missing_top_rung_climbs_to_the_nearest_rung_not_the_base_coder():
     lp = BoardLoop({"coder": "base", "coders": {"smart": "base", "reasoning": "mid", "opus": "top"}})
     lp._resolve_delegate = lambda name, expect: None if name == "top" else name
-    assert lp._live_rung("opus", ["top"], lp._coders_for({})) == ["mid"]
+    assert lp._live_rung("advanced", ["top"], lp._coders_for({})) == ["mid"]
     lp._resolve_delegate = lambda name, expect: None if name in ("mid", "top") else name
     assert lp._live_rung("reasoning", ["mid"], lp._coders_for({})) == ["base"]  # nothing stronger live
 
@@ -624,7 +624,7 @@ def test_R6b_the_fallback_warning_is_logged_once(caplog):
     lp._resolve_delegate = lambda name, expect: None if name == "top" else name
     with caplog.at_level("WARNING", logger="protoagent.plugins.project_board"):
         for _ in range(3):
-            lp._live_rung("opus", ["top"], lp._coders_for({}))
+            lp._live_rung("advanced", ["top"], lp._coders_for({}))
     assert len([r for r in caplog.records if "dispatching 'mid' instead" in r.getMessage()]) == 1
     assert len([r for r in caplog.records if "names delegate 'top'" in r.getMessage()]) == 1
 
