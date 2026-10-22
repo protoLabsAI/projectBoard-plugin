@@ -454,6 +454,11 @@ _MINIMAL_ARGS = {
     "board_remove_dependency": {"feature_id": "bd-1", "depends_on": "bd-2"},
     "board_get_feature": {"feature_id": "bd-1"},
     "board_comments": {"feature_id": "bd-1"},
+    "board_record_work_location": {
+        "feature_id": "bd-1",
+        "entry": {"id": "evidence", "path": "/evidence", "purpose": "findings"},
+    },
+    "board_list_work_locations": {"feature_id": "bd-1"},
     "board_mark_ready": {"feature_id": "bd-1"},
     "board_check_ready": {"feature_id": "bd-1"},
     "board_mark_designing": {"feature_id": "bd-1"},
