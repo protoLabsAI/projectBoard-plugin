@@ -245,3 +245,12 @@ def test_card_from_chat_skill_uses_the_adr_0118_send_bridge_not_hitl():
     # create → ready (the loop only claims ready cards) → watch
     flow = text[text.index("## 2. When the values arrive") :]
     assert flow.index("board_create_feature") < flow.index("board_mark_ready") < flow.index("board_watch")
+
+
+def test_card_form_skeleton_never_submits_a_form():
+    """The inline artifact frame is sandboxed without allow-forms: a <form> submit is blocked
+    and its handler never runs, so the confirm chip never appears. The skeleton must click."""
+    skill = (Path(pb.__file__).parent / "skills" / "card-from-chat" / "SKILL.md").read_text(encoding="utf-8")
+    assert "<form" not in skill.split("```html", 1)[1].split("```", 1)[0]
+    assert 'type="submit"' not in skill and 'addEventListener("submit"' not in skill
+    assert '$("go").addEventListener("click"' in skill
