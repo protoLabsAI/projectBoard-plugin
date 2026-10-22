@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -15,6 +16,8 @@ import threading
 import time
 
 from . import project_registry, work_locations
+
+log = logging.getLogger("protoagent.plugins.project_board")
 
 
 def approved_roots():
@@ -231,7 +234,10 @@ class Sweep:
                     return
                 entry = entries[(first + index) % len(entries)]
                 self.location_offsets[feature["id"]] = first + index + 1
-                self._check_entry(store, notify, feature, entry, roots, deadline, cache)
+                try:
+                    self._check_entry(store, notify, feature, entry, roots, deadline, cache)
+                except Exception:  # noqa: BLE001 — one location's probe/ledger error must not end the pass
+                    log.warning("[project_board] work-location check failed for %s", feature["id"], exc_info=True)
                 checked += 1
             if checked >= 20:
                 break
@@ -243,19 +249,31 @@ class Sweep:
         facts = cache[key]
         risk = risks(facts, feature.get("blocked"))
         old = entry.get("last_check", {})
-        transition = risk != old.get("risks", []) or facts.get("sha", entry.get("sha")) != old.get(
-            "sha", entry.get("sha")
-        )
-        check = {**facts, "risks": risk, "cycle": old.get("cycle", 0) + int(transition)}
+        # Alert (and re-alert) only on a material RISK transition. A bare HEAD-sha move is
+        # not a risk: the first observation of a clean, sha-less entry, or any commit-and-push
+        # that advances the recorded sha, must never fire a spurious "risk resolved". The cycle
+        # bumps on each transition so a recovered-then-recurring risk re-notifies past dedup.
+        transition = risk != old.get("risks", [])
+        cycle = old.get("cycle", 0) + int(transition)
+        check = {**facts, "risks": risk, "cycle": cycle}
+        # Never erase confirmed push evidence: an unverifiable probe (filesystem off, path
+        # outside approved roots, non-HTTPS upstream, timeout) leaves pushed None and retains
+        # the recorded verdict; only a verified probe overwrites it with a fresh True/False.
+        pushed = facts["pushed"] if facts["pushed"] is not None else entry.get("pushed")
         state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
-        state.update(pushed=facts["pushed"], last_check=check)
+        state.update(pushed=pushed, last_check=check)
         # Identity remains the recorded identity; observed identity lives in last_check.
         if self.stop.is_set():
             return
-        if check != old:
+        # Spend a permanent ledger revision only on a MATERIAL change — the risk set, the
+        # coarse probe status, or the persisted pushed verdict. Probe wiggle (upstream_sha,
+        # behind, error text) within the same status and risk set refreshes nothing durable,
+        # so it must not accrue revisions against the card-wide MAX_REVISIONS history cap.
+        material = transition or facts.get("status") != old.get("status") or pushed != entry.get("pushed")
+        if material:
             store.record_work_location(feature["id"], state)
         if transition:
-            incident = hashlib.sha256(json.dumps([key, check["cycle"], risk]).encode()).hexdigest()
+            incident = hashlib.sha256(json.dumps([key, cycle, risk]).encode()).hexdigest()
             notify(
                 feature["id"],
                 f"Work location {entry['path']}: {', '.join(risk) or 'risk resolved'}. "

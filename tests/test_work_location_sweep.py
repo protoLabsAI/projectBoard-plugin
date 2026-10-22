@@ -96,7 +96,10 @@ def test_persistence_dedup_recovery_and_identity(repo, tmp_path, monkeypatch):
     assert len(notices) == 2 and "risk resolved" in notices[-1][0][1]
     monkeypatch.setattr(sweep, "git", lambda *a, **kw: (_ for _ in ()).throw(PermissionError("denied")))
     worker.check(board, notify)
-    assert writes[-1]["pushed"] is None and writes[-1]["sha"] == ""
+    # An unverifiable probe keeps the recorded identity and the confirmed push — it never
+    # overwrites pushed=True with null — while recording the unknown status as evidence.
+    assert writes[-1]["pushed"] is True and writes[-1]["sha"] == ""
+    assert writes[-1]["last_check"]["status"] == "unknown"
 
 
 async def test_slow_worker_single_flight_and_shutdown(monkeypatch):
@@ -123,6 +126,58 @@ async def test_slow_worker_single_flight_and_shutdown(monkeypatch):
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def test_clean_location_does_not_alert_or_churn(repo, tmp_path, monkeypatch):
+    # Finding 2: a clean, pushed, sha-less entry has no risk. Its first sweep must persist
+    # evidence without firing a spurious "risk resolved"; a steady state must not churn.
+    clone, _ = repo
+    monkeypatch.setattr(sweep, "approved_roots", lambda: [tmp_path])
+    entry = work_locations.validate({"id": "clone", "path": str(clone), "purpose": "work", "sha": ""})
+    feature = {"id": "bd-1", "work_locations": {"entries": [entry]}}
+    writes, notices = [], []
+
+    def record(fid, state):
+        state = work_locations.validate(state)
+        writes.append(state)
+        feature["work_locations"]["entries"] = [state]
+
+    board = SimpleNamespace(list_features=lambda: [feature], record_work_location=record)
+    worker = sweep.Sweep()
+    notify = lambda *a, **kw: notices.append((a, kw))
+    worker.check(board, notify)
+    worker.check(board, notify)
+    assert notices == []
+    assert len(writes) == 1 and writes[0]["last_check"]["risks"] == []
+    assert writes[0]["pushed"] is True and writes[0]["sha"] == ""
+
+
+def test_immaterial_probe_wiggle_spends_no_ledger_revision(monkeypatch):
+    # Finding 1: upstream_sha/behind moving while status, risk set and pushed hold steady is
+    # not a material change, so it must not accrue revisions against the card's history cap.
+    entry = {"id": "x", "path": "/x", "purpose": "work"}
+    feature = {"id": "bd-1", "work_locations": {"entries": [entry]}}
+    writes = []
+
+    def record(fid, state):
+        state = work_locations.validate(state)
+        writes.append(state)
+        feature["work_locations"]["entries"] = [state]
+
+    board = SimpleNamespace(list_features=lambda: [feature], record_work_location=record)
+    facts = iter(
+        [
+            {"status": "verified", "pushed": True, "ahead": 0, "behind": 0, "upstream_sha": "a" * 40},
+            {"status": "verified", "pushed": True, "ahead": 0, "behind": 3, "upstream_sha": "b" * 40},
+            {"status": "verified", "pushed": True, "ahead": 0, "behind": 7, "upstream_sha": "c" * 40},
+        ]
+    )
+    monkeypatch.setattr(sweep, "probe", lambda *a, **kw: next(facts))
+    monkeypatch.setattr(sweep, "approved_roots", lambda: [])
+    worker = sweep.Sweep()
+    for _ in range(3):
+        worker.check(board, lambda *a, **kw: None)
+    assert len(writes) == 1
 
 
 def test_changed_identity_is_not_pushed(repo, tmp_path):
