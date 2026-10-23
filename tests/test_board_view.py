@@ -490,7 +490,20 @@ def test_held_projects_have_a_render_path_that_names_each_reason():
     assert "(s && s.preflight && s.preflight.held) || {};" in BOARD_PAGE
     assert "(s && s.held_projects) || [];" in BOARD_PAGE
     assert "esc(name)" in BOARD_PAGE
-    assert 'esc(String(held[name] || "gate preflight failed"))' in BOARD_PAGE
+    assert 'heldReasonHtml(failures[name], String(held[name] || "gate preflight failed"))' in BOARD_PAGE
+
+
+def test_held_reason_shows_the_failing_line_and_folds_the_gate_output():
+    """The raw reason is the gate's whole log (a pytest progress bar filled the card).
+    The item shows the failing step and the headline from preflight.failures, esc()'d,
+    and folds the output tail under a <details>; with no failure detail it shows only
+    the reason's first line, capped."""
+    assert "(s && s.preflight && s.preflight.failures) || {};" in BOARD_PAGE
+    assert "function heldReasonHtml(f, reason)" in BOARD_PAGE
+    assert "esc(String(f.headline))" in BOARD_PAGE
+    assert "<summary" in BOARD_PAGE and ">Gate output</summary>" in BOARD_PAGE
+    assert "esc(tail)" in BOARD_PAGE
+    assert 'reason.split("\\n")[0]' in BOARD_PAGE
 
 
 def test_held_projects_get_their_own_warning_card_on_an_otherwise_healthy_board():
