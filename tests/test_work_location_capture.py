@@ -1,4 +1,10 @@
-"""All publication targets are disposable local bare repositories."""
+"""All publication targets are disposable local bare repositories.
+
+Two seams are exercised: ``observe`` (the coder's tool stream) only ACCUMULATES paths
+in memory, and ``drain`` (the drive's result/interruption seam) probes, persists and
+publishes. The production integration runs drain from ``loop.drive._drive``'s finally, so
+the interruption tests go through ``_drive`` rather than calling drain by hand.
+"""
 
 import asyncio
 from dataclasses import dataclass
@@ -8,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from project_board import coder_seam, work_location_capture as capture, work_locations
+from project_board import coder_seam, work_location_capture as capture, work_locations, worktree
 
 
 def git(path, *args):
@@ -24,6 +30,12 @@ class Store:
 
     def record_work_location(self, fid, state):
         self.comments.append(work_locations.PREFIX + json.dumps(work_locations.record(state, "board")))
+
+
+async def run(c, event, root=""):
+    """One progress event followed by the drive's result-seam drain."""
+    await c.observe(event, root)
+    await c.drain()
 
 
 @pytest.fixture
@@ -58,11 +70,20 @@ def latest(store):
     return store.list_work_locations("bd-test")["entries"][0]
 
 
+def drive_loop(store, project, monkeypatch):
+    from project_board.loop import BoardLoop
+
+    loop = BoardLoop.__new__(BoardLoop)
+    monkeypatch.setattr(loop, "_store", lambda: store)
+    monkeypatch.setattr(loop, "_repo_for", lambda feature: str(project))
+    return loop
+
+
 async def test_push_and_restart_from_card(repos):
     project, external, remote, _ = repos
     store = Store()
     c = capture.Capture(store, "bd-test", project)
-    await c.observe({"phase": "end", "locations": [{"path": str(external)}]})
+    await run(c, {"phase": "end", "locations": [{"path": str(external)}]})
     entry = latest(Store(list(store.comments)))  # no capture object / monitor memory
     assert entry["pushed"] is True
     assert entry["sha"] == git(remote, "rev-parse", "refs/heads/wip/bd-test")
@@ -95,7 +116,7 @@ async def test_refused_publication_keeps_exact_recovery(repos, monkeypatch, fail
     else:
         git(external, "remote", "set-url", "origin", str(remote.parent / "fork.git"))
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe({"input": {"cwd": str(external)}})
+    await run(capture.Capture(store, "bd-test", project), {"input": {"cwd": str(external)}})
     restarted = Store(list(store.comments))
     entry = latest(restarted)
     assert entry["pushed"] is False
@@ -109,7 +130,7 @@ async def test_refused_publication_keeps_exact_recovery(repos, monkeypatch, fail
     # A fresh dispatch can retry from only the recorded path once authority is restored.
     if failure == "permission":
         host.filesystem_projects[0]["write"] = True
-        await capture.Capture(restarted, "bd-test", project).observe({"locations": [entry["path"]]})
+        await run(capture.Capture(restarted, "bd-test", project), {"locations": [entry["path"]]})
         assert latest(restarted)["pushed"] is True
 
 
@@ -118,15 +139,25 @@ class Coder:
     workdir: str = ""
 
 
+async def _dispatch(loop, fid, tapped):
+    async def drive_captured(feature):
+        return await coder_seam.dispatch_coder_tapped(
+            Coder(), str(loop._repo_for(feature)), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+        )
+
+    loop._drive_captured = drive_captured
+    return await loop._drive({"id": fid})
+
+
 @pytest.mark.parametrize("outcome", ["cancel", "error", "partial"])
-async def test_actual_tapped_seam_captures_before_interruption(repos, outcome):
+async def test_tapped_seam_drains_through_drive_on_interruption(repos, monkeypatch, outcome):
     project, external, remote, _ = repos
     store = Store()
-    c = capture.Capture(store, "bd-test", project)
+    loop = drive_loop(store, project, monkeypatch)
 
     async def tapped(coder, prompt, *, on_tool, on_thought, on_text, timeout):
         await on_tool({"id": "exec-1", "phase": "start", "input": json.dumps({"cwd": str(external)})})
-        # A commit produced after the last tool event is picked up by the finally drain.
+        # A commit produced after the last tool event is picked up by the drive's drain.
         (external / "evidence").write_text("partial work before interruption")
         git(external, "add", "evidence")
         git(external, "commit", "-m", "partial")
@@ -136,33 +167,79 @@ async def test_actual_tapped_seam_captures_before_interruption(repos, outcome):
             raise RuntimeError("provider failed")
         return SimpleNamespace(reply="partial answer", stop_reason="max_tokens")
 
-    token = capture.active.set(c)
-    try:
-        if outcome == "partial":
+    if outcome == "partial":
+        assert await _dispatch(loop, "bd-test", tapped) == "partial answer"
+    else:
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else worktree.WorktreeError):
+            await _dispatch(loop, "bd-test", tapped)
+    entry = latest(Store(list(store.comments)))  # recovered from the card alone
+    assert entry["sha"] == git(external, "rev-parse", "HEAD")
+    assert entry["sha"] == git(remote, "rev-parse", "refs/heads/wip/bd-test")
+    assert entry["session_id"]
+    assert capture.active.get() is None
+
+
+async def test_drive_accumulates_during_stream_then_drains_at_result_seam(repos, monkeypatch):
+    project, external, remote, _ = repos
+    store = Store()
+    loop = drive_loop(store, project, monkeypatch)
+
+    async def tapped(coder, prompt, *, on_tool, on_thought, on_text, timeout):
+        await on_tool({"phase": "end", "input": {"cwd": str(external)}})
+        raise asyncio.TimeoutError()
+
+    async def drive_captured(feature):
+        assert capture.active.get().fid == feature["id"]
+        with pytest.raises(worktree.CoderTimeout):
             await coder_seam.dispatch_coder_tapped(
-                Coder(), str(project), "task", fid="bd-test", gen=1, _dispatch_tapped=tapped
+                Coder(), str(project), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
             )
-        else:
-            with pytest.raises(asyncio.CancelledError if outcome == "cancel" else Exception):
-                await coder_seam.dispatch_coder_tapped(
-                    Coder(), str(project), "task", fid="bd-test", gen=1, _dispatch_tapped=tapped
-                )
-    finally:
-        capture.active.reset(token)
+        # The tool stream only ACCUMULATED the path in memory; nothing is persisted yet,
+        # so a hold recorded right here would not race a store write under the ACP lock.
+        assert Store(list(store.comments)).list_work_locations("bd-test")["entries"] == []
+
+    monkeypatch.setattr(loop, "_drive_captured", drive_captured)
+    await loop._drive({"id": "bd-test"})
+    # The result/interruption seam drained once, after _drive_captured returned.
     entry = latest(Store(list(store.comments)))
     assert entry["sha"] == git(external, "rev-parse", "HEAD")
     assert entry["sha"] == git(remote, "rev-parse", "refs/heads/wip/bd-test")
-    assert entry["session_id"] == c.session
+    assert capture.active.get() is None
+
+
+@pytest.mark.parametrize("boom", ["list", "probe", "record"])
+async def test_capture_failure_never_breaks_the_drive(repos, monkeypatch, boom):
+    project, external, _, _ = repos
+    store = Store()
+    loop = drive_loop(store, project, monkeypatch)
+    if boom == "list":
+        monkeypatch.setattr(
+            store, "list_work_locations", lambda *a, **k: (_ for _ in ()).throw(ValueError("ledger boom"))
+        )
+    elif boom == "probe":
+        # A PermissionError the way a denied Path.exists/resolve raises mid-probe.
+        monkeypatch.setattr(capture.sweep, "probe", lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    else:
+        # A validate ValueError (e.g. an over-4096-byte last_check) surfaces as a store raise.
+        monkeypatch.setattr(store, "record_work_location", lambda *a, **k: (_ for _ in ()).throw(ValueError("too big")))
+
+    async def tapped(coder, prompt, *, on_tool, on_thought, on_text, timeout):
+        await on_tool({"input": {"cwd": str(external)}})
+        return SimpleNamespace(reply="clean result")
+
+    # The healthy build's reply survives; the capture explosion is swallowed and logged.
+    assert await _dispatch(loop, "bd-test", tapped) == "clean result"
+    assert capture.active.get() is None
 
 
 async def test_prose_is_not_authority_and_denied_path_is_recorded(repos, monkeypatch):
     project, external, _, _ = repos
     store = Store()
     c = capture.Capture(store, "bd-test", project)
-    await c.observe({"input": f"cd {external}; git push origin main", "output": f"commit at {external}"})
+    await run(c, {"input": f"cd {external}; git push origin main", "output": f"commit at {external}"})
     assert not store.comments
     monkeypatch.setattr(capture.sweep, "approved_roots", lambda: [project])
-    await c.observe({"locations": [{"path": str(external)}]})
+    await run(c, {"locations": [{"path": str(external)}]})
     assert latest(store)["path"] == str(external)
     assert latest(store)["pushed"] is None
     assert latest(store)["last_check"]["status"] == "capture-pending"
@@ -172,8 +249,9 @@ async def test_file_evidence_discovers_repo_without_staging_dirt(repos):
     project, external, remote, _ = repos
     (external / "uncommitted.txt").write_text("sole copy")
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe(
-        {"phase": "update", "locations": [{"path": str(external / "uncommitted.txt")}]}
+    await run(
+        capture.Capture(store, "bd-test", project),
+        {"phase": "update", "locations": [{"path": str(external / "uncommitted.txt")}]},
     )
     entries = store.list_work_locations("bd-test")["entries"]
     assert {e["path"] for e in entries} == {str(external), str(external / "uncommitted.txt")}
@@ -187,7 +265,7 @@ async def test_bare_remote_refusal_and_unverified_push(repos, monkeypatch):
     hook.write_text("#!/bin/sh\nexit 1\n")
     hook.chmod(0o755)
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe({"input": {"workdir": str(external)}})
+    await run(capture.Capture(store, "bd-test", project), {"input": {"workdir": str(external)}})
     assert latest(store)["pushed"] is False
     hook.unlink()
     real = capture.sweep.git
@@ -198,53 +276,86 @@ async def test_bare_remote_refusal_and_unverified_push(repos, monkeypatch):
         return real(path, *args, **kw)
 
     monkeypatch.setattr(capture.sweep, "git", no_readback)
-    await capture.Capture(store, "bd-test", project).observe({"input": {"workdir": str(external)}})
+    await run(capture.Capture(store, "bd-test", project), {"input": {"workdir": str(external)}})
     assert latest(store)["pushed"] is False
     assert "remote_ref" not in latest(store)
     assert git(remote, "rev-parse", "wip/bd-test") == latest(store)["sha"]
 
 
-async def test_drive_scopes_capture_before_hold_and_resets_context(repos, monkeypatch):
-    from project_board.loop import BoardLoop
+def test_internal_prefixes_cover_worktree_and_cut_from_checkout():
+    wt = "/home/me/proj/.worktrees/feat-x"
+    prefixes = capture._internal_prefixes(wt)
+    assert wt in prefixes
+    assert "/home/me/proj" in prefixes  # the checkout a .worktrees tree was cut from
+    c = capture.Capture(Store(), "bd-test", "/home/me/proj")
+    c.internal |= prefixes
+    assert c._is_internal("/home/me/proj/src/app.py")
+    assert c._is_internal("/home/me/proj/.worktrees/feat-x/app.py")
+    assert not c._is_internal("/home/me/other/app.py")
 
+
+async def test_project_main_checkout_is_never_captured_as_external(repos):
+    project, external, remote, _ = repos
+    (project / ".worktrees").mkdir()
+    store = Store()
+    c = capture.Capture(store, "bd-test", project)
+    # A coder reads the project's own main checkout and a board worktree by absolute path,
+    # alongside genuinely external evidence — only the external clone may be captured.
+    await c.observe(
+        {
+            "locations": [
+                {"path": str(project / "seed")},
+                {"path": str(project / ".worktrees" / "feat-x" / "app.py")},
+                {"path": str(external)},
+            ]
+        },
+        root=str(project / ".worktrees" / "feat-x"),
+    )
+    await c.drain()
+    assert {e["path"] for e in store.list_work_locations("bd-test")["entries"]} == {str(external)}
+    wip = git(remote, "rev-parse", "refs/heads/wip/bd-test")
+    assert wip == git(external, "rev-parse", "HEAD")
+    assert wip != git(project, "rev-parse", "HEAD")  # the project's own HEAD was never pushed
+
+
+async def test_observe_touches_no_git_or_store_until_drain(repos, monkeypatch):
     project, external, _, _ = repos
     store = Store()
-    loop = BoardLoop.__new__(BoardLoop)
-    monkeypatch.setattr(loop, "_store", lambda: store)
-    monkeypatch.setattr(loop, "_repo_for", lambda feature: str(project))
+    calls = {"git": 0, "list": 0, "record": 0}
 
-    async def drive(feature):
-        assert capture.active.get().fid == feature["id"]
+    def counted(name, real):
+        def wrapper(*a, **k):
+            calls[name] += 1
+            return real(*a, **k)
 
-        async def tapped(coder, prompt, *, on_tool, on_thought, on_text, timeout):
-            await on_tool({"phase": "end", "input": {"cwd": str(external)}})
-            raise asyncio.TimeoutError()
+        return wrapper
 
-        with pytest.raises(Exception):
-            await coder_seam.dispatch_coder_tapped(
-                Coder(), str(project), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
-            )
-        # This is the drive's hold/error seam; durable facts already exist.
-        assert latest(Store(list(store.comments)))["sha"] == git(external, "rev-parse", "HEAD")
-
-    monkeypatch.setattr(loop, "_drive_captured", drive)
-    await loop._drive({"id": "bd-test"})
-    assert capture.active.get() is None
+    monkeypatch.setattr(capture.sweep, "git", counted("git", capture.sweep.git))
+    monkeypatch.setattr(store, "list_work_locations", counted("list", store.list_work_locations))
+    monkeypatch.setattr(store, "record_work_location", counted("record", store.record_work_location))
+    c = capture.Capture(store, "bd-test", project)
+    # Many repeated tool events — no ledger read, no git probe, no push on the hot path.
+    for _ in range(20):
+        await c.observe({"input": {"cwd": str(external)}, "locations": [{"path": str(external)}]})
+    assert calls == {"git": 0, "list": 0, "record": 0}
+    await c.drain()
+    assert calls["list"] == 1 and calls["git"] > 0 and calls["record"] > 0
 
 
 async def test_symlink_metadata_and_remote_override_are_not_authority(repos):
     project, external, _, host = repos
     store = Store()
     git(external, "config", "remote.origin.pushurl", "https://user:secret@example.invalid/fork")
-    await capture.Capture(store, "bd-test", project).observe({"locations": [str(external)]})
+    await run(capture.Capture(store, "bd-test", project), {"locations": [str(external)]})
     assert latest(store)["pushed"] is False
     assert "secret" not in json.dumps(store.comments)
-    # Narrow read authority to the project: a symlink under it cannot grant access.
-    link = project / "outside"
+    # Authority is resolve-based, never lexical: a symlink OUTSIDE the project that points
+    # into an unauthorized tree cannot borrow the project's read grant.
+    link = external.parent / "symlink-outside"
     link.symlink_to(external, target_is_directory=True)
     host.filesystem_projects = [{"path": str(project), "write": True}]
     other = Store()
-    await capture.Capture(other, "bd-test", project).observe({"locations": [str(link)]})
+    await run(capture.Capture(other, "bd-test", project), {"locations": [str(link)]})
     assert latest(other)["sha"] == ""
     assert latest(other)["pushed"] is None
 
@@ -253,7 +364,7 @@ async def test_more_specific_read_only_grant_blocks_push(repos):
     project, external, _, host = repos
     host.filesystem_projects.append({"path": str(external), "write": False})
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe({"locations": [str(external)]})
+    await run(capture.Capture(store, "bd-test", project), {"locations": [str(external)]})
     assert latest(store)["sha"] == git(external, "rev-parse", "HEAD")
     assert latest(store)["pushed"] is False
 
@@ -272,7 +383,9 @@ async def test_cancellation_waits_for_durable_record(repos, monkeypatch):
         return real(fid, state)
 
     monkeypatch.setattr(store, "record_work_location", record)
-    task = asyncio.create_task(capture.Capture(store, "bd-test", project).observe({"locations": [str(external)]}))
+    c = capture.Capture(store, "bd-test", project)
+    await c.observe({"locations": [str(external)]})
+    task = asyncio.create_task(c.drain())
     assert await asyncio.to_thread(started.wait, 5)
     task.cancel()
     release.set()
@@ -287,7 +400,7 @@ async def test_later_sweep_preserves_publication_recovery_step(repos):
     project, external, _, host = repos
     host.filesystem_projects[0]["write"] = False
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe({"locations": [str(external)]})
+    await run(capture.Capture(store, "bd-test", project), {"locations": [str(external)]})
     entry = latest(store)
     step = entry["last_check"]["next_step"]
     capture.sweep.Sweep()._check_entry(
@@ -319,7 +432,7 @@ async def test_transport_uses_project_config_and_external_objects(repos, monkeyp
 
     monkeypatch.setattr(capture.sweep, "git", checked)
     store = Store()
-    await capture.Capture(store, "bd-test", project).observe({"locations": [str(external)]})
+    await run(capture.Capture(store, "bd-test", project), {"locations": [str(external)]})
     assert len(pushes) == 1
     assert latest(store)["pushed"] is True
     assert "helper" not in json.dumps(store.comments)

@@ -56,9 +56,20 @@ Day-to-day operation: agent tools, skills, the HTTP surface and the console view
 A coding dispatch records external paths from structured ACP tool locations and
 `cwd`, `workdir`, `path`, or `file_path` inputs. It records file evidence and, within
 approved filesystem roots, its enclosing git checkout. Shell commands, narration,
-and final-answer prose do not authorize inspection or publication. The capture
-runs during tool progress and drains again on partial replies, errors, timeouts,
-and cancellation, before the drive handles a hold or candidate cleanup.
+and final-answer prose do not authorize inspection or publication. Paths inside the
+board's own project checkout or its dispatch worktree are never treated as external
+work — that remains worktree salvage's job — so a coder reading the main checkout by
+absolute path can never push the project's own HEAD.
+
+Capture has two seams. During the coder's tool stream it only ACCUMULATES the
+observed paths in memory — no git, no store, no network on that hot path, so it
+cannot stall the stream or eat into the dispatch timeout. Once the dispatch ends —
+a clean reply, a partial/error result, a timeout, or an operator cancel — the drive
+drains once: it probes each path locally, persists the attributable identity, and
+publishes early. The drain is shielded so a durable write finishes even while the
+dispatch is being cancelled, and it is wholly best-effort: a store, filesystem, or
+transport failure during capture is logged and swallowed, never allowed to turn a
+healthy build into a failed drive.
 
 For work outside an observable coding dispatch (including ordinary delegated task
 replies and unrelated scratch jobs), the lead or delegate must call

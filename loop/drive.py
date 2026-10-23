@@ -1727,7 +1727,17 @@ class DriveMixin:
         try:
             return await self._drive_captured(feature)
         finally:
-            work_location_capture.active.reset(token)
+            # The interruption/result seam: the coder's tool stream only ACCUMULATED
+            # external paths (cheap, never touching git); this is where they are probed,
+            # their attributable identity persisted, and a committed WIP/evidence ref
+            # published early — on a clean result, a partial/error, a timeout, or an
+            # operator cancel alike (the drain shields its durable write so cancellation
+            # still records before context is lost). It never raises: a monitoring
+            # concern must not turn a built card into a failed drive.
+            try:
+                await capture.drain()
+            finally:
+                work_location_capture.active.reset(token)
 
     async def _drive_captured(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
