@@ -29,6 +29,38 @@ def test_reload_aliases_and_snapshot():
     assert not {"coders", "routing"} & set(setup_check.LOOP_RESTART_KEYS)
 
 
+def _host(section):
+    # What the host hands reload(): the whole saved section under `plugin_config`.
+    return SimpleNamespace(plugin_config={"project_board": section})
+
+
+@pytest.mark.parametrize("key", ["routing", "coders"])
+def test_host_reload_without_a_policy_key_clears_it(key):
+    # Deleting `routing:` (or `coders:`) from the YAML must reach the running loop:
+    # neither key has a manifest default, so its absence from the host section is a delete.
+    loop = BoardLoop({"coders": copy.deepcopy(LADDER), "routing": {"exclusive": ["codex"]}})
+    loop._resolve_delegate = lambda name, _: name
+    kept = {k: v for k, v in copy.deepcopy(loop.cfg).items() if k in ("coders", "routing") and k != key}
+    result = loop.reload(_host(kept))
+    assert key not in loop.cfg
+    assert key in result
+    if key == "routing":
+        assert loop._exclusive_for({}) == []
+        assert loop._coders_for({}) == LADDER
+    else:
+        assert loop.coders == {}
+        assert loop.escalation_on is False
+
+
+def test_plain_dict_reload_without_a_policy_key_keeps_it():
+    # A plain dict is a partial update: a key it doesn't mention is left alone.
+    loop = BoardLoop({"coders": copy.deepcopy(LADDER), "routing": {"exclusive": ["codex"]}})
+    loop._resolve_delegate = lambda name, _: name
+    loop.reload({"max_concurrent": 2})
+    assert loop._exclusive_for({}) == ["codex"]
+    assert loop.cfg["coders"] == LADDER
+
+
 @pytest.mark.parametrize(
     "update",
     [

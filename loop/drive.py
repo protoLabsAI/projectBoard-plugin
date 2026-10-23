@@ -282,7 +282,13 @@ class DriveMixin:
         # candidate first, then atomically replace both the loop's map and the shared
         # board's map. In-flight drives have already resolved their checkout; new
         # claims and every subsequent dispatch use the replacement.
-        if any(key in section for key in ("projects", "default_project", "coders", "routing")):
+        # The host hands the WHOLE saved section, and neither `coders` nor `routing` has a
+        # manifest default to fill a gap — so from the host, a policy key that is missing
+        # was deleted (turning strict routing off is deleting `routing:`). A plain-dict
+        # reload stays a partial update: a missing key leaves the knob alone.
+        complete = isinstance(getattr(new_config, "plugin_config", None), dict)
+        cleared = tuple(k for k in ("coders", "routing") if complete and k not in section and k in self.cfg)
+        if cleared or any(key in section for key in ("projects", "default_project", "coders", "routing")):
             candidate = dict(self.cfg)
             if "projects" in section:
                 candidate["projects"] = section.get("projects")
@@ -291,6 +297,8 @@ class DriveMixin:
             for key in ("coders", "routing"):
                 if key in section:
                     candidate[key] = section[key]
+                elif key in cleared:
+                    candidate.pop(key)
             try:
                 from ..projects import normalize_tier_config
                 from ..routing import validate_routing
@@ -309,9 +317,12 @@ class DriveMixin:
                 log.warning("[project_board] reload: project routing is malformed — keeping current map: %s", exc)
             else:
                 for key in ("coders", "routing"):
-                    if key in section and self.cfg.get(key) != candidate.get(key):
-                        changed[key] = (self.cfg.get(key), candidate[key])
-                        self.cfg[key] = candidate[key]
+                    if (key in section or key in cleared) and self.cfg.get(key) != candidate.get(key):
+                        changed[key] = (self.cfg.get(key), candidate.get(key))
+                        if key in candidate:
+                            self.cfg[key] = candidate[key]
+                        else:
+                            self.cfg.pop(key, None)
                 self.coders = {k: rung_delegates(v) for k, v in (candidate.get("coders") or {}).items()}
                 # Keep the escalation gate in step with the live ladder: `escalation_on` is
                 # otherwise set once at construction (core.py), so a live single-coder↔ladder
