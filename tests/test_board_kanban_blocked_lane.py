@@ -20,7 +20,17 @@ from tests.test_coder_monitor_v2 import _extract_fn
 def test_kanban_lanes_and_drag_home_use_the_card_lane():
     assert "FEATURES.filter(f => laneOf(f) === state)" in BOARD_PAGE
     assert "FEATURES.filter(f => f.state === state)" not in BOARD_PAGE
-    assert "const home = {lane: laneOf(f)," in BOARD_PAGE
+    assert "const home = {lane: laneOf(f), index: [...LANES[laneOf(f)].list.children].indexOf(n)};" in BOARD_PAGE
+    assert "home, over: home.lane," in BOARD_PAGE
+    assert "LANES[f.state]" not in BOARD_PAGE  # no lane lookup by raw state: LANES has no "blocked"
+
+
+def test_a_blocked_card_in_building_is_not_live_and_not_movable():
+    # The lane is placement only: liveness (coder monitor) and drag read the card's state.
+    fn = BOARD_PAGE[BOARD_PAGE.index("function updateCard(") :]
+    fn = fn[: fn.index("\n}\n")]
+    assert 'const live = f.state === "in_progress";' in fn
+    assert "const owned = LOOP_OWNED.has(state) || blockedHere;" in fn
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
@@ -32,6 +42,7 @@ def test_kanban_lanes_and_drag_home_use_the_card_lane():
         ({"state": "blocked", "bead_status": "open", "labels": ["blocked", "ready"]}, "ready"),
         ({"state": "blocked", "bead_status": "open", "labels": ["blocked"]}, "backlog"),
         ({"state": "blocked"}, "backlog"),
+        ({"state": "blocked", "bead_status": "deferred", "labels": ["blocked", "ready"]}, "backlog"),
         ({"state": "in_review", "bead_status": "in_progress", "labels": ["in-review"]}, "in_review"),
         ({"state": "done"}, "done"),
     ],

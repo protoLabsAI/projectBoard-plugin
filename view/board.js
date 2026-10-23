@@ -12,11 +12,13 @@ const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
 // `blocked` is a board state with no Kanban lane of its own, so a blocked card sits in the
 // lane of the lifecycle it was blocked in (its `blocked` chip and red edge say why) —
 // otherwise it vanished from the Kanban while its dependents waited on it.
+const BLOCKED_WHY = "Blocked — unblock it from the ⋯ menu (M) to move it.";
 function laneOf(f){
   if (f.state !== "blocked") return f.state;
   const labels = f.labels || [];
   if (f.bead_status === "in_progress") return labels.includes("in-review") ? "in_review" : "in_progress";
-  return labels.includes("ready") ? "ready" : "backlog";
+  // Same order as the store's board_state(): a deferred bead is backlog whatever its labels.
+  return f.bead_status !== "deferred" && labels.includes("ready") ? "ready" : "backlog";
 }
 // State → operator-facing label (#182): a view-layer relabel only — internal
 // state names (store/API/tools) are unchanged. `ready` means spec complete and
@@ -713,12 +715,15 @@ function setData(n, key, v){ if (v == null) n.removeAttribute("data-"+key); else
 // Patch ONE reused card node to the feature's current state. The markup is rewritten
 // only when it changed, so a poll that changed nothing touches nothing.
 function updateCard(n, f, state){
+  // `state` is the LANE (laneOf); liveness and movability read the card's own state, so a
+  // blocked card shown in Building is not a live build and can't be dragged.
   // An in_progress card is live — clicking it opens the coder monitor drawer (#84).
   // A task never dispatches a coder, so it never opens the MONITOR (#217); it opens
   // the same drawer showing its detail + controls (bd-rdmh) via a data-task handle.
-  const live = state === "in_progress";
+  const live = f.state === "in_progress";
   const mon = live && !isTask(f);
-  const owned = LOOP_OWNED.has(state);
+  const blockedHere = f.state === "blocked";
+  const owned = LOOP_OWNED.has(state) || blockedHere;
   const keep = [...n.classList].filter(c => TRANSIENT.has(c));
   n.className = "card"+(mon?" card--live":"")+(isTask(f)?" card--task":"")
     + (f.blocked ? " card--blocked" : (f.dag_blocked ? " card--waiting" : ""))
@@ -732,7 +737,7 @@ function updateCard(n, f, state){
   n.tabIndex = 0;
   n.setAttribute("role", "listitem");
   n.setAttribute("aria-keyshortcuts", "M Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown");
-  if (owned) n.title = LOOP_WHY[state]; else n.removeAttribute("title");
+  if (owned) n.title = blockedHere ? BLOCKED_WHY : LOOP_WHY[state]; else n.removeAttribute("title");
   const html = cardHTML(f, state);
   if (n._html !== html){ n.innerHTML = html; n._html = html; }
   paintBuilding(n, f);
