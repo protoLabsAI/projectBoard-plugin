@@ -25,6 +25,7 @@ import re
 import subprocess
 
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1446,6 +1447,36 @@ def _board_tools(cfg: dict, registry=None):
         return json.dumps({"id": f["id"], "state": f["board_state"], "review": side})
 
     @tool
+    def board_routing_get() -> str:
+        """Read the effective coder ladder and exclusive allowlist for every project."""
+        from .routing import routing_get
+
+        try:
+            return json.dumps(routing_get())
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    async def board_routing_set(
+        config: RunnableConfig,
+        coders: dict | None = None,
+        exclusive: list[str] | None = None,
+        project: str | None = None,
+    ) -> str:
+        """Persist and apply routing live. Requires host-injected operator-tier context.
+
+        Omit project for board defaults; coders replaces the ladder, and an empty
+        exclusive list disables strict routing. Existing drives retain their route.
+        """
+        from .routing import operator_actor, routing_set
+
+        try:
+            actor = operator_actor(config)
+            return json.dumps(await routing_set(actor=actor, coders=coders, exclusive=exclusive, project=project))
+        except (PermissionError, ValueError) as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_hold_merge(feature_id: str, reason: str) -> str:
         """Place the operator's per-card auto-merge veto (the `merge-hold` label, #532) —
         the loop never auto-merges a held card however green it is, so a human merges it by
@@ -1976,6 +2007,8 @@ def _board_tools(cfg: dict, registry=None):
         board_requeue_ci_fix,
         board_block_feature,
         board_unblock_feature,
+        board_routing_get,
+        board_routing_set,
         board_hold_merge,
         board_release_merge_hold,
         board_reset_merged_verify_budget,

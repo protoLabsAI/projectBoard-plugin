@@ -1245,7 +1245,7 @@ def test_stale_loop_keys_compare_only_restart_knobs():
         )
         == []
     )
-    assert setup_check.stale_loop_keys({"repo": "/b", "coders": {"smart": "y"}}, snap) == ["coders", "repo"]
+    assert setup_check.stale_loop_keys({"repo": "/b", "coders": {"smart": "y"}}, snap) == ["repo"]
     assert setup_check.stale_loop_keys({"repo": "/b"}, None) == []
 
 

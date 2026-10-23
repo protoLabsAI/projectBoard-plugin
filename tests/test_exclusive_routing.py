@@ -220,7 +220,7 @@ async def test_single_coder_requires_allowlist_membership(monkeypatch, base, cod
         assert "routing.exclusive [codex]" in next(c[2] for c in board.calls if c[0] == "flag_blocked")
 
 
-def test_top_level_policy_change_requires_restart():
+def test_top_level_policy_change_is_live():
     before = {"routing": {"exclusive": []}}
     after = {"routing": {"exclusive": ["codex"]}}
-    assert setup_check.stale_loop_keys(after, setup_check.snapshot_of(before)) == ["routing"]
+    assert setup_check.stale_loop_keys(after, setup_check.snapshot_of(before)) == []

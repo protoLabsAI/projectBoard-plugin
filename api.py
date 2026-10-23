@@ -484,6 +484,27 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
             raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
+    @router.get("/routing")
+    async def _routing_get():
+        from .routing import routing_get
+
+        try:
+            return JSONResponse(routing_get(), headers={"Cache-Control": "no-store"})
+        except ValueError as exc:
+            raise HTTPException(503, str(exc))
+
+    @router.put("/routing")
+    async def _routing_set(request: Request, body: dict = Body(...)):
+        # This router inherits the same host operator gate as PUT /projects.
+        from .routing import routing_set
+
+        if set(body) - {"coders", "exclusive", "project"}:
+            raise HTTPException(400, "unknown routing fields")
+        try:
+            return await routing_set(actor=str(getattr(request.state, "subject", "operator")), **body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+
     @router.get("/projects")
     async def _projects():
         """Live project config for the custom Configure tab (no router snapshot)."""

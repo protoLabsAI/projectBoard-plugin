@@ -1,0 +1,220 @@
+"""Host-free live routing and operator mutation contracts (#577)."""
+
+import copy
+import json
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from httpx import ASGITransport, AsyncClient
+from _host_apply import apply_updates
+
+from project_board import _board_tools, api, routing, setup_check, worktree
+from project_board.loop import BoardLoop
+from tests.test_exclusive_routing import LADDER, LadderStore
+from tests.test_loop import _drive_with
+
+
+def test_reload_aliases_and_snapshot():
+    loop = BoardLoop({"coders": LADDER})
+    loop._resolve_delegate = lambda name, _: name
+    captured = loop._coders_for({})
+    loop.reload({"coders": {"smart": ["sonnet"], "opus": ["codex"]}, "routing": {"exclusive": ["codex"]}})
+    assert captured == LADDER
+    assert loop._coders_for({}) == {"standard": [], "advanced": ["codex"]}
+    assert loop._exclusive_for({}) == ["codex"]
+    assert not setup_check.stale_loop_keys(loop.cfg, setup_check.snapshot_of({}))
+    assert not {"coders", "routing"} & set(setup_check.LOOP_RESTART_KEYS)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"coders": []},
+        {"coders": {"typo": "sonnet"}},
+        {"coders": {"smart": [3]}},
+        {"routing": []},
+        {"routing": {"exclusive": "codex"}},
+        {"routing": {"exclusive": ["missing"]}},
+        {"coders": {"standard": "missing"}},
+    ],
+)
+def test_bad_reload_is_atomic(update, caplog):
+    loop = BoardLoop({"coders": copy.deepcopy(LADDER)})
+    loop._resolve_delegate = lambda name, _: None if name == "missing" else name
+    before = copy.deepcopy(loop.cfg)
+    loop.reload({**update, "projects": {"new": {"repo": "/new"}}})
+    assert loop.cfg == before
+    assert loop._coders_for({}) == LADDER
+    assert "keeping current map" in caplog.text
+
+
+async def test_inflight_escalation_keeps_captured_policy(monkeypatch):
+    dispatched = []
+    holder = {}
+
+    def seed(loop):
+        holder["loop"] = loop
+        loop._resolve_delegate = lambda name, _: name
+        loop._dispatch_reached_model = lambda fid: True
+        loop.decompose_after_timeouts = 0
+
+    async def dispatch(coder, *args, **kwargs):
+        dispatched.append(coder)
+        if len(dispatched) == 1:
+            holder["loop"].reload({"coders": LADDER, "routing": {"exclusive": ["sonnet"]}})
+            raise worktree.CoderTimeout("coder timed out after 1800s")
+        return "implemented with tests"
+
+    async def open_pr(*args, **kwargs):
+        return "https://github.com/o/r/pull/1"
+
+    await _drive_with(
+        monkeypatch,
+        cfg={"coder": "sonnet", "coders": LADDER, "routing": {"exclusive": ["codex"]}},
+        store=LadderStore(),
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=open_pr,
+    )
+    assert dispatched == ["codex", "codex"]
+    assert holder["loop"]._coders_for({}) == {tier: ["sonnet"] for tier in LADDER}
+
+
+@pytest.fixture
+def host(monkeypatch, tmp_path):
+    from project_board import project_registry
+
+    live = SimpleNamespace(
+        plugin_config={
+            "project_board": {
+                "coders": {"smart": "sonnet", "opus": "codex"},
+                "projects": {"app": {"repo": "/app"}, "own": {"repo": "/own", "routing": {"exclusive": []}}},
+            }
+        }
+    )
+    loop = BoardLoop(copy.deepcopy(live.plugin_config["project_board"]))
+    loop._resolve_delegate = lambda name, _: name if name in {"sonnet", "codex"} else None
+    calls = []
+
+    def apply(compute):
+        patch = compute(live)
+        calls.append(patch)
+        apply_updates(live.plugin_config, patch)
+        loop.reload(live)
+        return True, []
+
+    module = ModuleType("graph.plugins.host")
+    module.HOST = SimpleNamespace(apply_settings=apply)
+    monkeypatch.setitem(sys.modules, "graph.plugins.host", module)
+    monkeypatch.setattr(
+        project_registry, "_live_section", lambda **kw: copy.deepcopy(live.plugin_config["project_board"])
+    )
+    monkeypatch.setattr(
+        routing, "_default_delegates", lambda: lambda name: name if name in {"sonnet", "codex"} else None
+    )
+    monkeypatch.setenv("PROJECT_BOARD_DATA_DIR", str(tmp_path))
+    return live, loop, calls, tmp_path / "routing-audit.jsonl"
+
+
+async def test_tool_persists_applies_and_audits(host):
+    live, loop, calls, audit = host
+    tools = {t.name: t for t in _board_tools({})}
+    setter = tools["board_routing_set"]
+    assert "config" not in setter.tool_call_schema.model_fields
+    result = json.loads(
+        await setter.ainvoke(
+            {"coders": {"smart": ["codex"]}, "exclusive": ["codex"]},
+            config={"configurable": {"auth": {"tier": "operator", "subject": "alice"}}},
+        )
+    )
+    assert result["app"]["coders"]["standard"] == ["codex"]
+    assert result["app"]["exclusive"] == ["codex"]
+    assert result["own"]["exclusive"] == []
+    assert loop._coders_for({"project": "app"}) == {"standard": ["codex"]}
+    assert live.plugin_config["project_board"]["coders"] == {"standard": ["codex"]}
+    assert len(calls) == 1
+    records = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["who"] == "alice"
+    assert records[0]["when"]
+    assert records[0]["old"] != records[0]["new"] == result
+    assert json.loads(tools["board_routing_get"].invoke({})) == result
+
+
+@pytest.mark.parametrize("auth", [{}, {"tier": "agent"}, {"tier": "viewer"}])
+async def test_tool_refuses_without_operator(host, auth):
+    live, loop, calls, audit = host
+    before = copy.deepcopy(live.plugin_config)
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+    result = await setter.ainvoke({"exclusive": []}, config={"configurable": {"auth": auth}})
+    assert "requires operator" in result
+    assert not calls and not audit.exists()
+    assert live.plugin_config == before
+
+
+async def test_http_routes_and_project_override(host):
+    live, loop, calls, audit = host
+    live.plugin_config["project_board"]["projects"]["app"]["coders"] = {"smart": "sonnet", "opus": "codex"}
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def host_operator_gate(request: Request, call_next):
+        if request.headers.get("authorization") != "Bearer operator":
+            return JSONResponse({}, status_code=403)
+        request.state.subject = "http-operator"
+        return await call_next(request)
+
+    app.include_router(api.build_data_router({}), prefix="/api/plugins/project_board")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = "/api/plugins/project_board/routing"
+        assert (await client.put(path, json={"exclusive": []})).status_code == 403
+        assert not calls
+        client.headers["authorization"] = "Bearer operator"
+        response = await client.put(path, json={"project": "app", "coders": {"opus": "codex"}, "exclusive": ["codex"]})
+        assert response.status_code == 200, response.text
+        assert (await client.get(path)).json() == response.json()
+        assert loop._coders_for({"project": "app"}) == {"advanced": ["codex"]}
+        assert live.plugin_config["project_board"]["projects"]["app"]["coders"] == {"advanced": "codex"}
+        before = copy.deepcopy(live.plugin_config)
+        bad = await client.put(path, json={"coders": {"standard": "missing"}})
+        assert bad.status_code == 400 and "missing" in bad.text
+        assert live.plugin_config == before
+        assert len(calls) == len(audit.read_text().splitlines()) == 1
+        assert json.loads(audit.read_text())["who"] == "http-operator"
+
+
+async def test_malformed_tool_update_has_reason_and_no_side_effects(host):
+    live, loop, calls, audit = host
+    before = copy.deepcopy(live.plugin_config)
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+    result = await setter.ainvoke(
+        {"coders": {"unknown-tier": "codex"}},
+        config={"configurable": {"auth": {"tier": "operator", "subject": "alice"}}},
+    )
+    assert "unknown coder tier" in result
+    assert live.plugin_config == before
+    assert not calls and not audit.exists()
+
+
+def test_project_only_reload_rejects_malformed_routing(caplog):
+    loop = BoardLoop({"projects": {"app": {"repo": "/app"}}})
+    before = copy.deepcopy(loop.cfg)
+    loop.reload({"projects": {"app": {"repo": "/changed", "routing": {"exclusive": False}}}})
+    assert loop.cfg == before
+    assert loop._repo_for({"project": "app"}) == "/app"
+    assert "exclusive must be a list" in caplog.text
+
+
+async def test_host_refusal_neither_applies_nor_audits(host, monkeypatch):
+    live, loop, calls, audit = host
+    before = copy.deepcopy(live.plugin_config)
+    monkeypatch.setattr(
+        sys.modules["graph.plugins.host"].HOST, "apply_settings", lambda compute: (False, ["save denied"])
+    )
+    with pytest.raises(ValueError, match="save denied"):
+        await routing.routing_set(actor="alice", exclusive=[])
+    assert live.plugin_config == before
+    assert not calls and not audit.exists()

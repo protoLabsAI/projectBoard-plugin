@@ -122,7 +122,7 @@ REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
 # ``/status`` says so instead of reporting the NEW config as the loop's state.
-LOOP_RESTART_KEYS: tuple[str, ...] = ("coders", "repo", "base_branch", "db_path", "routing")
+LOOP_RESTART_KEYS: tuple[str, ...] = ("repo", "base_branch", "db_path")
 
 # The subprocess runner ``_br_version`` uses — a module attribute (not a bare
 # ``subprocess.run`` reference) so the suite's autouse fixture can pin it without

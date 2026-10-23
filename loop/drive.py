@@ -230,7 +230,7 @@ class DriveMixin:
         )
         # The RUNNING loop's config, in a process-stable slot: after a reload the
         # routers see the new config while this loop keeps its construction-time
-        # `coders`/`repo`/…; /status compares the two and says "restart to apply".
+        # `repo`/`base_branch`/…; /status compares the two and says "restart to apply".
         setup_check.publish_loop_snapshot(self.cfg)
         log.info(
             "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
@@ -282,25 +282,38 @@ class DriveMixin:
         # candidate first, then atomically replace both the loop's map and the shared
         # board's map. In-flight drives have already resolved their checkout; new
         # claims and every subsequent dispatch use the replacement.
-        if "projects" in section or "default_project" in section:
+        if any(key in section for key in ("projects", "default_project", "coders", "routing")):
             candidate = dict(self.cfg)
             if "projects" in section:
                 candidate["projects"] = section.get("projects")
             if "default_project" in section:
                 candidate["default_project"] = section.get("default_project")
+            for key in ("coders", "routing"):
+                if key in section:
+                    candidate[key] = section[key]
             try:
+                from ..projects import normalize_tier_config
+                from ..routing import validate_routing
+
+                candidate = normalize_tier_config(candidate)
+                candidate = validate_routing(candidate, lambda name: self._resolve_delegate(name, "acp"))
                 projects = resolve_projects(candidate)
                 default = resolve_default_project(candidate)
-            except (TypeError, ValueError) as exc:
+            except Exception as exc:  # noqa: BLE001 — retain the last valid policy
                 log.warning("[project_board] reload: project routing is malformed — keeping current map: %s", exc)
             else:
+                for key in ("coders", "routing"):
+                    if key in section and self.cfg.get(key) != candidate.get(key):
+                        changed[key] = (self.cfg.get(key), candidate[key])
+                        self.cfg[key] = candidate[key]
+                self.coders = {k: rung_delegates(v) for k, v in candidate.get("coders", {}).items()}
                 old_projects = self._projects
                 old_default = self._default_project
                 if projects != old_projects or default != old_default:
                     self._projects = projects
                     self._default_project = default
                     if "projects" in section:
-                        self.cfg["projects"] = section.get("projects")
+                        self.cfg["projects"] = candidate.get("projects")
                     if "default_project" in section:
                         self.cfg["default_project"] = section.get("default_project")
                     self._store_kw["projects"] = projects

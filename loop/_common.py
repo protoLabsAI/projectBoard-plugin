@@ -1073,8 +1073,8 @@ LIVE_BOOL_KNOBS = ("auto_merge", "br_autofetch")
 # per attempt, so a reload can hand the running loop a new delegate name — and the
 # setup preflight's coder gap (the fresh-archetype case: boot with no coder, pick one
 # in Settings) then clears and the paused loop resumes WITHOUT a restart. The `coders`
-# ladder map and `repo` stay restart knobs; `setup_status` reports them as
-# `loop_cfg_stale` when a reload changes them under a running loop.
+# ladder and routing policy are also live (#577). `repo` remains a restart knob;
+# `setup_status` reports it as `loop_cfg_stale` after a change.
 _RUNG_CURSOR = itertools.count()
 
 

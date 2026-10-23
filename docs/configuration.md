@@ -46,7 +46,7 @@ You cannot dispatch a card without these.
 | `repo` | `"."` | **restart** |
 | `base_branch` | `"main"` | **restart** |
 | `coder` | `—` | live |
-| `coders` | `—` | **restart** **· YAML only** |
+| `coders` | `—` | live |
 | `db_path` | `—` | **restart** |
 | `br_autofetch` | `True` | live |
 
@@ -707,8 +707,8 @@ rung or an unlisted base `coder`. Without a ladder, the base coder must be allow
 A single-delegate `coders` map does not enable a ladder: difficulty remains
 irrelevant, and strict mode does not add tier climbs or attempt labels.
 An absent or empty allowlist preserves existing routing and fallback behavior.
-Restart the loop after changing the top-level `routing` policy; setup status flags
-a policy that differs from the running loop. Project entries inherit the board allowlist unless they specify their own
+Top-level `coders` and `routing` apply live on config reload. Malformed updates
+retain the current policy and log a warning. In-flight drives keep their resolved route. Project entries inherit the board allowlist unless they specify their own
 `routing.exclusive`, including an explicit empty list.
 
 Not covered by routing.exclusive: review gate reviewer, review dispatch,
@@ -716,3 +716,20 @@ decompose, coder.solve offload, Max-Mode judge, and task-assignee delegates.
 These paths retain their own delegate configuration; strict routing is not a
 board-wide guarantee for helper or review calls. Setup check and `/status`
 list these exclusions and flag allowlist names that are not configured delegates.
+
+
+`board_routing_get()` and `GET /api/plugins/project_board/routing` return each
+project's effective `coders` ladder (before exclusive filtering) and `exclusive` list.
+`board_routing_set(coders=..., exclusive=..., project=...)` and
+`PUT /api/plugins/project_board/routing` accept the same fields. Omit `project` to
+edit board defaults; omit either policy field to preserve it. A supplied ladder
+replaces the old ladder, and `exclusive: []` disables strict routing. All tier keys
+and delegate names are validated before persistence; legacy tier aliases are rewritten.
+Writes use the host config-save/reload path and append caller, UTC time, and old/new
+routing to `routing-audit.jsonl` in the board data directory, plus a log entry.
+
+HTTP writes inherit the operator bearer gate used by the project routes. There was
+no operator-only tool guard to reuse: the setter requires the host to inject
+`RunnableConfig.configurable.auth = {"tier": "operator", "subject": "<caller>"}`.
+This context is not a tool argument. Missing or non-operator context is refused;
+hosts without this context integration must use the gated HTTP route.
