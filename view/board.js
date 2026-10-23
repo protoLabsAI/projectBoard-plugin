@@ -510,10 +510,30 @@ function setupLoopLine(setup){
 // copy, esc()'d — never raw HTML.
 function heldGateItems(s){
   const held = (s && s.preflight && s.preflight.held) || {};
+  const failures = (s && s.preflight && s.preflight.failures) || {};
   const names = (s && s.held_projects) || [];
   let html = "";
-  for (const name of names) html += '<li><b>' + esc(name) + '</b> — ' + esc(String(held[name] || "gate preflight failed")) + '</li>';
+  for (const name of names) html += '<li><b>' + esc(name) + '</b> — ' + heldReasonHtml(failures[name], String(held[name] || "gate preflight failed")) + '</li>';
   return html;
+}
+
+// One held project's reason: the failing step and the line that says what broke, with
+// the output tail folded under "Gate output". The raw reason is the gate's whole
+// (truncated) log, and printing it inline filled the board with a pytest progress bar.
+function heldReasonHtml(f, reason){
+  let line;
+  if (f && f.headline) {
+    const step = String(f.step || "");
+    const shortStep = step.length > 80 ? step.slice(0, 79) + "…" : step;
+    line = (step ? 'step ' + esc(String(f.step_index)) + '/' + esc(String(f.steps)) + ' <code>' + esc(shortStep) + '</code> failed: ' : '') + esc(String(f.headline));
+  } else {
+    const first = reason.split("\n")[0];
+    line = esc(first.length > 240 ? first.slice(0, 239) + "…" : first);
+  }
+  const tail = (f && f.tail) || (reason.includes("\n") ? reason : "");
+  if (!tail) return line;
+  return line + '<details style="margin-top:4px"><summary style="cursor:pointer;opacity:.75;font-size:12px">Gate output</summary>'
+    + '<pre style="white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;font-size:11px;margin:4px 0 0">' + esc(tail) + '</pre></details>';
 }
 
 // An otherwise-healthy board with held projects — the holds get their own warning card
