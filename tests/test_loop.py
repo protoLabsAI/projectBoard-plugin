@@ -12012,3 +12012,36 @@ async def test_the_fix_round_is_judged_against_the_head_it_started_on(monkeypatc
     feature = {**FEATURE, "pr_url": "https://github.com/o/r/pull/9"}
     await _drive_with(monkeypatch, open_pr=_open_pr, feature=feature)
     assert seen == [("/wt/feat-bd-1", "s" * 40)]
+
+
+async def test_dispatch_capture_finishes_before_goal_retry_and_hold(monkeypatch):
+    """A multi-attempt drive must not defer evidence writes to its outer finally."""
+    from project_board import work_location_capture
+
+    completed, persisted, verified = [], [], []
+
+    async def drain(self):
+        persisted[:] = completed
+
+    monkeypatch.setattr(work_location_capture.Capture, "drain", drain)
+
+    async def dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        # Prior attempt is durable before the next coder starts.
+        assert persisted == completed
+        completed.append(len(completed) + 1)
+        return "reply"
+
+    async def verify(self, feature, wt, base, coder_reply=""):
+        assert persisted == completed
+        verified.append(len(persisted))
+        return "missing tests"  # retry once, then hold
+
+    monkeypatch.setattr(BoardLoop, "_verify_goal", verify)
+    _, store = await _drive_with(
+        monkeypatch,
+        dispatch=dispatch,
+        open_pr=None,
+        cfg={"coder": "proto", "goal_verify": True, "goal_fix_max": 1},
+    )
+    assert verified == [1, 2]
+    assert "flag_blocked" in store.names()

@@ -14,7 +14,7 @@ import inspect
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
-from .. import host_friction, work_location_sweep
+from .. import host_friction, work_location_sweep, work_location_capture
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
@@ -1559,7 +1559,7 @@ class DriveMixin:
         host itself), so the capability-escalation edge collapses to a terminal block."""
         store = self._store()
         fid = feature["id"]
-        prompt = self._build_task_prompt(feature)
+        prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_self(invoke, prompt, session_id, timeout=self.coder_timeout or None)
         except asyncio.CancelledError:
@@ -1588,7 +1588,7 @@ class DriveMixin:
         coder path's terminal block."""
         store = self._store()
         fid = feature["id"]
-        prompt = self._build_task_prompt(feature)
+        prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_task(delegate, prompt, timeout=self.coder_timeout or None)
         except asyncio.CancelledError:
@@ -1721,7 +1721,38 @@ class DriveMixin:
         for fut in self._bg_records.pop(fid, []):
             await fut
 
+    async def _dispatch_captured(self, dispatch):
+        """Persist this attempt before retry, hold, or cleanup can lose its context."""
+        capture = work_location_capture.active.get()
+        if capture is not None:
+            # A later attempt can advance a previously published checkout immediately.
+            capture.seen.clear()
+            capture.probed_at.clear()
+        try:
+            return await dispatch
+        finally:
+            await work_location_capture.drain()
+
     async def _drive(self, feature: dict):
+        capture = work_location_capture.Capture(self._store(), feature["id"], self._repo_for(feature))
+        token = work_location_capture.active.set(capture)
+        try:
+            return await self._drive_captured(feature)
+        finally:
+            # Final safety net outside dispatches; each dispatch drains before retry/hold.
+            # The coder's tool stream only ACCUMULATED
+            # external paths (cheap, never touching git); this is where they are probed,
+            # their attributable identity persisted, and a committed WIP/evidence ref
+            # published early — on a clean result, a partial/error, a timeout, or an
+            # operator cancel alike (the drain shields its durable write so cancellation
+            # still records before context is lost). It never raises: a monitoring
+            # concern must not turn a built card into a failed drive.
+            try:
+                await capture.drain()
+            finally:
+                work_location_capture.active.reset(token)
+
+    async def _drive_captured(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
         the merge webhook. With per-tier coders configured, a *capability* failure
         (coder errored / produced no diff) climbs the ladder; with a single coder
@@ -1796,6 +1827,7 @@ class DriveMixin:
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                prompt += work_location_capture.reporting_instructions()
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
                 # (below) or round-robin across dispatches, never on a capability failure —
@@ -1912,15 +1944,17 @@ class DriveMixin:
                         # pre-model check for this re-dispatch (#339 review): a re-run that
                         # dies below the seam reads as "no model work THIS dispatch" and
                         # blocks for infra triage instead of climbing the tier ladder.
-                        result = await coder_seam.dispatch_coder_tapped(
-                            coder,
-                            wt,
-                            prompt,
-                            fid=fid,
-                            gen=1,
-                            tier=tier,
-                            timeout=self.coder_timeout or None,
-                            new_dispatch=True,
+                        result = await self._dispatch_captured(
+                            coder_seam.dispatch_coder_tapped(
+                                coder,
+                                wt,
+                                prompt,
+                                fid=fid,
+                                gen=1,
+                                tier=tier,
+                                timeout=self.coder_timeout or None,
+                                new_dispatch=True,
+                            )
                         )
                     elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
                         files_to_modify = feature.get("files_to_modify") or []
@@ -1947,52 +1981,56 @@ class DriveMixin:
                                 log.info("[project_board] %s fusion rung skipped for this dispatch: %s", fid, reason)
                                 fusion = None
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
-                        wt, branch, result = await coder_seam.dispatch(
-                            task=prompt,
-                            coder=coder,
-                            repo=repo,
-                            base=base,
-                            root=self.root,
-                            fid=fid,
-                            dispatch_timeout=self.coder_timeout or None,
-                            test_cmd=solve["test_cmd"],
-                            test_paths=solve["test_paths"],
-                            test_timeout=solve["test_timeout"],
-                            budget=solve["budget"],
-                            k=solve["k"],
-                            tree_depth=solve["tree_depth"],
-                            record_gens=lambda n: self._record_bg(fid, "record_gens", store.record_gens_spent, fid, n),
-                            fusion_delegate=fusion,
-                            fusion_k=solve["fusion_k"],
-                            files_to_modify=files_to_modify,
-                            fusion_max_file_chars=solve["fusion_max_file_chars"],
-                            # #86: same host-env strip the gate/preflight/format spawns
-                            # get — keep the whitelist consistent across every subprocess.
-                            env_passthrough=self.env_passthrough,
-                            # Each ladder candidate installs its own deps too (`setup_cmd`).
-                            setup_cmd=self._setup_cmd_for(feature),
-                            setup_timeout=self.setup_timeout,
-                            tier=tier,  # #84: label each solve gen with the current tier
-                            # #91: persist the verified candidate on the bead at the
-                            # verify boundary, so a crash before open_pr is salvageable.
-                            record_verified=lambda br_name, sha, wt_path: self._record_bg(
-                                fid,
-                                "record_verified",
-                                store.record_verified_candidate,
-                                fid,
-                                branch=br_name,
-                                sha=sha,
-                                worktree=wt_path,
-                            ),
-                            commit_message=title,
-                            title=raw_title,  # #227: canonical branch/dir slug tail
-                            max_concurrent_sessions=solve["max_concurrent_sessions"],
+                        wt, branch, result = await self._dispatch_captured(
+                            coder_seam.dispatch(
+                                task=prompt,
+                                coder=coder,
+                                repo=repo,
+                                base=base,
+                                root=self.root,
+                                fid=fid,
+                                dispatch_timeout=self.coder_timeout or None,
+                                test_cmd=solve["test_cmd"],
+                                test_paths=solve["test_paths"],
+                                test_timeout=solve["test_timeout"],
+                                budget=solve["budget"],
+                                k=solve["k"],
+                                tree_depth=solve["tree_depth"],
+                                record_gens=lambda n: self._record_bg(
+                                    fid, "record_gens", store.record_gens_spent, fid, n
+                                ),
+                                fusion_delegate=fusion,
+                                fusion_k=solve["fusion_k"],
+                                files_to_modify=files_to_modify,
+                                fusion_max_file_chars=solve["fusion_max_file_chars"],
+                                # #86: same host-env strip the gate/preflight/format spawns
+                                # get — keep the whitelist consistent across every subprocess.
+                                env_passthrough=self.env_passthrough,
+                                # Each ladder candidate installs its own deps too (`setup_cmd`).
+                                setup_cmd=self._setup_cmd_for(feature),
+                                setup_timeout=self.setup_timeout,
+                                tier=tier,  # #84: label each solve gen with the current tier
+                                # #91: persist the verified candidate on the bead at the
+                                # verify boundary, so a crash before open_pr is salvageable.
+                                record_verified=lambda br_name, sha, wt_path: self._record_bg(
+                                    fid,
+                                    "record_verified",
+                                    store.record_verified_candidate,
+                                    fid,
+                                    branch=br_name,
+                                    sha=sha,
+                                    worktree=wt_path,
+                                ),
+                                commit_message=title,
+                                title=raw_title,  # #227: canonical branch/dir slug tail
+                                max_concurrent_sessions=solve["max_concurrent_sessions"],
+                            )
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
-                        wt, branch, result = await self._dispatch_max_mode(
-                            feature, coder, prompt, repo, base, fid, tier
+                        wt, branch, result = await self._dispatch_captured(
+                            self._dispatch_max_mode(feature, coder, prompt, repo, base, fid, tier)
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     else:
@@ -2009,8 +2047,10 @@ class DriveMixin:
                         # the live remote ref, which a coder's own push would move.
                         round_start = await worktree.checkout_head_sha(wt) if feature.get("pr_url") else ""
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
-                        result = await coder_seam.dispatch_coder_tapped(
-                            coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                        result = await self._dispatch_captured(
+                            coder_seam.dispatch_coder_tapped(
+                                coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                            )
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
                     # #258 barrier: any record_gens/record_verified write-backs the
                     # dispatch scheduled on worker threads land before the drive

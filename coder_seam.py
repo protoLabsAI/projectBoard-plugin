@@ -997,6 +997,9 @@ async def dispatch_coder_tapped(
         progress_answer(fid, gen, delta)
 
     async def _tool_cb(event):
+        from . import work_location_capture
+
+        await work_location_capture.observe(event, worktree_path)
         progress_tool(fid, gen, event)
 
     async def _plan_cb(entries):
@@ -1153,6 +1156,9 @@ async def _dispatch_coder_tapped_legacy(
         progress_answer(fid, gen, delta)
 
     async def _tool_cb(event):
+        from . import work_location_capture
+
+        await work_location_capture.observe(event, worktree_path)
         progress_tool(fid, gen, event)
         # usage_update isn't forwarded as a callback — the client folds it into
         # last_usage as it goes, so sample it on each tool event to keep totals live.
