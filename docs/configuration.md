@@ -678,3 +678,39 @@ labels remain unchanged and are read through the same aliases.
 **`projects`** — one board, several repos. Each entry carries that repo's own `repo`,
 `base_branch`, `local_gate_cmd` and `coders`, so a card is built and gated against the
 repo it belongs to. Without it, every card uses the top-level values.
+
+### Strict coder routing
+
+Set `routing.exclusive` inside `project_board` to restrict implement, CI-fix,
+review-fix, and escalation dispatches to an explicit delegate allowlist:
+
+```yaml
+project_board:
+  coder: sonnet
+  routing:
+    exclusive: [codex]
+  coders:
+    standard: [codex, sonnet]
+    reasoning: sonnet
+    advanced: codex
+  projects:
+    app:
+      repo: /path/to/app
+      routing:
+        exclusive: [codex] # overrides the board value; [] disables strict mode here
+```
+
+Every rung is filtered before sibling selection. Empty or unavailable rungs are
+skipped upward; if no eligible configured delegate remains, the card is blocked
+with a reason naming the exclusive set. Strict mode never falls back to a weaker
+rung or an unlisted base `coder`. Without a ladder, the base coder must be allowed.
+An absent or empty allowlist preserves existing routing and fallback behavior.
+Restart the loop after changing the top-level `routing` policy; setup status flags
+a policy that differs from the running loop. Project entries inherit the board allowlist unless they specify their own
+`routing.exclusive`, including an explicit empty list.
+
+Not covered by routing.exclusive: review gate reviewer, review dispatch,
+decompose, coder.solve offload, Max-Mode judge, and task-assignee delegates.
+These paths retain their own delegate configuration; strict routing is not a
+board-wide guarantee for helper or review calls. Setup check and `/status`
+list these exclusions and flag allowlist names that are not configured delegates.

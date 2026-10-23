@@ -40,6 +40,10 @@ config:
   # out for a single-ACP-agent setup (no tier ladder, no redundant retries —
   # one dispatch, then Blocked on failure; `difficulty` is then ignored).
   # Legacy tier names smart and opus are still accepted (standard and advanced).
+  # routing:
+  #   exclusive: [codex]    # strict coder allowlist; project routing.exclusive overrides.
+  #                        # Empty/absent preserves normal fallback; exhaustion blocks.
+  #                        # Helpers/review/solve offload are not covered (see configuration docs).
   # coders:                 # tier → delegate; difficulty picks the starting rung.
   #   standard: proto       # rungs are standard → reasoning → advanced (store.TIER_LADDER);
   #   reasoning: proto-smart  # with `coder:` set it is the fallback for an unmapped rung,

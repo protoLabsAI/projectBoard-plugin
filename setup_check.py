@@ -122,7 +122,7 @@ REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
 # reload (``coder`` is live since v0.42.0 — see loop.LIVE_STR_KNOBS). A reload that
 # changes one of these leaves the running loop on the old value until a restart, so
 # ``/status`` says so instead of reporting the NEW config as the loop's state.
-LOOP_RESTART_KEYS: tuple[str, ...] = ("coders", "repo", "base_branch", "db_path")
+LOOP_RESTART_KEYS: tuple[str, ...] = ("coders", "repo", "base_branch", "db_path", "routing")
 
 # The subprocess runner ``_br_version`` uses — a module attribute (not a bare
 # ``subprocess.run`` reference) so the suite's autouse fixture can pin it without
@@ -986,6 +986,11 @@ def setup_status(
 
     status["release_freeze_hint"] = release_freeze.unavailable_hint()
     status["coder_rungs_hint"] = coder_rungs_hint(coder["missing_rungs"])
+    status["routing_exclusive_hint"] = routing_exclusive_hint(cfg, delegates)
+    if status["routing_exclusive_hint"]:
+        status["coder_rungs_hint"] = " ".join(
+            filter(None, (status["coder_rungs_hint"], status["routing_exclusive_hint"]))
+        )
     from . import health  # lazy, like release_freeze
 
     # #456 / #459: a preflight that can't finish in its timeout, and a project whose
@@ -998,6 +1003,33 @@ def setup_status(
     status["claim_stall_hint"] = health.claim_stall_hint()
     status["ready"] = all(status[k]["ok"] for k in SETUP_KEYS)
     return status
+
+
+def routing_exclusive_hint(cfg: dict, delegates) -> str:
+    """Strict coder routing is advisory for helpers, and validates its own roster."""
+    entries = [("board", cfg)]
+    try:
+        entries.extend(resolve_projects(cfg).items())
+    except Exception:  # noqa: BLE001 — the repo check owns malformed projects
+        pass
+    hints = []
+    active = False
+    for project, entry in entries:
+        names = _rung_names((entry.get("routing") or {}).get("exclusive"))
+        active = active or bool(names)
+        for name in names:
+            try:
+                found = delegates(name)
+            except Exception:  # noqa: BLE001 — unavailable roster
+                found = None
+            if found is None:
+                hints.append(f"routing.exclusive ({project}): delegate {name!r} is not configured/enabled.")
+    if active:
+        hints.append(
+            "not covered by routing.exclusive: review gate reviewer, review dispatch, decompose, "
+            "coder.solve offload, Max-Mode judge, task-assignee delegates."
+        )
+    return " ".join(hints)
 
 
 def _missing_rungs(cfg: dict, missing: set[str]) -> list[dict]:
@@ -1042,7 +1074,10 @@ def coder_rungs_hint(missing_rungs: list[dict]) -> str:
 
 
 # Which restart-only knobs feed which check — for the per-check restart note.
-_STALE_KEYS_PER_CHECK = {"coder": ("coders", "projects"), "repo": ("repo", "base_branch", "db_path", "projects")}
+_STALE_KEYS_PER_CHECK = {
+    "coder": ("coders", "projects", "routing"),
+    "repo": ("repo", "base_branch", "db_path", "projects"),
+}
 
 
 def _ladder_gap(cfg: dict) -> str:

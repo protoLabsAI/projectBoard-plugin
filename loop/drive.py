@@ -1765,6 +1765,8 @@ class DriveMixin:
         repo = self._repo_for(feature)
         base = self._base_branch_for(feature)
         coders = self._coders_for(feature)
+        exclusive = self._exclusive_for(feature)
+        escalation_on = self.escalation_on or bool(exclusive and coders)
         # #533: strip any `#n` the squash subject could read as a closing ref — a foreign
         # `fix: #6.3` → `fix: 6.3`, and in `refs_only` mode (another slice of this card's
         # source issue is still being coded) the card's OWN clean `#n` too, so the subject
@@ -1775,7 +1777,7 @@ class DriveMixin:
         refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, store, feature)
         title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
         raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
-        tier = (await asyncio.to_thread(store.current_tier, fid)) if self.escalation_on else ""
+        tier = (await asyncio.to_thread(store.current_tier, fid)) if escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         # Which sibling of the current rung to use. Seeded from a per-process counter so
         # consecutive cards do not all open on the same provider — spread is the ordinary
@@ -1834,14 +1836,27 @@ class DriveMixin:
                 # that is what climbing a rung is for. A sibling another card found unable
                 # to serve its model goes behind its live siblings rather than being
                 # rediscovered (#420).
-                siblings = coders.get(tier) if self.escalation_on else None
+                siblings = coders.get(tier) if escalation_on else None
                 if not siblings:
-                    siblings = [self.coder_name]
+                    siblings = [] if exclusive and escalation_on else [self.coder_name]
                 # A rung naming a delegate that no longer exists degrades instead of
                 # blocking (protoAgent#3692): its live siblings, else the base coder, else
                 # the nearest live rung. Only when nothing resolves does the block below
                 # name the missing delegate.
-                siblings = self._live_rung(tier, siblings, coders)
+                siblings = self._live_rung(tier, siblings, coders, exclusive=exclusive)
+                if exclusive and not siblings:
+                    reason = f"routing.exclusive [{', '.join(exclusive)}]: no eligible configured coder at or above {tier or 'default'}"
+                    nxt = await asyncio.to_thread(store.escalate, fid, reason) if escalation_on else None
+                    if nxt:
+                        tier = nxt
+                        retries = 0
+                        spent_here.clear()
+                        refused_here.clear()
+                        continue
+                    await self._block_or_stand_aside(
+                        store, fid, reason, repo=repo, wt=wt, branch=branch, pr_url=pr_url, friction=True
+                    )
+                    return
                 preferred = prefer_live_sibling(siblings, sib, spent_here)
                 if preferred != sib:
                     log.info(
@@ -2564,7 +2579,7 @@ class DriveMixin:
                             except Exception:  # noqa: BLE001 — attempt bookkeeping must never mask the verdict
                                 log.warning("[project_board] %s empty_result attempt record failed", fid, exc_info=True)
                             await self._budget_reset(store, fid, "empty-result")  # a climb gets its own retry window
-                            if self.escalation_on:
+                            if escalation_on:
                                 nxt = await asyncio.to_thread(store.escalate, fid, reason[:200])
                                 if nxt:
                                     log.info(
@@ -2585,6 +2600,8 @@ class DriveMixin:
                                         store, fid, "goal-fix", "gate-fix", "req-fix", "ledger-only"
                                     )
                                     continue
+                            if exclusive:
+                                reason += f"; routing.exclusive [{', '.join(exclusive)}] exhausted"
                             log.warning("[project_board] %s blocked (%s)", fid, reason)
                             if not await self._block_or_stand_aside(
                                 store, fid, reason, repo=repo, wt=wt, branch=branch, pr_url=pr_url
@@ -2818,7 +2835,7 @@ class DriveMixin:
                             self._inflight.pop(fid, None)
                             return
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
-                    if self.escalation_on and capability:
+                    if escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
                         if nxt:
                             log.info("[project_board] %s escalating %s→%s: %s", fid, tier, nxt, exc)
@@ -2869,7 +2886,8 @@ class DriveMixin:
                     if not await self._block_or_stand_aside(
                         store,
                         fid,
-                        f"{policy.category}: {exc}",
+                        f"{policy.category}: {exc}"
+                        + (f"; routing.exclusive [{', '.join(exclusive)}] exhausted" if exclusive else ""),
                         category=policy.category,
                         repo=repo,
                         wt=wt,
@@ -3374,7 +3392,9 @@ class DriveMixin:
             self._publish_preflight_health()
         return True
 
-    def _live_rung(self, tier: str, siblings: list[str], coders: dict) -> list[str]:
+    def _live_rung(
+        self, tier: str, siblings: list[str], coders: dict, *, exclusive: list[str] | None = None
+    ) -> list[str]:
         """The delegates this rung can actually dispatch to (protoAgent#3692).
 
         A ``coders`` rung can name a delegate the operator has since deleted. That used to
@@ -3386,6 +3406,10 @@ class DriveMixin:
         ``coder`` last. A card that climbed to a rung must not drop to the weakest model
         just because its rung is gone (#467 review). With nothing live at all, the list
         comes back unchanged, and the caller's block names the missing delegate as before."""
+        if exclusive:
+            # Strict routing never falls back down the ladder or to a foreign base coder.
+            # The drive persists each climb before resolving the next rung.
+            return [n for n in siblings if n in exclusive and self._resolve_delegate(n, "acp") is not None]
         live = [n for n in siblings if self._resolve_delegate(n, "acp") is not None]
         if len(live) == len(siblings):
             return siblings
