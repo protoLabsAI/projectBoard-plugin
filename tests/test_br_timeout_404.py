@@ -119,7 +119,14 @@ exec "{real}" "$@"
 
 @pytest.fixture
 def board(tmp_path, stallable_br):
-    return BeadsBoard(repo=str(tmp_path), actor="test")
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    # Warm the cold `.beads/` workspace now, while the normal deadline still holds. Several
+    # tests call stallable_br.stall() — which drops `_BR_TIMEOUT_S` to 1s — BEFORE their
+    # first board op, and that op would otherwise run a real `br init` (store _ensure_workspace)
+    # under the 1s bound and flake under `-n 6`. The stall() helper's comment promises cold
+    # setup keeps the normal deadline; bootstrapping here (one cheap real call) honours it (#568).
+    board._ensure_workspace()
+    return board
 
 
 def _show_ids(argv: list[str]) -> list[str]:
