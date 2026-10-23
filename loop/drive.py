@@ -1900,7 +1900,9 @@ class DriveMixin:
                 # Read live each attempt so a B3 reload of `routing.headroom` /
                 # `routing.prefer_sibling_at` applies without a restart.
                 headroom_on = self._headroom_on_for(feature)
-                rung_usage = self._rung_usage(siblings, on=headroom_on)
+                # The host usage store may hold a threading lock and poll HTTPS.
+                # Keep that blocking work off the event loop shared by card drives.
+                rung_usage = await asyncio.to_thread(self._rung_usage, siblings, on=headroom_on)
                 if headroom_on:
                     preferred = prefer_headroom_sibling(
                         siblings, sib, spent_here, rung_usage, prefer_at=self._prefer_sibling_at_for(feature)

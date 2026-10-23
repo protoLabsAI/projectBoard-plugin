@@ -13,6 +13,9 @@ off — must give byte-for-byte the decisions the pre-#579 ``prefer_live_sibling
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 
 from project_board import worktree
@@ -198,6 +201,42 @@ async def test_drive_opens_on_the_higher_headroom_sibling(monkeypatch):
     _fake_sdk(monkeypatch, {"codex": _snap(4), "sonnet": _snap(70)})
     await loop._drive({"id": "bd-hr", "title": "t", "spec": "s"})
     assert seen[0] == "sonnet", f"expected the opening dispatch to steer to sonnet, got {seen}"
+
+
+async def test_drive_usage_poll_does_not_block_the_event_loop(monkeypatch):
+    """A slow host poll must let other event-loop work run before it returns."""
+    loop_mod._PROVIDER_DOWN.clear()
+    seen = []
+    poll_released = []
+    poll_threads = []
+    event_loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    release = threading.Event()
+
+    async def _dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.NoChangesError("coder produced no commits")
+
+    def _provider_usage(delegate):
+        poll_threads.append(threading.get_ident())
+        event_loop.call_soon_threadsafe(started.set)
+        # Bounded so a regression cannot deadlock the test runner.
+        poll_released.append(release.wait(timeout=2))
+        return _snap(4 if delegate == "codex" else 70)
+
+    loop, store = _rung_env(monkeypatch, _dispatch, cfg=_LADDER, cursor=0)
+    monkeypatch.setattr("graph.sdk.provider_usage", _provider_usage, raising=False)
+    drive = asyncio.create_task(loop._drive({"id": "bd-poll", "title": "t", "spec": "s"}))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+    finally:
+        release.set()
+        await asyncio.wait_for(drive, timeout=5)
+
+    assert poll_threads and all(thread != loop_thread for thread in poll_threads)
+    assert all(poll_released), "event loop could not release the SDK poll while it was waiting"
+    assert seen[0] == "sonnet"
 
 
 async def test_headroom_never_selects_outside_routing_exclusive(monkeypatch):
