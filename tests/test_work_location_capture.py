@@ -2,8 +2,7 @@
 
 Two seams are exercised: ``observe`` (the coder's tool stream) only ACCUMULATES paths
 in memory, and ``drain`` (the drive's result/interruption seam) probes, persists and
-publishes. The production integration runs drain from ``loop.drive._drive``'s finally, so
-the interruption tests go through ``_drive`` rather than calling drain by hand.
+publishes. The drive drains at each dispatch boundary, with an outer finally as a safety net.
 """
 
 import asyncio
@@ -141,8 +140,10 @@ class Coder:
 
 async def _dispatch(loop, fid, tapped):
     async def drive_captured(feature):
-        return await coder_seam.dispatch_coder_tapped(
-            Coder(), str(loop._repo_for(feature)), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+        return await loop._dispatch_captured(
+            coder_seam.dispatch_coder_tapped(
+                Coder(), str(loop._repo_for(feature)), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+            )
         )
 
     loop._drive_captured = drive_captured
@@ -191,16 +192,17 @@ async def test_drive_accumulates_during_stream_then_drains_at_result_seam(repos,
     async def drive_captured(feature):
         assert capture.active.get().fid == feature["id"]
         with pytest.raises(worktree.CoderTimeout):
-            await coder_seam.dispatch_coder_tapped(
-                Coder(), str(project), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+            await loop._dispatch_captured(
+                coder_seam.dispatch_coder_tapped(
+                    Coder(), str(project), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+                )
             )
-        # The tool stream only ACCUMULATED the path in memory; nothing is persisted yet,
-        # so a hold recorded right here would not race a store write under the ACP lock.
-        assert Store(list(store.comments)).list_work_locations("bd-test")["entries"] == []
+        # Evidence is already durable before timeout handling can hold or retry.
+        assert latest(Store(list(store.comments)))["pushed"] is True
 
     monkeypatch.setattr(loop, "_drive_captured", drive_captured)
     await loop._drive({"id": "bd-test"})
-    # The result/interruption seam drained once, after _drive_captured returned.
+    # The outer safety net preserves the dispatch-boundary verdict.
     entry = latest(Store(list(store.comments)))
     assert entry["sha"] == git(external, "rev-parse", "HEAD")
     assert entry["sha"] == git(remote, "rev-parse", "refs/heads/wip/bd-test")
@@ -436,3 +438,91 @@ async def test_transport_uses_project_config_and_external_objects(repos, monkeyp
     assert len(pushes) == 1
     assert latest(store)["pushed"] is True
     assert "helper" not in json.dumps(store.comments)
+
+
+@pytest.mark.parametrize("tracking", [False, True])
+async def test_published_ref_survives_restart_and_sweep(repos, tracking):
+    import time
+
+    project, external, remote, _ = repos
+    if tracking:
+        git(external, "branch", "--set-upstream-to=origin/main")
+    store = Store()
+    await run(capture.Capture(store, "bd-test", project), {"locations": [str(external)]})
+    restarted = Store(list(store.comments))
+    alerts = []
+    checker = capture.sweep.Sweep()
+    cache = {}
+    for _ in range(2):
+        checker._check_entry(
+            restarted,
+            lambda *a, **kw: alerts.append(a),
+            {"id": "bd-test"},
+            latest(restarted),
+            capture.sweep.approved_roots(),
+            time.monotonic() + 10,
+            cache,
+        )
+    assert latest(restarted)["pushed"] is True
+    assert latest(restarted)["last_check"]["status"] == "verified"
+    assert latest(restarted)["last_check"]["risks"] == []
+    assert not alerts
+    # Same checkout/identity, different publication target: no cache verdict reuse.
+    other = dict(latest(restarted), id="other-ref", remote_ref="origin/main")
+    checker._check_entry(
+        restarted,
+        lambda *a, **kw: alerts.append(a),
+        {"id": "bd-test"},
+        other,
+        capture.sweep.approved_roots(),
+        time.monotonic() + 10,
+        cache,
+    )
+    entries = restarted.list_work_locations("bd-test")["entries"]
+    assert next(e for e in entries if e["id"] == "other-ref")["pushed"] is False
+    assert alerts
+
+
+async def test_each_attempt_persists_before_next_attempt_or_hold(repos, monkeypatch):
+    project, external, remote, _ = repos
+    store = Store()
+    loop = drive_loop(store, project, monkeypatch)
+    later_started, release = asyncio.Event(), asyncio.Event()
+
+    async def tapped(coder, prompt, *, on_tool, on_thought, on_text, timeout):
+        await on_tool({"locations": [str(external)]})
+        assert not store.comments  # still no I/O on the tool callback
+        return SimpleNamespace(reply="first attempt")
+
+    async def later():
+        # Simulate a retry that advances the same external checkout immediately.
+        later_started.set()
+        await release.wait()
+        (external / "evidence").write_text("second attempt")
+        git(external, "add", "evidence")
+        git(external, "commit", "-m", "second attempt")
+        return "second attempt"
+
+    async def drive_captured(feature):
+        await loop._dispatch_captured(
+            coder_seam.dispatch_coder_tapped(
+                Coder(), str(project), "task", fid=feature["id"], gen=1, _dispatch_tapped=tapped
+            )
+        )
+        await loop._dispatch_captured(later())
+        # This is the hold boundary, still inside the multi-attempt drive.
+        assert latest(Store(list(store.comments)))["sha"] == git(external, "rev-parse", "HEAD")
+        assert latest(store)["pushed"] is True
+
+    monkeypatch.setattr(loop, "_drive_captured", drive_captured)
+    task = asyncio.create_task(loop._drive({"id": "bd-test"}))
+    try:
+        await asyncio.wait_for(later_started.wait(), 10)
+        # Restart recovery while attempt two is running; the outer finally has not run.
+        entry = latest(Store(list(store.comments)))
+        assert entry["sha"] == git(remote, "rev-parse", "refs/heads/wip/bd-test")
+        assert entry["pushed"] is True
+    finally:
+        release.set()
+        await task
+    assert latest(store)["sha"] != entry["sha"]

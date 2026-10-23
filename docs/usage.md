@@ -65,8 +65,12 @@ Capture has two seams. During the coder's tool stream it only ACCUMULATES the
 observed paths in memory — no git, no store, no network on that hot path, so it
 cannot stall the stream or eat into the dispatch timeout. Once the dispatch ends —
 a clean reply, a partial/error result, a timeout, or an operator cancel — the drive
-drains once: it probes each path locally, persists the attributable identity, and
-publishes early. The drain is shielded so a durable write finishes even while the
+drains before retry, hold, or cleanup handling: it probes each path locally,
+persists the attributable identity, and
+publishes early. Each retry rechecks observed paths, including new commits in a
+previously published checkout. Later sweeps verify the recorded publication ref
+independently of the checkout’s configured upstream. The drain is shielded so a
+durable write finishes even while the
 dispatch is being cancelled, and it is wholly best-effort: a store, filesystem, or
 transport failure during capture is logged and swallowed, never allowed to turn a
 healthy build into a failed drive.

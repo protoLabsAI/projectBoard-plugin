@@ -9,7 +9,7 @@ Two seams, deliberately split so the live coder stream never pays for git work:
   accumulation of structured paths: no git, no store, no network, no lock-held
   subprocess. It is called on every tool event, so it must stay O(1)-ish and MUST
   NOT raise — a monitoring concern must never break a build.
-* ``drain`` — the RESULT/INTERRUPTION seam (the drive, once per feature). It probes
+* ``drain`` — the RESULT/INTERRUPTION seam (the drive, once per dispatch). It probes
   each accumulated path locally, persists its attributable identity, and publishes a
   committed WIP/evidence ref early. Shielded so a durable write/publish finishes even
   under cancellation, bounded by a deadline so cancellation cannot hang, and fully
@@ -385,7 +385,7 @@ async def observe(event=None, root=""):
 
 
 async def drain():
-    """RESULT/INTERRUPTION seam entry point (the drive, once per feature)."""
+    """RESULT/INTERRUPTION seam entry point (the drive, once per dispatch)."""
     capture = active.get()
     if capture is not None:
         await capture.drain()

@@ -139,8 +139,17 @@ def probe(entry, roots, deadline, *, local_only=False):
             )
             return facts
         branch = facts["branch"]
-        remote = run("config", "--get", f"branch.{branch}.remote")
-        ref = run("config", "--get", f"branch.{branch}.merge")
+        if entry.get("remote_ref"):
+            # Publication need not use the checkout's tracking branch. Resolve only
+            # a configured remote name, never a transport URL from the ledger.
+            remote, separator, name = entry["remote_ref"].partition("/")
+            if not separator or not remote or remote.startswith("-") or not name:
+                raise ValueError("recorded remote ref must be <remote>/<branch>")
+            ref = "refs/heads/" + name
+            run("check-ref-format", ref)
+        else:
+            remote = run("config", "--get", f"branch.{branch}.remote")
+            ref = run("config", "--get", f"branch.{branch}.merge")
         url = run("remote", "get-url", "--", remote)
         # Local transport also needs filesystem authority; never run remote helpers
         # or executable URLs from config, much less from the caller's ledger.
@@ -254,7 +263,7 @@ class Sweep:
                 break
 
     def _check_entry(self, store, notify, feature, entry, roots, deadline, cache):
-        key = tuple(entry.get(k, "") for k in ("path", "repo", "branch", "sha"))
+        key = tuple(entry.get(k, "") for k in ("path", "repo", "branch", "sha", "remote_ref"))
         if key not in cache:
             cache[key] = probe(entry, roots, min(deadline, time.monotonic() + 5))
         facts = cache[key]
