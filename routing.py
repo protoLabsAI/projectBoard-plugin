@@ -63,8 +63,11 @@ def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
         routing = entry.get("routing", {})
         if routing is None and not resolve:
             routing = {}
-        if not isinstance(routing, dict) or set(routing) - {"exclusive"}:
-            raise ValueError(f"{label}.routing must be a mapping containing only exclusive")
+        # #579 adds the headroom-steering knobs alongside exclusive; nothing else belongs.
+        if not isinstance(routing, dict) or set(routing) - {"exclusive", "headroom", "prefer_sibling_at"}:
+            raise ValueError(
+                f"{label}.routing must be a mapping containing only exclusive, headroom, prefer_sibling_at"
+            )
         exclusive = routing.get("exclusive", [])
         if not resolve and (exclusive is None or isinstance(exclusive, (str, tuple))):
             exclusive = rung_delegates(exclusive)
@@ -73,6 +76,23 @@ def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
         ):
             raise ValueError(f"{label}.routing.exclusive must be a list of delegate names")
         names.update(rung_delegates(exclusive))
+        # `headroom` (default true) toggles headroom steering; accept a real bool or a
+        # YAML/Settings boolean spelling (the loop coerces it with knob_bool).
+        if "headroom" in routing:
+            hv = routing["headroom"]
+            ok = isinstance(hv, bool) or (
+                isinstance(hv, str) and hv.strip().lower() in {"1", "true", "yes", "on", "0", "false", "no", "off", ""}
+            )
+            if not ok:
+                raise ValueError(f"{label}.routing.headroom must be a boolean")
+        # `prefer_sibling_at` is the used-% threshold (1..100).
+        if "prefer_sibling_at" in routing:
+            try:
+                pct = int(routing["prefer_sibling_at"])
+            except (TypeError, ValueError):
+                raise ValueError(f"{label}.routing.prefer_sibling_at must be an integer percent between 1 and 100")
+            if not 1 <= pct <= 100:
+                raise ValueError(f"{label}.routing.prefer_sibling_at must be an integer percent between 1 and 100")
     if resolve:
         resolver = delegates if delegates is not None else (_default_delegates() if names else None)
         for name in sorted(names):

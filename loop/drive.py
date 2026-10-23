@@ -1894,17 +1894,27 @@ class DriveMixin:
                         store, fid, reason, repo=repo, wt=wt, branch=branch, pr_url=pr_url, friction=True
                     )
                     return
-                preferred = prefer_live_sibling(siblings, sib, spent_here)
+                # Steer the opening provider by subscription headroom (#579) when it is
+                # on, else fall back to today's down-mark reorder. `siblings` is already
+                # the exclusive-filtered live rung, so neither pick can leave the B2 set.
+                # Read live each attempt so a B3 reload of `routing.headroom` /
+                # `routing.prefer_sibling_at` applies without a restart.
+                headroom_on = self._headroom_on_for(feature)
+                rung_usage = self._rung_usage(siblings, on=headroom_on)
+                if headroom_on:
+                    preferred = prefer_headroom_sibling(
+                        siblings, sib, spent_here, rung_usage, prefer_at=self._prefer_sibling_at_for(feature)
+                    )
+                else:
+                    preferred = prefer_live_sibling(siblings, sib, spent_here)
                 if preferred != sib:
                     log.info(
-                        "[project_board] %s starting on %s rather than %s at the %s rung — %s refused "
-                        "its model within the last %ds",
+                        "[project_board] %s starting on %s rather than %s at the %s rung — "
+                        "subscription headroom / a down-marked provider",
                         fid,
                         siblings[preferred % len(siblings)],
                         siblings[sib % len(siblings)],
                         tier or "default",
-                        siblings[sib % len(siblings)],
-                        int(_PROVIDER_DOWN_TTL_S),
                     )
                     sib = preferred
                 coder_name = siblings[sib % len(siblings)]
@@ -2701,7 +2711,7 @@ class DriveMixin:
                         if policy.category == "provider_unavailable":
                             refused_here.add(coder_name)
                             mark_provider_down(coder_name)
-                        target = rotation_target(policy.category, siblings, sib, spent_here)
+                        target = rotation_target(policy.category, siblings, sib, spent_here, usage=rung_usage)
                         if target is not None:
                             if keep_for_retry:
                                 keep_wt = True
@@ -2738,7 +2748,9 @@ class DriveMixin:
                     #     block anyway, so this can only help: it either serves, refuses (and
                     #     1.4 says so truthfully), or rate-limits too.
                     if provider_failure and policy.category == "rate_limit":
-                        target = rotation_target(policy.category, siblings, sib, spent_here, ignore_marks=True)
+                        target = rotation_target(
+                            policy.category, siblings, sib, spent_here, ignore_marks=True, usage=rung_usage
+                        )
                         if target is not None:
                             if keep_for_retry:
                                 keep_wt = True
@@ -3538,6 +3550,36 @@ class DriveMixin:
             self._oracle_unwinnable[name],
         )
         self._publish_preflight_health()
+
+    def _provider_usage(self, name: str) -> dict | None:
+        """One sibling's live subscription-usage snapshot via the host SDK (U7, #579):
+        ``{usable, headroom_pct, binding_window, resets_at}``, or None when it can't be
+        read. getattr-guarded (ADR 0122 D8) — a board release on an OLDER host that lacks
+        ``graph.sdk.provider_usage`` degrades every sibling to unknown, and unknown ==
+        today (D4). Never raises: a missing host or a flaky usage read is "unknown", never
+        a dispatch failure."""
+        try:
+            import graph.sdk as graph_sdk
+        except Exception:  # noqa: BLE001 — no host package at all (tests, CLI)
+            return None
+        fn = getattr(graph_sdk, "provider_usage", None)
+        if fn is None:
+            return None
+        try:
+            snap = fn(delegate=name)
+        except Exception:  # noqa: BLE001 — a flaky usage read is unknown, not a failure
+            return None
+        return snap if isinstance(snap, dict) else None
+
+    def _rung_usage(self, siblings: list[str], *, on: bool) -> dict[str, dict | None]:
+        """Usage snapshots for a rung's siblings, keyed by name (#579). All-None when
+        headroom steering is off (`routing.headroom: false`) or the host lacks the call,
+        so ``prefer_headroom_sibling`` / ``rotation_target`` fall back to today's order.
+        ``siblings`` is already the exclusive-filtered, live rung, so steering by headroom
+        can never leave ``routing.exclusive`` (B2)."""
+        if not on:
+            return {name: None for name in siblings}
+        return {name: self._provider_usage(name) for name in siblings}
 
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the
