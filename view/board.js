@@ -177,6 +177,9 @@ function routingLadders(body){
 async function renderRouting(){
   const host = $("routing");
   host.setAttribute("aria-busy", "true");
+  // The effective read resolves every project's ladder and each coder's usage (a few
+  // seconds): say so on first open instead of showing an empty tab.
+  if (!host.firstChild) host.innerHTML = '<p class="r-loading">Reading coder routing…</p>';
   try {
     const body = await api("/api/plugins/project_board/routing/effective");
     host.innerHTML = routingCoders(body) + routingLadders(body);
