@@ -851,14 +851,26 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             return str(pc.get("repo_conventions") or "")
         return self.repo_conventions
 
+    def _exclusive_for(self, feature: dict) -> list[str]:
+        """Project policy overrides the board policy, including an explicit empty list."""
+        routing = self.cfg.get("routing") or {}
+        project_routing = self._project_cfg(feature).get("routing") or {}
+        raw = project_routing.get("exclusive", routing.get("exclusive"))
+        return rung_delegates(raw)
+
     def _coders_for(self, feature: dict) -> dict[str, list[str]]:
         """The tier→delegate `coders` map for this feature's project (#90), else the
         instance default — so escalation on a multi-repo board climbs the ladder the
         FEATURE's project declares, not the board's."""
         raw = self._project_cfg(feature).get("coders")
         if isinstance(raw, dict) and raw:
-            return {str(k): rung_delegates(v) for k, v in raw.items()}
-        return self.coders
+            coders = {str(k): rung_delegates(v) for k, v in raw.items()}
+        else:
+            coders = self.coders
+        exclusive = self._exclusive_for(feature)
+        if exclusive:
+            return {tier: [n for n in names if n in exclusive] for tier, names in coders.items()}
+        return coders
 
     def _coder_solve_test_cmd_for(self, feature: dict) -> str:
         """The coder.solve() verifier command for this feature's project (#90): the

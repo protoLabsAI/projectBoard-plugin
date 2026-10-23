@@ -102,6 +102,7 @@ _PROJECT_SETTING_KEYS = (
     "base_branch",
     "local_gate_cmd",
     "coders",
+    "routing",
     "gate_files",
     "repo_conventions",
     "worktrees_root",
