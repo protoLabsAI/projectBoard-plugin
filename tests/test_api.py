@@ -863,6 +863,20 @@ def test_webhook_ignores_a_non_merge_event(monkeypatch):
     assert not any(call[0] == "record_merge" for call in store.calls)
 
 
+def test_webhook_refuses_a_signed_non_object_body(monkeypatch):
+    # A validly signed JSON array/string is a 400, not an AttributeError 500.
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg={"webhook_secret": "s3cret"})
+    for raw in (b"[1]", b'"hi"'):
+        r = c.post(
+            "/plugins/project_board/webhook/pr",
+            content=raw,
+            headers={"X-Hub-Signature-256": _signed("s3cret", raw)},
+        )
+        assert r.status_code == 400
+    assert not any(call[0] == "record_merge" for call in store.calls)
+
+
 def test_webhook_without_a_secret_fails_closed(monkeypatch):
     store = FakeStore(merged=None)
     c = _client(monkeypatch, store, cfg={"webhook_secret": ""})

@@ -43,7 +43,7 @@ MESSAGE_PREFIX = "Create board card · "
 MAX_PROJECTS = 30
 HINT_MAX = 160
 PROJECT_MAX = 128
-_PROJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_PROJECT_RE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_-]{{0,{PROJECT_MAX - 1}}}")
 _PROPS = {"projects", "project", "title_hint", "why_hint"}
 
 # Set by register_component(): True only when the host accepted the frame kind.
