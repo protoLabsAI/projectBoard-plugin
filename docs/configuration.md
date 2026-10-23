@@ -724,7 +724,9 @@ project's effective `coders` ladder (before exclusive filtering) and `exclusive`
 `PUT /api/plugins/project_board/routing` accept the same fields. Omit `project` to
 edit board defaults; omit either policy field to preserve it. A supplied ladder
 replaces the old ladder, and `exclusive: []` disables strict routing. All tier keys
-and delegate names are validated before persistence; legacy tier aliases are rewritten.
+and delegate names in supplied fields are validated before persistence; legacy tier aliases
+are rewritten. Disabled delegates in untouched fields do not block repairs to other
+scopes. Reload preserves legacy string allowlists and empty/null routing forms.
 Writes use the host config-save/reload path and append caller, UTC time, and old/new
 routing to `routing-audit.jsonl` in the board data directory, plus a log entry.
 

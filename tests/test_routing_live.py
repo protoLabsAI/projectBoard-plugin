@@ -36,7 +36,7 @@ def test_reload_aliases_and_snapshot():
         {"coders": {"typo": "sonnet"}},
         {"coders": {"smart": [3]}},
         {"routing": []},
-        {"routing": {"exclusive": "codex"}},
+        {"routing": {"exclusive": [3]}},
     ],
 )
 def test_bad_reload_is_atomic(update, caplog):
@@ -249,3 +249,68 @@ async def test_host_refusal_neither_applies_nor_audits(host, monkeypatch):
         await routing.routing_set(actor="alice", exclusive=[])
     assert live.plugin_config == before
     assert not calls and not audit.exists()
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"routing": {"exclusive": "sonnet"}},
+        {"routing": {"exclusive": None}},
+        {"routing": None},
+        {"coders": {"smart": ["", "sonnet", "  "]}},
+        {"coders": {"smart": ""}},
+        {"coders": None},
+    ],
+)
+@pytest.mark.parametrize("scope", ["board", "project"])
+def test_legacy_policy_survives_project_reload(policy, scope, caplog):
+    cfg = {"coders": copy.deepcopy(LADDER), "projects": {"app": {"repo": "/app"}}}
+    target = cfg if scope == "board" else cfg["projects"]["app"]
+    target.update(copy.deepcopy(policy))
+    loop = BoardLoop(cfg)
+    loop._resolve_delegate = lambda name, _: name
+    captured = loop._coders_for({"project": "app"})
+    exclusive = loop._exclusive_for({"project": "app"})
+    update = copy.deepcopy(cfg)
+    update["projects"]["app"]["repo"] = "/changed"
+    loop.reload(update)
+    assert loop._repo_for({"project": "app"}) == "/changed"
+    assert loop._coders_for({"project": "app"}) == captured
+    assert loop._exclusive_for({"project": "app"}) == exclusive
+    assert routing.effective_routing(update)["app"]["exclusive"] == exclusive
+    assert "keeping current map" not in caplog.text
+
+
+async def test_repair_disabled_delegate_one_field_and_scope_at_a_time(host):
+    live, loop, calls, audit = host
+    section = live.plugin_config["project_board"]
+    for target in (section, section["projects"]["app"], section["projects"]["own"]):
+        target.update(coders={"standard": ["gone"]}, routing={"exclusive": ["gone"]})
+    loop.reload(live)
+    for project in (None, "app", "own"):
+        await routing.routing_set(actor="alice", project=project, coders={"smart": ["sonnet"]})
+        await routing.routing_set(actor="alice", project=project, exclusive=[])
+    assert len(calls) == len(audit.read_text().splitlines()) == 6
+    assert all(value["coders"]["standard"] == ["sonnet"] for value in routing.routing_get().values())
+    assert loop._coders_for({"project": "app"}) == {"standard": ["sonnet"]}
+    before = copy.deepcopy(section)
+    with pytest.raises(ValueError, match="gone.*not configured"):
+        await routing.routing_set(actor="alice", exclusive=["gone"])
+    assert section == before
+    assert len(calls) == len(audit.read_text().splitlines()) == 6
+
+
+async def test_setter_can_replace_null_policy_and_audit_legacy_values(host):
+    live, loop, calls, audit = host
+    section = live.plugin_config["project_board"]
+    section.update(coders=None, routing=None)
+    section["projects"]["app"].update(coders={"smart": ["", "sonnet"]}, routing={"exclusive": "sonnet"})
+    loop.reload(live)
+    result = await routing.routing_set(actor="alice", coders={"smart": "codex"}, exclusive=["codex"])
+    assert result["app"]["exclusive"] == ["sonnet"]
+    assert result["own"]["coders"]["standard"] == ["codex"]
+    assert loop.coders == {"standard": ["codex"]}
+    record = json.loads(audit.read_text())
+    assert record["old"]["app"]["coders"]["standard"] == ["sonnet"]
+    assert record["new"] == result
+    assert len(calls) == 1

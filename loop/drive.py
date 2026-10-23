@@ -312,7 +312,7 @@ class DriveMixin:
                     if key in section and self.cfg.get(key) != candidate.get(key):
                         changed[key] = (self.cfg.get(key), candidate[key])
                         self.cfg[key] = candidate[key]
-                self.coders = {k: rung_delegates(v) for k, v in candidate.get("coders", {}).items()}
+                self.coders = {k: rung_delegates(v) for k, v in (candidate.get("coders") or {}).items()}
                 # Keep the escalation gate in step with the live ladder: `escalation_on` is
                 # otherwise set once at construction (core.py), so a live single-coder↔ladder
                 # change would leave `_drive_captured`'s gate stale — a new ladder never

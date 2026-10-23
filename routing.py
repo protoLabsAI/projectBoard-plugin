@@ -16,16 +16,10 @@ log = logging.getLogger("protoagent.plugins.project_board")
 
 
 def validate_routing(cfg, delegates=None, *, resolve=True):
-    """Validate a complete candidate without mutating the live policy.
+    """Validate structure, preserving legacy load forms when resolve=False.
 
-    With ``resolve`` (the operator set path) every named delegate must resolve
-    through ``delegates`` — or the default registry — so ``board_routing_set``
-    refuses a ladder naming a coder that is not configured. The live ``reload``
-    path passes ``resolve=False``: a delegate the operator has since disabled is
-    NOT malformed there. The dispatcher already skips a missing delegate per rung
-    via ``_live_rung`` (protoAgent#3692), so one disabled plugin named in the
-    board's own ``coders`` must not reject an unrelated ``projects`` edit that
-    rode the same reload (the candidate always carries the board's full cfg).
+    Resolve delegates only for operator-supplied fields. The complete stored
+    config may name disabled delegates in other fields that still need repair.
     """
     cfg = normalize_tier_config(copy.deepcopy(cfg))
     projects = resolve_projects(cfg)
@@ -33,25 +27,36 @@ def validate_routing(cfg, delegates=None, *, resolve=True):
     names = set()
     for label, entry in [("board", cfg), *projects.items()]:
         coders = entry.get("coders", {})
+        if coders is None and not resolve:
+            coders = {}
         if not isinstance(coders, dict):
             raise ValueError(f"{label}.coders must be a mapping")
         for tier, rung in coders.items():
             if tier not in TIER_LADDER:
                 raise ValueError(f"unknown coder tier {tier!r}")
             if (
-                not isinstance(rung, (str, list))
-                or (isinstance(rung, list) and any(not isinstance(n, str) or not n.strip() for n in rung))
-                or (isinstance(rung, str) and not rung.strip())
+                not isinstance(rung, (str, list) if resolve else (str, list, tuple, type(None)))
+                or (
+                    isinstance(rung, (list, tuple))
+                    and any(not isinstance(n, str) or (resolve and not n.strip()) for n in rung)
+                )
+                or (resolve and isinstance(rung, str) and not rung.strip())
             ):
                 raise ValueError(f"{label}.coders.{tier} must contain delegate names")
             names.update(rung_delegates(rung))
         routing = entry.get("routing", {})
+        if routing is None and not resolve:
+            routing = {}
         if not isinstance(routing, dict) or set(routing) - {"exclusive"}:
             raise ValueError(f"{label}.routing must be a mapping containing only exclusive")
         exclusive = routing.get("exclusive", [])
-        if not isinstance(exclusive, list) or any(not isinstance(n, str) or not n.strip() for n in exclusive):
+        if not resolve and (exclusive is None or isinstance(exclusive, (str, tuple))):
+            exclusive = rung_delegates(exclusive)
+        if not isinstance(exclusive, list) or any(
+            not isinstance(n, str) or (resolve and not n.strip()) for n in exclusive
+        ):
             raise ValueError(f"{label}.routing.exclusive must be a list of delegate names")
-        names.update(exclusive)
+        names.update(rung_delegates(exclusive))
     if resolve:
         resolver = delegates if delegates is not None else (_default_delegates() if names else None)
         for name in sorted(names):
@@ -65,11 +70,11 @@ def effective_routing(cfg):
     cfg = normalize_tier_config(cfg)
     result = {}
     for name, entry in resolve_projects(cfg).items():
-        exclusive = entry.get("routing", {}).get("exclusive", cfg.get("routing", {}).get("exclusive", []))
-        coders = entry.get("coders", cfg.get("coders", {}))
+        exclusive = (entry.get("routing") or {}).get("exclusive", (cfg.get("routing") or {}).get("exclusive"))
+        coders = entry.get("coders") or cfg.get("coders") or {}
         result[name] = {
             "coders": {tier: rung_delegates(coders.get(tier)) for tier in TIER_LADDER},
-            "exclusive": list(exclusive),
+            "exclusive": rung_delegates(exclusive),
         }
     return result
 
@@ -116,11 +121,15 @@ async def routing_set(*, actor, coders=None, exclusive=None, project=None):
                 if project not in candidate.get("projects", {}):
                     raise ValueError(f"unknown project {project!r}")
                 target = candidate["projects"][project]
+            supplied = {}
             if coders is not None:
+                supplied["coders"] = coders
                 target["coders"] = coders
             if exclusive is not None:
-                target["routing"] = {**target.get("routing", {}), "exclusive": exclusive}
-            candidate = validate_routing(candidate)
+                supplied["routing"] = {"exclusive": exclusive}
+                target["routing"] = {**(target.get("routing") or {}), "exclusive": exclusive}
+            validate_routing(supplied)
+            candidate = validate_routing(candidate, resolve=False)
             record.update(
                 who=actor,
                 when=datetime.now(timezone.utc).isoformat(),
@@ -134,10 +143,10 @@ async def routing_set(*, actor, coders=None, exclusive=None, project=None):
             }
             # Project entries are assigned whole by the host; only the top-level
             # coders map merges. Tombstones inside project entries would persist.
-            if "coders" in patch:
-                for key in set(section.get("coders", {})) - set(patch["coders"]):
+            if isinstance(patch.get("coders"), dict):
+                for key in set(section.get("coders") or {}) - set(patch["coders"]):
                     patch["coders"][key] = None
-                for key in TIER_ALIASES.keys() & section.get("coders", {}).keys():
+                for key in TIER_ALIASES.keys() & (section.get("coders") or {}).keys():
                     patch["coders"][key] = None
             return {"project_board": patch}
 
