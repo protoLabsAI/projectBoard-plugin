@@ -742,7 +742,13 @@ happens next. Every sweep, the loop walks the blocked lane:
 
 - **Self-healing classes** — `rate-limit`, `transient`, `merge-conflict` — are cleared and
   requeued automatically, up to **2 auto-retries** per card. These are conditions that
-  routinely pass on their own.
+  routinely pass on their own. Rate-limit blocks with a known quota reset stay blocked
+  until that UTC time; the first sweep at or after it clears and requeues the card,
+  spending one auto-retry as usual. The drive records the earliest reset from unusable
+  sibling SDK usage or provider error text as `resets-at:<iso>` in the block-reason
+  comment, alongside “rate-limited until <time>”. Waiting spends no retry. Missing,
+  malformed, or unavailable reset data (including older hosts without usage support)
+  keeps the existing sweep retry behavior.
   `oracle-timeout` (#459) is deliberately not one of them. The acceptance command can't
   finish in its budget, and waiting doesn't make it faster.
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
