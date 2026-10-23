@@ -15,6 +15,7 @@ import sys
 from .. import external_review, merge_state_hold, review_coverage_hold
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction
+from .drive import _recorded_reset
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
@@ -859,6 +860,10 @@ class ReconcileMixin:
                                 fresh.get("board_state") or "gone",
                             )
                             continue
+                        if cls == "rate-limit":
+                            reset = _recorded_reset(str(fresh.get("blocked_reason", reason) or ""))
+                            if reset is not None and time.time() < reset:
+                                continue  # Quota is still down; spend no retry before its reset.
                         await self._budget_set(store, fid, "unblock-retry", spent + 1)
                         await asyncio.to_thread(store.clear_blocked, fid)
                         await asyncio.to_thread(store.requeue, fid)

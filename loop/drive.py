@@ -11,6 +11,8 @@ so tests that monkeypatch ``project_board.loop.<name>`` still take effect.
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
@@ -21,6 +23,45 @@ from .. import host_friction, work_location_sweep, work_location_capture
 _FIXUPS_TIMEOUT_S = 180.0
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
+
+
+def _reset_timestamp(value) -> float | None:
+    """Accept SDK epoch seconds or ISO / HTTP dates; normalize to UTC."""
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            dt = datetime.fromtimestamp(value, timezone.utc)
+        else:
+            raw = str(value or "").strip()
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                dt = parsedate_to_datetime(raw)
+        return dt.replace(tzinfo=dt.tzinfo or timezone.utc).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def _text_reset(text: str, *, now: float) -> float | None:
+    """Best-effort parser; relative resets are anchored at the failure."""
+    candidates = []
+    for match in re.finditer(r"(?:resets?\s+at|try\s+again\s+at)\s+([^;\n]+)", text, re.I):
+        raw = match[1].strip()
+        iso = re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}| UTC)?", raw, re.I)
+        stamp = _reset_timestamp(iso[0].replace(" UTC", "+00:00") if iso else raw)
+        if stamp is not None:
+            candidates.append(stamp)
+    for match in re.finditer(r"resets?\s+in\s+(\d+(?:\.\d+)?)\s*(seconds?|minutes?|hours?)", text, re.I):
+        scale = {"s": 1, "m": 60, "h": 3600}[match[2][0].lower()]
+        candidates.append(now + float(match[1]) * scale)
+    for match in re.finditer(r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)", text, re.I):
+        candidates.append(now + float(match[1]))
+    candidates = [t for t in candidates if _reset_timestamp(t) is not None]
+    return min(candidates) if candidates else None
+
+
+def _recorded_reset(reason: str) -> float | None:
+    match = re.search(r"(?:^|\s)resets-at:([^\s;]+)", reason)
+    return _reset_timestamp(match[1]) if match else None
 
 
 # ── ready-queue livelock bound (#356) ────────────────────────────────────────────
@@ -1825,6 +1866,7 @@ class DriveMixin:
         # model outright (#420). Both reset on a climb: a new rung has its own providers.
         spent_here: set[str] = set()
         refused_here: set[str] = set()
+        reset_here: dict[str, float] = {}
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
@@ -1889,6 +1931,7 @@ class DriveMixin:
                         retries = 0
                         spent_here.clear()
                         refused_here.clear()
+                        reset_here.clear()
                         continue
                     await self._block_or_stand_aside(
                         store, fid, reason, repo=repo, wt=wt, branch=branch, pr_url=pr_url, friction=True
@@ -2643,6 +2686,7 @@ class DriveMixin:
                                     timeout_note = ""  # a new rung: an older timeout note is stale
                                     spent_here.clear()  # a NEW rung has its own providers (#362)
                                     refused_here.clear()
+                                    reset_here.clear()
                                     # Fresh per-tier budgets on the climb — mirrors the
                                     # shared capability-escalation path below.
                                     await self._budget_reset(
@@ -2708,6 +2752,10 @@ class DriveMixin:
                     #     says anything about the model's ability, so neither may spend the
                     #     retry budget or the capability ladder. A refusing provider is also
                     #     MARKED, so the next card starts on a live sibling instead.
+                    if policy.category == "rate_limit":
+                        reset = _text_reset(str(exc), now=time.time())
+                        if reset is not None:
+                            reset_here[coder_name] = min(reset, reset_here.get(coder_name, reset))
                     if provider_failure:
                         spent_here.add(coder_name)
                         if policy.category == "provider_unavailable":
@@ -2798,6 +2846,8 @@ class DriveMixin:
                                 f"refused its model — no coder at the {tier or 'default'} rung can take the "
                                 f"card right now (no tier climb): {exc}"
                             )
+                        if category == "rate_limit":
+                            reason = await asyncio.to_thread(self._reset_block_reason, reason, limited, reset_here)
                         log.warning("[project_board] %s blocked (%s, tier untouched): %s", fid, category, reason)
                         if not await self._block_or_stand_aside(
                             store, fid, reason, category=category, repo=repo, wt=wt, branch=branch, pr_url=pr_url
@@ -2923,6 +2973,7 @@ class DriveMixin:
                             retries = 0
                             spent_here.clear()  # a NEW rung has its own providers (#362)
                             refused_here.clear()
+                            reset_here.clear()
                             # Fresh goal-fix / local-gate / ledger budgets at the new tier —
                             # otherwise a tier that exhausted its retries hands the next
                             # (stronger) tier a spent budget, so it blocks on its first gap
@@ -2934,11 +2985,18 @@ class DriveMixin:
                     # The class is passed, not re-derived from the reason text: the store's own
                     # classify() would read a refusal phrase quoted in a goal gap back into
                     # `provider-unavailable`, undoing the re-classification above.
+                    reason = f"{policy.category}: {exc}"
+                    if policy.category == "rate_limit":
+                        reason = await asyncio.to_thread(
+                            self._reset_block_reason,
+                            reason,
+                            list(spent_here - refused_here) or [coder_name],
+                            reset_here,
+                        )
                     if not await self._block_or_stand_aside(
                         store,
                         fid,
-                        f"{policy.category}: {exc}"
-                        + (f"; routing.exclusive [{', '.join(exclusive)}] exhausted" if exclusive else ""),
+                        reason + (f"; routing.exclusive [{', '.join(exclusive)}] exhausted" if exclusive else ""),
                         category=policy.category,
                         repo=repo,
                         wt=wt,
@@ -3552,6 +3610,20 @@ class DriveMixin:
             self._oracle_unwinnable[name],
         )
         self._publish_preflight_health()
+
+    def _reset_block_reason(self, reason: str, limited: list[str], resets: dict[str, float]) -> str:
+        """Persist metadata in the store's existing blocked-reason comment."""
+        candidates = [resets[name] for name in limited if name in resets]
+        for name in limited:
+            snap = self._provider_usage(name)
+            if snap and snap.get("usable") is False:
+                reset = _reset_timestamp(snap.get("resets_at"))
+                if reset is not None:
+                    candidates.append(reset)
+        if candidates:
+            iso = datetime.fromtimestamp(min(candidates), timezone.utc).isoformat()
+            reason += f"; rate-limited until {iso}; resets-at:{iso}"
+        return reason
 
     def _provider_usage(self, name: str) -> dict | None:
         """One sibling's live subscription-usage snapshot via the host SDK (U7, #579):
