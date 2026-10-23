@@ -858,6 +858,28 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         raw = project_routing.get("exclusive", routing.get("exclusive"))
         return rung_delegates(raw)
 
+    def _headroom_on_for(self, feature: dict) -> bool:
+        """Whether coder dispatch steers by subscription headroom for this feature (#579).
+        Default on (ADR 0122 decided default); `routing.headroom: false` restores today's
+        behaviour. Project policy overrides the board policy, including an explicit value.
+        Read live off ``self.cfg`` so B3's reload applies it without a restart."""
+        routing = self.cfg.get("routing") or {}
+        project_routing = self._project_cfg(feature).get("routing") or {}
+        src = project_routing if "headroom" in project_routing else routing
+        return _knob_bool(src, "headroom", True, strict=False)
+
+    def _prefer_sibling_at_for(self, feature: dict) -> int:
+        """The used-% of the binding window at which the board prefers a higher-headroom
+        sibling (#579, default 90, clamped to 1..100). Project policy overrides the board
+        policy. Read live off ``self.cfg`` so B3's reload applies it without a restart."""
+        routing = self.cfg.get("routing") or {}
+        project_routing = self._project_cfg(feature).get("routing") or {}
+        raw = project_routing.get("prefer_sibling_at", routing.get("prefer_sibling_at", 90))
+        try:
+            return min(100, max(1, int(raw)))
+        except (TypeError, ValueError):
+            return 90
+
     def _coders_for(self, feature: dict) -> dict[str, list[str]]:
         """The tier→delegate `coders` map for this feature's project (#90), else the
         instance default — so escalation on a multi-repo board climbs the ladder the

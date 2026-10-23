@@ -738,3 +738,43 @@ no operator-only tool guard to reuse: the setter requires the host to inject
 `RunnableConfig.configurable.auth = {"tier": "operator", "subject": "<caller>"}`.
 This context is not a tool argument. Missing or non-operator context is refused;
 hosts without this context integration must use the gated HTTP route.
+
+### Headroom-aware sibling preference
+
+When a capability rung lists several interchangeable delegates, the board can steer
+which one a card opens on by each delegate's live subscription usage, read through the
+host's `graph.sdk.provider_usage(delegate=…)`:
+
+```yaml
+project_board:
+  routing:
+    headroom: true          # default; false restores the prior round-robin behaviour
+    prefer_sibling_at: 90    # default; prefer a higher-headroom sibling at ≥ this % used
+  coders:
+    standard: [codex, sonnet]
+  projects:
+    app:
+      repo: /path/to/app
+      routing:
+        headroom: false          # overrides the board value for this project
+        prefer_sibling_at: 85
+```
+
+- `routing.headroom` (default `true`) turns the steering on or off. `false` keeps the
+  existing behaviour exactly: siblings are ordered only by the `#420` down-mark.
+- `routing.prefer_sibling_at` (default `90`, clamped to `1`–`100`) is the used-% of the
+  binding window at which a sibling is considered spent enough to move away from.
+
+With steering on, a card opens on `current` unless that sibling is at or above
+`prefer_sibling_at`% of its window used (headroom ≤ `100 − prefer_sibling_at`), or the
+host reports it `usable: false` with a reset still in the future; then the card moves to
+the eligible sibling with the most headroom. A sibling the host calls unusable is skipped
+until its `resets_at`, and a provider failure rotates to the highest-headroom sibling
+left. Steering only reorders within the already exclusive-filtered rung, so it never
+selects a delegate outside `routing.exclusive`.
+
+A sibling with no usage snapshot — the host lacks `provider_usage`, or the read failed —
+is treated exactly as today: never preferred over, never penalised. When no sibling on a
+rung has a snapshot, dispatch is byte-for-byte identical to the prior behaviour. Both
+knobs are read live and apply on config reload, at board and project scope, like
+`routing.exclusive`.

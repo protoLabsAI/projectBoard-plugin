@@ -1186,6 +1186,44 @@ def provider_is_down(name: str, *, now: float | None = None) -> bool:
     return True
 
 
+# ── #579: subscription-headroom steering (ADR 0122 D7/D8) ───────────────────────────
+# U7 (bd-1i5y.10) exposes a delegate's live subscription usage through
+# ``graph.sdk.provider_usage(delegate=…)`` → ``{usable, headroom_pct, binding_window,
+# resets_at}`` or None. The board reads it ONLY through that seam (D8) and keeps the
+# routing POLICY here, in pure functions, so it is testable on a snapshot dict without
+# driving a card. The whole slice turns on D4's invariant: UNKNOWN must equal today, so a
+# sibling with no snapshot (the host lacks the call, or the read was flaky) is never
+# preferred over and never penalised, and a rung on which NO sibling is known behaves
+# byte-for-byte as it did before this slice.
+
+
+def _headroom_room(snap) -> float | None:
+    """How much of ``snap``'s binding window is still free (``headroom_pct``), or None
+    when the snapshot is unknown — a non-dict (the SDK returned None / lacks the call) or
+    one without a numeric ``headroom_pct`` (#579)."""
+    if not isinstance(snap, dict):
+        return None
+    room = snap.get("headroom_pct")
+    return room if isinstance(room, (int, float)) and not isinstance(room, bool) else None
+
+
+def _headroom_blocked(snap, now_wall) -> bool:
+    """Is ``snap`` a sibling that is DOWN until its reset — ``usable: False`` with a
+    ``resets_at`` still in the future (#579 D8 decided default: blocked = down until
+    resets_at)? Unknown (non-dict) and usable siblings are never blocked. A ``resets_at``
+    we cannot compare to ``now_wall`` leaves a ``usable: False`` sibling blocked — never
+    steer onto one the host calls unusable."""
+    if not isinstance(snap, dict) or snap.get("usable", True):
+        return False
+    resets = snap.get("resets_at")
+    if resets is None:
+        return False
+    try:
+        return resets > now_wall
+    except TypeError:
+        return True
+
+
 def rotation_target(
     category: str,
     siblings: list[str],
@@ -1194,10 +1232,11 @@ def rotation_target(
     *,
     now: float | None = None,
     ignore_marks: bool = False,
+    usage: dict | None = None,
 ) -> int | None:
     """Which sibling at this rung a PROVIDER failure should move to — or ``None`` to stay
-    (#362, #420). The next sibling after ``current``, in rung order, that has not already
-    failed for this card at this rung (``spent``, by name).
+    (#362, #420, #579). The next sibling after ``current``, in rung order, that has not
+    already failed for this card at this rung (``spent``, by name).
 
     Rotating within a rung means "this model is fine, its provider is not", so only a
     provider failure rotates: a spent quota must not burn the transient-retry budget on
@@ -1219,20 +1258,43 @@ def rotation_target(
     is spent, a marked sibling gets that real attempt too, rather than the card blocking
     while a possibly-repaired provider sits untried.
 
+    ``usage`` maps a sibling name to its ``graph.sdk.provider_usage`` snapshot (or None).
+    When any eligible sibling has a known snapshot the rotation prefers the one with the
+    MOST headroom, so a provider failure moves the card to the sibling least likely to be
+    throttled next (#579). A sibling the snapshot calls down until its reset is skipped
+    like a down-marked one. When every eligible sibling is unknown — the default, and
+    every host that lacks ``provider_usage`` — today's order stands: the first eligible
+    sibling after ``current`` (D4: unknown == today).
+
     Kept pure and separate from the drive loop so the POLICY is testable on its own — the
     decision is the whole feature, and it was previously buried in a 565-line function
     where the only way to exercise it was to drive an entire card."""
     if category not in _ROTATABLE_CATEGORIES or len(siblings) < 2:
         return None
     n = len(siblings)
+    snaps = usage or {}
+    now_wall = time.time() if now is None else now
+    eligible: list[int] = []
     for step in range(1, n):
         i = (current + step) % n
-        if siblings[i] in spent:
+        name = siblings[i]
+        if name in spent:
             continue
-        if category == "rate_limit" and not ignore_marks and provider_is_down(siblings[i], now=now):
+        if category == "rate_limit" and not ignore_marks and provider_is_down(name, now=now):
             continue
-        return i
-    return None
+        if _headroom_blocked(snaps.get(name), now_wall):
+            continue
+        eligible.append(i)
+    if not eligible:
+        return None
+    best, best_room = None, None
+    for i in eligible:
+        room = _headroom_room(snaps.get(siblings[i]))
+        if room is None:
+            continue
+        if best_room is None or room > best_room:
+            best, best_room = i, room
+    return best if best is not None else eligible[0]
 
 
 def prefer_live_sibling(siblings: list[str], current: int, spent: set[str], *, now: float | None = None) -> int:
@@ -1252,6 +1314,67 @@ def prefer_live_sibling(siblings: list[str], current: int, spent: set[str], *, n
         if siblings[i] not in spent and not provider_is_down(siblings[i], now=now):
             return i
     return current
+
+
+def prefer_headroom_sibling(
+    siblings: list[str],
+    current: int,
+    spent: set[str],
+    usage: dict,
+    *,
+    prefer_at: int = 90,
+    now: float | None = None,
+) -> int:
+    """Where a dispatch at this rung should start when the board steers by subscription
+    headroom (#579, ADR 0122 D7/D8). Like ``prefer_live_sibling`` it only ever REORDERS —
+    it never drops a sibling — and it is a PREFERENCE, not a verdict.
+
+    ``usage`` maps a sibling name to its ``graph.sdk.provider_usage`` snapshot
+    (``{usable, headroom_pct, binding_window, resets_at}``) or None when unknown. The
+    ``current`` sibling is left where it is unless its own snapshot shows it at or above
+    ``prefer_at``% of the binding window used (headroom ≤ ``100 - prefer_at``), or it is
+    ``usable: False`` with a reset still in the future; then the dispatch moves to the
+    eligible sibling with the most headroom. A sibling is skipped while the snapshot calls
+    it down until its ``resets_at``, or while it is still marked down from a refusal
+    (#420), and a sibling that already failed this card is never a target.
+
+    Unknown siblings are treated exactly as today — never preferred over, never penalised.
+    When NO sibling has a known snapshot there is nothing to steer by, so the result is
+    byte-for-byte ``prefer_live_sibling``'s (ADR 0122 D4: unknown == today), which is what
+    a host without ``provider_usage`` and ``routing.headroom: false`` both reduce to.
+
+    Pure, like ``rotation_target`` — the policy is the whole feature, so it is tested on a
+    snapshot dict without driving a card."""
+    n = len(siblings)
+    if n < 2:
+        return current
+    snaps = usage or {}
+    if not any(isinstance(snaps.get(s), dict) for s in siblings):
+        return prefer_live_sibling(siblings, current, spent, now=now)
+    now_wall = time.time() if now is None else now
+    floor = 100 - prefer_at  # headroom ≤ this ⇔ at/above prefer_at% of the window used
+    # Honour today's down-mark reordering first: it moves off a refused ``current`` onto a
+    # live sibling (an unknown one included), a move headroom must not undo.
+    start = prefer_live_sibling(siblings, current, spent, now=now)
+    cur_snap = snaps.get(siblings[start % n])
+    cur_room = _headroom_room(cur_snap)
+    cur_low = cur_room is not None and cur_room <= floor
+    if not (cur_low or _headroom_blocked(cur_snap, now_wall)):
+        return start
+    best, best_room = None, None
+    for step in range(n):
+        i = (start + step) % n
+        name = siblings[i]
+        if i != start % n and name in spent:
+            continue
+        if _headroom_blocked(snaps.get(name), now_wall) or provider_is_down(name, now=now):
+            continue
+        room = _headroom_room(snaps.get(name))
+        if room is None:
+            continue
+        if best_room is None or room > best_room:
+            best, best_room = i, room
+    return best if best is not None else start
 
 
 def rung_delegates(value) -> list[str]:
@@ -1830,6 +1953,9 @@ __all__ = [
     "rung_delegates",
     "rotation_target",
     "prefer_live_sibling",
+    "prefer_headroom_sibling",
+    "_headroom_room",
+    "_headroom_blocked",
     "_ROTATABLE_CATEGORIES",
     "provider_failure_category",
     "representative_failure",
