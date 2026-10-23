@@ -493,6 +493,17 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         except ValueError as exc:
             raise HTTPException(503, str(exc))
 
+    @router.get("/routing/effective")
+    async def _routing_effective():
+        # Read-only effective-routes view (#578): same operator gate + reads as /routing.
+        # Off the event loop — reading each delegate's live provider_usage may block.
+        from .routing import routing_effective
+
+        try:
+            return JSONResponse(await asyncio.to_thread(routing_effective), headers={"Cache-Control": "no-store"})
+        except ValueError as exc:
+            raise HTTPException(503, str(exc))
+
     @router.put("/routing")
     async def _routing_set(request: Request, body: dict = Body(...)):
         # This router inherits the same host operator gate as PUT /projects.

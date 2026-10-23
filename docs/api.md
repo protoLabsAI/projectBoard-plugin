@@ -20,6 +20,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | Method | Path | What it does |
 |---|---|---|
 | `GET` | `/routing` | Effective coder ladders and exclusive allowlists per project. |
+| `GET` | `/routing/effective` | Read-only effective routes for the console Routing panel: per project the implement/fix/escalate/review/helpers paths (uncovered ones marked), the exclusive-filtered ladder with which sibling the next dispatch opens on and why, and per-delegate down marks and subscription headroom (`unknown` when unread). |
 | `PUT` | `/routing` | Operator-only live routing update: `coders`, `exclusive`, and optional `project`. Validates delegates, saves config, reloads, and appends an audit record. |
 | `GET` | `/projects` | Live project config for the custom Configure tab (no router snapshot). |
 | `PUT` | `/projects/{name}` | Add/update one boarded repo through the same bounded seam as the agent tool. A save that sets a new gate command, or moves the project to another repo, answers only after that gate has run once on the clean base (minutes for a full suite); a red gate is a 400 naming the failure, a 409 means another save changed the project meanwhile. See [Long saves](#long-saves). The same save registers the repo as a read-only managed project (#452); the response's `managed_project` is `{action, name, detail}`, where `action` is one of `added`, `updated`, `unchanged`, `present`, `skipped` or `unsupported`. |

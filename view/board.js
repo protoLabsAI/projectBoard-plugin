@@ -74,9 +74,136 @@ function inlineCode(s){
 const NARROW = window.matchMedia("(max-width: 760px)");
 let VIEW = NARROW.matches ? "list" : "kanban";
 function setView(v){ VIEW=v; $("tk").classList.toggle("pl-tab--active",v==="kanban"); $("tl").classList.toggle("pl-tab--active",v==="list");
-  $("kanban").classList.toggle("hide",v!=="kanban"); $("list").classList.toggle("hide",v!=="list"); render(); }
+  $("tr").classList.toggle("pl-tab--active",v==="routing");
+  $("kanban").classList.toggle("hide",v!=="kanban"); $("list").classList.toggle("hide",v!=="list");
+  $("routing").classList.toggle("hide",v!=="routing");
+  if (v==="routing"){ ROUTING_MSG=null; renderRouting(); } else render(); }
 // Auto-switch to list when the viewport narrows (e.g. rotating a phone / resizing).
 NARROW.addEventListener("change", (e) => { if (e.matches && VIEW !== "list") setView("list"); });
+
+// ── Routing panel (#578) ─────────────────────────────────────────────────────────────
+// Reads GET /routing/effective (per-project effective coder routes + per-delegate down
+// marks / subscription headroom) and offers an operator control that sets or clears
+// routing.exclusive through B3's guarded, audited PUT /routing. "Codex only" is one click.
+// The "opens on X because Y" cells come straight from the endpoint, which computes them
+// with the loop's own prefer_live_sibling / prefer_headroom_sibling, so the view can't
+// drift from dispatch. The logic here is thin: fetch, build, save, surface refusals inline.
+let ROUTING_BUSY = false;        // a save is in flight — freeze the controls
+let ROUTING_MSG = null;          // {text, kind} shown inline after a save / load
+
+function routingBadge(text, variant){
+  return '<span class="pl-badge'+(variant?" pl-badge--"+variant:"")+'">'+esc(text)+'</span>';
+}
+function headroomText(h){ return h === "unknown" ? "unknown" : (h + "% free"); }
+
+function routingControl(body){
+  const dels = body.delegates || [];
+  const current = new Set(body.board_exclusive || []);
+  const picks = dels.length
+    ? dels.map(d => '<label class="r-del"><input type="checkbox" data-del="'+esc(d)+'"'
+        + (current.has(d) ? " checked" : "") + '> '+esc(d)+'</label>').join("")
+    : '<span class="r-none">No delegates are configured in any coder ladder yet.</span>';
+  const codexOnly = dels.includes("codex")
+    ? '<button type="button" class="r-btn r-btn--primary" data-act="codex-only">Codex only</button>' : "";
+  const msg = ROUTING_MSG
+    ? '<div class="pl-callout pl-callout--'+(ROUTING_MSG.kind==="error"?"error":ROUTING_MSG.kind==="ok"?"success":"")
+        +' r-msg">'+esc(ROUTING_MSG.text)+'</div>'
+    : "";
+  return '<section class="r-ctl"><h2>Strict coder routing</h2>'
+    + '<p class="r-intro">Restrict every coder path (implement, CI/review fix, escalation) to the chosen delegates — no YAML. '
+    + 'The review gate and helper delegates are never restricted. Saved through the audited routing path at board scope; a refusal changes nothing.</p>'
+    + '<div class="r-dels">'+picks+'</div>'
+    + '<div class="r-actions">'+codexOnly
+    + '<button type="button" class="r-btn" data-act="apply">Apply selection</button>'
+    + '<button type="button" class="r-btn" data-act="clear">Clear (restore full ladder)</button>'
+    + '<button type="button" class="r-btn r-btn--ghost" data-act="refresh">Refresh</button></div>'
+    + msg + '</section>';
+}
+
+function routingProject(name, p){
+  const excl = (p.exclusive && p.exclusive.length)
+    ? routingBadge("exclusive: "+p.exclusive.join(", ")+(p.exclusive_source!=="none"?" ("+p.exclusive_source+")":""), "info")
+    : routingBadge("full ladder — no exclusive", null);
+  const paths = (p.paths||[]).map(pt =>
+    '<tr><td>'+esc(pt.path)+'</td><td>'+(pt.covered
+        ? routingBadge("routed", "success")
+        : routingBadge("not covered by exclusive", "warning"))
+    + '</td><td class="r-detail">'+esc(pt.detail)+'</td></tr>').join("");
+  const ladder = (p.ladder||[]).map(r =>
+    '<tr><td class="r-tier">'+esc(r.tier)+'</td><td>'+(r.delegates.length?esc(r.delegates.join(", ")):'<span class="r-none">—</span>')
+    + '</td><td>'+(r.starts_on?esc(r.starts_on):'<span class="r-none">—</span>')
+    + '</td><td class="r-why">'+esc(r.reason)+'</td></tr>').join("");
+  const delegates = (p.delegates||[]).map(d =>
+    '<tr><td>'+esc(d.name)+'</td><td>'+(d.provider_is_down?routingBadge("down","error"):routingBadge("live","success"))
+    + '</td><td>'+esc(headroomText(d.headroom))+'</td></tr>').join("")
+    || '<tr><td colspan="3" class="r-none">No delegates configured for this project.</td></tr>';
+  return '<section class="r-proj"><div class="r-phead"><h3>'+esc(name)+'</h3>'+excl+'</div>'
+    + '<table class="pl-table r-tbl"><thead><tr><th>Lifecycle path</th><th>Coverage</th><th>Effective route</th></tr></thead><tbody>'+paths+'</tbody></table>'
+    + '<table class="pl-table r-tbl"><thead><tr><th>Rung</th><th>Eligible delegates</th><th>Opens on</th><th>Why</th></tr></thead><tbody>'+ladder+'</tbody></table>'
+    + '<table class="pl-table r-tbl"><thead><tr><th>Delegate</th><th>Provider</th><th>Headroom</th></tr></thead><tbody>'+delegates+'</tbody></table>'
+    + '</section>';
+}
+
+async function renderRouting(){
+  const host = $("routing");
+  host.setAttribute("aria-busy", "true");
+  try {
+    const body = await api("/api/plugins/project_board/routing/effective");
+    const projects = body.projects || {};
+    const names = Object.keys(projects).sort();
+    host.innerHTML = routingControl(body)
+      + (names.length ? names.map(n => routingProject(n, projects[n])).join("")
+         : '<section class="r-proj"><p class="r-none">No projects are configured.</p></section>');
+  } catch (e) {
+    host.innerHTML = '<div class="pl-callout pl-callout--error">Could not load routing: '+esc(String(e && e.message || e))+'</div>';
+  } finally {
+    host.removeAttribute("aria-busy");
+    syncRoutingControls();
+  }
+}
+
+function syncRoutingControls(){
+  $("routing").querySelectorAll(".r-btn, input[data-del]").forEach(el => { el.disabled = ROUTING_BUSY; });
+}
+
+async function putRouting(exclusive){
+  const r = await kit.apiFetch("/api/plugins/project_board/routing",
+    {method:"PUT", headers:{"content-type":"application/json"}, body:JSON.stringify({exclusive})});
+  // A host gate refusal (non-operator) is a bare 403; a validation refusal carries a detail.
+  if (r.status === 403) throw new Error("Refused: changing routing needs an operator session. Nothing changed.");
+  const d = await r.json().catch(() => { throw new Error("HTTP "+r.status+" (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || ("HTTP "+r.status));
+  return d;
+}
+
+async function routingSave(exclusive){
+  if (ROUTING_BUSY) return;
+  ROUTING_BUSY = true; ROUTING_MSG = {text:"Saving…", kind:null}; syncRoutingControls();
+  try {
+    await putRouting(exclusive);
+    ROUTING_MSG = {text: exclusive.length
+      ? ("Applied — strict routing set to "+exclusive.join(", ")+". The running board is already using it.")
+      : "Cleared — the full coder ladder is restored.", kind:"ok"};
+  } catch (e) {
+    ROUTING_MSG = {text: String(e && e.message || e), kind:"error"};  // refusal surfaced inline
+  } finally {
+    ROUTING_BUSY = false;
+    await renderRouting();   // re-read effective routes so the tables reflect exactly what landed
+  }
+}
+
+// One delegated listener — the panel's innerHTML is rebuilt on every render.
+$("routing").addEventListener("click", (e) => {
+  const btn = e.target.closest(".r-btn"); if (!btn || ROUTING_BUSY) return;
+  const act = btn.dataset.act;
+  if (act === "refresh"){ ROUTING_MSG = null; renderRouting(); return; }
+  if (act === "codex-only"){ routingSave(["codex"]); return; }
+  if (act === "clear"){ routingSave([]); return; }
+  if (act === "apply"){
+    const picked = [...$("routing").querySelectorAll("input[data-del]:checked")].map(i => i.dataset.del);
+    routingSave(picked);
+  }
+});
 
 let FEATURES = [];
 // The next-action chip (#208, #305): `next_action` is the one sentence that says what

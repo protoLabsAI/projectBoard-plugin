@@ -121,6 +121,195 @@ def routing_get():
     return effective_routing(_live_section(required=True))
 
 
+# Lifecycle paths ``routing.exclusive`` does NOT govern (#578, mirrors
+# setup_check.routing_exclusive_hint): the review gate reviewer, review dispatch, and the
+# helper delegates all run unrestricted by the strict coder set (B2).
+UNCOVERED_HELPER_PATHS = [
+    "review dispatch",
+    "decompose",
+    "coder.solve offload",
+    "Max-Mode judge",
+    "task-assignee delegates",
+]
+
+
+def _headroom_display(snap):
+    """A delegate's free binding-window headroom as a percent, else ``"unknown"`` (#578).
+
+    Unknown is a non-dict snapshot (the host lacks ``graph.sdk.provider_usage`` or the read
+    was flaky) or one without a numeric ``headroom_pct`` — never an error, so the view
+    reads "unknown" exactly where dispatch treats the sibling as today (ADR 0122 D4)."""
+    if not isinstance(snap, dict):
+        return "unknown"
+    room = snap.get("headroom_pct")
+    if isinstance(room, bool) or not isinstance(room, (int, float)):
+        return "unknown"
+    return room
+
+
+def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive):
+    """Which sibling the next dispatch opens on at this rung, and why (#578).
+
+    Computed with the loop's OWN ``prefer_live_sibling`` / ``prefer_headroom_sibling`` on
+    the same inputs, so the view can never disagree with dispatch. ``current`` is 0: a
+    fresh card opens on the first sibling unless a down mark (#420) or subscription
+    headroom (#579) steers it off. The reason is one of round-robin / down-marked /
+    ``headroom ≥N%`` / exclusive."""
+    from .loop import prefer_headroom_sibling, prefer_live_sibling, provider_is_down
+
+    n = len(siblings)
+    if n == 0:
+        return {"starts_on": None, "reason": "no eligible delegate"}
+    snaps = {name: usage(name) for name in siblings}
+    if headroom_on:
+        idx = prefer_headroom_sibling(siblings, 0, set(), snaps, prefer_at=prefer_at) % n
+    else:
+        idx = prefer_live_sibling(siblings, 0, set()) % n
+    if idx == 0:
+        reason = "exclusive" if (exclusive and n == 1) else "round-robin"
+    elif provider_is_down(siblings[0]):
+        reason = "down-marked"
+    else:
+        reason = f"headroom ≥{prefer_at}%"
+    return {"starts_on": siblings[idx], "reason": reason}
+
+
+def effective_routes(cfg, *, usage=None):
+    """The effective routing a console operator sees (#578), per project.
+
+    For each project it returns the exclusive-filtered coder ladder (one entry per
+    ``TIER_LADDER`` tier, with the delegates left after the B2 filter and which sibling the
+    next dispatch would open on, with the reason); the five named lifecycle paths —
+    implement, fix (CI/review), escalate, review, helpers — with the uncovered ones marked;
+    and, per delegate the ladder names, its live down mark (#420) and subscription headroom
+    (#579, "unknown" when unread). ``usage(name) -> snapshot|None`` reads a delegate's
+    ``graph.sdk.provider_usage`` snapshot; it defaults to all-unknown so the whole function
+    is host-free and testable on a config alone. The sibling pick reuses the loop's pure
+    functions, so the display can't drift from dispatch."""
+    from .loop import knob_bool, provider_is_down
+
+    usage = usage or (lambda name: None)
+    cfg = normalize_tier_config(cfg)
+    projects = resolve_projects(cfg)
+    board_routing = cfg.get("routing") or {}
+    all_delegates: set[str] = set()
+    out = {}
+    for name, entry in projects.items():
+        is_implicit = bool(entry.get(IMPLICIT_MARKER))
+        proj_routing = entry.get("routing") or {}
+        exclusive = rung_delegates(proj_routing.get("exclusive", board_routing.get("exclusive")))
+        if not is_implicit and "exclusive" in proj_routing:
+            source = "project"
+        elif board_routing.get("exclusive") is not None:
+            source = "board"
+        else:
+            source = "none"
+        coders = entry.get("coders") or cfg.get("coders") or {}
+        full = {tier: rung_delegates(coders.get(tier)) for tier in TIER_LADDER}
+        # Headroom knobs resolve exactly as the loop's _headroom_on_for /
+        # _prefer_sibling_at_for: the project's own value overrides the board default.
+        hsrc = proj_routing if "headroom" in proj_routing else board_routing
+        headroom_on = knob_bool(hsrc, "headroom", True, strict=False)
+        raw_at = proj_routing.get("prefer_sibling_at", board_routing.get("prefer_sibling_at", 90))
+        try:
+            prefer_at = min(100, max(1, int(raw_at)))
+        except (TypeError, ValueError):
+            prefer_at = 90
+        ladder = []
+        for tier in TIER_LADDER:
+            siblings = [n for n in full[tier] if n in exclusive] if exclusive else list(full[tier])
+            pick = _rung_pick(siblings, usage, headroom_on=headroom_on, prefer_at=prefer_at, exclusive=bool(exclusive))
+            ladder.append({"tier": tier, "delegates": siblings, **pick})
+        entry_rung = next((r for r in ladder if r["delegates"]), None)
+        # Every delegate the project's ladder names (pre-filter), in ladder order, with its
+        # live down mark and headroom — marks/headroom are per delegate, not per rung.
+        names_here: list[str] = []
+        for tier in TIER_LADDER:
+            for d in full[tier]:
+                if d not in names_here:
+                    names_here.append(d)
+        all_delegates.update(names_here)
+        delegate_rows = [
+            {"name": d, "provider_is_down": provider_is_down(d), "headroom": _headroom_display(usage(d))}
+            for d in names_here
+        ]
+        paths = [
+            {
+                "path": "implement",
+                "covered": True,
+                "detail": (
+                    f"opens on {entry_rung['starts_on']} at the {entry_rung['tier']} rung"
+                    if entry_rung
+                    else "no eligible delegate — the card blocks"
+                ),
+            },
+            {
+                "path": "fix (CI/review)",
+                "covered": True,
+                "detail": "re-dispatches on the card's current rung (same exclusive-filtered delegates)",
+            },
+            {
+                "path": "escalate",
+                "covered": True,
+                "detail": "climbs the ladder above, after the exclusive filter",
+            },
+            {
+                "path": "review",
+                "covered": False,
+                "detail": "review gate reviewer — not covered by routing.exclusive",
+            },
+            {
+                "path": "helpers",
+                "covered": False,
+                "detail": "not covered by routing.exclusive: " + ", ".join(UNCOVERED_HELPER_PATHS),
+            },
+        ]
+        out[name] = {
+            "exclusive": exclusive,
+            "exclusive_source": source,
+            "headroom_on": headroom_on,
+            "prefer_sibling_at": prefer_at,
+            "ladder": ladder,
+            "paths": paths,
+            "delegates": delegate_rows,
+        }
+    base = cfg.get("coder")
+    if isinstance(base, str) and base.strip():
+        all_delegates.add(base.strip())
+    return {
+        "board_exclusive": rung_delegates(board_routing.get("exclusive")),
+        "delegates": sorted(all_delegates),
+        "projects": out,
+    }
+
+
+def routing_effective():
+    """Live effective routing for GET /routing/effective (#578): the running board
+    config plus each delegate's live ``graph.sdk.provider_usage`` snapshot (getattr-
+    guarded, so an older host degrades every delegate to "unknown", never an error)."""
+    from .project_registry import _live_section
+
+    return effective_routes(_live_section(required=True), usage=_provider_usage)
+
+
+def _provider_usage(name):
+    """One delegate's live subscription-usage snapshot via the host SDK (U7, #579), or
+    ``None`` when it can't be read — the same getattr-guarded seam the drive loop uses
+    (ADR 0122 D8). Never raises: a missing host or a flaky read is "unknown"."""
+    try:
+        import graph.sdk as graph_sdk
+    except Exception:  # noqa: BLE001 — no host package at all (tests, CLI)
+        return None
+    fn = getattr(graph_sdk, "provider_usage", None)
+    if fn is None:
+        return None
+    try:
+        snap = fn(delegate=name)
+    except Exception:  # noqa: BLE001 — a flaky usage read is unknown, not a failure
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
 def operator_actor(config):
     """Only host-injected RunnableConfig auth may authorize the tool; never tool args."""
     auth = (config or {}).get("configurable", {}).get("auth", {})

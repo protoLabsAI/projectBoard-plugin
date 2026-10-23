@@ -39,6 +39,40 @@ preflight is holding too. If another save changes the same project while a gate 
 save is refused with a 409; save again. When a proxy gives up on a long save first (the
 fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
 
+## Routing panel (board page)
+
+The board page carries a third tab, **Routing**, next to Kanban and List. It is the
+console surface for strict coder routing (`routing.exclusive`) — the operator can set
+"Codex only" with no YAML.
+
+The panel reads `GET /routing/effective` (a board read, same operator gate as the rest of
+the page) and shows, per project:
+
+- **Lifecycle paths** — `implement`, `fix (CI/review)`, and `escalate` are the coder paths
+  the exclusive set governs; `review` (the review gate reviewer) and `helpers` (review
+  dispatch, decompose, coder.solve offload, Max-Mode judge, task-assignee delegates) are
+  marked **not covered by exclusive**, because strict routing is advisory for them.
+- **The ladder** — one row per capability rung (standard / reasoning / advanced) with the
+  delegates left after the exclusive filter, which sibling the next dispatch **opens on**,
+  and **why** (round-robin, down-marked, `headroom ≥N%`, or exclusive). That reason is
+  computed server-side with the loop's own sibling-preference functions, so what you read
+  can't drift from what dispatch does.
+- **Delegates** — each delegate's live provider state (live / down-marked, #420) and its
+  subscription headroom (#579). An older host, or a delegate with no usage snapshot, reads
+  **unknown** — never an error.
+
+The control above the tables sets the board-scope exclusive set: tick the configured
+delegates, use **Codex only** for the one-click headline case, **Apply selection** for any
+other set, or **Clear (restore full ladder)** to drop the restriction. Every save goes
+through B3's guarded, audited `PUT /routing`, so validation and the JSONL audit record
+apply and the change is live on the running board immediately. A refused save — a
+non-operator session, or a delegate that isn't configured/enabled — is surfaced inline and
+changes nothing; the tables re-read afterward so they always reflect what actually landed.
+Per-project `routing.exclusive` overrides remain YAML/`board_routing_set`-only and are shown
+in the table with their source.
+
+## Not exposed in the console
+
 The console intentionally does not expose every manifest default. Structural legacy
 single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)
 remain file-only; use the Projects editor for multi-repo routing. Low-level timing and
