@@ -1,0 +1,5 @@
+- **Usage-aware routing, part one.** `routing.exclusive` restricts a board to the named coders (B2, #576). Coders and routing now reload live, deleting either key takes effect without a restart, and `board_routing_get`/`board_routing_set` let an operator read and change the policy with an audit trail (B3, #577).
+- **A blocked card stays on the Kanban** in the lane it was blocked in, with its blocked chip and reason. Before, it vanished, and the cards waiting on it looked stuck for no reason (#605).
+- **The card drawer has tabs:** Card, and Code with the live diff (#595).
+- **The held-gate banner** shows the failing step and line, with the full gate log folded underneath (#601).
+- The PR webhook refuses a signed body that isn't a JSON object (#598), and the docs check no longer scans candidate worktrees (#600).
