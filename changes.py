@@ -115,20 +115,16 @@ def _parse_z_pairs(out: str, *, numstat: bool) -> list[list[str]]:
             continue
         if numstat:
             fields = tok.split("\t")
-            if len(fields) == 3 and fields[2] == "":  # rename: paths follow as two tokens
-                rows.append([fields[0], fields[1], tokens[i + 1], tokens[i + 2]])
-                i += 3
-            else:
-                rows.append(fields)
-                i += 1
+            rename = len(fields) == 3 and fields[2] == ""  # rename: paths follow as two tokens
+            width, need = (3, 4) if rename else (1, 1)
+            row = [fields[0], fields[1], *tokens[i + 1 : i + 3]] if rename else fields
         else:
-            code = tok
-            if code[:1] in ("R", "C"):
-                rows.append([code, tokens[i + 1], tokens[i + 2]])
-                i += 3
-            else:
-                rows.append([code, tokens[i + 1]])
-                i += 2
+            width = need = 3 if tok[:1] in ("R", "C") else 2
+            row = tokens[i : i + width]
+        if len(row) < need:
+            break  # truncated output: drop the partial row rather than index past the end
+        rows.append(row)
+        i += width
     return rows
 
 
@@ -249,6 +245,10 @@ async def feature_changes(repo: str, worktrees_root: str, fid: str, base: str) -
     when the card has none (not started, or done and reaped)."""
     trees = []
     for path, branch in worktree.feature_worktrees(repo, worktrees_root, fid):
-        if os.path.isdir(path):
+        if not os.path.isdir(path):
+            continue
+        try:
             trees.append(await tree_changes(path, branch, base))
+        except worktree.WorktreeError as exc:  # a git timeout: report it on this tree, not a 500
+            trees.append({"path": path, "branch": branch, "base": base, "error": str(exc)})
     return {"worktrees": trees}

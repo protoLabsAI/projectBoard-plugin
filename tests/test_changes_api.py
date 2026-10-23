@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from project_board import api, changes
+from project_board import api, changes, worktree
 
 FID = "bd-ch1"
 
@@ -170,3 +170,21 @@ def test_a_binary_file_has_no_body(monkeypatch, repo, wt):
 )
 def test_the_local_secret_rule(path, secret):
     assert bool(changes._local_secret_reason(path)) is secret
+
+
+def test_truncated_z_output_drops_the_partial_row_instead_of_raising():
+    assert changes._parse_z_pairs("1\t2\t\0old.py", numstat=True) == []
+    assert changes._parse_z_pairs("R100\0old.py", numstat=False) == []
+    assert changes._parse_z_pairs("M\0a.py\0R100\0b.py", numstat=False) == [["M", "a.py"]]
+
+
+def test_a_git_timeout_is_reported_on_the_worktree_not_a_500(monkeypatch, repo, wt):
+    async def _timeout(*_a, **_kw):
+        raise worktree.WorktreeError("git diff timed out after 30s")
+
+    monkeypatch.setattr(changes.worktree, "_git", _timeout)
+    c = _client(monkeypatch, repo, {FID: {"id": FID, "base_branch": "main"}})
+    r = _get(c)
+    assert r.status_code == 200
+    (tree,) = r.json()["worktrees"]
+    assert "timed out" in tree["error"]
