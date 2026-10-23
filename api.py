@@ -370,13 +370,7 @@ def build_router(cfg: dict):
         ``merged: true`` it sets the matching feature ``done`` (nothing else does)
         and reaps its worktree. The raw body is HMAC-verified against
         ``X-Hub-Signature-256``; no configured secret fails closed."""
-        raw = await request.body()
-        _verify_external(raw, request.headers.get("X-Hub-Signature-256", ""))
-        try:
-            body = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
-            raise HTTPException(400, "invalid JSON body")
-
+        body = await _signed_json(request)
         action = body.get("action")
         pr = body.get("pull_request") or {}
         if action != "closed" or not pr.get("merged"):
