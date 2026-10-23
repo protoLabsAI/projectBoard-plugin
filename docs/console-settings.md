@@ -56,7 +56,10 @@ the page) and shows, per project:
   delegates left after the exclusive filter, which sibling the next dispatch **opens on**,
   and **why** (round-robin, down-marked, `headroom ≥N%`, or exclusive). That reason is
   computed server-side with the loop's own sibling-preference functions, so what you read
-  can't drift from what dispatch does.
+  uses a read-only snapshot of the loop's round-robin cursor. This preview does not
+  reserve a turn: another dispatch or a provider-state change can change the next pick.
+  Empty rungs use the base coder when unrestricted; with escalation disabled, all
+  routes use the base coder and escalation is marked disabled.
 - **Delegates** — each delegate's live provider state (live / down-marked, #420) and its
   subscription headroom (#579). An older host, or a delegate with no usage snapshot, reads
   **unknown** — never an error.

@@ -26,7 +26,10 @@ LADDER = {"standard": ["sonnet", "codex"], "reasoning": ["sonnet"], "advanced": 
 
 
 @pytest.fixture(autouse=True)
-def _no_down_marks():
+def _no_down_marks(monkeypatch):
+    from project_board.loop import _common
+
+    monkeypatch.setattr(_common, "_RUNG_CURSOR", 0)
     # Down marks are process-global (loop._PROVIDER_DOWN); clear the names these tests
     # touch so one case's mark never leaks into another's pick.
     for name in ("sonnet", "codex"):
@@ -98,7 +101,7 @@ def test_project_override_exclusive_source():
 
 def test_headroom_unknown_is_never_an_error():
     # No usage reader and no host SDK → every delegate's headroom reads "unknown".
-    result = routing.effective_routes({"coders": {"standard": ["codex", "sonnet"]}})
+    result = routing.effective_routes({"coders": {"standard": ["codex", "sonnet"], "advanced": ["codex"]}})
     delegates = {d["name"]: d for d in _project(result)["delegates"]}
     assert set(delegates) == {"codex", "sonnet"}
     for row in delegates.values():
@@ -108,7 +111,7 @@ def test_headroom_unknown_is_never_an_error():
 
 def test_down_mark_shown_and_reason_matches_prefer_live_sibling():
     mark_provider_down("sonnet")
-    cfg = {"coders": {"standard": ["sonnet", "codex"]}, "routing": {"headroom": False}}
+    cfg = {"coders": {"standard": ["sonnet", "codex"], "advanced": ["codex"]}, "routing": {"headroom": False}}
     proj = _project(routing.effective_routes(cfg))
     delegates = {d["name"]: d for d in proj["delegates"]}
     assert delegates["sonnet"]["provider_is_down"] is True
@@ -121,7 +124,7 @@ def test_down_mark_shown_and_reason_matches_prefer_live_sibling():
 
 
 def test_round_robin_reason_when_nothing_steers():
-    cfg = {"coders": {"standard": ["sonnet", "codex"]}, "routing": {"headroom": False}}
+    cfg = {"coders": {"standard": ["sonnet", "codex"], "advanced": ["codex"]}, "routing": {"headroom": False}}
     rung = _project(routing.effective_routes(cfg))["ladder"][0]
     siblings = ["sonnet", "codex"]
     assert rung["starts_on"] == siblings[prefer_live_sibling(siblings, 0, set())] == "sonnet"
@@ -133,7 +136,7 @@ def test_headroom_steer_reason_matches_prefer_headroom_sibling():
         "sonnet": {"usable": True, "headroom_pct": 4},  # 96% used ≥ prefer_at 90
         "codex": {"usable": True, "headroom_pct": 70},
     }
-    cfg = {"coders": {"standard": ["sonnet", "codex"]}}  # headroom defaults on
+    cfg = {"coders": {"standard": ["sonnet", "codex"], "advanced": ["codex"]}}  # headroom defaults on
     proj = _project(routing.effective_routes(cfg, usage=lambda name: snaps.get(name)))
     rung = proj["ladder"][0]
     siblings = ["sonnet", "codex"]
@@ -150,7 +153,7 @@ def test_prefer_sibling_at_threshold_in_reason():
     # sonnet is 85% used — over the lowered 80% threshold — so dispatch steers off it;
     # at the default 90% threshold it would have stayed. The knob moves the line.
     snaps = {"sonnet": {"usable": True, "headroom_pct": 15}, "codex": {"usable": True, "headroom_pct": 90}}
-    cfg = {"coders": {"standard": ["sonnet", "codex"]}, "routing": {"prefer_sibling_at": 80}}
+    cfg = {"coders": {"standard": ["sonnet", "codex"], "advanced": ["codex"]}, "routing": {"prefer_sibling_at": 80}}
     proj = _project(routing.effective_routes(cfg, usage=lambda name: snaps.get(name)))
     rung = proj["ladder"][0]
     siblings = ["sonnet", "codex"]
@@ -204,7 +207,7 @@ async def test_endpoint_returns_effective_routes_and_is_gated(monkeypatch):
 async def test_endpoint_surfaces_live_headroom_when_host_exposes_it(monkeypatch):
     snaps = {"sonnet": {"usable": True, "headroom_pct": 12}, "codex": {"usable": True, "headroom_pct": 88}}
     app = _app(
-        {"coders": {"standard": ["sonnet", "codex"]}},
+        {"coders": {"standard": ["sonnet", "codex"], "advanced": ["codex"]}},
         provider_usage=lambda delegate: snaps.get(delegate),
         monkeypatch=monkeypatch,
     )
@@ -215,3 +218,86 @@ async def test_endpoint_surfaces_live_headroom_when_host_exposes_it(monkeypatch)
         delegates = {d["name"]: d for d in proj["delegates"]}
         assert delegates["sonnet"]["headroom"] == 12
         assert delegates["codex"]["headroom"] == 88
+
+
+@pytest.mark.parametrize("coders", [{}, {"standard": ["sonnet"]}, {"standard": ["sonnet"], "advanced": ["sonnet"]}])
+def test_single_coder_uses_base_instead_of_ladder(coders):
+    proj = _project(routing.effective_routes({"coder": "codex", "coders": coders}))
+    assert proj["escalation_on"] is False
+    assert all(r["delegates"] == ["codex"] and r["starts_on"] == "codex" for r in proj["ladder"])
+    assert "codex" in proj["paths"][0]["detail"]
+    assert any(d["name"] == "codex" for d in proj["delegates"])
+    assert "disabled" in proj["paths"][2]["detail"]
+
+
+@pytest.mark.parametrize("exclusive, expected", [([], ["base"]), (["codex"], [])])
+def test_empty_rung_base_fallback_respects_exclusive(exclusive, expected):
+    cfg = {
+        "coder": "base",
+        "coders": {"standard": ["sonnet"], "advanced": ["codex"]},
+        "routing": {"exclusive": exclusive},
+    }
+    proj = _project(routing.effective_routes(cfg))
+    assert proj["escalation_on"] is True
+    assert proj["ladder"][1]["delegates"] == expected
+
+
+def test_project_ladder_does_not_enable_board_escalation():
+    cfg = {"coder": "base", "projects": {"app": {"repo": "/app", "coders": LADDER}}}
+    proj = _project(routing.effective_routes(cfg), "app")
+    assert proj["escalation_on"] is False
+    assert all(r["starts_on"] == "base" for r in proj["ladder"])
+
+
+@pytest.mark.parametrize("current", [1, 3, 8])
+@pytest.mark.parametrize("steer", ["none", "down", "headroom"])
+def test_cursor_and_steering_match_dispatch(current, steer):
+    from project_board.loop import _common
+
+    siblings = ["sonnet", "codex"]
+    opening = siblings[current % 2]
+    snaps = {n: {"usable": True, "headroom_pct": 75} for n in siblings}
+    if steer == "down":
+        mark_provider_down(opening)
+    if steer == "headroom":
+        snaps[opening]["headroom_pct"] = 2
+    cfg = {"coders": LADDER, "routing": {"headroom": steer == "headroom"}}
+    # Consume actual dispatch turns, then preview without advancing the counter.
+    for _ in range(current):
+        _common._next_rung_cursor()
+    result = routing.effective_routes(cfg, usage=snaps.get)
+    again = routing.effective_routes(cfg, usage=snaps.get)
+    seed = _common._next_rung_cursor()
+    assert seed == result["cursor"] == again["cursor"] == current
+    idx = (
+        prefer_headroom_sibling(siblings, seed, set(), snaps, prefer_at=90)
+        if steer == "headroom"
+        else prefer_live_sibling(siblings, seed, set())
+    )
+    rung = _project(result)["ladder"][0]
+    assert rung["starts_on"] == siblings[idx % 2]
+    assert rung["reason"] == {"none": "round-robin", "down": "down-marked", "headroom": "headroom ≥90%"}[steer]
+
+
+async def test_endpoint_previews_live_cursor_without_consuming_it(monkeypatch):
+    from project_board.loop import _common
+
+    monkeypatch.setattr(_common, "_RUNG_CURSOR", 5)
+    app = _app({"coders": LADDER}, monkeypatch=monkeypatch)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        client.headers["authorization"] = "Bearer operator"
+        for _ in range(2):
+            response = await client.get("/api/plugins/project_board/routing/effective")
+            assert response.status_code == 200
+            assert response.json()["cursor"] == 5
+            assert _project(response.json())["ladder"][0]["starts_on"] == "codex"
+    assert _common._next_rung_cursor() == 5
+
+
+@pytest.mark.parametrize("exclusive, expected", [(["codex"], "codex"), (["sonnet"], None)])
+def test_single_coder_exclusive_filters_base_without_enabling_ladder(exclusive, expected):
+    cfg = {"coder": "codex", "coders": {"standard": ["sonnet"]}, "routing": {"exclusive": exclusive}}
+    proj = _project(routing.effective_routes(cfg))
+    assert proj["escalation_on"] is False
+    assert all(r["starts_on"] == expected for r in proj["ladder"])
+    assert ("the card blocks" in proj["paths"][0]["detail"]) == (expected is None)

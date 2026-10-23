@@ -1873,9 +1873,9 @@ class DriveMixin:
                 # that is what climbing a rung is for. A sibling another card found unable
                 # to serve its model goes behind its live siblings rather than being
                 # rediscovered (#420).
-                siblings = coders.get(tier) if escalation_on else None
-                if not siblings:
-                    siblings = [] if exclusive and escalation_on else [self.coder_name]
+                siblings = dispatch_rung(
+                    coders, tier, escalation_on=escalation_on, exclusive=exclusive, base_coder=self.coder_name
+                )
                 # A rung naming a delegate that no longer exists degrades instead of
                 # blocking (protoAgent#3692): its live siblings, else the base coder, else
                 # the nearest live rung. Only when nothing resolves does the block below

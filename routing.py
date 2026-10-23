@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from .projects import IMPLICIT_MARKER, TIER_ALIASES, default_project, normalize_tier_config, resolve_projects
 from .setup_check import _default_delegates, _rung_names as rung_delegates
-from .store import TIER_LADDER
+from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -147,14 +147,12 @@ def _headroom_display(snap):
     return room
 
 
-def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive):
+def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive, current):
     """Which sibling the next dispatch opens on at this rung, and why (#578).
 
-    Computed with the loop's OWN ``prefer_live_sibling`` / ``prefer_headroom_sibling`` on
-    the same inputs, so the view can never disagree with dispatch. ``current`` is 0: a
-    fresh card opens on the first sibling unless a down mark (#420) or subscription
-    headroom (#579) steers it off. The reason is one of round-robin / down-marked /
-    ``headroom ≥N%`` / exclusive."""
+    Uses the dispatch cursor snapshot and the loop's sibling preference functions.
+    This is a preview, not a reservation: concurrent dispatch may advance the cursor.
+    """
     from .loop import prefer_headroom_sibling, prefer_live_sibling, provider_is_down
 
     n = len(siblings)
@@ -162,19 +160,19 @@ def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive):
         return {"starts_on": None, "reason": "no eligible delegate"}
     snaps = {name: usage(name) for name in siblings}
     if headroom_on:
-        idx = prefer_headroom_sibling(siblings, 0, set(), snaps, prefer_at=prefer_at) % n
+        idx = prefer_headroom_sibling(siblings, current, set(), snaps, prefer_at=prefer_at) % n
     else:
-        idx = prefer_live_sibling(siblings, 0, set()) % n
-    if idx == 0:
+        idx = prefer_live_sibling(siblings, current, set()) % n
+    if idx == current % n:
         reason = "exclusive" if (exclusive and n == 1) else "round-robin"
-    elif provider_is_down(siblings[0]):
+    elif provider_is_down(siblings[current % n]):
         reason = "down-marked"
     else:
         reason = f"headroom ≥{prefer_at}%"
     return {"starts_on": siblings[idx], "reason": reason}
 
 
-def effective_routes(cfg, *, usage=None):
+def effective_routes(cfg, *, usage=None, current=None):
     """The effective routing a console operator sees (#578), per project.
 
     For each project it returns the exclusive-filtered coder ladder (one entry per
@@ -185,11 +183,14 @@ def effective_routes(cfg, *, usage=None):
     (#579, "unknown" when unread). ``usage(name) -> snapshot|None`` reads a delegate's
     ``graph.sdk.provider_usage`` snapshot; it defaults to all-unknown so the whole function
     is host-free and testable on a config alone. The sibling pick reuses the loop's pure
-    functions, so the display can't drift from dispatch."""
-    from .loop import knob_bool, provider_is_down
+    functions with one read-only cursor snapshot; concurrent dispatch may change the next pick."""
+    from .loop import dispatch_rung, knob_bool, peek_rung_cursor, provider_is_down
 
     usage = usage or (lambda name: None)
     cfg = normalize_tier_config(cfg)
+    current = peek_rung_cursor() if current is None else current
+    escalation_on = escalation_enabled(cfg)
+    base_coder = str(cfg.get("coder") or "").strip()
     projects = resolve_projects(cfg)
     board_routing = cfg.get("routing") or {}
     all_delegates: set[str] = set()
@@ -215,10 +216,21 @@ def effective_routes(cfg, *, usage=None):
             prefer_at = min(100, max(1, int(raw_at)))
         except (TypeError, ValueError):
             prefer_at = 90
+        filtered = {tier: [n for n in names if not exclusive or n in exclusive] for tier, names in full.items()}
         ladder = []
         for tier in TIER_LADDER:
-            siblings = [n for n in full[tier] if n in exclusive] if exclusive else list(full[tier])
-            pick = _rung_pick(siblings, usage, headroom_on=headroom_on, prefer_at=prefer_at, exclusive=bool(exclusive))
+            siblings = dispatch_rung(
+                filtered, tier, escalation_on=escalation_on, exclusive=exclusive, base_coder=base_coder
+            )
+            siblings = [n for n in siblings if n and (not exclusive or n in exclusive)]
+            pick = _rung_pick(
+                siblings,
+                usage,
+                headroom_on=headroom_on,
+                prefer_at=prefer_at,
+                exclusive=bool(exclusive),
+                current=current,
+            )
             ladder.append({"tier": tier, "delegates": siblings, **pick})
         entry_rung = next((r for r in ladder if r["delegates"]), None)
         # Every delegate the project's ladder names (pre-filter), in ladder order, with its
@@ -228,6 +240,8 @@ def effective_routes(cfg, *, usage=None):
             for d in full[tier]:
                 if d not in names_here:
                     names_here.append(d)
+        if base_coder and base_coder not in names_here:
+            names_here.append(base_coder)
         all_delegates.update(names_here)
         delegate_rows = [
             {"name": d, "provider_is_down": provider_is_down(d), "headroom": _headroom_display(usage(d))}
@@ -238,7 +252,11 @@ def effective_routes(cfg, *, usage=None):
                 "path": "implement",
                 "covered": True,
                 "detail": (
-                    f"opens on {entry_rung['starts_on']} at the {entry_rung['tier']} rung"
+                    (
+                        f"opens on {entry_rung['starts_on']} at the {entry_rung['tier']} rung"
+                        if escalation_on
+                        else f"opens on base coder {entry_rung['starts_on']}"
+                    )
                     if entry_rung
                     else "no eligible delegate — the card blocks"
                 ),
@@ -246,12 +264,20 @@ def effective_routes(cfg, *, usage=None):
             {
                 "path": "fix (CI/review)",
                 "covered": True,
-                "detail": "re-dispatches on the card's current rung (same exclusive-filtered delegates)",
+                "detail": (
+                    "re-dispatches on the card's current rung (same exclusive-filtered delegates)"
+                    if escalation_on
+                    else "re-dispatches on the base coder, subject to the exclusive filter"
+                ),
             },
             {
                 "path": "escalate",
                 "covered": True,
-                "detail": "climbs the ladder above, after the exclusive filter",
+                "detail": (
+                    "climbs the ladder above, after the exclusive filter"
+                    if escalation_on
+                    else "disabled — dispatch uses the base coder"
+                ),
             },
             {
                 "path": "review",
@@ -267,6 +293,7 @@ def effective_routes(cfg, *, usage=None):
         out[name] = {
             "exclusive": exclusive,
             "exclusive_source": source,
+            "escalation_on": escalation_on,
             "headroom_on": headroom_on,
             "prefer_sibling_at": prefer_at,
             "ladder": ladder,
@@ -277,6 +304,7 @@ def effective_routes(cfg, *, usage=None):
     if isinstance(base, str) and base.strip():
         all_delegates.add(base.strip())
     return {
+        "cursor": current,
         "board_exclusive": rung_delegates(board_routing.get("exclusive")),
         "delegates": sorted(all_delegates),
         "projects": out,

@@ -87,7 +87,7 @@ NARROW.addEventListener("change", (e) => { if (e.matches && VIEW !== "list") set
 // routing.exclusive through B3's guarded, audited PUT /routing. "Codex only" is one click.
 // The "opens on X because Y" cells come straight from the endpoint, which computes them
 // with the loop's own prefer_live_sibling / prefer_headroom_sibling, so the view can't
-// drift from dispatch. The logic here is thin: fetch, build, save, surface refusals inline.
+// drift for the same snapshot. Fetch, build, save, surface refusals inline.
 let ROUTING_BUSY = false;        // a save is in flight — freeze the controls
 let ROUTING_MSG = null;          // {text, kind} shown inline after a save / load
 
@@ -139,7 +139,8 @@ function routingProject(name, p){
     || '<tr><td colspan="3" class="r-none">No delegates configured for this project.</td></tr>';
   return '<section class="r-proj"><div class="r-phead"><h3>'+esc(name)+'</h3>'+excl+'</div>'
     + '<table class="pl-table r-tbl"><thead><tr><th>Lifecycle path</th><th>Coverage</th><th>Effective route</th></tr></thead><tbody>'+paths+'</tbody></table>'
-    + '<table class="pl-table r-tbl"><thead><tr><th>Rung</th><th>Eligible delegates</th><th>Opens on</th><th>Why</th></tr></thead><tbody>'+ladder+'</tbody></table>'
+    + '<p class="r-intro">Opening picks preview the next round-robin turn. Another dispatch or provider-state change can change the pick.</p>'
+    + '<table class="pl-table r-tbl"><thead><tr><th>Rung</th><th>Eligible delegates</th><th>Opens on (snapshot)</th><th>Why</th></tr></thead><tbody>'+ladder+'</tbody></table>'
     + '<table class="pl-table r-tbl"><thead><tr><th>Delegate</th><th>Provider</th><th>Headroom</th></tr></thead><tbody>'+delegates+'</tbody></table>'
     + '</section>';
 }
