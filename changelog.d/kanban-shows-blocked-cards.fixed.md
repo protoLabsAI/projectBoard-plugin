@@ -1,0 +1,1 @@
+- A blocked card now shows on the Kanban, in the lane it was blocked in (building, in review, on deck or backlog) with its red blocked chip. Before, it disappeared from every lane, so the cards waiting on it looked stuck for no reason.

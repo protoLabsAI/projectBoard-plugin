@@ -96,7 +96,7 @@ def test_drag_and_drop_uses_pointer_events_never_html5_dnd():
 
 def test_loop_owned_lanes_are_read_only_and_say_so():
     assert 'const LOOP_OWNED = new Set(["in_progress", "in_review", "done"]);' in BOARD_PAGE
-    assert "if (owned) n.title = LOOP_WHY[state];" in BOARD_PAGE  # the tooltip
+    assert "if (owned) n.title = blockedHere ? BLOCKED_WHY : LOOP_WHY[state];" in BOARD_PAGE  # the tooltip
     assert "if (LOOP_OWNED.has(f.state)){ toast(LOOP_WHY[f.state]" in BOARD_PAGE  # a refused drag says why
     assert 'class="lane-lock" title="' in BOARD_PAGE
 
