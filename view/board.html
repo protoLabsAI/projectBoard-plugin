@@ -21,7 +21,6 @@ var BASE = location.pathname.split("/plugins/")[0];
     <div class="pl-tabs">
       <button id="tk" class="pl-tab pl-tab--active" onclick="setView('kanban')">Kanban</button>
       <button id="tl" class="pl-tab" onclick="setView('list')">List</button>
-      <button id="tr" class="pl-tab" onclick="setView('routing')">Routing</button>
     </div>
   </div>
   <div id="err" class="pl-callout pl-callout--error" hidden></div>
@@ -29,10 +28,6 @@ var BASE = location.pathname.split("/plugins/")[0];
   <table id="list" class="pl-table hide"><thead><tr>
     <th>ID</th><th>Title</th><th>State</th><th>Pri</th><th>Flags</th><th>PR</th></tr></thead>
     <tbody id="rows"></tbody></table>
-  <!-- Routing panel (#578): effective per-project coder routes + an operator control to
-       set/clear routing.exclusive. Read via GET /routing/effective, saved via PUT /routing
-       (B3's guarded, audited path). Built on demand by the module when the tab opens. -->
-  <div id="routing" class="routing hide" aria-live="polite"></div>
 </div>
 <!-- Live monitor drawer (#84): a slide-over over a click-away scrim. -->
 <div id="scrim"></div>

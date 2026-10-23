@@ -212,6 +212,7 @@ def build_router(cfg: dict):
 
     from .board_view import BOARD_PAGE
     from .projects_view import PROJECTS_PAGE
+    from .routing_view import ROUTING_PAGE
 
     router = APIRouter()
 
@@ -250,6 +251,15 @@ def build_router(cfg: dict):
         operator-bearer-gated ``/api/plugins/project_board/projects`` routes.
         """
         return HTMLResponse(PROJECTS_PAGE, headers={"Cache-Control": "no-store"})
+
+    @router.get("/config/routing", response_class=HTMLResponse)
+    async def _routing_config():
+        """Public page chrome for the sandboxed Coder routing Configure tab (#578).
+
+        Like Projects, it holds no config data; every read and save goes through the
+        operator-bearer-gated ``/api/plugins/project_board/routing`` routes.
+        """
+        return HTMLResponse(ROUTING_PAGE, headers={"Cache-Control": "no-store"})
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)

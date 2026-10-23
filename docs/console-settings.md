@@ -3,6 +3,7 @@
 On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is split
 by operator intent:
 
+- **Coder routing** picks which coders may build (see below).
 - **Projects** is the live registry editor. It lists the configured project map and
   can add or update repos only inside the host's enabled Project onboarding root.
   Add/update preserves sibling projects and file-only per-project fields without
@@ -39,11 +40,12 @@ preflight is holding too. If another save changes the same project while a gate 
 save is refused with a 409; save again. When a proxy gives up on a long save first (the
 fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
 
-## Routing panel (board page)
+## Coder routing (Configure tab)
 
-The board page carries a third tab, **Routing**, next to Kanban and List. It is the
-console surface for strict coder routing (`routing.exclusive`): the operator picks which
-coders may build, with no YAML.
+**Settings → Plugins → Project Board → Configure → Coder routing** is the console surface
+for strict coder routing (`routing.exclusive`): the operator picks which coders may build,
+with no YAML. Like Projects, it is a plugin-served page with no config data in it; every
+read and save goes through the operator-gated `/api/plugins/project_board/routing` routes.
 
 **Coders.** One card per configured coder shows its provider state (live, or down-marked,
 #420), its subscription usage (#579; **Usage unknown** on an older host or with no usage

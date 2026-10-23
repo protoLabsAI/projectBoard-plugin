@@ -1,0 +1,31 @@
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);font-family:var(--pl-font-sans);font-size:13px}
+.wrap{padding:var(--pl-space-4);max-width:760px;margin:0 auto}
+/* Coder routing (#578): coders first (one card each, a switch that saves), then the
+   ladder once per group of projects that share it. DS card / switch / progress / dot. */
+.routing{display:flex;flex-direction:column;gap:var(--pl-space-6,24px)}
+.r-sec h2{font-size:15px;margin:0 0 var(--pl-space-2);color:var(--pl-color-fg)}
+.r-summary{margin:0 0 var(--pl-space-3);font-size:13px;color:var(--pl-color-fg)}
+.r-note{margin:var(--pl-space-3) 0 0;color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+.r-sec h2 + .r-note{margin:0 0 var(--pl-space-3)}
+.r-coders{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--pl-space-3)}
+.r-coder{display:flex;flex-direction:column;gap:var(--pl-space-3)}
+.r-coder .pl-switch{margin-top:auto}
+.r-coder--off{opacity:.6}
+.r-coder-head{display:flex;align-items:center;gap:var(--pl-space-2)}
+.r-coder-name{font-family:var(--pl-font-mono);font-weight:var(--pl-font-weight-semibold,600);font-size:13px}
+.r-coder-state{margin-left:auto;font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-usage{font-size:12px}
+.r-msg{margin-top:var(--pl-space-3)}
+.r-ladder{display:flex;flex-direction:column;gap:var(--pl-space-2);margin-bottom:var(--pl-space-3);max-width:640px}
+.r-ladder:last-child{margin-bottom:0}
+.r-ladder-head{font-size:12.5px;font-weight:var(--pl-font-weight-semibold,600)}
+.r-members{font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-rung{display:grid;grid-template-columns:96px minmax(0,1fr) 120px;gap:var(--pl-space-3);align-items:baseline;font-size:12.5px}
+.r-tier{font-family:var(--pl-font-mono);font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-path{font-family:var(--pl-font-mono)}
+.r-then{font-family:inherit;color:var(--pl-color-fg-muted);font-size:11px;margin:0 2px}
+.r-next{font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-none{color:var(--pl-color-fg-muted);font-style:italic}
+.r-loading{color:var(--pl-color-fg-muted);font-size:12.5px}

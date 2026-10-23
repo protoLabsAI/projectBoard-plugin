@@ -191,6 +191,15 @@ def test_projects_config_page_is_public_but_its_data_routes_are_not(monkeypatch)
     assert c.put("/plugins/project_board/projects/demo", json={"repo": "/repo"}).status_code == 404
 
 
+def test_routing_config_page_is_public_but_holds_no_routing_data(monkeypatch):
+    c = _client(monkeypatch, FakeStore())
+    page = c.get("/plugins/project_board/config/routing")
+    assert page.status_code == 200 and 'id="routing"' in page.text
+    assert page.headers["cache-control"] == "no-store"
+    # The page is chrome only: routing is read and saved through the gated /api routes.
+    assert c.get("/plugins/project_board/routing/effective").status_code == 404
+
+
 def test_projects_data_route_reads_live_registry_not_router_config(monkeypatch):
     import project_board.project_registry as registry
 

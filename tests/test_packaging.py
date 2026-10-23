@@ -330,6 +330,7 @@ def test_manifest_declares_the_ordered_tabbed_config_contract():
     m = _manifest()
     assert m["settings_tabs"] == [
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
+        {"id": "routing", "label": "Coder routing", "path": "/plugins/project_board/config/routing"},
         {"id": "automation", "label": "Automation"},
         {"id": "review", "label": "Review & merge"},
         {"id": "security", "label": "Security"},
