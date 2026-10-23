@@ -363,9 +363,66 @@ function showAllBtn(total){
   return '<button class="showall" onclick="showAllDone()">show all ('+total+')</button>';
 }
 
+// ── First load: skeletons, never a false "empty" (bd board-loading-skeletons) ──────
+// Until the FIRST /features response lands, FEATURES = [] means "not read yet", not
+// "nothing on the board" — so a render then (a board_watch follow, a view switch, …)
+// paints DS skeleton cards (`pl-skel`, plugin-kit.css) in every lane with a neutral "–"
+// count and the lanes aria-busy, and NO empty-state text. LOADED flips once, on the first
+// successful read; later refreshes never come back here, so a poll can't flash
+// skeletons. A first read that FAILS stops the shimmer (LOAD_FAILED) and leaves the lanes
+// blank — no "Nothing in the backlog." for a board that was never read — while the
+// error / setup callout above says why; the next successful read renders normally.
+let LOADED = false, LOAD_FAILED = false;
+const SKEL_CARDS = 3, SKEL_W = [["78%", "46%"], ["62%", "38%"], ["70%", "52%"]];
+function skelCardHTML(i){
+  const w = SKEL_W[i % SKEL_W.length];
+  return '<div class="skel-card" aria-hidden="true"><div class="pl-skel-lines">'
+    + '<div class="pl-skel" style="height:12px;width:'+w[0]+'"></div>'
+    + '<div class="pl-skel" style="height:9px;width:'+w[1]+'"></div></div></div>';
+}
+function renderSkeleton(){
+  ensureLanes();
+  const busy = !LOAD_FAILED;
+  COLS.forEach((state, li) => {
+    const lane = LANES[state];
+    // 2–3 cards per lane, varied so the board doesn't read as a grid of identical bars.
+    const n = busy ? SKEL_CARDS - (li % 2) : 0;
+    let html = "";
+    for (let i = 0; i < n; i++) html += skelCardHTML(li + i);
+    if (lane.list._skel !== html){ lane.list.innerHTML = html; lane.list._skel = html; }
+    lane.count.textContent = "–";
+    lane.empty.hidden = true;
+    lane.bar.style.width = "0%";
+    lane.el.setAttribute("aria-busy", busy ? "true" : "false");
+  });
+  const rows = busy ? Array.from({length: 4}, (_, i) =>
+      '<tr class="skel-row" aria-hidden="true">'
+      + '<td><div class="pl-skel" style="height:10px;width:52px"></div></td>'
+      + '<td><div class="pl-skel" style="height:10px;width:'+SKEL_W[i % SKEL_W.length][0]+'"></div></td>'
+      + '<td><div class="pl-skel" style="height:10px;width:64px"></div></td>'
+      + '<td><div class="pl-skel" style="height:10px;width:20px"></div></td>'
+      + '<td></td><td></td></tr>').join("") : "";
+  $("rows").innerHTML = rows;
+  $("list").setAttribute("aria-busy", busy ? "true" : "false");
+}
+// The first successful read: drop every skeleton (both views — the hidden one too) so
+// the keyed Kanban render starts from empty lane lists.
+function clearSkeleton(){
+  COLS.forEach(state => {
+    const lane = LANES[state];
+    if (!lane) return;
+    lane.list.querySelectorAll(".skel-card").forEach(n => n.remove());
+    lane.list._skel = null;
+    lane.el.removeAttribute("aria-busy");
+  });
+  $("rows").querySelectorAll(".skel-row").forEach(n => n.remove());
+  $("list").removeAttribute("aria-busy");
+}
+
 function render(){
   // A drag owns the board while it runs — a poll that lands mid-drag is painted after it.
   if (DRAG){ RENDER_DEFERRED = true; return; }
+  if (!LOADED){ renderSkeleton(); return; }  // not read yet: never the empty state
   if (VIEW === "kanban"){
     renderKanban();
   } else {
@@ -438,6 +495,7 @@ async function load(){
       // optimistic patch over the fresh rows (withPending).
       SERVER_ROWS = (r.features || []).map(f => ({...f, state: f.board_state ?? f.state}));
       FEATURES = withPending(sortFeatures(SERVER_ROWS.slice()));
+      if (!LOADED){ LOADED = true; LOAD_FAILED = false; clearSkeleton(); }
       render();
     }
     $("sub").textContent = "project_board — " + FEATURES.length + " features · a projection over beads";
@@ -462,6 +520,9 @@ async function load(){
     else $("err").hidden = true;
   } catch (e) {
     if (seq !== LOAD_SEQ) return;              // a superseded read's error is stale too
+    // Never read yet: stop the skeleton shimmer (it would read as "still loading" forever)
+    // but keep the lanes free of empty-state copy — the callout below says what failed.
+    if (!LOADED && !LOAD_FAILED){ LOAD_FAILED = true; render(); }
     // First-run tell (#unbound): a board never bound to a repo (shipped default
     // repo "." + no db_path) fails every read — that is missing SETUP, not an
     // error. /status is a pure config read, so it answers even when the store
@@ -2134,5 +2195,8 @@ function boot(){
   LIVE_TIMER = setTimeout(liveTick, REV_POLL_MS);
   clockTick();
 }
+// Skeletons NOW, before the handshake (up to 800 ms) and the first /features read
+// (a ~1 s+ br listing server-side) — the lanes never sit blank or read as empty.
+render();
 kit.initPluginView(boot);
 setTimeout(boot, 800);
