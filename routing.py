@@ -15,8 +15,18 @@ from .store import TIER_LADDER
 log = logging.getLogger("protoagent.plugins.project_board")
 
 
-def validate_routing(cfg, delegates=None):
-    """Validate a complete candidate without mutating the live policy."""
+def validate_routing(cfg, delegates=None, *, resolve=True):
+    """Validate a complete candidate without mutating the live policy.
+
+    With ``resolve`` (the operator set path) every named delegate must resolve
+    through ``delegates`` — or the default registry — so ``board_routing_set``
+    refuses a ladder naming a coder that is not configured. The live ``reload``
+    path passes ``resolve=False``: a delegate the operator has since disabled is
+    NOT malformed there. The dispatcher already skips a missing delegate per rung
+    via ``_live_rung`` (protoAgent#3692), so one disabled plugin named in the
+    board's own ``coders`` must not reject an unrelated ``projects`` edit that
+    rode the same reload (the candidate always carries the board's full cfg).
+    """
     cfg = normalize_tier_config(copy.deepcopy(cfg))
     projects = resolve_projects(cfg)
     default_project(cfg)
@@ -42,10 +52,11 @@ def validate_routing(cfg, delegates=None):
         if not isinstance(exclusive, list) or any(not isinstance(n, str) or not n.strip() for n in exclusive):
             raise ValueError(f"{label}.routing.exclusive must be a list of delegate names")
         names.update(exclusive)
-    resolver = delegates if delegates is not None else (_default_delegates() if names else None)
-    for name in sorted(names):
-        if resolver(name) is None:
-            raise ValueError(f"delegate {name!r} is not configured/enabled")
+    if resolve:
+        resolver = delegates if delegates is not None else (_default_delegates() if names else None)
+        for name in sorted(names):
+            if resolver(name) is None:
+                raise ValueError(f"delegate {name!r} is not configured/enabled")
     return cfg
 
 

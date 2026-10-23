@@ -37,11 +37,12 @@ def test_reload_aliases_and_snapshot():
         {"coders": {"smart": [3]}},
         {"routing": []},
         {"routing": {"exclusive": "codex"}},
-        {"routing": {"exclusive": ["missing"]}},
-        {"coders": {"standard": "missing"}},
     ],
 )
 def test_bad_reload_is_atomic(update, caplog):
+    # A STRUCTURALLY malformed candidate is rejected whole — the piggy-backed projects
+    # edit drops with it. A merely-disabled delegate is NOT malformed here: see
+    # test_projects_edit_survives_disabled_board_coder.
     loop = BoardLoop({"coders": copy.deepcopy(LADDER)})
     loop._resolve_delegate = lambda name, _: None if name == "missing" else name
     before = copy.deepcopy(loop.cfg)
@@ -49,6 +50,36 @@ def test_bad_reload_is_atomic(update, caplog):
     assert loop.cfg == before
     assert loop._coders_for({}) == LADDER
     assert "keeping current map" in caplog.text
+
+
+def test_projects_edit_survives_disabled_board_coder(caplog):
+    # finding 1: the candidate always carries the board's `coders`, so a reload that only
+    # touches `projects` must not be dropped because a delegate the board's ladder names
+    # has since been disabled (resolves to None). The dispatcher skips it per rung.
+    loop = BoardLoop({"coders": {"standard": ["sonnet", "gone"]}, "projects": {"app": {"repo": "/app"}}})
+    loop._resolve_delegate = lambda name, _: None if name == "gone" else name
+    loop.reload({"projects": {"app": {"repo": "/changed"}, "new": {"repo": "/new"}}})
+    assert loop._repo_for({"project": "app"}) == "/changed"
+    assert loop._repo_for({"project": "new"}) == "/new"
+    assert loop._coders_for({}) == {"standard": ["sonnet", "gone"]}
+    assert "keeping current map" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "start, update, on",
+    [
+        ({"coder": "sonnet"}, {"coders": LADDER}, True),
+        ({"coders": LADDER}, {"coders": {"standard": ["sonnet"]}}, False),
+    ],
+)
+def test_reload_retunes_escalation_gate(start, update, on):
+    # finding 2: `escalation_on` is set once at construction, so a live single-coder↔ladder
+    # change must recompute it or the next claim's dispatch gate stays stale.
+    loop = BoardLoop(copy.deepcopy(start))
+    loop._resolve_delegate = lambda name, _: name
+    assert loop.escalation_on is (not on)
+    loop.reload(copy.deepcopy(update))
+    assert loop.escalation_on is on
 
 
 async def test_inflight_escalation_keeps_captured_policy(monkeypatch):

@@ -296,7 +296,13 @@ class DriveMixin:
                 from ..routing import validate_routing
 
                 candidate = normalize_tier_config(candidate)
-                candidate = validate_routing(candidate, lambda name: self._resolve_delegate(name, "acp"))
+                # Structural validation only (resolve=False): a reload must never reject the
+                # whole candidate because a delegate the operator has since disabled is still
+                # named in the board's own `coders` — the candidate always carries that map,
+                # so otherwise a projects-only save would silently drop. The dispatcher skips a
+                # missing delegate per rung via `_live_rung` (protoAgent#3692). The operator
+                # set path keeps the resolution check.
+                candidate = validate_routing(candidate, resolve=False)
                 projects = resolve_projects(candidate)
                 default = resolve_default_project(candidate)
             except Exception as exc:  # noqa: BLE001 — retain the last valid policy
@@ -307,6 +313,12 @@ class DriveMixin:
                         changed[key] = (self.cfg.get(key), candidate[key])
                         self.cfg[key] = candidate[key]
                 self.coders = {k: rung_delegates(v) for k, v in candidate.get("coders", {}).items()}
+                # Keep the escalation gate in step with the live ladder: `escalation_on` is
+                # otherwise set once at construction (core.py), so a live single-coder↔ladder
+                # change would leave `_drive_captured`'s gate stale — a new ladder never
+                # climbing, a removed one still escalating. The next claim reads the fresh
+                # value; in-flight drives captured theirs at drive start.
+                self.escalation_on = escalation_enabled(candidate)
                 old_projects = self._projects
                 old_default = self._default_project
                 if projects != old_projects or default != old_default:
