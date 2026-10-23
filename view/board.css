@@ -444,37 +444,28 @@
   pre.diff .dl-d{background:color-mix(in srgb,var(--pl-color-status-error) 16%,transparent)}
   pre.diff .dl-h{color:var(--pl-color-status-info);background:var(--pl-color-bg-subtle)}
   pre.diff .dl-n{color:var(--pl-color-fg-muted)}
-  /* ── Routing panel (#578): effective per-project coder routes + the exclusive control.
-     Token-driven like the rest of the page; no new dependencies. */
-  .routing{display:flex;flex-direction:column;gap:var(--pl-space-4)}
-  .routing h2{font-size:14px;margin:0 0 var(--pl-space-2);color:var(--pl-color-accent)}
-  .routing .r-intro{margin:0 0 var(--pl-space-3);color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
-  .r-ctl{background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);
-    border-radius:var(--pl-radius-lg,8px);padding:var(--pl-space-3) var(--pl-space-4)}
-  .r-dels{display:flex;flex-wrap:wrap;gap:var(--pl-space-2);margin-bottom:var(--pl-space-3)}
-  .r-del{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;font-size:12px;cursor:pointer;
-    background:var(--pl-color-bg);border:var(--pl-border-width) solid var(--pl-color-border);border-radius:999px;
-    font-family:var(--pl-font-mono)}
-  .r-del:hover{border-color:var(--pl-color-accent)}
-  .r-del input{margin:0;cursor:pointer}
-  .r-actions{display:flex;flex-wrap:wrap;gap:var(--pl-space-2)}
-  .r-btn{padding:5px 12px;font-size:12px;cursor:pointer;color:var(--pl-color-fg);
-    background:var(--pl-color-bg);border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius)}
-  .r-btn:hover:not(:disabled){border-color:var(--pl-color-accent);color:var(--pl-color-fg)}
-  .r-btn:disabled{opacity:.5;cursor:default}
-  .r-btn--primary{color:var(--pl-color-accent);border-color:color-mix(in srgb,var(--pl-color-accent) 55%,var(--pl-color-border));
-    font-weight:var(--pl-font-weight-semibold,600)}
-  .r-btn--ghost{margin-left:auto;color:var(--pl-color-fg-muted)}
+  /* ── Routing panel (#578): coders first (one card each, a switch that saves), then the
+     ladder once per group of projects that share it. DS card / switch / progress / dot. */
+  .routing{display:flex;flex-direction:column;gap:var(--pl-space-6,24px);max-width:960px}
+  .r-sec h2{font-size:15px;margin:0 0 var(--pl-space-2);color:var(--pl-color-fg)}
+  .r-summary{margin:0 0 var(--pl-space-3);font-size:13px;color:var(--pl-color-fg)}
+  .r-note{margin:var(--pl-space-3) 0 0;color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+  .r-sec h2 + .r-note{margin:0 0 var(--pl-space-3)}
+  .r-coders{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--pl-space-3)}
+  .r-coder{display:flex;flex-direction:column;gap:var(--pl-space-3)}
+  .r-coder--off{opacity:.6}
+  .r-coder-head{display:flex;align-items:center;gap:var(--pl-space-2)}
+  .r-coder-name{font-family:var(--pl-font-mono);font-weight:var(--pl-font-weight-semibold,600);font-size:13px}
+  .r-coder-state{margin-left:auto;font-size:11.5px;color:var(--pl-color-fg-muted)}
+  .r-usage{font-size:12px}
   .r-msg{margin-top:var(--pl-space-3)}
-  .r-proj{background:color-mix(in srgb,var(--pl-color-bg-raised) 55%,var(--pl-color-bg));
-    border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius-lg,8px);
-    padding:var(--pl-space-3) var(--pl-space-4)}
-  .r-phead{display:flex;align-items:center;gap:var(--pl-space-2);margin-bottom:var(--pl-space-3);flex-wrap:wrap}
-  .r-phead h3{font-size:13px;margin:0;color:var(--pl-color-fg)}
-  .r-tbl{margin-bottom:var(--pl-space-3)}
-  .r-tbl:last-child{margin-bottom:0}
-  .r-tbl td,.r-tbl th{vertical-align:top}
-  .r-tier,.r-why{font-family:var(--pl-font-mono);font-size:11.5px}
-  .r-why{color:var(--pl-color-fg-muted)}
-  .r-detail{color:var(--pl-color-fg-muted);font-size:11.5px}
+  .r-ladder{display:flex;flex-direction:column;gap:var(--pl-space-2);margin-bottom:var(--pl-space-3)}
+  .r-ladder:last-child{margin-bottom:0}
+  .r-ladder-head{font-size:12.5px;font-weight:var(--pl-font-weight-semibold,600)}
+  .r-members{font-size:11.5px;color:var(--pl-color-fg-muted)}
+  .r-rung{display:grid;grid-template-columns:96px 1fr auto;gap:var(--pl-space-3);align-items:baseline;font-size:12.5px}
+  .r-tier{font-family:var(--pl-font-mono);font-size:11.5px;color:var(--pl-color-fg-muted)}
+  .r-path{font-family:var(--pl-font-mono)}
+  .r-then{font-family:inherit;color:var(--pl-color-fg-muted);font-size:11px;margin:0 2px}
+  .r-next{font-size:11.5px;color:var(--pl-color-fg-muted)}
   .r-none{color:var(--pl-color-fg-muted);font-style:italic}

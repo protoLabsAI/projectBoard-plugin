@@ -42,37 +42,30 @@ fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
 ## Routing panel (board page)
 
 The board page carries a third tab, **Routing**, next to Kanban and List. It is the
-console surface for strict coder routing (`routing.exclusive`) — the operator can set
-"Codex only" with no YAML.
+console surface for strict coder routing (`routing.exclusive`): the operator picks which
+coders may build, with no YAML.
 
-The panel reads `GET /routing/effective` (a board read, same operator gate as the rest of
-the page) and shows, per project:
+**Coders.** One card per configured coder shows its provider state (live, or down-marked,
+#420), its subscription usage (#579; **Usage unknown** on an older host or with no usage
+snapshot) and an **Allowed to build** switch. A switch saves at once through B3's guarded,
+audited `PUT /routing`, and the running board uses the change from the next card. Switching
+every coder but codex off is "Codex only". With every coder allowed there is no exclusive
+set. The last allowed coder can't be switched off. A refused save (a non-operator session,
+or a coder that isn't configured or enabled) shows inline and changes nothing, and the page
+re-reads afterward so it always shows what landed. Strict routing covers building, CI and
+review fixes, and escalation. The review gate and helpers (review dispatch, decompose,
+coder.solve offload, Max-Mode judge, task-assignee delegates) keep their own delegates.
 
-- **Lifecycle paths** — `implement`, `fix (CI/review)`, and `escalate` are the coder paths
-  the exclusive set governs; `review` (the review gate reviewer) and `helpers` (review
-  dispatch, decompose, coder.solve offload, Max-Mode judge, task-assignee delegates) are
-  marked **not covered by exclusive**, because strict routing is advisory for them.
-- **The ladder** — one row per capability rung (standard / reasoning / advanced) with the
-  delegates left after the exclusive filter, which sibling the next dispatch **opens on**,
-  and **why** (round-robin, down-marked, `headroom ≥N%`, or exclusive). That reason is
-  computed server-side with the loop's own sibling-preference functions, so what you read
-  uses a read-only snapshot of the loop's round-robin cursor. This preview does not
-  reserve a turn: another dispatch or a provider-state change can change the next pick.
-  Empty rungs use the base coder when unrestricted; with escalation disabled, all
-  routes use the base coder and escalation is marked disabled.
-- **Delegates** — each delegate's live provider state (live / down-marked, #420) and its
-  subscription headroom (#579). An older host, or a delegate with no usage snapshot, reads
-  **unknown** — never an error.
+**Ladder.** One block per group of projects that route the same way, so a board whose
+projects share a ladder shows it once ("All 14 projects"). Each rung (standard / reasoning
+/ advanced) lists its coders in order and which one the next card would open on right now.
+Hover the "next" pick for why (round-robin, down-marked, `headroom ≥N%`, or exclusive).
+That pick comes from `GET /routing/effective`, computed with the loop's own
+sibling-preference functions over a read-only snapshot of the round-robin cursor, so it is
+a preview: another dispatch or a provider-state change can change it.
 
-The control above the tables sets the board-scope exclusive set: tick the configured
-delegates, use **Codex only** for the one-click headline case, **Apply selection** for any
-other set, or **Clear (restore full ladder)** to drop the restriction. Every save goes
-through B3's guarded, audited `PUT /routing`, so validation and the JSONL audit record
-apply and the change is live on the running board immediately. A refused save — a
-non-operator session, or a delegate that isn't configured/enabled — is surfaced inline and
-changes nothing; the tables re-read afterward so they always reflect what actually landed.
-Per-project `routing.exclusive` overrides remain YAML/`board_routing_set`-only and are shown
-in the table with their source.
+Per-project `routing.exclusive` overrides remain YAML/`board_routing_set`-only; a project
+with one shows as its own ladder block.
 
 ## Not exposed in the console
 
