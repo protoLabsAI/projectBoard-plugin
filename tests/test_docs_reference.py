@@ -18,8 +18,10 @@ from __future__ import annotations
 import ast
 import pathlib
 import re
+import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
+_docs = sys.modules[__name__]  # this module, so the tests below can monkeypatch `_ROOT`
 _API_DOC = _ROOT / "docs" / "api.md"
 _TOOLS_DOC = _ROOT / "docs" / "tools.md"
 _CONFIG_DOC = _ROOT / "docs" / "configuration.md"
@@ -144,8 +146,34 @@ def _plugin_modules() -> list[pathlib.Path]:
     return [
         p
         for p in sorted(_ROOT.rglob("*.py"))
-        if ".venv" not in p.parts and "tests" not in p.parts and "__pycache__" not in str(p)
+        if ".venv" not in p.parts
+        and "tests" not in p.parts
+        and "__pycache__" not in str(p)
+        and not _in_nested_checkout(p)
     ]
+
+
+def _in_nested_checkout(p: pathlib.Path) -> bool:
+    """True when ``p`` lives in a nested git worktree rather than in the plugin itself.
+
+    The board builds its OWN repo, so its candidate trees sit inside it: ``worktrees_root``
+    defaults to ``.worktrees/``, and each ``feat-<id>`` tree carries a ``.git`` pointer file
+    at its root. Without this filter the guard read an IN-FLIGHT card's source as shipped
+    source. On 2026-10-23 half its input — 36 of 72 modules — came from
+    ``.worktrees/feat-bd-1i5y.9.g1``, whose ``self.cfg.get("routing")`` is undocumented
+    precisely BECAUSE IT HAS NOT LANDED YET. The guard therefore failed on clean main, which
+    failed the project's gate preflight, which held every board-plugin card — including the
+    siblings of the very card whose tree caused it, so no coder could clear it. CI never sees
+    this: a fresh clone has no candidate trees.
+
+    Keyed on the ``.git`` marker, not the name ``.worktrees``, so a board configured with a
+    different ``worktrees_root`` is covered too; a root OUTSIDE the repo was never affected."""
+    for parent in p.parents:
+        if parent == _ROOT:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
 
 
 def _config_keys() -> set[str]:
@@ -328,3 +356,64 @@ def test_the_yaml_only_count_in_the_prose_is_true():
         f"file and the manifest say {actual[0]} of {actual[1]}. Update the sentence. "
         f"YAML-only today: {sorted(yaml_only)}"
     )
+
+
+# ── the guard must read the PLUGIN, not the board's candidate trees ─────────────────
+
+
+def _fake_tree(root: pathlib.Path) -> pathlib.Path:
+    """A plugin checkout with one shipped module and one board candidate tree inside it —
+    the real layout: `worktrees_root` defaults to `.worktrees/`, and a linked git worktree
+    carries a `.git` POINTER FILE (not a directory) at its root."""
+    (root / "shipped.py").write_text('cfg.get("documented_knob")\n')
+    cand = root / ".worktrees" / "feat-bd-1.g1"
+    cand.mkdir(parents=True)
+    (cand / ".git").write_text("gitdir: /somewhere/.git/worktrees/feat-bd-1.g1\n")
+    (cand / "inflight.py").write_text('cfg.get("knob_that_has_not_landed")\n')
+    return cand
+
+
+def test_plugin_modules_skips_a_nested_candidate_tree(tmp_path, monkeypatch):
+    """A card still being built must not count as shipped source. The board builds its own
+    repo, so its candidate trees live INSIDE it; before this filter the guard scanned them
+    and demanded docs for a key that had not landed, failing on clean main."""
+    monkeypatch.setattr(_docs, "_ROOT", tmp_path)
+    cand = _fake_tree(tmp_path)
+
+    mods = _docs._plugin_modules()
+
+    assert tmp_path / "shipped.py" in mods
+    assert cand / "inflight.py" not in mods
+    assert not any(".worktrees" in p.parts for p in mods)
+
+
+def test_config_keys_ignores_a_candidate_tree_key(tmp_path, monkeypatch):
+    """The effect that actually broke the board: an in-flight `cfg.get(...)` became a
+    'config key read by the code but absent from docs', which failed the gate preflight for
+    EVERY card in the project — including the siblings of the card whose tree caused it."""
+    monkeypatch.setattr(_docs, "_ROOT", tmp_path)
+    _fake_tree(tmp_path)
+
+    keys = _docs._config_keys()
+
+    assert "documented_knob" in keys
+    assert "knob_that_has_not_landed" not in keys
+
+
+def test_the_filter_keys_on_the_git_marker_not_the_directory_name(tmp_path, monkeypatch):
+    """`worktrees_root` is configurable, so the name `.worktrees` is not the signal — the
+    `.git` pointer is. A differently-named root is skipped; an ordinary package directory
+    that merely sits deep in the tree is NOT."""
+    monkeypatch.setattr(_docs, "_ROOT", tmp_path)
+    renamed = tmp_path / "wt" / "feat-bd-2.g1"
+    renamed.mkdir(parents=True)
+    (renamed / ".git").write_text("gitdir: /elsewhere\n")
+    (renamed / "inflight.py").write_text('cfg.get("also_not_landed")\n')
+    pkg = tmp_path / "loop"
+    pkg.mkdir()
+    (pkg / "core.py").write_text('cfg.get("real_nested_knob")\n')
+
+    keys = _docs._config_keys()
+
+    assert "also_not_landed" not in keys
+    assert "real_nested_knob" in keys  # a genuine subpackage still counts
