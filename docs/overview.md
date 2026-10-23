@@ -88,7 +88,7 @@ The mechanics behind the board: the store, the loop, the gates and the planning 
   grounding so the next runs stop repeating known failures. **`cross-repo-chain`** is
   for work that spans repos through a release: the change in one repo, the publish, then
   the consumer card gated on it with `waits_for`. **`card-from-chat`** turns "add a feature
-  for …" into an inline form, then a ready card the Board view follows (`board_watch`).
+  for …" into the board's ready-made inline form (`board_card_form`), then a ready card the Board view follows (`board_watch`).
 - **Console view** — a Kanban + list projection over the `/features` API (ADR 0026).
   `board_watch` opens it on the main stage and follows one card through its lanes.
 
