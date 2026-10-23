@@ -727,6 +727,9 @@ replaces the old ladder, and `exclusive: []` disables strict routing. All tier k
 and delegate names in supplied fields are validated before persistence; legacy tier aliases
 are rewritten. Disabled delegates in untouched fields do not block repairs to other
 scopes. Reload preserves legacy string allowlists and empty/null routing forms.
+Unchanged legacy policy fields also remain valid during unrelated project or default-project
+edits; changed policy fields are validated before the atomic swap. A host reload without
+a `project_board` mapping is a no-op, while an explicitly empty mapping clears board routing.
 Writes use the host config-save/reload path and append caller, UTC time, and old/new
 routing to `routing-audit.jsonl` in the board data directory, plus a log entry.
 

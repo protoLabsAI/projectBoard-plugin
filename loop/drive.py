@@ -286,7 +286,8 @@ class DriveMixin:
         # manifest default to fill a gap — so from the host, a policy key that is missing
         # was deleted (turning strict routing off is deleting `routing:`). A plain-dict
         # reload stays a partial update: a missing key leaves the knob alone.
-        complete = isinstance(getattr(new_config, "plugin_config", None), dict)
+        plugin_config = getattr(new_config, "plugin_config", None)
+        complete = isinstance(plugin_config, dict) and isinstance(plugin_config.get("project_board"), dict)
         cleared = tuple(k for k in ("coders", "routing") if complete and k not in section and k in self.cfg)
         if cleared or any(key in section for key in ("projects", "default_project", "coders", "routing")):
             candidate = dict(self.cfg)
@@ -304,13 +305,11 @@ class DriveMixin:
                 from ..routing import validate_routing
 
                 candidate = normalize_tier_config(candidate)
-                # Structural validation only (resolve=False): a reload must never reject the
-                # whole candidate because a delegate the operator has since disabled is still
-                # named in the board's own `coders` — the candidate always carries that map,
-                # so otherwise a projects-only save would silently drop. The dispatcher skips a
-                # missing delegate per rung via `_live_rung` (protoAgent#3692). The operator
-                # set path keeps the resolution check.
-                candidate = validate_routing(candidate, resolve=False)
+                # Validate changed policy fields only. Unchanged legacy policy must not
+                # prevent a projects/default_project save from reaching the running loop.
+                # Delegate availability remains a write-time check: dispatch already
+                # skips disabled delegates, allowing operators to repair one field at a time.
+                candidate = validate_routing(candidate, resolve=False, previous=self.cfg)
                 projects = resolve_projects(candidate)
                 default = resolve_default_project(candidate)
             except Exception as exc:  # noqa: BLE001 — retain the last valid policy

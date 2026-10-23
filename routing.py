@@ -8,24 +8,40 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from .projects import TIER_ALIASES, default_project, normalize_tier_config, resolve_projects
+from .projects import IMPLICIT_MARKER, TIER_ALIASES, default_project, normalize_tier_config, resolve_projects
 from .setup_check import _default_delegates, _rung_names as rung_delegates
 from .store import TIER_LADDER
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
 
-def validate_routing(cfg, delegates=None, *, resolve=True):
+def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
     """Validate structure, preserving legacy load forms when resolve=False.
 
     Resolve delegates only for operator-supplied fields. The complete stored
     config may name disabled delegates in other fields that still need repair.
+    With a previous config, structural checks apply only to changed policy fields
+    in each scope. Existing load-compatible values must not block unrelated edits;
+    strict operator validation of supplied fields never uses this exemption.
     """
     cfg = normalize_tier_config(copy.deepcopy(cfg))
     projects = resolve_projects(cfg)
     default_project(cfg)
+    old = normalize_tier_config(previous) if previous is not None and not resolve else None
+    old_projects = resolve_projects(old) if old is not None else {}
     names = set()
-    for label, entry in [("board", cfg), *projects.items()]:
+    scopes = [
+        ("board", cfg, old),
+        *(
+            (name, entry, old if entry.get(IMPLICIT_MARKER) else old_projects.get(name))
+            for name, entry in projects.items()
+        ),
+    ]
+    for label, entry, prior in scopes:
+        if prior is not None:
+            # Compare normalized fields rather than whole project entries: changing a
+            # repo must not revalidate its unchanged legacy ladder.
+            entry = {key: value for key, value in entry.items() if key not in prior or value != prior[key]}
         coders = entry.get("coders", {})
         if coders is None and not resolve:
             coders = {}
@@ -129,7 +145,7 @@ async def routing_set(*, actor, coders=None, exclusive=None, project=None):
                 supplied["routing"] = {"exclusive": exclusive}
                 target["routing"] = {**(target.get("routing") or {}), "exclusive": exclusive}
             validate_routing(supplied)
-            candidate = validate_routing(candidate, resolve=False)
+            candidate = validate_routing(candidate, resolve=False, previous=section)
             record.update(
                 who=actor,
                 when=datetime.now(timezone.utc).isoformat(),

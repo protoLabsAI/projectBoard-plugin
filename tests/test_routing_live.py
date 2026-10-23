@@ -52,6 +52,19 @@ def test_host_reload_without_a_policy_key_clears_it(key):
         assert loop.escalation_on is False
 
 
+@pytest.mark.parametrize("plugin_config", [{}, {"other": {}}, {"project_board": None}, {"project_board": []}])
+def test_host_without_board_mapping_is_noop(plugin_config):
+    loop = BoardLoop({"coders": copy.deepcopy(LADDER), "routing": {"exclusive": ["codex"]}})
+    loop._resolve_delegate = lambda name, _: name
+    before = copy.deepcopy(loop.cfg)
+    captured = loop._coders_for({})
+    assert loop.reload(SimpleNamespace(plugin_config=plugin_config)) == {}
+    assert loop.cfg == before
+    assert loop._coders_for({}) == captured
+    assert loop._exclusive_for({}) == ["codex"]
+    assert loop.escalation_on is True
+
+
 def test_plain_dict_reload_without_a_policy_key_keeps_it():
     # A plain dict is a partial update: a key it doesn't mention is left alone.
     loop = BoardLoop({"coders": copy.deepcopy(LADDER), "routing": {"exclusive": ["codex"]}})
@@ -292,6 +305,10 @@ async def test_host_refusal_neither_applies_nor_audits(host, monkeypatch):
         {"coders": {"smart": ["", "sonnet", "  "]}},
         {"coders": {"smart": ""}},
         {"coders": None},
+        {"coders": []},
+        {"coders": False},
+        {"coders": {"custom-tier": "sonnet", "smart": "codex"}},
+        {"routing": {"exclusive": ["sonnet"], "legacy-option": True}},
     ],
 )
 @pytest.mark.parametrize("scope", ["board", "project"])
@@ -305,7 +322,7 @@ def test_legacy_policy_survives_project_reload(policy, scope, caplog):
     exclusive = loop._exclusive_for({"project": "app"})
     update = copy.deepcopy(cfg)
     update["projects"]["app"]["repo"] = "/changed"
-    loop.reload(update)
+    loop.reload(_host(update))
     assert loop._repo_for({"project": "app"}) == "/changed"
     assert loop._coders_for({"project": "app"}) == captured
     assert loop._exclusive_for({"project": "app"}) == exclusive
@@ -346,3 +363,45 @@ async def test_setter_can_replace_null_policy_and_audit_legacy_values(host):
     assert record["old"]["app"]["coders"]["standard"] == ["sonnet"]
     assert record["new"] == result
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"coders": {"custom-tier": "sonnet"}},
+        {"coders": []},
+        {"routing": {"exclusive": ["codex"], "legacy-option": True}},
+    ],
+)
+@pytest.mark.parametrize("projects", [{}, {"projects": {"app": {"repo": "/app"}, "other": {"repo": "/other"}}}])
+def test_default_project_reload_preserves_legacy_policy(policy, projects, caplog):
+    loop = BoardLoop({**policy, **projects})
+    loop.reload({"default_project": "other"})
+    assert loop._default_project == "other"
+    assert "keeping current map" not in caplog.text
+
+
+def test_changed_project_policy_still_validated_with_legacy_board(caplog):
+    loop = BoardLoop({"coders": {"custom-tier": "sonnet"}, "projects": {"app": {"repo": "/app"}}})
+    before = copy.deepcopy(loop.cfg)
+    loop.reload({"projects": {"app": {"repo": "/changed", "coders": {"typo": "sonnet"}}}})
+    assert loop.cfg == before
+    assert loop._repo_for({"project": "app"}) == "/app"
+    assert "unknown coder tier" in caplog.text
+
+
+async def test_setter_preserves_unmodified_legacy_policy_but_validates_supplied_fields(host):
+    live, loop, calls, audit = host
+    section = live.plugin_config["project_board"]
+    section["coders"] = {"custom-tier": "sonnet"}
+    section["projects"]["app"]["routing"] = {"legacy-option": True}
+    # Model a board started with legacy policy, not a newly submitted invalid policy.
+    loop.__init__(copy.deepcopy(section))
+    result = await routing.routing_set(actor="alice", exclusive=["codex"])
+    assert loop._exclusive_for({"project": "app"}) == ["codex"]
+    assert section["coders"] == {"custom-tier": "sonnet"}
+    assert section["projects"]["app"]["routing"] == {"legacy-option": True}
+    assert json.loads(audit.read_text())["new"] == result
+    with pytest.raises(ValueError, match="unknown coder tier"):
+        await routing.routing_set(actor="alice", coders={"custom-tier": "sonnet"})
+    assert len(calls) == len(audit.read_text().splitlines()) == 1
