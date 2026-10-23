@@ -109,7 +109,7 @@ def test_state_labels_are_used_at_every_render_site_with_a_fallback():
 def test_internal_state_names_stay_internal():
     """#182 is a view-layer label swap only — grouping, filtering, and the collapse
     toggle still key on the raw state names, so the API/store contract is untouched."""
-    assert "FEATURES.filter(f => f.state === state)" in BOARD_PAGE
+    assert "FEATURES.filter(f => laneOf(f) === state)" in BOARD_PAGE
     assert 'data-state="' in BOARD_PAGE
     assert "'+esc(state)+'" in BOARD_PAGE  # toggleGroup's data-state carries the raw state, not the label
     assert BOARD_PAGE.count('"on deck"') == 1  # the label lives only in the map — renders go through the lookup
@@ -312,7 +312,7 @@ def test_task_cards_share_lanes_and_ordering_with_coding_features():
     feature — no task-only lane, no separate ordering — so it lands in its board state
     with the shared blocked-first / in_progress-second / priority order."""
     # one filter/sort path for every feature; task-ness only changes card CHROME
-    assert "FEATURES.filter(f => f.state === state)" in BOARD_PAGE
+    assert "FEATURES.filter(f => laneOf(f) === state)" in BOARD_PAGE
     assert (
         ".sort((a,b) => (a.blocked?0:a.state==='in_progress'?1:2) - (b.blocked?0:b.state==='in_progress'?1:2) || a.priority - b.priority || a.id.localeCompare(b.id));"
         in BOARD_PAGE

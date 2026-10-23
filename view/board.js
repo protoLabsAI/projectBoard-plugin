@@ -9,6 +9,15 @@ try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
 catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
 
 const COLS = ["backlog", "ready", "in_progress", "in_review", "done"];
+// `blocked` is a board state with no Kanban lane of its own, so a blocked card sits in the
+// lane of the lifecycle it was blocked in (its `blocked` chip and red edge say why) —
+// otherwise it vanished from the Kanban while its dependents waited on it.
+function laneOf(f){
+  if (f.state !== "blocked") return f.state;
+  const labels = f.labels || [];
+  if (f.bead_status === "in_progress") return labels.includes("in-review") ? "in_review" : "in_progress";
+  return labels.includes("ready") ? "ready" : "backlog";
+}
 // State → operator-facing label (#182): a view-layer relabel only — internal
 // state names (store/API/tools) are unchanged. `ready` means spec complete and
 // queued for a coder, which read as finished under the raw name. Unknown
@@ -750,7 +759,7 @@ function renderKanban(){
   const focused = document.activeElement && document.activeElement.classList.contains("card") ? document.activeElement.dataset.id : null;
   // Lane contents first, so each lane's bar can show its share of the whole board.
   const lanes = COLS.map(state => {
-    let items = FEATURES.filter(f => f.state === state), total = items.length;
+    let items = FEATURES.filter(f => laneOf(f) === state), total = items.length;
     if (state === "done"){ const d = doneSlice(items); items = d.items; total = d.total; }  // cap Done (#115)
     return {state, items, total};
   });
@@ -1165,8 +1174,8 @@ function startDrag(e, f, n){
   const accent = laneAccent(n);
   if (accent) ghost.style.setProperty("--lane", accent);
   $("fx").appendChild(ghost);
-  const home = {lane: f.state, index: [...LANES[f.state].list.children].indexOf(n)};
-  DRAG = {f, n, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, home, over: f.state, ok: dropLanes(f)};
+  const home = {lane: laneOf(f), index: [...LANES[laneOf(f)].list.children].indexOf(n)};
+  DRAG = {f, n, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, home, over: home.lane, ok: dropLanes(f)};
   n.classList.add("card--placeholder");
   document.body.classList.add("is-dragging");
   COLS.forEach(state => {
