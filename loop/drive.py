@@ -1766,7 +1766,9 @@ class DriveMixin:
         base = self._base_branch_for(feature)
         coders = self._coders_for(feature)
         exclusive = self._exclusive_for(feature)
-        escalation_on = self.escalation_on or bool(exclusive and coders)
+        # Strict routing filters delegates; it must not turn a single-coder
+        # configuration into a ladder or make difficulty affect its dispatch.
+        escalation_on = self.escalation_on
         # #533: strip any `#n` the squash subject could read as a closing ref — a foreign
         # `fix: #6.3` → `fix: 6.3`, and in `refs_only` mode (another slice of this card's
         # source issue is still being coded) the card's OWN clean `#n` too, so the subject

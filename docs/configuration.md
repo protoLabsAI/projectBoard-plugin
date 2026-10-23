@@ -704,6 +704,8 @@ Every rung is filtered before sibling selection. Empty or unavailable rungs are
 skipped upward; if no eligible configured delegate remains, the card is blocked
 with a reason naming the exclusive set. Strict mode never falls back to a weaker
 rung or an unlisted base `coder`. Without a ladder, the base coder must be allowed.
+A single-delegate `coders` map does not enable a ladder: difficulty remains
+irrelevant, and strict mode does not add tier climbs or attempt labels.
 An absent or empty allowlist preserves existing routing and fallback behavior.
 Restart the loop after changing the top-level `routing` policy; setup status flags
 a policy that differs from the running loop. Project entries inherit the board allowlist unless they specify their own

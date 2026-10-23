@@ -183,8 +183,17 @@ def test_setup_status_exposes_exclusions_and_missing_delegate(tmp_path):
 
 
 @pytest.mark.parametrize("base", ["codex", "sonnet"])
-async def test_single_coder_requires_allowlist_membership(monkeypatch, base):
+@pytest.mark.parametrize("coders", [{}, {"standard": ["codex"]}, dict.fromkeys(store.TIER_LADDER, "codex")])
+@pytest.mark.parametrize("difficulty", ["small", "medium", "large", "architectural"])
+@pytest.mark.parametrize("available", [True, False])
+async def test_single_coder_requires_allowlist_membership(monkeypatch, base, coders, difficulty, available):
     dispatched = []
+    board = LadderStore(store.DIFFICULTY_TIER[difficulty])
+
+    def unexpected_tier_read(fid):
+        pytest.fail("single-coder routing must not consult difficulty/tier")
+
+    board.current_tier = unexpected_tier_read
 
     async def dispatch(coder, *args, **kwargs):
         dispatched.append(coder)
@@ -195,13 +204,20 @@ async def test_single_coder_requires_allowlist_membership(monkeypatch, base):
 
     _, board = await _drive_with(
         monkeypatch,
-        cfg={"coder": base, "routing": {"exclusive": ["codex"]}},
-        seed=lambda loop: setattr(loop, "_resolve_delegate", lambda name, _: name),
+        cfg={"coder": base, "coders": coders, "routing": {"exclusive": ["codex"]}},
+        store=board,
+        feature={**FEATURE, "difficulty": difficulty},
+        seed=lambda loop: setattr(loop, "_resolve_delegate", lambda name, _: name if available else None),
         dispatch=dispatch,
         open_pr=open_pr,
     )
-    assert dispatched == (["codex"] if base == "codex" else [])
-    assert ("flag_blocked" in board.names()) == (base != "codex")
+    allowed = base == "codex" and available
+    assert dispatched == (["codex"] if allowed else [])
+    assert ("flag_blocked" in board.names()) == (not allowed)
+    assert "escalate" not in board.names()
+    assert "record_attempt" not in board.names()
+    if not allowed:
+        assert "routing.exclusive [codex]" in next(c[2] for c in board.calls if c[0] == "flag_blocked")
 
 
 def test_top_level_policy_change_requires_restart():
