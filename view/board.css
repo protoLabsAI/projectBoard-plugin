@@ -201,6 +201,10 @@
   .card--live,.card--task{cursor:pointer}
   .card--live:hover,.card--task:hover{border-color:var(--pl-color-accent)}
   #list tr[data-mon],#list tr[data-task]{cursor:pointer}
+  /* Every coding card opens the card drawer (Card / Code tabs). */
+  .card[data-card]{cursor:pointer}
+  .card[data-card]:hover{border-color:var(--pl-color-accent)}
+  #list tr[data-card]{cursor:pointer}
   /* ── Live monitor drawer (#84): a slide-over mirroring the console goal-detail-drawer
      UX — a right-edge panel over a click-away scrim, polling the per-feature progress
      snapshot while open. Vanilla + token-driven; this page is an iframe, so it owns its
@@ -392,3 +396,51 @@
   /* Narrow/mobile: the JS auto-switches to the list; if Kanban is forced, stack it. */
   @media (max-width:760px){ .board{grid-template-columns:1fr} .wrap{padding:var(--pl-space-3)} .hint{display:none} }
   @media (max-width:1100px){ .hint{display:none} }
+  /* ── Card drawer: Card + Code tabs. A coding card's drawer is wider (diffs need the room);
+     the tab strip sits under the header and the body below it is the one scroll. */
+  #drawer.wide{width:min(780px,96vw)}
+  #drawer .dtabs{padding:0 var(--pl-space-4);border-bottom:var(--pl-border-width) solid var(--pl-color-border);flex:none}
+  #drawer .dtabs .pl-tab{font-size:12.5px}
+  .cflags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:var(--pl-space-2)}
+  .cflags:empty{display:none}
+  .cfacts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px var(--pl-space-3);margin:0 0 var(--pl-space-2)}
+  .cfacts .cf{min-width:0}
+  .cfacts dt{text-transform:uppercase;letter-spacing:.06em;font-size:10px;color:var(--pl-color-fg-muted)}
+  .cfacts dd{margin:1px 0 0;font-size:12.5px;color:var(--pl-color-fg);overflow-wrap:anywhere}
+  .cblock{margin:var(--pl-space-2) 0;font-size:12px;white-space:pre-wrap;word-break:break-word}
+  .cdeps,.cfiles{list-style:none;margin:0;padding:0}
+  .cdeps li,.cfiles li{font-size:12px;padding:2px 0;color:var(--pl-color-fg);overflow-wrap:anywhere}
+  .cdeps .pl-badge{margin-right:6px}
+  .cdeps .id{margin-right:4px;font-family:var(--pl-font-mono);color:var(--pl-color-fg-muted)}
+  .clabels{display:flex;flex-wrap:wrap;gap:4px}
+  .cfiles code{font-family:var(--pl-font-mono);font-size:11.5px}
+  /* Changes (Code tab): one row per file, expanding to its diff. The diff scrolls sideways
+     inside its own block, so the drawer never does. */
+  .sec-changes .chg-h{display:flex;align-items:center;gap:var(--pl-space-2);cursor:default}
+  .sec-changes .chg-h .sec-m{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sec-changes .chg-h .more{margin:0;flex:none}
+  .cfl{list-style:none;margin:0;padding:0}
+  .cfile{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);margin-bottom:4px;overflow:hidden}
+  .cfile-h{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:8px;width:100%;padding:5px 8px;cursor:pointer;font-size:12px}
+  .cfile-h:hover{background:var(--pl-color-bg-hover)}
+  .cfile-h:focus-visible{outline:2px solid var(--pl-color-focus);outline-offset:-2px}
+  .cfile .cpath{flex:1;min-width:0;font-family:var(--pl-font-mono);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+  .cfile .cnt{flex:none;font-family:var(--pl-font-mono);font-size:11px;color:var(--pl-color-fg-muted)}
+  .ca{color:var(--pl-color-status-success)}
+  .cd{color:var(--pl-color-status-error)}
+  .cst{flex:none;width:16px;text-align:center;font-family:var(--pl-font-mono);font-size:11px;font-weight:var(--pl-font-weight-semibold,600);border-radius:3px}
+  .cst-A{color:var(--pl-color-status-success)}
+  .cst-D{color:var(--pl-color-status-error)}
+  .cst-M{color:var(--pl-color-status-warning)}
+  .cst-R{color:var(--pl-color-status-info)}
+  .gen--changes .sec{border-top:none}
+  .cfile .chev{flex:none;margin-left:0}
+  .cfile:not(.open) .chev{transform:rotate(-45deg)}
+  .cfile.open .cfile-h{border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
+  .cnote{font-size:11.5px;color:var(--pl-color-fg-muted);padding:6px 8px}
+  pre.diff{margin:0;padding:4px 0;overflow-x:auto;background:var(--pl-color-bg-inset);font-family:var(--pl-font-mono);font-size:11.5px;line-height:1.5}
+  pre.diff .dl{display:block;padding:0 10px;white-space:pre;min-width:max-content}
+  pre.diff .dl-a{background:color-mix(in srgb,var(--pl-color-status-success) 16%,transparent)}
+  pre.diff .dl-d{background:color-mix(in srgb,var(--pl-color-status-error) 16%,transparent)}
+  pre.diff .dl-h{color:var(--pl-color-status-info);background:var(--pl-color-bg-subtle)}
+  pre.diff .dl-n{color:var(--pl-color-fg-muted)}

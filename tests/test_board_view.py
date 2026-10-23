@@ -289,6 +289,7 @@ def test_parked_task_awaiting_deliverable_chips_on_the_card():
     # flags() carries the chip and is rendered on both the Kanban card and the list row
     assert "out += nextActionChip(f);" in BOARD_PAGE
     assert BOARD_PAGE.count("flags(f)") == 3  # definition + Kanban card + list row
+    assert 'flags({...f, difficulty: ""})' in BOARD_PAGE  # …and the card drawer, minus difficulty
 
 
 def test_status_chips_stay_short_and_the_drawer_spells_them_out():
@@ -302,6 +303,8 @@ def test_status_chips_stay_short_and_the_drawer_spells_them_out():
     assert 'NEXT_ACTION_CHIP[f.next_action] || ["", shortLabel(f.next_action)]' in BOARD_PAGE
     assert "const CHIP_MAX = 32;" in BOARD_PAGE
     assert "let h = nextActionDetail(f) + '<div class=\"tdlbl\">spec</div>'" in BOARD_PAGE
+    # …and a coding card's Card tab carries the same line under its chips
+    assert "+ nextActionDetail(f)" in BOARD_PAGE
 
 
 def test_task_cards_share_lanes_and_ordering_with_coding_features():
@@ -470,9 +473,10 @@ def test_every_pr_url_href_is_minted_through_safehref():
     )
     # the old unguarded interpolation is gone — pr_url reaches an href ONLY via safeHref
     assert "href=\"'+esc(f.pr_url)" not in BOARD_PAGE
-    # exactly two dynamic href sites exist in the page, and both are the guarded ones
-    assert BOARD_PAGE.count("href=\"'+") == 2
-    assert BOARD_PAGE.count("href=\"'+esc(safeHref(") == 2
+    # every dynamic href site is a guarded one: the card/row footers plus the card drawer's
+    # PR fact and the Code tab's "see the PR" link
+    assert BOARD_PAGE.count("href=\"'+") == 4
+    assert BOARD_PAGE.count("href=\"'+esc(safeHref(") == 4
 
 
 # ── preflight-held projects render as a warning card (#261) ──────────────────────
@@ -594,7 +598,8 @@ def test_r1_r2_task_cards_and_rows_are_clickable_via_a_data_task_handle():
     same isTask ternary that stamps the handle only onto task cards/rows."""
     # the list row stamps it in markup; the keyed Kanban card node sets it as an attribute
     assert BOARD_PAGE.count("data-task=\"'+esc(f.id)+'\"") == 1
-    assert BOARD_PAGE.count("(isTask(f)?' data-task=\"'+esc(f.id)+'\"':\"\")") == 1
+    # …and every other row a data-card handle (the card drawer)
+    assert BOARD_PAGE.count("(isTask(f)?' data-task=\"'+esc(f.id)+'\"':' data-card=\"'+esc(f.id)+'\"')") == 1
     assert 'setData(n, "task", isTask(f) ? f.id : null);' in BOARD_PAGE
     # clickable cursor + hover cue extends to task cards/rows, not only the monitor ones
     assert ".card--live,.card--task{cursor:pointer}" in BOARD_PAGE
@@ -657,9 +662,10 @@ def test_r3_monitor_stays_coding_only_and_tasks_never_poll():
         "MON_FID = null;\n  if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }\n  TASK_FID = fid;"
         in BOARD_PAGE
     )
-    # only one setInterval site exists — the monitor poll (the board's live refresh is a
-    # self-scheduling setTimeout); openTask adds no second (tasks don't poll)
-    assert BOARD_PAGE.count("setInterval(") == 1
+    # two setInterval sites exist — the monitor poll and the Code tab's Changes poll (the
+    # board's live refresh is a self-scheduling setTimeout); openTask adds none (tasks don't poll)
+    assert BOARD_PAGE.count("setInterval(") == 2
+    assert "CHG_TIMER = setInterval(() => pollChanges(fid), CHG_POLL_MS);" in BOARD_PAGE
 
 
 def test_r3_pollmonitor_fences_a_late_poll_from_clobbering_a_repurposed_drawer():

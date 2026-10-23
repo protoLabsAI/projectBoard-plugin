@@ -364,7 +364,8 @@ function render(){
       // in_progress CODING rows open the monitor; a task row opens its detail drawer
       // (bd-rdmh) via a data-task handle — no inline sub-row, no monitor poll (#84/#217).
       const mon = f.state==="in_progress" && !isTask(f);
-      return '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':"")+'>'
+      // Every other coding row opens the card drawer (data-card) on its Card tab.
+      return '<tr'+(mon?' data-mon="'+esc(f.id)+'"':"")+(isTask(f)?' data-task="'+esc(f.id)+'"':' data-card="'+esc(f.id)+'"')+'>'
         + '<td class="id">'+esc(f.id)+'</td><td>'+docIco(f)+inlineCode(f.title)+'</td>'
         + '<td><span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span>'
         + '<span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state)+'</span></span></td>'
@@ -397,6 +398,7 @@ function render(){
   // the drawer re-renders too — its state (in_progress → in_review → done) and the
   // reject-form toggle survive a re-render, the same way REJECT_OPEN/COLLAPSED do.
   syncTaskDrawer();
+  syncCardDrawer();
 }
 
 // Every full read carries the listing's ETag back as If-None-Match, so the periodic
@@ -717,6 +719,7 @@ function updateCard(n, f, state){
   n.dataset.state = state;
   setData(n, "mon", mon ? f.id : null);
   setData(n, "task", isTask(f) ? f.id : null);
+  setData(n, "card", isTask(f) ? null : f.id);                   // every coding card opens the drawer
   n.tabIndex = 0;
   n.setAttribute("role", "listitem");
   n.setAttribute("aria-keyshortcuts", "M Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown");
@@ -1157,7 +1160,7 @@ function startDrag(e, f, n){
   const ghost = n.cloneNode(true);
   ghost.classList.remove("card--enter", "card--landed", "card--flash", "card--flying");
   ghost.classList.add("card--ghost");
-  ghost.removeAttribute("data-mon"); ghost.removeAttribute("data-task"); ghost.removeAttribute("tabindex");
+  ghost.removeAttribute("data-mon"); ghost.removeAttribute("data-task"); ghost.removeAttribute("data-card"); ghost.removeAttribute("tabindex");
   ghost.style.cssText = "position:fixed;margin:0;left:"+r.left+"px;top:"+r.top+"px;width:"+r.width+"px";
   const accent = laneAccent(n);
   if (accent) ghost.style.setProperty("--lane", accent);
@@ -1353,7 +1356,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "Enter" || e.key === " "){
     e.preventDefault();
-    if (n.hasAttribute("data-mon") || n.hasAttribute("data-task")) n.click();
+    if (n.hasAttribute("data-mon") || n.hasAttribute("data-task") || n.hasAttribute("data-card")) n.click();
     else openMenu(f.id, n.querySelector("[data-card-menu]") || n);
     return;
   }
@@ -1641,6 +1644,7 @@ function renderMonitor(data, force){
   body.innerHTML = gens.length
     ? gens.slice().sort((a, b) => (a.done ? 1 : 0) - (b.done ? 1 : 0) || b.gen - a.gen).map(genCard).join("")
     : '<div class="pl-empty">No live coder run for this feature right now.</div>';
+  body.insertAdjacentHTML("beforeend", changesSection());    // what the run has changed so far
   body.scrollTop = top;                 // a poll never yanks the reader back to the top
   enhanceSaying($("drawer-body"));   // upgrade "saying" plain text → rendered markdown (lazy, best-effort)
 }
@@ -1676,8 +1680,8 @@ async function pollMonitor(){
 }
 function openMonitor(fid){
   TASK_FID = null;                                               // switching drawer modes → not a task
+  enterCard(fid, "code");                                        // the card drawer, on its Code tab
   MON_FID = fid;
-  $("drawer-title").textContent = "Coder monitor — " + fid;
   if (fid !== MON_LAST_FID){ for (const k in MON_UI) delete MON_UI[k]; MON_LAST_FID = fid; }
   MON_LAST = ""; MON_DATA = null;
   $("drawer").classList.add("open"); $("scrim").classList.add("open");
@@ -1686,6 +1690,7 @@ function openMonitor(fid){
   pollMonitor();
   if (MON_TIMER) clearInterval(MON_TIMER);
   MON_TIMER = setInterval(pollMonitor, MON_POLL_MS);
+  startChanges(fid);
 }
 // Open a task's detail in the SAME drawer (bd-rdmh): a task has no coder run, so there
 // is NO polling — clear any monitor state first (MON_FID=null fences a poll already in
@@ -1694,6 +1699,7 @@ function openTask(fid){
   MON_FID = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
   TASK_FID = fid;
+  leaveCard();                                                   // a task has no Card/Code tabs
   TASK_DETAIL = null;                                            // drop the prior task's fetched detail
   VERIFY_NOTE = null;                                            // …and any approval note it carried
   $("drawer-title").textContent = "Task — " + fid;
@@ -1759,9 +1765,270 @@ function syncTaskDrawer(){
 function closeMonitor(){
   MON_FID = null; TASK_FID = null; TASK_DETAIL = null; VERIFY_NOTE = null;
   if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
+  leaveCard(true);
   $("drawer").classList.remove("open"); $("scrim").classList.remove("open");
   document.body.classList.remove("drawer-open");
 }
+// ── Card drawer: Card + Code tabs ─────────────────────────────────────────────────
+// Every coding card opens the shared #drawer. The Card tab is the card itself (state,
+// links, dependencies, spec, acceptance criteria, requirement ledger); the Code tab is the
+// coder monitor above a Changes section: the files the card's worktree differs in from its
+// base, with diffs (GET …/changes). The Code tab shows for an in_progress card, and for any
+// other card once a probe finds a coder run or a worktree for it. A task keeps its own
+// drawer (openTask) and has no tabs. CARD_TAB remembers each card's last tab, so a poll's
+// re-render, or closing and reopening, lands on the same view.
+const CARD_TAB = {};                     // fid → "card" | "code"
+const CODE_SEEN = {};                    // fid → true once a run or a worktree was found
+let CARD_FID = null, CARD_DETAIL = null, CARD_LAST = "";
+const CARD_DETAIL_SEQ = {};
+// Changes: polled slower than the monitor, and only while the Code tab is showing.
+const CHG_POLL_MS = 10000;
+let CHG_TIMER = null, CHG_DATA = null, CHG_SEQ = 0;
+const CHG_UI = {};                       // "<tree>:<path>" → true (file expanded)
+function hasCode(fid){
+  const f = featureById(fid);
+  return !!(f && !isTask(f) && (f.state === "in_progress" || CODE_SEEN[fid]));
+}
+// Point the drawer at card `fid` on `tab`: a different card drops the previous card's
+// cached detail, diff and toggles, and fetches its own detail.
+function enterCard(fid, tab){
+  if (CARD_FID !== fid){
+    CARD_DETAIL = null; CHG_DATA = null; CARD_LAST = "";
+    for (const k in CHG_UI) delete CHG_UI[k];
+  }
+  CARD_FID = fid;
+  CARD_TAB[fid] = tab;
+  const f = featureById(fid);
+  if (f && f.state === "in_progress") CODE_SEEN[fid] = true;    // keep the tab once it moves on
+  $("drawer").classList.add("wide");
+  paintCardHeader();
+  renderTabs();
+  if (!CARD_DETAIL || CARD_DETAIL.fid !== fid) fetchCardDetail(fid);
+}
+// `keepWidth`: the drawer is closing — it slides out at the width it was shown at.
+function leaveCard(keepWidth){
+  stopChanges();
+  CARD_FID = null; CARD_DETAIL = null; CARD_LAST = "";
+  if (!keepWidth) $("drawer").classList.remove("wide");
+  renderTabs();
+}
+// Open card `fid`, on `tab` when given, else its remembered tab, else Code for a card that
+// is building and Card for the rest.
+function openCard(fid, tab){
+  const f = featureById(fid);
+  if (f && isTask(f)) { openTask(fid); return; }
+  const want = tab || CARD_TAB[fid] || (f && f.state === "in_progress" ? "code" : "card");
+  if (want === "code" && hasCode(fid)) { openMonitor(fid); return; }
+  MON_FID = null; TASK_FID = null;                               // the Card tab polls nothing
+  if (MON_TIMER) { clearInterval(MON_TIMER); MON_TIMER = null; }
+  stopChanges();
+  enterCard(fid, "card");
+  $("drawer").classList.add("open"); $("scrim").classList.add("open");
+  document.body.classList.add("drawer-open");
+  syncCardDrawer(true);
+  if (!hasCode(fid)) probeCode(fid);
+}
+function paintCardHeader(){
+  const f = featureById(CARD_FID);
+  const dt = $("drawer-title");
+  const dh = esc(CARD_FID || "")+(f && f.title ? '<span class="dt-name">'+inlineCode(f.title)+'</span>' : '');
+  if (dt.innerHTML !== dh) dt.innerHTML = dh;
+}
+const TAB_LABEL = {card: "Card", code: "Code"};
+function renderTabs(){
+  const el = $("drawer-tabs"), body = $("drawer-body");
+  if (!CARD_FID){
+    el.hidden = true; el.innerHTML = "";
+    body.removeAttribute("role"); body.removeAttribute("aria-labelledby");
+    return;
+  }
+  const tabs = hasCode(CARD_FID) ? ["card", "code"] : ["card"];
+  const cur = tabs.includes(CARD_TAB[CARD_FID]) ? CARD_TAB[CARD_FID] : "card";
+  const html = tabs.map(t => '<button type="button" role="tab" id="dtab-'+t+'" class="pl-tab'+(t === cur ? " pl-tab--active" : "")
+    + '" aria-selected="'+(t === cur)+'" aria-controls="drawer-body" tabindex="'+(t === cur ? 0 : -1)+'" data-drawer-tab="'+t+'">'
+    + TAB_LABEL[t]+'</button>').join("");
+  if (el.innerHTML !== html) el.innerHTML = html;
+  el.hidden = false;
+  body.setAttribute("role", "tabpanel");
+  body.setAttribute("aria-labelledby", "dtab-"+cur);
+}
+function selectTab(tab, focus){
+  if (!CARD_FID || tab === CARD_TAB[CARD_FID]) { if (focus) $("dtab-"+tab).focus(); return; }
+  openCard(CARD_FID, tab);
+  if (focus && $("dtab-"+tab)) $("dtab-"+tab).focus();
+}
+$("drawer-tabs").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-drawer-tab]");
+  if (t) selectTab(t.getAttribute("data-drawer-tab"), false);
+});
+// Arrow keys move between tabs (and select, the automatic-activation tablist pattern).
+$("drawer-tabs").addEventListener("keydown", (e) => {
+  const tabs = [...$("drawer-tabs").querySelectorAll("[data-drawer-tab]")].map(b => b.getAttribute("data-drawer-tab"));
+  const i = tabs.indexOf(CARD_FID ? CARD_TAB[CARD_FID] : "");
+  const next = {ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1}[e.key];
+  if (next === undefined || !tabs.length) return;
+  e.preventDefault();
+  selectTab(tabs[(next + tabs.length) % tabs.length], true);
+});
+// The single-card read (GET /features/{fid}) behind the Card tab: the /features list is a
+// preview (#399). Re-fetched when the list shows the card changed. Fenced like
+// fetchTaskDetail: a late answer for a card the drawer has left is dropped.
+async function fetchCardDetail(fid){
+  const seq = CARD_DETAIL_SEQ[fid] = (CARD_DETAIL_SEQ[fid] || 0) + 1;
+  try {
+    const f = await api(FEAT + encodeURIComponent(fid));
+    if (CARD_FID !== fid || seq !== CARD_DETAIL_SEQ[fid]) return;
+    CARD_DETAIL = {fid: fid, feature: f};
+  } catch (e) {
+    if (CARD_FID !== fid || seq !== CARD_DETAIL_SEQ[fid]) return;
+    CARD_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};
+  }
+  syncCardDrawer();
+}
+// Render the open card's Card tab from the live FEATURES plus its single-card read. A
+// no-op when no card is open or the Code tab is showing (its polls paint it), and when the
+// markup is unchanged (a poll keeps the reader's scroll and selection).
+function syncCardDrawer(force){
+  if (!CARD_FID) return;
+  paintCardHeader();
+  renderTabs();
+  if (CARD_TAB[CARD_FID] === "code" && hasCode(CARD_FID)) return;
+  const f = featureById(CARD_FID);
+  let html;
+  if (!f) html = '<div class="pl-empty">Card not found.</div>';
+  else {
+    const d = CARD_DETAIL && CARD_DETAIL.fid === CARD_FID ? CARD_DETAIL : null;
+    if (d && d.feature && d.feature.updated_at && f.updated_at && d.feature.updated_at !== f.updated_at) fetchCardDetail(CARD_FID);
+    const merged = d && d.feature ? {...f, ...d.feature, state: f.state, next_action: f.next_action, next_action_hint: f.next_action_hint} : f;
+    html = (d && d.error ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load card detail: " + d.error)+'</div>' : "")
+      + cardDetail(merged);
+  }
+  if (!force && html === CARD_LAST) return;
+  CARD_LAST = html;
+  const body = $("drawer-body"), top = body.scrollTop;
+  body.innerHTML = html;
+  body.scrollTop = top;
+}
+// Labels the board writes for its own bookkeeping (shas, counters, the project stamp).
+const INTERNAL_LABEL = /^(project|gens|diff|merged-verified|review-clean-sha|verified):/;
+function cardDetail(f){
+  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
+  const fact = (k, v) => v === "" || v == null ? "" : '<div class="cf"><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>';
+  const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts) || 0;
+  let h = '<div class="cflags">'+flags({...f, difficulty: ""})+'</div>'          // difficulty is a fact below
+    + nextActionDetail(f)                                                       // the chip's full status
+    + '<dl class="cfacts">'
+    + fact("state", '<span class="pl-dot-row"><span class="pl-dot '+(DOT_VARIANT[f.state]||"")+'"></span><span class="pl-dot-row__label">'+esc(STATE_LABEL[f.state] || f.state || "")+'</span></span>')
+    + fact("priority", f.priority == null ? "" : "P"+esc(String(f.priority)))
+    + fact("difficulty", f.difficulty ? esc(f.difficulty) : "")
+    + fact("project", f.project ? esc(f.project) : "")
+    + fact("base", f.base_branch ? esc(f.base_branch) : "")
+    + fact("runs", (f.gens_spent || tries) ? esc((f.gens_spent || 0) + (f.gens_spent === 1 ? " run" : " runs") + (tries ? " · " + tries + (tries === 1 ? " attempt" : " attempts") : "")) : "")
+    + fact("PR", f.pr_url ? '<a href="'+esc(safeHref(f.pr_url))+'" target="_blank" rel="noopener noreferrer">'+esc(String(f.pr_url).replace(/^https?:\/\/github\.com\/[^/]+\/([^/]+)\/pull\/(\d+).*$/, "$1#$2"))+' ↗</a>' : "")
+    + fact("issue", f.source_issue ? esc(f.source_issue) : "")
+    + '</dl>';
+  if (f.blocked && f.blocked_reason) h += '<div class="pl-callout pl-callout--error cblock"><b>Blocked</b> '+esc(f.blocked_reason)+'</div>';
+  const deps = f.depends_on || [], open = new Set(f.open_depends_on || []);
+  if (deps.length) h += '<div class="tdlbl">depends on</div><ul class="cdeps">'
+    + deps.map(d => '<li><span class="pl-badge'+(open.has(d) ? " pl-badge--warning" : " pl-badge--success")+'">'+(open.has(d) ? "open" : "done")+'</span>'
+      + '<span class="id">'+esc(d)+'</span>'+(featureById(d) ? ' '+inlineCode(featureById(d).title || "") : "")+'</li>').join("")+'</ul>';
+  const gates = Array.isArray(f.gates) && f.gates.length ? f.gates : (f.waits_for || []).map(s => ({spec: s}));
+  if (gates.length) h += '<div class="tdlbl">waits for</div><ul class="cdeps">'
+    + gates.map(g => '<li><span class="pl-badge'+(g.met ? " pl-badge--success" : " pl-badge--warning")+'">'+(g.met ? "met" : "waiting")+'</span>'
+      + '<span title="'+esc(g.detail || "")+'">'+esc(g.spec || "")+'</span></li>').join("")+'</ul>';
+  const labels = (f.labels || []).filter(l => !INTERNAL_LABEL.test(l));
+  if (labels.length) h += '<div class="tdlbl">labels</div><div class="clabels">'+labels.map(l => '<span class="pl-badge">'+esc(l)+'</span>').join("")+'</div>';
+  h += '<div class="tdlbl">spec</div>' + prose(f.spec)
+    + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
+  h += taskRequirements(f);
+  const planned = f.files_to_modify || [];
+  if (planned.length) h += '<div class="tdlbl">planned files</div><ul class="cfiles">'+planned.map(p => '<li><code>'+esc(p)+'</code></li>').join("")+'</ul>';
+  return h;
+}
+// One /changes read for a card not building, so a card with a run or a worktree still on
+// disk (in review, blocked mid-fix) shows its Code tab.
+async function probeCode(fid){
+  try {
+    const [p, c] = await Promise.all([
+      api(FEAT + encodeURIComponent(fid) + "/progress").catch(() => null),
+      api(FEAT + encodeURIComponent(fid) + "/changes").catch(() => null),
+    ]);
+    if (CARD_FID !== fid) return;
+    if (c) CHG_DATA = {fid: fid, data: c};
+    if ((p && (p.gens || []).length) || (c && (c.worktrees || []).length)){ CODE_SEEN[fid] = true; renderTabs(); }
+  } catch (e) { /* the Card tab stands on its own */ }
+}
+function startChanges(fid){
+  stopChanges();
+  pollChanges(fid);
+  CHG_TIMER = setInterval(() => pollChanges(fid), CHG_POLL_MS);
+}
+function stopChanges(){ if (CHG_TIMER) { clearInterval(CHG_TIMER); CHG_TIMER = null; } }
+async function pollChanges(fid){
+  if (document.hidden || MON_FID !== fid) return;
+  const seq = ++CHG_SEQ;
+  let next;
+  try { next = {fid: fid, data: await api(FEAT + encodeURIComponent(fid) + "/changes")}; }
+  catch (e) { next = {fid: fid, error: "" + ((e && e.message) || e)}; }
+  if (MON_FID !== fid || seq !== CHG_SEQ) return;
+  const same = CHG_DATA && JSON.stringify(CHG_DATA) === JSON.stringify(next);
+  CHG_DATA = next;
+  if (!same) renderMonitor(MON_DATA || {gens: []}, true);
+}
+const DIFF_STATUS = {A: "added", M: "modified", D: "deleted", R: "renamed"};
+function diffBody(text){
+  return String(text || "").replace(/\n$/, "").split("\n").map(l => {
+    const c = l[0] === "+" ? "dl-a" : l[0] === "-" ? "dl-d" : l.startsWith("@@") ? "dl-h" : l[0] === "\\" ? "dl-n" : "";
+    return '<span class="dl'+(c ? " "+c : "")+'">'+(esc(l) || " ")+'</span>';
+  }).join("");
+}
+function changeFile(tree, f){
+  const k = tree + ":" + f.path, open = !!CHG_UI[k];
+  const counts = f.redacted ? '<span class="cnt">hidden</span>'
+    : f.binary ? '<span class="cnt">binary</span>'
+    : '<span class="cnt"><span class="ca">+'+(f.additions ?? "?")+'</span> <span class="cd">−'+(f.deletions ?? "?")+'</span></span>';
+  const name = (f.old_path ? esc(f.old_path)+' → ' : '') + esc(f.path);
+  let h = '<li class="cfile'+(open ? " open" : "")+'"><button type="button" class="cfile-h" data-chg-toggle="'+esc(k)+'" aria-expanded="'+open+'">'
+    + '<span class="cst cst-'+esc(f.status)+'" title="'+esc(DIFF_STATUS[f.status] || f.status)+'">'+esc(f.status)+'</span>'
+    + '<span class="cpath" title="'+esc((f.old_path ? f.old_path+" → " : "")+f.path)+'"><bdi>'+name+'</bdi></span>'+counts
+    + '<span class="chev" aria-hidden="true"></span></button>';
+  if (open){
+    if (f.redacted) h += '<div class="cnote">Content hidden: '+esc(f.redacted_reason || "looks like a secret")+'.</div>';
+    else if (f.binary) h += '<div class="cnote">Binary file — no text diff.</div>';
+    else if (!f.diff) h += '<div class="cnote">'+(f.truncated ? "Too large to show here." : "No text changes.")+'</div>';
+    else h += '<pre class="diff">'+diffBody(f.diff)+'</pre>'+(f.truncated ? '<div class="cnote">Diff cut short — the rest is in the worktree.</div>' : "");
+  }
+  return h + '</li>';
+}
+// The Changes section the Code tab shows under the coder monitor, from CHG_DATA.
+function changesSection(){
+  const f = featureById(CARD_FID) || {};
+  const refresh = '<button type="button" class="more" data-chg-refresh="1">Refresh</button>';
+  const wrap = (meta, body) => '<div class="gen gen--changes"><section class="sec sec-changes"><div class="sec-h chg-h"><span class="sec-l">Changes</span>'
+    + (meta ? '<span class="sec-m">'+meta+'</span>' : "")+refresh+'</div><div class="sec-b">'+body+'</div></section></div>';
+  const d = CHG_DATA && CHG_DATA.fid === CARD_FID ? CHG_DATA : null;
+  if (!d) return wrap("", '<div class="pl-empty">Loading changes…</div>');
+  if (d.error) return wrap("", '<div class="pl-callout pl-callout--error">'+esc("Couldn't read the changes: " + d.error)+'</div>');
+  const trees = (d.data && d.data.worktrees) || [];
+  if (!trees.length) return wrap("", '<div class="pl-empty">No local worktree'
+    + (f.pr_url ? ' — see the <a href="'+esc(safeHref(f.pr_url))+'" target="_blank" rel="noopener noreferrer">PR ↗</a>' : "")+'</div>');
+  return trees.map(t => {
+    const files = t.files || [];
+    const meta = esc(t.branch || "")+(t.base ? ' vs '+esc(t.base) : "")+' · '+(t.file_count ?? files.length)+(files.length === 1 ? " file" : " files")
+      + ' <span class="ca">+'+(t.additions || 0)+'</span> <span class="cd">−'+(t.deletions || 0)+'</span>';
+    if (t.error) return wrap(meta, '<div class="pl-callout pl-callout--error">'+esc(t.error)+'</div>');
+    const body = files.length
+      ? '<ul class="cfl">'+files.map(x => changeFile(t.path || t.branch || "", x)).join("")+'</ul>'
+        + (t.files_truncated ? '<div class="cnote">Showing the first '+files.length+' of '+t.file_count+' files.</div>' : "")
+      : '<div class="pl-empty">No changes yet.</div>';
+    return wrap(meta, body);
+  }).join("");
+}
+$("drawer-body").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-chg-toggle]");
+  if (t && MON_FID){ const k = t.getAttribute("data-chg-toggle"); CHG_UI[k] = !CHG_UI[k]; renderMonitor(MON_DATA || {gens: []}, true); return; }
+  if (e.target.closest("[data-chg-refresh]") && MON_FID) pollChanges(MON_FID);
+});
 // Delegate clicks: a [data-mon] element (coding in_progress card/row) opens the monitor,
 // a [data-task] element (any task card/row) opens its detail drawer; the task action
 // buttons (#217) are delegated the same way, keyed on data-* verb.
@@ -1769,10 +2036,13 @@ document.addEventListener("click", (e) => {
   const mb = e.target.closest("[data-card-menu]");
   if (mb) { if (MENU_FOR === mb.getAttribute("data-card-menu")) closeMenu(true); else openMenu(mb.getAttribute("data-card-menu"), mb); return; }
   if (e.target.closest("#move-menu")) return;
+  if (e.target.closest("a[href]")) return;                       // a card's PR link just opens the PR
   const el = e.target.closest("[data-mon]");
   if (el) { openMonitor(el.getAttribute("data-mon")); return; }
   const tel = e.target.closest("[data-task]");
   if (tel) { openTask(tel.getAttribute("data-task")); return; }
+  const cel = e.target.closest("[data-card]");
+  if (cel) { openCard(cel.getAttribute("data-card")); return; }
   const act = e.target.closest("[data-deliver],[data-approve],[data-reject],[data-reject-toggle]");
   if (!act) return;
   if (act.hasAttribute("data-deliver")) submitDeliver(act.getAttribute("data-deliver"));
