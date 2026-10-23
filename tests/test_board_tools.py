@@ -485,6 +485,8 @@ _MINIMAL_ARGS = {
 # or their own refusal (board_register_project works the host config seam). They are held to
 # the NEVER-RAISE half of the contract.
 _NO_STORE_ARGS = {
+    "board_routing_get": {},
+    "board_routing_set": {"exclusive": []},
     "board_dispatch": {},
     "board_projects": {},  # a config read, no store
     "board_card_form": {"title_hint": "Add undo"},  # a config read + a component, no store

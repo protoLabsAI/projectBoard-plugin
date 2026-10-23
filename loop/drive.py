@@ -230,7 +230,7 @@ class DriveMixin:
         )
         # The RUNNING loop's config, in a process-stable slot: after a reload the
         # routers see the new config while this loop keeps its construction-time
-        # `coders`/`repo`/…; /status compares the two and says "restart to apply".
+        # `repo`/`base_branch`/…; /status compares the two and says "restart to apply".
         setup_check.publish_loop_snapshot(self.cfg)
         log.info(
             "[project_board] loop started (coder=%s reviewer=%s every %ss, max_concurrent=%d, "
@@ -282,25 +282,60 @@ class DriveMixin:
         # candidate first, then atomically replace both the loop's map and the shared
         # board's map. In-flight drives have already resolved their checkout; new
         # claims and every subsequent dispatch use the replacement.
-        if "projects" in section or "default_project" in section:
+        # The host hands the WHOLE saved section, and neither `coders` nor `routing` has a
+        # manifest default to fill a gap — so from the host, a policy key that is missing
+        # was deleted (turning strict routing off is deleting `routing:`). A plain-dict
+        # reload stays a partial update: a missing key leaves the knob alone.
+        plugin_config = getattr(new_config, "plugin_config", None)
+        complete = isinstance(plugin_config, dict) and isinstance(plugin_config.get("project_board"), dict)
+        cleared = tuple(k for k in ("coders", "routing") if complete and k not in section and k in self.cfg)
+        if cleared or any(key in section for key in ("projects", "default_project", "coders", "routing")):
             candidate = dict(self.cfg)
             if "projects" in section:
                 candidate["projects"] = section.get("projects")
             if "default_project" in section:
                 candidate["default_project"] = section.get("default_project")
+            for key in ("coders", "routing"):
+                if key in section:
+                    candidate[key] = section[key]
+                elif key in cleared:
+                    candidate.pop(key)
             try:
+                from ..projects import normalize_tier_config
+                from ..routing import validate_routing
+
+                candidate = normalize_tier_config(candidate)
+                # Validate changed policy fields only. Unchanged legacy policy must not
+                # prevent a projects/default_project save from reaching the running loop.
+                # Delegate availability remains a write-time check: dispatch already
+                # skips disabled delegates, allowing operators to repair one field at a time.
+                candidate = validate_routing(candidate, resolve=False, previous=self.cfg)
                 projects = resolve_projects(candidate)
                 default = resolve_default_project(candidate)
-            except (TypeError, ValueError) as exc:
+            except Exception as exc:  # noqa: BLE001 — retain the last valid policy
                 log.warning("[project_board] reload: project routing is malformed — keeping current map: %s", exc)
             else:
+                for key in ("coders", "routing"):
+                    if (key in section or key in cleared) and self.cfg.get(key) != candidate.get(key):
+                        changed[key] = (self.cfg.get(key), candidate.get(key))
+                        if key in candidate:
+                            self.cfg[key] = candidate[key]
+                        else:
+                            self.cfg.pop(key, None)
+                self.coders = {k: rung_delegates(v) for k, v in (candidate.get("coders") or {}).items()}
+                # Keep the escalation gate in step with the live ladder: `escalation_on` is
+                # otherwise set once at construction (core.py), so a live single-coder↔ladder
+                # change would leave `_drive_captured`'s gate stale — a new ladder never
+                # climbing, a removed one still escalating. The next claim reads the fresh
+                # value; in-flight drives captured theirs at drive start.
+                self.escalation_on = escalation_enabled(candidate)
                 old_projects = self._projects
                 old_default = self._default_project
                 if projects != old_projects or default != old_default:
                     self._projects = projects
                     self._default_project = default
                     if "projects" in section:
-                        self.cfg["projects"] = section.get("projects")
+                        self.cfg["projects"] = candidate.get("projects")
                     if "default_project" in section:
                         self.cfg["default_project"] = section.get("default_project")
                     self._store_kw["projects"] = projects

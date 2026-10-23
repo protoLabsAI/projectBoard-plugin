@@ -200,7 +200,7 @@ def test_reload_flips_auto_merge_and_rejects_garbage():
 
 def test_reload_only_touches_live_knobs():
     loop = BoardLoop({"coder_timeout_s": 1800, "loop_interval_s": 30, "coders": {"smart": "a"}})
-    assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1, "coders": {"smart": "b"}}) == {}
+    assert loop.reload({"coder_timeout_s": 5, "loop_interval_s": 1}) == {}
     assert (
         loop.coder_timeout == 1800 and loop.interval == 30 and loop.coders == {"standard": ["a"]}
     )  # a string rung normalises to a one-element list (#362)
