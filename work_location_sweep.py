@@ -34,13 +34,13 @@ def authorized(path, roots):
     return path.is_absolute() and any(path.resolve().is_relative_to(root) for root in roots)
 
 
-def git(path, *args, deadline):
+def git(path, *args, deadline, alternate_objects=None, timeout=2.0):
     """REAL seam: bare-origin/clone coverage in test_work_location_sweep.py.
 
     No shell, optional locks, hooks, credential programs or custom transports.
     Kill the process group on timeout; bound captured output even for large dirt.
     """
-    remaining = min(2.0, deadline - time.monotonic())
+    remaining = min(timeout, deadline - time.monotonic())
     if remaining <= 0:
         raise TimeoutError("location probe budget exhausted")
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -52,6 +52,10 @@ def git(path, *args, deadline):
         GIT_CONFIG_NOSYSTEM="1",
         GIT_CONFIG_GLOBAL=os.devnull,
     )
+    if alternate_objects is not None:
+        # Capture supplies an independently authorized object store, while transport
+        # runs in the trusted project checkout (never with an external repo's config).
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = json.dumps(str(alternate_objects), ensure_ascii=False)
     argv = [
         "git",
         "-c",
@@ -85,7 +89,7 @@ def git(path, *args, deadline):
         return data.decode("utf-8", "replace").strip()
 
 
-def probe(entry, roots, deadline):
+def probe(entry, roots, deadline, *, local_only=False):
     facts = {"status": "unknown", "pushed": None}
     try:
         path = Path(entry["path"])
@@ -127,6 +131,13 @@ def probe(entry, roots, deadline):
         facts["sha"] = run("rev-parse", "--verify", "HEAD")
         facts["branch"] = run("symbolic-ref", "--quiet", "--short", "HEAD")
         facts["dirty"] = bool(run("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all"))
+        if local_only:
+            facts.update(
+                status="verified",
+                git_dir=str(metadata.resolve()),
+                common_dir=str((metadata / target).resolve()) if common.is_file() else str(metadata.resolve()),
+            )
+            return facts
         branch = facts["branch"]
         remote = run("config", "--get", f"branch.{branch}.remote")
         ref = run("config", "--get", f"branch.{branch}.merge")
@@ -261,6 +272,10 @@ class Sweep:
         # outside approved roots, non-HTTPS upstream, timeout) leaves pushed None and retains
         # the recorded verdict; only a verified probe overwrites it with a fresh True/False.
         pushed = facts["pushed"] if facts["pushed"] is not None else entry.get("pushed")
+        # Capture's exact publication recovery step remains available after later
+        # read-only checks; an unsuccessful sweep must not erase that instruction.
+        if pushed is not True and old.get("next_step"):
+            check["next_step"] = old["next_step"]
         state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
         state.update(pushed=pushed, last_check=check)
         # Identity remains the recorded identity; observed identity lives in last_check.

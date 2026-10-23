@@ -933,6 +933,39 @@ async def dispatch_coder_tapped(
     new_dispatch: bool = False,
     _dispatch_tapped=None,
 ) -> str:
+    # The final drain precedes solve's candidate cleanup and drive hold/error handling.
+    from . import work_location_capture
+
+    try:
+        return await _dispatch_coder_tapped(
+            coder,
+            worktree_path,
+            prompt,
+            fid=fid,
+            gen=gen,
+            tier=tier,
+            timeout=timeout,
+            env_passthrough=env_passthrough,
+            new_dispatch=new_dispatch,
+            _dispatch_tapped=_dispatch_tapped,
+        )
+    finally:
+        await work_location_capture.observe()
+
+
+async def _dispatch_coder_tapped(
+    coder,
+    worktree_path: str,
+    prompt: str,
+    *,
+    fid: str | None,
+    gen: int,
+    tier: str = "",
+    timeout: float | None = None,
+    env_passthrough: Iterable[str] = (),
+    new_dispatch: bool = False,
+    _dispatch_tapped=None,
+) -> str:
     """Dispatch the ACP coder into ``worktree_path`` like ``worktree.dispatch_coder``
     — same fresh-both session discipline, same guaranteed subprocess teardown — but
     with the coder's thought/tool/answer/usage/plan/stop callbacks wired into this
@@ -997,6 +1030,9 @@ async def dispatch_coder_tapped(
         progress_answer(fid, gen, delta)
 
     async def _tool_cb(event):
+        from . import work_location_capture
+
+        await work_location_capture.observe(event, worktree_path)
         progress_tool(fid, gen, event)
 
     async def _plan_cb(entries):
@@ -1153,6 +1189,9 @@ async def _dispatch_coder_tapped_legacy(
         progress_answer(fid, gen, delta)
 
     async def _tool_cb(event):
+        from . import work_location_capture
+
+        await work_location_capture.observe(event, worktree_path)
         progress_tool(fid, gen, event)
         # usage_update isn't forwarded as a callback — the client folds it into
         # last_usage as it goes, so sample it on each tool event to keep totals live.

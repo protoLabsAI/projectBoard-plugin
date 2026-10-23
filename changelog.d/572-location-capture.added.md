@@ -1,0 +1,1 @@
+Capture structured external work locations during coding dispatches and on interrupted results. Persist exact recovery identities before attempting authorized, non-force WIP publication, and verify remote reachability before marking work pushed.

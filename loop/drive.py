@@ -14,7 +14,7 @@ import inspect
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
-from .. import host_friction, work_location_sweep
+from .. import host_friction, work_location_sweep, work_location_capture
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
@@ -1559,7 +1559,7 @@ class DriveMixin:
         host itself), so the capability-escalation edge collapses to a terminal block."""
         store = self._store()
         fid = feature["id"]
-        prompt = self._build_task_prompt(feature)
+        prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_self(invoke, prompt, session_id, timeout=self.coder_timeout or None)
         except asyncio.CancelledError:
@@ -1588,7 +1588,7 @@ class DriveMixin:
         coder path's terminal block."""
         store = self._store()
         fid = feature["id"]
-        prompt = self._build_task_prompt(feature)
+        prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_task(delegate, prompt, timeout=self.coder_timeout or None)
         except asyncio.CancelledError:
@@ -1722,6 +1722,14 @@ class DriveMixin:
             await fut
 
     async def _drive(self, feature: dict):
+        capture = work_location_capture.Capture(self._store(), feature["id"], self._repo_for(feature))
+        token = work_location_capture.active.set(capture)
+        try:
+            return await self._drive_captured(feature)
+        finally:
+            work_location_capture.active.reset(token)
+
+    async def _drive_captured(self, feature: dict):
         """Drive one feature ready→in_review (or →blocked). `done` is set later by
         the merge webhook. With per-tier coders configured, a *capability* failure
         (coder errored / produced no diff) climbs the ladder; with a single coder
@@ -1796,6 +1804,7 @@ class DriveMixin:
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                prompt += work_location_capture.reporting_instructions()
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
                 # (below) or round-robin across dispatches, never on a capability failure —
