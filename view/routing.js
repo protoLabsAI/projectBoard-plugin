@@ -67,7 +67,7 @@ function routingCoders(body){
   const msg = ROUTING_MSG
     ? '<div class="pl-callout pl-callout--'+(ROUTING_MSG.kind==="error"?"error":ROUTING_MSG.kind==="ok"?"success":"info")+' r-msg">'+esc(ROUTING_MSG.text)+'</div>'
     : "";
-  return '<section class="r-sec"><h2>Coders</h2>'
+  return '<section class="r-sec"><div class="r-head"><h2>Coders</h2><span class="r-live">Switches apply live, no Save needed.</span></div>'
     + '<p class="r-summary">'+esc(routingSummary(dels, exclusive))+'</p>'
     + '<div class="r-coders">'+dels.map(d => coderCard(d, allowed.has(d.name), allowed.size === 1)).join("")+'</div>'
     + msg
