@@ -1943,13 +1943,12 @@ class DriveMixin:
                 # Read live each attempt so a B3 reload of `routing.headroom` /
                 # `routing.prefer_sibling_at` applies without a restart.
                 headroom_on = self._headroom_on_for(feature)
+                prefer_at = self._prefer_sibling_at_for(feature) if headroom_on else None
                 # The host usage store may hold a threading lock and poll HTTPS.
                 # Keep that blocking work off the event loop shared by card drives.
                 rung_usage = await asyncio.to_thread(self._rung_usage, siblings, on=headroom_on)
                 if headroom_on:
-                    preferred = prefer_headroom_sibling(
-                        siblings, sib, spent_here, rung_usage, prefer_at=self._prefer_sibling_at_for(feature)
-                    )
+                    preferred = prefer_headroom_sibling(siblings, sib, spent_here, rung_usage, prefer_at=prefer_at)
                 else:
                     preferred = prefer_live_sibling(siblings, sib, spent_here)
                 if preferred != sib:
@@ -1964,7 +1963,7 @@ class DriveMixin:
                     sib = preferred
                 # #581: the LOWEST-precedence reorder — a usage_policy rule keeps an account
                 # under its target % by preferring a specific delegate, applied AFTER the B5
-                # headroom pick so headroom's blocked/down verdicts stand. `siblings` is the
+                # headroom pick with its threshold so policy cannot undo that steer. `siblings` is the
                 # exclusive-filtered live rung and the policy only reorders within it, so it
                 # can never leave the B2 set. Read live each attempt (B3 reload), and only
                 # poll usage when a rule is actually configured — no policy ⇒ byte-identical
@@ -1973,7 +1972,7 @@ class DriveMixin:
                 if policy:
                     policy_usage = await asyncio.to_thread(self._policy_usage, siblings, policy, dict(rung_usage))
                     policy_sib, policy_reason = apply_usage_policy(
-                        siblings, sib, tier, policy_usage, policy, spent=spent_here
+                        siblings, sib, tier, policy_usage, policy, spent=spent_here, prefer_at=prefer_at
                     )
                     if (
                         policy_reason is not None

@@ -305,3 +305,71 @@ def test_usage_policy_reloads_live():
         }
     )
     assert loop._usage_policy_for(feature) == [new_rule]
+
+
+@pytest.mark.parametrize(
+    ("prefer_at", "headroom", "fires"),
+    [
+        (90, 10, False),
+        (90, 5, False),
+        (90, 11, True),
+        (70, 30, False),
+        (70, 31, True),
+        (None, 5, True),
+        (90, None, True),
+    ],
+)
+def test_policy_respects_headroom_threshold(prefer_at, headroom, fires):
+    usage = {"anthropic-oauth": _snap(25), "sonnet": _snap(80), "codex": _snap(headroom)}
+    decision = loop_mod.policy_decision(
+        ["sonnet", "codex"],
+        0,
+        "standard",
+        usage,
+        [_RULE],
+        prefer_at=prefer_at,
+    )
+    assert decision["index"] == (1 if fires else 0)
+    assert (decision["rule"] is _RULE) == fires
+    assert apply_usage_policy(
+        ["sonnet", "codex"],
+        0,
+        "standard",
+        usage,
+        [_RULE],
+        prefer_at=prefer_at,
+    ) == (decision["index"], decision["reason"])
+
+
+def test_policy_skips_low_headroom_rule_and_tries_next():
+    usage = {"anthropic-oauth": _snap(25), "sonnet": _snap(80), "codex": _snap(10), "opus": _snap(60)}
+    second = {**_RULE, "prefer": "opus"}
+    decision = loop_mod.policy_decision(["sonnet", "codex", "opus"], 0, "standard", usage, [_RULE, second])
+    assert decision["index"] == 2
+    assert decision["rule"] is second
+
+
+@pytest.mark.parametrize(
+    ("routing", "headroom", "expected"),
+    [
+        ({}, 10, "sonnet"),
+        ({"prefer_sibling_at": 70}, 30, "sonnet"),
+        ({"prefer_sibling_at": 70}, 31, "codex"),
+        ({"headroom": False}, 10, "codex"),
+    ],
+)
+async def test_drive_policy_cannot_undo_headroom_pick(monkeypatch, routing, headroom, expected):
+    loop_mod._PROVIDER_DOWN.clear()
+    seen = []
+
+    async def dispatch(coder, wt, prompt, **kw):
+        seen.append(coder)
+        raise worktree.NoChangesError("coder produced no commits")
+
+    cfg = {**_LADDER_POLICY, "routing": {"usage_policy": [_RULE], **routing}}
+    # Start on the policy target: headroom must move off it at the live threshold,
+    # and the policy must not put it back even though it remains usable.
+    loop, _ = _rung_env(monkeypatch, dispatch, cfg=cfg, cursor=1)
+    _fake_sdk(monkeypatch, {"anthropic-oauth": _snap(25), "sonnet": _snap(80), "codex": _snap(headroom)})
+    await loop._drive({"id": "bd-pol-headroom", "title": "t", "spec": "s"})
+    assert seen[0] == expected

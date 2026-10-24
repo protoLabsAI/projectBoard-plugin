@@ -1405,8 +1405,8 @@ def prefer_headroom_sibling(
 # (``usable: False`` with a future reset). Like the headroom functions it only ever
 # REORDERS within the rung; it never adds a delegate the rung lacks, never overrides
 # exclusive/gates/down marks, and — D4 — an UNKNOWN account snapshot leaves the pick
-# byte-for-byte as B5 left it. Applied AFTER headroom, so headroom's blocked/down verdicts
-# (the bars above it in precedence) are honoured before policy reorders.
+# byte-for-byte as B5 left it. Applied AFTER headroom, with the same used-% threshold
+# so policy cannot steer back onto a sibling headroom just left.
 #
 # Kept PURE and split from the drive, like ``rotation_target`` / ``prefer_headroom_sibling``,
 # so the policy is testable on a snapshot dict — and so B7b's effective-routes view can call
@@ -1432,7 +1432,7 @@ def _account_used_pct(snap) -> float | None:
     return None if room is None else 100 - room
 
 
-def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=None):
+def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=None, prefer_at=90):
     """Which sibling the usage_policy steers this rung's next dispatch onto, and why
     (#581, ADR 0122 D8). PURE — the drive's ``apply_usage_policy`` and B7b's effective-routes
     view both call this, so the display can never drift from the dispatch decision.
@@ -1440,7 +1440,9 @@ def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=N
     ``usage`` maps a name (a rule's ``account`` AND each rung sibling) to its
     ``graph.sdk.provider_usage`` snapshot (or None when unknown). ``spent`` is the set of
     sibling names that already failed this card at this rung; ``now`` overrides wall time
-    for the reset comparisons (tests).
+    for the reset comparisons (tests). ``prefer_at`` is the live headroom used-%
+    threshold; pass None when headroom routing is disabled. A known preferred sibling
+    at/above that threshold cannot be selected by policy; unknown headroom is unchanged.
 
     Returns a dict: ``index`` — the sibling index to open on (== ``current`` when no rule
     fires); ``rule`` — the rule that fired, or None; ``reason`` — a one-line explanation, or
@@ -1449,7 +1451,8 @@ def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=N
 
     A rule fires when ALL hold: its (canonical) tier set contains ``tier`` (or it names no
     tiers); its account's snapshot is KNOWN and used-% ≥ ``keep_under``; and ``prefer`` is
-    in ``siblings`` and eligible — not spent, not down-marked, not blocked. The FIRST rule
+    in ``siblings`` and eligible — not spent, not down-marked, not blocked, and below the
+    enabled headroom threshold when its usage is known. The FIRST rule
     in list order that fully fires wins; everything else leaves ``current`` in place. A
     ``keep_under`` outside 1..100 or an otherwise malformed rule is skipped defensively (the
     config seam refuses them up front; this stays safe if one slips through)."""
@@ -1485,6 +1488,9 @@ def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=N
         # same bars headroom honours, and the precedence levels above policy.
         if prefer in spent or provider_is_down(prefer, now=now) or _headroom_blocked(snaps.get(prefer), now_wall):
             continue
+        prefer_used = _account_used_pct(snaps.get(prefer))
+        if prefer_at is not None and prefer_used is not None and prefer_used >= prefer_at:
+            continue
         reason = (
             f"usage_policy: {account} at {used:.0f}% used ≥ keep_under {keep_under}% "
             f"→ prefer {prefer} for {tier_c or 'default'}"
@@ -1500,13 +1506,13 @@ def policy_decision(siblings, current, tier, usage, policy, *, spent=None, now=N
     return none
 
 
-def apply_usage_policy(siblings, current, tier, usage, policy, *, spent=None, now=None):
+def apply_usage_policy(siblings, current, tier, usage, policy, *, spent=None, now=None, prefer_at=90):
     """The usage_policy pick for the drive's sibling selection: ``(index, reason | None)``
     (#581). A thin wrapper over ``policy_decision`` — applied AFTER B5's headroom preference
     and LOWEST in precedence, it only reorders within the already exclusive-filtered, live
     rung and never fires on an unknown account (D4). ``reason`` is set only when a rule
     actually fired, so the caller logs exactly the rule that steered the card."""
-    decision = policy_decision(siblings, current, tier, usage, policy, spent=spent, now=now)
+    decision = policy_decision(siblings, current, tier, usage, policy, spent=spent, now=now, prefer_at=prefer_at)
     return decision["index"], decision["reason"]
 
 

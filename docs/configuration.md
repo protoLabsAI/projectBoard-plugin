@@ -809,6 +809,10 @@ Each rule is `{account, keep_under, prefer, tiers}`. When a card's tier is in a 
 above `keep_under`% of its binding window used, the card opens on `prefer` instead of
 today's choice — provided `prefer` is already in the rung (after exclusive filtering) and
 eligible: not already spent this card, not down-marked, and not reported `usable: false`.
+When headroom routing is enabled, `prefer` must also be below `routing.prefer_sibling_at`
+(default 90% used) if its usage is known. This prevents a policy from moving back onto a
+sibling the headroom preference just left. Unknown sibling usage does not disqualify it;
+`routing.headroom: false` disables this threshold check, but keeps the eligibility checks above.
 The first rule that fully applies wins. Account usage is read through the same
 `graph.sdk.provider_usage` seam as the headroom preference. With `anthropic-oauth` at 75%
 and the rule above, a standard card opens on `codex`; at 60% it uses today's choice.
