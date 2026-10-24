@@ -8,7 +8,14 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from .projects import IMPLICIT_MARKER, TIER_ALIASES, default_project, normalize_tier_config, resolve_projects
+from .projects import (
+    IMPLICIT_MARKER,
+    TIER_ALIASES,
+    canonical_tier,
+    default_project,
+    normalize_tier_config,
+    resolve_projects,
+)
 from .setup_check import _default_delegates, _rung_names as rung_delegates
 from .store import TIER_LADDER, escalation_enabled
 
@@ -63,10 +70,16 @@ def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
         routing = entry.get("routing", {})
         if routing is None and not resolve:
             routing = {}
-        # #579 adds the headroom-steering knobs alongside exclusive; nothing else belongs.
-        if not isinstance(routing, dict) or set(routing) - {"exclusive", "headroom", "prefer_sibling_at"}:
+        # #579 adds the headroom-steering knobs alongside exclusive; #581 adds usage_policy.
+        if not isinstance(routing, dict) or set(routing) - {
+            "exclusive",
+            "headroom",
+            "prefer_sibling_at",
+            "usage_policy",
+        }:
             raise ValueError(
-                f"{label}.routing must be a mapping containing only exclusive, headroom, prefer_sibling_at"
+                f"{label}.routing must be a mapping containing only exclusive, headroom, "
+                "prefer_sibling_at, usage_policy"
             )
         exclusive = routing.get("exclusive", [])
         if not resolve and (exclusive is None or isinstance(exclusive, (str, tuple))):
@@ -93,6 +106,45 @@ def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
                 raise ValueError(f"{label}.routing.prefer_sibling_at must be an integer percent between 1 and 100")
             if not 1 <= pct <= 100:
                 raise ValueError(f"{label}.routing.prefer_sibling_at must be an integer percent between 1 and 100")
+        # #581: `usage_policy` is a list of {account, keep_under, prefer, tiers} reorder
+        # rules. Each is validated structurally here; `account` and `prefer` join `names` so
+        # the resolve pass refuses an unknown delegate/account. An invalid rule raises, and
+        # the reload path's try/except then keeps the current policy unchanged.
+        policy = routing.get("usage_policy", [])
+        if not resolve and policy is None:
+            policy = []
+        if not isinstance(policy, list):
+            raise ValueError(f"{label}.routing.usage_policy must be a list of rules")
+        for rule in policy:
+            if not isinstance(rule, dict):
+                raise ValueError(f"{label}.routing.usage_policy rules must each be a mapping")
+            account = rule.get("account")
+            prefer = rule.get("prefer")
+            if not isinstance(account, str) or not account.strip():
+                raise ValueError(f"{label}.routing.usage_policy rule must name an account (a provider/delegate)")
+            if not isinstance(prefer, str) or not prefer.strip():
+                raise ValueError(f"{label}.routing.usage_policy rule must name a prefer delegate")
+            try:
+                keep_under = int(rule.get("keep_under"))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{label}.routing.usage_policy keep_under must be an integer percent between 1 and 100"
+                )
+            if not 1 <= keep_under <= 100:
+                raise ValueError(
+                    f"{label}.routing.usage_policy keep_under must be an integer percent between 1 and 100"
+                )
+            tiers = rule.get("tiers", [])
+            if tiers is None:
+                tiers = []
+            if isinstance(tiers, str):
+                tiers = [tiers]
+            if not isinstance(tiers, (list, tuple)) or any(not isinstance(t, str) or not t.strip() for t in tiers):
+                raise ValueError(f"{label}.routing.usage_policy tiers must be a list of tier names")
+            for tier_name in tiers:
+                if canonical_tier(tier_name.strip()) not in TIER_LADDER:
+                    raise ValueError(f"{label}.routing.usage_policy references unknown tier {tier_name!r}")
+            names.update([account.strip(), prefer.strip()])
     if resolve:
         resolver = delegates if delegates is not None else (_default_delegates() if names else None)
         for name in sorted(names):
