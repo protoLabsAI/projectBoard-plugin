@@ -212,6 +212,7 @@ def build_router(cfg: dict):
 
     from .board_view import BOARD_PAGE
     from .projects_view import PROJECTS_PAGE
+    from .routing_view import ROUTING_PAGE
 
     router = APIRouter()
 
@@ -250,6 +251,15 @@ def build_router(cfg: dict):
         operator-bearer-gated ``/api/plugins/project_board/projects`` routes.
         """
         return HTMLResponse(PROJECTS_PAGE, headers={"Cache-Control": "no-store"})
+
+    @router.get("/config/routing", response_class=HTMLResponse)
+    async def _routing_config():
+        """Public page chrome for the sandboxed Coder routing Configure tab (#578).
+
+        Like Projects, it holds no config data; every read and save goes through the
+        operator-bearer-gated ``/api/plugins/project_board/routing`` routes.
+        """
+        return HTMLResponse(ROUTING_PAGE, headers={"Cache-Control": "no-store"})
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
@@ -490,6 +500,17 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         try:
             return JSONResponse(routing_get(), headers={"Cache-Control": "no-store"})
+        except ValueError as exc:
+            raise HTTPException(503, str(exc))
+
+    @router.get("/routing/effective")
+    async def _routing_effective():
+        # Read-only effective-routes view (#578): same operator gate + reads as /routing.
+        # Off the event loop — reading each delegate's live provider_usage may block.
+        from .routing import routing_effective
+
+        try:
+            return JSONResponse(await asyncio.to_thread(routing_effective), headers={"Cache-Control": "no-store"})
         except ValueError as exc:
             raise HTTPException(503, str(exc))
 

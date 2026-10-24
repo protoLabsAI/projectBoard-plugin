@@ -36,7 +36,6 @@ dispatch). Missing any of the three gates ⇒ honest degrade to the single shot 
 from __future__ import annotations
 
 import asyncio
-import itertools
 from pathlib import Path
 import hashlib
 import json
@@ -1075,7 +1074,8 @@ LIVE_BOOL_KNOBS = ("auto_merge", "br_autofetch")
 # in Settings) then clears and the paused loop resumes WITHOUT a restart. The `coders`
 # ladder and routing policy are also live (#577). `repo` remains a restart knob;
 # `setup_status` reports it as `loop_cfg_stale` after a change.
-_RUNG_CURSOR = itertools.count()
+_RUNG_CURSOR = 0
+_RUNG_CURSOR_LOCK = threading.Lock()
 
 
 def _next_rung_cursor() -> int:
@@ -1083,7 +1083,25 @@ def _next_rung_cursor() -> int:
 
     Deliberately NOT persisted: spread is a statistical property across many dispatches,
     not a guarantee about any one card, and a restart re-seeding at zero costs nothing."""
-    return next(_RUNG_CURSOR)
+    global _RUNG_CURSOR
+    with _RUNG_CURSOR_LOCK:
+        current = _RUNG_CURSOR
+        _RUNG_CURSOR += 1
+        return current
+
+
+def peek_rung_cursor() -> int:
+    """Snapshot the next dispatch seed without consuming a round-robin turn."""
+    with _RUNG_CURSOR_LOCK:
+        return _RUNG_CURSOR
+
+
+def dispatch_rung(coders, tier, *, escalation_on, exclusive, base_coder):
+    """Initial siblings before live-delegate resolution, shared with the console."""
+    siblings = coders.get(tier) if escalation_on else None
+    if not siblings:
+        siblings = [] if exclusive and escalation_on else [base_coder]
+    return siblings
 
 
 # The failure classes that say "this PROVIDER can't serve the rung right now" rather
@@ -1960,6 +1978,8 @@ __all__ = [
     "provider_failure_category",
     "representative_failure",
     "_next_rung_cursor",
+    "peek_rung_cursor",
+    "dispatch_rung",
     "_PROVIDER_DOWN_TTL_S",
     "_PROVIDER_DOWN",
     "mark_provider_down",

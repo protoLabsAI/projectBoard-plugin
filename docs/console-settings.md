@@ -3,6 +3,7 @@
 On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is split
 by operator intent:
 
+- **Coder routing** picks which coders may build (see below).
 - **Projects** is the live registry editor. It lists the configured project map and
   can add or update repos only inside the host's enabled Project onboarding root.
   Add/update preserves sibling projects and file-only per-project fields without
@@ -38,6 +39,37 @@ the new routing before any of the project's work dispatches, and it re-checks ca
 preflight is holding too. If another save changes the same project while a gate runs, the
 save is refused with a 409; save again. When a proxy gives up on a long save first (the
 fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
+
+## Coder routing (Configure tab)
+
+**Settings → Plugins → Project Board → Configure → Coder routing** is the console surface
+for strict coder routing (`routing.exclusive`): the operator picks which coders may build,
+with no YAML. Like Projects, it is a plugin-served page with no config data in it; every
+read and save goes through the operator-gated `/api/plugins/project_board/routing` routes.
+
+**Coders.** One card per configured coder shows its provider state (live, or down-marked,
+#420), its subscription usage (#579; **Usage unknown** on an older host or with no usage
+snapshot) and an **Allowed to build** switch. A switch saves at once through B3's guarded,
+audited `PUT /routing`, and the running board uses the change from the next card. Switching
+every coder but codex off is "Codex only". With every coder allowed there is no exclusive
+set. The last allowed coder can't be switched off. A refused save (a non-operator session,
+or a coder that isn't configured or enabled) shows inline and changes nothing, and the page
+re-reads afterward so it always shows what landed. Strict routing covers building, CI and
+review fixes, and escalation. The review gate and helpers (review dispatch, decompose,
+coder.solve offload, Max-Mode judge, task-assignee delegates) keep their own delegates.
+
+**Ladder.** One block per group of projects that route the same way, so a board whose
+projects share a ladder shows it once ("All 14 projects"). Each rung (standard / reasoning
+/ advanced) lists its coders in order and which one the next card would open on right now.
+Hover the "next" pick for why (round-robin, down-marked, `headroom ≥N%`, or exclusive).
+That pick comes from `GET /routing/effective`, computed with the loop's own
+sibling-preference functions over a read-only snapshot of the round-robin cursor, so it is
+a preview: another dispatch or a provider-state change can change it.
+
+Per-project `routing.exclusive` overrides remain YAML/`board_routing_set`-only; a project
+with one shows as its own ladder block.
+
+## Not exposed in the console
 
 The console intentionally does not expose every manifest default. Structural legacy
 single-repo bindings (`project`, `repo`, `base_branch`, `worktrees_root`, `db_path`)
