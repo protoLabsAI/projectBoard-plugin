@@ -211,6 +211,7 @@ def build_router(cfg: dict):
     from fastapi.responses import HTMLResponse
 
     from .board_view import BOARD_PAGE
+    from .overview_view import OVERVIEW_PAGE
     from .projects_view import PROJECTS_PAGE
     from .routing_view import ROUTING_PAGE
 
@@ -242,6 +243,16 @@ def build_router(cfg: dict):
         from .board_card_form import FORM_PAGE
 
         return HTMLResponse(FORM_PAGE)
+
+    @router.get("/config/overview", response_class=HTMLResponse)
+    async def _overview_config():
+        """Public page chrome for the Overview Configure tab (S1a, #611).
+
+        Like Projects and Routing it holds no board data: the board on/off switch, the live
+        counts, the problems and the pending-restart banner all read and write through the
+        operator-bearer-gated ``/api/plugins/project_board`` routes (settings/status/features).
+        """
+        return HTMLResponse(OVERVIEW_PAGE, headers={"Cache-Control": "no-store"})
 
     @router.get("/config/projects", response_class=HTMLResponse)
     async def _projects_config():
