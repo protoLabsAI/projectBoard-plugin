@@ -581,7 +581,7 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001 — best-effort, per feature
                 log.warning("[project_board] boot preflight release: clear_blocked failed for %s", fid, exc_info=True)
 
-    async def _list_for_pass(self, store, state: str, pass_name: str) -> list[dict]:
+    async def _list_for_pass(self, store, state: str, pass_name: str, *, raise_on_error: bool = False) -> list[dict]:
         """The ``state`` rows one pass of the reconcile/sweep acts on — or none, when the
         read itself failed (#404). A pass drives several independent edges off separate
         reads (the PR reconcile scans in_review AND blocked), and one read that stalled
@@ -597,6 +597,8 @@ class ReconcileMixin:
             raise  # a STALLED store: the tick stops here, rather than stall on the next read too
         except BoardError as exc:
             log.warning("[project_board] %s: could not read the %s cards, skipped this pass: %s", pass_name, state, exc)
+            if raise_on_error:
+                raise
             return []
 
     # ── periodic health sweep (self-heal during the run) ───────────────────────
@@ -1075,13 +1077,20 @@ class ReconcileMixin:
         # has held not-clean past merge_hold_alert_s for /status health. It reads the merge
         # edge's own process state, so it reflects the holds the previous pass's reconciles
         # left and this pass's clears show on the next one — like a claim stall, surfaced.
-        self._publish_merge_holds()
         # #196: blocked cards can carry a PR too (review-verify blocks, closed-PR triage,
         # manual flags) — a merged PR is ground truth for them exactly as for in_review,
         # and scanning only in_review left merged-but-blocked cards stuck forever. They
         # take ONLY the MERGED edge below: CLOSED would rewrite their blocked reason, and
         # the OPEN-branch gates (rebase/CI/review) must not run against held work.
-        in_review = await self._list_for_pass(store, "in_review", "PR reconcile")
+        try:
+            in_review = await self._list_for_pass(store, "in_review", "PR reconcile", raise_on_error=True)
+        except store_mod.BoardTimeout:
+            raise
+        except BoardError:
+            # A failed read is not evidence that cards left review; retain their clocks.
+            in_review = []
+        else:
+            self._publish_merge_holds(in_review)
         blocked = await self._list_for_pass(store, "blocked", "PR reconcile")
         started = [t for t in (self._start_card_work(store, f) for f in [*in_review, *blocked] if f.get("pr_url")) if t]
         if detach or not started:
@@ -1508,22 +1517,26 @@ class ReconcileMixin:
                 pr_url,
             )
 
-    def _publish_merge_holds(self) -> None:
+    def _publish_merge_holds(self, in_review: list[dict]) -> None:
         """Publish the in_review cards GitHub has held not-clean (UNSTABLE/BLOCKED) longer
         than ``merge_hold_alert_s`` for /status health (#495 slice 2) — a PR stuck the way a
         claim stall leaves ready work, surfaced instead of reading ``auto-merge pending`` for
         hours. Reads the merge edge's own process state (``merge_state_hold``, which stamps a
-        first-seen ``since`` on each hold), so a hold that cleared, merged or closed — all go
-        through its ``clear_hold`` — drops off the next pass. Each row carries the operator
+        first-seen ``since`` on each hold). Prune holds against the current review cards
+        and auto-merge setting so leaving review also resets the clock. A cleared, merged
+        or closed hold drops off the next pass. Each row carries the operator
         hold text and the age. 0 turns the health entry off; the per-card next_action hold
         still shows. Best-effort: health bookkeeping never breaks the reconcile pass."""
         try:
-            if not self.merge_hold_alert_s:
-                health.publish_merge_holds([])
-                return
+            review_prs = {f["id"]: f.get("pr_url") for f in in_review if f.get("board_state") == "in_review"}
             now = time.time()
             rows = []
             for fid, hold in merge_state_hold.all_holds().items():
+                if not self.auto_merge or not review_prs.get(fid) or review_prs[fid] != hold.get("pr_url"):
+                    merge_state_hold.clear_hold(fid)
+                    continue
+                if not self.merge_hold_alert_s:
+                    continue
                 age = now - float(hold.get("since") or now)
                 if age < self.merge_hold_alert_s:
                     continue

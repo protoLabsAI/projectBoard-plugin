@@ -633,7 +633,9 @@ hours while its `QA panel` check or an unresolved review thread never settles. O
 has stood this long (default one hour), the reconcile pass lists the card on `/status` under
 `merge_holds` with its hold text and age — like a claim stall, surfaced rather than left
 reading `auto-merge pending`. The entry clears when the hold clears or the PR merges or
-closes. `0` turns the health entry off; the per-card next-action hold still shows.
+closes, the card leaves review or is deleted, or auto-merge is disabled. Leaving review
+resets the hold age, so a card returning to review starts a new clock. `0` turns the health
+entry off; the per-card next-action hold still shows.
 
 Two of those carry security weight and are easy to skim past:
 

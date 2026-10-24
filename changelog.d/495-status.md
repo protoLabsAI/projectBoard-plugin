@@ -5,6 +5,7 @@
   merge-state hold now stamps a first-seen time, and each reconcile pass publishes the
   in_review cards held longer than `merge_hold_alert_s` (default 3600) to `/status` under
   `merge_holds`, with their hold text and age. The entry clears when the hold clears or the PR
-  merges or closes. `merge_hold_alert_s: 0` turns the health entry off; the per-card
+  merges or closes, the card leaves review or is deleted, or auto-merge is disabled. Returning
+  to review starts a fresh hold clock. `merge_hold_alert_s: 0` turns the health entry off; the per-card
   next-action hold still shows. No GitHub call was added — it reads the merge edge's own
   process state.
