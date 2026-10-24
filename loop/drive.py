@@ -1422,6 +1422,15 @@ class DriveMixin:
             self._last_claim_at = time.monotonic()
             decision = dict(getattr(self, "_last_claim_decision", None) or {})
         record = self._dispatch_decision_record(decision)
+        if record["outcome"] == "review-wip-limit":
+            from ..store import read_review_queue
+
+            queue = await asyncio.to_thread(read_review_queue)
+            if queue:
+                evidence = {k: queue[k] for k in ("depth", "gateway_degraded") if queue.get(k) is not None}
+                record.update(evidence)
+                if evidence:
+                    record["detail"] += "; " + ", ".join(f"{k}={v}" for k, v in evidence.items())
         if record["outcome"] in ("empty-queue", "all-candidates-held"):
             await self._explain_held(record)
         return record

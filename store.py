@@ -38,6 +38,7 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -48,7 +49,8 @@ import threading
 import types
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import urlopen
 
 from . import _TERMINAL_STATES, br_fetch, work_locations, work_snapshot
 from . import gates as publish_gates
@@ -5875,6 +5877,46 @@ def review_coverage_hold_posture(feature: dict) -> dict | None:
     }
 
 
+def read_review_queue(*, repo: str = "", pr: str = "") -> dict | None:
+    """Optional sibling telemetry via the host listener; failures are always no data.
+
+    Async callers must offload this bounded synchronous read to a worker.
+    """
+    try:
+        from graph.sdk import config as host_config
+
+        port = int(host_config().port)
+        if not 0 < port < 65536:
+            return None
+        url = f"http://127.0.0.1:{port}/api/plugins/pr-reviewer/queue"
+        if repo and pr:
+            url += "?" + urlencode({"repo": repo, "pr": pr})
+        with urlopen(url, timeout=0.5) as response:
+            data = json.load(response)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 — optional telemetry, including older/missing plugins
+        return None
+
+
+def _review_queue_action(data: dict | None) -> str:
+    if not isinstance(data, dict):
+        return NEXT_ACTION_REVIEW_IN_PROGRESS
+    state = data.get("state")
+    if state == "queued":
+        position = data.get("position")
+        if type(position) is not int or position < 1:
+            return NEXT_ACTION_REVIEW_IN_PROGRESS
+        text = f"review queued behind {position - 1}"
+    elif state == "running":
+        text = "review running"
+    else:
+        return NEXT_ACTION_REVIEW_IN_PROGRESS
+    eta = data.get("eta_verdict_s")
+    if type(eta) in (int, float) and math.isfinite(eta) and eta >= 0:
+        text += f" (ETA ~{math.ceil(eta / 60)} min)"
+    return text
+
+
 def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> list[dict]:
     """Stamp ``next_action`` / ``awaiting_merge`` / ``next_action_hint`` on every row
     that owes the PM a next action — a coding ``in_review`` card from the board's config
@@ -5884,7 +5926,7 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
     ``in_progress`` one (#305); and a backlog or backlog-blocked card whose every
     dependency has closed, via ``stranded_posture`` (#406). A task is routed to
     ``task_posture`` first, so the coding review-gate wording never lands on it. Labels +
-    config only, no per-row network. Rows in any other state are left untouched (the
+    config plus best-effort local queue telemetry. Rows in any other state are left untouched (the
     payload shape for them is unchanged). Mutates and returns ``feats``.
 
     ``cfg`` is the board's LIVE config dict (the one ``register()`` hands the loop, the
@@ -5927,6 +5969,7 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
     # dependency was a scope cut rather than a delivery (#406). A dependency outside the
     # listing (archived, or a state-filtered read) simply reads as closed.
     cancelled = frozenset(str(f.get("id")) for f in feats if f.get("board_state") == "cancelled")
+    queue_cache = {}  # Per-poll PR cache, including unavailable results.
     for f in feats:
         # A task-type bead (#217) never merges a PR: its in_review Done edge is
         # record_verification and its parked in_progress state awaits a deliverable — both owned
@@ -5988,6 +6031,12 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
             reason = getattr(live_loop(), "_review_not_running", {}).get(f.get("id"), "")
             if reason:
                 posture = {**posture, "next_action": f"review not running: {reason}"}
+            else:
+                key = pr_key(f.get("pr_url"))
+                if all(key):
+                    if key not in queue_cache:
+                        queue_cache[key] = read_review_queue(repo=key[0], pr=key[1])
+                    posture = {**posture, "next_action": _review_queue_action(queue_cache[key])}
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]

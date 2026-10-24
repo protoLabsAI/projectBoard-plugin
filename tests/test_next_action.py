@@ -748,3 +748,152 @@ def test_board_page_chips_the_merged_verify_exhaustion_hold():
         '"auto-merge held: merged-verify budget exhausted": ["pl-badge--warning", "merge held (verify budget)"],'
         in BOARD_PAGE
     )
+
+
+@pytest.mark.parametrize(
+    "data,want",
+    [
+        ({"state": "queued", "position": 3, "eta_verdict_s": 600}, "review queued behind 2 (ETA ~10 min)"),
+        ({"state": "queued", "position": 1, "eta_verdict_s": None}, "review queued behind 0"),
+        ({"state": "running", "eta_verdict_s": 61}, "review running (ETA ~2 min)"),
+        ({"state": "running", "eta_verdict_s": None}, "review running"),
+        ({"state": "running", "eta_verdict_s": "bad"}, "review running"),
+        ({"state": "queued", "position": None}, "review in progress"),
+        ({"state": "idle"}, "review in progress"),
+        (None, "review in progress"),
+    ],
+)
+def test_review_queue_status_and_poll_cache(monkeypatch, data, want):
+    calls = []
+
+    def reader(**kw):
+        calls.append(kw)
+        return data
+
+    monkeypatch.setattr(store, "read_review_queue", reader)
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: None)
+    for _ in range(2):
+        rows = annotate_next_action([_feat(labels=["review-pending"]), _feat(labels=["review-pending"])], {})
+        assert all(f["next_action"] == want and not f["awaiting_merge"] for f in rows)
+    assert calls == [{"repo": "o/r", "pr": "42"}] * 2
+
+
+def test_queue_transport_and_unreachable_fallback(monkeypatch):
+    from io import BytesIO
+    from urllib.parse import parse_qs, urlparse
+
+    calls = []
+
+    def open_queue(url, *, timeout):
+        calls.append((url, timeout))
+        return BytesIO(b'{"state":"running","eta_verdict_s":60}')
+
+    from types import SimpleNamespace
+
+    import graph.sdk
+
+    monkeypatch.setattr(graph.sdk, "config", lambda: SimpleNamespace(port=9999), raising=False)
+    monkeypatch.setattr(store, "urlopen", open_queue)
+    assert store.read_review_queue(repo="o/r", pr="42")["state"] == "running"
+    url, timeout = calls[0]
+    assert urlparse(url).path == "/api/plugins/pr-reviewer/queue"
+    assert parse_qs(urlparse(url).query) == {"repo": ["o/r"], "pr": ["42"]}
+    assert timeout == 0.5
+
+    def unavailable(*a, **kw):
+        raise TimeoutError("unreachable")
+
+    monkeypatch.setattr(store, "urlopen", unavailable)
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: None)
+    row = annotate_next_action([_feat(labels=["review-pending"])], {})[0]
+    assert row["next_action"] == "review in progress"
+
+
+def test_review_queue_preserves_existing_precedence(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: SimpleNamespace(_review_not_running={"bd-1": "held"}))
+
+    def unexpected(*a, **kw):
+        pytest.fail("queue should not be read for this posture")
+
+    monkeypatch.setattr(store, "read_review_queue", unexpected)
+    assert annotate_next_action([_feat(labels=["review-pending"])], {})[0]["next_action"] == "review not running: held"
+    for feat in [_feat(labels=["review-pending"], blocked=True), _feat(labels=["review-clean"]), _task()]:
+        annotate_next_action([feat], {}, is_driven=lambda _: False)
+
+
+@pytest.mark.parametrize(
+    "queue", [{"depth": 7, "gateway_degraded": True}, {"depth": 0, "gateway_degraded": False}, None]
+)
+async def test_review_wip_hold_quotes_queue(monkeypatch, queue):
+    loop = BoardLoop({"loop_enabled": True, "max_pending_reviews": 5, "preflight": False})
+
+    async def scan():
+        loop._last_claim_decision = {"gate": "max_pending_reviews", "pending_reviews": 5}
+
+    monkeypatch.setattr(loop, "_spawn_ready", scan)
+    monkeypatch.setattr(store, "read_review_queue", lambda: queue)
+    result = await loop.dispatch_now()
+    assert result["outcome"] == "review-wip-limit"
+    assert result["dispatched"] == []
+    for key in ("depth", "gateway_degraded"):
+        if queue is None:
+            assert key not in result
+        else:
+            assert result[key] == queue[key]
+            assert f"{key}={queue[key]}" in result["detail"]
+
+
+def test_queue_chip_keeps_full_status_in_tooltip_and_drawer():
+    from project_board.board_view import BOARD_PAGE
+
+    assert '["review queued behind ", ["pl-badge--info", "review queued"]]' in BOARD_PAGE
+    assert '["review running", ["pl-badge--info", "review running"]]' in BOARD_PAGE
+    assert "esc(nextActionTip(f))" in BOARD_PAGE
+
+
+def test_queue_reader_uses_host_listener_and_ignores_bad_responses(monkeypatch):
+    from io import BytesIO
+    from types import SimpleNamespace
+
+    import graph.sdk
+
+    monkeypatch.setattr(graph.sdk, "config", lambda: SimpleNamespace(port=9876), raising=False)
+    calls = []
+
+    def response(url, *, timeout):
+        calls.append(url)
+        return BytesIO(b'{"depth":2,"gateway_degraded":false}')
+
+    monkeypatch.setattr(store, "urlopen", response)
+    assert store.read_review_queue() == {"depth": 2, "gateway_degraded": False}
+    assert calls == ["http://127.0.0.1:9876/api/plugins/pr-reviewer/queue"]
+    for body in (b"not json", b"[]", b"null"):
+        monkeypatch.setattr(store, "urlopen", lambda *a, **kw: BytesIO(body))
+        assert store.read_review_queue() is None
+
+
+def test_single_card_queue_read_runs_off_event_loop(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    feat = _feat(labels=["review-pending"])
+    monkeypatch.setattr(api, "get_store", lambda **kw: SimpleNamespace(get_feature=lambda fid: feat))
+    monkeypatch.setattr("project_board.loop.live_loop", lambda: None)
+    calls = []
+
+    def reader(**kw):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        calls.append(kw)
+        return {"state": "queued", "position": 3, "eta_verdict_s": 600}
+
+    monkeypatch.setattr(store, "read_review_queue", reader)
+    app = FastAPI()
+    app.include_router(api.build_data_router({}), prefix="/api/plugins/project_board")
+    with TestClient(app) as client:
+        response = client.get("/api/plugins/project_board/features/bd-1")
+    assert response.status_code == 200
+    assert response.json()["next_action"] == "review queued behind 2 (ETA ~10 min)"
+    assert calls == [{"repo": "o/r", "pr": "42"}]

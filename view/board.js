@@ -114,6 +114,8 @@ const NEXT_ACTION_CHIP = {
 //  - publish gates (`waits_for`): a card waiting on an external publish/release/merge.
 //  - release freeze: the auto-merge edge held a PR because its repo is mid-release.
 const NEXT_ACTION_PREFIX_CHIP = [
+  ["review queued behind ", ["pl-badge--info", "review queued"]],
+  ["review running", ["pl-badge--info", "review running"]],
   ["waiting on publish", ["pl-badge--warning", "waiting on publish"]],
   ["held: release freeze", ["pl-badge--warning", "held: release freeze"]],
 ];
