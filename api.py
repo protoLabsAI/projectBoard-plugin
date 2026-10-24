@@ -785,9 +785,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(lambda: store().get_feature(fid))
         if f is None:
             raise HTTPException(404, f"unknown feature {fid!r}")
-        # next_action + cached publish-gate verdicts, the same stamp the listing carries
-        # (labels + config + in-process caches — no network).
-        return annotate_next_action([f], cfg or {})[0]
+        # Same stamp as the listing, including optional local queue telemetry. Keep
+        # the read off the event loop so the sibling route can answer on this host.
+        return await _guard(lambda: annotate_next_action([f], cfg or {})[0])
 
     @router.get("/features/{fid}/ready-check")
     async def _ready_check(fid: str):
