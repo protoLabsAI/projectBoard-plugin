@@ -1,0 +1,450 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Board review &amp; merge</title>
+<style>
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);font-family:var(--pl-font-sans);font-size:13px}
+.wrap{padding:var(--pl-space-4);max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:var(--pl-space-4,16px)}
+.rv-intro{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px;line-height:1.5}
+.rv-loading{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px}
+
+/* A step card: an on/off switch and its sub-settings. An off step greys its dependent subs. */
+.rv-step{display:flex;flex-direction:column;gap:var(--pl-space-3);padding:var(--pl-space-4)}
+.rv-step-head{display:flex;align-items:flex-start;gap:var(--pl-space-3)}
+.rv-step-num{flex:0 0 auto;width:22px;height:22px;border-radius:999px;display:flex;align-items:center;justify-content:center;background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);color:var(--pl-color-fg-muted);font-size:12px;font-weight:var(--pl-font-weight-semibold,600)}
+.rv-step-headings{display:flex;flex-direction:column;gap:2px;min-width:0}
+.rv-step-title{margin:0;font-size:15px}
+.rv-step-lede{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px;line-height:1.5}
+.rv-step-switchhelp{margin:0;color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+.rv-step--off .rv-step-num{opacity:.55}
+
+/* Sub-settings sit indented under the step switch, hung off a hairline rail. */
+.rv-subs{display:flex;flex-direction:column;gap:var(--pl-space-3);padding-left:var(--pl-space-3);border-left:var(--pl-border-width) solid var(--pl-color-border);margin-left:11px}
+.rv-knob{display:flex;flex-direction:column;gap:var(--pl-space-2)}
+.rv-knob--off{opacity:.5}
+.rv-knob-head{display:flex;align-items:center;gap:var(--pl-space-2)}
+.rv-knob-label{font-size:12.5px;font-weight:var(--pl-font-weight-semibold,600)}
+.rv-knob-help{margin:0;color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+
+.rv-select,.rv-text{font:inherit;padding:5px 9px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);color:var(--pl-color-fg);max-width:320px}
+.rv-text{margin-top:var(--pl-space-2)}
+.rv-select:focus-visible,.rv-text:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.rv-select:disabled,.rv-text:disabled{cursor:not-allowed;opacity:.6}
+
+.rv-stepper{display:inline-flex;align-items:center;gap:var(--pl-space-2)}
+.rv-stepbtn{cursor:pointer;width:26px;height:26px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);color:var(--pl-color-fg);font:inherit;line-height:1}
+.rv-stepbtn:hover:not(:disabled){border-color:var(--pl-color-accent)}
+.rv-stepbtn:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.rv-stepbtn:disabled{cursor:not-allowed;opacity:.5}
+.rv-step-val{min-width:1.5em;text-align:center;font-variant-numeric:tabular-nums}
+
+/* Dependent cards: a labelled two-way radio with the trade-off spelled out. */
+.rv-radios{display:flex;flex-direction:column;gap:var(--pl-space-2)}
+.rv-radio{display:flex;gap:var(--pl-space-3);padding:var(--pl-space-3);border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);cursor:pointer}
+.rv-radio:hover{border-color:var(--pl-color-accent)}
+.rv-radio--on{border-color:var(--pl-color-accent)}
+.rv-radio-input{margin-top:3px;accent-color:var(--pl-color-accent)}
+.rv-radio-body{display:flex;flex-direction:column;gap:2px;min-width:0}
+.rv-radio-label{font-size:12.5px;font-weight:var(--pl-font-weight-semibold,600)}
+.rv-radio-hint{color:var(--pl-color-accent);font-weight:var(--pl-font-weight-semibold,600);font-size:11.5px;margin-left:var(--pl-space-1,4px)}
+.rv-radio-sub{color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+
+.rv-saved{margin:0;color:var(--pl-color-accent);font-size:12px}
+.rv-saving{margin:0;color:var(--pl-color-fg-muted);font-size:12px}
+.rv-inline,.rv-msg{margin:0}
+.rv-restart-title{font-weight:var(--pl-font-weight-semibold,600)}
+.rv-restart-list{margin:var(--pl-space-1,4px) 0 0}
+.rv-restart-how{margin:var(--pl-space-2) 0 0;color:var(--pl-color-fg-muted);font-size:12px}
+@media(max-width:520px){.wrap{padding:var(--pl-space-3)}.rv-subs{padding-left:var(--pl-space-3)}}
+</style>
+<script>
+var BASE = location.pathname.split("/plugins/")[0];
+(function(){var l=document.createElement("link");l.rel="stylesheet";
+  l.href=BASE+"/_ds/plugin-kit.css";document.head.appendChild(l);})();
+</script></head><body>
+<main class="wrap"><div id="review" aria-live="polite"></div></main>
+<script type="module">
+// Review & merge (S4, #614) — the Configure tab that answers "what happens after a PR opens?".
+// It lays the pipeline out as four ordered step cards (Review → CI → Rebase → Merge), each an
+// on/off switch with its attempts as steppers, plus the workflow/reviewer/merge-method pickers
+// and the dependent-cards radio. It holds no board data: every read and write rides the
+// operator-bearer-gated /api/plugins/project_board routes via the DS plugin-kit's authed,
+// slug-aware fetch (settings for the knobs, routing/effective for the delegate picker). No
+// handshake of our own, no hardcoded /api/… path.
+let kit;
+try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
+catch (e) { kit = null; }
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const SETTINGS_API = "/api/plugins/project_board/settings";
+const ROUTING_API = "/api/plugins/project_board/routing/effective";
+const SLOW_MS = 500;  // only show a loading line once the reads are actually slow — no flash on a fast board
+
+const api = async (p, init) => {
+  const r = await kit.apiFetch(p, { cache: "no-store", ...(init || {}) });
+  // A host gate refusal (non-operator) is a bare 403 with no JSON body — catch it before parsing.
+  if (r.status === 403) throw new Error("Refused: this needs an operator session. Nothing changed.");
+  const d = await r.json().catch(() => { throw new Error("HTTP " + r.status + " (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+  return d;
+};
+
+function callout(kind, text){
+  const cls = kind === "error" ? "pl-callout--error" : kind === "ok" ? "pl-callout--success" : "pl-callout--info";
+  return '<div class="pl-callout ' + cls + ' rv-msg">' + esc(text) + '</div>';
+}
+function inlineMsg(m){
+  if (!m) return "";
+  if (m.kind === "error") return '<div class="pl-callout pl-callout--error rv-inline">' + esc(m.text) + '</div>';
+  return '<p class="' + (m.kind === "ok" ? "rv-saved" : "rv-saving") + '">' + esc(m.text) + '</p>';
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────────────────────
+let SAVE_BUSY = false;      // a settings save is in flight — freeze the controls
+let SETTINGS = null;        // last /settings snapshot (scalar knobs + pending_restart)
+let ROUTING = null;         // last /routing/effective read (delegates, for the reviewer picker)
+let SETTINGS_MSG = {};      // {key: {kind, text}} inline message per control
+const PICKER_CUSTOM = {};   // {key: true} when a picker is in free-text mode
+
+const settingMeta = (key) => ((SETTINGS && SETTINGS.settings) || {})[key] || null;
+const settingValue = (key) => { const m = settingMeta(key); return m ? m.value : undefined; };
+
+// The four steps, in the order a PR actually travels them. Each `key` is the step's on/off knob;
+// `subs` are its settings. `dep: true` subs grey out when the step is off — they mirror the
+// host schema's own depends_on (review_workflow/review_fix_max → review_gate, ci_* → ci_poll,
+// rebase_fix_max → auto_rebase, merge_method → auto_merge). The copy is S6's plain wording.
+const STEPS = [
+  {
+    key: "review_gate", title: "Review", order: "1",
+    lede: "Review the pull request before it can merge.",
+    switchLabel: "Require review before merging",
+    switchHelp: "Review changes before merging and send serious findings back to the coder to fix.",
+    subs: [
+      { kind: "picker", key: "review_workflow", source: "workflow", dep: true,
+        label: "Workflow for required reviews",
+        choose: "Choose a workflow…", typeOption: "Type a workflow name…", placeholder: "workflow name",
+        help: "Use this configured workflow to review changes before allowing a merge." },
+      { kind: "stepper", key: "review_fix_max", dep: true,
+        label: "Attempts to fix review findings",
+        help: "Let the coder fix review findings this many times before blocking the card for your attention." },
+      { kind: "picker", key: "reviewer", source: "delegate", dep: false,
+        label: "Agent for pull request reviews",
+        choose: "Choose an agent…", typeOption: "Type an agent name…", placeholder: "agent name",
+        help: "Use this review agent for optional reviews or when required reviews have no workflow runner available." },
+      { kind: "bool", key: "review_dispatch", dep: false,
+        label: "Request an extra review on opening",
+        help: "Ask the review agent for an advisory review when a pull request opens." },
+    ],
+  },
+  {
+    key: "ci_poll", title: "CI", order: "2",
+    lede: "Watch the pull request's checks and send failures back to the coder.",
+    switchLabel: "Send failed checks back to the coder",
+    switchHelp: "Check pull request test results and send failures back to the coder to fix.",
+    subs: [
+      { kind: "stepper", key: "ci_rerun_max", dep: true,
+        label: "Rerun failed checks before changing code",
+        help: "Retry failed GitHub Actions jobs this many times before asking for a code fix; zero disables retries." },
+      { kind: "stepper", key: "ci_fix_max", dep: true,
+        label: "Attempts to fix failed checks",
+        help: "Allow this many automatic fixes for failed checks before blocking the card; zero blocks on the first failure." },
+    ],
+  },
+  {
+    key: "auto_rebase", title: "Rebase", order: "3",
+    lede: "Keep the pull request current with its base branch.",
+    switchLabel: "Update pull requests with base changes",
+    switchHelp: "Update pull requests when their base branch changes and ask the coder to resolve conflicts.",
+    subs: [
+      { kind: "stepper", key: "rebase_fix_max", dep: true,
+        label: "Attempts to fix merge conflicts",
+        help: "Let the coder resolve merge conflicts this many times before blocking the card." },
+    ],
+  },
+  {
+    key: "auto_merge", title: "Merge", order: "4",
+    lede: "Merge the pull request once every check and review is green.",
+    switchLabel: "Merge approved pull requests automatically",
+    switchHelp: "Merge pull requests when all required checks and reviews are current and passing, unless the card is held for manual approval.",
+    subs: [
+      { kind: "method", key: "merge_method", dep: true,
+        label: "How to merge pull requests",
+        help: "Use this GitHub merge method when merging pull requests automatically." },
+      // Verification also runs with auto-rebase, independently of auto-merge.
+      { kind: "stepper", key: "merged_verify_max", dep: false,
+        label: "Failed checks before holding a merge",
+        help: "Hold automatic merging after this many failed or inconclusive checks against the latest base; zero allows unlimited attempts." },
+      { kind: "bool", key: "merge_poll", dep: false,
+        label: "Check pull request status automatically",
+        help: "Check for merged or closed pull requests so the board stays current even when GitHub cannot send updates." },
+    ],
+  },
+];
+
+// Dependent cards: a labelled two-way radio over dep_gate. "merge" is the safer default (build on
+// landed code); "review" is faster (start as soon as the blocker opens a PR). Shared-foundation
+// cards always gate on merge regardless — that caveat rides in the help line, not a third option.
+const DEP_GATE = {
+  title: "Dependent cards",
+  lede: "When a card is blocked by another, start it…",
+  help: "Shared foundation changes always wait for their prerequisite to merge, whatever you choose here.",
+  options: [
+    { value: "merge", label: "When the blocker merges", hint: "safer",
+      sub: "Dependents build on code that is already on the base branch." },
+    { value: "review", label: "When the blocker opens a pull request", hint: "faster",
+      sub: "Dependents start sooner, building on code that has not merged yet." },
+  ],
+};
+const METHOD_LABELS = { squash: "Squash and merge", merge: "Create a merge commit", rebase: "Rebase and merge" };
+
+// ── Controls ────────────────────────────────────────────────────────────────────────────────
+function stepBtn(key, dir, disabled, label){
+  return '<button type="button" class="rv-stepbtn" data-step="' + esc(key) + '" data-dir="' + dir + '"'
+    + (disabled ? " disabled" : "") + ' aria-label="' + esc(label) + '">' + (dir < 0 ? "−" : "+") + '</button>';
+}
+function knobWrap(sub, control, off){
+  return '<div class="rv-knob' + (off ? " rv-knob--off" : "") + '" data-knob="' + esc(sub.key) + '">'
+    + '<div class="rv-knob-head"><span class="rv-knob-label">' + esc(sub.label) + '</span></div>'
+    + control
+    + '<p class="rv-knob-help">' + esc(sub.help) + '</p>'
+    + inlineMsg(SETTINGS_MSG[sub.key]) + '</div>';
+}
+function stepper(sub, off){
+  const meta = settingMeta(sub.key) || {};
+  const value = Number(meta.value);
+  const dis = off || SAVE_BUSY;
+  return knobWrap(sub,
+    '<div class="rv-stepper" role="group" aria-label="' + esc(sub.label) + '">'
+    + stepBtn(sub.key, -1, dis || !(value > meta.minimum), "Decrease " + sub.label)
+    + '<span class="rv-step-val" data-val="' + esc(sub.key) + '">' + value + '</span>'
+    + stepBtn(sub.key, 1, dis || !(value < meta.maximum), "Increase " + sub.label)
+    + '</div>', off);
+}
+function boolSub(sub, off){
+  const on = (settingMeta(sub.key) || {}).value === true;
+  const dis = off || SAVE_BUSY;
+  return '<div class="rv-knob' + (off ? " rv-knob--off" : "") + '" data-knob="' + esc(sub.key) + '">'
+    + '<label class="pl-switch' + (dis ? " pl-switch--disabled" : "") + '">'
+    + '<input type="checkbox" class="pl-switch__input" data-bool="' + esc(sub.key) + '"' + (on ? " checked" : "") + (dis ? " disabled" : "") + '>'
+    + '<span class="pl-switch__track"><span class="pl-switch__thumb"></span></span>'
+    + '<span class="pl-switch__label">' + esc(sub.label) + '</span></label>'
+    + '<p class="rv-knob-help">' + esc(sub.help) + '</p>'
+    + inlineMsg(SETTINGS_MSG[sub.key]) + '</div>';
+}
+function methodSelect(sub, off){
+  const cur = String(settingValue(sub.key) || "");
+  const opts = (settingMeta(sub.key) || {}).options || [];
+  const dis = off || SAVE_BUSY;
+  const options = opts.map(o => '<option value="' + esc(o) + '"' + (o === cur ? " selected" : "") + '>'
+    + esc(METHOD_LABELS[o] || o) + '</option>').join("");
+  return knobWrap(sub, '<select class="rv-select" data-method="' + esc(sub.key) + '"' + (dis ? " disabled" : "") + '>' + options + '</select>', off);
+}
+// A picker of configured values (delegates for `reviewer`, known workflows for `review_workflow`)
+// that ALWAYS keeps a free-text escape, like the Coders coder picker: a board whose value isn't in
+// the list — or that has no list to offer — can still be set. The host roster is the authority on
+// whether a name resolves, so a typed name is saved and setup checks confirm it.
+function pickerOptions(sub){
+  if (sub.source === "delegate") return (ROUTING && ROUTING.delegates) || [];
+  // Workflows aren't enumerable through the plugin API, so offer what IS configured: the current
+  // value plus the shipped default, with free text for any other host recipe.
+  const cur = String(settingValue("review_workflow") || "");
+  return [...new Set([cur, "code-review"].filter(Boolean))];
+}
+function pickerControl(sub, off){
+  const key = sub.key;
+  const cur = String(settingValue(key) || "");
+  const opts = pickerOptions(sub);
+  const known = opts.includes(cur);
+  const custom = PICKER_CUSTOM[key] || !opts.length || (!!cur && !known);
+  const dis = off || SAVE_BUSY;
+  const options = [];
+  if (!cur) options.push('<option value="" disabled hidden' + (custom ? "" : " selected") + '>' + esc(sub.choose) + '</option>');
+  opts.forEach(o => options.push('<option value="' + esc(o) + '"' + (o === cur && !custom ? " selected" : "") + '>' + esc(o) + '</option>'));
+  options.push('<option value="__custom__"' + (custom ? " selected" : "") + '>' + esc(sub.typeOption) + '</option>');
+  let control = "";
+  if (opts.length)
+    control += '<select class="rv-select" data-picker="' + esc(key) + '"' + (dis ? " disabled" : "") + '>' + options.join("") + '</select>';
+  if (custom)
+    control += '<input type="text" class="rv-text" data-picker-text="' + esc(key) + '" value="' + esc(cur) + '"'
+      + ' placeholder="' + esc(sub.placeholder) + '" spellcheck="false" autocomplete="off"' + (dis ? " disabled" : "") + '>';
+  return knobWrap(sub, control, off);
+}
+function subControl(sub, stepOn){
+  const off = sub.dep && !stepOn;
+  if (sub.kind === "stepper") return stepper(sub, off);
+  if (sub.kind === "bool") return boolSub(sub, off);
+  if (sub.kind === "method") return methodSelect(sub, off);
+  return pickerControl(sub, off);
+}
+function stepSwitch(step){
+  const on = settingValue(step.key) === true;
+  return '<label class="pl-switch' + (SAVE_BUSY ? " pl-switch--disabled" : "") + '">'
+    + '<input type="checkbox" class="pl-switch__input" data-step-switch="' + esc(step.key) + '"' + (on ? " checked" : "") + (SAVE_BUSY ? " disabled" : "") + '>'
+    + '<span class="pl-switch__track"><span class="pl-switch__thumb"></span></span>'
+    + '<span class="pl-switch__label">' + esc(step.switchLabel) + '</span></label>'
+    + '<p class="rv-step-switchhelp">' + esc(step.switchHelp) + '</p>'
+    + inlineMsg(SETTINGS_MSG[step.key]);
+}
+function stepCard(step){
+  const on = settingValue(step.key) === true;
+  return '<section class="pl-card rv-step' + (on ? "" : " rv-step--off") + '">'
+    + '<div class="rv-step-head"><span class="rv-step-num" aria-hidden="true">' + esc(step.order) + '</span>'
+    + '<div class="rv-step-headings"><h2 class="rv-step-title">' + esc(step.title) + '</h2>'
+    + '<p class="rv-step-lede">' + esc(step.lede) + '</p></div></div>'
+    + stepSwitch(step)
+    + '<div class="rv-subs">' + step.subs.map(s => subControl(s, on)).join("") + '</div>'
+    + '</section>';
+}
+function depGateSection(){
+  const cur = String(settingValue("dep_gate") || "merge");
+  const opts = DEP_GATE.options.map(o => {
+    const on = o.value === cur;
+    return '<label class="rv-radio' + (on ? " rv-radio--on" : "") + '">'
+      + '<input type="radio" name="dep-gate" class="rv-radio-input" data-dep-gate="' + esc(o.value) + '"' + (on ? " checked" : "") + (SAVE_BUSY ? " disabled" : "") + '>'
+      + '<span class="rv-radio-body"><span class="rv-radio-label">' + esc(o.label)
+      + '<span class="rv-radio-hint">' + esc(o.hint) + '</span></span>'
+      + '<span class="rv-radio-sub">' + esc(o.sub) + '</span></span></label>';
+  }).join("");
+  return '<section class="pl-card rv-step">'
+    + '<div class="rv-step-head"><div class="rv-step-headings"><h2 class="rv-step-title">' + esc(DEP_GATE.title) + '</h2>'
+    + '<p class="rv-step-lede">' + esc(DEP_GATE.lede) + '</p></div></div>'
+    + '<div class="rv-radios">' + opts + '</div>'
+    + '<p class="rv-knob-help">' + esc(DEP_GATE.help) + '</p>'
+    + inlineMsg(SETTINGS_MSG.dep_gate) + '</section>';
+}
+function restartBanner(settings){
+  const pending = (settings && settings.pending_restart) || [];
+  if (!pending.length) return "";
+  const labels = pending.map(p => esc(p.label || p.key)).join(", ");
+  const n = pending.length;
+  const noun = n === 1 ? "change takes" : "changes take";
+  return '<div class="pl-callout pl-callout--info rv-restart">'
+    + '<div class="rv-restart-title">' + n + " " + noun + ' effect after a restart</div>'
+    + '<p class="rv-restart-list">' + labels + '</p>'
+    + '<p class="rv-restart-how">Restart this board member — stop and start it (or restart the agent) — to apply '
+    + (n === 1 ? "it" : "them") + '.</p></div>';
+}
+
+function view(){
+  return restartBanner(SETTINGS)
+    + '<p class="rv-intro">What happens after a pull request opens — each step runs in order, and you can turn any of them off.</p>'
+    + STEPS.map(stepCard).join("")
+    + depGateSection();
+}
+
+function paint(){
+  const host = $("review");
+  if (SETTINGS) host.innerHTML = view();
+}
+
+let RENDER_VERSION = 0;
+async function load(){
+  const version = ++RENDER_VERSION;
+  const host = $("review");
+  let done = false;
+  const slow = setTimeout(() => {
+    if (!done && version === RENDER_VERSION && !host.firstChild) host.innerHTML = '<p class="rv-loading">Reading review & merge settings…</p>';
+  }, SLOW_MS);
+  try {
+    // Settings is primary (every knob + the banner). routing/effective is best-effort: an
+    // unreachable routing read only costs the reviewer picker its delegate list — it falls back
+    // to free text — never the whole page.
+    const [settings, routing] = await Promise.all([
+      api(SETTINGS_API),
+      api(ROUTING_API).catch(() => null),
+    ]);
+    done = true; clearTimeout(slow);
+    if (version !== RENDER_VERSION) return;
+    SETTINGS = settings; ROUTING = routing;
+    paint();
+  } catch (e) {
+    done = true; clearTimeout(slow);
+    if (version === RENDER_VERSION) host.innerHTML = callout("error", "Could not load the review & merge settings: " + String((e && e.message) || e));
+  } finally {
+    clearTimeout(slow);
+  }
+}
+
+// A restart-only knob just saved: nudge the host to show its own pending-restart affordance.
+// Harmless before core #4489 ships (no listener answers), and our banner already lists it.
+function postRestartPending(result){
+  try {
+    window.parent.postMessage({
+      type: "protoagent:settings:restart-pending",
+      plugin: "project_board",
+      keys: ((result && result.pending_restart) || []).map(p => p.key),
+    }, "*");
+  } catch (e) { /* no host frame */ }
+}
+
+async function saveSetting(key, value){
+  if (SAVE_BUSY) return;
+  const restart = !!(settingMeta(key) || {}).restart;
+  SAVE_BUSY = true;
+  SETTINGS_MSG = { [key]: { kind: null, text: "Saving…" } };
+  // Optimistic: reflect the submitted value at once (so an off step greys its subs immediately);
+  // the re-read below replaces it with exactly what the host saved.
+  if (SETTINGS && SETTINGS.settings && SETTINGS.settings[key]) SETTINGS.settings[key].value = value;
+  paint();
+  try {
+    const result = await api(SETTINGS_API, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ [key]: value }) });
+    SETTINGS_MSG = { [key]: { kind: "ok", text: restart ? "Saved — restart to apply." : "Saved." } };
+    if (restart) postRestartPending(result);
+  } catch (e) {
+    SETTINGS_MSG = { [key]: { kind: "error", text: String((e && e.message) || e) } };
+  } finally {
+    SAVE_BUSY = false;
+    try { SETTINGS = await api(SETTINGS_API); } catch (_e) { /* keep last snapshot */ }
+    paint();
+  }
+}
+function choosePicker(key, value){
+  saveSetting(key, String(value == null ? "" : value).trim());
+}
+function stepKnob(key, dir){
+  const meta = settingMeta(key) || {};
+  const next = Math.max(meta.minimum, Math.min(meta.maximum, Number(meta.value) + dir));
+  if (next === Number(meta.value)) return;
+  saveSetting(key, next);
+}
+
+// Delegated listeners — #review's innerHTML is rebuilt on every paint.
+$("review").addEventListener("change", (e) => {
+  if (SAVE_BUSY) return;
+  const stepSw = e.target.closest("[data-step-switch]");
+  if (stepSw) { saveSetting(stepSw.dataset.stepSwitch, stepSw.checked); return; }
+  const bool = e.target.closest("[data-bool]");
+  if (bool) { saveSetting(bool.dataset.bool, bool.checked); return; }
+  const picker = e.target.closest("[data-picker]");
+  if (picker) {
+    const key = picker.dataset.picker;
+    if (picker.value === "__custom__") {
+      PICKER_CUSTOM[key] = true; SETTINGS_MSG = {}; paint();
+      try { const t = document.querySelector && document.querySelector('[data-picker-text="' + key + '"]'); if (t && t.focus) t.focus(); } catch (_e) { /* no DOM */ }
+      return;
+    }
+    PICKER_CUSTOM[key] = false; choosePicker(key, picker.value); return;
+  }
+  const ptext = e.target.closest("[data-picker-text]");
+  if (ptext) { choosePicker(ptext.dataset.pickerText, ptext.value); return; }
+  const method = e.target.closest("[data-method]");
+  if (method) { saveSetting(method.dataset.method, method.value); return; }
+  const dep = e.target.closest("[data-dep-gate]");
+  if (dep && dep.checked) { saveSetting("dep_gate", dep.dataset.depGate); return; }
+});
+$("review").addEventListener("click", (e) => {
+  const step = e.target.closest("[data-step]");
+  if (!step || SAVE_BUSY) return;
+  stepKnob(step.dataset.step, Number(step.dataset.dir));
+});
+
+let booted = false;
+if (!kit) {
+  $("review").innerHTML = callout("error", "Could not load the authenticated plugin bridge. Open this from the Configure dialog.");
+} else {
+  kit.initPluginView(() => { if (!booted) { booted = true; load(); } });
+}
+</script></body></html>

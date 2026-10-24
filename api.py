@@ -213,6 +213,7 @@ def build_router(cfg: dict):
     from .board_view import BOARD_PAGE
     from .overview_view import OVERVIEW_PAGE
     from .projects_view import PROJECTS_PAGE
+    from .review_view import REVIEW_PAGE
     from .routing_view import ROUTING_PAGE
 
     router = APIRouter()
@@ -271,6 +272,18 @@ def build_router(cfg: dict):
         operator-bearer-gated ``/api/plugins/project_board/routing`` routes.
         """
         return HTMLResponse(ROUTING_PAGE, headers={"Cache-Control": "no-store"})
+
+    @router.get("/config/review", response_class=HTMLResponse)
+    async def _review_config():
+        """Public page chrome for the Review & merge Configure tab (S4, #614).
+
+        Like Overview and Routing it holds no board data: the Review→CI→Rebase→Merge step
+        switches, their attempts steppers, the workflow/reviewer/merge-method pickers and the
+        dependent-cards radio all read and write through the operator-bearer-gated
+        ``/api/plugins/project_board`` routes (settings + routing/effective for the delegate
+        picker) via the authenticated plugin-kit fetch.
+        """
+        return HTMLResponse(REVIEW_PAGE, headers={"Cache-Control": "no-store"})
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
