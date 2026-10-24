@@ -282,16 +282,18 @@ config:
                             # on PRIVATE packages. Blank = anonymous reads (public packages).
                             # Or set PROJECT_BOARD_NPM_TOKEN (then NPM_TOKEN).
 
-# Configure-dialog information architecture (protoAgent #3179/#3180). `projects` is
-# plugin-owned UI because a keyed map is not an honest scalar field; the other tabs use
-# the generic schema renderer. min_protoagent_version keeps hosts without this contract
-# from loading a Configure surface they cannot render faithfully.
+# Configure-dialog information architecture (protoAgent #3179/#3180). `overview`,
+# `projects`, `routing` (Coders) and `review` (Review & merge) are plugin-owned pages
+# (a `path:`): a keyed map, live counts, a routing ladder and a Review→CI→Rebase→Merge
+# pipeline are not honest scalar fields. `automation` and `security` still use the generic
+# schema renderer below. min_protoagent_version keeps hosts without this contract from
+# loading a Configure surface they cannot render faithfully.
 settings_tabs:
   - { id: overview, label: "Overview", path: /plugins/project_board/config/overview }
   - { id: projects, label: "Projects", path: /plugins/project_board/config/projects }
   - { id: routing, label: "Coders", path: /plugins/project_board/config/routing }
   - { id: automation, label: "Automation" }
-  - { id: review, label: "Review & merge" }
+  - { id: review, label: "Review & merge", path: /plugins/project_board/config/review }
   - { id: security, label: "Security" }
 
 # Console settings. `restart: true` is deliberate: only LIVE_KNOBS are re-applied by
@@ -309,6 +311,15 @@ settings_tabs:
 # Advanced block — `max_concurrent_sessions`, `coder_solve`, `coder_solve_test_cmd`,
 # `max_mode_n`, `decompose_after_timeouts`, `goal_verify`. None render as generic schema fields;
 # all are written through PUT /settings and tracked in pending_restart via settings_api's
+# hand-added allowlist.
+#
+# The Review & merge tab (S4, #614) owns the whole after-a-PR-opens pipeline by the SAME
+# mechanism — a Review→CI→Rebase→Merge page of step cards (each an on/off switch plus its
+# attempts steppers) with workflow/reviewer/merge-method pickers and the dependent-cards radio.
+# These fifteen keys left the schema list below: `review_gate`, `review_workflow`, `reviewer`,
+# `review_dispatch`, `review_fix_max`, `ci_poll`, `ci_rerun_max`, `ci_fix_max`, `auto_rebase`,
+# `rebase_fix_max`, `auto_merge`, `merge_method`, `merged_verify_max`, `merge_poll`, `dep_gate`.
+# They are still written through PUT /settings and tracked in pending_restart via settings_api's
 # hand-added allowlist. The automation schema tab below now holds only br_autofetch, base_refresh
 # and local_gate_cmd (S5 relocates those).
 settings:
@@ -319,36 +330,10 @@ settings:
   - { key: local_gate_cmd, label: "Checks before opening a pull request", type: string, group: "Project Board", tab: automation, restart: true,
       description: "Run this check command before opening a pull request unless the project overrides it; blank disables the default checks." }
 
-  - { key: auto_merge, label: "Merge approved pull requests automatically", type: bool, group: "Project Board", tab: review,
-      description: "Merge pull requests when all required checks and reviews are current and passing, unless the card is held for manual approval." }
-  - { key: merged_verify_max, label: "Failed checks before holding a merge", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review,
-      description: "Hold automatic merging after this many failed or inconclusive checks against the latest base; zero allows unlimited attempts." }
-  - { key: merge_method, label: "How to merge pull requests", type: select, options: [squash, merge, rebase], group: "Project Board", tab: review, restart: true, depends_on: { key: auto_merge },
-      description: "Use this GitHub merge method when merging pull requests automatically." }
-  - { key: review_gate, label: "Require review before merging", type: bool, group: "Project Board", tab: review, restart: true,
-      description: "Review changes before merging and send serious findings back to the coder to fix." }
-  - { key: review_workflow, label: "Workflow for required reviews", type: string, group: "Project Board", tab: review, restart: true, depends_on: { key: review_gate },
-      description: "Use this configured workflow to review changes before allowing a merge." }
-  - { key: reviewer, label: "Agent for pull request reviews", type: string, group: "Project Board", tab: review, restart: true,
-      description: "Use this review agent for optional reviews or when required reviews have no workflow runner available." }
-  - { key: review_dispatch, label: "Request an extra review on opening", type: bool, group: "Project Board", tab: review, restart: true,
-      description: "Ask the review agent for an advisory review when a pull request opens." }
-  - { key: review_fix_max, label: "Attempts to fix review findings", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: review_gate },
-      description: "Let the coder fix review findings this many times before blocking the card for your attention." }
-  - { key: merge_poll, label: "Check pull request status automatically", type: bool, group: "Project Board", tab: review, restart: true,
-      description: "Check for merged or closed pull requests so the board stays current even when GitHub cannot send updates." }
-  - { key: ci_poll, label: "Send failed checks back to the coder", type: bool, group: "Project Board", tab: review, restart: true,
-      description: "Check pull request test results and send failures back to the coder to fix." }
-  - { key: ci_fix_max, label: "Attempts to fix failed checks", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: ci_poll },
-      description: "Allow this many automatic fixes for failed checks before blocking the card; zero blocks on the first failure." }
-  - { key: ci_rerun_max, label: "Rerun failed checks before changing code", type: number, minimum: 0, maximum: 5, group: "Project Board", tab: review, restart: true, depends_on: { key: ci_poll },
-      description: "Retry failed GitHub Actions jobs this many times before asking for a code fix; zero disables retries." }
-  - { key: auto_rebase, label: "Update pull requests with base changes", type: bool, group: "Project Board", tab: review, restart: true,
-      description: "Update pull requests when their base branch changes and ask the coder to resolve conflicts." }
-  - { key: rebase_fix_max, label: "Attempts to fix merge conflicts", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review, restart: true, depends_on: { key: auto_rebase },
-      description: "Let the coder resolve merge conflicts this many times before blocking the card." }
-  - { key: dep_gate, label: "When dependent cards can start", type: select, options: [merge, review], group: "Project Board", tab: review, restart: true,
-      description: "Start dependent cards after their prerequisite merges or reaches review; shared foundation changes must always merge first." }
+  # The Review & merge pipeline (auto_merge, merged_verify_max, merge_method, review_gate,
+  # review_workflow, reviewer, review_dispatch, review_fix_max, merge_poll, ci_poll, ci_fix_max,
+  # ci_rerun_max, auto_rebase, rebase_fix_max, dep_gate) moved to the plugin-owned Review & merge
+  # page (S4, #614) — see the Review tab in settings_tabs and settings_api's _PAGE_OWNED.
 
   - { key: webhook_secret, label: "Secret for GitHub updates", type: secret, group: "Project Board", tab: security, restart: true,
       description: "Verify incoming merge, check, and review updates with this secret; blank disables public update routes." }

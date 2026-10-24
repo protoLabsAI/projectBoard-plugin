@@ -287,11 +287,14 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
-    # Page-owned by the Coders tab (S3, #613): the `coder` picker, the two capacity steppers and
-    # the six Advanced tuning knobs were removed from the generic `settings:` list but are still
-    # written through PUT /settings — settings_api hand-adds them to its allowlist, exactly like
-    # loop_enabled. The automation schema tab now holds only br_autofetch/base_refresh/local_gate_cmd.
+    # Page-owned by the Coders tab (S3, #613) and the Review & merge tab (S4, #614): these knobs
+    # were removed from the generic `settings:` list but are still written through PUT /settings —
+    # settings_api hand-adds them to its allowlist, exactly like loop_enabled. The Coders tab owns
+    # the `coder` picker, the two capacity steppers and the six Advanced tuning knobs; the Review
+    # tab owns the whole Review→CI→Rebase→Merge pipeline plus the dependent-cards gate. The
+    # automation schema tab now holds only br_autofetch/base_refresh/local_gate_cmd.
     page_owned = {
+        # Coders tab (S3, #613)
         "coder",
         "max_concurrent",
         "max_pending_reviews",
@@ -301,6 +304,22 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "max_mode_n",
         "decompose_after_timeouts",
         "goal_verify",
+        # Review & merge tab (S4, #614)
+        "review_gate",
+        "review_workflow",
+        "reviewer",
+        "review_dispatch",
+        "review_fix_max",
+        "ci_poll",
+        "ci_rerun_max",
+        "ci_fix_max",
+        "auto_rebase",
+        "rebase_fix_max",
+        "auto_merge",
+        "merge_method",
+        "merged_verify_max",
+        "merge_poll",
+        "dep_gate",
     }
     hidden = {
         # Page-owned: the Overview tab (S1a, #611) renders loop_enabled's on/off switch, so it
@@ -355,9 +374,11 @@ def test_manifest_declares_the_ordered_tabbed_config_contract():
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
         {"id": "routing", "label": "Coders", "path": "/plugins/project_board/config/routing"},
         {"id": "automation", "label": "Automation"},
-        {"id": "review", "label": "Review & merge"},
+        {"id": "review", "label": "Review & merge", "path": "/plugins/project_board/config/review"},
         {"id": "security", "label": "Security"},
     ]
+    # The review tab gained a `path` (S4, #614), so only automation + security use the generic
+    # schema renderer now; the tab id `review` is unchanged, so its deep links survive.
     schema_tabs = {t["id"] for t in m["settings_tabs"] if "path" not in t}
     assert {field["tab"] for field in m["settings"]} <= schema_tabs
     assert {field["tab"] for field in m["settings"]} == schema_tabs

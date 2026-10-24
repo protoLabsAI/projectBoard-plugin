@@ -45,12 +45,13 @@ SETTINGS.setdefault(
     {"label": "Build ready cards automatically", "type": "bool", "minimum": None, "maximum": None, "options": None},
 )
 
-# The Coders Configure tab (S3, #613) owns these nine by the SAME mechanism as loop_enabled:
-# they were removed from the manifest `settings:` block (so the host's generic schema renderer
-# no longer draws them), but the Coders page still reads and writes them through PUT /settings —
-# so they stay in this allowlist by hand, carrying the label/type/bounds the manifest `settings:`
-# entries used to declare (their defaults still come from `config:` below). Keep each line in
-# step with the loop's LIVE_KNOBS classification and with view/routing.js's own copy.
+# The Coders Configure tab (S3, #613) and the Review & merge tab (S4, #614) own these by the
+# SAME mechanism as loop_enabled: each key was removed from the manifest `settings:` block (so
+# the host's generic schema renderer no longer draws it), but the page still reads and writes it
+# through PUT /settings — so they stay in this allowlist by hand, carrying the label/type/bounds
+# the manifest `settings:` entries used to declare (their defaults still come from `config:`
+# below). Keep each line in step with the loop's LIVE_KNOBS classification and with the page's
+# own copy (view/routing.js, view/review.html).
 _PAGE_OWNED = {
     "coder": {"label": "Coder for builds", "type": "string", "minimum": None, "maximum": None, "options": None},
     "max_concurrent": {
@@ -108,6 +109,113 @@ _PAGE_OWNED = {
         "minimum": None,
         "maximum": None,
         "options": None,
+    },
+    # ── Review & merge tab (S4, #614): the Review→CI→Rebase→Merge pipeline, the
+    # workflow/reviewer/merge-method pickers and the dependent-cards radio. ───────────────
+    "review_gate": {
+        "label": "Require review before merging",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "review_workflow": {
+        "label": "Workflow for required reviews",
+        "type": "string",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "reviewer": {
+        "label": "Agent for pull request reviews",
+        "type": "string",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "review_dispatch": {
+        "label": "Request an extra review on opening",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "review_fix_max": {
+        "label": "Attempts to fix review findings",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 20,
+        "options": None,
+    },
+    "ci_poll": {
+        "label": "Send failed checks back to the coder",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "ci_rerun_max": {
+        "label": "Rerun failed checks before changing code",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 5,
+        "options": None,
+    },
+    "ci_fix_max": {
+        "label": "Attempts to fix failed checks",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 20,
+        "options": None,
+    },
+    "auto_rebase": {
+        "label": "Update pull requests with base changes",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "rebase_fix_max": {
+        "label": "Attempts to fix merge conflicts",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 20,
+        "options": None,
+    },
+    "auto_merge": {
+        "label": "Merge approved pull requests automatically",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "merge_method": {
+        "label": "How to merge pull requests",
+        "type": "select",
+        "minimum": None,
+        "maximum": None,
+        "options": ["squash", "merge", "rebase"],
+    },
+    "merged_verify_max": {
+        "label": "Failed checks before holding a merge",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 20,
+        "options": None,
+    },
+    "merge_poll": {
+        "label": "Check pull request status automatically",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "dep_gate": {
+        "label": "When dependent cards can start",
+        "type": "select",
+        "minimum": None,
+        "maximum": None,
+        "options": ["merge", "review"],
     },
 }
 for _key, _meta in _PAGE_OWNED.items():
