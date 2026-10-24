@@ -196,6 +196,7 @@ def test_live_counts_and_repeated_rechecks(health_fails):
     harness = r"""
 import assert from 'node:assert/strict';
 const BASE = '';
+globalThis.window = {parent: {}, addEventListener() {}};
 let button, markup = '', boot, release;
 let reads = 0;
 const listeners = {};
@@ -249,6 +250,99 @@ for (let attempt = 0; attempt < 2; attempt++) {
 }
 assert.equal(reads, 9);
 """
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", harness + script + assertions],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize(
+    "capabilities",
+    [None, {}, {"restart": False}, {"restart": "true"}, {"restart": True}, ["protoagent:restart-request"]],
+)
+def test_restart_host_contract_and_fresh_settings(capabilities):
+    """Exercise the actual module: opt-in, targeted message, reconnect and stale reads."""
+    script = OVERVIEW_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0]
+    script = script.replace('import(BASE + "/_ds/plugin-kit.js")', "globalThis.testKit")
+    harness = r"""
+import assert from 'node:assert/strict';
+const BASE = '/agents/member';
+const origin = 'https://console.example';
+let message, boot, markup = '', reads = 0, hold = null;
+let pending = [{key: 'internal', label: 'Build ready cards automatically'}];
+const clicks = {};
+const posts = [];
+const parent = {postMessage(...args) { posts.push(args); }};
+globalThis.window = {parent, addEventListener(type, fn) { message = fn; }};
+const host = {
+  addEventListener(type, fn) { clicks[type] = fn; },
+  set innerHTML(value) { markup = value; },
+};
+globalThis.document = {getElementById(id) { return id === 'ov' ? host : null; }};
+globalThis.testKit = {
+  initPluginView(fn) { boot = fn; },
+  async apiFetch(path, options) {
+    assert.ok(['/api/plugins/project_board/settings', '/api/plugins/project_board/status',
+               '/api/plugins/project_board/features'].includes(path), 'never a restart route');
+    assert.equal(options.cache, 'no-store');
+    assert.equal(options.method, undefined);
+    const data = path.endsWith('/settings') ? {pending_restart: [...pending]} : {};
+    if (path.endsWith('/settings')) reads++;
+    if (hold) await hold;
+    return {ok: true, status: 200, async json() { return data; }};
+  },
+};
+const emit = (data, source = parent, from = origin) => message({data, source, origin: from});
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const clickRestart = () => clicks.click({target: {
+  closest(selector) { return selector === '#restart-now' ? this : null; },
+}});
+"""
+    assertions = r"""
+// Untrusted frames cannot advertise support or initiate reads.
+emit({type: 'protoagent:init', capabilities: {restart: true}}, {});
+assert.equal(reads, 0);
+emit({type: 'protoagent:init', capabilities: {restart: true}}, parent, 'null');
+assert.equal(reads, 0);
+emit({type: 'protoagent:init', capabilities: CAPS});
+boot();
+await settle();
+const supported = CAPS?.restart === true || Array.isArray(CAPS);
+assert.equal(markup.includes('id="restart-now"'), supported);
+assert.equal(markup.includes('Restart this board member'), !supported);
+assert.ok(markup.includes('Build ready cards automatically'));
+clickRestart();
+assert.deepEqual(posts, supported ? [[{type: 'protoagent:restart-request'}, origin]] : []);
+assert.ok(markup.includes('effect after a restart'), 'request does not clear pending');
+const before = reads;
+emit({type: 'protoagent:reconnected'}, {});
+emit({type: 'protoagent:reconnected'}, parent, 'https://other.example');
+assert.equal(reads, before);
+// An old pending snapshot must not overwrite the fresh post-reconnect read.
+let release;
+hold = new Promise(resolve => { release = resolve; });
+emit({type: 'protoagent:reconnected'});
+hold = null;
+pending = [];
+emit({type: 'protoagent:reconnected'});
+await settle();
+assert.equal(reads, before + 2);
+assert.ok(!markup.includes('effect after a restart'));
+release();
+await settle();
+assert.ok(!markup.includes('effect after a restart'));
+// Repeated init also refreshes settings and can withdraw support.
+pending = [{label: 'Another change'}];
+emit({type: 'protoagent:init'});
+await settle();
+assert.equal(reads, before + 3);
+assert.ok(markup.includes('Restart this board member'));
+assert.ok(!markup.includes('id="restart-now"'));
+""".replace("CAPS", json.dumps(capabilities))
     result = subprocess.run(
         ["node", "--input-type=module", "-e", harness + script + assertions],
         capture_output=True,
