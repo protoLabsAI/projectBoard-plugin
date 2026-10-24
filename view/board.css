@@ -47,12 +47,16 @@
     color:var(--pl-color-fg-muted);background:var(--pl-color-bg);border-radius:var(--pl-radius)}
   .lane--drop-no.lane--over .lane-why{color:var(--pl-color-fg);opacity:1}
   /* Cards: id/priority row, title, a one-line spec, then chips. */
-  .card{--card-accent:var(--lane);position:relative;background:var(--pl-color-bg-raised);
+  .card,.skel-card{--card-accent:var(--lane);position:relative;background:var(--pl-color-bg-raised);
     border:var(--pl-border-width) solid var(--pl-color-border);border-left:3px solid var(--card-accent);
     border-radius:var(--pl-radius);padding:8px 10px 9px 10px;
     box-shadow:0 1px 2px color-mix(in srgb,var(--pl-color-fg) 7%,transparent);
     transition:border-color .15s ease,box-shadow .2s ease,opacity .2s ease;outline:none}
   .card--movable{cursor:grab;touch-action:pan-y}
+  /* First-load placeholder (renderSkeleton in the view JS): a card-shaped box around the DS
+     skeleton bars (.pl-skel from plugin-kit.css — the shimmer and its reduced-motion
+     static fill are the kit's). Not a .card, so no card handler ever sees it. */
+  .skel-card{--card-accent:var(--pl-color-border);pointer-events:none;box-shadow:none}
   .card--blocked{--card-accent:var(--pl-color-status-error)}
   .card--waiting{--card-accent:var(--pl-color-status-warning)}
   .lane[data-lane="backlog"] .card:not(.card--blocked):not(.card--waiting){--card-accent:var(--pl-color-border-strong,var(--pl-color-fg-muted))}
