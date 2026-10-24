@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Callable
 
 from .. import host_friction, review_coverage_hold
 from ..projects import normalize_tier_config
@@ -35,8 +36,21 @@ _FRICTION_BLOCK_CAUSES = (
 
 
 class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
-    def __init__(self, cfg: dict, *, gap_reporter: setup_check.GapReporter | None = None):
+    def __init__(
+        self,
+        cfg: dict,
+        *,
+        gap_reporter: setup_check.GapReporter | None = None,
+        wall_clock: Callable[[], float] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+    ):
         self.cfg = cfg or {}
+        self._wall_clock = wall_clock or time.time
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self.wake_settle_gap_s = max(0.0, float(self.cfg.get("wake_settle_gap_s", 60)))
+        self.wake_settle_ticks = _knob_int(self.cfg, "wake_settle_ticks", 2, floor=0)
+        self._last_tick_clocks: tuple[float, float] | None = None
+        self._wake_settle_remaining = 0
         tier_cfg = normalize_tier_config(self.cfg)
         # Setup preflight (v0.42.0): the host-gap reporter register() built around the
         # plugin registry (a no-op reporter when the host lacks the seam or — in the
