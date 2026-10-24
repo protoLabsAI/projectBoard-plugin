@@ -33,6 +33,17 @@ _MANIFEST = yaml.safe_load(Path(__file__).with_name("protoagent.plugin.yaml").re
 # to fail and the next rewording a one-file change.
 _META_FIELDS = ("label", "type", "minimum", "maximum", "options")
 SETTINGS = {entry["key"]: {field: entry.get(field) for field in _META_FIELDS} for entry in _MANIFEST["settings"]}
+
+# `loop_enabled` OUTLIVES its manifest `settings:` entry (#611, S1a): the Overview Configure
+# tab owns its on/off switch, so it was removed from the generic schema UI — but the switch
+# still saves through this boundary (PUT /settings) and the value must still appear in
+# pending_restart (it is restart-only, not a LIVE_KNOB). This is the deliberate hand-add the
+# header comment above describes: add it to the derived mapping rather than let the Overview
+# page re-implement the guarded write. Its boot value/default still come from `config:` below.
+SETTINGS.setdefault(
+    "loop_enabled",
+    {"label": "Build ready cards automatically", "type": "bool", "minimum": None, "maximum": None, "options": None},
+)
 _DEFAULTS = _MANIFEST["config"]
 _boot_values: dict | None = None
 
