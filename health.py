@@ -156,6 +156,22 @@ def orphaned_cards_snapshot() -> list:
     return [dict(c) for c in _health.get("orphaned_cards") or ()]
 
 
+def publish_merge_holds(cards: list) -> None:
+    """Called by the reconcile pass with the in_review cards whose merge-state hold (#495)
+    has stood longer than ``merge_hold_alert_s`` — a PR GitHub has read not-clean for hours,
+    stuck the same way a claim stall leaves ready work unclaimed. Each is ``{id, hold, age_s,
+    status, pr_url}``: ``hold`` is the operator text (``held: PR not clean on GitHub
+    (UNSTABLE) — QA panel: in progress``) and ``age_s`` how long it has been held. ``[]``
+    clears the entry, so a hold that cleared, merged or closed drops off the next pass."""
+    _health["merge_holds"] = [dict(c) for c in cards or ()]
+
+
+def merge_holds_snapshot() -> list:
+    """The long-held merge-state holds the last reconcile pass found — ``[]`` before the
+    first pass, on a board whose loop is off, or when none exceed ``merge_hold_alert_s``."""
+    return [dict(c) for c in _health.get("merge_holds") or ()]
+
+
 def publish_claim_stall(reason: str) -> None:
     """Called by the loop when its claim-stall signal changes (#462): the reason the board
     is idle with ready work and a free slot, or "" once the claim scan runs again."""

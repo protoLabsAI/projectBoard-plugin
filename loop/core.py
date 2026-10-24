@@ -159,6 +159,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # public webhook URL. On by default (cheap; only probes `in_review` PRs).
         self.merge_poll = bool(self.cfg.get("merge_poll", True))
         self.merge_poll_interval = float(self.cfg.get("merge_poll_interval_s", 60))
+        # #495: how long a PR GitHub reads as not-clean (UNSTABLE/BLOCKED) may sit held
+        # before the reconcile pass publishes it to /status health — a stuck PR surfaced
+        # like a claim stall, not left reading `auto-merge pending` for hours. 0 turns the
+        # health entry off (the per-card next_action hold still shows, as before).
+        self.merge_hold_alert_s = float(self.cfg.get("merge_hold_alert_s", 3600))
         # How many in_review/blocked cards' PR reconciles (rebase, merged-state gate, CI,
         # review gate, auto-merge) run at once (#462). Each is its own task, off the tick,
         # so the claim scan never waits on them; this bounds them against each other.

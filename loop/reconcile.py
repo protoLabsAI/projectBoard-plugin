@@ -1071,6 +1071,11 @@ class ReconcileMixin:
         claimed nothing for four hours with 32 cards ready. Without it (a direct call) the
         pass is awaited to the end, and a stalled store still raises out of it."""
         store = self._store()
+        # #495: before this pass's card reconciles move anything, publish the cards GitHub
+        # has held not-clean past merge_hold_alert_s for /status health. It reads the merge
+        # edge's own process state, so it reflects the holds the previous pass's reconciles
+        # left and this pass's clears show on the next one — like a claim stall, surfaced.
+        self._publish_merge_holds()
         # #196: blocked cards can carry a PR too (review-verify blocks, closed-PR triage,
         # manual flags) — a merged PR is ground truth for them exactly as for in_review,
         # and scanning only in_review left merged-but-blocked cards stuck forever. They
@@ -1502,6 +1507,43 @@ class ReconcileMixin:
                 "; ".join(checks) or "no pending or failing check in the pass's read",
                 pr_url,
             )
+
+    def _publish_merge_holds(self) -> None:
+        """Publish the in_review cards GitHub has held not-clean (UNSTABLE/BLOCKED) longer
+        than ``merge_hold_alert_s`` for /status health (#495 slice 2) — a PR stuck the way a
+        claim stall leaves ready work, surfaced instead of reading ``auto-merge pending`` for
+        hours. Reads the merge edge's own process state (``merge_state_hold``, which stamps a
+        first-seen ``since`` on each hold), so a hold that cleared, merged or closed — all go
+        through its ``clear_hold`` — drops off the next pass. Each row carries the operator
+        hold text and the age. 0 turns the health entry off; the per-card next_action hold
+        still shows. Best-effort: health bookkeeping never breaks the reconcile pass."""
+        try:
+            if not self.merge_hold_alert_s:
+                health.publish_merge_holds([])
+                return
+            now = time.time()
+            rows = []
+            for fid, hold in merge_state_hold.all_holds().items():
+                age = now - float(hold.get("since") or now)
+                if age < self.merge_hold_alert_s:
+                    continue
+                status = str(hold.get("status") or "")
+                checks = list(hold.get("checks") or [])
+                text = f"{store_mod.NEXT_ACTION_MERGE_STATE_HOLD_PREFIX} ({status})"
+                if checks:
+                    text += " — " + "; ".join(checks)
+                rows.append(
+                    {
+                        "id": fid,
+                        "hold": text,
+                        "age_s": age,
+                        "status": status,
+                        "pr_url": str(hold.get("pr_url") or ""),
+                    }
+                )
+            health.publish_merge_holds(rows)
+        except Exception:  # noqa: BLE001 — a health publish must never break the reconcile
+            log.warning("[project_board] publishing merge-state holds failed (ignored)", exc_info=True)
 
     async def _maybe_auto_merge(self, store, fid: str, pr_url: str, repo: str, *, view: dict | None = None) -> bool:
         """Merge an in_review PR once every gate the loop owns is green and current
