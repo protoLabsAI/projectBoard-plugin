@@ -2,22 +2,51 @@
 [hidden]{display:none!important}
 html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);font-family:var(--pl-font-sans);font-size:13px}
 .wrap{padding:var(--pl-space-4);max-width:760px;margin:0 auto}
-.head,.panel-head,.row,.actions{display:flex;align-items:center;gap:var(--pl-space-3)}
+.head,.panel-head,.actions{display:flex;align-items:center;gap:var(--pl-space-3)}
 .head,.panel-head{justify-content:space-between}.head{margin-bottom:var(--pl-space-4)}
 h1{font-size:16px;margin:0 0 3px}h2{font-size:14px;margin:0}.head p{margin:0;color:var(--pl-color-fg-muted)}
-.panel{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);padding:var(--pl-space-4);margin-bottom:var(--pl-space-3)}
-.project{margin-bottom:var(--pl-space-3)}.project h2{font-family:var(--pl-font-mono)}
-.meta{display:grid;grid-template-columns:minmax(90px,auto) 1fr;gap:5px var(--pl-space-3);margin:var(--pl-space-3) 0;color:var(--pl-color-fg-muted)}
-.meta dt{font-weight:600}.meta dd{margin:0;overflow-wrap:anywhere;color:var(--pl-color-fg)}
-.badge{font-size:10px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:999px;padding:2px 7px;color:var(--pl-color-fg-muted)}
+.mono{font-family:var(--pl-font-mono)}
 .empty{text-align:center;padding:var(--pl-space-6);color:var(--pl-color-fg-muted);border:var(--pl-border-width) dashed var(--pl-color-border);border-radius:var(--pl-radius)}
+.badge{font-size:10px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:999px;padding:2px 7px;color:var(--pl-color-fg-muted);white-space:nowrap}
+
+/* Compact rows: one project per line so ~14 fit about one screen. The gate command is never
+   here — it lives in the editor's Checks section. The checks dot + its one-line reason are. */
+.rows{display:flex;flex-direction:column;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);overflow:hidden}
+.rows:empty,.rows:has(.empty){border:0}
+.prow-wrap{display:flex;align-items:center;gap:var(--pl-space-2);border-top:var(--pl-border-width) solid var(--pl-color-border);background:var(--pl-color-bg-raised)}
+.prow-wrap:first-child{border-top:0}
+.prow-wrap.malformed{flex-wrap:wrap}
+.prow{flex:1;min-width:0;display:flex;align-items:center;gap:var(--pl-space-3);padding:7px var(--pl-space-3);border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.prow:hover:not(:disabled){background:var(--pl-color-bg-hover)}
+.prow:disabled{cursor:default}
+.prow:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:-2px}
+.prow .pl-dot{flex:0 0 auto}
+.prow-name{font-family:var(--pl-font-mono);font-weight:var(--pl-font-weight-semibold,600);flex:0 0 auto;white-space:nowrap}
+.prow-repo{font-family:var(--pl-font-mono);color:var(--pl-color-fg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.prow-branch{color:var(--pl-color-fg-muted);flex:0 0 auto;font-size:12px}
+.prow-tail{margin-left:auto;display:flex;align-items:center;gap:var(--pl-space-3);min-width:0}
+.prow-reason{color:var(--pl-color-status-error);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40ch}
+.prow-del{flex:0 0 auto;margin-right:var(--pl-space-3);padding:4px 9px}
+.prow-note{flex:0 0 100%;margin:0 var(--pl-space-3) var(--pl-space-3)}
+
 .btn{cursor:pointer;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);color:var(--pl-color-fg);padding:7px 11px;font:inherit}
 .btn:hover{border-color:var(--pl-color-accent)}.btn.primary{background:var(--pl-color-accent);border-color:var(--pl-color-accent);color:var(--pl-color-bg)}.btn.danger{color:var(--pl-color-status-error)}
-.btn:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}.btn:disabled{cursor:not-allowed;opacity:.55}
-.project .actions{justify-content:flex-end;border-top:var(--pl-border-width) solid var(--pl-color-border);padding-top:var(--pl-space-3)}
+.btn:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}.btn:disabled{cursor:not-allowed;opacity:.55}
+
+/* Side panel: slides in from the right over a dimmed backdrop; full width on narrow screens. */
+.panel-overlay{position:fixed;inset:0;z-index:20;display:flex;justify-content:flex-end}
+.panel-backdrop{position:absolute;inset:0;background:var(--pl-color-bg);opacity:.55}
+.side-panel{position:relative;width:min(440px,100%);height:100%;overflow-y:auto;background:var(--pl-color-bg-raised);border-left:var(--pl-border-width) solid var(--pl-color-border);padding:var(--pl-space-4);box-shadow:var(--pl-shadow-overlay,none)}
+.panel-head{margin-bottom:var(--pl-space-3)}
+.checks{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);padding:0 var(--pl-space-3)}
+.checks[open]{padding-bottom:var(--pl-space-3)}
+.checks summary{cursor:pointer;padding:var(--pl-space-3) 0;font-weight:var(--pl-font-weight-semibold,600)}
+.checks .mono{white-space:pre-wrap;overflow-wrap:anywhere}
+
 form{margin-top:var(--pl-space-4)}fieldset{display:grid;gap:var(--pl-space-3);margin:0;padding:0;border:0;min-width:0}label{display:grid;gap:5px;font-weight:600}label small{font-weight:400;color:var(--pl-color-fg-muted)}
+.checks label{margin-top:var(--pl-space-3)}
 input,textarea{width:100%;padding:8px;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg);color:var(--pl-color-fg);font:inherit}textarea{resize:vertical}
 .check{display:flex;grid-template-columns:auto 1fr;align-items:center;font-weight:400}.check input{width:auto}.actions{justify-content:flex-end}
 .pl-callout{margin-bottom:var(--pl-space-3)}
 .callout-row{display:flex;align-items:center;justify-content:space-between;gap:var(--pl-space-3)}
-@media(max-width:520px){.wrap{padding:var(--pl-space-3)}.head{align-items:flex-start}.meta{grid-template-columns:1fr}.project .actions{justify-content:stretch}.project .actions .btn{flex:1}}
+@media(max-width:520px){.wrap{padding:var(--pl-space-3)}.head{align-items:flex-start}.prow{flex-wrap:wrap}.prow-tail{margin-left:0;flex-basis:100%}.side-panel{width:100%;border-left:0}}

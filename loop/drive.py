@@ -442,6 +442,7 @@ class DriveMixin:
                         for stale_name in stale:
                             verdicts.pop(stale_name, None)
                     self._preflight_slow_warned.difference_update(stale)
+                    self._preflight_no_command.difference_update(stale)
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)

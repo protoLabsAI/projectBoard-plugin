@@ -2127,8 +2127,35 @@ def test_status_reports_nothing_held_before_any_preflight_has_run(monkeypatch):
         "dirty": {},
         "slow": {},
         "unwinnable_oracle": {},
+        "passed": [],
         "failures": {},
     }
+
+
+def test_status_publishes_a_per_project_pass_set_excluding_indeterminate_verdicts(monkeypatch):
+    """#612 review: the board page's checks dot must show green from a per-project PASS
+    verdict, never a board-wide 'something ran' flag — otherwise a slow/dirty/oracle entry
+    (or a project added after the last pass) reads as a false green. So /status publishes
+    ``passed``: the projects whose gate ran CLEAN on the base with no caveat. A held (red),
+    dirty or slow (indeterminate, #456/#300) or unwinnable-oracle (#459) project is left out,
+    and a project with no verdict at all is simply absent."""
+    from project_board import health
+
+    health.publish_preflight(
+        {"green": True, "web": "tsc: not found", "edited": True, "slowpoke": True, "noorc": True},
+        {"edited": "uncommitted changes to store.py"},
+        slow={"slowpoke": {"cmd": "pytest", "timeout_s": 60, "sha": "abc1234"}},
+        oracle={"noorc": "coder.solve() oracle is unwinnable"},
+    )
+    c = _client(monkeypatch, FakeStore())
+
+    pf = c.get("/api/plugins/project_board/status").json()["preflight"]
+
+    assert pf["passed"] == ["green"]  # only the clean pass, none of the caveated verdicts
+    assert "web" not in pf["passed"]  # held is red, never green
+    assert "edited" not in pf["passed"]  # dirty checkout -> no verdict
+    assert "slowpoke" not in pf["passed"]  # a timeout is indeterminate
+    assert "noorc" not in pf["passed"]  # unwinnable oracle
 
 
 # ── #258 F2c: async routes run their store calls OFF the event-loop thread ──────

@@ -424,6 +424,7 @@ class PreflightMixin:
             feature = {"project": name}
             cmd = self._preflight_cmd_for(feature)
             if not cmd:
+                self._preflight_no_command.add(name)
                 self._preflight_state[name] = True  # nothing to smoke → runnable
                 continue
             repo = self._repo_for(feature)
@@ -511,6 +512,7 @@ class PreflightMixin:
             slow=self._preflight_slow,
             oracle=self._oracle_unwinnable,
             failures=self._preflight_detail,
+            no_command=self._preflight_no_command,
         )
 
     async def _preflight(
@@ -605,6 +607,7 @@ class PreflightMixin:
                 self._preflight_failed_at.pop(name, None)
                 self._preflight_detail.pop(name, None)
                 self._preflight_friction.pop(name, None)
+                self._preflight_no_command.discard(name)
                 self._preflight_state[name] = True
                 if sha:
                     self._preflight_sha[name] = sha
