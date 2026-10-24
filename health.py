@@ -51,6 +51,7 @@ def publish_preflight(
     slow: dict | None = None,
     oracle: dict | None = None,
     failures: dict | None = None,
+    no_command: set[str] | None = None,
 ) -> None:
     """Called by the loop after each preflight pass with its live maps:
     ``state`` (project -> True | reason-string | None), ``dirty``
@@ -64,7 +65,8 @@ def publish_preflight(
     projects whose gate ran CLEAN on the base (``state`` is True) with no outstanding
     caveat — not ``dirty`` (the checkout wasn't at base, so there is no verdict either
     way, #255/#300), not ``slow`` (a timeout is indeterminate, #456) and not an unwinnable
-    ``oracle`` (#459). A reader (the board page's checks dot) can then show green ONLY for a
+    ``oracle`` (#459), and not ``no_command`` (runnable without running a gate). A reader
+    (the board page's checks dot) can then show green ONLY for a
     real pass instead of guessing from a board-wide "something was evaluated" flag: a held,
     dirty, slow, oracle or not-yet-checked project is simply absent from ``passed`` (#612)."""
     held = {n: r for n, r in state.items() if isinstance(r, str)}
@@ -72,7 +74,13 @@ def publish_preflight(
     slow_map = {n: dict(v) for n, v in (slow or {}).items()}
     oracle_map = dict(oracle or {})
     passed = sorted(
-        n for n, r in state.items() if r is True and n not in dirty_map and n not in slow_map and n not in oracle_map
+        n
+        for n, r in state.items()
+        if r is True
+        and n not in dirty_map
+        and n not in slow_map
+        and n not in oracle_map
+        and n not in (no_command or ())
     )
     _health["preflight"] = {
         "held": held,

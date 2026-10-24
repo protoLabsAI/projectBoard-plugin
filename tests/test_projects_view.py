@@ -172,3 +172,58 @@ def test_projects_css_uses_design_system_tokens_and_no_hardcoded_colours():
     # Colours come from DS tokens (works in light and dark).
     assert "var(--pl-color-bg)" in css and "var(--pl-color-fg)" in css
     assert "var(--pl-color-status-error)" in css
+
+
+async def test_no_command_is_runnable_but_never_published_as_passed(tmp_path, monkeypatch):
+    from project_board import health, worktree
+    from project_board.loop import BoardLoop
+
+    monkeypatch.setattr(health, "_health", {})
+    loop = BoardLoop({"repo": str(tmp_path)})
+    monkeypatch.setattr(loop, "_store", lambda: object())
+    monkeypatch.setattr(loop, "_ready_projects", lambda store: ["ungated", "clean"])
+    monkeypatch.setattr(loop, "_preflight_cmd_for", lambda feature: "exit 0" if feature["project"] == "clean" else "")
+
+    async def clean_checkout(*args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(worktree, "base_checkout_dirt", clean_checkout)
+    await loop._maybe_preflight()
+    loop._publish_preflight_health()
+    assert loop._preflight_state == {"ungated": True, "clean": True}
+    assert health.preflight_snapshot()["passed"] == ["clean"]
+    assert health.preflight_snapshot()["held"] == {}
+
+    # A later successful gate replaces the no-command exemption with a real verdict.
+    await loop._preflight("ungated", "exit 0", str(tmp_path))
+    loop._publish_preflight_health()
+    assert health.preflight_snapshot()["passed"] == ["clean", "ungated"]
+
+
+def test_published_pass_excludes_every_runnable_without_verdict_case(monkeypatch):
+    from project_board import health
+
+    monkeypatch.setattr(health, "_health", {})
+    health.publish_preflight(
+        {"clean": True, "ungated": True, "dirty": True, "slow": True, "oracle": True, "held": "failed", "new": None},
+        {"dirty": "not at base"},
+        slow={"slow": {"timeout_s": 1}},
+        oracle={"oracle": "unwinnable"},
+        no_command={"ungated"},
+    )
+    assert health.preflight_snapshot()["passed"] == ["clean"]
+    assert health.preflight_snapshot()["held"] == {"held": "failed"}
+
+
+def test_gate_configuration_reload_clears_only_changed_no_command_markers(monkeypatch):
+    import project_board.loop as loop_mod
+    from project_board.loop import BoardLoop
+
+    projects = {"changed": {"repo": "/changed"}, "unchanged": {"repo": "/unchanged"}}
+    loop = BoardLoop({"projects": projects, "default_project": "changed"})
+    loop._preflight_no_command.update(projects)
+    loop._preflight_state.update(dict.fromkeys(projects, True))
+    monkeypatch.setattr(loop_mod, "reconfigure_cached_store", lambda **kwargs: True)
+    loop.reload({"projects": {**projects, "changed": {"repo": "/changed", "local_gate_cmd": "exit 0"}}})
+    assert loop._preflight_no_command == {"unchanged"}
+    assert loop._preflight_state == {"unchanged": True}
