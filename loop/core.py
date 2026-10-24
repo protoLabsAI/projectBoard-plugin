@@ -628,6 +628,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # Without this guard every PR was reviewed twice on the same head (2× panel
         # tokens), a duplicate verdict burned the bounce budget (1/2 → 2/2 with no
         # fix between), and two non-deterministic verdicts raced for the label.
+        self._review_tasks: dict[str, asyncio.Task] = {}  # task owning each live gate (#478)
+        self._review_not_running: dict[str, str] = {}  # per-card scheduling diagnostics
         self._review_inflight: set[str] = set()
         # Consecutive failed reap attempts per worktree id (not path, so it survives
         # repo-path changes). After _REAP_WARN_CAP failures the noise is downgraded

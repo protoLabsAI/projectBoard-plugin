@@ -1120,7 +1120,9 @@ class ReconcileMixin:
         if _loop.live_drive(fid) is not None or fid in self._inflight_files:
             return "a drive holds it"
         if fid in self._review_inflight:
-            return "its review gate is running"
+            if self._review_is_running(fid):
+                return "its review gate is running"
+            return self._review_not_running[fid]
         return ""
 
     async def _card_work(self, store, f: dict):
@@ -2995,6 +2997,17 @@ class ReconcileMixin:
                 )
 
     # ── blocking review gate (plan M5) ────────────────────────────────────────
+    def _review_is_running(self, fid: str) -> bool:
+        """Validate the marker against its owning task; repair orphaned markers (#478)."""
+        task = self._review_tasks.get(fid)
+        if task is not None and not task.done():
+            self._review_not_running.pop(fid, None)
+            return True
+        self._review_inflight.discard(fid)
+        self._review_tasks.pop(fid, None)
+        self._review_not_running[fid] = "stale in-flight marker had no live task; retrying next poll"
+        return False
+
     async def _review_gate(self, store, fid: str, pr_url: str, repo: str) -> None:
         """Run the adversarial review workflow on the just-opened PR and act on the
         findings — the review sibling of the CI bounce:
@@ -3021,20 +3034,25 @@ class ReconcileMixin:
         job for gates that actually died (host restart: the set is empty on boot).
         """
         if fid in self._review_inflight:
-            log.debug("[project_board] %s review gate already running — not re-armed", fid)
+            if self._review_is_running(fid):
+                log.debug("[project_board] %s review gate already running — not re-armed", fid)
             return
         zombie = self._review_zombies.get(fid)
         if zombie is not None and not zombie.done():
             # The last review call timed out and was abandoned, but it has not returned yet
             # (#471 review). Starting a second one would stack model calls on a hung stream.
+            self._review_not_running[fid] = "abandoned review call is still running"
             log.warning("[project_board] %s review gate not re-run — its abandoned review call is still running", fid)
             return
         self._review_zombies.pop(fid, None)
         self._review_inflight.add(fid)
+        self._review_tasks[fid] = asyncio.current_task()
+        self._review_not_running.pop(fid, None)
         try:
             await self._review_gate_run(store, fid, pr_url, repo)
         finally:
             self._review_inflight.discard(fid)
+            self._review_tasks.pop(fid, None)
 
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
