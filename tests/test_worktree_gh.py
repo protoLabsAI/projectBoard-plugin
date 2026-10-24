@@ -273,7 +273,7 @@ async def test_pr_unresolved_threads_reads_a_bounded_well_typed_list(gh_fixture,
     assert isinstance(threads, list), "a readable PR must return a list, never None"
     assert len(threads) <= 5
     for t in threads:
-        assert set(t) == {"author", "path", "line", "body"}, t
+        assert set(t) == {"author", "path", "line", "body", "commit", "isOutdated"}, t
         assert isinstance(t["author"], str) and isinstance(t["path"], str) and isinstance(t["body"], str)
 
 

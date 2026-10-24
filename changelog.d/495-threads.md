@@ -13,3 +13,7 @@
   threads never bounce, and an unreadable thread read (a `gh` timeout) changes nothing — it is
   never read as "no threads". Replying to or resolving the threads after the push is out of
   scope.
+  Rebase/conflict and CI repair retain priority over thread fixes. Only non-outdated threads
+  originally posted on the current head can trigger a bounce: unresolved findings from a prior
+  head cannot spend another fix round while the new push awaits review. Unknown provenance
+  leaves the card alone. BEHIND and DIRTY PRs remain owned by the rebase path.

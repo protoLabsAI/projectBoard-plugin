@@ -1243,14 +1243,6 @@ class ReconcileMixin:
                         # merging a PR the panel has rejected spends budget on nothing.
                         if await self._reconcile_external_review(store, f, pr_url, repo, view=view):
                             continue
-                        # #495: the panel edge above only acts on a REVIEW carrying a FAIL marker.
-                        # A bot that leaves its Major/Critical findings as inline REVIEW THREADS
-                        # instead (CodeRabbit) produced an UNSTABLE PR with open Major threads and
-                        # no panel FAIL — it sat in_review forever (bd-fgtf). Bounce it on those
-                        # threads, with the SAME once-per-head / ext-review-fix machinery, and skip
-                        # the edges below for a PR that cannot merge as it stands.
-                        if await self._reconcile_review_threads(store, f, pr_url, repo, view=view):
-                            continue
                         # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
                         # sibling merge re-stales the others off the shared base, and a rebase
                         # force-pushes + re-runs CI — so checking CI on the stale head first
@@ -1266,6 +1258,12 @@ class ReconcileMixin:
                             continue  # blocked on a red merged-state gate (or the card left review) → nothing further
                         if self.ci_poll:
                             await self._reconcile_ci(store, fid, pr_url, repo, feature=f)
+                        # Preserve rebase/conflict and CI repair before spending a thread fix.
+                        # CI may already have requeued or blocked this card.
+                        if (await asyncio.to_thread(store.get_feature, fid) or {}).get(
+                            "board_state"
+                        ) == "in_review" and await self._reconcile_review_threads(store, f, pr_url, repo, view=view):
+                            continue
                         # The re-arm half of the review gate (#328): a direct/human push to
                         # the branch of an in_review PR sitting in `changes-requested` moved
                         # the head out from under a verdict the gate — which re-runs only on
@@ -2995,7 +2993,7 @@ class ReconcileMixin:
         protoAgent#3745). This edge reads those threads and bounces on them.
 
         Returns True when it took ownership of the pass (bounced, held or blocked), so the caller
-        skips the rebase / merged-state / CI / merge edges below exactly as the panel edge does.
+        skips the remaining review / merge edges. Rebase and CI repair run before this edge.
         Fails OPEN — returns False, the pass proceeds — whenever nothing is proven:
 
         * external review is off for this card (no config); or
@@ -3003,7 +3001,8 @@ class ReconcileMixin:
         * no configured bot has a Major/Critical thread open (Minor-only never bounces, r2); or
         * the PR already reads CLEAN on GitHub (it is about to merge — the merge edge owns it — and
           an advisory thread does not stop it), or its merge state is UNKNOWN/unreadable (not proof
-          it is stuck).
+          it is stuck); BEHIND/DIRTY and failing CI stay with their existing repair paths; or
+        * the finding is outdated or cannot be proven to originate on the current head.
 
         The threads are read FIRST and the merge state only when a blocking thread exists, so the
         common clean-PR poll costs one bounded ``gh`` read and never a second. The bounce reuses the
@@ -3024,11 +3023,21 @@ class ReconcileMixin:
         # it is stuck, so fail open there too. Read LAST, so a clean PR with no bad threads never
         # pays for it.
         mss = await worktree.pr_merge_state(pr_url, cwd=repo)
-        if mss in ("", "CLEAN", "UNKNOWN"):
+        if mss in ("", "CLEAN", "UNKNOWN", "BEHIND", "DIRTY"):
             return False
         head = str((view or {}).get("headRefOid") or "").strip() or await worktree.pr_head_sha(pr_url, cwd=repo)
         if not head:
             return False  # no head to pin the once-per-head stamp to — nothing to do this pass
+        # Unresolved threads survive fix pushes, including threads on unchanged lines.
+        # Require original current-head evidence; unknown provenance cannot spend budget.
+        blocking = [t for t in blocking if t.get("commit") == head and t.get("isOutdated") is False]
+        if not blocking:
+            return False
+        # CI may have started a rerun without moving the card out of review. Leave red
+        # required checks to that repair path rather than spending a thread fix meanwhile.
+        ci_status, _ = await worktree.pr_ci_status(pr_url, cwd=repo)
+        if ci_status == "failing":
+            return False
         short = head[: store_mod.SHORT_SHA_LEN]
         signals = external_review.thread_summary(blocking)
         log.info(

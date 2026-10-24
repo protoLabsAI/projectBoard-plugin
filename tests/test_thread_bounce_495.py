@@ -22,6 +22,8 @@ real-``gh`` coverage lives in tests/test_worktree_gh.py).
 
 from __future__ import annotations
 
+import pytest
+
 import project_board.loop as loop_mod
 from project_board import external_review, worktree
 from project_board.loop import BoardLoop
@@ -48,9 +50,11 @@ RB_PROSE_BODY = (
 )
 
 
-def _thread(body, *, author="coderabbitai[bot]", path="apps/web/useKeybindings.ts", line=55):
+def _thread(
+    body, *, author="coderabbitai[bot]", path="apps/web/useKeybindings.ts", line=55, commit=HEAD, outdated=False
+):
     """A ``worktree.pr_unresolved_threads`` entry — the shape the edge consumes."""
-    return {"author": author, "path": path, "line": line, "body": body}
+    return {"author": author, "path": path, "line": line, "body": body, "commit": commit, "isOutdated": outdated}
 
 
 # ── the pure half ─────────────────────────────────────────────────────────────────────
@@ -184,6 +188,10 @@ def _loop(monkeypatch, store, *, threads, merge_state="UNSTABLE", head=HEAD, cfg
 
         return _run
 
+    async def _ci_status(*args, **kwargs):
+        return "passing", ""
+
+    monkeypatch.setattr(worktree, "pr_ci_status", _ci_status)
     monkeypatch.setattr(worktree, "pr_state", _state)
     monkeypatch.setattr(worktree, "pr_review_state", _review_state)
     monkeypatch.setattr(worktree, "pr_unresolved_threads", _threads)
@@ -214,8 +222,8 @@ async def test_a_major_thread_bounces_into_a_fix_round_once_per_head(monkeypatch
     assert "apps/web/useKeybindings.ts:55" in queued and "focusin` guard records" in queued
     assert "scope.py" not in queued  # the Minor thread is not required
     assert loop._ci_prior_diff["bd-1"].startswith("diff --git")
-    # Nothing else ran on a PR that cannot merge: no rebase, no merged-state gate, no merge.
-    assert loop.ran == []
+    # Existing repair edges run before thread handling.
+    assert loop.ran == ["rebase", "merged-verify", "ci"]
 
     # The fix round comes back to review at the SAME head (no new push). The ext-review-bounced
     # stamp holds it — told once, never re-bounced — and told ONCE however many times the card is
@@ -228,8 +236,9 @@ async def test_a_major_thread_bounces_into_a_fix_round_once_per_head(monkeypatch
     assert [c for c in store.calls if c[0] == "record_review_bounce"] == [("record_review_bounce", HEAD)]
     holds = [c for c in store.comments if c.startswith("auto-merge held:")]
     assert len(holds) == 1 and "needs a human" in holds[0]  # told once, not once per poll
-    # Held, not merged: the operator is told once, and no rebase/merged-state/merge edge runs.
-    assert loop.ran == ["notify"]
+    # A same-head hold still allows rebase and CI handling on every poll.
+    assert loop.ran.count("notify") == 1
+    assert loop.ran.count("rebase") == loop.ran.count("ci") == 4
 
 
 async def test_minor_only_threads_do_not_bounce(monkeypatch):
@@ -274,9 +283,9 @@ async def test_a_thread_by_an_unconfigured_author_does_not_bounce(monkeypatch):
 
 async def test_a_new_head_rearms_the_thread_bounce(monkeypatch):
     """The stamp is per head. A fix round that pushes a new head gets a fresh bounce on the
-    threads still open there."""
+    fresh threads posted on that head."""
     store = _Store(labels=[f"ext-review-bounced:{HEAD[:12]}"])  # already bounced for the old head
-    loop = _loop(monkeypatch, store, threads=[_thread(RB_MAJOR_BODY)], head=NEW_HEAD)
+    loop = _loop(monkeypatch, store, threads=[_thread(RB_MAJOR_BODY, commit=NEW_HEAD)], head=NEW_HEAD)
     await loop._reconcile_prs()
     assert ("record_review_bounce", NEW_HEAD) in store.calls and store.state == "ready"
     assert f"ext-review-bounced:{NEW_HEAD[:12]}" in store.labels
@@ -304,3 +313,94 @@ async def test_the_bounce_shares_the_counter_the_panel_already_spent(monkeypatch
     loop = _loop(monkeypatch, store, threads=[_thread(RB_MAJOR_BODY)], cfg={"review_fix_max": 3})
     await loop._reconcile_prs()
     assert "budget:ext-review-fix:2" in store.labels and store.state == "ready"
+
+
+@pytest.mark.parametrize("merge_state", ["BLOCKED", "UNSTABLE"])
+@pytest.mark.parametrize("commit,outdated", [(HEAD, False), (NEW_HEAD, True), ("", False), (NEW_HEAD, None)])
+async def test_stale_or_unproven_threads_cannot_spend_new_head_budget(monkeypatch, merge_state, commit, outdated):
+    store = _Store(labels=[f"ext-review-bounced:{HEAD[:12]}", "budget:ext-review-fix:1"])
+    loop = _loop(
+        monkeypatch,
+        store,
+        threads=[_thread(RB_MAJOR_BODY, commit=commit, outdated=outdated)],
+        head=NEW_HEAD,
+        merge_state=merge_state,
+    )
+    for _ in range(3):
+        await loop._reconcile_prs()
+    assert not store.calls
+    assert "budget:ext-review-fix:1" in store.labels
+    assert loop.ran.count("ci") == 3
+
+
+@pytest.mark.parametrize("merge_state,outcome", [("BEHIND", "clean"), ("DIRTY", "conflict")])
+async def test_real_rebase_retains_priority_over_major_threads(monkeypatch, merge_state, outcome):
+    store = _Store(labels=[f"ext-review-bounced:{HEAD[:12]}"])
+    loop = _loop(monkeypatch, store, threads=[_thread(RB_MAJOR_BODY)], merge_state=merge_state)
+    monkeypatch.setattr(loop, "_maybe_rebase", BoardLoop._maybe_rebase.__get__(loop))
+    calls = []
+
+    async def rebase(*args, **kwargs):
+        calls.append(outcome)
+        return outcome, "conflict in x.py"
+
+    monkeypatch.setattr(worktree, "rebase_onto_base", rebase)
+    await loop._reconcile_prs()
+    assert calls == [outcome]
+    assert not any(c[0] == "record_review_bounce" for c in store.calls)
+    if outcome == "clean":
+        assert store.state == "in_review"
+        assert not store.calls
+    else:
+        assert store.state == "ready"
+        assert "CONFLICTS" in loop._ci_feedback["bd-1"]
+
+
+@pytest.mark.parametrize("rerun", [False, True])
+async def test_real_ci_failure_keeps_feedback_and_owns_fix_round(monkeypatch, rerun):
+    store = _Store()
+    loop = _loop(monkeypatch, store, threads=[_thread(RB_MAJOR_BODY)])
+    monkeypatch.setattr(loop, "_reconcile_ci", BoardLoop._reconcile_ci.__get__(loop))
+
+    async def status(*args, **kwargs):
+        return "failing", "required tests failed"
+
+    async def no_rerun(*args, **kwargs):
+        return rerun
+
+    monkeypatch.setattr(worktree, "pr_ci_status", status)
+    monkeypatch.setattr(loop, "_rerun_ci_once", no_rerun)
+    await loop._reconcile_prs()
+    if rerun:
+        assert store.state == "in_review"
+        assert not store.calls
+        assert not any(label.startswith("budget:ext-review-fix:") for label in store.labels)
+        return
+    assert store.state == "ready"
+    assert loop._ci_feedback["bd-1"] == "required tests failed"
+    assert not any(c[0] == "record_review_bounce" for c in store.calls)
+    assert "budget:ci-fix:1" in store.labels
+
+
+async def test_thread_read_preserves_original_commit_and_outdated_flag(monkeypatch):
+    import json
+    from conftest import REAL_SEAMS
+
+    async def gh(*args, **kwargs):
+        assert "originalCommit{oid}" in " ".join(args)
+        assert "isOutdated" in " ".join(args)
+        node = {
+            "isResolved": False,
+            "isOutdated": True,
+            "path": "x.py",
+            "line": 4,
+            "comments": {
+                "nodes": [{"author": {"login": "coderabbitai"}, "body": RB_MAJOR_BODY, "originalCommit": {"oid": HEAD}}]
+            },
+        }
+        return 0, json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [node]}}}}}), ""
+
+    monkeypatch.setattr(worktree, "_gh", gh)
+    result = await REAL_SEAMS["worktree.pr_unresolved_threads"](PR)
+    assert result[0]["commit"] == HEAD
+    assert result[0]["isOutdated"] is True

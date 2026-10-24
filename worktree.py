@@ -2972,8 +2972,8 @@ _REVIEW_THREADS_QUERY = (
     "repository(owner:$owner,name:$repo){"
     "pullRequest(number:$number){"
     "reviewThreads(first:$first){nodes{"
-    "isResolved path line "
-    "comments(first:1){nodes{author{login} path originalLine body}}"
+    "isResolved isOutdated path line "
+    "comments(first:1){nodes{author{login} path originalLine body originalCommit{oid}}}"
     "}}}}}"
 )
 
@@ -2982,7 +2982,7 @@ async def pr_unresolved_threads(
     pr_url: str, *, cwd: str = ".", first: int = PR_REVIEW_THREADS_MAX
 ) -> list[dict] | None:
     """The PR's UNRESOLVED review threads (#495), read bounded via ``gh api graphql`` —
-    ``[{author, path, line, body}, …]``, one entry per thread GitHub reports
+    ``[{author, path, line, body, commit, isOutdated}, …]``, one entry per thread GitHub reports
     ``isResolved=false``, carrying the thread's first comment's author login, file, line and
     body. At most ``first`` threads; each body capped at ``PR_THREAD_BODY_CHARS``.
 
@@ -3037,6 +3037,8 @@ async def pr_unresolved_threads(
             line = first_comment.get("originalLine")
         threads.append(
             {
+                "commit": str((first_comment.get("originalCommit") or {}).get("oid") or ""),
+                "isOutdated": node.get("isOutdated"),
                 "author": str((first_comment.get("author") or {}).get("login") or ""),
                 "path": str(node.get("path") or first_comment.get("path") or ""),
                 "line": line,
