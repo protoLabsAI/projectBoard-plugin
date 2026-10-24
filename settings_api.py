@@ -44,6 +44,75 @@ SETTINGS.setdefault(
     "loop_enabled",
     {"label": "Build ready cards automatically", "type": "bool", "minimum": None, "maximum": None, "options": None},
 )
+
+# The Coders Configure tab (S3, #613) owns these nine by the SAME mechanism as loop_enabled:
+# they were removed from the manifest `settings:` block (so the host's generic schema renderer
+# no longer draws them), but the Coders page still reads and writes them through PUT /settings —
+# so they stay in this allowlist by hand, carrying the label/type/bounds the manifest `settings:`
+# entries used to declare (their defaults still come from `config:` below). Keep each line in
+# step with the loop's LIVE_KNOBS classification and with view/routing.js's own copy.
+_PAGE_OWNED = {
+    "coder": {"label": "Coder for builds", "type": "string", "minimum": None, "maximum": None, "options": None},
+    "max_concurrent": {
+        "label": "Cards building at once",
+        "type": "number",
+        "minimum": 1,
+        "maximum": 64,
+        "options": None,
+    },
+    "max_pending_reviews": {
+        "label": "Pull requests waiting for review",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1000,
+        "options": None,
+    },
+    "max_concurrent_sessions": {
+        "label": "Parallel coding sessions per build",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 32,
+        "options": None,
+    },
+    "coder_solve": {
+        "label": "Try solutions until tests pass",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "coder_solve_test_cmd": {
+        "label": "Tests for candidate solutions",
+        "type": "string",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+    "max_mode_n": {
+        "label": "Alternative builds to compare",
+        "type": "number",
+        "minimum": 1,
+        "maximum": 16,
+        "options": None,
+    },
+    "decompose_after_timeouts": {
+        "label": "Timeouts before asking to split a card",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 10,
+        "options": None,
+    },
+    "goal_verify": {
+        "label": "Check acceptance criteria before review",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
+}
+for _key, _meta in _PAGE_OWNED.items():
+    SETTINGS.setdefault(_key, _meta)
+
 _DEFAULTS = _MANIFEST["config"]
 _boot_values: dict | None = None
 
