@@ -5292,7 +5292,7 @@ class BeadsBoard:
             # round's prompt leads with it (#432 review).
             "rejection_feedback": rejection if bead.get("issue_type") == LABEL_TASK else "",
             "blocked_class": blocked_class,
-            "blocked_reason": blocked_reason,
+            "blocked_reason": blocked_reason if LABEL_BLOCKED in labels else "",
             "delivered_by": delivered_by,
             # Verification provenance (#316 S3a): who approved the task Done edge
             # (`verified_by`, from the close reason — "" when unverified) and whether the
@@ -5981,6 +5981,13 @@ def annotate_next_action(feats: list[dict], cfg: dict, *, is_driven=None) -> lis
                 }
             else:
                 posture = review_coverage_hold_posture(f) or merge_state_hold_posture(f) or posture
+        if posture["next_action"] == NEXT_ACTION_REVIEW_IN_PROGRESS:
+            # Process-local scheduling evidence, owned by the live loop (#478).
+            from .loop import live_loop
+
+            reason = getattr(live_loop(), "_review_not_running", {}).get(f.get("id"), "")
+            if reason:
+                posture = {**posture, "next_action": f"review not running: {reason}"}
         f["next_action"] = posture["next_action"]
         f["awaiting_merge"] = posture["awaiting_merge"]
         f["next_action_hint"] = posture["next_action_hint"]
