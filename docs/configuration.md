@@ -778,3 +778,48 @@ is treated exactly as today: never preferred over, never penalised. When no sibl
 rung has a snapshot, dispatch is byte-for-byte identical to the prior behaviour. Both
 knobs are read live and apply on config reload, at board and project scope, like
 `routing.exclusive`.
+
+### Usage policy (keep an account under a target %)
+
+`routing.usage_policy` is a list of rules that keep a named account's subscription usage
+*under* a target percentage by opening matching cards on a specific delegate. It is the
+lowest-precedence routing steer — a deliberate lever on top of the headroom preference
+above, for when you want a particular account held below a line (cost control, a shared
+quota, a reserved subscription) rather than just load-balanced:
+
+```yaml
+project_board:
+  routing:
+    usage_policy:
+      - account: anthropic-oauth   # whose used-% to watch
+        keep_under: 70             # when it is at/above this % used…
+        prefer: codex              # …open on this delegate instead
+        tiers: [standard]          # for cards at these tiers (omit ⇒ all tiers)
+  coders:
+    standard: [sonnet, codex]
+  projects:
+    app:
+      repo: /path/to/app
+      routing:
+        usage_policy: []           # overrides the board value; [] disables it here
+```
+
+Each rule is `{account, keep_under, prefer, tiers}`. When a card's tier is in a rule's
+`tiers` (a missing/empty `tiers` matches every tier) **and** the rule's `account` is at or
+above `keep_under`% of its binding window used, the card opens on `prefer` instead of
+today's choice — provided `prefer` is already in the rung (after exclusive filtering) and
+eligible: not already spent this card, not down-marked, and not reported `usable: false`.
+The first rule that fully applies wins. Account usage is read through the same
+`graph.sdk.provider_usage` seam as the headroom preference. With `anthropic-oauth` at 75%
+and the rule above, a standard card opens on `codex`; at 60% it uses today's choice.
+
+**Precedence** (highest to lowest): `routing.exclusive` > publish gates > down/blocked
+marks > headroom preference > `usage_policy`. A policy rule therefore never selects a
+delegate outside `routing.exclusive` or outside the rung, never a down/blocked/spent
+sibling, and never overrides exclusive mode or gates. An **unknown** account snapshot (the
+host lacks `provider_usage`, or the read failed) means the rule does not fire, so dispatch
+is byte-for-byte identical to the headroom behaviour above.
+
+`usage_policy` is read live and applies on config reload at board and project scope, like
+the other `routing` keys. A rule naming an unknown delegate or account, or a `keep_under`
+outside `1`–`100`, is refused with a reason and leaves the current policy unchanged.

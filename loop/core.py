@@ -880,6 +880,18 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         except (TypeError, ValueError):
             return 90
 
+    def _usage_policy_for(self, feature: dict) -> list[dict]:
+        """The `routing.usage_policy` rules (#581) for this feature — a list of
+        `{account, keep_under, prefer, tiers}` reorder rules, the lowest-precedence routing
+        steer. Project policy overrides the board policy, including an explicit empty list,
+        exactly like `routing.exclusive`. Read live off ``self.cfg`` so a B3 reload applies a
+        change with no restart. Non-dict entries are dropped so a malformed element can't
+        crash the sibling pick (validation refuses them at the config seam first)."""
+        routing = self.cfg.get("routing") or {}
+        project_routing = self._project_cfg(feature).get("routing") or {}
+        raw = project_routing.get("usage_policy", routing.get("usage_policy"))
+        return [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+
     def _coders_for(self, feature: dict) -> dict[str, list[str]]:
         """The tier→delegate `coders` map for this feature's project (#90), else the
         instance default — so escalation on a multi-repo board climbs the ladder the

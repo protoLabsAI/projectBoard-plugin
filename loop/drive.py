@@ -1962,6 +1962,32 @@ class DriveMixin:
                         tier or "default",
                     )
                     sib = preferred
+                # #581: the LOWEST-precedence reorder — a usage_policy rule keeps an account
+                # under its target % by preferring a specific delegate, applied AFTER the B5
+                # headroom pick so headroom's blocked/down verdicts stand. `siblings` is the
+                # exclusive-filtered live rung and the policy only reorders within it, so it
+                # can never leave the B2 set. Read live each attempt (B3 reload), and only
+                # poll usage when a rule is actually configured — no policy ⇒ byte-identical
+                # to B5. Account usage reuses the snapshots headroom already gathered.
+                policy = self._usage_policy_for(feature)
+                if policy:
+                    policy_usage = await asyncio.to_thread(self._policy_usage, siblings, policy, dict(rung_usage))
+                    policy_sib, policy_reason = apply_usage_policy(
+                        siblings, sib, tier, policy_usage, policy, spent=spent_here
+                    )
+                    if (
+                        policy_reason is not None
+                        and siblings[policy_sib % len(siblings)] != siblings[sib % len(siblings)]
+                    ):
+                        log.info(
+                            "[project_board] %s starting on %s rather than %s at the %s rung — %s",
+                            fid,
+                            siblings[policy_sib % len(siblings)],
+                            siblings[sib % len(siblings)],
+                            tier or "default",
+                            policy_reason,
+                        )
+                        sib = policy_sib
                 coder_name = siblings[sib % len(siblings)]
                 coder = self._resolve_delegate(coder_name, "acp")
                 if coder is None:
@@ -3654,6 +3680,26 @@ class DriveMixin:
         if not on:
             return {name: None for name in siblings}
         return {name: self._provider_usage(name) for name in siblings}
+
+    def _policy_usage(self, siblings: list[str], policy: list[dict], base: dict) -> dict[str, dict | None]:
+        """Usage snapshots the usage_policy (#581) needs, keyed by name: the rung siblings
+        (for the ``prefer`` delegate's eligibility) plus each rule's ``account`` (whose
+        used-% the rule caps). Reuses ``base`` — the snapshots headroom steering already
+        gathered this attempt — and polls only the names still missing, so the policy adds
+        at most one ``graph.sdk.provider_usage`` read per sibling headroom left unread
+        (``routing.headroom: false``) and per distinct account. Read through the SAME D8
+        seam as headroom; a host without the call degrades every name to unknown == today
+        (D4). ``siblings`` is already the exclusive-filtered, live rung, so nothing here can
+        steer outside ``routing.exclusive`` (B2)."""
+        usage = dict(base)
+        for name in siblings:
+            if usage.get(name) is None:
+                usage[name] = self._provider_usage(name)
+        for rule in policy:
+            account = str((rule or {}).get("account") or "").strip()
+            if account and account not in usage:
+                usage[account] = self._provider_usage(account)
+        return usage
 
     def _resolve_delegate(self, name: str, expect_type: str):
         """Look up a live delegate by name from the delegates registry. Returns the
