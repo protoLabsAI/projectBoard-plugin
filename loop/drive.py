@@ -2995,7 +2995,7 @@ class DriveMixin:
                                     why=f"it then timed out ({str(exc)[:200]}), and was not parked for a split",
                                 )
                                 return
-                            await self._park_for_split(store, fid, timeouts, exc)
+                            await self._park_for_split(store, fid, timeouts, exc, feature=feature)
                             await self._discard_tree(store, fid, repo, wt, branch, base=base)  # save first (#405)
                             self._inflight.pop(fid, None)
                             return
@@ -3167,7 +3167,9 @@ class DriveMixin:
         difficulty = str(feature.get("difficulty", "")).strip().lower()
         return self.decompose_after_timeouts_by_difficulty.get(difficulty, self.decompose_after_timeouts)
 
-    async def _park_for_split(self, store, fid: str, timeouts: int, exc: Exception) -> None:
+    async def _park_for_split(
+        self, store, fid: str, timeouts: int, exc: Exception, *, feature: dict | None = None
+    ) -> None:
         """Park a card whose fresh builds keep timing out, and hand its split to the board's
         own agent (#378) — in the one order that is safe:
 
@@ -3181,6 +3183,29 @@ class DriveMixin:
            when none had been filed.)
         3. RELEASE the task, only now: the agent that picks it up ends by cancelling this card,
            which must never be found still in flight."""
+        # Some cards are never split (#585): a RELEASE CHORE (chore: release …, or only
+        # version/lockfile files) has no buildable slices, and a DECOMPOSE TASK split again
+        # is a loop (the timed-out decompose that motivated this). Block them with a PLAIN
+        # timeout reason and skip the split entirely — the fix is a longer coder budget, not
+        # more slices. TOO_WIDE_CLASS keeps the park out of the self-healing sweep and makes
+        # an operator unblock reset the timeout count, exactly what the reason asks for.
+        feat = feature
+        if feat is None:
+            try:
+                feat = await asyncio.to_thread(store.get_feature, fid) or {}
+            except Exception:  # noqa: BLE001 — an unreadable card is treated as splittable
+                feat = {}
+        no_split = store_mod.no_decompose_reason(str(feat.get("title") or ""), feat.get("files_to_modify") or [])
+        if no_split:
+            reason = (
+                f"timed out {timeouts}x; not split: {no_split}; raise coder_timeout_s and unblock it "
+                f"(unblocking resets its timeout count): {exc}"
+            )
+            log.warning(
+                "[project_board] %s timed out %dx — blocked as too wide, NOT split (%s)", fid, timeouts, no_split
+            )
+            await asyncio.to_thread(self._flag_blocked, store, fid, reason, category=TOO_WIDE_CLASS)
+            return
         ask = getattr(store, "request_decomposition", None)  # older/stub store: skip
         try:
             learned = self._timeout_escalation_context(fid)
