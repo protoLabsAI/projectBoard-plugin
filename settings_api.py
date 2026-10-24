@@ -14,149 +14,26 @@ from .project_registry import _live_section, _MUTATION_LOCK
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
-# Explicit allowlist retained when fields move out of the manifest settings UI.
 # Defaults remain owned by manifest.config (ADR 0019).
-SETTINGS = {
-    "loop_enabled": {
-        "label": "Run orchestration loop",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "decompose_after_timeouts": {
-        "label": "Ask to split after N timeouts",
-        "type": "number",
-        "minimum": 0,
-        "maximum": 10,
-        "options": None,
-    },
-    "coder": {"label": "Coder delegate", "type": "string", "minimum": None, "maximum": None, "options": None},
-    "br_autofetch": {
-        "label": "Fetch br automatically",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "max_concurrent": {"label": "Parallel builds", "type": "number", "minimum": 1, "maximum": 64, "options": None},
-    "max_concurrent_sessions": {
-        "label": "Coder sessions per build",
-        "type": "number",
-        "minimum": 0,
-        "maximum": 32,
-        "options": None,
-    },
-    "max_pending_reviews": {
-        "label": "Review-queue limit",
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1000,
-        "options": None,
-    },
-    "goal_verify": {
-        "label": "Verify acceptance goals",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "base_refresh": {
-        "label": "Keep base checkouts current",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "local_gate_cmd": {
-        "label": "Default local gate",
-        "type": "string",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "coder_solve": {
-        "label": "Execution-grounded solve ladder",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "coder_solve_test_cmd": {
-        "label": "Solve verification command",
-        "type": "string",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "max_mode_n": {"label": "Max-Mode candidates", "type": "number", "minimum": 1, "maximum": 16, "options": None},
-    "auto_merge": {"label": "Auto-merge green PRs", "type": "bool", "minimum": None, "maximum": None, "options": None},
-    "merged_verify_max": {
-        "label": "Merged-state verification budget",
-        "type": "number",
-        "minimum": 0,
-        "maximum": 20,
-        "options": None,
-    },
-    "merge_method": {
-        "label": "Merge method",
-        "type": "select",
-        "minimum": None,
-        "maximum": None,
-        "options": ["squash", "merge", "rebase"],
-    },
-    "review_gate": {
-        "label": "Blocking adversarial review",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "review_workflow": {
-        "label": "Review workflow",
-        "type": "string",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "reviewer": {"label": "Reviewer delegate", "type": "string", "minimum": None, "maximum": None, "options": None},
-    "review_dispatch": {
-        "label": "Advisory reviewer dispatch",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "review_fix_max": {"label": "Review fix attempts", "type": "number", "minimum": 0, "maximum": 20, "options": None},
-    "merge_poll": {
-        "label": "Reconcile pull requests",
-        "type": "bool",
-        "minimum": None,
-        "maximum": None,
-        "options": None,
-    },
-    "ci_poll": {"label": "Bounce failing CI", "type": "bool", "minimum": None, "maximum": None, "options": None},
-    "ci_fix_max": {"label": "CI fix attempts", "type": "number", "minimum": 0, "maximum": 20, "options": None},
-    "ci_rerun_max": {"label": "CI reruns before a fix", "type": "number", "minimum": 0, "maximum": 5, "options": None},
-    "auto_rebase": {"label": "Rebase stale PRs", "type": "bool", "minimum": None, "maximum": None, "options": None},
-    "rebase_fix_max": {
-        "label": "Conflict fix attempts",
-        "type": "number",
-        "minimum": 0,
-        "maximum": 20,
-        "options": None,
-    },
-    "dep_gate": {
-        "label": "Dependency release gate",
-        "type": "select",
-        "minimum": None,
-        "maximum": None,
-        "options": ["merge", "review"],
-    },
-    "webhook_secret": {"label": "Webhook secret", "type": "secret", "minimum": None, "maximum": None, "options": None},
-    "npm_token": {"label": "npm registry token", "type": "secret", "minimum": None, "maximum": None, "options": None},
-}
-_DEFAULTS = yaml.safe_load(Path(__file__).with_name("protoagent.plugin.yaml").read_text())["config"]
+#
+# This allowlist was written out explicitly so a field could be RETAINED here after moving
+# out of the manifest's settings UI. No field does that today, and the suite asserts the
+# two key sets are EQUAL, so the explicit copy bought nothing and cost the drift below. If
+# a setting ever must outlive its manifest entry, add it to the derived mapping by hand and
+# relax that assertion — deliberately, rather than by letting 30 labels rot.
+_MANIFEST = yaml.safe_load(Path(__file__).with_name("protoagent.plugin.yaml").read_text())
+
+# Operator-facing metadata for each scalar setting, DERIVED from the manifest — the one
+# place this text already lives (the console renders the manifest; `_DEFAULTS` below reads
+# the same file for `config`). It used to be restated here as a 140-line literal, which is
+# a copy that cannot be kept honest: #624 reworded all 30 labels into plain language while
+# this module was in flight with the old wording, so each PR was green alone and the MERGED
+# state failed — every one of the 30 labels disagreed. `test_allowlist_metadata_and_masking`
+# compares the two, which is what caught it; deriving them makes the comparison impossible
+# to fail and the next rewording a one-file change.
+_META_FIELDS = ("label", "type", "minimum", "maximum", "options")
+SETTINGS = {entry["key"]: {field: entry.get(field) for field in _META_FIELDS} for entry in _MANIFEST["settings"]}
+_DEFAULTS = _MANIFEST["config"]
 _boot_values: dict | None = None
 
 
