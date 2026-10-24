@@ -494,6 +494,31 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
             raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
 
+    from .settings_api import capture_boot_settings
+
+    capture_boot_settings(cfg or {})
+
+    @router.get("/settings")
+    async def _settings_get():
+        from .settings_api import settings_snapshot
+
+        try:
+            return JSONResponse(settings_snapshot(), headers={"Cache-Control": "no-store"})
+        except ValueError:
+            raise HTTPException(503, "could not read board settings")
+
+    @router.put("/settings")
+    async def _settings_put(request: Request, body: dict = Body(...)):
+        from .settings_api import apply_setting_updates
+
+        try:
+            result = await apply_setting_updates(body, actor=str(getattr(request.state, "subject", "operator")))
+        except ValueError:
+            raise HTTPException(503, "could not read saved board settings")
+        if not result["ok"]:
+            raise HTTPException(400, result["reason"])
+        return result
+
     @router.get("/routing")
     async def _routing_get():
         from .routing import routing_get
