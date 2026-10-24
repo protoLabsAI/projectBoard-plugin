@@ -1794,8 +1794,11 @@ def cancel_side_effects(fid: str, pr_url: str = "", *, cwd: str = ".") -> dict:
 
 
 # ── operator unblock of a review-gate block (#512) ───────────────────────────────
-# When the in-loop review gate exhausts its fix budget it BLOCKS the card ("review
-# findings persist after N fix attempt(s) — needs human review") AND leaves a `failure`
+# When the in-loop review gate exhausts its fix budget it BLOCKS the card — either
+# "review findings persist after N fix attempt(s) — needs human review" (the same finding
+# survived every round) or "new findings each round after N fix attempt(s) (rounds
+# conflict) — needs a design call; needs human review" (#514 slice 2: disjoint findings
+# each round) — AND leaves a `failure`
 # status under worktree.GATE_STATUS_CONTEXT on the PR head (reconcile.py ~2938).
 # ``store.clear_blocked`` alone lifts the blocked flag but touches neither the review
 # substate nor that status, so the card lands back in_review with no review substate and a
@@ -1807,13 +1810,19 @@ def cancel_side_effects(fid: str, pr_url: str = "", *, cwd: str = ".") -> dict:
 _UNBLOCK_GH_TIMEOUT = 30.0
 _UNBLOCK_REARM_STATUS_DESC = "Review gate re-armed by operator unblock"
 _UNBLOCK_OVERRIDE_STATUS_DESC = "Operator override — review findings accepted by a human"
-# The exact reason shape the in-loop review gate writes when it exhausts its review-fix
-# budget (reconcile.py ~2933: "review findings persist after <n> fix attempt(s) — needs
-# human review: <pr_url>"). Both substrings together fingerprint THAT block and nothing
-# else: a hand block (board_block_feature / POST /block) carries an operator reason, a
-# transient failure carries a classifier reason, and the external-review block says
-# "external review FAILED …" (a DIFFERENT panel) — none match both markers.
-_REVIEW_GATE_BLOCK_MARKERS = ("review findings persist after", "needs human review")
+# The reason shape the in-loop review gate writes when it exhausts its review-fix budget
+# (reconcile.py ~3384). Since #514 slice 2 that budget block takes one of TWO wordings —
+# "review findings persist after … fix attempt(s) — needs human review" (same finding
+# survived) and "new findings each round after … fix attempt(s) (rounds conflict) — needs
+# a design call; needs human review" (disjoint findings) — so the fingerprint can no longer
+# key off "review findings persist after", which only the first carries. Both wordings DO
+# share "<n> fix attempt(s)" and "needs human review", and those two together still
+# fingerprint THAT block and nothing else: a hand block (board_block_feature / POST /block)
+# carries an operator reason, a transient failure carries a classifier reason ("needs
+# triage", not "needs human review"), and the external-review block says "external review
+# FAILED … after N review fix round(s)" (a DIFFERENT panel, "fix round(s)" not "fix
+# attempt(s)") — none match both markers.
+_REVIEW_GATE_BLOCK_MARKERS = ("fix attempt(s)", "needs human review")
 
 
 def _is_review_gate_block(feature_before: dict) -> bool:

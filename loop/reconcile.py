@@ -3382,16 +3382,55 @@ class ReconcileMixin:
         rendered = self._render_findings(blocking)
         n = await self._budget_get(store, fid, "review-fix")
         if n >= self.review_fix_max:
+            # #514 slice 2: tell a block where the SAME finding survived every fix round
+            # apart from one where each round raised a DIFFERENT finding. The first is an
+            # ordinary "a human finishes this fix" review; the second is rounds fighting
+            # each other — round N's fix reopening round N-1's finding, bd-49yo — which no
+            # further patch resolves, so it needs a design call, not another round. Compare
+            # the current blocking set against the per-round history (slice 1) by identity;
+            # the current round is the last one appended above.
+            history = self._review_history(fid)
+            surviving = self._surviving_review_findings(history, blocking)
+            if surviving:
+                named = "; ".join(f"{f.file}:{f.line} {f.claim}" for f in surviving)
+                # KEEP the "review findings persist after … needs human review" wording:
+                # both phrases are read by ``_REVIEW_GATE_BLOCK_MARKERS`` to class this as a
+                # review-gate block (#512), and the operator unblock keys off that class.
+                block_reason = (
+                    f"review findings persist after {n} fix attempt(s) — needs human review "
+                    f"({len(surviving)} surviving across rounds: {named}): {pr_url}"
+                )
+                description = (
+                    f"Review gate: {len(surviving)} finding(s) persist after {n} fix attempt(s) — needs human review"
+                )
+                comment = (
+                    f"{rendered}\n\nThese findings persist across rounds after {n} fix attempt(s) — "
+                    f"needs human review.\nSurviving: {named}\n\n{pr_url}"
+                )
+            else:
+                # Disjoint findings each round — every fix opened the next round's hole. The
+                # phrase "needs human review" stays so the block still classes as a
+                # review-gate block (#512); "rounds conflict — needs a design call" tells the
+                # human it's the patch-by-patch loop itself, not one stubborn finding.
+                block_reason = (
+                    f"new findings each round after {n} fix attempt(s) (rounds conflict) — "
+                    f"needs a design call; needs human review: {pr_url}"
+                )
+                description = (
+                    f"Review gate: new findings each round after {n} fix attempt(s) "
+                    f"(rounds conflict) — needs a design call"
+                )
+                comment = (
+                    f"{rendered}\n\nEach review round raised a different finding after {n} fix attempt(s) "
+                    f"(rounds conflict) — needs a design call; needs human review: {pr_url}"
+                )
             await asyncio.to_thread(store.set_review_substate, fid, None, note=rendered)
             # Blocked for a human, changes-requested dropped: clear the head stamp too so
             # an operator unblock can't leave a dead-head marker for the reconcile (#328).
             await self._stamp_reviewed_head(store, fid, "")
-            await asyncio.to_thread(
-                self._flag_blocked,
-                store,
-                fid,
-                f"review findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
-            )
+            # Budget exhaustion needs a human regardless of words in reviewer claims
+            # (or "rounds conflict"). It is a gate outcome, not host friction.
+            await asyncio.to_thread(self._flag_blocked, store, fid, block_reason, category="terminal", friction=False)
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             await self._budget_reset(store, fid, "review-fix")
@@ -3404,8 +3443,8 @@ class ReconcileMixin:
                 repo,
                 reviewed_head,
                 state="failure",
-                description=f"Review gate: {len(blocking)} finding(s) persist after {n} fix attempt(s) — needs human review",
-                comment=f"{rendered}\n\nThese findings persist after {n} fix attempt(s) — needs human review: {pr_url}",
+                description=description,
+                comment=comment,
             )
             log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
             return
@@ -3598,6 +3637,34 @@ class ReconcileMixin:
             return data
         # Legacy: a flat findings list → one round, reviewed head unknown.
         return [{"round": 1, "head": "", "findings": data}]
+
+    @staticmethod
+    def _finding_identity(file: str, claim: str) -> tuple[str, str]:
+        """The cross-round identity of a review finding (#514): its normalized file path
+        paired with its claim. Path separators and a leading ``./`` are normalized and
+        both halves whitespace-collapsed + case-folded, so the SAME finding reported in
+        two rounds compares equal despite cosmetic drift in how it was quoted."""
+        path = (file or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return (" ".join(path.split()).casefold(), " ".join((claim or "").split()).casefold())
+
+    def _surviving_review_findings(self, history: list[dict], blocking: list) -> list:
+        """The current blocking findings whose identity (normalized file + claim) ALSO
+        appeared in an EARLIER round (#514). Non-empty → the same finding survived the fix
+        attempts (a "persist" block); empty when ≥2 rounds are on record → every round
+        raised a different finding, i.e. the rounds conflict and a human must make a design
+        call. With fewer than two rounds there is nothing earlier to compare against, so
+        every current finding counts as surviving — the pre-#514 "persist" reading, kept
+        unchanged for that degenerate case."""
+        if len(history) < 2:
+            return list(blocking)
+        earlier = {
+            self._finding_identity(f.get("file", ""), f.get("claim", ""))
+            for rnd in history[:-1]
+            for f in (rnd.get("findings") or [])
+        }
+        return [f for f in blocking if self._finding_identity(f.file, f.claim) in earlier]
 
     def _review_fix_feedback(self, fid: str, blocking: str) -> str:
         """Keep historical context separate from the gate's authoritative fix set.
