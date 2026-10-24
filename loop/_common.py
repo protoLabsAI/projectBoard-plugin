@@ -1062,8 +1062,16 @@ def _source_issue_has_open_sibling(store, feature: dict) -> bool:
 # step with the manifest's ``settings:`` block (those are the console fields) and
 # the "Concurrency" section of docs/configuration.md. The manifest half is enforced
 # by tests/test_docs_reference.py; the doc half is enforced by its config-key coverage.
-LIVE_KNOBS = ("max_concurrent", "max_pending_reviews", "max_concurrent_sessions", "auto_merge", "coder", "br_autofetch")
-LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0}
+LIVE_KNOBS = (
+    "max_concurrent",
+    "max_pending_reviews",
+    "max_concurrent_sessions",
+    "auto_merge",
+    "coder",
+    "br_autofetch",
+    "merged_verify_max",
+)
+LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0, "merged_verify_max": 0}
 # Knobs that are booleans (coerced by _knob_bool) or strings (stripped); everything
 # else in LIVE_KNOBS is an int with a floor in LIVE_KNOB_FLOORS.
 # `br_autofetch` (v0.43.0) is live so an operator who left it off can flip it on and
