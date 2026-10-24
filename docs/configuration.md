@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **32 of 83 keys are in this state, including `coders` and `projects`** —
+never renders it. **34 of 85 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -460,11 +460,21 @@ blank.
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
 | `base_refresh` | `True` | **restart** |
+| `provider_stall_idle_s` | `600` | **restart · YAML only** |
+| `provider_stall_max` | `2` | **restart · YAML only** |
 | `decompose_after_timeouts` | `2` | **restart** |
 | `decompose_after_timeouts_by_difficulty` | `{}` | **restart · YAML only** |
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
+
+A fresh-build coder timeout whose idle gap — the silence since its last tool/thought/plan/
+answer event, measured from the live progress monitor — is at least `provider_stall_idle_s`
+seconds retries on the same tier as `provider_stall`, without spending the too-wide timeout
+budget. `provider_stall_max` bounds these retries using the persisted `budget:provider-stall`
+counter (reset when the build reaches review). Once spent, the ordinary timeout policy
+applies. An unreadable gap (an untapped host, an evicted buffer) and pre-model failures
+retain the existing policy. Set `provider_stall_max: 0` to disable stall retries.
 
 `decompose_after_timeouts` is the one that changes behaviour rather than tuning it. A coder
 timeout on a fresh build is a **size** signal, not a capability one. It produces no diff and no
