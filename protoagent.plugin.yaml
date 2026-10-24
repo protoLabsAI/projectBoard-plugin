@@ -287,6 +287,7 @@ config:
 # the generic schema renderer. min_protoagent_version keeps hosts without this contract
 # from loading a Configure surface they cannot render faithfully.
 settings_tabs:
+  - { id: overview, label: "Overview", path: /plugins/project_board/config/overview }
   - { id: projects, label: "Projects", path: /plugins/project_board/config/projects }
   - { id: routing, label: "Coder routing", path: /plugins/project_board/config/routing }
   - { id: automation, label: "Automation" }
@@ -297,9 +298,12 @@ settings_tabs:
 # BoardLoop.reload; every other exposed scalar is useful/operator-safe but remains the
 # boot-time value until the member restarts. Structural routing lives in Projects, and
 # machine/internal tuning stays file-only (documented in docs/configuration.md).
+#
+# `loop_enabled` is deliberately ABSENT here: the Overview tab (S1a, #611) owns its on/off
+# switch, so it no longer renders as a generic schema field. It is still written through the
+# same PUT /settings boundary and still surfaces in pending_restart — settings_api keeps it in
+# its allowlist by hand (that module's header comment anticipates this).
 settings:
-  - { key: loop_enabled, label: "Build ready cards automatically", type: bool, group: "Project Board", tab: automation, restart: true,
-      description: "Start building ready cards after restart, or turn off to keep the board and tools available without starting builds." }
   - { key: decompose_after_timeouts, label: "Timeouts before asking to split a card", type: number, minimum: 0, maximum: 10, group: "Project Board", tab: automation, restart: true,
       description: "After this many fresh-build timeouts, pause the card and ask to split it into smaller tasks; zero disables the request." }
   - { key: coder, label: "Coder for builds", type: string, group: "Project Board", tab: automation,

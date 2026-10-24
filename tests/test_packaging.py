@@ -288,6 +288,10 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
     hidden = {
+        # Page-owned: the Overview tab (S1a, #611) renders loop_enabled's on/off switch, so it
+        # is no longer a generic schema field here — it is still written through PUT /settings
+        # (settings_api keeps it in its allowlist by hand) and still restart-only.
+        "loop_enabled",
         # Structural/machine routing belongs in the Projects editor or YAML.
         "project",
         "repo",
@@ -329,6 +333,7 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
 def test_manifest_declares_the_ordered_tabbed_config_contract():
     m = _manifest()
     assert m["settings_tabs"] == [
+        {"id": "overview", "label": "Overview", "path": "/plugins/project_board/config/overview"},
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
         {"id": "routing", "label": "Coder routing", "path": "/plugins/project_board/config/routing"},
         {"id": "automation", "label": "Automation"},

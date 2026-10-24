@@ -1,0 +1,271 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Board overview</title>
+<style>
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);font-family:var(--pl-font-sans);font-size:13px}
+.wrap{padding:var(--pl-space-4);max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:var(--pl-space-5,20px)}
+.ov-sec{display:flex;flex-direction:column;gap:var(--pl-space-3)}
+.ov-sec h2{font-size:15px;margin:0;color:var(--pl-color-fg)}
+.ov-head{display:flex;align-items:center;justify-content:space-between;gap:var(--pl-space-3)}
+.ov-muted{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px}
+.ov-loading{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px}
+.btn{cursor:pointer;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised);color:var(--pl-color-fg);padding:5px 11px;font:inherit}
+.btn:hover{border-color:var(--pl-color-accent)}
+.btn:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.btn:disabled{cursor:not-allowed;opacity:.55}
+
+/* Board switch: the one control on this tab. The state line below says, in words, what on/off
+   does — the board on/off setting, saved through PUT /settings (a restart-only knob). */
+.ov-switch-row{display:flex;align-items:center;gap:var(--pl-space-3)}
+.ov-state{margin:0;color:var(--pl-color-fg-muted);font-size:12.5px}
+.ov-msg{margin:0}
+
+/* Now: four counts, each a link to the board filtered to that state. */
+.ov-counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:var(--pl-space-3)}
+.ov-count{display:flex;flex-direction:column;gap:2px;padding:var(--pl-space-3);text-decoration:none;color:inherit;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);background:var(--pl-color-bg-raised)}
+.ov-count:hover{border-color:var(--pl-color-accent);background:var(--pl-color-bg-hover)}
+.ov-count:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.ov-count-n{font-size:22px;font-weight:var(--pl-font-weight-semibold,600);line-height:1.1}
+.ov-count-label{font-size:12px;color:var(--pl-color-fg-muted)}
+
+/* Problems: one plain line each, with what-to-do text; a red/blue dot marks severity. */
+.ov-problems{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--pl-space-3)}
+.ov-problem{display:flex;align-items:flex-start;gap:var(--pl-space-2)}
+.ov-problem .pl-dot{flex:0 0 auto;margin-top:3px}
+.ov-problem-body{display:flex;flex-direction:column;gap:2px;min-width:0}
+.ov-problem-title{font-weight:var(--pl-font-weight-semibold,600)}
+.ov-problem-text{color:var(--pl-color-fg-muted);font-size:12.5px;line-height:1.5}
+.ov-problem-ctx{color:var(--pl-color-fg-muted);font-size:11.5px;font-family:var(--pl-font-mono);overflow-wrap:anywhere}
+.ov-ok{display:flex;align-items:center;gap:var(--pl-space-2);color:var(--pl-color-fg-muted);font-size:12.5px}
+
+/* Pending restart: a callout with the changed labels and how to apply them (no button yet — S1b). */
+.ov-restart-title{font-weight:var(--pl-font-weight-semibold,600)}
+.ov-restart-list{margin:var(--pl-space-1,4px) 0 0}
+.ov-restart-how{margin:var(--pl-space-2) 0 0;color:var(--pl-color-fg-muted);font-size:12px}
+@media(max-width:520px){.wrap{padding:var(--pl-space-3)}}
+</style>
+<script>
+var BASE = location.pathname.split("/plugins/")[0];
+(function(){var l=document.createElement("link");l.rel="stylesheet";
+  l.href=BASE+"/_ds/plugin-kit.css";document.head.appendChild(l);})();
+</script></head><body>
+<main class="wrap"><div id="ov" aria-live="polite"></div></main>
+<script type="module">
+// Overview (S1a, #611) — the FIRST Configure tab, answering "is the board working?". It holds
+// no board data: the on/off switch, the live counts, the problems and the pending-restart banner
+// all read and write through the operator-bearer-gated /api/plugins/project_board routes via the
+// DS plugin-kit's authed, slug-aware fetch. No handshake of our own, no hardcoded /api/… path.
+let kit;
+try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
+catch (e) { kit = null; }
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const SETTINGS_API = "/api/plugins/project_board/settings";
+const STATUS_API = "/api/plugins/project_board/status";
+const FEATURES_API = "/api/plugins/project_board/features";
+// The board view, fleet-proxy-safe off the same derived BASE. The state is encoded as a query so
+// the board can filter to it; the board view owns consuming the filter and its own auth handshake.
+const BOARD = BASE + "/plugins/project_board/board";
+// The ONLY raw config key this page names, and only as the PUT payload key — never as visible copy.
+const LOOP_KEY = "loop_enabled";
+const SLOW_MS = 500;  // only show a loading line once the reads are actually slow — no flash on a fast board
+
+const api = async (p, init) => {
+  const r = await kit.apiFetch(p, { cache: "no-store", ...(init || {}) });
+  // A host gate refusal (non-operator) is a bare 403 with no JSON body — catch it before parsing.
+  if (r.status === 403) throw new Error("Refused: this needs an operator session. Nothing changed.");
+  const d = await r.json().catch(() => { throw new Error("HTTP " + r.status + " (non-JSON response)"); });
+  if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+  return d;
+};
+
+function callout(kind, text){
+  const cls = kind === "error" ? "pl-callout--error" : kind === "ok" ? "pl-callout--success" : "pl-callout--info";
+  return '<div class="pl-callout ' + cls + ' ov-msg">' + esc(text) + '</div>';
+}
+
+let SWITCH_BUSY = false;   // a save is in flight — freeze the switch
+let SWITCH_MSG = null;     // {kind, text} shown inline under the switch after a save
+
+// ── Board switch: the board on/off setting, saved through PUT /settings. State in words below. ─
+function switchSection(settings){
+  const entry = ((settings && settings.settings) || {})[LOOP_KEY] || {};
+  const on = entry.value === true;
+  const state = on
+    ? "On — picking up ready cards."
+    : "Off — the board and tools still work, nothing is dispatched.";
+  return '<section class="ov-sec"><h2>Board</h2>'
+    + '<div class="ov-switch-row">'
+    + '<label class="pl-switch' + (SWITCH_BUSY ? " pl-switch--disabled" : "") + '">'
+    + '<input type="checkbox" class="pl-switch__input" id="board-switch"' + (on ? " checked" : "") + (SWITCH_BUSY ? " disabled" : "") + '>'
+    + '<span class="pl-switch__track"><span class="pl-switch__thumb"></span></span>'
+    + '<span class="pl-switch__label">Build ready cards automatically</span></label>'
+    + '</div>'
+    + '<p class="ov-state">' + esc(state) + '</p>'
+    + (SWITCH_MSG ? callout(SWITCH_MSG.kind, SWITCH_MSG.text) : "")
+    + '</section>';
+}
+
+async function saveLoop(on, input){
+  if (SWITCH_BUSY) return;
+  SWITCH_BUSY = true;
+  if (input) input.disabled = true;     // freeze immediately; the full re-render below shows the result
+  SWITCH_MSG = { kind: null, text: "Saving…" };
+  try {
+    await api(SETTINGS_API, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ [LOOP_KEY]: on }) });
+    SWITCH_MSG = { kind: "ok", text: on
+      ? "Saved. The board starts picking up ready cards after a restart."
+      : "Saved. The board stops dispatching after a restart." };
+  } catch (e) {
+    SWITCH_MSG = { kind: "error", text: String((e && e.message) || e) };
+  } finally {
+    SWITCH_BUSY = false;
+    await render();   // re-read so the switch AND the pending-restart banner show exactly what landed
+  }
+}
+
+// ── Now: counts of building / in review / blocked / waiting, each a link to the filtered board. ─
+const COUNTS = [
+  { label: "Building", state: "in_progress" },
+  { label: "In review", state: "in_review" },
+  { label: "Blocked", state: "blocked" },
+  { label: "Waiting", state: "ready" },
+];
+function countsSection(features){
+  if (!features) {
+    return '<section class="ov-sec"><h2>Now</h2>'
+      + '<p class="ov-muted">Counts are unavailable — the board could not be read just now.</p></section>';
+  }
+  const tally = {};
+  (features.features || []).forEach(f => { const s = f.state; tally[s] = (tally[s] || 0) + 1; });
+  const tiles = COUNTS.map(c => {
+    const n = tally[c.state] || 0;
+    const href = BOARD + "?state=" + encodeURIComponent(c.state);
+    return '<a class="ov-count" href="' + esc(href) + '" target="_top">'
+      + '<span class="ov-count-n">' + n + '</span>'
+      + '<span class="ov-count-label">' + esc(c.label) + '</span></a>';
+  }).join("");
+  return '<section class="ov-sec"><h2>Now</h2><div class="ov-counts">' + tiles + '</div></section>';
+}
+
+// ── Problems: one plain line each + what to do. None of these have a one-click plugin fix, so each
+// carries a sentence; the section's Re-check button re-runs the reads (the /status read re-runs the
+// setup preflight), which IS the "re-run check" fix. A raw error string is never the only signal. ─
+function problems(status){
+  const out = [];
+  const setup = (status && status.setup) || {};
+  [["br", "Board tool"], ["gh", "GitHub CLI"], ["coder", "Coder"], ["repo", "Repository"]].forEach(([key, title]) => {
+    const c = setup[key];
+    if (c && c.ok === false) {
+      out.push({ tone: "error", title: title + " isn’t ready",
+        text: (c.hint || "").trim() || "Open the other Settings tabs to finish setting this up." });
+    }
+  });
+  const pf = (status && status.preflight) || {};
+  Object.keys(pf.held || {}).sort().forEach(name => {
+    const fail = (pf.failures || {})[name] || {};
+    out.push({ tone: "error", title: "Project “" + name + "” is held",
+      text: "Its checks are failing on the base branch, so its ready cards won’t build until they pass again.",
+      context: (fail.headline || "").trim() });
+  });
+  Object.keys(pf.dirty || {}).sort().forEach(name => {
+    out.push({ tone: "info", title: "Project “" + name + "” isn’t on its base branch",
+      text: "Reset the board-owned checkout to its base branch, or let the next automatic refresh move it." });
+  });
+  if (status && status.claim_stall) {
+    out.push({ tone: "info", title: "The board has ready work but isn’t starting it",
+      text: "A build or review may be stuck — check the most recent card’s log, then turn the board off and on to re-scan." });
+  }
+  return out;
+}
+function problemsSection(status){
+  const head = '<div class="ov-head"><h2>Problems</h2>'
+    + '<button type="button" id="recheck" class="btn"' + (RECHECK_BUSY ? " disabled" : "") + '>Re-check</button></div>';
+  if (!status) {
+    return '<section class="ov-sec">' + head
+      + '<p class="ov-muted">Could not read the board’s health just now. Re-check in a moment.</p></section>';
+  }
+  const probs = problems(status);
+  if (!probs.length) {
+    return '<section class="ov-sec">' + head
+      + '<div class="ov-ok"><span class="pl-dot pl-dot--success"></span>Nothing needs your attention right now.</div></section>';
+  }
+  const rows = probs.map(p => {
+    const dot = p.tone === "error" ? "pl-dot--error" : "pl-dot--info";
+    const ctx = p.context ? '<span class="ov-problem-ctx">' + esc(p.context) + '</span>' : "";
+    return '<li class="ov-problem"><span class="pl-dot ' + dot + '"></span>'
+      + '<div class="ov-problem-body"><span class="ov-problem-title">' + esc(p.title) + '</span>'
+      + '<span class="ov-problem-text">' + esc(p.text) + '</span>' + ctx + '</div></li>';
+  }).join("");
+  return '<section class="ov-sec">' + head + '<ul class="ov-problems">' + rows + '</ul></section>';
+}
+
+// ── Pending restart: the saved, restart-only settings not yet live, listed by LABEL (never key). ─
+function restartBanner(settings){
+  const pending = (settings && settings.pending_restart) || [];
+  if (!pending.length) return "";
+  const labels = pending.map(p => esc(p.label || p.key)).join(", ");
+  const n = pending.length;
+  const noun = n === 1 ? "change takes" : "changes take";
+  return '<div class="pl-callout pl-callout--info">'
+    + '<div class="ov-restart-title">' + n + " " + noun + ' effect after a restart</div>'
+    + '<p class="ov-restart-list">' + labels + '</p>'
+    + '<p class="ov-restart-how">Restart this board member — stop and start it (or restart the agent) — to apply '
+    + (n === 1 ? "it" : "them") + '.</p></div>';
+}
+
+function view(settings, status, features){
+  return restartBanner(settings)
+    + switchSection(settings)
+    + countsSection(features)
+    + problemsSection(status);
+}
+
+let RECHECK_BUSY = false;
+async function render(){
+  const host = $("ov");
+  let done = false;
+  const slow = setTimeout(() => { if (!done) host.innerHTML = '<p class="ov-loading">Reading board status…</p>'; }, SLOW_MS);
+  try {
+    // Settings is primary (the switch + the banner). Status and features are best-effort: an
+    // unbound or slow board must still render the switch, not a blank tab.
+    const [settings, status, features] = await Promise.all([
+      api(SETTINGS_API),
+      api(STATUS_API).catch(() => null),
+      api(FEATURES_API).catch(() => null),
+    ]);
+    done = true; clearTimeout(slow);
+    host.innerHTML = view(settings, status, features);
+  } catch (e) {
+    done = true; clearTimeout(slow);
+    host.innerHTML = callout("error", "Could not load the board overview: " + String((e && e.message) || e));
+  } finally {
+    clearTimeout(slow);
+    RECHECK_BUSY = false;
+  }
+}
+
+// One delegated listener each — #ov's innerHTML is rebuilt on every render.
+$("ov").addEventListener("change", (e) => {
+  const sw = e.target.closest("#board-switch");
+  if (!sw || SWITCH_BUSY) return;
+  saveLoop(sw.checked, sw);
+});
+$("ov").addEventListener("click", (e) => {
+  const rc = e.target.closest("#recheck");
+  if (!rc || RECHECK_BUSY) return;
+  RECHECK_BUSY = true; rc.disabled = true;
+  render();
+});
+
+if (!kit) {
+  $("ov").innerHTML = callout("error", "Could not load the authenticated plugin bridge. Open this from the Configure dialog.");
+} else {
+  let booted = false;
+  kit.initPluginView(() => { if (!booted) { booted = true; render(); } });
+}
+</script></body></html>
