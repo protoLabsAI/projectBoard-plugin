@@ -3428,7 +3428,9 @@ class ReconcileMixin:
             # Blocked for a human, changes-requested dropped: clear the head stamp too so
             # an operator unblock can't leave a dead-head marker for the reconcile (#328).
             await self._stamp_reviewed_head(store, fid, "")
-            await asyncio.to_thread(self._flag_blocked, store, fid, block_reason)
+            # Budget exhaustion needs a human regardless of words in reviewer claims
+            # (or "rounds conflict"). It is a gate outcome, not host friction.
+            await asyncio.to_thread(self._flag_blocked, store, fid, block_reason, category="terminal", friction=False)
             self._ci_feedback.pop(fid, None)
             self._ci_prior_diff.pop(fid, None)
             await self._budget_reset(store, fid, "review-fix")

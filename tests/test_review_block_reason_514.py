@@ -20,9 +20,9 @@ import json
 
 import pytest
 
-from project_board import worktree
+from project_board import host_friction, worktree
 from project_board.loop import BoardLoop
-from project_board.loop._common import _REVIEW_GATE_BLOCK_MARKERS, _is_review_gate_block
+from project_board.loop._common import _REVIEW_GATE_BLOCK_MARKERS, _SELF_HEALING_BLOCKS, _is_review_gate_block
 from project_board.store import LABEL_BLOCKED
 
 from tests.test_loop import _GateStore, _inject_fake_findings
@@ -157,6 +157,45 @@ async def test_both_wordings_still_class_as_a_review_gate_block(monkeypatch):
     )
     assert not _is_review_gate_block({"labels": [LABEL_BLOCKED], "blocked_reason": ci})
     assert not _is_review_gate_block({"labels": [LABEL_BLOCKED], "blocked_reason": external})
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "timeout loses the result",
+        "connection is leaked",
+        "network failure drops writes",
+        "rate limit is ignored",
+        "conflict resolution drops rows",
+        "request timed out after the result was committed",
+        "coder dispatch failed without notifying the caller",
+        "delegate is not reachable but reported healthy",
+        "worktree is missing but cleanup reports success",
+    ],
+)
+@pytest.mark.parametrize("survives", [True, False], ids=["persist", "rounds-conflict"])
+async def test_budget_block_is_terminal_without_host_friction(monkeypatch, claim, survives):
+    """Reviewer prose must not turn a human decision into retryable infrastructure failure."""
+    _inject_fake_findings(monkeypatch)
+    records = []
+    monkeypatch.setattr(host_friction, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    last = json.dumps([_finding(claim)])
+    first = last if survives else json.dumps([_finding("an earlier different finding")])
+    loop = _seq_loop(monkeypatch, [first, last])
+    store = _GateStore()
+
+    reason = await _block(loop, store)
+
+    category = [c for c in store.calls if c[0] == "flag_blocked"][-1][3]
+    assert category == "terminal"
+    assert category not in _SELF_HEALING_BLOCKS
+    assert records == []
+    assert _is_review_gate_block({"labels": [LABEL_BLOCKED], "blocked_reason": reason})
+    if survives:
+        assert claim in reason
+        assert "review findings persist" in reason
+    else:
+        assert "rounds conflict" in reason
 
 
 def test_surviving_findings_compare_by_normalized_identity():

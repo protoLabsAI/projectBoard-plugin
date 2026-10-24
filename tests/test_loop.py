@@ -6673,9 +6673,9 @@ class _RoundTripStore(_GateStore):
             self.labels.append(f"reviewed-head:{sha}")
         return super().record_reviewed_head(fid, sha)
 
-    def flag_blocked(self, fid, reason, *, automatic=False):
+    def flag_blocked(self, fid, reason, category="", *, automatic=False):
         self.state = "blocked"
-        return super().flag_blocked(fid, reason)
+        return super().flag_blocked(fid, reason, category, automatic=automatic)
 
     def unblock(self, fid):
         self.state = "in_review"
@@ -7182,6 +7182,7 @@ async def test_rearm_review_does_not_reset_the_review_fix_budget(monkeypatch):
     await loop._reconcile_prs()
     assert runs == [store.pr_url]
     assert store.state == "blocked"  # spent budget → blocked, not a fresh bounce
+    assert [c for c in store.calls if c[0] == "flag_blocked"][-1][3] == "terminal"
     assert not any(c[0] == "requeue" for c in store.calls)
 
 
