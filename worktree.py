@@ -2961,6 +2961,93 @@ async def pr_review_state(pr_url: str, *, cwd: str = ".") -> dict | None:
     return data
 
 
+# A PR's unresolved review threads are read BOUNDED (#495): at most this many threads, each
+# thread's first-comment body capped, so one noisy PR (or one essay-length bot comment) cannot
+# blow the prompt/log budget or the gh round-trip.
+PR_REVIEW_THREADS_MAX = 100
+PR_THREAD_BODY_CHARS = 2000
+
+_REVIEW_THREADS_QUERY = (
+    "query($owner:String!,$repo:String!,$number:Int!,$first:Int!){"
+    "repository(owner:$owner,name:$repo){"
+    "pullRequest(number:$number){"
+    "reviewThreads(first:$first){nodes{"
+    "isResolved isOutdated path line "
+    "comments(first:1){nodes{author{login} path originalLine body originalCommit{oid}}}"
+    "}}}}}"
+)
+
+
+async def pr_unresolved_threads(
+    pr_url: str, *, cwd: str = ".", first: int = PR_REVIEW_THREADS_MAX
+) -> list[dict] | None:
+    """The PR's UNRESOLVED review threads (#495), read bounded via ``gh api graphql`` —
+    ``[{author, path, line, body, commit, isOutdated}, …]``, one entry per thread GitHub reports
+    ``isResolved=false``, carrying the thread's first comment's author login, file, line and
+    body. At most ``first`` threads; each body capped at ``PR_THREAD_BODY_CHARS``.
+
+    Returns ``None`` when the read is UNKNOWN — a ``gh`` timeout, a non-zero exit, an
+    unparseable / error payload, or a url with no repo/number — NEVER ``[]``. "No unresolved
+    threads" and "could not read the threads" must not be conflated: a timed-out read read as
+    ``[]`` would look like a clean PR and let a merge through (the #495 fail-safe). ``[]`` means
+    the read SUCCEEDED and there genuinely are none. Never raises into the loop."""
+    repo_slug, number = _parse_pr(pr_url)
+    owner, _, repo = (repo_slug or "").partition("/")
+    if not owner or not repo or not number:
+        return None
+    try:
+        rc, out, _err = await _gh_read(
+            _gh(
+                "api",
+                "graphql",
+                "-f",
+                f"query={_REVIEW_THREADS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"repo={repo}",
+                "-F",
+                f"number={number}",
+                "-F",
+                f"first={max(1, int(first))}",
+                cwd=cwd,
+            )
+        )
+    except (WorktreeError, OSError):  # a timeout, no `gh`, a cwd that is gone
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # A GraphQL error payload (rc 0, but `data.…` is null / absent) reads as UNKNOWN, not
+        # as "no threads" — the same fail-safe as a non-zero exit.
+        return None
+    if not isinstance(nodes, list):
+        return None
+    threads: list[dict] = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("isResolved"):
+            continue
+        comments = ((node.get("comments") or {}).get("nodes")) or []
+        first_comment = comments[0] if comments and isinstance(comments[0], dict) else {}
+        line = node.get("line")
+        if line in (None, ""):
+            line = first_comment.get("originalLine")
+        threads.append(
+            {
+                "commit": str((first_comment.get("originalCommit") or {}).get("oid") or ""),
+                "isOutdated": node.get("isOutdated"),
+                "author": str((first_comment.get("author") or {}).get("login") or ""),
+                "path": str(node.get("path") or first_comment.get("path") or ""),
+                "line": line,
+                "body": str(first_comment.get("body") or "")[:PR_THREAD_BODY_CHARS],
+            }
+        )
+    return threads
+
+
 async def _find_marked_comment(repo_slug: str, number: str, marker: str, *, cwd: str) -> tuple[str, str]:
     """The ``(id, body)`` of the board's marked PR comment (the one whose body contains
     ``marker``), or ``("", "")`` when none exists or the list can't be read — the caller then

@@ -45,6 +45,13 @@ DEFAULT_CHECK_RUNS: tuple[str, ...] = ("QA panel",)
 # is unreviewed") and flips green minutes later, so reading it as a FAIL held every fresh
 # head (#477 review). A status is only worth listing if its red means "the panel rejected it".
 DEFAULT_STATUSES: tuple[str, ...] = ()
+# The review bots whose UNRESOLVED review threads block a merge when the thread carries a
+# Major/Critical finding (#495). CodeRabbit (and protoreview's own inline threads) leave their
+# findings as review THREADS rather than a FAIL review with a marker, so the #473 panel edge
+# never sees them and the PR sits in_review forever (bd-fgtf / protoAgent#3745). Compared
+# login-insensitively (``_login``), so the config's ``coderabbitai[bot]`` matches the GraphQL
+# ``coderabbitai`` actor login and vice-versa.
+DEFAULT_THREAD_BOTS: tuple[str, ...] = ("coderabbitai[bot]", "protoreview")
 
 # A finding blocks the merge when it is serious AND the panel stood behind it — the same
 # bar the in-process gate applies (blocker/major, not refuted), made explicit for the
@@ -68,6 +75,28 @@ HOLD_INCOMPLETE_COVERAGE = "hold:incomplete-coverage"
 _BODY_EXCERPT_CHARS = 4000
 # How much evidence per finding the bounce quotes.
 _EVIDENCE_CHARS = 1200
+# How much of an unresolved review thread's first comment a bounce quotes (#495).
+_THREAD_BODY_CHARS = 1200
+# A review thread blocks the merge when its first comment carries a Major/Critical/Blocker
+# severity BADGE — the same bar #473 applies to a panel finding, read from the free-text body
+# the bot posts inline. CodeRabbit (and protoreview's own inline threads) post that severity as
+# a markdown-emphasised span near the top of the comment: ``_🟠 Major_``, ``**🔴 Critical**``,
+# ``**Blocker**``. We match the severity word ONLY inside such a span — an emphasis opener
+# (``_`` / ``*``, optionally doubled) at a markdown boundary (start-of-line or after whitespace
+# / ``|`` / ``(``), then only emoji, spaces or punctuation around the word, then a close on the
+# SAME line. Matching the badge and not the bare word is the point (#495 review): a Minor /
+# nitpick / unlabelled thread whose PROSE merely mentions "a major refactor" or "the critical
+# section" — or a snake_case ``is_major`` identifier in a pasted code snippet — must NOT bounce
+# the card, spend the shared ext-review-fix budget and eventually block it for a human. Only the
+# emphasised-badge shape is POSITIVE evidence; everything else is left alone (fail-safe). The
+# ``[^_*\nA-Za-z]*`` guards on either side keep ``majority`` / ``critically`` / ``Majorly`` out
+# (the char touching the word must be an emphasis marker or a non-letter, never another letter)
+# and keep a bolded SENTENCE that happens to contain the word (``**fix the major bug**``) from
+# reading as a badge.
+_THREAD_BLOCKING_RE = re.compile(
+    r"(?<![^\s|(>])[_*]{1,2}[^_*\nA-Za-z]*(?:critical|blocker|major)[^_*\nA-Za-z]*[_*]{1,2}",
+    re.I,
+)
 
 _JSON_FENCE_RE = re.compile(r"```json[^\n]*\n(.*?)```", re.S)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
@@ -84,6 +113,8 @@ class Config:
     marker: str = DEFAULT_MARKER
     check_runs: tuple[str, ...] = DEFAULT_CHECK_RUNS
     statuses: tuple[str, ...] = DEFAULT_STATUSES
+    # The bots whose unresolved Major/Critical review THREADS bounce the card (#495).
+    thread_bots: tuple[str, ...] = DEFAULT_THREAD_BOTS
 
     def is_reviewer(self, login: str) -> bool:
         return _login(login) in {_login(r) for r in self.reviewers}
@@ -107,10 +138,11 @@ def parse_config(raw) -> Config | None:
     """``external_review`` → a :class:`Config`, or ``None`` when the check is off.
 
     Unset or ``true`` is the default (the protoreview panel). ``false`` turns it off. A
-    mapping overrides any of ``reviewers`` / ``marker`` / ``check_runs`` / ``statuses``
-    and may carry ``enabled: false``. An empty ``check_runs`` or ``statuses`` list turns
-    that signal off; an empty ``reviewers`` list turns the whole check off (nobody's
-    verdict can be read)."""
+    mapping overrides any of ``reviewers`` / ``marker`` / ``check_runs`` / ``statuses`` /
+    ``thread_bots`` and may carry ``enabled: false``. An empty ``check_runs`` or ``statuses``
+    list turns that signal off; an empty ``reviewers`` list turns the whole check off (nobody's
+    verdict can be read); an empty ``thread_bots`` list turns the #495 unresolved-thread bounce
+    off while leaving the panel-FAIL edge on."""
     if raw is False or (isinstance(raw, str) and raw.strip().lower() in ("false", "off", "no", "0")):
         return None
     if not isinstance(raw, dict):
@@ -127,6 +159,7 @@ def parse_config(raw) -> Config | None:
         marker=marker,
         check_runs=_names(raw.get("check_runs"), DEFAULT_CHECK_RUNS),
         statuses=_names(raw.get("statuses"), DEFAULT_STATUSES),
+        thread_bots=_names(raw.get("thread_bots"), DEFAULT_THREAD_BOTS),
     )
 
 
@@ -367,3 +400,63 @@ def render_findings(verdict: Verdict, pr_url: str = "") -> str:
 def fail_summary(verdict: Verdict) -> str:
     """One line naming the failing signals, for logs and hold comments."""
     return "; ".join(verdict.signals) or "no failing signal"
+
+
+# ── unresolved review-thread findings (#495) ─────────────────────────────────────────────
+
+
+def thread_is_blocking(body: str) -> bool:
+    """Whether a review thread's first-comment ``body`` carries a Major / Critical / Blocker
+    severity BADGE — the bar a thread must clear to bounce the card (#495). An emphasised badge
+    (``_🟠 Major_``, ``**Critical**``) counts; a Minor / nitpick / unlabelled body, or one that
+    only mentions the words in PROSE (``a major refactor``, ``the critical section``), does not.
+    Only positive badge evidence counts, so an ambiguous body is left alone (see
+    :data:`_THREAD_BLOCKING_RE`)."""
+    return bool(_THREAD_BLOCKING_RE.search(body or ""))
+
+
+def blocking_threads(threads, bots) -> list[dict]:
+    """The UNRESOLVED review threads a fix round must address (#495): authored by one of the
+    configured ``bots`` (login-insensitive, so ``coderabbitai[bot]`` matches the GraphQL
+    ``coderabbitai``) AND marked Major/Critical in the body. ``threads`` is what
+    ``worktree.pr_unresolved_threads`` returns — ``{author, path, line, body}`` dicts. A thread
+    by anyone else, or a Minor/unlabelled one, is dropped; ``threads`` of ``None`` yields ``[]``
+    (the caller treats an UNKNOWN read as "change nothing", never as "no threads")."""
+    wanted = {_login(b) for b in bots or ()}
+    return [
+        t
+        for t in threads or []
+        if isinstance(t, dict)
+        and _login(str(t.get("author") or "")) in wanted
+        and thread_is_blocking(str(t.get("body") or ""))
+    ]
+
+
+def thread_summary(threads) -> str:
+    """One line naming the blocking threads' count and authors, for logs and hold comments."""
+    authors = ", ".join(sorted({str(t.get("author") or "?") for t in threads})) or "a review bot"
+    return f"{len(threads)} unresolved major/critical review thread(s) from {authors}"
+
+
+def render_thread_findings(threads: list[dict], pr_url: str = "") -> str:
+    """The fix-round feedback for unresolved Major/Critical bot threads (#495): each thread's
+    ``file:line``, author and body, so the coder fixes the specific code the bot flagged. Mirrors
+    :func:`render_findings` so the next prompt reads the same whether the rejection came from the
+    panel's FAIL review or from its inline threads."""
+    where = f" on {pr_url}" if pr_url else ""
+    lines = [
+        f"Unresolved review threads block the merge{where} — a review bot flagged "
+        f"{len(threads)} Major/Critical issue(s) that must be fixed (or the thread resolved):",
+        "",
+    ]
+    for i, t in enumerate(threads, 1):
+        loc = str(t.get("path") or "?")
+        if t.get("line") not in (None, ""):
+            loc += f":{t.get('line')}"
+        author = str(t.get("author") or "the reviewer")
+        lines.append(f"{i}. `{loc}` — {author}:")
+        body = str(t.get("body") or "").strip()[:_THREAD_BODY_CHARS]
+        if body:
+            fence = _fence(body)
+            lines += [f"   {fence}", *("   " + ln for ln in body.splitlines()), f"   {fence}"]
+    return "\n".join(lines).rstrip()
