@@ -74,16 +74,51 @@ function routingCoders(body){
     + '<p class="r-note">Covers building, CI and review fixes, and escalation. The review gate and helpers (decompose, Max-Mode judge, task assignees) keep their own delegates.</p>'
     + '</section>';
 }
-// Projects that route the same way share one ladder block.
+// Projects that route the same way share one ladder block. usage_policy (#581) is config, like
+// exclusive, so key on the RULES (not their live account %) — a project with its own rules splits off.
 function ladderKey(p){
-  return JSON.stringify([p.exclusive || [], p.escalation_on, (p.ladder || []).map(r => [r.tier, r.delegates])]);
+  return JSON.stringify([
+    p.exclusive || [], p.escalation_on,
+    (p.ladder || []).map(r => [r.tier, r.delegates]),
+    (p.usage_policy || []).map(r => [r.account, r.keep_under, r.prefer, r.tiers || []]),
+  ]);
+}
+// #581 B7b: one usage_policy rule's live state — active once its account is known and over the
+// target %, else inactive (under target, or "usage unknown" — never an error, D4).
+function ruleStatus(r){
+  const used = r.account_used_pct;
+  if (used === "unknown" || used == null) return {text: "usage unknown — inactive", off: true};
+  const u = Math.round(Number(used));
+  return Number(used) >= Number(r.keep_under)
+    ? {text: u+"% used ≥ "+esc(r.keep_under)+"% — active", off: false}
+    : {text: u+"% used < "+esc(r.keep_under)+"% — inactive", off: true};
+}
+// The active rules for a ladder group, read-only. The deciding rule per rung is the "rule N" tag
+// below; here the operator sees every rule and whether its account is currently over its target.
+function policyRules(p){
+  const rules = p.usage_policy || [];
+  if (!rules.length) return "";
+  const row = (r, i) => {
+    const st = ruleStatus(r);
+    const tiers = (r.tiers || []).length ? r.tiers.join(", ") : "all tiers";
+    return '<li class="r-rule'+(st.off ? " r-rule--off" : "")+'">'
+      + '<span class="r-rule-tag">rule '+(i+1)+'</span>'
+      + '<span class="r-rule-body">keep <b>'+esc(r.account)+'</b> under '+esc(r.keep_under)+'%'
+      + ' → prefer <b>'+esc(r.prefer)+'</b> <span class="r-rule-tiers">('+esc(tiers)+')</span></span>'
+      + '<span class="r-rule-state">'+esc(st.text)+'</span></li>';
+  };
+  return '<div class="r-rules"><div class="r-rules-head">Usage rules</div>'
+    + '<ol class="r-rules-list">'+rules.map(row).join("")+'</ol></div>';
 }
 function ladderRows(p){
-  return (p.ladder || []).map(r =>
-    '<div class="r-rung"><span class="r-tier">'+esc(r.tier)+'</span>'
-    + '<span class="r-path">'+(r.delegates.length ? r.delegates.map(esc).join(' <span class="r-then">then</span> ') : '<span class="r-none">no coder</span>')+'</span>'
-    + (r.starts_on ? '<span class="r-next" title="'+esc(r.reason)+'">next: '+esc(r.starts_on)+'</span>' : '')
-    + '</div>').join("");
+  return (p.ladder || []).map(r => {
+    const pol = r.policy || {};
+    const tag = pol.rule_index != null ? ' <span class="r-rule-tag r-rule-tag--pick">rule '+(pol.rule_index+1)+'</span>' : '';
+    return '<div class="r-rung"><span class="r-tier">'+esc(r.tier)+'</span>'
+      + '<span class="r-path">'+(r.delegates.length ? r.delegates.map(esc).join(' <span class="r-then">then</span> ') : '<span class="r-none">no coder</span>')+'</span>'
+      + (r.starts_on ? '<span class="r-next" title="'+esc(r.reason)+'">next: '+esc(r.starts_on)+tag+'</span>' : '')
+      + '</div>';
+  }).join("");
 }
 function routingLadders(body){
   const projects = body.projects || {};
@@ -98,10 +133,11 @@ function routingLadders(body){
       : (i === 0 ? members.length+" projects" : members.join(", "));
     const list = members.length === names.length || i !== 0 ? "" : '<div class="r-members">'+members.map(esc).join(", ")+'</div>';
     return '<div class="pl-card r-ladder"><div class="r-ladder-head">'+esc(who)
-      + (p.escalation_on ? "" : ' <span class="r-none">· no escalation</span>')+'</div>'+list+ladderRows(p)+'</div>';
+      + (p.escalation_on ? "" : ' <span class="r-none">· no escalation</span>')+'</div>'+list
+      + policyRules(p) + ladderRows(p) + '</div>';
   };
   return '<section class="r-sec"><h2>Ladder</h2>'
-    + '<p class="r-note">Cards start on the standard rung and climb when a coder runs out of time or attempts. "Next" is the coder the next card would open on right now.</p>'
+    + '<p class="r-note">Cards start on the standard rung and climb when a coder runs out of time or attempts. "Next" is the coder the next card would open on right now; a "rule N" tag means a usage rule steered it there.</p>'
     + ordered.map(block).join("") + '</section>';
 }
 

@@ -199,18 +199,58 @@ def _headroom_display(snap):
     return room
 
 
-def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive, current):
-    """Which sibling the next dispatch opens on at this rung, and why (#578).
+def _no_policy():
+    """The all-None usage_policy decision a rung carries when no rule steers it (#581 B7b)."""
+    return {"rule_index": None, "reason": None, "account": None, "used_pct": None, "prefer": None}
 
-    Uses the dispatch cursor snapshot and the loop's sibling preference functions.
-    This is a preview, not a reservation: concurrent dispatch may advance the cursor.
+
+def _policy_rule_view(rule, account_snaps):
+    """One usage_policy rule echoed read-only for the view (#581 B7b): its account, target
+    ``keep_under`` %, preferred delegate and (canonical) tiers — ``[]`` meaning every tier —
+    plus the account's live used-% (``"unknown"`` when the snapshot can't be read, which the
+    view renders as "rule inactive (usage unknown)", never an error, D4)."""
+    account = str(rule.get("account") or "").strip()
+    tiers: list[str] = []
+    raw_tiers = rule.get("tiers")
+    if isinstance(raw_tiers, str):
+        raw_tiers = [raw_tiers]
+    for t in raw_tiers or []:
+        canon = canonical_tier(str(t).strip())
+        if canon and canon not in tiers:
+            tiers.append(canon)
+    try:
+        keep_under = int(rule.get("keep_under"))
+    except (TypeError, ValueError):
+        keep_under = rule.get("keep_under")
+    room = _headroom_display(account_snaps.get(account)) if account else "unknown"
+    used = "unknown" if room == "unknown" else 100 - room
+    return {
+        "account": account,
+        "keep_under": keep_under,
+        "prefer": str(rule.get("prefer") or "").strip(),
+        "tiers": tiers,
+        "account_used_pct": used,
+    }
+
+
+def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive, current, tier="", policy=None, snaps=None):
+    """Which sibling the next dispatch opens on at this rung, and why (#578; #581 B7b).
+
+    Uses the dispatch cursor snapshot and the loop's sibling preference functions, then layers
+    the lowest-precedence ``usage_policy`` reorder on top with the loop's own ``policy_decision``
+    (#581) — so ``starts_on``/``reason`` match what dispatch finally does, and the rung carries a
+    ``policy`` sub-dict naming the rule that decided (``_no_policy`` when none did, including when
+    an account's usage is unknown). This is a preview, not a reservation: concurrent dispatch may
+    advance the cursor. ``snaps`` (siblings plus each rule's account) defaults to the sibling-only
+    read, keeping the function host-free on a config alone.
     """
-    from .loop import prefer_headroom_sibling, prefer_live_sibling, provider_is_down
+    from .loop import policy_decision, prefer_headroom_sibling, prefer_live_sibling, provider_is_down
 
     n = len(siblings)
     if n == 0:
-        return {"starts_on": None, "reason": "no eligible delegate"}
-    snaps = {name: usage(name) for name in siblings}
+        return {"starts_on": None, "reason": "no eligible delegate", "policy": _no_policy()}
+    if snaps is None:
+        snaps = {name: usage(name) for name in siblings}
     if headroom_on:
         idx = prefer_headroom_sibling(siblings, current, set(), snaps, prefer_at=prefer_at) % n
     else:
@@ -221,7 +261,25 @@ def _rung_pick(siblings, usage, *, headroom_on, prefer_at, exclusive, current):
         reason = "down-marked"
     else:
         reason = f"headroom ≥{prefer_at}%"
-    return {"starts_on": siblings[idx], "reason": reason}
+    # #581 B7b: the usage_policy reorder is applied AFTER the headroom pick (``idx``), with the
+    # headroom used-% threshold — None when headroom steering is off — exactly as the drive passes
+    # it to apply_usage_policy. Same pure policy_decision the drive calls, so the view cannot drift.
+    policy = policy or []
+    decision = policy_decision(
+        siblings, idx, tier, snaps, policy, spent=set(), prefer_at=prefer_at if headroom_on else None
+    )
+    out_policy = _no_policy()
+    if decision["reason"] is not None:
+        out_policy = {
+            "rule_index": next((i for i, r in enumerate(policy) if r is decision["rule"]), None),
+            "reason": decision["reason"],
+            "account": decision["account"],
+            "used_pct": decision["used_pct"],
+            "prefer": decision["prefer"],
+        }
+        idx = decision["index"] % n
+        reason = decision["reason"]
+    return {"starts_on": siblings[idx], "reason": reason, "policy": out_policy}
 
 
 def effective_routes(cfg, *, usage=None, current=None):
@@ -229,9 +287,12 @@ def effective_routes(cfg, *, usage=None, current=None):
 
     For each project it returns the exclusive-filtered coder ladder (one entry per
     ``TIER_LADDER`` tier, with the delegates left after the B2 filter and which sibling the
-    next dispatch would open on, with the reason); the five named lifecycle paths —
-    implement, fix (CI/review), escalate, review, helpers — with the uncovered ones marked;
-    and, per delegate the ladder names, its live down mark (#420) and subscription headroom
+    next dispatch would open on, with the reason, and a ``policy`` sub-dict naming the
+    ``usage_policy`` rule that steered that pick, if any — #581 B7b); the project's active
+    ``usage_policy`` rules echoed read-only with each account's live used-% (``usage_policy`` /
+    ``usage_policy_source``); the five named lifecycle paths — implement, fix (CI/review),
+    escalate, review, helpers — with the uncovered ones marked; and, per delegate the ladder
+    names, its live down mark (#420) and subscription headroom
     (#579, "unknown" when unread). ``usage(name) -> snapshot|None`` reads a delegate's
     ``graph.sdk.provider_usage`` snapshot; it defaults to all-unknown so the whole function
     is host-free and testable on a config alone. The sibling pick reuses the loop's pure
@@ -268,6 +329,21 @@ def effective_routes(cfg, *, usage=None, current=None):
             prefer_at = min(100, max(1, int(raw_at)))
         except (TypeError, ValueError):
             prefer_at = 90
+        # #581 B7b: the project's active usage_policy rules, resolved exactly as the drive's
+        # _usage_policy_for (project overrides board, including an explicit empty list; non-dict
+        # entries dropped), echoed read-only with each account's live used-% so the view can show a
+        # rule as active (account over its target) or inactive ("usage unknown" / under target —
+        # never an error, D4). The per-rung decision below reuses the same snapshots.
+        raw_policy = proj_routing.get("usage_policy", board_routing.get("usage_policy"))
+        policy = [r for r in raw_policy if isinstance(r, dict)] if isinstance(raw_policy, list) else []
+        if not is_implicit and "usage_policy" in proj_routing:
+            policy_source = "project"
+        elif board_routing.get("usage_policy") is not None:
+            policy_source = "board"
+        else:
+            policy_source = "none"
+        account_snaps = {a: usage(a) for a in dict.fromkeys(str(r.get("account") or "").strip() for r in policy) if a}
+        policy_rules = [_policy_rule_view(r, account_snaps) for r in policy]
         filtered = {tier: [n for n in names if not exclusive or n in exclusive] for tier, names in full.items()}
         ladder = []
         for tier in TIER_LADDER:
@@ -275,6 +351,8 @@ def effective_routes(cfg, *, usage=None, current=None):
                 filtered, tier, escalation_on=escalation_on, exclusive=exclusive, base_coder=base_coder
             )
             siblings = [n for n in siblings if n and (not exclusive or n in exclusive)]
+            snaps = {name: usage(name) for name in siblings}
+            snaps.update({a: s for a, s in account_snaps.items() if a not in snaps})
             pick = _rung_pick(
                 siblings,
                 usage,
@@ -282,6 +360,9 @@ def effective_routes(cfg, *, usage=None, current=None):
                 prefer_at=prefer_at,
                 exclusive=bool(exclusive),
                 current=current,
+                tier=tier,
+                policy=policy,
+                snaps=snaps,
             )
             ladder.append({"tier": tier, "delegates": siblings, **pick})
         entry_rung = next((r for r in ladder if r["delegates"]), None)
@@ -348,6 +429,8 @@ def effective_routes(cfg, *, usage=None, current=None):
             "escalation_on": escalation_on,
             "headroom_on": headroom_on,
             "prefer_sibling_at": prefer_at,
+            "usage_policy": policy_rules,
+            "usage_policy_source": policy_source,
             "ladder": ladder,
             "paths": paths,
             "delegates": delegate_rows,
