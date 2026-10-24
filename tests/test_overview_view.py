@@ -6,7 +6,12 @@ plugin-kit's authed fetch after initPluginView, shows a loading line without a b
 timer, uses DS tokens with no hardcoded colours, and never prints a raw config key as copy.
 """
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from project_board.overview_view import OVERVIEW_PAGE
 
@@ -180,3 +185,74 @@ def test_no_raw_config_key_name_appears_as_visible_copy():
     assert "dep_gate" not in OVERVIEW_PAGE
     # The switch's visible label is operator words, not the key.
     assert "Build ready cards automatically" in OVERVIEW_PAGE
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("health_fails", [False, True])
+def test_live_counts_and_repeated_rechecks(health_fails):
+    """Run the page with API-shaped rows and buttons replaced on every render."""
+    script = OVERVIEW_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0]
+    script = script.replace('import(BASE + "/_ds/plugin-kit.js")', "globalThis.testKit")
+    harness = r"""
+import assert from 'node:assert/strict';
+const BASE = '';
+let button, markup = '', boot, release;
+let reads = 0;
+const listeners = {};
+const host = {
+  addEventListener(type, fn) { listeners[type] = fn; },
+  set innerHTML(value) {
+    markup = value;
+    const tag = value.match(/<button[^>]*id="recheck"[^>]*>/);
+    button = tag ? {
+      disabled: tag[0].includes(' disabled'),
+      closest(selector) { return selector === '#recheck' ? this : null; },
+    } : null;
+  },
+};
+globalThis.document = {
+  getElementById(id) { return id === 'ov' ? host : id === 'recheck' ? button : null; },
+};
+const rows = ['in_progress', 'in_review', 'in_review', 'blocked', 'blocked', 'blocked',
+              'ready', 'ready', 'ready', 'ready', 'done'].map(board_state => ({board_state}));
+globalThis.testKit = {
+  initPluginView(callback) { boot = callback; },
+  async apiFetch(path) {
+    reads++;
+    if (release) await release.promise;
+    if (HEALTH_FAILS && path.endsWith('/status')) throw new Error('unavailable');
+    return {ok: true, status: 200, async json() {
+      return path.endsWith('/features') ? {features: rows} : {};
+    }};
+  },
+};
+""".replace("HEALTH_FAILS", json.dumps(health_fails))
+    assertions = r"""
+const settled = () => new Promise(resolve => setImmediate(resolve));
+boot();
+await settled();
+assert.deepEqual([...markup.matchAll(/class="ov-count-n">(\d+)</g)].map(m => Number(m[1])),
+                 [1, 2, 3, 4]);
+assert.equal(button.disabled, false);
+for (let attempt = 0; attempt < 2; attempt++) {
+  let finish;
+  release = {promise: new Promise(resolve => { finish = resolve; })};
+  const before = reads;
+  listeners.click({target: button});
+  assert.equal(button.disabled, true, 'disabled during reads');
+  listeners.click({target: button});
+  assert.equal(reads, before + 3, 'duplicate clicks do not start more reads');
+  finish();
+  await settled();
+  release = null;
+  assert.equal(button.disabled, false, 'replacement button is enabled after reads');
+}
+assert.equal(reads, 9);
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", harness + script + assertions],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

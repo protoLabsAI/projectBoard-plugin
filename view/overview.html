@@ -141,7 +141,7 @@ function countsSection(features){
       + '<p class="ov-muted">Counts are unavailable — the board could not be read just now.</p></section>';
   }
   const tally = {};
-  (features.features || []).forEach(f => { const s = f.state; tally[s] = (tally[s] || 0) + 1; });
+  (features.features || []).forEach(f => { const s = f.board_state; tally[s] = (tally[s] || 0) + 1; });
   const tiles = COUNTS.map(c => {
     const n = tally[c.state] || 0;
     const href = BOARD + "?state=" + encodeURIComponent(c.state);
@@ -246,6 +246,8 @@ async function render(){
   } finally {
     clearTimeout(slow);
     RECHECK_BUSY = false;
+    const rc = $("recheck");  // render replaced the button; release the current control
+    if (rc) rc.disabled = false;
   }
 }
 
