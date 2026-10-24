@@ -468,12 +468,13 @@ blank.
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
 
-Fresh-build coder timeouts with a host-reported age since the last tool event of at least
-`provider_stall_idle_s` seconds retry on the same tier as `provider_stall`, without spending
-the too-wide timeout budget. `provider_stall_max` bounds these retries using the persisted
-`budget:provider-stall` counter (reset when the build reaches review). Once spent, the
-ordinary timeout policy applies. Missing or malformed ages and pre-model failures retain
-the existing policy. Set `provider_stall_max: 0` to disable stall retries.
+A fresh-build coder timeout whose idle gap — the silence since its last tool/thought/plan/
+answer event, measured from the live progress monitor — is at least `provider_stall_idle_s`
+seconds retries on the same tier as `provider_stall`, without spending the too-wide timeout
+budget. `provider_stall_max` bounds these retries using the persisted `budget:provider-stall`
+counter (reset when the build reaches review). Once spent, the ordinary timeout policy
+applies. An unreadable gap (an untapped host, an evicted buffer) and pre-model failures
+retain the existing policy. Set `provider_stall_max: 0` to disable stall retries.
 
 `decompose_after_timeouts` is the one that changes behaviour rather than tuning it. A coder
 timeout on a fresh build is a **size** signal, not a capability one. It produces no diff and no

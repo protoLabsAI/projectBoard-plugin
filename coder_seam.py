@@ -310,6 +310,7 @@ class _GenBuffer:
         "run",
         "started",
         "ended",
+        "last_event",
         "current_tool",
         "recent_tools",
         "thought_tail",
@@ -346,6 +347,13 @@ class _GenBuffer:
         self.run = 0
         self.started = _monotonic()
         self.ended: float | None = None
+        # Monotonic time of the last tool / thought / plan / answer event (#585). Seeds at
+        # `started`, so a gen that produced nothing reads an idle gap equal to its whole
+        # runtime. `snapshot()` exposes the gap (`idle_s`) — the silence the drive's
+        # provider_stall branch keys on: a backend that stalls mid-build stops streaming
+        # on every channel, so this clock stops advancing while the gen's elapsed keeps
+        # climbing to the timeout.
+        self.last_event = self.started
         self.current_tool: dict | None = None
         self.recent_tools: deque = deque(maxlen=_RECENT_TOOLS_MAX)
         self.thought_tail = ""
@@ -356,11 +364,17 @@ class _GenBuffer:
         self.done = False
         self.stop_reason: str | None = None
 
+    def _mark_event(self) -> None:
+        # A tool/thought/plan/answer event just arrived — the stream is alive. Advance
+        # the idle clock (#585); the gap between it and the timeout is the stall signal.
+        self.last_event = _monotonic()
+
     def add_thought(self, delta: str) -> None:
         # Coalesce into a ROLLING tail: append the delta, then keep only the last
         # _THOUGHT_TAIL_MAX chars. Never accumulates per-word chunks as a list.
         if not delta:
             return
+        self._mark_event()
         self.thought_tail = (self.thought_tail + delta)[-_THOUGHT_TAIL_MAX:]
 
     def add_answer(self, delta: str) -> None:
@@ -374,6 +388,7 @@ class _GenBuffer:
         # with no joiner. A host whose ACP client already drops it never reaches here.
         if self._segment_chunks >= 2 and len(delta) >= _SEGMENT_REPLAY_FLOOR and delta == self._segment:
             return
+        self._mark_event()
         self._segment += delta
         self._segment_chunks += 1
         # Two narration runs with no work signal between can still arrive glued: the
@@ -392,6 +407,7 @@ class _GenBuffer:
         # entry-capped so a runaway plan can't bloat the buffer.
         if not isinstance(entries, (list, tuple)):
             return
+        self._mark_event()
         # A plan update is a work boundary like a tool call (narration after it is a new
         # paragraph); the replay guard's segment is deliberately NOT reset (#3979).
         self._paragraph = True
@@ -408,6 +424,7 @@ class _GenBuffer:
         self.plan = plan
 
     def add_tool(self, event: dict) -> None:
+        self._mark_event()
         phase = str(event.get("phase") or "")
         name = str(event.get("name") or "tool")
         kind = str(event.get("kind") or "") or _infer_tool_kind(name)
@@ -511,6 +528,11 @@ class _GenBuffer:
             # A finished gen's clock FREEZES at progress_end — otherwise the drawer can't
             # tell a completed gen from a running one (panel finding on #89).
             "elapsed_s": round(max(0.0, (self.ended if self.ended is not None else _monotonic()) - self.started), 1),
+            # Seconds the stream sat silent before the gen's clock stopped (#585): the gap
+            # from the last tool/thought/plan/answer event to `ended` (or now, while live).
+            # A fresh-build timeout whose idle_s is long is a stalled backend, not a
+            # too-wide card — the drive retries it on the same tier (provider_stall).
+            "idle_s": round(max(0.0, (self.ended if self.ended is not None else _monotonic()) - self.last_event), 1),
             "current_tool": self._clean_tool(self.current_tool, roots),
             "recent_tools": [self._clean_tool(r, roots) for r in self.recent_tools],
             "thought_tail": _scrub_text(self.thought_tail, roots),

@@ -28,11 +28,15 @@ _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible se
 
 
 def _timeout_idle_s(message: str) -> float | None:
-    """Use the host timeout's reported age since last tool event (#585).
+    """Parse an "age since last tool event" a HOST baked into its timeout message (#585).
 
-    Do not infer an age from total runtime or the ring buffer: its timestamps may
-    belong to another candidate. Missing, malformed, negative or non-finite ages
-    are unknown and preserve the ordinary timeout policy. Only seconds qualify.
+    The FALLBACK source, not the primary one: the plugin's own seam raises a plain
+    ``coder timed out after {timeout}s`` (``coder_seam``/``worktree``) with no age, so in
+    this repo's dispatch path the age comes from the progress ring buffer instead
+    (``_timeout_idle_gap``). This still honours a protoAgent DelegateError/CoderTimeout
+    that DID pre-format the age into its text. Missing, malformed, negative or
+    non-finite ages are unknown and preserve the ordinary timeout policy. Only seconds
+    qualify.
     """
     match = re.search(
         r"\b(?:age since last tool event|last tool event(?: age)?)\s*[:=]?\s*"
@@ -2535,7 +2539,7 @@ class DriveMixin:
                         )
                         return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
-                    idle_s = _timeout_idle_s(str(exc)) if isinstance(exc, worktree.CoderTimeout) else None
+                    idle_s = self._timeout_idle_gap(fid, exc) if isinstance(exc, worktree.CoderTimeout) else None
                     if idle_s is not None:
                         exc = worktree.CoderTimeout(f"{exc}; last event {idle_s:.0f}s before timeout")
                     if self._shutting_down:
@@ -4137,6 +4141,42 @@ class DriveMixin:
         reachable (the review finding on the first cut). Fail-safe toward "no model
         work" so an ambiguous dispatch failure blocks rather than climbs (#339)."""
         return coder_seam.dispatch_reached_model(fid)
+
+    def _timeout_idle_gap(self, fid: str, exc) -> float | None:
+        """Seconds the coder sat idle — no tool/thought/plan/answer — before the timeout
+        (#585). This is what tells a stalled backend (a long silence after real work,
+        then killed) from a card that was too wide to finish inside the budget.
+
+        The PRIMARY source is the progress ring buffer — the same
+        ``coder_seam.progress_snapshot`` ``_timeout_escalation_context`` mines, and the
+        only idle signal populated in the plugin's own dispatch path (its seam raises a
+        plain ``timed out after {timeout}s``). Each gen stamps ``last_event`` on every
+        tool/thought/plan/answer and ``snapshot()`` exposes ``idle_s`` = wall-time from
+        that last event to when the gen was killed. Scoped to the gen the seam stamped
+        TIMED OUT so a sibling max-mode candidate's clock can't answer for this one (the
+        last gen is the fallback for an unstamped buffer) — exactly as the escalation
+        note scopes itself.
+
+        A host that DID pre-format an "age since last tool event" into its CoderTimeout
+        message is honoured as a fallback (``_timeout_idle_s``). Missing, malformed,
+        negative or non-finite gaps are unknown and preserve the ordinary timeout policy.
+        Best-effort: a monitor read must never break the drive."""
+        try:
+            gens = coder_seam.progress_snapshot(fid).get("gens") or []
+        except Exception:  # noqa: BLE001 — a monitor read must never break the drive
+            gens = []
+        timed_out = [g for g in gens if str(g.get("stop_reason") or "").startswith(coder_seam.TIMED_OUT_REASON)]
+        gen = (timed_out or gens or [{}])[-1]
+        idle = gen.get("idle_s")
+        try:
+            idle = float(idle)
+        except (TypeError, ValueError):
+            idle = None
+        if idle is not None and math.isfinite(idle) and idle >= 0:
+            return idle
+        # No usable ring-buffer gap (an evicted/empty buffer, an untapped host) — fall
+        # back to an age the host itself may have baked into the message.
+        return _timeout_idle_s(str(exc))
 
     def _timeout_escalation_context(self, fid: str) -> str:
         """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).
