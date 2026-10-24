@@ -573,6 +573,52 @@ def split_breadth(files, patterns) -> tuple[list[str], list[str]]:
     return counted, excluded
 
 
+# Files whose only change in a release is a version bump or a regenerated lockfile. A card
+# that touches ONLY these is a release chore (#585): decomposing it yields no independently
+# buildable slices, so a repeated timeout parks it for a longer coder budget rather than
+# filing a split. Matched `.gitignore`-style via ``path_matches_glob`` (so `*.lock` catches
+# any lockfile and `changelog.d/**` any changelog fragment), after the `(new)` marker is
+# stripped.
+RELEASE_FILE_GLOBS = (
+    "pyproject.toml",
+    "protoagent.plugin.yaml",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "uv.lock",
+    "*.lock",
+    "CHANGELOG.md",
+    "changelog.d/**",
+)
+
+
+def no_decompose_reason(title, files_to_modify) -> str:
+    """Pure predicate (#585): the reason a card must NOT be auto-decomposed on a repeated
+    coder timeout, or ``""`` when it may be split as usual (#378).
+
+    A repeated ``CoderTimeout`` normally parks a card and files a decompose task. Two kinds
+    of card must never take that path, because splitting them produces nothing useful:
+
+    - a RELEASE CHORE — its title starts with ``chore: release``, or EVERY file it touches
+      is a version manifest or lockfile (``RELEASE_FILE_GLOBS``: pyproject.toml, *.lock,
+      CHANGELOG.md, changelog.d/**, …). A version/lockfile bump has no buildable slices.
+    - a DECOMPOSE TASK itself — its title starts with ``Decompose bd-``. Splitting a split
+      is a loop (the timed-out decompose task that motivated #585).
+
+    For either, the fix is a longer coder budget (raise ``coder_timeout_s`` and unblock),
+    not more slices. An empty ``files_to_modify`` is NOT treated as version/lockfile-only —
+    a card that declares no files is left splittable, falling through to ``""``."""
+    t = str(title or "").strip()
+    if t.startswith("chore: release"):
+        return "release chore (title starts with 'chore: release')"
+    if t.startswith("Decompose bd-"):
+        return "decompose task (never split a split)"
+    files = [p for p in (files_to_modify or []) if str(p).strip()]
+    if files and all(any(path_matches_glob(p, g) for g in RELEASE_FILE_GLOBS) for p in files):
+        return "only version/lockfile files touched"
+    return ""
+
+
 PRIORITY_MIN = 0
 PRIORITY_MAX = 4
 # Cumulative generations `coder.solve()` has spent on this feature (ADR 0064 P2 board
