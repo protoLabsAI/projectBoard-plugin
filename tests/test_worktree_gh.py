@@ -30,7 +30,8 @@ every push, the paths the loop actually opens PRs from.
 The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for_branch``,
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
 ``read_review_status``, ``_find_marked_comment``, ``post_or_update_pr_comment``, ``merge_pr`` —
-and, since #473, ``pr_review_state`` (the external QA panel's verdict read).
+and, since #473, ``pr_review_state`` (the external QA panel's verdict read); since #495,
+``pr_unresolved_threads`` (the PR's unresolved review threads, a ``gh api graphql`` read).
 Reads use the pinned fixture. The only writes are (1) EXACTLY ONE commit status per run, keyed
 on a STABLE disposable ``(context, sha)`` — GitHub records each POST as a new immutable entry
 (the combined-status rollup, which the review gate reads, reports only the latest per context),
@@ -252,6 +253,39 @@ async def test_pr_review_state_is_none_for_a_pr_that_does_not_exist(gh_fixture, 
     monkeypatch.setattr(worktree, "pr_review_state", REAL_SEAMS["worktree.pr_review_state"])
     missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
     assert await worktree.pr_review_state(missing, cwd=gh_fixture.repo_dir) is None
+
+
+# ── pr_unresolved_threads (#495: the PR's unresolved review threads) ─────────────────────
+
+
+@requires_gh
+async def test_pr_unresolved_threads_reads_a_bounded_well_typed_list(gh_fixture, monkeypatch):
+    """``pr_unresolved_threads`` asks real GitHub (``gh api graphql``) for the PR's unresolved
+    review threads (#495) and returns a bounded ``[{author, path, line, body}, …]``. A mock
+    accepts any GraphQL; this proves real `gh` accepts the query and that the shape
+    ``external_review.blocking_threads`` walks is what GitHub returns. The fixture has no
+    guaranteed open thread, so the CONTRACT is pinned — a list (never ``None`` for a readable PR)
+    of well-typed dicts, bounded by ``first`` — not a particular thread."""
+    from conftest import REAL_SEAMS
+
+    monkeypatch.setattr(worktree, "pr_unresolved_threads", REAL_SEAMS["worktree.pr_unresolved_threads"])
+    threads = await worktree.pr_unresolved_threads(gh_fixture.url, cwd=gh_fixture.repo_dir, first=5)
+    assert isinstance(threads, list), "a readable PR must return a list, never None"
+    assert len(threads) <= 5
+    for t in threads:
+        assert set(t) == {"author", "path", "line", "body"}, t
+        assert isinstance(t["author"], str) and isinstance(t["path"], str) and isinstance(t["body"], str)
+
+
+@requires_gh
+async def test_pr_unresolved_threads_is_none_for_a_pr_that_does_not_exist(gh_fixture, monkeypatch):
+    """An unreadable PR is ``None`` — never ``[]`` (a timeout/GraphQL error must not look like "no
+    threads" and let a merge through) and never a raise (the #495 fail-safe)."""
+    from conftest import REAL_SEAMS
+
+    monkeypatch.setattr(worktree, "pr_unresolved_threads", REAL_SEAMS["worktree.pr_unresolved_threads"])
+    missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
+    assert await worktree.pr_unresolved_threads(missing, cwd=gh_fixture.repo_dir) is None
 
 
 # ── post_review_status + read_review_status (the commit-status write + its readback) ────

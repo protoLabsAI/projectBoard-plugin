@@ -1243,6 +1243,14 @@ class ReconcileMixin:
                         # merging a PR the panel has rejected spends budget on nothing.
                         if await self._reconcile_external_review(store, f, pr_url, repo, view=view):
                             continue
+                        # #495: the panel edge above only acts on a REVIEW carrying a FAIL marker.
+                        # A bot that leaves its Major/Critical findings as inline REVIEW THREADS
+                        # instead (CodeRabbit) produced an UNSTABLE PR with open Major threads and
+                        # no panel FAIL — it sat in_review forever (bd-fgtf). Bounce it on those
+                        # threads, with the SAME once-per-head / ext-review-fix machinery, and skip
+                        # the edges below for a PR that cannot merge as it stands.
+                        if await self._reconcile_review_threads(store, f, pr_url, repo, view=view):
+                            continue
                         # Keep a stale/conflicting PR mergeable BEFORE the CI reconcile: a
                         # sibling merge re-stales the others off the shared base, and a rebase
                         # force-pushes + re-runs CI — so checking CI on the stale head first
@@ -2831,18 +2839,54 @@ class ReconcileMixin:
                 f"{pr_url}",
             )
             return True
-        stamp = f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{short}"
-        if stamp in (feature.get("labels") or []):
-            await asyncio.to_thread(
-                self._note_external_hold,
-                store,
-                fid,
-                head,
+        await self._record_external_bounce(
+            store,
+            feature,
+            pr_url,
+            repo,
+            head=head,
+            rendered=external_review.render_findings(verdict, pr_url),
+            signals=signals,
+            reject_label="external review FAILED",
+            already_bounced_hold=(
                 f"the external review still FAILS at head {short} ({signals}), and a fix round was already "
                 f"bounced for this head without a new push — needs a human (push a fix, or close the PR): "
-                f"{pr_url}",
-            )
-            return True
+                f"{pr_url}"
+            ),
+        )
+        return True
+
+    async def _record_external_bounce(
+        self,
+        store,
+        feature: dict,
+        pr_url: str,
+        repo: str,
+        *,
+        head: str,
+        rendered: str,
+        signals: str,
+        reject_label: str,
+        already_bounced_hold: str,
+    ) -> None:
+        """The shared bounce tail for an external-review rejection at the PR's current head — the
+        panel's FAIL (#473) and a configured bot's unresolved Major/Critical threads (#495) both
+        land here. The caller has already PROVEN the rejection and rendered the findings; this owns
+        only the stamp / budget / requeue / block machinery and its claim-locked re-read, so the two
+        edges can never drift apart.
+
+        In order: the head already carries this card's ``ext-review-bounced:<sha>`` stamp → HOLD
+        (``already_bounced_hold``); the loop is still working the card → defer this pass; otherwise,
+        under the claim lock, record the findings and either requeue the SAME PR into a fix round
+        (spending one ``ext-review-fix`` unit) or — once ``review_fix_max`` is spent — block for a
+        human with ``reject_label`` naming the rejection. Once per head: only a new push re-arms the
+        bounce. ``signals`` is the one-line evidence for logs and the block reason."""
+        fid = feature["id"]
+        short = head[: store_mod.SHORT_SHA_LEN]
+        stamp = f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{short}"
+        if stamp in (feature.get("labels") or []):
+            await asyncio.to_thread(self._note_external_hold, store, fid, head, already_bounced_hold)
+            return
         if (
             _loop.live_drive(fid) is not None
             or fid in self._inflight_files
@@ -2850,16 +2894,16 @@ class ReconcileMixin:
             or _loop.requeue_refusal(fid, own_task=asyncio.current_task())
         ):
             log.info(
-                "[project_board] %s external review FAILED at %s, but the loop is still working the card — "
+                "[project_board] %s %s at %s, but the loop is still working the card — "
                 "bounce deferred to the next poll: %s",
                 fid,
+                reject_label,
                 short,
                 pr_url,
             )
-            return True
-        rendered = external_review.render_findings(verdict, pr_url)
+            return
         n = await self._budget_get(store, fid, "ext-review-fix", feature)
-        # The diff the panel failed rides beside the findings (the gate's carry-the-lesson
+        # The diff the review failed rides beside the findings (the gate's carry-the-lesson
         # lever). Read BEFORE the claim lock: a `gh` round-trip must not hold the claim scan.
         prior_diff = ""
         if n < self.review_fix_max:
@@ -2872,20 +2916,20 @@ class ReconcileMixin:
             # requeue may have moved the card since the pass read it.
             fresh = await asyncio.to_thread(store.get_feature, fid) or {}
             if fresh.get("board_state") != "in_review" or stamp in (fresh.get("labels") or []):
-                return True
+                return
             if (
                 _loop.live_drive(fid) is not None
                 or fid in self._inflight_files
                 or _loop.requeue_refusal(fid, own_task=asyncio.current_task())
             ):
-                return True
+                return
             await asyncio.to_thread(lambda: store.record_review_bounce(fid, rendered, head=head))
             if n >= self.review_fix_max:
                 await asyncio.to_thread(
                     self._flag_blocked,
                     store,
                     fid,
-                    f"external review FAILED at head {short} ({signals}) after {n} review fix round(s) — "
+                    f"{reject_label} at head {short} ({signals}) after {n} review fix round(s) — "
                     f"needs human review: {pr_url}",
                     # Stated, never guessed from the words: a `TIMED_OUT` check in the reason
                     # must not read as a transient block the sweep would auto-requeue.
@@ -2895,13 +2939,14 @@ class ReconcileMixin:
                 self._ci_prior_diff.pop(fid, None)
                 await self._budget_reset(store, fid, "ext-review-fix")
                 log.warning(
-                    "[project_board] %s blocked (external review FAIL at %s, %d fix round(s) spent): %s",
+                    "[project_board] %s blocked (%s at %s, %d fix round(s) spent): %s",
                     fid,
+                    reject_label,
                     short,
                     n,
                     pr_url,
                 )
-                return True
+                return
             await self._budget_set(store, fid, "ext-review-fix", n + 1)
             _loop.queue_review_feedback(fid, rendered)
             if prior_diff:
@@ -2911,13 +2956,85 @@ class ReconcileMixin:
             await asyncio.to_thread(store.requeue, fid)
         getattr(self, "_ext_review_held", {}).pop(fid, None)
         log.info(
-            "[project_board] %s external review FAILED at %s (%s) → fix round %d/%d on the same PR: %s",
+            "[project_board] %s %s at %s (%s) → fix round %d/%d on the same PR: %s",
             fid,
+            reject_label,
             short,
             signals,
             n + 1,
             self.review_fix_max,
             pr_url,
+        )
+
+    async def _reconcile_review_threads(
+        self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
+    ) -> bool:
+        """Bounce an in_review PR that will NOT merge and carries unresolved Major/Critical review
+        threads from a configured bot (#495). The #473 panel edge only fires on a review the bot
+        posts as a PR REVIEW with a FAIL marker; a bot that instead leaves its findings as inline
+        REVIEW THREADS (CodeRabbit, protoreview's own thread comments) produced an UNSTABLE PR with
+        open Major threads and NO panel FAIL — it sat ``in_review`` forever (bd-fgtf /
+        protoAgent#3745). This edge reads those threads and bounces on them.
+
+        Returns True when it took ownership of the pass (bounced, held or blocked), so the caller
+        skips the rebase / merged-state / CI / merge edges below exactly as the panel edge does.
+        Fails OPEN — returns False, the pass proceeds — whenever nothing is proven:
+
+        * external review is off for this card (no config); or
+        * the thread read is UNKNOWN (``None`` — a gh timeout is NEVER read as "no threads", r3); or
+        * no configured bot has a Major/Critical thread open (Minor-only never bounces, r2); or
+        * the PR already reads CLEAN on GitHub (it is about to merge — the merge edge owns it — and
+          an advisory thread does not stop it), or its merge state is UNKNOWN/unreadable (not proof
+          it is stuck).
+
+        The threads are read FIRST and the merge state only when a blocking thread exists, so the
+        common clean-PR poll costs one bounded ``gh`` read and never a second. The bounce reuses the
+        #473 machinery (:meth:`_record_external_bounce`): once per head, bounded by ``review_fix_max``
+        in ``budget:ext-review-fix``, blocked for a human when spent."""
+        fid = feature["id"]
+        cfg = self._external_review_cfg_for(feature)
+        if cfg is None:
+            return False
+        threads = await worktree.pr_unresolved_threads(pr_url, cwd=repo)
+        if threads is None:
+            return False  # UNKNOWN (timeout / unreadable) is never "no threads" — change nothing (r3)
+        blocking = external_review.blocking_threads(threads, cfg.thread_bots)
+        if not blocking:
+            return False  # no configured bot has a Major/Critical thread open — Minor-only never bounces (r2)
+        # Only when the PR will NOT merge as it stands: a CLEAN PR is about to merge (the merge edge
+        # owns it) and an advisory thread does not stop it; an UNKNOWN/unreadable status is not proof
+        # it is stuck, so fail open there too. Read LAST, so a clean PR with no bad threads never
+        # pays for it.
+        mss = await worktree.pr_merge_state(pr_url, cwd=repo)
+        if mss in ("", "CLEAN", "UNKNOWN"):
+            return False
+        head = str((view or {}).get("headRefOid") or "").strip() or await worktree.pr_head_sha(pr_url, cwd=repo)
+        if not head:
+            return False  # no head to pin the once-per-head stamp to — nothing to do this pass
+        short = head[: store_mod.SHORT_SHA_LEN]
+        signals = external_review.thread_summary(blocking)
+        log.info(
+            "[project_board] %s PR is %s on GitHub with %s at head %s → bouncing on the threads: %s",
+            fid,
+            mss,
+            signals,
+            short,
+            pr_url,
+        )
+        await self._record_external_bounce(
+            store,
+            feature,
+            pr_url,
+            repo,
+            head=head,
+            rendered=external_review.render_thread_findings(blocking, pr_url),
+            signals=signals,
+            reject_label="unresolved review threads",
+            already_bounced_hold=(
+                f"unresolved review threads still block the merge at head {short} ({signals}), and a fix "
+                f"round was already bounced for this head without a new push — needs a human (push a fix, "
+                f"or resolve the threads): {pr_url}"
+            ),
         )
         return True
 

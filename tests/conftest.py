@@ -142,6 +142,7 @@ REAL_SEAMS = {
     "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
     "worktree.refresh_base_checkout": _worktree_mod.refresh_base_checkout,
     "worktree.pr_review_state": _worktree_mod.pr_review_state,
+    "worktree.pr_unresolved_threads": _worktree_mod.pr_unresolved_threads,
     "worktree.rerun_failed_ci": _worktree_mod.rerun_failed_ci,
 }
 
@@ -463,4 +464,20 @@ def _no_external_review_read(monkeypatch):
         return None
 
     monkeypatch.setattr(_worktree_mod, "pr_review_state", _unread)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_review_thread_read(monkeypatch):
+    """The PR reconcile reads a PR's UNRESOLVED review threads to bounce on a bot's Major/Critical
+    finding (#495). In the unit tier every PR url is made up, so a real read would shell
+    `gh api graphql` against a repo that does not exist, on every reconcile test. Stub it to "no
+    unresolved threads" (nothing to bounce on — the pass runs as before); tests/
+    test_thread_bounce_495.py fakes threads, and the real-gh tier (tests/test_worktree_gh.py) puts
+    the real one back (``REAL_SEAMS``)."""
+
+    async def _none(_pr_url, *, cwd=".", first=0):
+        return []
+
+    monkeypatch.setattr(_worktree_mod, "pr_unresolved_threads", _none)
     yield
