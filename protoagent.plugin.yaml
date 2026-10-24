@@ -285,16 +285,18 @@ config:
 # Configure-dialog information architecture (protoAgent #3179/#3180). `overview`,
 # `projects`, `routing` (Coders) and `review` (Review & merge) are plugin-owned pages
 # (a `path:`): a keyed map, live counts, a routing ladder and a Review→CI→Rebase→Merge
-# pipeline are not honest scalar fields. `automation` and `security` still use the generic
-# schema renderer below. min_protoagent_version keeps hosts without this contract from
-# loading a Configure surface they cannot render faithfully.
+# pipeline are not honest scalar fields. `maintenance` (S5, #615) is the ONE remaining
+# generic schema tab below — occasional upkeep plus the two secrets, the things nobody
+# needs to get started — folding the old `automation` and `security` tabs into one and
+# placed LAST. It carries `apply: live` (core protoAgent #4489 reads it to apply saves to
+# the running member; older hosts ignore the key). min_protoagent_version keeps hosts
+# without this contract from loading a Configure surface they cannot render faithfully.
 settings_tabs:
   - { id: overview, label: "Overview", path: /plugins/project_board/config/overview }
   - { id: projects, label: "Projects", path: /plugins/project_board/config/projects }
   - { id: routing, label: "Coders", path: /plugins/project_board/config/routing }
-  - { id: automation, label: "Automation" }
   - { id: review, label: "Review & merge", path: /plugins/project_board/config/review }
-  - { id: security, label: "Security" }
+  - { id: maintenance, label: "Maintenance", apply: live }
 
 # Console settings. `restart: true` is deliberate: only LIVE_KNOBS are re-applied by
 # BoardLoop.reload; every other exposed scalar is useful/operator-safe but remains the
@@ -320,25 +322,29 @@ settings_tabs:
 # `review_dispatch`, `review_fix_max`, `ci_poll`, `ci_rerun_max`, `ci_fix_max`, `auto_rebase`,
 # `rebase_fix_max`, `auto_merge`, `merge_method`, `merged_verify_max`, `merge_poll`, `dep_gate`.
 # They are still written through PUT /settings and tracked in pending_restart via settings_api's
-# hand-added allowlist. The automation schema tab below now holds only br_autofetch, base_refresh
-# and local_gate_cmd (S5 relocates those).
+# hand-added allowlist. The Maintenance schema tab below (S5, #615) now holds the five generic
+# fields that survive — br_autofetch, base_refresh and local_gate_cmd plus the two secrets
+# (webhook_secret, npm_token) folded in from the old Security tab. None is needed to get a board
+# started; each description says WHEN an operator would reach for it.
 settings:
-  - { key: br_autofetch, label: "Download the board tool automatically", type: bool, group: "Project Board", tab: automation,
-      description: "Download and verify the missing board command-line tool from github.com, or turn off to install it yourself." }
-  - { key: base_refresh, label: "Update project checkouts automatically", type: bool, group: "Project Board", tab: automation, restart: true,
-      description: "Keep board-owned checkouts up to date, leaving local edits, other branches, and diverged history untouched." }
-  - { key: local_gate_cmd, label: "Checks before opening a pull request", type: string, group: "Project Board", tab: automation, restart: true,
-      description: "Run this check command before opening a pull request unless the project overrides it; blank disables the default checks." }
+  - { key: br_autofetch, label: "Download the board tool automatically", type: bool, group: "Project Board", tab: maintenance,
+      description: "Download and verify the board's card database tool (br) from github.com when it is missing, or turn it off to install br yourself." }
+  - { key: base_refresh, label: "Update project checkouts automatically", type: bool, group: "Project Board", tab: maintenance, restart: true,
+      description: "Keep board-owned checkouts up to date before builds, or turn this off when you update those working copies yourself." }
+  - { key: local_gate_cmd, label: "Checks before opening a pull request", type: string, group: "Project Board", tab: maintenance, restart: true,
+      description: "Set the lint and test command to run before each pull request opens, or leave it blank when a project defines its own checks." }
 
   # The Review & merge pipeline (auto_merge, merged_verify_max, merge_method, review_gate,
   # review_workflow, reviewer, review_dispatch, review_fix_max, merge_poll, ci_poll, ci_fix_max,
   # ci_rerun_max, auto_rebase, rebase_fix_max, dep_gate) moved to the plugin-owned Review & merge
   # page (S4, #614) — see the Review tab in settings_tabs and settings_api's _PAGE_OWNED.
 
-  - { key: webhook_secret, label: "Secret for GitHub updates", type: secret, group: "Project Board", tab: security, restart: true,
-      description: "Verify incoming merge, check, and review updates with this secret; blank disables public update routes." }
-  - { key: npm_token, label: "Token for private package checks", type: secret, group: "Project Board", tab: security, restart: true,
-      description: "Use this read token to check private npm package releases; blank checks the public registry without signing in." }
+  # Secrets stay type: secret — stored through the host's secret settings path and never echoed
+  # back to the browser. Each says what it UNLOCKS, not what it is.
+  - { key: webhook_secret, label: "Secret for GitHub updates", type: secret, group: "Project Board", tab: maintenance, restart: true,
+      description: "Set this to unlock the public merge, check, and review update routes; leave it blank to keep those routes closed." }
+  - { key: npm_token, label: "Token for private package checks", type: secret, group: "Project Board", tab: maintenance, restart: true,
+      description: "Set this read token to unlock release checks for private npm packages; leave it blank for public packages that need no sign-in." }
 
 # Console view (ADR 0026) — a left-rail icon whose panel iframes the board page.
 # The list/Kanban view is a projection over the /features API (no separate store).

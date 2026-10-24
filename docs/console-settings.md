@@ -1,32 +1,34 @@
 # Configure it in the console
 
-On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is split
-by operator intent:
+On protoAgent 0.153.2+, **Settings → Plugins → Project Board → Configure** is five tabs,
+each answering one operator question, in the order you meet a board: is it on, what does it
+build, who builds it, what happens to a pull request, and the upkeep you rarely touch —
+**Overview, Projects, Coders, Review & merge, Maintenance**. Every scalar is explicit about
+how it applies: live to the running loop, or persisted now but effective after the member
+restarts (those are marked **restart** and list themselves in the pending-restart banner).
 
-- **Coder routing** picks which coders may build (see below).
-- **Projects** is the live registry editor. It lists the configured project map and
-  can add or update repos only inside the host's enabled Project onboarding root.
-  Add/update preserves sibling projects and file-only per-project fields without
-  returning those fields' values to the browser, then reads live config back before
-  reporting success. Malformed non-mapping entries stay visible but read-only until
-  repaired in YAML (the API refuses to overwrite them too). A sole project is the
-  runtime's implicit default; adding a second preserves that choice explicitly, and
-  the sole default cannot be misleadingly “cleared.” Delete requires explicit
-  confirmation and is refused while an active board card names that project—or while
-  a legacy unlabelled active card routes through it as the effective default.
-- **Automation** contains the loop posture, coder, concurrency/back-pressure, local
-  verification, and candidate-generation controls.
-- **Review & merge** contains review dispatch/gating, CI reconciliation, rebase,
-  dependency release, and auto-merge behavior.
-- **Security** contains the webhook HMAC secret. It is stored through the host's
-  secret settings path, never returned by the Projects API.
+## Overview — is the board on, and is anything wrong?
 
-Every scalar is explicit about apply behavior. `coder`, `br_autofetch`,
-`max_concurrent`, `max_concurrent_sessions`, `max_pending_reviews`, and `auto_merge`
-apply to the running loop; fields marked **restart** are persisted immediately but
-do not change the already-constructed loop/router until the member restarts. Project
-map/default changes apply live as one validated routing policy and do not produce a
-false restart warning.
+The **Overview** tab is the first stop: a single **Build ready cards automatically** switch
+for the loop, live counts of what the board is doing, any setup problems with a one-click
+fix action, and a pending-restart banner that offers **Restart now** when the host
+advertises restart support (older hosts show the manual steps instead). It is a
+plugin-served page with no config data in it; every read and write goes through the
+operator-gated settings routes.
+
+## Projects — which repositories does the board build in?
+
+The **Projects** tab is the live registry editor. It lists the configured project map and
+can add or update repos only inside the host's enabled Project onboarding root. Add/update
+preserves sibling projects and file-only per-project fields without returning those fields'
+values to the browser, then reads live config back before reporting success. Malformed
+non-mapping entries stay visible but read-only until repaired in YAML (the API refuses to
+overwrite them too). A sole project is the runtime's implicit default; adding a second
+preserves that choice explicitly, and the sole default cannot be misleadingly “cleared.”
+Delete requires explicit confirmation and is refused while an active board card names that
+project—or while a legacy unlabelled active card routes through it as the effective default.
+Project map and default changes apply live as one validated routing policy and do not raise
+a false restart warning.
 
 A save that sets a new local gate command, or moves the project (and its gate) to another
 repo, runs that gate once on the clean base before anything persists, and a red gate refuses
@@ -40,12 +42,20 @@ preflight is holding too. If another save changes the same project while a gate 
 save is refused with a 409; save again. When a proxy gives up on a long save first (the
 fleet proxy allows 20s), the editor reads the outcome from `GET /projects`.
 
-## Coder routing (Configure tab)
+## Coders — who builds, and how hard?
 
-**Settings → Plugins → Project Board → Configure → Coder routing** is the console surface
-for strict coder routing (`routing.exclusive`): the operator picks which coders may build,
-with no YAML. Like Projects, it is a plugin-served page with no config data in it; every
-read and save goes through the operator-gated `/api/plugins/project_board/routing` routes.
+The **Coders** tab leads with a **Default coder** picker, two **Capacity** steppers
+(parallel builds and the review-queue limit, both applied live), and an **Advanced** block —
+collapsed by default — holding the tuning knobs most boards leave alone. `coder`,
+`max_concurrent` and `max_pending_reviews` apply to the running loop on save; an Advanced
+knob that needs a restart says so and lists itself in the pending-restart banner.
+
+### Strict routing and the ladder
+
+The lower half of the Coders tab is the console surface for strict coder routing
+(`routing.exclusive`): the operator picks which coders may build, with no YAML. Like
+Projects, it is a plugin-served page with no config data in it; every read and save goes
+through the operator-gated `/api/plugins/project_board/routing` routes.
 
 **Coders.** One card per configured coder shows its provider state (live, or down-marked,
 #420), its subscription usage (#579; **Usage unknown** on an older host or with no usage
@@ -68,6 +78,33 @@ a preview: another dispatch or a provider-state change can change it.
 
 Per-project `routing.exclusive` overrides remain YAML/`board_routing_set`-only; a project
 with one shows as its own ladder block.
+
+## Review & merge — what happens after a pull request opens?
+
+The **Review & merge** tab reads top to bottom as the four steps a pull request actually
+travels — **Review → CI → Rebase → Merge** — so the page alone tells you what the board will
+do. Each step is a card with an on/off switch and its attempt counts as small steppers;
+turning a step off disables its dependent sub-settings. Review carries the required-review
+switch with a workflow picker, a reviewer picker, an advisory-review-on-open switch and a
+fix-attempts stepper; CI carries bounce-failing-checks with rerun and fix steppers; Rebase
+carries update-with-base-changes and a conflict-fix stepper; Merge carries auto-merge with a
+merge-method picker, a hold-after-failed-checks stepper and the reconcile-PRs switch. Below
+the steps, a **Dependent cards** radio sets whether a blocked card starts when its blocker
+merges (safer) or opens a pull request (faster); shared foundation changes always wait for a
+merge. Every read and write goes through the operator-gated settings routes; a restart-only
+knob lists itself in the pending-restart banner.
+
+## Maintenance — occasional upkeep and secrets
+
+The **Maintenance** tab is the last tab, and nothing on it is needed to get a board started.
+It folds the old Automation and Security tabs into one place for the things you reach for
+only now and then: whether the board downloads its own card-database tool (`br`), whether it
+keeps board-owned checkouts current, the check command run before a pull request opens, and
+the two secrets — the GitHub webhook secret and the private-npm read token. The secrets are
+**type secret**: stored through the host's secret settings path and never returned to the
+browser, so their values are never shown; a blank secret simply leaves its route or sign-in
+off. `br_autofetch` applies to the running loop on save; the other three are persisted
+immediately and take effect after the member restarts, and each says so.
 
 ## Not exposed in the console
 
@@ -124,7 +161,7 @@ default. Applies live on save: a paused loop resumes on its next check.
 
 | Label | Help |
 |---|---|
-| Download the board tool automatically | Download and verify the missing board command-line tool from github.com, or turn off to install it yourself. |
+| Download the board tool automatically | Download and verify the board's card database tool (br) from github.com when it is missing, or turn it off to install br yourself. |
 
 When the beads CLI (br) is not on PATH, download the pinned beads-rust release for this
 platform into the agent's data dir and use it (sha256-verified; needs github.com). Off =
@@ -175,7 +212,7 @@ acceptance criteria, including test coverage.
 
 | Label | Help |
 |---|---|
-| Update project checkouts automatically | Keep board-owned checkouts up to date, leaving local edits, other branches, and diverged history untouched. |
+| Update project checkouts automatically | Keep board-owned checkouts up to date before builds, or turn this off when you update those working copies yourself. |
 
 Each health sweep fetches the base branch of every board-owned checkout (under the
 onboarding root, or registered by the board) and fast-forwards it when it is clean and
@@ -188,7 +225,7 @@ status. Off = no fetch, no fast-forward.
 
 | Label | Help |
 |---|---|
-| Checks before opening a pull request | Run this check command before opening a pull request unless the project overrides it; blank disables the default checks. |
+| Checks before opening a pull request | Set the lint and test command to run before each pull request opens, or leave it blank when a project defines its own checks. |
 
 Fast lint/typecheck/unit command run before a PR opens. Project-specific values in the
 Projects tab override it. Blank disables the default gate.
@@ -358,7 +395,7 @@ review (more parallel). Foundation work always waits for merge.
 
 | Label | Help |
 |---|---|
-| Secret for GitHub updates | Verify incoming merge, check, and review updates with this secret; blank disables public update routes. |
+| Secret for GitHub updates | Set this to unlock the public merge, check, and review update routes; leave it blank to keep those routes closed. |
 
 HMAC-SHA256 secret for public merge, CI, and review ingress. Blank disables every public
 mutation route. Stored in secrets.yaml.
@@ -367,7 +404,7 @@ mutation route. Stored in secrets.yaml.
 
 | Label | Help |
 |---|---|
-| Token for private package checks | Use this read token to check private npm package releases; blank checks the public registry without signing in. |
+| Token for private package checks | Set this read token to unlock release checks for private npm packages; leave it blank for public packages that need no sign-in. |
 
 Read token for npm publish gates (waits_for npm:...) on PRIVATE packages. Blank reads
 the public registry anonymously, which is all a public package needs. Stored in

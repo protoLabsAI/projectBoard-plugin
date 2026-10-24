@@ -291,8 +291,9 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     # were removed from the generic `settings:` list but are still written through PUT /settings —
     # settings_api hand-adds them to its allowlist, exactly like loop_enabled. The Coders tab owns
     # the `coder` picker, the two capacity steppers and the six Advanced tuning knobs; the Review
-    # tab owns the whole Review→CI→Rebase→Merge pipeline plus the dependent-cards gate. The
-    # automation schema tab now holds only br_autofetch/base_refresh/local_gate_cmd.
+    # tab owns the whole Review→CI→Rebase→Merge pipeline plus the dependent-cards gate. The lone
+    # generic schema tab is now Maintenance (S5, #615): br_autofetch, base_refresh, local_gate_cmd
+    # and the two secrets (webhook_secret, npm_token).
     page_owned = {
         # Coders tab (S3, #613)
         "coder",
@@ -373,13 +374,14 @@ def test_manifest_declares_the_ordered_tabbed_config_contract():
         {"id": "overview", "label": "Overview", "path": "/plugins/project_board/config/overview"},
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
         {"id": "routing", "label": "Coders", "path": "/plugins/project_board/config/routing"},
-        {"id": "automation", "label": "Automation"},
         {"id": "review", "label": "Review & merge", "path": "/plugins/project_board/config/review"},
-        {"id": "security", "label": "Security"},
+        {"id": "maintenance", "label": "Maintenance", "apply": "live"},
     ]
-    # The review tab gained a `path` (S4, #614), so only automation + security use the generic
-    # schema renderer now; the tab id `review` is unchanged, so its deep links survive.
+    # S5 (#615) folded the old automation + security tabs into one Maintenance tab, placed LAST:
+    # it is the ONLY generic schema tab left (no `path`), and carries `apply: live` (core #4489).
+    # The four plugin-owned pages keep their `path` and unchanged ids, so their deep links survive.
     schema_tabs = {t["id"] for t in m["settings_tabs"] if "path" not in t}
+    assert schema_tabs == {"maintenance"}
     assert {field["tab"] for field in m["settings"]} <= schema_tabs
     assert {field["tab"] for field in m["settings"]} == schema_tabs
     assert next(field for field in m["settings"] if field["key"] == "webhook_secret")["type"] == "secret"
