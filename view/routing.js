@@ -27,6 +27,7 @@ let ROUTING_MSG = null;          // {text, kind} shown inline after a routing sa
 let SAVE_BUSY = false;           // a settings save is in flight — freeze the knobs
 let SETTINGS_MSG = {};           // {key: {kind, text}} inline message per settings knob
 let ROUTING_BODY = null;         // last /routing/effective read (coders + ladder)
+let SETTINGS_ERROR = null;      // settings reads must not hide the independent routing controls
 let SETTINGS = null;             // last /settings snapshot (scalar knobs + pending_restart)
 let CODER_CUSTOM = false;        // the default-coder control is in free-text mode (type any delegate)
 
@@ -82,6 +83,7 @@ function routingSummary(dels, exclusive){
 // — not this list — is the authority on whether a name resolves, so a typed name is saved and
 // setup checks confirm it; only an empty name is refused here (the loop needs one to build).
 function coderPicker(){
+  if (!SETTINGS) return "";
   const dels = (ROUTING_BODY && ROUTING_BODY.delegates) || [];
   const cur = String(settingValue("coder") || "");
   const known = dels.includes(cur);
@@ -305,11 +307,11 @@ function routingLadders(body){
 
 function renderAll(){
   const host = $("routing");
-  if (!ROUTING_BODY || !SETTINGS) return;
+  if (!ROUTING_BODY) return;
   host.innerHTML = restartBanner(SETTINGS)
     + coderSection()
-    + capacitySection()
-    + advancedSection()
+    + (SETTINGS_ERROR ? inlineMsg({kind:"error", text:"Could not load settings: " + SETTINGS_ERROR}) : "")
+    + (SETTINGS ? capacitySection() + advancedSection() : "")
     + routingLadders(ROUTING_BODY);
   syncRoutingControls();
 }
@@ -320,10 +322,14 @@ async function renderRouting(){
   // The effective read resolves every project's ladder and each coder's usage (a few
   // seconds): say so on first open instead of showing an empty tab.
   if (!host.firstChild) host.innerHTML = '<p class="r-loading">Reading coders and routing…</p>';
+  SETTINGS_ERROR = null;
   try {
     const [body, settings] = await Promise.all([
       api("/api/plugins/project_board/routing/effective"),
-      api("/api/plugins/project_board/settings"),
+      api("/api/plugins/project_board/settings").catch(e => {
+        SETTINGS_ERROR = String(e && e.message || e);
+        return null; // Hide unavailable scalar controls, but keep routing usable.
+      }),
     ]);
     ROUTING_BODY = body; SETTINGS = settings;
     renderAll();

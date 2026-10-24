@@ -414,3 +414,97 @@ assert.ok(markup.includes('Enter a coder name'), 'blank refused inline');
         timeout=15,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("failure", ["http", "network", "non-json"])
+def test_routing_remains_usable_when_settings_read_fails(failure):
+    """Settings outages cannot remove the independent routing controls, including after saves."""
+    script = ROUTING_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0]
+    script = script.replace('import(BASE + "/_ds/plugin-kit.js")', "globalThis.testKit")
+    harness = r"""
+import assert from 'node:assert/strict';
+const BASE = '';
+let markup = '';
+let settingsFail = true;
+const calls = [];
+const listeners = {};
+const switches = ['codex', 'proto'].map(del => ({dataset: {del}, checked: true}));
+const host = {
+  setAttribute() {}, removeAttribute() {},
+  addEventListener(type, fn) { listeners[type] = fn; },
+  querySelectorAll() { return switches; },
+  get firstChild() { return markup ? {} : null; },
+  set innerHTML(v) { markup = v; },
+};
+globalThis.document = {getElementById(id) { return id === 'routing' ? host : null; }};
+globalThis.window = {parent: {postMessage() {}}};
+const routing = {
+  delegates: ['codex', 'proto'], board_exclusive: [],
+  projects: {app: {escalation_on: true, ladder: [{tier: 'standard', delegates: ['proto']}]}},
+};
+const response = data => ({ok: true, status: 200, async json() { return data; }});
+globalThis.testKit = {
+  initPluginView(cb) { this.boot = cb; },
+  async apiFetch(path, init) {
+    calls.push({path, init});
+    if (path.endsWith('/settings')) {
+      if (settingsFail) {
+        if (FAILURE === 'network') throw new Error('Network unavailable');
+        return {ok: false, status: 500, async json() {
+          if (FAILURE === 'non-json') throw new Error('Invalid JSON');
+          return {detail: 'Boot snapshot unavailable <retry>'};
+        }};
+      }
+      return response({settings: {coder: {value: 'codex'}}, pending_restart: []});
+    }
+    if (init && init.method === 'PUT') {
+      routing.board_exclusive = JSON.parse(init.body).exclusive;
+      return response({ok: true});
+    }
+    return response(routing);
+  },
+};
+const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
+"""
+    assertions = r"""
+globalThis.testKit.boot();
+await flush();
+function assertRoutingAvailable() {
+  assert.ok(markup.includes('data-del="codex"'), 'coder switch remains rendered');
+  assert.ok(markup.includes('Allowed to build'), 'routing controls remain rendered');
+  assert.ok(markup.includes('r-ladder'), 'ladder remains rendered');
+  assert.ok(markup.includes('Could not load settings:'), 'settings failure is localized');
+  assert.ok(!markup.includes('Could not load coders:'), 'no page-wide failure');
+  assert.ok(!markup.includes('id="coder-picker"'), 'unavailable picker hidden');
+  assert.ok(!markup.includes('data-step='), 'unavailable capacity steppers hidden');
+  assert.ok(!markup.includes('r-advanced'), 'unavailable advanced controls hidden');
+  assert.ok(!markup.includes('<retry>'), 'error detail escaped');
+}
+assertRoutingAvailable();
+switches[1].checked = false;
+listeners.change({target: {closest(s) { return s === 'input[data-del]' ? switches[1] : null; }}});
+await flush();
+const puts = calls.filter(c => c.init && c.init.method === 'PUT');
+assert.equal(puts.length, 1);
+assert.ok(puts[0].path.endsWith('/routing'));
+assert.deepEqual(JSON.parse(puts[0].init.body), {exclusive: ['codex']});
+assertRoutingAvailable();
+assert.ok(markup.includes('Saved. Only codex'), 'routing save success survives failed settings refresh');
+assert.ok(markup.includes('data-del="codex" checked disabled'), 'last allowed coder stays protected');
+settingsFail = false;
+await renderRouting();
+assert.ok(!markup.includes('Could not load settings:'), 'settings error clears on recovery');
+assert.ok(markup.includes('id="coder-picker"'), 'picker restored');
+assert.ok(markup.includes('r-advanced'), 'advanced restored');
+settingsFail = true;
+await renderRouting();
+assertRoutingAvailable();
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", f"const FAILURE = '{failure}';\n" + harness + script + assertions],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
