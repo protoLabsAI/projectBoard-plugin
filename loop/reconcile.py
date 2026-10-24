@@ -2471,11 +2471,7 @@ class ReconcileMixin:
         findings = await asyncio.to_thread(self._last_review_findings, store, fid)
         if not findings:
             return
-        self._ci_feedback[fid] = (
-            "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
-            "below in the existing branch (the PR updates on push) — do not rewrite "
-            "unrelated code.\n\n" + findings
-        )
+        self._ci_feedback[fid] = self._review_fix_feedback(fid, findings)
         try:
             self._ci_prior_diff[fid] = await worktree.pr_diff(pr_url, cwd=repo)
         except Exception:  # noqa: BLE001 — the diff is a convenience; the branch is resumed regardless
@@ -3418,18 +3414,10 @@ class ReconcileMixin:
         # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
         # LEAD with EVERY round's findings, not just this one (#514): fixing only the
         # latest round let round N's fix reopen round N-1's finding and bounce forever
-        # (bd-49yo). The satisfy-ALL instruction heads the prompt so the coder treats the
-        # whole set as one constraint rather than trading one finding for another.
+        # (bd-49yo). History supplies context; the satisfy-ALL instruction applies only
+        # to the current blocking set, which alone defines the required fixes.
         self._ci_prior_diff[fid] = worktree.truncate_diff(full_diff, worktree.PR_DIFF_MAX_CHARS)
-        rounds = self._review_history(fid)
-        self._ci_feedback[fid] = (
-            "An adversarial code review of your PR REQUESTED CHANGES — across "
-            f"{len(rounds)} review round(s). Satisfy ALL of these at once; do not trade one "
-            "for another (a fix that reopens an earlier round's finding is not a fix).\n\n"
-            + self._render_review_history(fid)
-            + "\n\nFix every finding above in the existing branch (the PR updates on push) — "
-            "do not rewrite unrelated code."
-        )
+        self._ci_feedback[fid] = self._review_fix_feedback(fid, rendered)
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_CHANGES_REQUESTED, note=rendered)
         # Pin the verdict to the head it was rendered against (#328) so a later external
         # push to this branch reads as a demonstrable head move and re-arms the gate — an
@@ -3611,19 +3599,43 @@ class ReconcileMixin:
         # Legacy: a flat findings list → one round, reviewed head unknown.
         return [{"round": 1, "head": "", "findings": data}]
 
+    def _review_fix_feedback(self, fid: str, blocking: str) -> str:
+        """Keep historical context separate from the gate's authoritative fix set.
+
+        Recovery supplies the latest persisted blocking note; a live bounce supplies
+        the same rendered blocking set it writes to the bead and PR comment.
+        """
+        history = self._render_review_history(fid)
+        context = (
+            "## Review history (context only)\n"
+            "These are historical observations, not a list of required fixes. Findings may "
+            "be fixed, refuted, uncertain, or non-blocking; absence from a later round does "
+            "not make an earlier finding a current blocker. Preserve earlier valid fixes "
+            "while addressing the current blockers.\n\n" + history + "\n\n"
+            if history
+            else ""
+        )
+        return (
+            "An adversarial code review of your PR REQUESTED CHANGES.\n\n"
+            + context
+            + "## Required fixes — current blocking findings\n"
+            "Satisfy ALL of these at once; do not trade one for another. "
+            "Fix every finding in this section in the existing branch (the PR updates on push) — "
+            "do not rewrite unrelated code.\n\n" + blocking
+        )
+
     def _render_review_history(self, fid: str) -> str:
-        """Render EVERY round of the card's review history for the fix prompt (#514):
-        each round's non-refuted findings under a round header, so the coder sees the
-        full set to satisfy at once rather than only the latest round's findings."""
+        """Render all rounds as context, preserving verdicts, not as required fixes."""
         blocks = []
         for rnd in self._review_history(fid):
-            findings = [f for f in (rnd.get("findings") or []) if f.get("verdict") != "refuted"]
+            findings = rnd.get("findings") or []
             if not findings:
                 continue
             head = rnd.get("head") or ""
             header = f"### Review round {rnd.get('round')}" + (f" (head {head[:12]})" if head else "")
             lines = "\n".join(
-                f"- {f.get('file', '')}:{f.get('line', '')} [{f.get('severity', '')}] {f.get('claim', '')}"
+                f"- {f.get('file', '')}:{f.get('line', '')} "
+                f"[{f.get('severity', '')}; {f.get('verdict', '')}] {f.get('claim', '')}"
                 for f in findings
             )
             blocks.append(f"{header}\n{lines}")

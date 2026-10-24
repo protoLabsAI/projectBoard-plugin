@@ -5,7 +5,7 @@ fix prompt only ever saw the latest round — and fix rounds flipped back and fo
 (bd-49yo / #513: round 2 reverted round 1's fix, round 3 asked for it back). It is
 now an append-only list of ``{round, head, findings}`` rounds: the re-review is
 handed the whole history as prior_findings, and the fix prompt leads with every
-round under a satisfy-ALL instruction. A legacy single-round value (a bare findings
+round as context alongside the current blockers under a satisfy-ALL instruction. A legacy single-round value (a bare findings
 list) is still read, and the history clears wherever the single prior used to pop.
 """
 
@@ -226,3 +226,67 @@ async def test_legacy_prior_rides_into_the_re_review(monkeypatch):
     history = loop._review_history("bd-1")
     assert [r["round"] for r in history] == [1, 2]
     assert history[1]["findings"][0]["claim"] == "fresh finding"
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+async def test_required_fixes_match_current_blocking_note_and_pr_comment(monkeypatch, recovery):
+    """History must not promote dropped, refuted, minor or ungrounded findings."""
+    _inject_fake_findings(monkeypatch)
+    current = json.loads(_blocker("current blocker"))
+    for claim, severity, verdict, evidence in [
+        ("minor advice", "minor", "confirmed", "x"),
+        ("nit advice", "nit", "confirmed", "x"),
+        ("refuted concern", "major", "refuted", "x"),
+        ("ungrounded concern", "major", "confirmed", "this long evidence is absent from the diff"),
+    ]:
+        current.append(dict(file="a.py", line=3, claim=claim, severity=severity, verdict=verdict, evidence=evidence))
+    loop = _seq_loop(monkeypatch, [_blocker("previously fixed blocker"), json.dumps(current)])
+    comments = []
+
+    async def _comment(pr_url, body, **kwargs):
+        comments.append(body)
+        return True
+
+    monkeypatch.setattr(worktree, "post_or_update_pr_comment", _comment)
+
+    async def _head(*args, **kwargs):
+        return "a" * 40
+
+    monkeypatch.setattr(worktree, "pr_head_sha", _head)
+    store = _GateStore()
+    await loop._review_gate(store, "bd-1", _PR, "/repo")
+    await loop._review_gate(store, "bd-1", _PR, "/repo")
+    note = store.review_states[-1][1]
+    assert "current blocker" in note
+    assert note in comments[-1]
+    assert loop._review_history("bd-1")[-1]["findings"][-1]["verdict"] == "uncertain"
+    if recovery:
+        loop._ci_feedback.clear()
+        monkeypatch.setattr(store, "feature_comments", lambda fid: [s[1] for s in store.review_states], raising=False)
+        await loop._reinject_review_feedback(store, "bd-1", _PR, "/repo")
+    context, required = loop._ci_feedback["bd-1"].split("## Required fixes — current blocking findings\n")
+    assert "context only" in context
+    assert "not a list of required fixes" in context
+    assert "Satisfy ALL of these at once; do not trade one for another" in required
+    assert required.endswith(note)
+    for claim in ["previously fixed blocker", "minor advice", "nit advice", "refuted concern", "ungrounded concern"]:
+        assert claim in context
+        assert claim not in required
+    assert "[major; uncertain] ungrounded concern" in context
+
+
+async def test_recovery_without_memory_uses_only_latest_blocking_note(monkeypatch):
+    loop = BoardLoop({})
+    store = _GateStore()
+    notes = ["## Review findings (blocking)\n- old blocker", "## Review findings (blocking)\n- current blocker"]
+    monkeypatch.setattr(store, "feature_comments", lambda fid: notes, raising=False)
+
+    async def _diff(*args, **kwargs):
+        return "diff"
+
+    monkeypatch.setattr(worktree, "pr_diff", _diff)
+    await loop._reinject_review_feedback(store, "bd-1", _PR, "/repo")
+    prompt = loop._ci_feedback["bd-1"]
+    assert prompt.endswith(notes[-1])
+    assert "old blocker" not in prompt
+    assert "context only" not in prompt
