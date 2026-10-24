@@ -95,8 +95,9 @@
   .bld-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--pl-color-accent);
     box-shadow:0 0 0 0 color-mix(in srgb,var(--pl-color-accent) 55%,transparent);animation:bld-ping 1.8s ease-out infinite}
   @keyframes bld-ping{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--pl-color-accent) 55%,transparent)}80%,100%{box-shadow:0 0 0 7px transparent}}
-  .bld-who{font-weight:600;color:var(--pl-color-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-  .bld-gen{font-family:var(--pl-font-mono);font-size:10px;color:var(--pl-color-fg-muted);white-space:nowrap}
+  /* The coder's name never yields: in a narrow lane the rung label truncates first. */
+  .bld-who{flex:0 0 auto;max-width:100%;font-weight:600;color:var(--pl-color-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bld-gen{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--pl-font-mono);font-size:10px;color:var(--pl-color-fg-muted);white-space:nowrap}
   .bld-el{margin-left:auto;font-family:var(--pl-font-mono);font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--pl-color-accent);white-space:nowrap}
   .bld-act{margin-top:2px;font-family:var(--pl-font-mono);font-size:10.5px;color:var(--pl-color-fg-muted);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
