@@ -28,6 +28,7 @@ let SAVE_BUSY = false;           // a settings save is in flight — freeze the 
 let SETTINGS_MSG = {};           // {key: {kind, text}} inline message per settings knob
 let ROUTING_BODY = null;         // last /routing/effective read (coders + ladder)
 let SETTINGS = null;             // last /settings snapshot (scalar knobs + pending_restart)
+let CODER_CUSTOM = false;        // the default-coder control is in free-text mode (type any delegate)
 
 const settingMeta = (key) => ((SETTINGS && SETTINGS.settings) || {})[key] || null;
 const settingValue = (key) => { const m = settingMeta(key); return m ? m.value : undefined; };
@@ -71,26 +72,39 @@ function routingSummary(dels, exclusive){
     + (exclusive.length === 1 ? "it" : "them") + ".";
 }
 
-// ── The default-coder picker: the `coder` setting as a picker of configured delegates (#613). An
-// unconfigured saved name (or a blank board) is flagged inline and never re-submitted — B2's
-// exclusive filter and the loop both key on real delegate names, so an invalid choice is refused.
+// ── The default-coder picker: the `coder` setting (#613). The routing read only knows the
+// delegates named in a ladder (plus the current coder), so a picker of just those would strand a
+// fresh board — no ladder means an empty list and no way to set the required coder — and would
+// hide any configured delegate that no ladder names. So the control keeps the picker for the
+// common case AND always offers free text: the delegates become a <select> with a trailing
+// "Type a coder name…" option, and when that's chosen (or there's nothing to pick, or the saved
+// coder isn't in any ladder) a text input takes any delegate the host provides. The host roster
+// — not this list — is the authority on whether a name resolves, so a typed name is saved and
+// setup checks confirm it; only an empty name is refused here (the loop needs one to build).
 function coderPicker(){
   const dels = (ROUTING_BODY && ROUTING_BODY.delegates) || [];
   const cur = String(settingValue("coder") || "");
   const known = dels.includes(cur);
-  const invalid = !!cur && !known;
-  const opts = [];
-  if (!cur || invalid) opts.push('<option value="" disabled hidden'+(cur?"":" selected")+'>Choose a coder…</option>');
-  dels.forEach(d => opts.push('<option value="'+esc(d)+'"'+(d===cur?" selected":"")+'>'+esc(d)+'</option>'));
-  if (invalid) opts.push('<option value="'+esc(cur)+'" selected>'+esc(cur)+' — not configured</option>');
+  const custom = CODER_CUSTOM || !dels.length || (!!cur && !known);
   const msg = SETTINGS_MSG.coder;
+  const opts = [];
+  if (!cur) opts.push('<option value="" disabled hidden'+(custom?"":" selected")+'>Choose a coder…</option>');
+  dels.forEach(d => opts.push('<option value="'+esc(d)+'"'+(d === cur && !custom ? " selected" : "")+'>'+esc(d)+'</option>'));
+  opts.push('<option value="__custom__"'+(custom?" selected":"")+'>Type a coder name…</option>');
+  const labelFor = dels.length ? "coder-picker" : "coder-text";
+  let control = "";
+  if (dels.length)
+    control += '<select class="r-select" id="coder-picker"'+(SAVE_BUSY?" disabled":"")+'>'+opts.join("")+'</select>';
+  if (custom)
+    control += '<input type="text" class="r-text r-coder-text" id="coder-text" data-coder-text'
+      + ' value="'+esc(cur)+'" placeholder="delegate name" spellcheck="false" autocomplete="off"'
+      + (SAVE_BUSY?" disabled":"")+'>';
   return '<div class="r-knob r-picker">'
-    + '<div class="r-knob-head"><label class="r-knob-label" for="coder-picker">Default coder</label></div>'
-    + '<select class="r-select" id="coder-picker"'+(SAVE_BUSY?" disabled":"")+'>'+opts.join("")+'</select>'
-    + '<p class="r-knob-help">Choose the configured coder that builds cards, with changes taking effect on the next check.</p>'
-    + (dels.length ? "" : '<p class="r-none">No coders are configured yet — add one in a project ladder or the YAML.</p>')
-    + (invalid ? '<div class="pl-callout pl-callout--error r-inline">“'+esc(cur)+'” isn’t a configured coder. Pick one from the list.</div>'
-               : inlineMsg(msg))
+    + '<div class="r-knob-head"><label class="r-knob-label" for="'+labelFor+'">Default coder</label></div>'
+    + control
+    + '<p class="r-knob-help">Choose the configured coder that builds cards, or type the name of any delegate the host provides; changes take effect on the next check.</p>'
+    + (dels.length ? "" : '<p class="r-none">No coders are configured in any ladder yet — type the delegate name that should build.</p>')
+    + inlineMsg(msg)
     + '</div>';
 }
 
@@ -100,8 +114,7 @@ function coderSection(){
   const def = String(settingValue("coder") || "");
   const head = '<div class="r-head"><h2>Coders</h2><span class="r-live">Switches apply live, no Save needed.</span></div>';
   if (!dels.length)
-    return '<section class="r-sec">'+head+coderPicker()
-      + '<p class="r-none">No coders are configured in any ladder yet.</p></section>';
+    return '<section class="r-sec">'+head+coderPicker()+'</section>';
   const exclusive = body.board_exclusive || [];
   const allowed = new Set(exclusive.length ? exclusive : dels.map(d => d.name));
   const msg = ROUTING_MSG
@@ -397,12 +410,26 @@ async function saveSetting(key, value){
   }
 }
 
-// The picker only offers configured delegates, but guard the write anyway: an unconfigured name
-// (a stale saved value, or a future bug) is refused inline, never submitted. Blank clears it.
-function chooseCoder(name){
+// Save the chosen coder. A typed name may be any delegate the host provides — a fresh board or
+// one whose coder isn't in any ladder could never set it otherwise — so a typed name is accepted
+// and setup checks confirm it resolves; an empty one is refused inline (the loop needs a coder to
+// build). A pick that comes straight off the <select> can only ever be a configured delegate, but
+// guard it anyway: an unconfigured value there (a stale option, or a future bug) is refused inline
+// and never submitted. `typed` marks the free-text path.
+function chooseCoder(name, typed){
+  name = String(name || "").trim();
+  if (typed){
+    if (!name){
+      SETTINGS_MSG = {coder: {kind:"error", text: "Enter a coder name — the loop needs one to build."}};
+      renderAll();
+      return;
+    }
+    saveSetting("coder", name);
+    return;
+  }
   const valid = new Set((ROUTING_BODY && ROUTING_BODY.delegates) || []);
   if (name && !valid.has(name)){
-    SETTINGS_MSG = {coder: {kind:"error", text: "“"+name+"” isn’t a configured coder. Pick one from the list."}};
+    SETTINGS_MSG = {coder: {kind:"error", text: "“"+name+"” isn’t a configured coder. Pick one from the list, or choose “Type a coder name…”."}};
     renderAll();
     return;
   }
@@ -430,7 +457,16 @@ $("routing").addEventListener("change", (e) => {
   }
   if (SAVE_BUSY) return;
   const picker = e.target.closest("#coder-picker");
-  if (picker){ chooseCoder(picker.value); return; }
+  if (picker){
+    if (picker.value === "__custom__"){
+      CODER_CUSTOM = true; SETTINGS_MSG = {}; renderAll();
+      const t = $("coder-text"); if (t) t.focus();
+      return;
+    }
+    CODER_CUSTOM = false; chooseCoder(picker.value); return;
+  }
+  const coderText = e.target.closest("[data-coder-text]");
+  if (coderText){ chooseCoder(coderText.value, true); return; }
   const bool = e.target.closest("input[data-bool]");
   if (bool){ saveSetting(bool.dataset.bool, bool.checked); return; }
   const text = e.target.closest("input[data-text]");

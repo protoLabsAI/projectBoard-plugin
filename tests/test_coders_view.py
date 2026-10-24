@@ -6,8 +6,9 @@ on the PUBLIC router (tested there), holds no board data, reads and writes only 
 plugin-kit's authed fetch after initPluginView, uses DS tokens with no hardcoded colours, and
 never prints a raw config key as visible copy. The scalar knobs save through the guarded PUT
 /settings boundary (S0); the allow/deny switches and ladder keep B3's PUT /routing. A node
-harness exercises the interactive bits (the picker save + invalid refusal, the stepper's
-consequence line updating, and the restart-pending host nudge)."""
+harness exercises the interactive bits (the picker save, its free-text fallback so a ladderless
+board can still set a coder, the inline refusal, the stepper's consequence line updating, and the
+restart-pending host nudge)."""
 
 import shutil
 import subprocess
@@ -83,10 +84,28 @@ def test_coder_picker_lists_configured_delegates_and_saves_through_put_settings(
 
 
 def test_invalid_coder_choice_is_refused_inline_and_never_submitted():
-    # chooseCoder refuses a name that is not a configured delegate — inline, with no PUT.
-    assert "function chooseCoder(name)" in ROUTING_PAGE
+    # A value that comes straight off the <select> can only be a configured delegate; chooseCoder
+    # still guards that path, refusing an unconfigured one inline with no PUT.
+    assert "function chooseCoder(name, typed)" in ROUTING_PAGE
     assert "valid.has(name)" in ROUTING_PAGE
-    assert "isn’t a configured coder. Pick one from the list." in ROUTING_PAGE
+    assert "isn’t a configured coder. Pick one from the list" in ROUTING_PAGE
+
+
+def test_coder_picker_keeps_a_free_text_fallback_so_a_ladderless_board_can_be_set():
+    # The routing read only names the delegates in a ladder (plus the current coder), so a picker
+    # of just those would strand a fresh board — no ladder means no option and the required coder
+    # could never be set, nor could a configured delegate that no ladder names. The control always
+    # offers free text: a "Type a coder name…" option and a text input for any delegate the host
+    # provides.
+    assert '"__custom__"' in ROUTING_PAGE
+    assert "Type a coder name…" in ROUTING_PAGE
+    assert "data-coder-text" in ROUTING_PAGE
+    # A typed name is NOT refused for being absent from the ladder-derived list — it's saved and
+    # setup checks confirm it resolves. Only an empty typed name is refused inline.
+    assert "chooseCoder(coderText.value, true)" in ROUTING_PAGE
+    assert "Enter a coder name — the loop needs one to build." in ROUTING_PAGE
+    # With nothing to pick from, no empty <select> is rendered — only the text input.
+    assert "if (dels.length)\n    control +=" in ROUTING_PAGE
 
 
 # ── capacity: two LIVE steppers, each with a one-line consequence that updates ────────────────
@@ -288,6 +307,105 @@ assert.ok(nudge.keys.includes('goal_verify'), 'nudge names the key');
 assert.ok(markup.includes('Saved — restart to apply.'), 'restart knob message');
 assert.ok(markup.includes('effect after a restart'), 'pending-restart banner shown');
 assert.ok(markup.includes('Check acceptance criteria before review'), 'banner lists by label');
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", harness + script + assertions],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_live_ladderless_board_can_still_set_its_coder_by_free_text():
+    """A board with no ladder resolves no delegates, so the picker has nothing to list. It must
+    still be able to set the required coder: the control falls back to a free-text input and the
+    typed name saves through PUT /settings (a regression guard for the review that rejected a
+    picker-only control, which stranded a fresh board)."""
+    script = ROUTING_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0]
+    script = script.replace('import(BASE + "/_ds/plugin-kit.js")', "globalThis.testKit")
+    harness = r"""
+import assert from 'node:assert/strict';
+const BASE = '';
+let markup = '';
+const listeners = {};
+const host = {
+  setAttribute() {}, removeAttribute() {},
+  addEventListener(type, fn) { listeners[type] = fn; },
+  querySelectorAll() { return []; },
+  get firstChild() { return markup ? {} : null; },
+  set innerHTML(v) { markup = v; },
+  get innerHTML() { return markup; },
+};
+globalThis.document = {
+  getElementById(id) {
+    if (id === 'routing') return host;
+    if (id === 'coder-text') return {focus() {}};
+    return null;
+  },
+};
+globalThis.window = { parent: { postMessage() {} } };
+
+// Fresh board: no ladder, so routing resolves no delegates, and the coder is unset.
+const ROUTING = {delegates: [], board_exclusive: [], cursor: 0, projects: {}};
+const META = {
+  coder: {type: 'string', restart: false, value: ''},
+  max_concurrent: {type: 'number', minimum: 1, maximum: 64, restart: false, value: 1},
+  max_pending_reviews: {type: 'number', minimum: 0, maximum: 1000, restart: false, value: 5},
+  max_concurrent_sessions: {type: 'number', minimum: 0, maximum: 32, restart: false, value: 0},
+  coder_solve: {type: 'bool', restart: true, value: true},
+  coder_solve_test_cmd: {type: 'string', restart: true, value: ''},
+  max_mode_n: {type: 'number', minimum: 1, maximum: 16, restart: true, value: 1},
+  decompose_after_timeouts: {type: 'number', minimum: 0, maximum: 10, restart: true, value: 2},
+  goal_verify: {type: 'bool', restart: true, value: false},
+};
+function settings() {
+  const s = {};
+  for (const [k, m] of Object.entries(META)) s[k] = {...m};
+  return {settings: s, pending_restart: []};
+}
+const calls = [];
+globalThis.testKit = {
+  initPluginView(cb) { this._boot = cb; },
+  async apiFetch(path, init) {
+    const method = (init && init.method) || 'GET';
+    const body = init && init.body ? JSON.parse(init.body) : null;
+    calls.push({path, method, body});
+    if (method === 'PUT' && path.endsWith('/settings')) {
+      for (const [k, v] of Object.entries(body)) if (META[k]) META[k].value = v;
+      return {ok: true, status: 200, async json() { return {ok: true, saved: Object.keys(body), pending_restart: []}; }};
+    }
+    if (path.endsWith('/routing/effective')) return {ok: true, status: 200, async json() { return ROUTING; }};
+    if (path.endsWith('/settings')) return {ok: true, status: 200, async json() { return settings(); }};
+    return {ok: true, status: 200, async json() { return {}; }};
+  },
+};
+function el(matches, props) { return Object.assign({closest(s) { return matches.includes(s) ? this : null; }}, props); }
+const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
+"""
+    assertions = r"""
+globalThis.testKit._boot();
+await flush();
+
+// No ladder => no <select> picker, but a free-text input is offered so the coder is still settable.
+assert.ok(!markup.includes('id="coder-picker"'), 'no empty select on a ladderless board');
+assert.ok(markup.includes('data-coder-text'), 'free-text coder input offered');
+
+// Typing a delegate name saves it through PUT /settings — the name is not refused for being
+// absent from the (empty) ladder-derived list.
+listeners.change({target: el(['[data-coder-text]'], {value: 'codex'})});
+await flush();
+const puts = calls.filter(c => c.method === 'PUT' && c.path.endsWith('/settings'));
+assert.equal(puts.length, 1, 'one settings PUT');
+assert.deepEqual(puts[0].body, {coder: 'codex'}, 'typed coder saved through PUT /settings');
+assert.ok(markup.includes('Saved.'), 'inline Saved shown');
+
+// An empty (whitespace) name is refused inline, with no further PUT.
+listeners.change({target: el(['[data-coder-text]'], {value: '   '})});
+await flush();
+assert.equal(calls.filter(c => c.method === 'PUT' && c.path.endsWith('/settings')).length, 1, 'blank name not submitted');
+assert.ok(markup.includes('Enter a coder name'), 'blank refused inline');
 """
     result = subprocess.run(
         ["node", "--input-type=module", "-e", harness + script + assertions],
