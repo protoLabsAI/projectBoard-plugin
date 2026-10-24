@@ -1,0 +1,1 @@
+Added operator-authenticated `POST /features/{fid}/reset-merged-verify-budget` to clear a card’s persisted merged-verify budget and live loop cache, matching the agent tool. Unknown or blank ids return 404 without changes.

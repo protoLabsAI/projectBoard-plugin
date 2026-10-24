@@ -1012,6 +1012,36 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         )
         return {**f, "review": side}
 
+    @router.post("/features/{fid}/reset-merged-verify-budget")
+    async def _reset_merged_verify_budget(fid: str):
+        """Reset the durable and live merged-verify budget, matching the agent tool."""
+        from .loop import reset_merged_verify_budget
+        from .store import BoardNotFound
+
+        fid = fid.strip()
+        if not fid:
+            raise HTTPException(404, "feature_id is required to reset a merged-verify budget")
+
+        def reset():
+            board = store()
+            try:
+                if board.get_feature(fid) is None:
+                    raise HTTPException(404, f"unknown feature {fid!r}")
+                f = board.reset_merged_verify_budget(fid)
+            except BoardNotFound as exc:
+                raise HTTPException(404, str(exc)) from exc
+            # Re-clear under the live loop's reset lock after the durable reset, just
+            # like the tool, so an in-flight exhaustion sentinel cannot undo it.
+            cache_cleared = reset_merged_verify_budget(fid, board)
+            return {
+                "id": f["id"],
+                "state": f["board_state"],
+                "merged_verify_budget_reset": True,
+                "cache_cleared": cache_cleared,
+            }
+
+        return await _guard(reset)
+
     @router.post("/features/{fid}/merge-hold")
     async def _merge_hold(fid: str, body: dict = Body(default={})):
         """Place the operator's per-card auto-merge veto (`merge-hold`, #532) — the REST
