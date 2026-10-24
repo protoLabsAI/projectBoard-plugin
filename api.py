@@ -663,6 +663,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             "base_checkouts": base_checkouts,
             "stale_base_checkouts": {n: r["detail"] for n, r in base_checkouts.items() if r.get("state") == "stale"},
             "orphaned_cards": health.orphaned_cards_snapshot(),
+            # #495: in_review cards GitHub has held not-clean longer than merge_hold_alert_s,
+            # with their hold text and age — a PR stuck the way a claim stall leaves ready work.
+            "merge_holds": health.merge_holds_snapshot(),
         }
 
     async def _reap_worktree(fid: str, feature: dict | None = None) -> None:

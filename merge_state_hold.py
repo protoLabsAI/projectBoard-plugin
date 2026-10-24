@@ -82,6 +82,14 @@ def hold_for(fid: str) -> dict | None:
         return dict(h, checks=list(h["checks"])) if h else None
 
 
+def all_holds() -> dict[str, dict]:
+    """Every live hold, ``{fid: {status, checks, pr_url, since}}`` — a snapshot copy, safe
+    to read without the lock. ``since`` is when the hold was first seen (#495 slice 2): the
+    reconcile pass reads it to find PRs GitHub has held not-clean past ``merge_hold_alert_s``."""
+    with _LOCK:
+        return {fid: dict(h, checks=list(h["checks"])) for fid, h in _HOLDS.items()}
+
+
 def set_hold(fid: str, status: str, checks: list[str], pr_url: str) -> bool:
     """Record the hold. True when it is new or names a different blocker than before, so
     the caller logs once per blocker rather than once per poll."""

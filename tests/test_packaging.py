@@ -306,6 +306,7 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "loop_interval_s",
         "coder_timeout_s",
         "merge_poll_interval_s",
+        "merge_hold_alert_s",
         "auto_merge_max",
         "health_sweep_interval_s",
         # #462: the review-call cap, the per-card reconcile bound and the stall signal.

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **36 of 87 keys are in this state, including `coders` and `projects`** —
+never renders it. **36 of 88 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -611,6 +611,7 @@ A loop paused at its setup gate reports its own gap instead. `0` turns the signa
 | `health_sweep_interval_s` | `300` | reload |
 | `local_gate_timeout_s` | `600` | reload |
 | `loop_interval_s` | `30` | reload |
+| `merge_hold_alert_s` | `3600` | reload |
 | `wake_settle_gap_s` | `60` | **restart** **· YAML only** |
 | `wake_settle_ticks` | `2` | **restart** **· YAML only** |
 | `merge_poll_interval_s` | `60` | reload |
@@ -625,6 +626,16 @@ When the wall-clock gap between ticks exceeds the monotonic gap by more than
 including the detecting tick. Reconcile, health, and preflight still run, and
 `board_dispatch` reports `settling-after-wake`. Another detected sleep restarts the
 window; setting `wake_settle_ticks` to `0` disables the hold.
+
+`merge_hold_alert_s` is the sibling health signal for a different stuck shape: a PR GitHub
+reads not-clean (UNSTABLE/BLOCKED) that the auto-merge edge correctly refuses, held for
+hours while its `QA panel` check or an unresolved review thread never settles. Once a hold
+has stood this long (default one hour), the reconcile pass lists the card on `/status` under
+`merge_holds` with its hold text and age — like a claim stall, surfaced rather than left
+reading `auto-merge pending`. The entry clears when the hold clears or the PR merges or
+closes, the card leaves review or is deleted, or auto-merge is disabled. Leaving review
+resets the hold age, so a card returning to review starts a new clock. `0` turns the health
+entry off; the per-card next-action hold still shows.
 
 Two of those carry security weight and are easy to skim past:
 
