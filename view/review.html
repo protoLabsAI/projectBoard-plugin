@@ -173,7 +173,8 @@ const STEPS = [
       { kind: "method", key: "merge_method", dep: true,
         label: "How to merge pull requests",
         help: "Use this GitHub merge method when merging pull requests automatically." },
-      { kind: "stepper", key: "merged_verify_max", dep: true,
+      // Verification also runs with auto-rebase, independently of auto-merge.
+      { kind: "stepper", key: "merged_verify_max", dep: false,
         label: "Failed checks before holding a merge",
         help: "Hold automatic merging after this many failed or inconclusive checks against the latest base; zero allows unlimited attempts." },
       { kind: "bool", key: "merge_poll", dep: false,

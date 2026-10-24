@@ -180,7 +180,8 @@ def test_styles_use_ds_tokens_and_no_hardcoded_colours():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
-def test_live_pipeline_pickers_greying_and_save():
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_live_pipeline_pickers_greying_and_save(auto_merge):
     """Run the real page script with API-shaped reads and a stubbed host frame."""
     script = REVIEW_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0]
     script = script.replace('import(BASE + "/_ds/plugin-kit.js")', "globalThis.testKit")
@@ -212,7 +213,7 @@ const META = {
   ci_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 2, label: 'Attempts to fix failed checks'},
   auto_rebase: {type: 'bool', restart: true, value: true, label: 'Update pull requests with base changes'},
   rebase_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 1, label: 'Attempts to fix merge conflicts'},
-  auto_merge: {type: 'bool', restart: false, value: true, label: 'Merge approved pull requests automatically'},
+  auto_merge: {type: 'bool', restart: false, value: AUTO_MERGE_JSON, label: 'Merge approved pull requests automatically'},
   merge_method: {type: 'select', options: ['squash', 'merge', 'rebase'], restart: true, value: 'squash', label: 'How to merge pull requests'},
   merged_verify_max: {type: 'number', minimum: 0, maximum: 20, restart: false, value: 5, label: 'Failed checks before holding a merge'},
   merge_poll: {type: 'bool', restart: true, value: true, label: 'Check pull request status automatically'},
@@ -251,6 +252,7 @@ const strip = (s) => s.replace(/<[^>]*>/g, ' ');
 const PAGE_OWNED = PAGE_OWNED_JSON;
 """
     harness = harness.replace("PAGE_OWNED_JSON", json.dumps(list(PAGE_OWNED)))
+    harness = harness.replace("AUTO_MERGE_JSON", json.dumps(auto_merge))
     assertions = r"""
 globalThis.testKit._boot();
 await flush();
@@ -285,6 +287,14 @@ await flush();
 assert.ok(markup.includes('rv-knob--off" data-knob="review_fix_max"'), 'review_fix_max greyed when Review off');
 assert.ok(markup.includes('data-step="review_fix_max" data-dir="-1" disabled'), 'its stepper is disabled when greyed');
 assert.ok(markup.includes('rv-knob" data-knob="reviewer"'), 'the non-dependent reviewer stays live');
+
+// Verification runs with auto-rebase even when auto-merge is off (the defaults).
+// Check rendered availability: calling the listener alone bypasses disabled buttons.
+assert.ok(markup.includes('rv-knob" data-knob="merged_verify_max"'), 'verification budget is not greyed');
+for (const dir of ['-1', '1']) {
+  assert.ok(!markup.includes('data-step="merged_verify_max" data-dir="' + dir + '" disabled'), 'verification stepper stays enabled');
+}
+assert.equal(markup.includes('data-method="merge_method" disabled'), !META.auto_merge.value, 'merge method still depends on auto-merge');
 
 // A LIVE knob (merged_verify_max) steps through PUT /settings and shows a plain "Saved.".
 let before = calls.filter(c => c.method === 'PUT').length;
