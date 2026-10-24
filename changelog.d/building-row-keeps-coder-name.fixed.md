@@ -1,0 +1,1 @@
+- A building card shows its coder's full name again in a narrow Building lane ("codex", not "c…"). When space is short, the rung label truncates first, and the full name is on hover.

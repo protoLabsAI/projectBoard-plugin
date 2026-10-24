@@ -1031,6 +1031,7 @@ function paintBuilding(n, f){
     + '<div class="bld-act"></div><div class="bld-bar" aria-hidden="true"><i></i></div>';
   const i = buildInfo(f);
   setText(b.querySelector(".bld-who"), i.who);
+  b.querySelector(".bld-who").title = i.who;
   setText(b.querySelector(".bld-gen"), i.gen);
   setText(b.querySelector(".bld-el"), i.el);
   setText(b.querySelector(".bld-act"), i.act);
