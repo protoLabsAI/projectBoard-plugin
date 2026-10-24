@@ -37,15 +37,16 @@ def host(monkeypatch):
 def test_allowlist_metadata_and_masking(host):
     live, _, _ = host
     manifest = yaml.safe_load(Path(settings.__file__).with_name("protoagent.plugin.yaml").read_text())
-    # `loop_enabled` OUTLIVES its manifest settings entry (#611): the Overview tab owns its
-    # switch, so it was dropped from the generic schema UI, but settings_api keeps it in the
-    # allowlist by hand so PUT /settings + pending_restart still cover it. Every OTHER key is
+    # `loop_enabled` (#611) and the Coders tab's nine (S3, #613) OUTLIVE their manifest settings
+    # entries: they were dropped from the generic schema UI, but settings_api keeps them in the
+    # allowlist by hand so PUT /settings + pending_restart still cover them. Every OTHER key is
     # still derived 1:1 from the manifest.
-    assert set(settings.SETTINGS) == {entry["key"] for entry in manifest["settings"]} | {"loop_enabled"}
+    hand_added = {"loop_enabled"} | set(settings._PAGE_OWNED)
+    assert set(settings.SETTINGS) == {entry["key"] for entry in manifest["settings"]} | hand_added
     for entry in manifest["settings"]:
         for field in ("label", "type", "minimum", "maximum", "options"):
             assert settings.SETTINGS[entry["key"]][field] == entry.get(field)
-    assert len(settings.SETTINGS) == 30  # 29 manifest settings + the hand-added loop_enabled.
+    assert len(settings.SETTINGS) == 30  # 20 manifest settings + loop_enabled + the 9 page-owned.
     live["webhook_secret"] = "never-echo-this"
     settings.capture_boot_settings(live)
     live["npm_token"] = "nor-this"

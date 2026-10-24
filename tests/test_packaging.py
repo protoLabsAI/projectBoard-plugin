@@ -287,11 +287,27 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
+    # Page-owned by the Coders tab (S3, #613): the `coder` picker, the two capacity steppers and
+    # the six Advanced tuning knobs were removed from the generic `settings:` list but are still
+    # written through PUT /settings — settings_api hand-adds them to its allowlist, exactly like
+    # loop_enabled. The automation schema tab now holds only br_autofetch/base_refresh/local_gate_cmd.
+    page_owned = {
+        "coder",
+        "max_concurrent",
+        "max_pending_reviews",
+        "max_concurrent_sessions",
+        "coder_solve",
+        "coder_solve_test_cmd",
+        "max_mode_n",
+        "decompose_after_timeouts",
+        "goal_verify",
+    }
     hidden = {
         # Page-owned: the Overview tab (S1a, #611) renders loop_enabled's on/off switch, so it
         # is no longer a generic schema field here — it is still written through PUT /settings
         # (settings_api keeps it in its allowlist by hand) and still restart-only.
         "loop_enabled",
+        *page_owned,
         # Structural/machine routing belongs in the Projects editor or YAML.
         "project",
         "repo",
@@ -320,12 +336,14 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     }
     assert set(fields) | hidden == set(m["config"])
     assert set(fields).isdisjoint(hidden)
-    assert set(LIVE_KNOBS) <= set(fields)
+    # Every LIVE knob is turnable by a human — as a generic manifest field, or on the page that
+    # now owns it (the four page-owned LIVE knobs live on the Coders tab, tested in test_coders_view).
+    assert set(LIVE_KNOBS) <= set(fields) | page_owned
     for key, spec in fields.items():
         assert bool(spec.get("restart", False)) is (key not in LIVE_KNOBS), key
         assert spec["label"] and spec["description"], key
         assert key in m["config"], f"{key} has no manifest default"
-    for key in LIVE_KNOBS:
+    for key in set(LIVE_KNOBS) & set(fields):
         want = "bool" if key in LIVE_BOOL_KNOBS else ("string" if key in LIVE_STR_KNOBS else "number")
         assert fields[key]["type"] == want, key
 
@@ -335,7 +353,7 @@ def test_manifest_declares_the_ordered_tabbed_config_contract():
     assert m["settings_tabs"] == [
         {"id": "overview", "label": "Overview", "path": "/plugins/project_board/config/overview"},
         {"id": "projects", "label": "Projects", "path": "/plugins/project_board/config/projects"},
-        {"id": "routing", "label": "Coder routing", "path": "/plugins/project_board/config/routing"},
+        {"id": "routing", "label": "Coders", "path": "/plugins/project_board/config/routing"},
         {"id": "automation", "label": "Automation"},
         {"id": "review", "label": "Review & merge"},
         {"id": "security", "label": "Security"},

@@ -43,3 +43,41 @@ html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-
 .r-rule--off{opacity:.6}
 .r-rule-tag{font-family:var(--pl-font-mono);font-size:10.5px;padding:0 6px;border-radius:999px;background:var(--pl-color-bg-subtle,rgba(127,127,127,.14));color:var(--pl-color-fg-muted)}
 .r-rule-tag--pick{background:var(--pl-color-accent-subtle,rgba(99,102,241,.16));color:var(--pl-color-accent-fg,var(--pl-color-fg))}
+
+/* Coders overhaul (S3, #613): a default-coder picker, LIVE capacity steppers with a one-line
+   consequence, and a collapsed Advanced block of tuning knobs. All colours are DS tokens (the
+   rgba() literals above and in the kit fallbacks are the token's own fallback, never hardcoded
+   chrome), so the page tracks light and dark. */
+.r-knobs{display:flex;flex-direction:column;gap:var(--pl-space-4,16px)}
+.r-knob{display:flex;flex-direction:column;gap:var(--pl-space-1,4px)}
+.r-knob-head{display:flex;align-items:center;gap:var(--pl-space-2)}
+.r-knob-label{font-size:13px;font-weight:var(--pl-font-weight-semibold,600)}
+.r-knob-help{margin:0;color:var(--pl-color-fg-muted);font-size:12px;line-height:1.5}
+.r-consequence{margin:2px 0 0;font-size:12.5px;color:var(--pl-color-fg)}
+.r-picker{margin-bottom:var(--pl-space-3)}
+.r-select,.r-text{font:inherit;color:var(--pl-color-fg);background:var(--pl-color-bg-raised);border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);padding:5px 9px;max-width:360px}
+.r-select:focus-visible,.r-text:focus-visible,.r-step:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.r-text{width:100%}
+.r-mono{font-family:var(--pl-font-mono);font-size:12px;overflow-wrap:anywhere}
+.r-stepper{display:inline-flex;align-items:stretch;gap:0;width:max-content;border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);overflow:hidden;background:var(--pl-color-bg-raised)}
+.r-step{cursor:pointer;border:0;background:transparent;color:var(--pl-color-fg);font:inherit;font-size:16px;line-height:1;padding:4px 12px;min-width:34px}
+.r-step:hover:not(:disabled){background:var(--pl-color-bg-hover)}
+.r-step:disabled{cursor:not-allowed;opacity:.45}
+.r-step-val{min-width:44px;text-align:center;align-self:center;font-variant-numeric:tabular-nums;font-weight:var(--pl-font-weight-semibold,600);border-left:var(--pl-border-width) solid var(--pl-color-border);border-right:var(--pl-border-width) solid var(--pl-color-border);padding:4px 6px}
+.r-saved{margin:2px 0 0;font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-saving{margin:2px 0 0;font-size:11.5px;color:var(--pl-color-fg-muted)}
+.r-inline{margin-top:var(--pl-space-2)}
+.r-coder-default{font-size:10.5px;padding:0 6px;border-radius:999px;background:var(--pl-color-accent-subtle,rgba(99,102,241,.16));color:var(--pl-color-accent-fg,var(--pl-color-fg))}
+.r-coder--default{border-color:var(--pl-color-accent)}
+.r-restart{margin-bottom:var(--pl-space-2)}
+.r-restart-title{font-weight:var(--pl-font-weight-semibold,600)}
+.r-restart-list{margin:var(--pl-space-1,4px) 0 0}
+.r-restart-how{margin:var(--pl-space-2) 0 0;color:var(--pl-color-fg-muted);font-size:12px}
+.r-advanced{border:var(--pl-border-width) solid var(--pl-color-border);border-radius:var(--pl-radius);padding:var(--pl-space-3);background:var(--pl-color-bg-raised)}
+.r-advanced[open]{padding-bottom:var(--pl-space-4,16px)}
+.r-adv-summary{cursor:pointer;display:flex;flex-direction:column;gap:2px;list-style:none}
+.r-adv-summary::-webkit-details-marker{display:none}
+.r-adv-summary:focus-visible{outline:2px solid var(--pl-color-accent);outline-offset:2px}
+.r-adv-title{font-size:15px;font-weight:var(--pl-font-weight-semibold,600)}
+.r-adv-note{font-size:12px;color:var(--pl-color-fg-muted)}
+.r-adv-knobs{margin-top:var(--pl-space-3)}

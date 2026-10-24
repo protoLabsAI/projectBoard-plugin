@@ -289,7 +289,7 @@ config:
 settings_tabs:
   - { id: overview, label: "Overview", path: /plugins/project_board/config/overview }
   - { id: projects, label: "Projects", path: /plugins/project_board/config/projects }
-  - { id: routing, label: "Coder routing", path: /plugins/project_board/config/routing }
+  - { id: routing, label: "Coders", path: /plugins/project_board/config/routing }
   - { id: automation, label: "Automation" }
   - { id: review, label: "Review & merge" }
   - { id: security, label: "Security" }
@@ -303,31 +303,21 @@ settings_tabs:
 # switch, so it no longer renders as a generic schema field. It is still written through the
 # same PUT /settings boundary and still surfaces in pending_restart — settings_api keeps it in
 # its allowlist by hand (that module's header comment anticipates this).
+#
+# The Coders tab (S3, #613) owns nine more by the same mechanism: `coder` (a picker of the
+# configured delegates), `max_concurrent` + `max_pending_reviews` (capacity steppers), and the
+# Advanced block — `max_concurrent_sessions`, `coder_solve`, `coder_solve_test_cmd`,
+# `max_mode_n`, `decompose_after_timeouts`, `goal_verify`. None render as generic schema fields;
+# all are written through PUT /settings and tracked in pending_restart via settings_api's
+# hand-added allowlist. The automation schema tab below now holds only br_autofetch, base_refresh
+# and local_gate_cmd (S5 relocates those).
 settings:
-  - { key: decompose_after_timeouts, label: "Timeouts before asking to split a card", type: number, minimum: 0, maximum: 10, group: "Project Board", tab: automation, restart: true,
-      description: "After this many fresh-build timeouts, pause the card and ask to split it into smaller tasks; zero disables the request." }
-  - { key: coder, label: "Coder for builds", type: string, group: "Project Board", tab: automation,
-      description: "Choose the configured coder that builds cards, with changes taking effect on the next check." }
   - { key: br_autofetch, label: "Download the board tool automatically", type: bool, group: "Project Board", tab: automation,
       description: "Download and verify the missing board command-line tool from github.com, or turn off to install it yourself." }
-  - { key: max_concurrent, label: "Cards building at once", type: number, minimum: 1, maximum: 64, group: "Project Board", tab: automation,
-      description: "Limit how many cards build at once; lowering this limit lets running builds finish." }
-  - { key: max_concurrent_sessions, label: "Parallel coding sessions per build", type: number, minimum: 0, maximum: 32, group: "Project Board", tab: automation,
-      description: "Limit simultaneous coding sessions within each build; zero allows as many as the candidate budget permits." }
-  - { key: max_pending_reviews, label: "Pull requests waiting for review", type: number, minimum: 0, maximum: 1000, group: "Project Board", tab: automation,
-      description: "Pause new builds when this many pull requests await review; zero removes the limit." }
-  - { key: goal_verify, label: "Check acceptance criteria before review", type: bool, group: "Project Board", tab: automation, restart: true,
-      description: "Have an independent model check the changes against the card’s acceptance criteria, including test coverage, before opening a pull request." }
   - { key: base_refresh, label: "Update project checkouts automatically", type: bool, group: "Project Board", tab: automation, restart: true,
       description: "Keep board-owned checkouts up to date, leaving local edits, other branches, and diverged history untouched." }
   - { key: local_gate_cmd, label: "Checks before opening a pull request", type: string, group: "Project Board", tab: automation, restart: true,
       description: "Run this check command before opening a pull request unless the project overrides it; blank disables the default checks." }
-  - { key: coder_solve, label: "Try solutions until tests pass", type: bool, group: "Project Board", tab: automation, restart: true,
-      description: "Try and test alternative solutions when the coding plugin, acceptance criteria, and a test command are available." }
-  - { key: coder_solve_test_cmd, label: "Tests for candidate solutions", type: string, group: "Project Board", tab: automation, restart: true,
-      description: "Run this command to test candidate solutions, or leave blank to use the checks configured before opening a pull request." }
-  - { key: max_mode_n, label: "Alternative builds to compare", type: number, minimum: 1, maximum: 16, group: "Project Board", tab: automation, restart: true,
-      description: "Build each fresh card this many ways and keep the best result; one turns off alternatives, while higher values multiply coding cost." }
 
   - { key: auto_merge, label: "Merge approved pull requests automatically", type: bool, group: "Project Board", tab: review,
       description: "Merge pull requests when all required checks and reviews are current and passing, unless the card is held for manual approval." }
