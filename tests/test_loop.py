@@ -11510,9 +11510,12 @@ async def test_a_demoted_finding_rides_into_the_next_round_as_uncertain(monkeypa
     await loop._review_gate(store, "bd-1", "https://github.com/o/r/pull/3306", "/repo")
 
     assert store.review_states[-1][0] == "review-clean"  # demoted, so nothing blocking
+    # #514: _review_prior now holds the round history ({round, head, findings}); the demoted
+    # finding rides inside round 1's findings as `uncertain`, not the `confirmed` it arrived as.
     carried = json.loads(loop._review_prior["bd-1"])
-    assert len(carried) == 1
-    assert carried[0]["verdict"] == "uncertain"  # not the "confirmed" it arrived as
+    assert len(carried) == 1  # one round
+    assert len(carried[0]["findings"]) == 1
+    assert carried[0]["findings"][0]["verdict"] == "uncertain"
 
 
 async def test_the_truncation_guard_only_fires_on_a_diff_that_was_actually_cut(monkeypatch):

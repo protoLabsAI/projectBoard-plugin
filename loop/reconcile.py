@@ -3326,15 +3326,29 @@ class ReconcileMixin:
                     )
                 except Exception:  # noqa: BLE001 — bookkeeping must not fail the gate
                     log.warning("[project_board] %s ungrounded-finding comment failed", fid, exc_info=True)
-        # Remember this round's findings — the next run (a bounce re-review) passes
-        # them back as the recipe's prior_findings input, making it a DELTA review
-        # (drop fixed, carry still-open) instead of a from-scratch re-litigation.
-        # Serialized HERE, after the grounding partition (#381) and before either verdict
+        # Append this round to the card's review history (#514) — an append-only list of
+        # ``{round, head, findings}``. The next run (a bounce re-review) is handed the WHOLE
+        # history as prior_findings so it is a DELTA review across EVERY round (drop fixed,
+        # carry still-open, spot regressed), and the fix prompt leads with every round at
+        # once — not just the latest, which let round N's fix silently revert round N-1's and
+        # bounced forever (bd-49yo / #513: round 2 reverted round 1, round 3 asked it back).
+        # Appended HERE, after the grounding partition (#381) and before either verdict
         # branch, so a demoted finding rides into the next round as `uncertain` rather than
         # as the `confirmed` this round declined to act on — which the re-review would
         # simply re-confirm.
         try:
-            self._review_prior[fid] = json.dumps([f.to_dict() for f in findings]) if findings else ""
+            if findings:
+                history = self._review_history(fid)
+                history.append(
+                    {
+                        "round": len(history) + 1,
+                        "head": reviewed_head or "",
+                        "findings": [f.to_dict() for f in findings],
+                    }
+                )
+                self._review_prior[fid] = json.dumps(history)
+            else:
+                self._review_prior[fid] = ""
         except Exception:  # noqa: BLE001 — memory is an optimization, never a gate failure
             self._review_prior.pop(fid, None)
         if not blocking:
@@ -3402,11 +3416,19 @@ class ReconcileMixin:
         await self._budget_set(store, fid, "review-fix", n + 1)
         # Carry the lesson exactly like the CI bounce: findings as the rejection
         # feedback + the reviewed diff so the coder fixes THIS attempt, not a fresh one.
+        # LEAD with EVERY round's findings, not just this one (#514): fixing only the
+        # latest round let round N's fix reopen round N-1's finding and bounce forever
+        # (bd-49yo). The satisfy-ALL instruction heads the prompt so the coder treats the
+        # whole set as one constraint rather than trading one finding for another.
         self._ci_prior_diff[fid] = worktree.truncate_diff(full_diff, worktree.PR_DIFF_MAX_CHARS)
+        rounds = self._review_history(fid)
         self._ci_feedback[fid] = (
-            "An adversarial code review of your PR REQUESTED CHANGES. Fix every finding "
-            "below in the existing branch (the PR updates on push) — do not rewrite "
-            "unrelated code.\n\n" + rendered
+            "An adversarial code review of your PR REQUESTED CHANGES — across "
+            f"{len(rounds)} review round(s). Satisfy ALL of these at once; do not trade one "
+            "for another (a fix that reopens an earlier round's finding is not a fix).\n\n"
+            + self._render_review_history(fid)
+            + "\n\nFix every finding above in the existing branch (the PR updates on push) — "
+            "do not rewrite unrelated code."
         )
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_CHANGES_REQUESTED, note=rendered)
         # Pin the verdict to the head it was rendered against (#328) so a later external
@@ -3461,9 +3483,12 @@ class ReconcileMixin:
         if runner is not None and number:
             try:
                 inputs: dict = {"pr": number, "repo": repo_slug}
-                prior = self._review_prior.get(fid)
-                if prior:
-                    inputs["prior_findings"] = prior
+                # The WHOLE round-marked history (#514), not just the last round — so the
+                # re-review is a delta across every prior round and can tell a finding this
+                # round FIXED from one an earlier round's fix REGRESSED.
+                history = self._review_history(fid)
+                if history:
+                    inputs["prior_findings"] = json.dumps(history)
                 result = await _within(
                     runner(self.review_workflow, inputs),
                     self.review_gate_timeout,
@@ -3566,6 +3591,43 @@ class ReconcileMixin:
             return render_findings_markdown(findings, title=_REVIEW_FINDINGS_TITLE)
         except ImportError:  # unreachable when _parse_findings succeeded; belt+braces
             return "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in findings)
+
+    def _review_history(self, fid: str) -> list[dict]:
+        """Parse the card's stored review history (#514) into a list of round dicts
+        ``{round, head, findings}``. Tolerates a LEGACY single-round value — a bare
+        findings list (the pre-#514 ``prior_findings`` shape, ADR 0078 D5) — by wrapping
+        it as round 1 so a value a prior process left behind is still read."""
+        raw = self._review_prior.get(fid)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, list) or not data:
+            return []
+        if all(isinstance(r, dict) and "round" in r for r in data):
+            return data
+        # Legacy: a flat findings list → one round, reviewed head unknown.
+        return [{"round": 1, "head": "", "findings": data}]
+
+    def _render_review_history(self, fid: str) -> str:
+        """Render EVERY round of the card's review history for the fix prompt (#514):
+        each round's non-refuted findings under a round header, so the coder sees the
+        full set to satisfy at once rather than only the latest round's findings."""
+        blocks = []
+        for rnd in self._review_history(fid):
+            findings = [f for f in (rnd.get("findings") or []) if f.get("verdict") != "refuted"]
+            if not findings:
+                continue
+            head = rnd.get("head") or ""
+            header = f"### Review round {rnd.get('round')}" + (f" (head {head[:12]})" if head else "")
+            lines = "\n".join(
+                f"- {f.get('file', '')}:{f.get('line', '')} [{f.get('severity', '')}] {f.get('claim', '')}"
+                for f in findings
+            )
+            blocks.append(f"{header}\n{lines}")
+        return "\n\n".join(blocks)
 
     def _note_gate_speed(self, feature: dict | None, cmd: str, *, timed_out: bool) -> None:
         """Remember whether this project's gate finishes inside ``local_gate_timeout_s``

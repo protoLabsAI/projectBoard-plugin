@@ -615,9 +615,13 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # re-alert a block the operator was already told about — this set is rebuilt empty
         # on every restart and must never be the sole record.
         self._notified_blocks: set[str] = set()
-        # Last parsed findings JSON per fid — fed back as the recipe's
-        # prior_findings input so a bounce re-review is a DELTA review
-        # (GitHub-native review memory, ADR 0078 D5).
+        # The card's whole review history per fid (#514): a JSON list of
+        # ``{round, head, findings}`` rounds, append-only within one PR. Fed back as
+        # the recipe's prior_findings input so a bounce re-review is a DELTA review
+        # over EVERY round (GitHub-native review memory, ADR 0078 D5), and the fix
+        # prompt leads with every round at once — not just the latest, which let
+        # round N's fix silently revert round N-1's (bd-49yo / #513). Read through
+        # ``_review_history`` (tolerant of a legacy single-round flat findings value).
         self._review_prior: dict[str, str] = {}
         # Features whose review gate is RUNNING in this process right now (#205).
         # The gate has two call sites — the drive (PR just opened) and the
