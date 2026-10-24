@@ -4,11 +4,15 @@ try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
 catch (error) { kitError = error instanceof Error ? error.message : String(error); }
 
 const API = "/api/plugins/project_board/projects";
+// The checks dot reads the loop's live preflight from the board status route (both reads go
+// through the authenticated kit fetch). A held project is red with its one-line reason.
+const STATUS = "/api/plugins/project_board/status";
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>\"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'\"':"&quot;"}[c]));
 const errorText = (error) => error instanceof Error ? error.message : String(error || "Unknown error");
 const emptyState = () => ({projects:[], default_project:"", onboarding:{enabled:false,root:""}});
 let state = emptyState();
+let checks = {held:{}, failures:{}, evaluated:false};
 let lastTrigger = null;
 let loading = false;
 let mutating = false;
@@ -44,7 +48,7 @@ const proxyGaveUp = (error) => !error.status || error.status === 502 || error.st
 async function awaitSaveOutcome(name, requestId){
   const deadline = Date.now() + SAVE_WAIT_MS;
   let unseen = 0;
-  message(`The connection gave up before ${name}'s gate finished, but the agent is still running it. Waiting for the result…`);
+  editorMessage(`The connection gave up before ${name}'s gate finished, but the agent is still running it. Waiting for the result…`);
   while (Date.now() < deadline){
     await new Promise((resolve) => setTimeout(resolve, SAVE_POLL_MS));
     let data;
@@ -71,13 +75,46 @@ function normalized(data){
     },
   };
 }
+// The loop publishes an EMPTY preflight before its first pass and when it's off, and only HELD
+// projects keep a reason. So a non-empty held/dirty/slow/oracle map is the signal that a
+// verdict exists at all: with one, projects not flagged read as passing; with none, every dot
+// reads "not run" (no verdict yet / loop off) — never a false green.
+function checksFrom(status){
+  const pf = (status && status.preflight) || {};
+  const held = pf.held || {};
+  const evaluated = [held, pf.dirty, pf.slow, pf.unwinnable_oracle]
+    .some((m) => m && typeof m === "object" && Object.keys(m).length > 0);
+  return {held, failures: pf.failures || {}, evaluated};
+}
+function dotFor(name){
+  if (checks.held && Object.prototype.hasOwnProperty.call(checks.held, name)){
+    const failure = checks.failures?.[name];
+    return {variant:"pl-dot--error", reason:(failure?.headline) || checks.held[name] || "Held behind a red gate.", title:""};
+  }
+  if (checks.evaluated) return {variant:"pl-dot--success", reason:"", title:"Checks pass."};
+  return {variant:"", reason:"", title:"No preflight verdict yet."};
+}
+// Home dir shown as `~` so a row stays short (e.g. `~/dev/x`).
+function shortRepo(repo){
+  if (!repo) return "Not configured";
+  return String(repo).replace(/^\/(?:Users|home)\/[^/]+/, "~").replace(/^\/root(?=\/|$)/, "~");
+}
 function message(text, error=false){
   const el = error ? $("error") : $("notice");
   $(error ? "error-text" : "notice-text").textContent = text;
   el.hidden = !text;
   if (text) el.scrollIntoView({block:"nearest"});
 }
-function clearMessages(){ $("notice").hidden = true; $("error").hidden = true; }
+// Refusals and the gate-wait line show INSIDE the open side panel; a page-top callout would
+// sit behind the panel. Save success is reported at the top because the panel is closed by then.
+function editorMessage(text, error=false){
+  const el = $("editor-msg");
+  el.textContent = text;
+  el.className = "pl-callout" + (error ? " pl-callout--error" : "");
+  el.hidden = !text;
+  if (text) el.scrollIntoView({block:"nearest"});
+}
+function clearMessages(){ $("notice").hidden = true; $("error").hidden = true; $("editor-msg").hidden = true; }
 // Editing needs a consented SPACE, not just the switch. The host refuses any write whose
 // repo doesn't resolve under `onboarding.root`, so gating on `enabled` alone would leave a
 // live button whose every submit fails server-side — which is what defaulting `enabled` on
@@ -91,9 +128,15 @@ function syncControls(){
   $("retry").disabled = busy;
   $("editor-fields").disabled = mutating;
   $("cancel").disabled = mutating;
+  $("save").disabled = mutating || !canEdit();
   $("projects").querySelectorAll("button").forEach((button) => {
-    const editBlocked = button.hasAttribute("data-edit") && (!canEdit() || button.dataset.editable === "false");
-    button.disabled = busy || editBlocked;
+    if (button.hasAttribute("data-open")){
+      // Opening the editor needs a usable onboarding space; a non-mapping entry is not editable.
+      button.disabled = busy || !canEdit() || button.dataset.editable === "false";
+    } else {
+      // Delete stays available even when adding/editing is blocked — unused entries can go.
+      button.disabled = busy;
+    }
   });
 }
 
@@ -115,11 +158,21 @@ function render(){
   $("projects").innerHTML = state.projects.map((project) => {
     const isDefault = project.name === state.default_project;
     const editable = project.editable !== false;
-    const extras = project.extra_fields?.length ? `<div class="pl-callout">Preserved file-only fields: ${esc(project.extra_fields.join(", "))}</div>` : "";
-    const malformed = editable ? "" : '<div class="pl-callout pl-callout--warning">This entry is not a mapping. Repair it in YAML or delete it; the editor will not overwrite it.</div>';
-    return `<article class="panel project" data-name="${esc(project.name)}"><div class="row"><h2 tabindex="-1">${esc(project.name)}</h2>${isDefault?'<span class="badge">default</span>':""}</div>
-      <dl class="meta"><dt>Repository</dt><dd>${esc(project.repo || "Not configured")}</dd><dt>Base branch</dt><dd>${esc(project.base_branch || "main")}</dd><dt>Local gate</dt><dd>${esc(project.local_gate_cmd || "Inherited / none")}</dd></dl>${extras}${malformed}
-      <div class="actions"><button type="button" class="btn" data-edit="${esc(project.name)}" data-editable="${editable}" aria-label="Edit ${esc(project.name)}">Edit</button><button type="button" class="btn danger" data-delete="${esc(project.name)}" aria-label="Delete ${esc(project.name)}">Delete</button></div></article>`;
+    const dot = editable ? dotFor(project.name) : {variant:"", reason:"", title:"Not a mapping — repair in YAML."};
+    const reason = dot.reason ? `<span class="prow-reason" title="${esc(dot.reason)}">${esc(dot.reason)}</span>` : "";
+    const def = isDefault ? '<span class="badge">default</span>' : "";
+    const note = editable ? "" : '<div class="pl-callout pl-callout--warning prow-note">This entry is not a mapping. Repair it in YAML or delete it; the editor will not overwrite it.</div>';
+    const openTitle = editable ? (dot.reason || dot.title || "") : "This entry is not a mapping.";
+    return `<div class="prow-wrap${editable ? "" : " malformed"}" data-name="${esc(project.name)}">
+      <button type="button" class="prow" data-open="${esc(project.name)}" data-editable="${editable}" aria-label="Edit ${esc(project.name)}" title="${esc(openTitle)}">
+        <span class="pl-dot ${dot.variant}"></span>
+        <span class="prow-name">${esc(project.name)}</span>
+        <span class="prow-repo">${esc(shortRepo(project.repo))}</span>
+        <span class="prow-branch">${esc(project.base_branch || "main")}</span>
+        <span class="prow-tail">${reason}${def}</span>
+      </button>
+      <button type="button" class="btn danger prow-del" data-delete="${esc(project.name)}" aria-label="Delete ${esc(project.name)}">Delete</button>
+      ${note}</div>`;
   }).join("");
   syncControls();
 }
@@ -128,7 +181,14 @@ async function load({clear=true}={}){
   if (clear) clearMessages();
   loading = true; syncControls();
   try {
-    state = normalized(await request(API, {cache:"no-store"}));
+    // The list is primary; the dots are best-effort. A status read that fails leaves every dot
+    // "not run" rather than failing the whole page.
+    const [projData, statusData] = await Promise.all([
+      request(API, {cache:"no-store"}),
+      request(STATUS, {cache:"no-store"}).catch(() => null),
+    ]);
+    state = normalized(projData);
+    checks = checksFrom(statusData);
     render();
     return true;
   } catch (error) {
@@ -152,6 +212,11 @@ function openEditor(project){
     $("conventions").value = editing ? (project.repo_conventions || "") : "";
     $("default").checked = editing ? project.name === state.default_project : state.projects.length === 0;
     $("default").disabled = editing && state.projects.length === 1;
+    $("checks").open = false;  // Checks (gate command + conventions) start collapsed.
+    const extras = $("editor-extras");
+    const fields = editing && project.extra_fields?.length ? project.extra_fields.join(", ") : "";
+    extras.hidden = !fields;
+    extras.textContent = fields ? `Preserved file-only fields: ${fields}` : "";
     $("editor").hidden = false;
     (editing ? $("repo") : $("name")).focus();
   }
@@ -159,18 +224,19 @@ function openEditor(project){
 function closeEditor(restoreFocus=true, force=false){
   if (mutating && !force) return;
   $("editor").hidden = true; $("form").reset(); $("name").disabled = false;
+  $("editor-extras").hidden = true; $("editor-msg").hidden = true;
   if (restoreFocus && lastTrigger?.isConnected) lastTrigger.focus();
 }
 function focusProject(name){
-  const target = [...$("projects").querySelectorAll("[data-edit]")].find((button) => button.dataset.edit === name);
-  const heading = target?.closest(".project")?.querySelector("h2");
+  const target = [...$("projects").querySelectorAll("[data-open]")].find((button) => button.dataset.open === name);
   const fallback = [...$("projects").querySelectorAll("button")].find((button) => !button.disabled)
     || (!$("add").disabled ? $("add") : $("page-title"));
-  (target && !target.disabled ? target : heading || fallback).focus();
+  (target && !target.disabled ? target : fallback).focus();
 }
 
 $("add").addEventListener("click", (event) => { lastTrigger = event.currentTarget; openEditor(null); });
 $("cancel").addEventListener("click", () => closeEditor());
+$("backdrop").addEventListener("click", () => closeEditor());
 $("retry").addEventListener("click", () => {
   if (!kit){ location.reload(); return; }
   $("loading").hidden = false; $("loading").textContent = "Loading projects…"; load();
@@ -178,11 +244,11 @@ $("retry").addEventListener("click", () => {
 $("editor").addEventListener("keydown", (event) => { if (event.key === "Escape" && !mutating) closeEditor(); });
 $("projects").addEventListener("click", async (event) => {
   const button = event.target.closest("button"); if (!button || mutating || loading) return;
-  const edit = button.getAttribute("data-edit");
-  if (edit){ lastTrigger = button; openEditor(state.projects.find((project) => project.name === edit)); return; }
+  const open = button.getAttribute("data-open");
+  if (open){ lastTrigger = button; openEditor(state.projects.find((project) => project.name === open)); return; }
   const remove = button.getAttribute("data-delete"); if (!remove) return;
   if (!window.confirm(`Delete board project “${remove}”? This is allowed only when no active board cards reference it.`)) return;
-  mutating = true; button.textContent = "Deleting…"; button.closest(".project").setAttribute("aria-busy", "true"); clearMessages(); syncControls();
+  mutating = true; button.textContent = "Deleting…"; button.closest(".prow-wrap").setAttribute("aria-busy", "true"); clearMessages(); syncControls();
   let applied = false;
   let refreshed = false;
   try {
@@ -194,11 +260,11 @@ $("projects").addEventListener("click", async (event) => {
     refreshed = await load({clear:false});
     if (refreshed) message(`Deleted ${remove}. The running board is already using the new registry.`);
     else message(`Deleted ${remove}, but the project list could not be refreshed. The change applied; Retry to reload live state.`, true);
-  } catch (error) { message(errorText(error), true); }
+  } catch (error) { message(errorText(error), true); }  // a refusal (409) shows inline, in plain words
   finally {
     mutating = false;
     if (applied) render();
-    else { button.textContent = "Delete"; button.closest(".project")?.removeAttribute("aria-busy"); syncControls(); }
+    else { button.textContent = "Delete"; button.closest(".prow-wrap")?.removeAttribute("aria-busy"); syncControls(); }
     if (applied) focusProject("");
   }
 });
@@ -211,7 +277,7 @@ $("form").addEventListener("submit", async (event) => {
   const body = {repo:$("repo").value.trim(), base_branch:$("base").value.trim(), local_gate_cmd:$("gate").value.trim(), repo_conventions:$("conventions").value.trim(), default_action:defaultAction, request_id:requestId};
   const runsGate = gateWillRun(body, original ? state.projects.find((project) => project.name === original) : null);
   mutating = true; $("save").textContent = runsGate ? "Running the gate…" : "Saving…"; $("form").setAttribute("aria-busy", "true"); syncControls();
-  if (runsGate) message(`Saving ${name} runs its gate once on the clean base before anything is saved. For a full test suite that takes minutes; the result appears here.`);
+  if (runsGate) editorMessage(`Saving ${name} runs its gate once on the clean base before anything is saved. For a full test suite that takes minutes; the result appears here.`);
   let applied = false;
   let refreshed = false;
   try {
@@ -231,7 +297,7 @@ $("form").addEventListener("submit", async (event) => {
     refreshed = await load({clear:false});
     if (refreshed) message(`Saved ${name}. The running board is already using this project.`);
     else message(`Saved ${name}, but the project list could not be refreshed. The change applied; Retry to reload live state.`, true);
-  } catch (error) { $("notice").hidden = true; message(errorText(error), true); }
+  } catch (error) { editorMessage(errorText(error), true); }  // 409 (concurrent save) / red gate shown inline
   finally {
     mutating = false; $("save").textContent = "Save project"; $("form").removeAttribute("aria-busy");
     if (applied) render(); else syncControls();

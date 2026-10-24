@@ -16,21 +16,32 @@ var BASE = location.pathname.split("/plugins/")[0];
   <div id="onboarding" class="pl-callout pl-callout--warning" hidden></div>
   <div id="error" class="pl-callout pl-callout--error callout-row" hidden role="alert"><span id="error-text"></span><button id="retry" class="btn" type="button">Retry</button></div>
   <div id="loading" class="empty" role="status">Loading projects…</div>
-  <div id="projects" aria-live="polite"></div>
-  <section id="editor" class="panel" hidden aria-labelledby="editor-title">
-    <div class="panel-head"><h2 id="editor-title">Add project</h2><button id="cancel" class="btn" type="button">Cancel</button></div>
-    <form id="form">
-      <input id="original-name" type="hidden">
-      <fieldset id="editor-fields">
-        <label>Project key<input id="name" name="name" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" autocomplete="off"><small>Stable key stamped onto board cards. Existing keys cannot be renamed.</small></label>
-        <label>Repository path<input id="repo" name="repo" type="text" required maxlength="4096" autocomplete="off"><small>Must be an existing Git checkout under the configured onboarding root.</small></label>
-        <label>Base branch<input id="base" name="base_branch" type="text" value="main" required maxlength="255" autocomplete="off"></label>
-        <label>Local gate command<input id="gate" name="local_gate_cmd" type="text" maxlength="8192" autocomplete="off"><small>Optional repo-specific fast test/lint gate.</small></label>
-        <label>Repository conventions<textarea id="conventions" name="repo_conventions" rows="4" maxlength="32768"></textarea><small>Rules injected into coder dispatches: test, changelog, and import conventions.</small></label>
-        <label class="check"><input id="default" name="make_default" type="checkbox"> Use for new cards that do not name a project <small>The only project is always the default.</small></label>
-        <div class="actions"><button id="save" class="btn primary" type="submit">Save project</button></div>
-      </fieldset>
-    </form>
-  </section>
+  <div id="projects" class="rows" aria-live="polite"></div>
+
+  <!-- Side-panel editor. Opened by a row click (edit) or Add (empty). The local gate command
+       and repo conventions live under the collapsed Checks section, so a row never shows them. -->
+  <div id="editor" class="panel-overlay" hidden>
+    <div id="backdrop" class="panel-backdrop" tabindex="-1"></div>
+    <section class="side-panel" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <div class="panel-head"><h2 id="editor-title">Add project</h2><button id="cancel" class="btn" type="button">Cancel</button></div>
+      <div id="editor-extras" class="pl-callout" hidden></div>
+      <div id="editor-msg" class="pl-callout" hidden role="status" aria-live="polite"></div>
+      <form id="form">
+        <input id="original-name" type="hidden">
+        <fieldset id="editor-fields">
+          <label>Project key<input id="name" name="name" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" autocomplete="off"><small>Stable key stamped onto board cards. Existing keys cannot be renamed.</small></label>
+          <label>Repository path<input id="repo" name="repo" type="text" required maxlength="4096" autocomplete="off"><small>Must be an existing Git checkout under the configured onboarding root.</small></label>
+          <label>Base branch<input id="base" name="base_branch" type="text" value="main" required maxlength="255" autocomplete="off"></label>
+          <details id="checks" class="checks">
+            <summary>Checks</summary>
+            <label>Local gate command<textarea id="gate" name="local_gate_cmd" class="mono" rows="2" maxlength="8192" autocomplete="off" spellcheck="false"></textarea><small>Optional repo-specific fast test/lint gate. Runs once on the clean base before a save persists.</small></label>
+            <label>Repository conventions<textarea id="conventions" name="repo_conventions" class="mono" rows="4" maxlength="32768" spellcheck="false"></textarea><small>Rules injected into coder dispatches: test, changelog, and import conventions.</small></label>
+          </details>
+          <label class="check"><input id="default" name="make_default" type="checkbox"> Use for new cards that do not name a project <small>The only project is always the default.</small></label>
+          <div class="actions"><button id="save" class="btn primary" type="submit">Save project</button></div>
+        </fieldset>
+      </form>
+    </section>
+  </div>
 </main>
 <script type="module">__PROJECTS_JS__</script></body></html>
