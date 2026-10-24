@@ -39,6 +39,13 @@ RB_MAJOR_BODY = (
 )
 RB_MINOR_BODY = "_🧹 Nitpick_ | _Minor_\n\nConsider renaming `x` to something descriptive."
 RB_CRITICAL_BODY = "**🔴 Critical**: user input flows unescaped into the SQL query builder."
+# A Minor-badged thread whose PROSE mentions the severity words — and a pasted snake_case
+# identifier. The bare words are NOT a badge, so this must NOT bounce (#495 review): only the
+# emphasised severity badge blocks, never a word in the explanation.
+RB_PROSE_BODY = (
+    "_🧹 Nitpick_ | _Minor_\n\nA major refactor would help here, near the critical section; "
+    "also `is_major` reads oddly."
+)
 
 
 def _thread(body, *, author="coderabbitai[bot]", path="apps/web/useKeybindings.ts", line=55):
@@ -61,18 +68,27 @@ def test_thread_bots_config_default_and_override():
 def test_blocking_threads_keeps_only_configured_bots_marked_major_or_critical():
     bots = external_review.DEFAULT_THREAD_BOTS
     threads = [
-        _thread(RB_MAJOR_BODY),  # configured bot, Major → kept
-        _thread(RB_CRITICAL_BODY, path="db.py", line=9),  # configured bot, Critical → kept
+        _thread(RB_MAJOR_BODY),  # configured bot, Major badge → kept
+        _thread(RB_CRITICAL_BODY, path="db.py", line=9),  # configured bot, Critical badge → kept
         _thread(RB_MINOR_BODY, path="scope.py", line=12),  # configured bot, Minor → dropped
         _thread(RB_MAJOR_BODY, author="some-human", path="x.py"),  # not a bot → dropped
-        _thread("a major refactor would help here", author="protoreview", path="y.py"),  # bare word still a marker
+        # Configured bot, but the words are only in PROSE under a Minor badge — NOT a severity
+        # badge, so it does NOT block (#495 review): prose must never spend the fix budget.
+        _thread(RB_PROSE_BODY, author="protoreview", path="y.py"),
     ]
     kept = external_review.blocking_threads(threads, bots)
-    assert [t["path"] for t in kept] == ["apps/web/useKeybindings.ts", "db.py", "y.py"]
+    assert [t["path"] for t in kept] == ["apps/web/useKeybindings.ts", "db.py"]
     # None (an unknown read) is never "no threads" — it yields [] for the caller to fail open on.
     assert external_review.blocking_threads(None, bots) == []
     assert external_review.thread_is_blocking(RB_MINOR_BODY) is False
     assert external_review.thread_is_blocking(RB_MAJOR_BODY) is True
+    assert external_review.thread_is_blocking(RB_CRITICAL_BODY) is True
+    # An emphasised badge blocks; the same words in prose — or a code identifier — do not.
+    assert external_review.thread_is_blocking("**Blocker**: this cannot ship.") is True
+    assert external_review.thread_is_blocking("a major refactor near the critical section") is False
+    assert external_review.thread_is_blocking("this is a majority view, critically reviewed") is False
+    assert external_review.thread_is_blocking("bump the major version in `max_major_count`") is False
+    assert external_review.thread_is_blocking(RB_PROSE_BODY) is False
 
 
 def test_render_thread_findings_leads_with_file_line_and_body():
@@ -202,12 +218,16 @@ async def test_a_major_thread_bounces_into_a_fix_round_once_per_head(monkeypatch
     assert loop.ran == []
 
     # The fix round comes back to review at the SAME head (no new push). The ext-review-bounced
-    # stamp holds it — told once, never re-bounced.
-    store.state = "in_review"
-    await loop._reconcile_prs()
+    # stamp holds it — told once, never re-bounced — and told ONCE however many times the card is
+    # polled at that head. The panel edge runs first on every pass and clears its OWN hold memory;
+    # that reset must not wipe this edge's, or the hold comment would re-post every poll (#495
+    # review). Poll it several times to prove the dedup survives.
+    for _ in range(3):
+        store.state = "in_review"
+        await loop._reconcile_prs()
     assert [c for c in store.calls if c[0] == "record_review_bounce"] == [("record_review_bounce", HEAD)]
     holds = [c for c in store.comments if c.startswith("auto-merge held:")]
-    assert len(holds) == 1 and "needs a human" in holds[0]
+    assert len(holds) == 1 and "needs a human" in holds[0]  # told once, not once per poll
     # Held, not merged: the operator is told once, and no rebase/merged-state/merge edge runs.
     assert loop.ran == ["notify"]
 

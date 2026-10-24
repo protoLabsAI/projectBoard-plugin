@@ -77,14 +77,26 @@ _BODY_EXCERPT_CHARS = 4000
 _EVIDENCE_CHARS = 1200
 # How much of an unresolved review thread's first comment a bounce quotes (#495).
 _THREAD_BODY_CHARS = 1200
-# A review thread blocks the merge when its first comment marks it Major/Critical/Blocker —
-# the same bar #473 applies to a panel finding, read from the free-text body the bot posts
-# inline. Minor / nitpick / unlabelled threads never block. Only POSITIVE evidence of a
-# blocking severity bounces, so an ambiguous body is left alone (fail-safe). The boundaries are
-# LETTER-only (not ``\b``) so a markdown-emphasised badge — ``_🟠 Major_``, ``**Critical**`` —
-# still matches (``_`` is a word char, so ``\b`` would fail after it), while ``majority`` or
-# ``critically`` does not.
-_THREAD_BLOCKING_RE = re.compile(r"(?<![a-z])(?:critical|blocker|major)(?![a-z])", re.I)
+# A review thread blocks the merge when its first comment carries a Major/Critical/Blocker
+# severity BADGE — the same bar #473 applies to a panel finding, read from the free-text body
+# the bot posts inline. CodeRabbit (and protoreview's own inline threads) post that severity as
+# a markdown-emphasised span near the top of the comment: ``_🟠 Major_``, ``**🔴 Critical**``,
+# ``**Blocker**``. We match the severity word ONLY inside such a span — an emphasis opener
+# (``_`` / ``*``, optionally doubled) at a markdown boundary (start-of-line or after whitespace
+# / ``|`` / ``(``), then only emoji, spaces or punctuation around the word, then a close on the
+# SAME line. Matching the badge and not the bare word is the point (#495 review): a Minor /
+# nitpick / unlabelled thread whose PROSE merely mentions "a major refactor" or "the critical
+# section" — or a snake_case ``is_major`` identifier in a pasted code snippet — must NOT bounce
+# the card, spend the shared ext-review-fix budget and eventually block it for a human. Only the
+# emphasised-badge shape is POSITIVE evidence; everything else is left alone (fail-safe). The
+# ``[^_*\nA-Za-z]*`` guards on either side keep ``majority`` / ``critically`` / ``Majorly`` out
+# (the char touching the word must be an emphasis marker or a non-letter, never another letter)
+# and keep a bolded SENTENCE that happens to contain the word (``**fix the major bug**``) from
+# reading as a badge.
+_THREAD_BLOCKING_RE = re.compile(
+    r"(?<![^\s|(>])[_*]{1,2}[^_*\nA-Za-z]*(?:critical|blocker|major)[^_*\nA-Za-z]*[_*]{1,2}",
+    re.I,
+)
 
 _JSON_FENCE_RE = re.compile(r"```json[^\n]*\n(.*?)```", re.S)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
@@ -394,9 +406,12 @@ def fail_summary(verdict: Verdict) -> str:
 
 
 def thread_is_blocking(body: str) -> bool:
-    """Whether a review thread's first-comment ``body`` marks it Major / Critical / Blocker —
-    the bar a thread must clear to bounce the card (#495). Minor / nitpick / unlabelled bodies
-    do not. Only positive evidence counts, so an ambiguous body is left alone."""
+    """Whether a review thread's first-comment ``body`` carries a Major / Critical / Blocker
+    severity BADGE — the bar a thread must clear to bounce the card (#495). An emphasised badge
+    (``_🟠 Major_``, ``**Critical**``) counts; a Minor / nitpick / unlabelled body, or one that
+    only mentions the words in PROSE (``a major refactor``, ``the critical section``), does not.
+    Only positive badge evidence counts, so an ambiguous body is left alone (see
+    :data:`_THREAD_BLOCKING_RE`)."""
     return bool(_THREAD_BLOCKING_RE.search(body or ""))
 
 

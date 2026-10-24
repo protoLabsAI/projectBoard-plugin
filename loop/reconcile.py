@@ -2758,15 +2758,23 @@ class ReconcileMixin:
         raw = pc.get("external_review") if "external_review" in pc else self.cfg.get("external_review")
         return external_review.parse_config(raw)
 
-    def _note_external_hold(self, store, fid: str, head: str, why: str) -> None:
-        """Say ONCE per (card, head) why a card the panel failed is held rather than bounced
-        — on the bead and to the operator. Store-only; runs off the event loop."""
+    def _note_external_hold(self, store, fid: str, head: str, why: str, *, scope: str = "panel") -> None:
+        """Say ONCE per (scope, card, head) why a card is held rather than bounced — on the bead
+        and to the operator. Store-only; runs off the event loop.
+
+        ``scope`` namespaces the once-per-head memory by which edge raised the hold: the #473
+        panel edge (``"panel"``) and the #495 thread edge (``"threads"``) each have their own.
+        They MUST stay apart — the panel edge clears its own memory on every pass the panel has
+        not failed (see ``_reconcile_external_review``), which is the common case for a card held
+        on threads alone; a single shared key would let that reset wipe the thread edge's memory
+        and re-post the ``auto-merge held:`` comment on every poll (#495 review)."""
         held = getattr(self, "_ext_review_held", None)
         if held is None:
             held = self._ext_review_held = {}
-        if held.get(fid) == head:
+        key = (scope, fid)
+        if held.get(key) == head:
             return
-        held[fid] = head
+        held[key] = head
         log.warning("[project_board] %s held: %s", fid, why)
         try:
             store.comment(fid, f"auto-merge held: {why}")
@@ -2822,7 +2830,10 @@ class ReconcileMixin:
             view = await worktree.pr_review_state(pr_url, cwd=repo)
         verdict = external_review.evaluate(view, cfg) if view else None
         if verdict is None or not verdict.failed:
-            getattr(self, "_ext_review_held", {}).pop(fid, None)
+            # The panel passed (or is unreadable): clear ONLY the panel edge's hold memory, so a
+            # later panel FAIL at this head re-notifies. The #495 thread edge keeps its own
+            # ("threads", fid) memory — a thread-only hold must survive this pass (#495 review).
+            getattr(self, "_ext_review_held", {}).pop(("panel", fid), None)
             return False
         head = verdict.head
         short = head[: store_mod.SHORT_SHA_LEN]
@@ -2868,6 +2879,7 @@ class ReconcileMixin:
         signals: str,
         reject_label: str,
         already_bounced_hold: str,
+        hold_scope: str = "panel",
     ) -> None:
         """The shared bounce tail for an external-review rejection at the PR's current head — the
         panel's FAIL (#473) and a configured bot's unresolved Major/Critical threads (#495) both
@@ -2880,12 +2892,16 @@ class ReconcileMixin:
         under the claim lock, record the findings and either requeue the SAME PR into a fix round
         (spending one ``ext-review-fix`` unit) or — once ``review_fix_max`` is spent — block for a
         human with ``reject_label`` naming the rejection. Once per head: only a new push re-arms the
-        bounce. ``signals`` is the one-line evidence for logs and the block reason."""
+        bounce. ``signals`` is the one-line evidence for logs and the block reason.
+
+        ``hold_scope`` namespaces the once-per-head hold memory to the calling edge (``"panel"`` /
+        ``"threads"``) so the panel edge's per-pass reset can't wipe a thread-only hold — the two
+        edges share this tail but not their hold-comment dedup (#495 review)."""
         fid = feature["id"]
         short = head[: store_mod.SHORT_SHA_LEN]
         stamp = f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{short}"
         if stamp in (feature.get("labels") or []):
-            await asyncio.to_thread(self._note_external_hold, store, fid, head, already_bounced_hold)
+            await asyncio.to_thread(self._note_external_hold, store, fid, head, already_bounced_hold, scope=hold_scope)
             return
         if (
             _loop.live_drive(fid) is not None
@@ -2954,7 +2970,9 @@ class ReconcileMixin:
             else:
                 self._ci_prior_diff.pop(fid, None)
             await asyncio.to_thread(store.requeue, fid)
-        getattr(self, "_ext_review_held", {}).pop(fid, None)
+        # A fresh bounce clears THIS edge's hold memory so the next already-bounced pass at this
+        # head notifies once more; the other edge's memory is left untouched (#495 review).
+        getattr(self, "_ext_review_held", {}).pop((hold_scope, fid), None)
         log.info(
             "[project_board] %s %s at %s (%s) → fix round %d/%d on the same PR: %s",
             fid,
@@ -3035,6 +3053,7 @@ class ReconcileMixin:
                 f"round was already bounced for this head without a new push — needs a human (push a fix, "
                 f"or resolve the threads): {pr_url}"
             ),
+            hold_scope="threads",
         )
         return True
 
