@@ -42,8 +42,8 @@ def test_projects_page_reads_the_live_preflight_from_status_for_the_checks_dot()
     assert 'request(API, {cache:"no-store"})' in PROJECTS_PAGE
     assert 'request(STATUS, {cache:"no-store"})' in PROJECTS_PAGE
     assert "Promise.all(" in PROJECTS_PAGE
-    # Dot states: held -> error (with its one-line reason), evaluated-and-not-held -> success,
-    # nothing published -> neutral "not run".
+    # Dot states: held -> error (with its one-line reason), in the per-project `passed` set ->
+    # success, anything else -> neutral "not run".
     assert "function checksFrom(status)" in PROJECTS_PAGE
     assert "status.preflight" in PROJECTS_PAGE
     assert "pl-dot--error" in PROJECTS_PAGE and "pl-dot--success" in PROJECTS_PAGE
@@ -51,6 +51,19 @@ def test_projects_page_reads_the_live_preflight_from_status_for_the_checks_dot()
     assert "checks.held[name]" in PROJECTS_PAGE
     # A status read failure must not fail the page — the list is primary, dots best-effort.
     assert 'request(STATUS, {cache:"no-store"}).catch(() => null)' in PROJECTS_PAGE
+
+
+def test_projects_green_dot_reads_a_per_project_pass_not_a_board_wide_flag():
+    """#612 review (blocking): green came from one board-wide `evaluated` flag — once any
+    preflight map had an entry, every project not in `held` went green, including the
+    `slow` (indeterminate), `dirty` and `unwinnable_oracle` entries that SET the flag and
+    any project added after the last pass. That is a false green. Green must instead read
+    the ONE authoritative per-project verdict the loop publishes: `preflight.passed`."""
+    # The dot greens ONLY on a positive per-project pass, and that set comes straight from
+    # the published preflight — no board-wide "anything ran" flag survives.
+    assert "checks.passed.has(name)" in PROJECTS_PAGE
+    assert "passed: new Set(Array.isArray(pf.passed) ? pf.passed : [])" in PROJECTS_PAGE
+    assert "evaluated" not in PROJECTS_PAGE
 
 
 def test_projects_rows_are_compact_and_never_show_the_gate_command():

@@ -12,7 +12,7 @@ const esc = (value) => String(value ?? "").replace(/[&<>\"]/g, (c) => ({"&":"&am
 const errorText = (error) => error instanceof Error ? error.message : String(error || "Unknown error");
 const emptyState = () => ({projects:[], default_project:"", onboarding:{enabled:false,root:""}});
 let state = emptyState();
-let checks = {held:{}, failures:{}, evaluated:false};
+let checks = {held:{}, failures:{}, passed:new Set()};
 let lastTrigger = null;
 let loading = false;
 let mutating = false;
@@ -75,24 +75,28 @@ function normalized(data){
     },
   };
 }
-// The loop publishes an EMPTY preflight before its first pass and when it's off, and only HELD
-// projects keep a reason. So a non-empty held/dirty/slow/oracle map is the signal that a
-// verdict exists at all: with one, projects not flagged read as passing; with none, every dot
-// reads "not run" (no verdict yet / loop off) — never a false green.
+// The dot reads ONE authoritative per-project verdict the loop publishes, never a board-wide
+// "anything ran" flag. `preflight.held` names the projects frozen behind a red gate
+// (with a reason); `preflight.passed` names the projects whose gate ran CLEAN on the base with
+// no caveat — the loop already excludes dirty, slow (indeterminate, #456) and unwinnable-oracle
+// (#459) projects from it. Everything else — a dirty/slow/oracle entry, a project added since
+// the last pass, or nothing published yet (loop off / first pass) — is neither, so its dot reads
+// "not run" and is never a false green (#612).
 function checksFrom(status){
   const pf = (status && status.preflight) || {};
-  const held = pf.held || {};
-  const evaluated = [held, pf.dirty, pf.slow, pf.unwinnable_oracle]
-    .some((m) => m && typeof m === "object" && Object.keys(m).length > 0);
-  return {held, failures: pf.failures || {}, evaluated};
+  return {
+    held: pf.held || {},
+    failures: pf.failures || {},
+    passed: new Set(Array.isArray(pf.passed) ? pf.passed : []),
+  };
 }
 function dotFor(name){
   if (checks.held && Object.prototype.hasOwnProperty.call(checks.held, name)){
     const failure = checks.failures?.[name];
     return {variant:"pl-dot--error", reason:(failure?.headline) || checks.held[name] || "Held behind a red gate.", title:""};
   }
-  if (checks.evaluated) return {variant:"pl-dot--success", reason:"", title:"Checks pass."};
-  return {variant:"", reason:"", title:"No preflight verdict yet."};
+  if (checks.passed.has(name)) return {variant:"pl-dot--success", reason:"", title:"Gate passed on the clean base."};
+  return {variant:"", reason:"", title:"No preflight verdict for this project yet."};
 }
 // Home dir shown as `~` so a row stays short (e.g. `~/dev/x`).
 function shortRepo(repo){

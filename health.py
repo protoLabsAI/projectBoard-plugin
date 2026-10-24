@@ -58,13 +58,28 @@ def publish_preflight(
     sha}: a preflight command that can't finish inside ``preflight_timeout_s``, #456),
     ``oracle`` (project -> why its coder.solve() oracle is unwinnable, #459) and
     ``failures`` (project -> {cmd, step, step_index, steps, exit_code, headline, tail}:
-    what a held project's failed gate said, redacted). Only HELD projects keep a failure."""
+    what a held project's failed gate said, redacted). Only HELD projects keep a failure.
+
+    ``passed`` is derived here as the ONE authoritative per-project pass signal: the
+    projects whose gate ran CLEAN on the base (``state`` is True) with no outstanding
+    caveat — not ``dirty`` (the checkout wasn't at base, so there is no verdict either
+    way, #255/#300), not ``slow`` (a timeout is indeterminate, #456) and not an unwinnable
+    ``oracle`` (#459). A reader (the board page's checks dot) can then show green ONLY for a
+    real pass instead of guessing from a board-wide "something was evaluated" flag: a held,
+    dirty, slow, oracle or not-yet-checked project is simply absent from ``passed`` (#612)."""
     held = {n: r for n, r in state.items() if isinstance(r, str)}
+    dirty_map = dict(dirty)
+    slow_map = {n: dict(v) for n, v in (slow or {}).items()}
+    oracle_map = dict(oracle or {})
+    passed = sorted(
+        n for n, r in state.items() if r is True and n not in dirty_map and n not in slow_map and n not in oracle_map
+    )
     _health["preflight"] = {
         "held": held,
-        "dirty": dict(dirty),
-        "slow": {n: dict(v) for n, v in (slow or {}).items()},
-        "unwinnable_oracle": dict(oracle or {}),
+        "dirty": dirty_map,
+        "slow": slow_map,
+        "unwinnable_oracle": oracle_map,
+        "passed": passed,
         "failures": {
             n: {k: v for k, v in dict(d).items() if k != "key"} for n, d in (failures or {}).items() if n in held
         },
@@ -73,20 +88,23 @@ def publish_preflight(
 
 def preflight_snapshot() -> dict:
     """``{held: {project: reason}, dirty: {project: why}, slow: {project: {cmd,
-    timeout_s, sha}}, unwinnable_oracle: {project: why}, failures: {project: {cmd, step,
-    step_index, steps, exit_code, headline, tail}}}``. Held projects are the ones whose
-    ready work is frozen behind a red gate; ``failures`` says which step of their gate
-    failed and shows the last lines of its output (secrets redacted). Slow ones run a preflight that can't
-    finish in its timeout, so their verdict is only "indeterminate" (#456). An unwinnable
-    oracle means that project's cards skip coder.solve() (#459). Empty before the first
-    preflight pass (and on a board whose loop is off), which reads correctly as "nothing
-    held"."""
+    timeout_s, sha}}, unwinnable_oracle: {project: why}, passed: [project, …], failures:
+    {project: {cmd, step, step_index, steps, exit_code, headline, tail}}}``. Held projects
+    are the ones whose ready work is frozen behind a red gate; ``failures`` says which step
+    of their gate failed and shows the last lines of its output (secrets redacted). Slow
+    ones run a preflight that can't finish in its timeout, so their verdict is only
+    "indeterminate" (#456). An unwinnable oracle means that project's cards skip
+    coder.solve() (#459). ``passed`` is the projects whose gate ran clean on the base with
+    none of those caveats — the one positive per-project verdict (#612). Empty before the
+    first preflight pass (and on a board whose loop is off), which reads correctly as
+    "nothing held, nothing passed"."""
     snap = _health.get("preflight") or {}
     return {
         "held": dict(snap.get("held") or {}),
         "dirty": dict(snap.get("dirty") or {}),
         "slow": {n: dict(v) for n, v in (snap.get("slow") or {}).items()},
         "unwinnable_oracle": dict(snap.get("unwinnable_oracle") or {}),
+        "passed": list(snap.get("passed") or []),
         "failures": {n: dict(v) for n, v in (snap.get("failures") or {}).items()},
     }
 
