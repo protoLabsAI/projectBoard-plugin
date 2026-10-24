@@ -40,7 +40,7 @@ html,body{margin:0;min-height:100%;background:var(--pl-color-bg);color:var(--pl-
 .ov-problem-ctx{color:var(--pl-color-fg-muted);font-size:11.5px;font-family:var(--pl-font-mono);overflow-wrap:anywhere}
 .ov-ok{display:flex;align-items:center;gap:var(--pl-space-2);color:var(--pl-color-fg-muted);font-size:12.5px}
 
-/* Pending restart: a callout with the changed labels and how to apply them (no button yet — S1b). */
+/* Pending restart: a callout with the changed labels and how to apply them. */
 .ov-restart-title{font-weight:var(--pl-font-weight-semibold,600)}
 .ov-restart-list{margin:var(--pl-space-1,4px) 0 0}
 .ov-restart-how{margin:var(--pl-space-2) 0 0;color:var(--pl-color-fg-muted);font-size:12px}
@@ -214,8 +214,10 @@ function restartBanner(settings){
   return '<div class="pl-callout pl-callout--info">'
     + '<div class="ov-restart-title">' + n + " " + noun + ' effect after a restart</div>'
     + '<p class="ov-restart-list">' + labels + '</p>'
-    + '<p class="ov-restart-how">Restart this board member — stop and start it (or restart the agent) — to apply '
-    + (n === 1 ? "it" : "them") + '.</p></div>';
+    + (RESTART_SUPPORTED
+      ? '<p class="ov-restart-how"><button type="button" id="restart-now" class="btn">Restart now</button></p>'
+      : '<p class="ov-restart-how">Restart this board member — stop and start it (or restart the agent) — to apply '
+    + (n === 1 ? "it" : "them") + '.</p>') + '</div>';
 }
 
 function view(settings, status, features){
@@ -226,10 +228,12 @@ function view(settings, status, features){
 }
 
 let RECHECK_BUSY = false;
+let RENDER_VERSION = 0;
 async function render(){
+  const version = ++RENDER_VERSION;
   const host = $("ov");
   let done = false;
-  const slow = setTimeout(() => { if (!done) host.innerHTML = '<p class="ov-loading">Reading board status…</p>'; }, SLOW_MS);
+  const slow = setTimeout(() => { if (!done && version === RENDER_VERSION) host.innerHTML = '<p class="ov-loading">Reading board status…</p>'; }, SLOW_MS);
   try {
     // Settings is primary (the switch + the banner). Status and features are best-effort: an
     // unbound or slow board must still render the switch, not a blank tab.
@@ -239,12 +243,13 @@ async function render(){
       api(FEATURES_API).catch(() => null),
     ]);
     done = true; clearTimeout(slow);
-    host.innerHTML = view(settings, status, features);
+    if (version === RENDER_VERSION) host.innerHTML = view(settings, status, features);
   } catch (e) {
     done = true; clearTimeout(slow);
-    host.innerHTML = callout("error", "Could not load the board overview: " + String((e && e.message) || e));
+    if (version === RENDER_VERSION) host.innerHTML = callout("error", "Could not load the board overview: " + String((e && e.message) || e));
   } finally {
     clearTimeout(slow);
+    if (version !== RENDER_VERSION) return;
     RECHECK_BUSY = false;
     const rc = $("recheck");  // render replaced the button; release the current control
     if (rc) rc.disabled = false;
@@ -258,16 +263,47 @@ $("ov").addEventListener("change", (e) => {
   saveLoop(sw.checked, sw);
 });
 $("ov").addEventListener("click", (e) => {
+  const restart = e.target.closest("#restart-now");
+  if (restart) {
+    if (RESTART_SUPPORTED && HOST_ORIGIN) {
+      window.parent.postMessage({ type: "protoagent:restart-request" }, HOST_ORIGIN);
+    }
+    return;
+  }
   const rc = e.target.closest("#recheck");
   if (!rc || RECHECK_BUSY) return;
   RECHECK_BUSY = true; rc.disabled = true;
   render();
 });
 
+// The published DS kit has no outgoing frame channel and strips capabilities from
+// its init callback. Observe only parent messages here; bearer/theme stay with the kit.
+// Older hosts advertise nothing and retain the manual restart instructions.
+let RESTART_SUPPORTED = false;
+let HOST_ORIGIN = null;
+let booted = false;
+window.addEventListener("message", (event) => {
+  if (event.source !== window.parent || event.origin === "null" || !event.origin) return;
+  if (HOST_ORIGIN && event.origin !== HOST_ORIGIN) return;
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.type === "protoagent:init") {
+    HOST_ORIGIN = event.origin;
+    const caps = data.capabilities;
+    RESTART_SUPPORTED = Array.isArray(caps)
+      ? caps.includes("protoagent:restart-request")
+      : caps?.restart === true;
+    // Run after the kit consumes the fresh bearer. Repeated init after reconnect
+    // must read settings again; the request itself never clears pending changes.
+    if (kit && booted) queueMicrotask(() => render());
+  } else if (data.type === "protoagent:reconnected" && HOST_ORIGIN && kit && booted) {
+    render();
+  }
+});
+
 if (!kit) {
   $("ov").innerHTML = callout("error", "Could not load the authenticated plugin bridge. Open this from the Configure dialog.");
 } else {
-  let booted = false;
   kit.initPluginView(() => { if (!booted) { booted = true; render(); } });
 }
 </script></body></html>
