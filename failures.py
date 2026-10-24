@@ -25,11 +25,15 @@ class Policy:
     max_attempts: int  # total dispatch attempts (1 = no retry)
 
 
+PROVIDER_STALL_CLASS = "provider_stall"
+
+
 # Ordered: first match wins. Patterns are matched case-insensitively against the
 # error message. Only genuinely transient/infra classes are retryable — a stronger
 # model can't clear a rate limit, and a re-dispatch off the latest base can clear a
 # merge conflict, but an auth error or an unknown failure needs a human.
 _RULES: tuple[tuple[str, Policy], ...] = (
+    (r"\bprovider_stall\b", Policy(PROVIDER_STALL_CLASS, True, 15.0, 3)),
     (
         # The provider can't serve its model AT ALL (#420): the model was retired, the
         # account's plan refuses it, or the client is too old to speak it. Not a quota

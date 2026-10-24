@@ -181,6 +181,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # out of the default board view, NEVER deleted (query back via
         # include_archived). Rides the sweep cadence; no scheduler of its own.
         self.archive_after_days = float(self.cfg.get("archive_after_days", 7))
+        # #585: host-reported silence gets a separate, durable same-tier retry budget.
+        self.provider_stall_idle_s = max(0.0, float(self.cfg.get("provider_stall_idle_s", 600)))
+        self.provider_stall_max = max(0, int(self.cfg.get("provider_stall_max", 2)))
         # #378: how many CoderTimeouts on one card before the loop asks the board's own
         # agent to decompose it. 2, not 1 — a single timeout can be an unlucky gate run,
         # and asking on the first one would file a decompose task for every slow build.
@@ -582,6 +585,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self._review_run_failures: dict[str, int] = {}
         # #378: how many times a coder has timed out on this card, across restarts.
         self._timeout_attempts: dict[str, int] = {}
+        self._provider_stall_attempts: dict[str, int] = {}
         # How many times the blocked sweep has auto-cleared each card (see
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.
         self._unblock_retries: dict[str, int] = {}
@@ -659,6 +663,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
 
     # ── persisted fix budgets (#259): bead labels are truth, the dicts are caches ─
     def _budget_cache(self, kind: str) -> dict[str, int]:
+        if kind == "provider-stall":
+            return self._provider_stall_attempts
         return getattr(self, _BUDGET_KINDS[kind])
 
     async def _budget_get(self, store, fid: str, kind: str, feature: dict | None = None) -> int:
@@ -705,7 +711,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         very next ``_budget_get(..., feature)`` rehydrate the exhausted count from
         that stale snapshot and block the fresh window the reset granted.
         Best-effort on the bead, like ``_budget_set``."""
-        names = kinds or tuple(_BUDGET_KINDS)
+        names = kinds or (*_BUDGET_KINDS, "provider-stall")
         for kind in names:
             if kinds:
                 self._budget_cache(kind)[fid] = 0

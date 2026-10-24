@@ -11,18 +11,39 @@ so tests that monkeypatch ``project_board.loop.<name>`` still take effect.
 from __future__ import annotations
 
 import inspect
+import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction, work_location_sweep, work_location_capture
+from ..failures import PROVIDER_STALL_CLASS
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
 _FIXUPS_TIMEOUT_S = 180.0
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
+
+
+def _timeout_idle_s(message: str) -> float | None:
+    """Use the host timeout's reported age since last tool event (#585).
+
+    Do not infer an age from total runtime or the ring buffer: its timestamps may
+    belong to another candidate. Missing, malformed, negative or non-finite ages
+    are unknown and preserve the ordinary timeout policy. Only seconds qualify.
+    """
+    match = re.search(
+        r"\b(?:age since last tool event|last tool event(?: age)?)\s*[:=]?\s*"
+        r"(\d+(?:\.\d+)?)\s*(?:seconds?|s)\b",
+        message,
+        re.I,
+    )
+    if match is None:
+        return None
+    age = float(match[1])
+    return age if math.isfinite(age) else None
 
 
 def _reset_timestamp(value) -> float | None:
@@ -2514,6 +2535,9 @@ class DriveMixin:
                         )
                         return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
+                    idle_s = _timeout_idle_s(str(exc)) if isinstance(exc, worktree.CoderTimeout) else None
+                    if idle_s is not None:
+                        exc = worktree.CoderTimeout(f"{exc}; last event {idle_s:.0f}s before timeout")
                     if self._shutting_down:
                         log.info("[project_board] %s dispatch aborted by shutdown — no escalation", fid)
                         self._inflight.pop(fid, None)
@@ -2936,6 +2960,17 @@ class DriveMixin:
                     #     block: a three-rung ladder timed out three times before it asked, and the
                     #     sweep then rebuilt the card twice more, racing its own split.
                     if isinstance(exc, worktree.CoderTimeout) and not reusing and not feature.get("pr_url"):
+                        if idle_s is not None and idle_s >= self.provider_stall_idle_s:
+                            stalls = await self._budget_get(store, fid, "provider-stall")
+                            if stalls < self.provider_stall_max:
+                                await self._budget_set(store, fid, "provider-stall", stalls + 1)
+                                reason = (
+                                    f"{PROVIDER_STALL_CLASS}: {exc}; same-tier retry "
+                                    f"{stalls + 1}/{self.provider_stall_max}"
+                                )
+                                await self._comment(store, fid, reason)
+                                await asyncio.sleep(classify(PROVIDER_STALL_CLASS).base_delay_s)
+                                continue
                         timeouts = await self._budget_get(store, fid, "timeout") + 1
                         await self._budget_set(store, fid, "timeout", timeouts)
                         threshold = self._too_wide_threshold(feature)  # 0 = never park (block as before)
@@ -3065,7 +3100,15 @@ class DriveMixin:
                 # requirement ledger #113, and the empty-result count #198), and the timeout
                 # count (#378): a card that built in one dispatch is demonstrably not too wide.
                 await self._budget_reset(
-                    store, fid, "goal-fix", "gate-fix", "req-fix", "empty-result", "ledger-only", "timeout"
+                    store,
+                    fid,
+                    "goal-fix",
+                    "gate-fix",
+                    "req-fix",
+                    "empty-result",
+                    "ledger-only",
+                    "timeout",
+                    "provider-stall",
                 )
                 if self.review_gate:
                     # Blocking adversarial review (M5). May requeue the feature with
