@@ -322,6 +322,8 @@ settings:
 
   - { key: auto_merge, label: "Auto-merge green PRs", type: bool, group: "Project Board", tab: review,
       description: "Merge an in-review PR once every gate the loop runs is green and current: GitHub CLEAN (required checks + branch protection), the merged-state verdict stamped against the current base, and a clean review-gate verdict. Off = park green PRs for you to merge. Label a card merge-hold to exempt it. Applies live on save." }
+  - { key: merged_verify_max, label: "Merged-state verification budget", type: number, minimum: 0, maximum: 20, group: "Project Board", tab: review,
+      description: "Failed or inconclusive merged-state re-verifications allowed before auto-merge is held. A green verdict resets the count. 0 = unlimited. Applies live on save." }
   - { key: merge_method, label: "Merge method", type: select, options: [squash, merge, rebase], group: "Project Board", tab: review, restart: true, depends_on: { key: auto_merge },
       description: "GitHub merge strategy used by auto-merge." }
   - { key: review_gate, label: "Blocking adversarial review", type: bool, group: "Project Board", tab: review, restart: true,
