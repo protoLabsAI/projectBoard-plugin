@@ -795,6 +795,7 @@ class DriveMixin:
 
     async def _tick(self) -> bool:
         """One tick's phases, in order — True if the claim scan started a drive."""
+        self._sample_tick_clocks()
         spawned = False
         # Each phase runs on its OWN (#404). A phase that FAILS — a `br` call refused, a
         # bug — is logged by name and runs again on its own next turn, and the others go
@@ -822,11 +823,28 @@ class DriveMixin:
                 # SAME queue can never interleave with this tick into over-claiming past
                 # max_concurrent or double-dispatching a card.
                 async with self._claim_guard():
-                    scan, spawned = await self._tick_phase("claim scan", self._spawn_ready)
-                if scan == "ok":
-                    self._last_claim_at = time.monotonic()
+                    if not self._wake_settle_remaining:
+                        scan, spawned = await self._tick_phase("claim scan", self._spawn_ready)
+                        if scan == "ok":
+                            self._last_claim_at = time.monotonic()
         self._check_claim_stall()
         return bool(spawned)
+
+    def _sample_tick_clocks(self) -> None:
+        """Hold claims after sleep; keep the hold through the interval after each tick."""
+        wall, mono = self._wall_clock(), self._monotonic_clock()
+        previous = self._last_tick_clocks
+        self._last_tick_clocks = (wall, mono)
+        self._wake_settle_remaining = max(0, self._wake_settle_remaining - 1)
+        if previous is not None:
+            gap = (wall - previous[0]) - (mono - previous[1])
+            if gap > self.wake_settle_gap_s:
+                self._wake_settle_remaining = self.wake_settle_ticks
+                log.info(
+                    "[project_board] settling-after-wake: wall/monotonic gap %.1fs; holding claims for %d ticks",
+                    gap,
+                    self.wake_settle_ticks,
+                )
 
     def _start_location_sweep(self):
         if self._shutting_down:
@@ -892,6 +910,8 @@ class DriveMixin:
         ``claim_decision`` — and nothing on the board said so. A scan that finished and
         claimed nothing (every card held, a WIP limit) is a decision, and is explained
         where it is made (``board_dispatch``, the held cards' own hints)."""
+        if self._wake_settle_remaining:
+            return ""
         if not self.claim_stall_ticks or not self.enabled or self._setup_paused or self._shutting_down:
             return ""
         ready = self._ready_count
@@ -1377,6 +1397,17 @@ class DriveMixin:
             log.warning("[project_board] board_dispatch: preflight evaluation failed", exc_info=True)
             return self._dispatch_error_record("preflight evaluation", exc)
         async with self._claim_guard():
+            if self._wake_settle_remaining:
+                return {
+                    "dispatched": [],
+                    "outcome": "settling-after-wake",
+                    "detail": "New work is held while the machine settles after waking from sleep.",
+                    "running": len(self._drives),
+                    "max_concurrent": self.max_concurrent,
+                    "skipped": [],
+                    "parked": [],
+                    "held": {},
+                }
             drives_before = set(getattr(self, "_drives", ()) or ())  # drive-task snapshot
             try:
                 await self._spawn_ready()

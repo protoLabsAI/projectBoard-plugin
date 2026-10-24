@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **34 of 85 keys are in this state, including `coders` and `projects`** —
+never renders it. **36 of 87 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -611,12 +611,20 @@ A loop paused at its setup gate reports its own gap instead. `0` turns the signa
 | `health_sweep_interval_s` | `300` | reload |
 | `local_gate_timeout_s` | `600` | reload |
 | `loop_interval_s` | `30` | reload |
+| `wake_settle_gap_s` | `60` | **restart** **· YAML only** |
+| `wake_settle_ticks` | `2` | **restart** **· YAML only** |
 | `merge_poll_interval_s` | `60` | reload |
 | `rebase_fix_max` | `1` | reload |
 | `review_run_max` | `3` | reload |
 | `review_workflow` | `"code-review"` | reload |
 | `webhook_secret` | `—` | reload |
 | `worktrees_root` | `".worktrees"` | reload |
+
+When the wall-clock gap between ticks exceeds the monotonic gap by more than
+`wake_settle_gap_s` seconds, the loop holds new claims for `wake_settle_ticks` ticks,
+including the detecting tick. Reconcile, health, and preflight still run, and
+`board_dispatch` reports `settling-after-wake`. Another detected sleep restarts the
+window; setting `wake_settle_ticks` to `0` disables the hold.
 
 Two of those carry security weight and are easy to skim past:
 
