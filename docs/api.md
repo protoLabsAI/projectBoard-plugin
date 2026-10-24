@@ -19,6 +19,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 | Method | Path | What it does |
 |---|---|---|
+| `GET` | `/settings` | Read allowlisted scalar settings, masked secrets, boot values, metadata, and pending restart labels. See Scalar board settings below. |
+| `PUT` | `/settings` | Validate and save a flat settings patch through the host, auditing actor and keys; return saved keys and restart requirements. See Scalar board settings below. |
 | `GET` | `/routing` | Effective coder ladders and exclusive allowlists per project. |
 | `GET` | `/routing/effective` | Read-only effective routes for the Configure ▸ Coder routing tab: per project the implement/fix/escalate/review/helpers paths (uncovered ones marked), the exclusive-filtered ladder with which sibling the next dispatch opens on and why, and per-delegate down marks and subscription headroom (`unknown` when unread). |
 | `PUT` | `/routing` | Operator-only live routing update: `coders`, `exclusive`, and optional `project`. Validates delegates, saves config, reloads, and appends an audit record. |
@@ -109,3 +111,33 @@ The Projects editor does exactly this when the connection gives up.
   and re-stamping a verdict are all safe to retry.
 - The board is a **projection over beads**. Every mutation shells `br`; nothing is cached
   behind it, so an external `br` edit is picked up on the next read.
+
+### Scalar board settings (#617)
+
+`GET /api/plugins/project_board/settings` and `PUT /api/plugins/project_board/settings`
+inherit the host's operator bearer gate, like `/routing`. They are not exposed on
+the public `/plugins/project_board` router.
+
+GET returns `{settings: {key: {value, boot_value, label, type, minimum, maximum,
+options, restart}}, pending_restart}` with `Cache-Control: no-store`. The explicit
+allowlist covers all 30 currently declared manifest settings (including both
+secrets) and is retained as Configure pages take over those fields. Defaults come
+from the manifest. Secret `value` and `boot_value` contain only `{set: boolean}`.
+`restart` is false exactly for `loop/_common.py`'s `LIVE_KNOBS`.
+
+PUT accepts a flat object, for example `{"max_concurrent": 4, "review_fix_max": 3}`.
+The complete batch is validated before one `HOST.apply_settings` callable/save;
+unknown keys, wrong types, invalid select options, and values outside the manifest
+bounds return HTTP 400 with a reason and write nothing. Numeric settings are integer
+counts; booleans and numeric strings are not accepted as counts. Secrets are strings
+and are passed to the host's secret-store boundary, never echoed or logged.
+
+Success returns `{ok: true, saved: [key, ...], restart_required: [key, ...],
+pending_restart: [{key, label}, ...]}`. `restart_required` lists submitted restart-only
+keys. `pending_restart` lists all restart-only saved values that differ from the
+boot snapshot, including changes made through other settings writers. Saving the
+boot value again clears that entry; restarting captures a new boot snapshot and
+clears the list. Live knobs never enter it. Every write attempt logs the actor from
+`request.state.subject` and submitted key names, without values. Host refusal is
+HTTP 400 with a generic reason to avoid leaking secrets from host diagnostics;
+unavailable reads return HTTP 503.
