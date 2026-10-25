@@ -1,0 +1,1 @@
+- **A coder the board runs lights up on the org chart and shows in its history (#641).** Board dispatches now go on protoAgent's delegation ledger through `sdk.delegation`, labelled `bd-xxxx: <card title>`. This needs protoAgent v0.217.0 or later; on an older core the board dispatches exactly as before, unrecorded.
