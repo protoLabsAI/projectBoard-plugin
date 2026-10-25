@@ -1730,6 +1730,7 @@ class DriveMixin:
         coder path's terminal block."""
         store = self._store()
         fid = feature["id"]
+        coder_seam.note_card(fid, feature.get("title"))  # what its run is for, on the host's ledger
         prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_task(delegate, prompt, timeout=self.coder_timeout or None)
@@ -1901,6 +1902,7 @@ class DriveMixin:
         it blocks at once — no redundant tier dance."""
         store = self._store()
         fid = feature["id"]
+        coder_seam.note_card(fid, feature.get("title"))  # what its runs are for, on the host's ledger
         # #90: resolve repo/base/coders from THIS feature's project, not the instance
         # default — so a multi-repo board builds each feature in its own checkout and
         # escalates through the ladder its project declares.

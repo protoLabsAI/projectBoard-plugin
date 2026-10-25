@@ -86,6 +86,7 @@ import re
 import shlex
 import concurrent.futures
 import contextlib
+import contextvars
 import fnmatch
 import sys
 import threading
@@ -942,7 +943,96 @@ def _import_dispatch_tapped():
     return dispatch_tapped
 
 
+# ── the host's delegation ledger ─────────────────────────────────────────────────
+# A board coder run is a delegation like any `delegate_to`, but the board reaches the
+# adapter directly, around the host's one recording funnel — so the run was on no record:
+# the org chart never lit the coder up and its history skipped every board run (Josh,
+# 10-25: "codex is not lighting up when the projmanager uses it"). `sdk.delegation`
+# (protoAgent #4512) is that funnel for a plugin; it is feature-detected, so a host
+# predating it dispatches exactly as before, unrecorded.
+
+#: fid → card title, so the ledger says what a run was FOR. Noted by the drive, which has
+#: the feature in hand; bounded, since a long-lived loop sees every card it ever drove.
+_CARD_TITLES: "OrderedDict[str, str]" = OrderedDict()
+_CARD_TITLES_MAX = 512
+#: The card the current drive is working, for a dispatch that isn't handed its fid (a
+#: task's). A ContextVar: each drive is its own task, and the tasks it gathers inherit it.
+_CURRENT_CARD: "contextvars.ContextVar[str]" = contextvars.ContextVar("project_board_card", default="")
+
+
+def note_card(fid: str | None, title) -> None:
+    """Remember the card this drive works, and its title, for the ledger rows its coder
+    runs write."""
+    if not fid:
+        return
+    _CURRENT_CARD.set(fid)
+    _CARD_TITLES[fid] = str(title or "").strip()
+    _CARD_TITLES.move_to_end(fid)
+    while len(_CARD_TITLES) > _CARD_TITLES_MAX:
+        _CARD_TITLES.popitem(last=False)
+
+
+def _run_label(fid: str | None) -> str:
+    fid = fid or _CURRENT_CARD.get()
+    title = _CARD_TITLES.get(fid, "")
+    return f"{fid}: {title}" if fid and title else (fid or "board run")
+
+
+@contextlib.contextmanager
+def _on_record(delegate, fid: str | None):
+    """Put one dispatch to ``delegate`` on the host's delegation ledger for its duration —
+    live while it runs, one row on any exit. A no-op on a host without ``sdk.delegation``;
+    a ledger failure never touches the dispatch (the host's funnel is best-effort)."""
+    try:
+        from graph import sdk
+
+        seam = getattr(sdk, "delegation", None)
+    except Exception:  # noqa: BLE001 — host-free test env / a host predating the seam
+        seam = None
+    if seam is None:
+        yield None
+        return
+    with seam(
+        to_kind=str(getattr(delegate, "type", "") or "acp"),
+        to_name=str(getattr(delegate, "name", "") or ""),
+        to_instance=str(getattr(delegate, "url", "") or ""),
+        what=_run_label(fid),
+        origin="project_board",
+    ) as edge:
+        yield edge
+
+
 async def dispatch_coder_tapped(
+    coder,
+    worktree_path: str,
+    prompt: str,
+    *,
+    fid: str | None,
+    gen: int,
+    tier: str = "",
+    timeout: float | None = None,
+    env_passthrough: Iterable[str] = (),
+    new_dispatch: bool = False,
+    _dispatch_tapped=None,
+) -> str:
+    """``_dispatch_coder_tapped`` on the host's delegation ledger (``_on_record``): the
+    coder lights up on the org chart while it works and the run lands in its history."""
+    with _on_record(coder, fid):
+        return await _dispatch_coder_tapped(
+            coder,
+            worktree_path,
+            prompt,
+            fid=fid,
+            gen=gen,
+            tier=tier,
+            timeout=timeout,
+            env_passthrough=env_passthrough,
+            new_dispatch=new_dispatch,
+            _dispatch_tapped=_dispatch_tapped,
+        )
+
+
+async def _dispatch_coder_tapped(
     coder,
     worktree_path: str,
     prompt: str,
@@ -1271,8 +1361,9 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
     kind = str(getattr(delegate, "type", "") or "acp")
     adapter = ADAPTERS.get(kind) or ADAPTERS["acp"]
     try:
-        coro = adapter.dispatch(delegate, prompt, timeout=timeout)
-        return await worktree.coder_bound(coro, timeout)
+        with _on_record(delegate, None):
+            coro = adapter.dispatch(delegate, prompt, timeout=timeout)
+            return await worktree.coder_bound(coro, timeout)
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"task delegate timed out after {timeout}s")
     except DelegateError as exc:
