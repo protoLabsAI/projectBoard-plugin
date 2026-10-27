@@ -79,7 +79,7 @@ The mechanics behind the board: the store, the loop, the gates and the planning 
   otherwise reached after three cheaper rungs fail — shouldn't require contriving a
   task hard enough to fail its way there. `{"rung": "fusion"}` in the body; `coder`
   optional (defaults to `project_board.coder`).
-- **Planning layer** — two reasoning subagents (`decompose` + `antagonist`) driven by
+- **Planning layer** — two reasoning subagents (`decompose` + `plan_antagonist`) driven by
   the `decompose-project` skill: idea → outline → MADR ADRs → epics › milestones ›
   features, hardened by an adversary, with a per-epic human gate. Two more skills bracket
   it: **`onboard-project`** runs FIRST against a repo this board has not worked before —
