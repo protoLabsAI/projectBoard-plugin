@@ -169,7 +169,7 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — monitoring must never break registration
         log.exception("[project_board] attaching the coder-monitor buffer failed")
 
-    # Planning layer (D9): the decompose/antagonist subagents + the orchestration
+    # Planning layer (D9): the decompose/plan_antagonist subagents + the orchestration
     # skill that turns an idea into the docs tree + the board (per-epic human gate).
     try:
         from .subagents import ANTAGONIST_CONFIG, DECOMPOSE_CONFIG
