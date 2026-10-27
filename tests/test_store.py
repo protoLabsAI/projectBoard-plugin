@@ -2649,6 +2649,10 @@ def _plan_board(make_board, monkeypatch):
     counter = {"n": 0}
 
     def _create(title, *, itype="feature", parent="", priority=2, description="", external_ref=""):
+        # Mirror the real _create (store.py:1879): validate_priority BEFORE minting, so an
+        # invalid plan-item priority raises a BoardError create_from_plan fails per-item — the
+        # fake can't let `priority: ""`/`False` slip the validation the real board enforces (#644).
+        priority = store.validate_priority(priority)
         counter["n"] += 1
         fid = f"bd-{counter['n']}"
         beads[fid] = {
@@ -2658,6 +2662,7 @@ def _plan_board(make_board, monkeypatch):
             "spec": description or "spec",
             "acceptance_criteria": "WHEN x THE SYSTEM SHALL y",
             "files_to_modify": ["a.py (new)"],  # (new) bypasses the path-existence gate (#110)
+            "priority": priority,  # records the priority create_from_plan resolved (#644)
         }
         return fid
 
@@ -2716,6 +2721,74 @@ def test_create_from_plan_resolves_inter_item_deps_by_index_and_title(make_board
     # both dependents wired to the foundation's minted id (bd-1) — resolved AFTER all creates
     edges = {(a[2], a[3]) for a in br.cmds("dep")}
     assert edges == {("bd-2", "bd-1"), ("bd-3", "bd-1")}
+
+
+def test_create_from_plan_preserves_priority_zero(make_board, monkeypatch):
+    """`priority: 0` is beads' HIGHEST priority — it must survive, not get demoted to the
+    default 2 by a falsy `or 2` fallback (#644). An out-of-order claim queue follows if it does."""
+    b, beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan([{"title": "Most urgent", "spec": "s", "files": "a.py", "priority": 0}])
+    assert out["summary"]["created"] == 1
+    assert beads["bd-1"]["priority"] == 0
+
+
+def test_create_from_plan_defaults_priority_when_missing_or_null(make_board, monkeypatch):
+    """A missing key or an explicit null still falls back to the 2 default — only 0 was the
+    casualty of the old `or 2`; absence/None keep their intended default."""
+    b, beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "No priority key", "spec": "s", "files": "a.py"},
+            {"title": "Null priority", "spec": "s", "files": "b.py", "priority": None},
+        ]
+    )
+    assert out["summary"]["created"] == 2
+    assert beads["bd-1"]["priority"] == 2
+    assert beads["bd-2"]["priority"] == 2
+
+
+def test_create_from_plan_passes_through_explicit_priority(make_board, monkeypatch):
+    """A normal non-zero priority is unchanged — the fix narrows only the falsy-0 case."""
+    b, beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan([{"title": "Low priority", "spec": "s", "files": "a.py", "priority": 3}])
+    assert out["summary"]["created"] == 1
+    assert beads["bd-1"]["priority"] == 3
+
+
+def test_create_from_plan_non_int_priority_fails_that_item_not_the_whole_batch(make_board, monkeypatch):
+    """A non-int priority like ``""`` must fail ITS item with a named reason while the rest of the
+    batch proceeds (all-or-report). The raw value reaches ``validate_priority`` inside the per-item
+    try, so a bare ``int("")`` ValueError can no longer abort the batch and strand already-created
+    items with no dep edges and no per-item report (#644)."""
+    b, beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan(
+        [
+            {"title": "Bad priority", "spec": "s", "files": "a.py", "priority": ""},
+            {"title": "Still runs", "spec": "s", "files": "b.py"},
+        ]
+    )
+    assert out["summary"]["requested"] == 2
+    assert out["summary"]["created"] == 1  # the good sibling — NOT aborted by the bad item
+    assert out["summary"]["failed"] == 1
+    assert out["created_ids"] == ["bd-1"]  # the bad item minted no id (rejected before any write)
+    bad = next(r for r in out["items"] if not r["created"])
+    assert bad["index"] == 0
+    assert "priority" in bad["error"]
+
+
+def test_create_from_plan_bool_priority_rejected_not_promoted_to_zero(make_board, monkeypatch):
+    """A bool priority is rejected, never silently promoted: ``int(False)`` is 0 (beads' HIGHEST
+    priority), so a bare-``int`` conversion would have let ``priority: False`` jump the whole queue.
+    ``validate_priority`` refuses a bool, so the item fails with a named reason and nothing is
+    minted (#644)."""
+    b, beads, _br = _plan_board(make_board, monkeypatch)
+    out = b.create_from_plan([{"title": "Bool priority", "spec": "s", "files": "a.py", "priority": False}])
+    assert out["summary"]["created"] == 0
+    assert out["summary"]["failed"] == 1
+    bad = out["items"][0]
+    assert not bad["created"]
+    assert "priority" in bad["error"]
+    assert beads == {}  # rejected before any write — no bead left behind
 
 
 def test_create_from_plan_double_dash_dep_fails_that_item_not_the_whole_batch(make_board, monkeypatch):

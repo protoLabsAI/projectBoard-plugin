@@ -2327,6 +2327,14 @@ class BeadsBoard:
             except BoardError as exc:
                 results.append({"index": i, "created": False, "title": _plan_item_title(item), "error": str(exc)})
                 continue
+            # 0 is beads' HIGHEST priority, so the old `item.get("priority", 2) or 2` silently
+            # demoted a priority-0 item to the 2 default and reordered the loop's claim queue;
+            # only a missing or null key falls back to 2. The RAW value is handed to
+            # create_feature (no int() here) so validate_priority — reached inside the per-item
+            # try below — rejects a non-int ("") or a bool as THIS item's named failure, never an
+            # uncaught ValueError that aborts the whole batch and breaks all-or-report (#644).
+            p = item.get("priority")
+            priority = 2 if p is None else p
             try:
                 f = self.create_feature(
                     title,
@@ -2335,7 +2343,7 @@ class BeadsBoard:
                     design=str(item.get("design") or ""),
                     files_to_modify=_plan_files(item.get("files", item.get("files_to_modify"))),
                     parent=str(item.get("parent") or ""),
-                    priority=int(item.get("priority", 2) or 2),
+                    priority=priority,
                     difficulty=str(item.get("difficulty") or ""),
                     depends_on=(),  # wired in phase 2, once every plan-item id is known
                     foundation=bool(item.get("foundation", False)),
