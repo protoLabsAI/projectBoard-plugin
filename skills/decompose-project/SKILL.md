@@ -5,10 +5,10 @@ description: >-
   is written. Runs the adversarial decomposition pipeline (idea → outline → MADR
   decision records → epics › milestones › features with EARS acceptance criteria),
   writing the plan as docs in the working tree AND populating the beads board — with
-  an antagonist hardening every step and a human approval gate per epic. The board's
-  loop then builds the `ready` features. Do NOT use to write code; this only plans.
+  the plan_antagonist subagent hardening every step and a human approval gate per epic.
+  The board's loop then builds the `ready` features. Do NOT use to write code; this only plans.
 tools:
-  - task            # drive the `decompose` (propose) + `antagonist` (attack) subagents
+  - task            # drive the `decompose` (propose) + `plan_antagonist` (attack) subagents
   - read_file
   - list_dir
   - find_files
@@ -42,8 +42,8 @@ specs/epic-NN-<slug>/epic.md
 ## The per-step loop (use for EVERY artifact)
 For each artifact you create, run **propose → attack → revise** before writing it:
 1. `task(decompose, …)` — pass the **step**, the relevant context (point it at the
-   idea + the docs already written), and (after round 1) the antagonist's feedback.
-2. `task(antagonist, …)` — pass the same step + the proposed artifact. It returns
+   idea + the docs already written), and (after round 1) the plan_antagonist's feedback.
+2. `task(plan_antagonist, …)` — pass the same step + the proposed artifact. It returns
    `VERDICT: PASS` or `VERDICT: REVISE` + a numbered fix list.
 3. If REVISE, go back to step 1 with the feedback. Cap at **3 rounds**; if it still
    won't pass, write it anyway with a `> TODO(plan): unresolved — <points>` note and
@@ -60,7 +60,7 @@ to fan out, but keep the propose→attack pairing for each.
    loop for `01-outline.md`, then the load-bearing `docs/decisions/*.md` ADRs.
 2. **Epics & milestones:** run the loop to produce the epic + milestone breakdown.
    Create the epic bead (`board_create_epic`). Mark a milestone `foundation: true`
-   in its frontmatter **only** if the antagonist agreed it's genuinely shared
+   in its frontmatter **only** if the plan_antagonist agreed it's genuinely shared
    structure (dependents will gate on its *merge*).
 3. **For the FIRST epic only**, decompose its milestones into features: run the loop
    for each feature's `requirements.md` / `design.md` / `tasks.md`. For each feature
@@ -106,8 +106,8 @@ to fan out, but keep the propose→attack pairing for each.
 ## Rules
 - The **docs are the source of truth**; the beads mirror them (link the feature
   bead to its `specs/.../feature-NNN/` dir in the spec body).
-- Honor `docs/constitution.md` and cite ADRs in `design.md` — the antagonist checks this.
+- Honor `docs/constitution.md` and cite ADRs in `design.md` — the plan_antagonist checks this.
 - A feature is `ready` only with a self-sufficient spec + EARS acceptance criteria a
-  junior could pick up. If the antagonist couldn't get it there, it does NOT go ready.
+  junior could pick up. If the plan_antagonist couldn't get it there, it does NOT go ready.
 - Keep `difficulty` optional — only set it if the operator runs a multi-tier coder
   ladder; otherwise omit it (it's ignored with a single coder).

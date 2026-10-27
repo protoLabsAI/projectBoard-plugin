@@ -11,7 +11,7 @@ description: >-
 
   Composes the already-built `delegates` plugin (ADR 0024/0025) — it does NOT
   reimplement the spawn primitive. The board is a projection over beads (no separate
-  store to drift). Planning is two reasoning subagents (`decompose` + `antagonist`)
+  store to drift). Planning is two reasoning subagents (`decompose` + `plan_antagonist`)
   driven by the `decompose-project` skill. Requires the **`br`** (beads) CLI on PATH,
   the `gh` CLI, and `plugins.enabled: [delegates]` with an `acp` coder declared AND
   named in `coder:` (no default). A setup preflight checks all four at register time
