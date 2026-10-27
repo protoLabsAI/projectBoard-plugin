@@ -4,7 +4,7 @@ Two reasoning-tier subagents the lead agent drives through a
 propose→attack→revise loop, one decomposition *step* at a time. They are pure
 thinkers — they read context and return prose; they never write files or touch
 the board. The `decompose-project` skill orchestrates them: it feeds each step's
-context in, loops decompose↔antagonist until the critic passes (or N rounds), then
+context in, loops decompose↔plan_antagonist until the critic passes (or N rounds), then
 the lead agent writes the doc to the tree and creates the beads (with a per-epic human
 gate). Keeping the subagents side-effect-free is what makes the loop safe to rerun.
 """
@@ -43,7 +43,7 @@ DECOMPOSE_CONFIG = SubagentConfig(
     description=(
         "Planning decomposer. Given a decomposition STEP (idea→outline, "
         "outline→decisions, →epics/milestones, →feature requirements/design/tasks) "
-        "and the project context (+ any antagonist feedback to address), proposes "
+        "and the project context (+ any plan_antagonist feedback to address), proposes "
         "the single next artifact as markdown. Pure proposer — returns the document "
         "text; it does not write files or touch the board. Drive it via the "
         "`decompose-project` skill's propose→attack→revise loop."
@@ -59,7 +59,7 @@ one step at a time, so an autonomous coding agent could pick up any feature cold
 ## How you work
 - The caller gives you the **step**, the **idea/prior artifacts** (read the tree for
   context — constitution, earlier decisions, sibling specs), and possibly the
-  **antagonist's feedback** from the last round. Produce ONLY that step's artifact.
+  **plan_antagonist's feedback** from the last round. Produce ONLY that step's artifact.
 - Honor the **constitution** (`docs/constitution.md`) every step — never propose
   something that violates it; cite it where relevant.
 - Decisions are **MADR**: always name the rejected options and *why*, so no one
@@ -68,7 +68,7 @@ one step at a time, so an autonomous coding agent could pick up any feature cold
   micro-phases. A feature is one coherent, independently-shippable change.
 - Acceptance criteria are **EARS** and testable — no "works well", give the trigger
   and the observable response.
-- If you received antagonist feedback, address each point concretely (don't hand-wave).
+- If you received plan_antagonist feedback, address each point concretely (don't hand-wave).
 
 ## Output
 Return the artifact as clean markdown (with the YAML frontmatter the step calls for —
@@ -78,7 +78,7 @@ no "here is the doc" — just the document content. The skill writes it to the t
 )
 
 ANTAGONIST_CONFIG = SubagentConfig(
-    name="antagonist",
+    name="plan_antagonist",
     description=(
         "Planning critic. Given a decomposition STEP and the decomposer's proposed "
         "artifact, attacks it hard for that step's specific failure modes and returns "
@@ -87,7 +87,7 @@ ANTAGONIST_CONFIG = SubagentConfig(
     ),
     model=_MODEL,
     tools=["read_file", "list_dir", "find_files", "search_files"],
-    system_prompt="""You are protoAgent's **antagonist** subagent — the adversary in an
+    system_prompt="""You are protoAgent's **plan_antagonist** subagent — the adversary in an
 adversarial planning pipeline. Your job is to catch a bad decomposition BEFORE any
 code is written, where it's cheap to fix. Be skeptical and specific; default to
 REVISE when something is vague — but don't invent problems just to find them.
