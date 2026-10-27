@@ -2327,6 +2327,11 @@ class BeadsBoard:
             except BoardError as exc:
                 results.append({"index": i, "created": False, "title": _plan_item_title(item), "error": str(exc)})
                 continue
+            # 0 is beads' HIGHEST priority, so `item.get("priority", 2) or 2` would silently
+            # demote a priority-0 item to 2 and reorder the loop's claim queue; only a missing
+            # or null key falls back to the 2 default (#644).
+            p = item.get("priority")
+            priority = 2 if p is None else int(p)
             try:
                 f = self.create_feature(
                     title,
@@ -2335,7 +2340,7 @@ class BeadsBoard:
                     design=str(item.get("design") or ""),
                     files_to_modify=_plan_files(item.get("files", item.get("files_to_modify"))),
                     parent=str(item.get("parent") or ""),
-                    priority=int(item.get("priority", 2) or 2),
+                    priority=priority,
                     difficulty=str(item.get("difficulty") or ""),
                     depends_on=(),  # wired in phase 2, once every plan-item id is known
                     foundation=bool(item.get("foundation", False)),
