@@ -1262,34 +1262,20 @@ def build_register_tool(cfg: dict):
         gate: str = "",
         repo_conventions: str = "",
     ) -> str:
-        """Register an already-cloned repo as a board project so features can be dispatched to it.
-
-        Use this after a repo is on disk (onboard_project clones it and grants filesystem
-        reach; this adds the board half so a coder can actually open PRs against it).
-        Bounded by the operator's onboarding space: the repo must sit under the
-        configured onboarding root, and onboarding must be enabled.
-
-        The repo is also registered as a READ-ONLY managed project (the host's
-        `projects:` registry, GitHub from its origin remote, default branch = base_branch)
-        unless it already is one, so your filesystem tools can read the checkout the
-        coders branch from. Deleting the board project later removes that entry only if
-        this registration added it.
+        """Register an already-cloned repo as a board project so features can be dispatched to it;
+        use it after onboard_project clones the repo. Onboarding must be enabled and the repo must
+        sit under the operator's onboarding root. Also registers the checkout as a read-only host
+        project if it isn't one already.
 
         Args:
             name: the project key features will carry (e.g. "pr-reviewer").
             repo: path to the checkout on disk.
-            base_branch: branch worktrees are cut from. Defaults to main.
-            gate: "" (keep/inherit the configured gate) or the literal "auto" to have
-                the loop discover the pre-PR gate from the repo's own declared target
-                (a gate/ci/check/verify script or Makefile/justfile target). This tool
-                takes no gate command text — explicit commands are operator
-                configuration (Settings ▸ Projects), not agent input.
-            repo_conventions: repo-specific rules injected into every coder dispatch
-                (changelog policy, import rules, gate quirks). Omitting this is the
-                single most common cause of a coder inventing the wrong convention.
-
-        Returns a line naming what was registered, or an error naming the bound it hit.
-        """
+            base_branch: branch worktrees are cut from.
+            gate: "" (keep/inherit the configured gate) or the literal "auto" (discover the repo's
+                own gate target). Never a command: explicit gate commands are operator config.
+            repo_conventions: repo rules injected into every coder dispatch (changelog policy,
+                import rules, gate quirks). Omitting it is the most common cause of a coder
+                inventing the wrong convention."""
         try:
             result = await upsert_project(
                 name,
