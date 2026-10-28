@@ -19,6 +19,7 @@ loop.py/worktree.py.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -562,64 +563,23 @@ def _board_tools(cfg: dict, registry=None):
         project: str = "",
         waits_for: str = "",
     ) -> str:
-        """Create a board feature (a bead; starts in `backlog`). To pass the Ready
-        gate a feature needs a self-sufficient `spec`, testable `acceptance_criteria`,
-        AND `files_to_modify` (comma-separated paths to create/modify — vague tasks
-        make a coding agent produce nothing). `parent` is the epic/milestone id;
-        `difficulty` (small|medium|large) seeds the model tier; `depends_on` is a
-        comma-separated list of blocking feature ids; set `foundation=True` for a
-        feature others build on (dependents gate on its merge, never its review).
-        `source_issue` names the ORIGINATING GitHub issue — a full issue URL or
-        `owner/repo#N`, stored normalized as `owner/repo#N` (off-label, in the bead's
-        notes metadata — a label can't carry `/`/`#`) — so the feature's PR gets a
-        `Fixes #N` line and the issue auto-closes on merge. `project` names the entry
-        in the board's `projects:` map this feature builds in (#90) — it determines
-        which repo the feature's worktree/PR target and which repo the Ready gate
-        validates its files against; it's stamped as an immutable `project:<name>`
-        label. Defaults to the board's `default_project` when omitted; a single-repo
-        board can ignore it. `waits_for` (comma-separated) names PUBLISH GATES — external facts that must ALL
-        hold before the loop claims the card, for work that needs something another repo
-        SHIPS, not merely merges. For a consumer of another card's change use
-        `npm:<package>@contains:<owner>/<repo>@<card-id>` (e.g.
-        `npm:@protolabsai/ui@contains:protoLabsAI/protoContent@bd-a1`): met only once a
-        published version is proven to contain that card's merge commit — never a version
-        floor, which an unrelated publish can satisfy. Also `npm:<package>@<semver-range>`,
-        `release:<owner>/<repo>@<tag>`, `release:<owner>/<repo>@<package>@<range>` (a
-        bare range is refused on a repo that tags per package), and
-        `pr:<owner>/<repo>#<n>` (merged). An unmet gate keeps the card out of the claim
-        with `next_action` `waiting on publish: …`; a bad spec refuses the create. Use
-        `depends_on` for a card on THIS board.
+        """Create a coding feature (starts in backlog). Ready needs a self-sufficient `spec`,
+        testable `acceptance_criteria` and `files_to_modify`: comma-separated paths that exist in
+        the project's repo, with `(new)` after any file this card creates (`src/a.js,
+        .changeset/add-accent.md (new)`). `parent`: epic/milestone id. `difficulty`:
+        small|medium|large (model tier). `depends_on`: comma-separated blocker ids on THIS board.
+        `foundation=True`: dependents gate on its merge, not its review. `source_issue`: the
+        originating GitHub issue (URL or `owner/repo#N`); its PR gets `Fixes #N`. `project`: the
+        `projects:` entry it builds in (default_project if omitted). `waits_for`: comma-separated
+        publish gates that must all hold before the card is claimed, for work needing something
+        another repo SHIPS (npm:/release:/pr: specs); for a consumer of another card's change use
+        `npm:<pkg>@contains:<owner>/<repo>@<card-id>`, never a version floor.
 
-        `files_to_modify` — every path must exist in the project's repo, EXCEPT a file this
-        card will CREATE, which carries the `(new)` marker after its path:
-        `src/tokens.js, dist/tokens.css, .changeset/add-accent.md (new)`. A changeset is
-        always new, so in a changesets repo nearly every card carries one `(new)` entry.
-        Generated and boilerplate files (the project's `breadth_exclude` globs; by default
-        `.changeset/**`, lockfiles, `**/dist/**`, `*.generated.*`, `CHANGELOG.md`,
-        `changelog.d/**`) still belong in the list — the coder needs them — but do not
-        count toward the breadth cap (small/medium 4, large 6). Two open cards naming the
-        same file must be ordered by a `depends_on` PATH (a chain counts: C → B → A orders
-        A and C too); a project's `hot_files` are chained for you at create.
-
-        The reply carries `ready_check` — a DRY RUN of every Ready-gate check that can be
-        judged now (required fields, paths exist or are `(new)`, breadth, design, shared
-        files, dependency sanity): `ok`, and when not ok `will_be_refused_at_ready` with
-        EVERY failure and its fix, plus `suggested_edges` for unserialised shared files.
-        The card is created either way; fix what it lists before `board_mark_ready`.
-
-        DEDUP: refuses to create when a feature with the same title is already OPEN
-        on this board (backlog/ready/in_progress/in_review/blocked) — calling this
-        twice for the same task (e.g. reconsidering mid-turn) stacks a duplicate the
-        loop then churns on. It ALSO refuses when `depends_on` names a feature that is
-        already `in_review` with an open PR: work built on in-flight work is a fix
-        round and belongs on that feature's OWN PR — the warning points you at
-        `board_requeue_feature(fid, findings=...)` instead. When `source_issue` is
-        set it ALSO refuses when an open PR in that issue's repo already references
-        the issue number (title/body) — the issue is already being worked; review or
-        contribute to that PR instead of dispatching a second coder at it. Pass
-        `force=true` to create anyway (bypasses all three checks). A store read or
-        GitHub API failure never blocks creation (better a possible dup than a
-        stuck board)."""
+        The reply's `ready_check` dry-runs the Ready gate; fix what it lists before
+        board_mark_ready. Refuses a likely duplicate: a same-title open card, a `depends_on` onto
+        an in_review card with an open PR (that is a fix round: board_requeue_feature(fid,
+        findings=...)), or a `source_issue` an open PR already references. `force=true` bypasses.
+        Breadth caps, shared files, gate grammar: board-tool-reference skill."""
         try:
             # Resolve the store against THIS feature's project (#90): its repo/base_branch
             # for the get_store call, so the dedup read + the create land against the right
@@ -684,23 +644,11 @@ def _board_tools(cfg: dict, registry=None):
         force: bool = False,
         waits_for: str = "",
     ) -> str:
-        """Create a board TASK (a `task`-type bead; starts in `backlog`) — the sibling of
-        board_create_feature for work that ships a DELIVERABLE (a doc, a decision, an
-        artifact ref) instead of a PR (#217). A task rides the SAME rails as a coding
-        feature (ready → claim → in_progress → in_review) but takes the delivery/verify
-        edges: board_deliver moves it to in_review on a recorded deliverable (no PR), and
-        board_verify is its Done edge. To pass the Ready gate a task needs a self-sufficient
-        `spec` + testable `acceptance_criteria` — but NO `files_to_modify` (a task doesn't
-        touch repo files, so that coding-feature requirement is relaxed for tasks).
-
-        `assignee` pre-assigns the bead; `priority` (0 = highest) ranks it in the ready
-        queue; `parent` is the epic/milestone id; `depends_on` is a comma-separated list of
-        blocking feature ids; `project` (#90), `source_issue` (#97) and `waits_for` (publish
-        gates — npm:/release:/pr: specs) behave exactly as on board_create_feature. DEDUP is identical to board_create_feature — a same-title open
-        card, a `depends_on` on an in-flight PR, or a `source_issue` an open PR already
-        references is refused unless `force=true` (a store/GitHub read failure never blocks
-        creation). Inputs are stripped of any literal wrapping double quotes first (same
-        hygiene as board_create_feature)."""
+        """Create a TASK (starts in backlog): work that ships a deliverable (doc, decision, artifact
+        ref) instead of a PR. Same lifecycle as a feature, but board_deliver moves it to in_review
+        and board_verify closes it. Ready needs `spec` + `acceptance_criteria`, no
+        `files_to_modify`. `assignee` pre-assigns; `priority` 0 = highest. The other args, the
+        dedup refusals and `force` behave as on board_create_feature."""
         try:
             project = _strip_wrapping_quotes(project)
             store = get_store(**_store_kw_for(project))
@@ -752,40 +700,14 @@ def _board_tools(cfg: dict, registry=None):
         waits_for: str = "",
         project: str = "",
     ) -> str:
-        """Partially update an existing feature — the REPAIR path for a bead the Ready
-        gate rejects. Only the non-empty arguments are written; every other field is left
-        as-is. Use it to fill a missing `spec`, `acceptance_criteria`, or `files_to_modify`
-        (comma-separated paths) on a feature `board_mark_ready` refused, then mark it ready
-        again — no need to cancel and recreate the bead. `title` renames the feature
-        (empty = leave unchanged). `difficulty` (small|medium|large)
-        re-seeds the model tier. `depends_on` (comma-separated feature ids) ADDS blocking
-        edges, and `foundation=True` restores the foundation flag — the repairs for
-        dependencies/foundation dropped by a create-time failure (False = leave as-is;
-        this tool never removes the flag). `source_issue` (a full GitHub issue URL or
-        `owner/repo#N`, stored normalized off-label in the bead's notes metadata)
-        sets/replaces the originating issue the feature's PR will reference as
-        `Fixes #N`; `"none"` clears it (move a split's closing edge to its last slice).
-        `project` RE-HOMES the card to another entry of the board's
-        `projects:` map (#454) — e.g. the cards left on `default` after a board moved from
-        the flat `repo:` binding to projects. A card's project decides which repo its
-        worktree/branch/PR target, so the move is allowed only while the card is backlog
-        or ready, has no PR and has never been dispatched; otherwise it is refused with
-        the reason (a ready card must also have its files_to_modify in the new repo — fix
-        them in the same call). Empty leaves the project as-is. `priority`
-        changes the scheduling rank in place when supplied (0 = highest); omitted/None
-        leaves the current priority untouched. `waits_for` REPLACES the card's publish
-        gates (comma-separated npm:/release:/pr: specs, see board_create_feature); `none`
-        clears them; empty leaves them as-is. Inputs are stripped of any literal
-        wrapping double quotes before storage (same hygiene as board_create_feature).
-
-        `files_to_modify` REPLACES the whole list. Mark a file the card will CREATE with
-        `(new)` after its path (`.changeset/add-accent.md (new)`) — without it the Ready
-        gate refuses the path as nonexistent. Files matching the project's
-        `breadth_exclude` globs (changesets, lockfiles, build output by default) are kept
-        for the coder but not counted toward the breadth cap.
-
-        The reply carries `ready_check`, the same DRY RUN board_create_feature returns:
-        every check `board_mark_ready` would refuse on, all at once, each with its fix."""
+        """Partially update a feature: the repair path for a card the Ready gate refused (no need to
+        cancel and recreate). Only non-empty args are written. `files_to_modify` REPLACES the list
+        (mark created files `(new)`, e.g. `.changeset/x.md (new)`). `depends_on` ADDS edges
+        (board_remove_dependency removes them); `foundation=True` sets the flag, never clears it.
+        `source_issue` / `waits_for` replace the value; `none` clears it. `priority` None leaves
+        it. `project` re-homes the card, allowed only while backlog/ready with no PR and never
+        dispatched. The reply carries the same `ready_check` dry run as board_create_feature.
+        Details: board-tool-reference skill."""
         try:
             store = get_store(**store_kw)
             title = _strip_wrapping_quotes(title)
@@ -831,23 +753,11 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_remove_dependency(feature_id: str, depends_on: str) -> str:
-        """Remove one or more `blocks` dependency edges from a feature — the INVERSE of
-        board_update_feature(depends_on=…), which ADDS edges. Use it to drop a WRONG
-        blocker the PM added (a mis-decomposed chain, an edge onto a cancelled card).
-        `depends_on` is a comma-separated list of blocker feature ids to unlink; each
-        existing edge is torn down via store.remove_dependency so the card is no longer
-        gated on that blocker.
-
-        Both the feature and every named blocker must be real cards on the board — an
-        unknown id returns `Error: unknown feature …` and removes NOTHING (the call is
-        all-or-nothing on validation). An id that IS a feature but is not actually a
-        blocking edge on this card is reported under `not_found` ("no such edge") — not an
-        error, and the other named edges are still removed. Returns JSON
-        `{id, removed: [...], not_found: [...], open_depends_on: [...]}` reflecting the
-        board AFTER the change (a removed blocker no longer appears in `open_depends_on`),
-        and records an audit comment on the card naming the removed edges. Inputs are
-        stripped of any literal wrapping double quotes first (same hygiene as
-        board_update_feature). Never raises — a store failure comes back as `Error: …`."""
+        """Remove blocker edges from a feature, the inverse of board_update_feature(depends_on=…):
+        e.g. a wrong edge from a mis-decomposed chain. `depends_on`: comma-separated blocker ids.
+        Any unknown id returns an Error and removes nothing; a real card that isn't a blocker is
+        listed in `not_found`. Returns `{id, removed, not_found, open_depends_on}` and records an
+        audit comment."""
         try:
             store = get_store(**store_kw)
             feature_id = _strip_wrapping_quotes(feature_id).strip()
@@ -900,38 +810,15 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_get_feature(feature_id: str) -> str:
-        """Read a single feature's FULL detail as JSON — `title`, `spec`,
-        `acceptance_criteria`, `design`, `state`, `labels`, `pr_url`, `merge_hold`
-        (true when the operator has placed a per-card auto-merge veto, #532 —
-        board_hold_merge sets it, board_release_merge_hold lifts it), `difficulty`,
-        `files_to_modify`, `foundation`, `priority`, `source_issue`, `project`
-        (the entry in the board's `projects:` map this feature builds in, #90),
-        `requirements`
-        (the tracked requirement ledger decomposed from the acceptance criteria at
-        mark_ready — each item `{id, text, status, decline_reason?}`, status one of
-        open/done/declined; the completion gate refuses a PR while any item is
-        open), plus two dependency views: `depends_on` (EVERY blocking edge — the
-        historical ledger, including already-merged blockers) and `open_depends_on`
-        (only the edges whose blocker is still OPEN — the live, actionable "what's
-        blocking me now" signal), `waits_for` (the card's publish gates) with `gates` (each
-        gate's last-checked verdict: `{spec, met, detail, error, checked_at}` — from the
-        loop's cache, no network; board_check_gates re-checks) and `next_action` (e.g.
-        `waiting on publish: npm @x/y containing o/r@bd-a1 (card bd-a1 not merged yet (#5))`,
-        `held: release freeze (…)`,
-        when something other than a coder is what moves the card). A BLOCKED card carries
-        `blocked_reason` and `blocked_class`; one held by its project's gate preflight
-        (`blocked_class: preflight-hold`) also carries `preflight_failure` — `{cmd, step,
-        step_index, steps, exit_code, headline, tail}`: which step of the project's gate
-        failed on its clean base checkout, the line that says what broke, and the last 30
-        lines of output (secrets redacted). That is an environment fault, not the card's:
-        report it to the operator; the loop lifts the hold once the gate passes. A TASK (#217) also carries `deliverable` (the recorded
-        deliverable text — "" until board_deliver records one), `delivered_by`, and
-        `open_requirements` (the ids of ledger items no delivery has closed) — what
-        board_verify judges; open items are for the verifier to weigh, nothing refuses
-        on them. The READ half of a read-modify-write: fetch the
-        current criteria/spec, revise them, then `board_update_feature` — no
-        operator round-trip. Returns `Error: unknown feature …` for an id that
-        isn't on the board."""
+        """Read one card's full detail as JSON: spec, acceptance_criteria, state, labels, pr_url,
+        merge_hold, files_to_modify, project, `requirements` (the ledger from the acceptance
+        criteria; a PR is refused while any item is open), `depends_on` (every edge) vs
+        `open_depends_on` (still blocking), `waits_for` with cached `gates` verdicts,
+        `next_action`, and `blocked_reason`/`blocked_class` when blocked. A `preflight-hold` card
+        carries `preflight_failure`: the project's gate failing on its clean base, an environment
+        fault to report to the operator (the loop lifts the hold itself). A task also carries
+        `deliverable`, `delivered_by`, `open_requirements`. The read half of read-modify-write
+        before board_update_feature. Field reference: board-tool-reference skill."""
         try:
             f = get_store(**store_kw).get_feature(feature_id)
         except BoardError as exc:
@@ -1030,17 +917,8 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_comments(feature_id: str, page_size: int = 50, offset: int = 0) -> str:
-        """Read one feature's persisted comment history as paginated JSON.
-
-        This is the audit-scale read path for bead comments: it uses the board store's
-        owned ``br show`` projection, normalizes every comment's text, preserves
-        available id/author/timestamp metadata, and assigns a stable zero-based
-        ``position`` to every returned comment. Results are oldest-first. ``page_size``
-        must be 1..100, ``offset`` is the zero-based comment offset, and the response
-        includes ``has_more`` plus ``next_offset`` so callers can reconstruct long
-        histories without direct SQLite/shell access or silent truncation. Unknown
-        features return ``Error: unknown feature …``; known/commentless features return
-        an empty successful page."""
+        """Read one feature's comment history as paginated JSON, oldest first. `page_size` is 1..100;
+        follow `next_offset` while `has_more`."""
         try:
             feature_id = _strip_wrapping_quotes(feature_id).strip()
             page_size = int(page_size)
@@ -1088,16 +966,10 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_check_ready(feature_id: str) -> str:
-        """Report what board_mark_ready would say about a card NOW, changing nothing (#455).
-        Returns `{id, state, ok, refusals, advisories, breadth, unserialised,
-        suggested_edges}`: `refusals` is every failed Ready check, each `{gate, message,
-        fix}` (gates: required-fields, phantom-paths, breadth, design, shared-file);
-        `advisories` refuse nothing (a depends_on edge onto a cancelled card); `breadth`
-        is the counted total, the cap, and the files `breadth_exclude` left out;
-        `unserialised` is every pair of open cards sharing a file with no depends_on path
-        between them, and `suggested_edges` the chain edges (earliest-created first) that
-        would serialise them all. Use it after a batch of edits, or before marking a
-        whole set ready."""
+        """Report what board_mark_ready would say about a card now, changing nothing. Returns `{id,
+        state, ok, refusals, advisories, breadth, unserialised, suggested_edges}`; each refusal is
+        `{gate, message, fix}`, and `suggested_edges` would serialise open cards that share a file.
+        Use it after a batch of edits or before marking a set ready."""
         try:
             return json.dumps(get_store(**store_kw).ready_check(feature_id))
         except BoardError as exc:
@@ -1118,16 +990,11 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_cancel_feature(feature_id: str, reason: str = "") -> str:
-        """Cancel a feature created in error (bad decomposition, duplicate, scope cut) —
-        the verb that RETIRES a bad card. Tags the bead `cancelled` and closes it with an
-        auditable `reason` (`br close -r`), a second terminal edge that keeps the card (and
-        its history) visible in a distinct `cancelled` state — NOT `done`, so the merge/CI
-        reconcilers and loop-retro never mistake it for shipped work. The bead survives (a
-        cancel, not a hard delete). `reason` is stripped of any literal wrapping double
-        quotes before storage (same hygiene as board_create_feature). A cancel also
-        closes the card's open PR (with a comment pointing at the card) and stops its
-        in-flight coder, if any (#211) — best-effort; the reply carries `pr_closed` /
-        `drive_cancelled` so you can say what happened."""
+        """Cancel a card created in error (bad decomposition, duplicate, scope cut). Closes it in a
+        distinct `cancelled` state (not `done`) with an auditable `reason`; the bead and its
+        history remain. Also closes its open PR and stops its in-flight coder, best-effort (see
+        `pr_closed` / `drive_cancelled` in the reply). For genuinely shipped work use
+        board_mark_done."""
         try:
             reason = _strip_wrapping_quotes(reason)
             store = get_store(**store_kw)
@@ -1147,17 +1014,10 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_mark_done(feature_id: str, reason: str = "") -> str:
-        """Mark a feature `done` by hand — the MANUAL Done edge (#228), for work that
-        shipped OUTSIDE the board's PR lifecycle (the change landed via another repo/tool,
-        or the feature completed off-board), where record_merge's automatic pr_url match
-        never fires. Accepts only an in-flight card (in_progress / in_review / blocked) and
-        errors on a backlog/ready card (nothing shipped yet) or an already-terminal one
-        (done/cancelled). Closes the bead like record_merge — clears the `blocked` flag,
-        drops open blocker edges, then closes — so its dependents unblock. `reason` is
-        recorded as a comment (the audit trail for WHY it was hand-closed) and is stripped
-        of any literal wrapping double quotes first (same hygiene as board_create_feature).
-        Use board_cancel_feature instead to RETIRE a bad card (a distinct `cancelled`
-        state); this marks GENUINELY-completed work done."""
+        """Mark an in-flight card (in_progress / in_review / blocked) done by hand, for work that
+        shipped outside the board's PR lifecycle. Closes it so its dependents unblock; `reason` is
+        the audit comment. Refused on a backlog/ready or already-terminal card. To retire a bad
+        card use board_cancel_feature."""
         try:
             reason = _strip_wrapping_quotes(reason)
             f = get_store(**store_kw).mark_done(feature_id, reason=reason)
@@ -1167,25 +1027,16 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     async def board_attach_pr(feature_id: str, pr_url: str, reason: str = "") -> str:
-        """Attach a PR the board did NOT open to the existing coding card it belongs to (#402)
-        — recovered work an operator pushed by hand, or a fix made outside the loop — so the
-        board tracks it like one of its own. The card moves to `in_review` with that PR, and
-        the normal reconcile takes it from there (CI, the review gate, rebase, merge → done).
-        No duplicate card, no re-dispatch, no hand-close after the merge.
+        """Attach an open PR the board did NOT open (hand-pushed recovery, a fix made outside the
+        loop) to its existing coding card. The card moves to in_review and the normal reconcile
+        (CI, review gate, merge) takes over: no duplicate card, no re-dispatch.
 
-        Refused with the reason, and nothing changes, unless BOTH hold. The PR must be OPEN,
-        in the card's project repo (not a fork), on the card's own branch (`feat/<id>-<slug>`,
-        the branch every fix round resumes), and targeting the project's base. The card must be
-        a coding feature that is ready, in_progress or blocked, with no PR of its own in review,
-        no open dependency, and no live coder drive. It must have passed the Ready gate (a
-        blocked backlog card has not). A card whose earlier PR was CLOSED may take the new one in
-        its place. A MERGED PR is refused: record shipped work with board_mark_done. Re-attaching
-        the card's own PR is a no-op in review and refused anywhere else: a blocked card stays
-        blocked until board_unblock_feature. A draft attaches, and auto-merge holds it until it is
-        marked ready. The attached code has NOT been through the board's pre-PR checks (fixups,
-        local gate, acceptance tests); CI and the review gate still apply. `reason` is recorded in
-        the audit comment on the card; if that comment fails, the attach stands and the result
-        carries a `warning`."""
+        Refused, changing nothing, unless the PR is OPEN, in the card's project repo (not a fork),
+        on the card's branch `feat/<id>-<slug>` and targeting the project's base; AND the card is
+        a coding feature that passed the Ready gate, is ready / in_progress / blocked, with no PR
+        in review, no open dependency and no live drive. A MERGED PR is refused: use
+        board_mark_done. The attached code skipped the board's pre-PR checks; CI and the review
+        gate still apply. `reason` goes in the audit comment. Edge cases: board-tool-reference skill."""
         # Lazy imports: the loop imports from here, so a top-level import would cycle.
         from .api import base_branch_for_feature, repo_for_feature
         from .loop import attach_external_pr
@@ -1211,25 +1062,14 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_deliver(feature_id: str, text: str = "", ref: str = "") -> str:
-        """Record a TASK's deliverable (#217) — the task sibling of a coder's open_pr edge,
-        moving the bead in_progress → in_review with NO PR. `text` is the deliverable itself
-        (recorded as a `deliverable:` comment the board reads back into the `deliverable`
-        field); optional `ref` (a doc URL, an artifact path) lands on the same `external_ref`
-        slot a coding feature's pr_url occupies, so link consumers just work. Then verify it
-        with board_verify. TASK-ONLY and in_progress-ONLY: a coding feature (or a task not
-        yet claimed) is refused with an `Error: …` — a coding feature entering review with
-        no pr_url would strand the merge reconciler. Safe to retry: repeating the delivery a
-        task in review already carries returns its `in_review` state and writes nothing.
-        A DIFFERENT deliverable for a task already in review is refused (the recorded one
-        stands) — to replace it, board_verify(approved=false) first, then deliver again.
-        If the task has a requirement ledger, END `text` with a `## Requirements` section —
-        one `- <id>: done` or `- <id>: declined — <reason>` line per item, exactly that
-        (a hedge like `done?` or a reasonless decline closes nothing, and rows inside a
-        code fence are ignored) — and those items close on the ledger; unreported ones stay
-        open for the verifier to see (never a refusal). While the task awaits its verdict,
-        the rows of a refused or repeated delivery still land. An EMPTY delivery (no text,
-        no ref) is refused. `text`/`ref` are stripped of any literal wrapping double quotes
-        first (same hygiene as board_create_feature)."""
+        """Record a TASK's deliverable, moving it in_progress → in_review with no PR; then
+        board_verify it. `text` is the deliverable; `ref` an optional doc URL or artifact path.
+        Task-only and in_progress-only; an empty delivery is refused. Repeating the same delivery
+        is a no-op; a different one for a task already in review is refused (reject it with
+        board_verify(approved=false) first). If the task has a requirement ledger, END `text` with
+        a `## Requirements` section of `- <id>: done` or `- <id>: declined — <reason>` lines,
+        exactly that form, outside any code fence; unreported items stay open for the verifier.
+        Details: board-tool-reference skill."""
         try:
             text = _strip_wrapping_quotes(text)
             ref = _strip_wrapping_quotes(ref)
@@ -1240,32 +1080,13 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_verify(feature_id: str, approved: bool = True, feedback: str = "", by: str = "") -> str:
-        """Verify a TASK's delivered work (#217) — the task Done edge, record_merge's
-        verify sibling. `approved=true` CLOSES the task `done` with an auditable
-        `verified: <by>` reason (a task has no PR to merge, so a verifier's approval is
-        what closes it). `approved=false` records `feedback` as a comment (the next dispatch
-        prompt leads with it, the adverse-review shape), reopens the requirement items the
-        rejected round closed (each keeps what it had claimed as `reopened_from`), and
-        requeues the bead to `ready` for another pass.
-
-        `by` names the verifier written into that `verified: <by>` reason (#316), forwarded
-        UNCHANGED. SELF-APPROVAL is NOT blocked: when the verifier matches the task's
-        deliverer the close is still recorded — just FLAGGED (a `self-verified` label plus a
-        `(self-verified)` note on the reason) so the provenance is auditable; the store
-        records it, it never refuses. The empty tool default is DELIBERATE: because this
-        tool IS the agent, an omitted `by` forwards blank and the STORE resolves it to its
-        own actor — it is NOT the HTTP API's `operator` default (the out-of-band API is a
-        different caller and defaults differently on purpose).
-
-        OPEN REQUIREMENTS are surfaced, never enforced (#399): when ledger items are still
-        open the result carries a `note` — "2 requirement(s) still open: r2, r4" — and the
-        approval stands; the verifier decides. Read them BEFORE deciding via
-        board_get_feature's `open_requirements`.
-
-        TASK-ONLY and in_review-ONLY: a coding feature (closed here it would dodge
-        record_merge, the ONE Done edge for code) or a task not in review is refused with an
-        `Error: …`. `feedback` is stripped of any literal wrapping double quotes first (same
-        hygiene as board_create_feature); `by` is not — it forwards verbatim."""
+        """Verify a TASK in in_review (task-only: a coding feature closes only through its merge).
+        `approved=true` closes it done with reason `verified: <by>`. `approved=false` records
+        `feedback` (the next dispatch prompt leads with it), reopens the requirement items that
+        round closed, and requeues it to ready. `by` names the verifier; leave it empty to record
+        your own actor. Self-approval is allowed but labelled `self-verified`. Open requirements
+        don't block approval (the result notes them): read board_get_feature's
+        `open_requirements` before deciding."""
         try:
             feedback = _strip_wrapping_quotes(feedback)
             f = get_store(**store_kw).record_verification(feature_id, approved, feedback, by=by)
@@ -1279,31 +1100,14 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_requeue_feature(feature_id: str, findings: str = "", escalate: bool = False) -> str:
-        """Put a feature back to `ready` for re-dispatch, keeping its open PR — the verb
-        the fix-round doctrine needs to carry review findings to the SAME branch.
-
-        WITH `findings` (an adverse review's requested changes): mirrors
-        `POST /features/{fid}/review` — records a DISTINCT review-bounce comment on the
-        bead (`record_review_bounce`), queues the findings so the loop's NEXT dispatch
-        prompt LEADS with them (`queue_review_feedback`), THEN requeues onto the same
-        open PR (`requeue`). This is the fix round: the coder re-dispatches knowing
-        exactly what to fix, instead of blindly re-running the original prompt. Requires
-        `in_review` (record_review_bounce enforces the state an adverse review lands
-        from).
-
-        WITHOUT `findings` (empty): a BARE re-dispatch — just `requeue`. Back to `ready`,
-        open PR preserved, assignee cleared, NO new feedback; the coder re-runs against
-        the ORIGINAL prompt (a plain retry, e.g. after a transient failure). The puller
-        re-claims it and the loop re-dispatches (at the higher tier if it was just
-        escalated; the open PR is pushed to, not reopened). `findings` is stripped of any
-        literal wrapping double quotes before storage (same hygiene as
-        board_create_feature). Refused while the loop is still working the card (a live
-        drive or review gate): wait for the round to end, or cancel the card.
-
-        `escalate=true` (with `findings`) climbs the model ladder as the bounce requeues,
-        exactly as `POST /features/{fid}/review` with `escalate: true` does; with the ladder
-        already at its top the card is Blocked instead (#473). Without a configured ladder it
-        is a same-tier bounce."""
+        """Put a card back to ready for re-dispatch, keeping its open PR. With `findings` (an adverse
+        review's requested changes; the card must be in_review) this is the fix round on the SAME
+        PR: a review bounce is recorded and the next dispatch prompt leads with the findings.
+        Without `findings` it is a plain retry against the original prompt. `escalate=true` (with
+        findings) climbs the model ladder; already at the top, the card is blocked instead.
+        Refused while the loop is still working the card (a live drive or review gate): wait for
+        the round to end, or cancel. A CI failure on a bounced PR is board_requeue_ci_fix.
+        Recovery map: board-tool-reference skill."""
         try:
             # Never under a live round (#398): pulling the card out from under a build that
             # is still running is how a requeued card went terminal. Refused, not overridden.
@@ -1336,20 +1140,11 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_requeue_ci_fix(feature_id: str, ci_failure: str = "") -> str:
-        """Requeue a bounced coding feature for a CI-fix round on its existing PR.
-
-        This is the recovery verb for the intentional open-PR lifecycle:
-        `open_review` moves a coding feature to `in_review` with `pr_url`; a failing
-        check goes through `bounce_ci_fail`, which deliberately removes `in-review` and
-        parks that same open-PR feature in `in_progress`; this tool records the concrete
-        CI failure as a DISTINCT CI-fix comment, queues it so the NEXT coder dispatch
-        prompt LEADS with the failure, then requeues the same card to `ready` with its PR
-        preserved. It accepts only that bounced shape: a coding feature, `in_progress`,
-        non-empty `ci_failure`, and an open `pr_url`. Use
-        `board_requeue_feature(feature_id, findings=...)` for adverse HUMAN review
-        findings; that guard still requires `in_review`. Refused while the loop is still
-        working the card: a card mid-round has this same shape, and a requeue would pull it
-        out from under a build that has not finished."""
+        """Requeue a coding feature that CI bounced (in_progress with an open `pr_url`) for a CI-fix
+        round on that same PR: records `ci_failure` (required) so the next dispatch prompt leads
+        with it, then requeues it to ready with the PR kept. Refused while the loop is still
+        working the card (a card mid-round has this same shape). Human review findings go through
+        board_requeue_feature."""
         try:
             # Never under a live round (#398): a card mid-round has exactly the in_progress +
             # open-PR shape this verb accepts, and requeuing it pulled `bd-p8ft` out from
@@ -1377,16 +1172,10 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_block_feature(feature_id: str, reason: str, owner: str = "operator") -> str:
-        """Flag a feature `blocked` with a `reason` — it stays ON the board (blocked is a
-        flag, not a lane) with the reason visible, and is skipped by the puller until
-        cleared. Complements the board_update_feature repair path: block when the feature
-        is stuck on something external (a missing dep, an unanswered question) and you want
-        the card parked-and-visible; update when the spec itself needs fixing. A block set
-        here is never cleared automatically, whatever the reason says — lift it with
-        board_unblock_feature. `reason` is required, and is stripped of any literal wrapping
-        double quotes before storage (same hygiene as board_create_feature).
-        `owner` supports `operator` (default terminal/manual block) and `agent`
-        (agent-owned hold without an operator alert). Both need explicit unblock."""
+        """Flag a card blocked with a required `reason`; it stays visible and the puller skips it. Use
+        it for an external stall (missing dep, open question); use board_update_feature when the
+        spec needs fixing. Never cleared automatically: lift it with board_unblock_feature.
+        `owner`: `operator` (default) or `agent` (an agent-owned hold, no operator alert)."""
         try:
             if owner not in ("operator", "agent"):
                 raise BoardError("owner must be one of: operator, agent")
@@ -1401,25 +1190,13 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_unblock_feature(feature_id: str, override_review: bool = False) -> str:
-        """Clear the `blocked` flag so the feature can be re-dispatched — the inverse of
-        board_block_feature. Removes the blocked label; the puller can claim it again once
-        it's otherwise `ready`. A card parked `too-wide` after repeated timeouts also gets
-        its timeout count reset, so the retry is a real attempt.
-
-        When the card was a review-gated in_review PR (the review gate exhausted its fix budget
-        and blocked it), lifting the flag alone leaves it back in_review with no review substate
-        and the board's own `failure` gate status still on the PR head, so it can never promote
-        (#512). This verb then DECIDES the gate on the PR's LIVE head:
-
-        - default (`override_review=False`) RE-ARMS the gate — review-pending with a fresh
-          review-fix budget and a pending `board/review-gate` status, so the next reconcile
-          re-reviews the current head from scratch;
-        - `override_review=True` is YOUR explicit acceptance of the review findings as a human:
-          it posts a success `board/review-gate` status at the live head, sets review-clean
-          PINNED to that head, and records an audit comment. The ordinary merged-state / CI /
-          auto-merge gates still decide the merge, and a later push leaves the pin stale, so an
-          override never covers an unreviewed head. Use it only when you have read the findings
-          and judged them acceptable."""
+        """Clear a card's blocked flag so it can be re-dispatched (a `too-wide` card's timeout count
+        resets too). For an in_review PR the review gate blocked after exhausting its fix budget,
+        this also decides the gate on the PR's live head: the default re-arms it (a fresh review
+        of the current head, a fresh fix budget); `override_review=True` records YOUR acceptance of
+        the findings as a human (a success review status pinned to the live head; CI and merge
+        gates still apply, and a later push unpins it). Override only after you have read the
+        findings and judged them acceptable. Details: board-tool-reference skill."""
         try:
             store = get_store(**store_kw)
             # Read the card BEFORE the clear: a blocked in_review PR still carries the in-review
@@ -1478,19 +1255,10 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_hold_merge(feature_id: str, reason: str) -> str:
-        """Place the operator's per-card auto-merge veto (the `merge-hold` label, #532) —
-        the loop never auto-merges a held card however green it is, so a human merges it by
-        hand. Use it for a change you want to QA yourself before it lands: a console layout
-        change, a risky migration. It only vetoes the MERGE edge; the card still builds,
-        verifies and gets reviewed as usual.
-
-        `reason` is REQUIRED (say why it must be merged by hand) and is stripped of any
-        literal wrapping double quotes before storage (same hygiene as board_create_feature).
-        Valid in any non-terminal state (backlog/ready/in_progress/in_review/blocked), so a
-        hold can be set before the card is ever dispatched; a done or cancelled card, or an
-        unknown id, returns an `Error:` and changes nothing. Idempotent: re-holding an
-        already-held card is a no-op with no second audit comment. Lift it with
-        board_release_merge_hold."""
+        """Place the operator's auto-merge veto (`merge-hold` label) on a card: the loop never
+        auto-merges it, so a human merges by hand (e.g. a change to QA first). The card still
+        builds, verifies and is reviewed. `reason` is required (why it must be merged by hand).
+        Valid in any non-terminal state; idempotent. Lift it with board_release_merge_hold."""
         try:
             reason = _strip_wrapping_quotes(reason).strip()
             if not reason:
@@ -1514,21 +1282,11 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_reset_merged_verify_budget(feature_id: str) -> str:
-        """Reset ONE feature's merged-state re-verify budget (ADR 0326, #326) — the
-        supported way to un-stick an in_review card whose `next_action` reads `auto-merge
-        held: merged-verify budget exhausted`.
-
-        When a sibling merge keeps moving base under an in_review PR, the loop re-runs the
-        gate against the merged state and stamps `merged-verified:<sha>`; that re-verify
-        is bounded by `merged_verify_max` (#131). Once the budget is spent the loop stops
-        re-verifying, the stamp goes stale, and with `auto_merge` on the PR can never
-        auto-merge. This clears BOTH halves of that budget so the next reconcile verifies
-        again with no host restart: the persisted `budget:merged-verify:<n>` label (an
-        auditable comment is recorded on the bead) AND the running loop's in-process
-        budget cache. Only the `merged-verify` kind is touched — every other budget is
-        left alone. A blank or unknown `feature_id` alters nothing and returns an error
-        (the reset can never silently touch a phantom bead). Raising `merged_verify_max`
-        in Settings ▸ Project Board is the alternative remedy; this is the per-card one."""
+        """Reset one in_review card's merged-state re-verify budget: the fix when its `next_action`
+        reads `auto-merge held: merged-verify budget exhausted`. Clears the persisted budget label
+        and the loop's in-process cache so the next reconcile re-verifies; touches no other
+        budget. Raising `merged_verify_max` in Settings ▸ Project Board is the board-wide
+        alternative. Background: board-tool-reference skill."""
         try:
             feature_id = _strip_wrapping_quotes(feature_id).strip()
             if not feature_id:
@@ -1564,54 +1322,16 @@ def _board_tools(cfg: dict, registry=None):
         failing_only: bool = False,
         project: str = "",
     ) -> str:
-        """List board features, optionally filtered by board `state` (backlog/ready/
-        in_progress/in_review/done/blocked). Priority order. Terminal features
-        (done/cancelled) past the archive window carry an `archived` label and are
-        EXCLUDED from this default response (#115) — the live board, not all of
-        history. Pass `include_archived=true` for the exhaustive view; nothing is
-        ever deleted, so archived features stay fully queryable.
-
-        `project` (a name in the board's `projects:` map, #90) narrows the listing to
-        the features that build in that project — the multi-repo board's "just this
-        repo's cards" view. Omitted (the default) lists every project; each row carries
-        its `project` field so an unfiltered listing stays legible on a mixed board.
-        A live row whose `project` is NOT in the map (#454 — typically `default`, left
-        behind when the board moved from the flat `repo:` binding to projects) carries
-        `project_unresolved: true` and a `project_hint` naming the
-        board_update_feature(project=...) call that re-homes it.
-
-        Every `in_review` row carries `next_action` — the ONE sentence that says what
-        moves it (#208): `awaiting-merge (auto_merge off)` (reviewed, nothing
-        board-side in the way, and the loop will NOT merge — a human must),
-        `auto-merge pending` (the loop merges once GitHub reports CLEAN), `review in
-        progress`, `changes requested`, `awaiting review verdict (no review-clean)`,
-        `merge-hold (operator veto)`, `blocked`, `draft (run gh pr ready)` — plus
-        `awaiting_merge: true` and a `next_action_hint` ("auto_merge is off — merge #N
-        or turn it on in Settings ▸ Project Board") for the first case. When ANY row is
-        `awaiting_merge`, LEAD your status report with it and offer the two verbs that
-        actually move it — merge that PR, or enable `auto_merge` — NOT a re-review: the
-        review gate has already cleared it. Derived from labels + the LIVE config (a
-        Settings save to `auto_merge` changes it without a restart); costs no network.
-        With `with_ci=true`, a row whose rollup is red reads `ci failing` instead
-        (never "merge #N" on a red PR).
-
-        A card STRANDED outside the ready lane carries one too (#406), with the verb in its
-        `next_action_hint`: `dependencies closed — promote` (a backlog card whose every
-        dependency has closed; nothing promotes it but you, so board_mark_ready it, or
-        board_mark_designing it if it is parked on purpose), and `blocked — dependencies
-        closed` (a card blocked in backlog whose dependencies have all closed; the block is
-        never cleared for you, so read its reason before board_unblock_feature). A
-        dependency that was CANCELLED rather than merged is named in the hint: confirm the
-        card still makes sense first.
-
-        `with_ci=true` joins each live PR-bearing row with its LIVE CI rollup
-        (#107): `ci_status` (passing|failing|pending|none; "" = no PR probed) plus
-        the failing check names in `ci_summary`. OPT-IN, never default — each
-        PR-bearing feature costs a `gh` network call (see
-        store.annotate_ci_status for the full cost rationale). `failing_only=true`
-        (implies `with_ci`) narrows the listing to rows whose CI is red; with no
-        explicit `state` it defaults to `in_review` — the PM's "which PRs are red
-        and waiting" query — but honors a `state` you pass alongside it."""
+        """List board features in priority order, optionally filtered by `state`
+        (backlog/ready/in_progress/in_review/done/blocked) or `project`. Archived terminal cards
+        are left out unless `include_archived=true`. Rows that something other than a coder must
+        move carry `next_action` (with the verb in `next_action_hint`); values: board-tool-reference skill. When any row
+        reads `awaiting-merge (auto_merge off)` (`awaiting_merge: true`), LEAD your status report
+        with it and offer the two verbs that move it, merge that PR or enable auto_merge, NOT a
+        re-review. A `project_unresolved: true` row's `project_hint` names the
+        board_update_feature(project=…) call that re-homes it. `with_ci=true` adds live
+        `ci_status`/`ci_summary` (one gh call per PR, so only when needed); `failing_only=true`
+        implies with_ci and keeps red rows (in_review unless you pass `state`)."""
         if failing_only:
             with_ci = True
             state = state or "in_review"
@@ -1673,13 +1393,9 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_retro() -> str:
-        """Retro the board: mine the attempt/outcome history of completed + blocked
-        features into recurring failure CLASSES + flow stats (escalation / block /
-        multi-attempt rates + the blocked features and why). The loop-retro skill
-        reads this to distill durable grounding (PROTO.md gotchas) so the next runs
-        stop repeating known failures. Read-only. Spans ALL history: the store's
-        retro read explicitly opts into `archived` features (#115), so a
-        retrospective never silently shrinks to the archive window."""
+        """Read-only: mine the whole board history (archived cards included) into recurring failure
+        classes and flow stats (escalation / block / multi-attempt rates, blocked cards and why).
+        The loop-retro skill reads it."""
         from . import retro
 
         try:
@@ -1700,14 +1416,11 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_check_gates(feature_id: str = "") -> str:
-        """Check publish gates (`waits_for`) NOW, against the npm registry / GitHub, instead
-        of waiting for the loop's next ready sweep. With `feature_id`, that card's gates;
-        empty, every open (backlog/ready) card that carries any. Returns JSON rows `{id,
-        state, waits_for, gates: [{spec, met, detail, error, checked_at}], clear}` —
-        `clear: true` means every gate holds and the loop will claim the card (a backlog
-        card still needs board_mark_ready). A failed check reads unmet with its `error` (fail
-        closed). Results land in the same shared cache the loop reads, so a check here is
-        what the board shows next; a spec asked within the last 15s is answered from cache."""
+        """Check publish gates (`waits_for`) now against npm / GitHub instead of waiting for the
+        loop's next sweep. With `feature_id`, that card's gates; empty, every open card that has
+        any. Rows carry `gates` verdicts and `clear` (a backlog card still needs
+        board_mark_ready). A failed check reads unmet (fail closed). Results land in the cache the
+        loop reads."""
         from . import gates as publish_gates
 
         try:
@@ -1744,38 +1457,12 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     async def board_dispatch() -> str:
-        """Ask the running board loop to evaluate its ready queue RIGHT NOW instead of
-        waiting for the next interval, and report what happened (#390) — the observable
-        entry point into the loop's OWN claim path, NOT a second scheduler.
-
-        Returns a JSON decision record. `outcome` is one of: `dispatched` (a card was
-        claimed and a drive started — its feature id is in `dispatched`); `empty-queue`
-        (nothing is ready, and nothing is held); `held` (nothing is claimable, but cards are
-        held: `held` maps each reason — `dependencies-closed-promote`,
-        `blocked-dependencies-closed`, `ready-waiting-on-dependencies`,
-        `backlog-waiting-on-dependencies`, `waiting-on-publish` (a ready card whose `waits_for`
-        publish gates are not all met), `blocked:<class>` — to its count, first few ids,
-        and the step that moves it; `blocked:preflight-hold` also carries
-        `preflight_failures`, per held project the failing gate step, the line that says
-        what broke and the output's last lines, secrets redacted); `at-capacity` (all `max_concurrent` drive slots are full);
-        `review-wip-limit` (`max_pending_reviews` PRs already await review); `parked` (a
-        task-type card was claimed to in_progress awaiting async delivery, holding no
-        slot); `all-candidates-held` (every ready card was blocked/held, deferred by the
-        hot-file guard, held by a per-project preflight, or lost a claim race — see
-        `skipped`, plus `held` for the rest of the board); `loop-disabled`
-        (project_board.loop_enabled=false); or
-        `loop-not-running` (no loop surface is live in this process); or `error` (a
-        dispatch stage crashed — the fail-closed preflight or the claim scan raised, and
-        the record carries the stage and exception rather than raising into the agent
-        loop). `detail` is a
-        one-sentence human summary; `running`/`max_concurrent` show the live slot picture.
-
-        Every scheduling gate a periodic tick honors — loop_enabled, project isolation,
-        concurrency, review-WIP and the hot-file protection — applies here unchanged and
-        under the same claim lock, so calling this repeatedly or concurrently can never
-        double-claim or double-dispatch an in-flight feature; it only makes the loop act
-        now rather than at the next tick, and it claims a card only when one is genuinely
-        ready and there is capacity."""
+        """Ask the running board loop to evaluate its ready queue now (its own claim path, not a
+        second scheduler) and return a JSON decision record: `outcome` (dispatched, empty-queue,
+        held, at-capacity, review-wip-limit, parked, all-candidates-held, loop-disabled,
+        loop-not-running, error), a one-sentence `detail`, `held` reasons with the step that moves
+        each, and the live slot picture. Every scheduling gate and the claim lock apply, so
+        repeated calls never double-dispatch. Outcome meanings: board-tool-reference skill."""
         from .loop import request_dispatch
 
         try:
@@ -1785,25 +1472,14 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     async def board_salvage_feature(feature_id: str, force: bool = False, tree: str = "") -> str:
-        """Publish a stranded card's finished work WITHOUT dispatching a coder (#427) — for a
-        card whose worktree already holds the implementation when no coder can (or should)
-        be sent to redo it. Commits what the tree holds, runs the repo's pre-PR gate, pushes
-        the branch, opens the PR and moves the card to in_review, all on the board's own
-        machinery; a candidate tree (`feat-<id>.g1`) is promoted to the card's branch first.
-
-        An OPERATOR OVERRIDE: it skips the drive's goal, requirement-ledger and source-issue
-        checks; CI and the review gate still apply. Only for a STRANDED card: `in_progress`
-        with no live drive, or `blocked` (a card blocked out of review goes back to review on
-        its own PR). It refuses, changing nothing, while a drive owns the card, when no
-        worktree of the card has changes vs base, or when several do and `tree` (a `feat-…`
-        directory name or a path) does not pick one. If the pre-PR gate is RED it publishes
-        nothing and returns `outcome: gate-red` with the gate output's tail; `force=true`
-        publishes anyway as a DRAFT carrying that output (an existing PR is converted, and
-        the output posted on it). `draft` is read back from GitHub — trust it, not `force`.
-
-        Returns a JSON record: `outcome` (`published` / `gate-red` / `refused` /
-        `cancelled` / `not-found` / `error` / `loop-not-running`), `detail`, `worktree`,
-        `branch`, `pr_url`, `draft`, `gate_output`."""
+        """Operator override: publish a STRANDED card's finished worktree without dispatching a coder
+        (commit, run the pre-PR gate, push, open the PR, move it to in_review). Skips the drive's
+        goal, requirement-ledger and source-issue checks; CI and the review gate still apply. Only
+        for a card in_progress with no live drive, or blocked. Refuses, changing nothing, while a
+        drive owns the card, when no worktree has changes vs base, or when several do and `tree`
+        doesn't pick one. A red gate publishes nothing (`outcome: gate-red`); `force=true`
+        publishes it as a DRAFT with the gate output. Trust the returned `draft`, not `force`.
+        Outcomes: board-tool-reference skill."""
         from .loop import request_salvage
 
         try:
@@ -1813,29 +1489,17 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_show_cards(ids: list[str] = [], state: str = "", project: str = "", title: str = "") -> str:
-        """Answer a status check-in with live board cards INLINE in the chat — "what's
-        blocked?", "how's the epic?", "status?", "where are we?" — instead of paragraphs.
-        Each card shows its current state, `next_action`, block reason, PR link and action
-        buttons, and re-reads itself every ~15s, so the answer stays current.
+        """Show live board cards inline in the chat to answer a status check-in ("status?", "what's
+        blocked?", "how's the epic?"). Cards show state, next_action, block reason, PR link and
+        action buttons, and refresh themselves.
 
-        AFTER CALLING IT, WRITE AT MOST 2 LINES OF PROSE: only what the cards can't say
-        (the one thing that needs the operator, or your call). Never restate the cards as
-        bullets — the operator is looking at them.
+        AFTER CALLING IT, WRITE AT MOST 2 LINES OF PROSE: only what the cards can't say. Never
+        restate the cards.
 
-        "How's the board?" / "status?" / "check in" → call it with NO arguments: every open
-        card (all states but done), most urgent first. Otherwise pass `ids` (≤ 20 card ids,
-        e.g. an epic's cards) to show exactly those, OR a `state` (backlog/ready/in_progress/
-        in_review/blocked/done) and/or `project` for a live query (no state = open work; done
-        shows the most recent). `title` (≤ 80 chars) labels the
-        header ("Epic #4076"). Returns a short text summary (header + one line per card) for
-        you and text-only clients — read it, don't paste it back.
-
-        Do NOT call it for your own reasoning — board_list / board_get_feature are the
-        reads for that; this is for SHOWING the operator. Each card button proposes an
-        exact message the operator confirms (`Unblock board card bd-…`, `Why is board card
-        bd-… blocked?`, `Ask Vera to re-review board card bd-…`, `Merge board card bd-…`,
-        `Show the live coder run for board card bd-…`, `Dispatch board card bd-…`) — act
-        on it with the matching board_* tool (see the showing-board-cards skill)."""
+        No args: every open card, most urgent first. Or pass `ids` (≤ 20), or a `state` and/or
+        `project`; `title` (≤ 80 chars) labels the header. The returned text summary is for you;
+        don't paste it back. Not for your own reasoning (use board_list / board_get_feature). Card
+        buttons send messages you act on with board_* tools: see the showing-board-cards skill."""
         from .board_cards import MAX_IDS, build_props, component_tail, summary_text, validate_props
 
         props = build_props(ids, state=state, project=_strip_wrapping_quotes(project), title=title)
@@ -1910,21 +1574,15 @@ def _board_tools(cfg: dict, registry=None):
 
     @tool
     def board_card_form(project: str = "", title_hint: str = "", why_hint: str = "") -> str:
-        """Show the operator the NEW BOARD CARD form inline in the chat — a fixed, ready-made
-        form (Project, Title, What & why, Acceptance criteria, Priority) with a Create card
-        button. Call it RIGHT AWAY when the user asks to add a feature, task, bug fix or idea
-        to the board ("add a feature for …", "put … on the board", "make a card for …").
-        Never write an HTML form for this yourself.
+        """Show the operator the NEW BOARD CARD form inline in the chat (Project, Title, What & why,
+        Acceptance criteria, Priority, a Create card button). Call it RIGHT AWAY when the user asks
+        to add a feature, task, bug fix or idea to the board. Never write an HTML form for this
+        yourself. `title_hint` / `why_hint` (one line each, from the request) become placeholders;
+        `project` preselects a project.
 
-        `title_hint` / `why_hint` (one line each, drawn from the request) become the empty
-        fields' placeholders; `project` preselects a project (the board's default
-        otherwise). The project picker lists the board's projects and is hidden when there
-        is only one.
-
-        AFTER CALLING IT, WRITE ONE SHORT LINE ("Fill this in and press Create card.") and
-        nothing else. When the user presses Create card and confirms, their next message
-        arrives as `Create board card · <title>` / `Project: … · Priority: P<n>` / `Why: …` /
-        `- <criterion>` lines — then create the card (card-from-chat skill)."""
+        AFTER CALLING IT, WRITE ONE SHORT LINE ("Fill this in and press Create card.") and nothing
+        else. The submitted form arrives as a `Create board card · <title>` message: create the
+        card per the card-from-chat skill."""
         from .board_card_form import EMIT, build_props, component_tail
 
         rows, default = _project_rows()
@@ -2031,4 +1689,8 @@ def _board_tools(cfg: dict, registry=None):
 
     if (register_tool := build_register_tool(cfg)) is not None:
         tools.append(register_tool)
+    # Every description rides on every model call, and @tool keeps the docstring's
+    # source indentation verbatim (8 spaces a line). Dedent it: same text, fewer tokens.
+    for t in tools:
+        t.description = inspect.cleandoc(t.description or "")
     return tools
