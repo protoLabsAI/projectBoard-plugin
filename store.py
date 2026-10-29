@@ -593,6 +593,12 @@ RELEASE_FILE_GLOBS = (
     "changelog.d/**",
 )
 
+# A #378 timeout-decomposition task is filed with this title prefix (``Decompose <card> —
+# …``). It is the single authoritative signal for "this is a decompose task", shared by
+# ``no_decompose_reason`` (never split a split) and ``is_decompose_task`` (keep it on the
+# self-dispatch path) so the two can never disagree about what one is.
+DECOMPOSE_TITLE_PREFIX = "Decompose bd-"
+
 
 def no_decompose_reason(title, files_to_modify) -> str:
     """Pure predicate (#585): the reason a card must NOT be auto-decomposed on a repeated
@@ -613,12 +619,28 @@ def no_decompose_reason(title, files_to_modify) -> str:
     t = str(title or "").strip()
     if t.startswith("chore: release"):
         return "release chore (title starts with 'chore: release')"
-    if t.startswith("Decompose bd-"):
+    if t.startswith(DECOMPOSE_TITLE_PREFIX):
         return "decompose task (never split a split)"
     files = [p for p in (files_to_modify or []) if str(p).strip()]
     if files and all(any(path_matches_glob(p, g) for g in RELEASE_FILE_GLOBS) for p in files):
         return "only version/lockfile files touched"
     return ""
+
+
+def is_decompose_task(feature: dict) -> bool:
+    """True for a #378 timeout-decomposition task — a self-assigned board-management task
+    the board files with the title ``Decompose <card> — …``.
+
+    Such a task embeds the oversized card's spec and acceptance criteria VERBATIM
+    (``ORIGINAL SPEC`` / ``ORIGINAL ACCEPTANCE CRITERIA``), so a command named in that
+    copied text would otherwise make :func:`project_board.loop.prompt.is_execution_task`
+    read it as an execution task (#654). But its real job is to call the board's own
+    feature tools (``board_create_feature`` / ``board_cancel_feature`` /
+    ``board_mark_ready``) over the first-party self-dispatch path (#311) — an ACP coder has
+    none of those tools — so ``_dispatch_task`` must keep it on ``_dispatch_self`` whatever
+    the copied text names. Recognized by the same title convention
+    :func:`no_decompose_reason` uses."""
+    return str(feature.get("title") or "").strip().startswith(DECOMPOSE_TITLE_PREFIX)
 
 
 PRIORITY_MIN = 0

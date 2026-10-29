@@ -44,11 +44,92 @@ def _recovery_block(feature: dict) -> str:
     )
 
 
+# Command tokens are recognized ONLY in a command POSITION — a fenced shell block, a
+# `$ ` prompt line, an inline-code span with an execution cue, right after an explicit
+# run verb, or at the very start of a line — never mid-prose. A writing spec that merely NAMES a tool ("document
+# how pytest fixtures work", "the target runtime is Python 3.12"), or that embeds another
+# card's spec verbatim (a #378 decompose task copies the oversized card's commands), must
+# stay a writing task — the loose `\b`-anywhere match flagged all of those (#654 review).
+#
+# Tokens that are never ordinary English, so a line-start / code / run-verb match is safe.
+_CMD_STRICT = r"(?:pytest|npm|npx|curl|run_eval|uv[ \t]+run)"
+# Tokens that are ALSO English words ("make the edits", "Python 3.12 runtime"): matched in
+# a strong command position, and at a bare line start only when LOWERCASE and followed by a
+# real argument — so `make test` / `python check.py` count but `Make this …` does not.
+_CMD_AMBIG = r"(?:make|python)"
+# Leading list/quote markers a command line may carry before the token.
+_BULLET = r"(?:[-*+][ \t]+|\d+[.)][ \t]+|>[ \t]*)*"
+# An article/pronoun after `make`/`python` means prose, not a command argument.
+_NOT_AN_ARG = (
+    r"(?!the\b|a\b|an\b|it\b|this\b|that\b|these\b|those\b|them\b|they\b|your\b|our\b|their\b"
+    r"|its\b|his\b|her\b|my\b|sure\b|certain\b|every\b|each\b|all\b|any\b|some\b|no\b|us\b|me\b)"
+)
+
+# A fenced block whose info string names a shell — the block IS commands to run. A fence
+# with any other hint (```json, ```python example) or none is NOT, by itself, execution.
+_SHELL_FENCE = re.compile(
+    r"^[ \t]*(?:`{3,}|~{3,})[ \t]*(?:sh|bash|shell|zsh|console|shell-session|sh-session|ps1|powershell|bat|cmd)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+# A shell-prompt line: `$ ` at line start (after an optional list marker).
+_SHELL_PROMPT = re.compile(rf"^[ \t]*{_BULLET}\$[ \t]", re.MULTILINE)
+# Backticks quote names as well as commands. Require an execution cue, and anchor the
+# command at the start of the span: "Document how `pytest` fixtures work" is writing.
+_INLINE_CMD = re.compile(
+    rf"\b(?:verify|check|test)[ \t]+with[ \t]+`(?:{_CMD_STRICT}|{_CMD_AMBIG})\b[^`\n]*`",
+    re.IGNORECASE,
+)
+# Imperative run verbs name an action; "runs", "running", and "via" also describe
+# tools in ordinary prose. Quoting the command does not change the requested action.
+_RUN_VERB_CMD = re.compile(
+    rf"\b(?:run|execute|invoke|call)[ \t]+`?(?:{_CMD_STRICT}|{_CMD_AMBIG})\b",
+    re.IGNORECASE,
+)
+# A non-English command token at the very start of a line (after optional list markers).
+_LINE_START_STRICT = re.compile(rf"^[ \t]*{_BULLET}{_CMD_STRICT}\b", re.IGNORECASE | re.MULTILINE)
+# An English-ambiguous token at line start — case-SENSITIVE (lowercase only) and followed
+# by a real argument: "make test" / "python check.py", not "Make the edits" / "make this".
+_LINE_START_AMBIG = re.compile(rf"^[ \t]*{_BULLET}{_CMD_AMBIG}[ \t]+{_NOT_AN_ARG}\S", re.MULTILINE)
+
+_EXECUTION_PATTERNS = (
+    _SHELL_FENCE,
+    _SHELL_PROMPT,
+    _INLINE_CMD,
+    _RUN_VERB_CMD,
+    _LINE_START_STRICT,
+    _LINE_START_AMBIG,
+)
+
+
+def is_execution_task(feature: dict) -> bool:
+    """Recognize explicit execution labels and command-shaped task instructions.
+
+    True when the card carries the ``execute`` label, or its spec / acceptance criteria
+    name commands to RUN in a command position (a shell fence, a ``$ `` prompt, inline
+    code with an execution cue, an explicit run verb, or a bare command line). A doc/decision spec that merely
+    talks about tools is False — and so is a #378 decompose task whose embedded original
+    spec happens to name commands (see :func:`project_board.store.is_decompose_task`).
+    That exclusion applies to both routing and prompt framing, even with an execute label.
+
+    Command detection reads only the spec and acceptance criteria, not titles or
+    recovery metadata; the title is used only to recognize decompose tasks.
+    """
+    if store_mod.is_decompose_task(feature):
+        return False
+    if "execute" in (feature.get("labels") or []):
+        return True
+    for field in ("spec", "acceptance_criteria"):
+        text = str(feature.get(field) or "")
+        if any(pattern.search(text) for pattern in _EXECUTION_PATTERNS):
+            return True
+    return False
+
+
 class PromptMixin:
-    def _build_task_prompt(self, feature: dict) -> str:
+    def _build_task_prompt(self, feature: dict, cwd: str | None = None) -> str:
         """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
         criteria, framed as a request for a DELIVERABLE (a doc, a decision, an artifact
-        ref), NOT a code change — a task has no worktree or PR, and the delegate's reply
+        ref), NOT a code change — an execution task gets a scratch directory, and the delegate's reply
         IS the deliverable ``record_delivery`` records.
 
         With a requirement ledger (#399) it also asks for the SAME ``## Requirements``
@@ -84,16 +165,28 @@ class PromptMixin:
             if reqs
             else ""
         )
+        execution = is_execution_task(feature)
+        shell_block = (
+            "\nYou have a shell in your working directory "
+            f"({cwd or '<cwd>'} — a scratch checkout of the project at base, or an empty dir). "
+            "Run the commands this task names. Report real numbers, or an honest FAIL with "
+            "the command and its output. Never decline for lack of a shell. "
+            "Do not commit, push or open a PR.\n"
+            if execution
+            else ""
+        )
+        context = "Your reply IS the " if execution else "There is no code change, worktree, or PR: your reply IS the "
         return (
             f"You have been assigned ONE task. Complete it and reply with the "
             f"deliverable — a document, a decision, or a reference to the artifact you "
-            f"produced. There is no code change, worktree, or PR: your reply IS the "
+            f"produced. {context}"
             f"deliverable, so make it self-contained.\n\n"
             f"# {title}\n\n"
             f"{rejected_block}"
             f"{_recovery_block(feature)}"
             f"## Task\n{spec}\n"
             f"{criteria_block}"
+            f"{shell_block}"
             f"{req_block}"
         )
 
