@@ -1720,33 +1720,111 @@ class DriveMixin:
 
     async def _drive_task(self, feature: dict, delegate) -> None:
         """Drive a ``task`` bead with a sister-agent assignee — an ACP coder OR an A2A
-        agent (#217/#304) — the task sibling of ``_drive``. No worktree, no git, no PR:
-        dispatch the spec + acceptance criteria to the assignee delegate over its native
-        adapter (``coder_seam.dispatch_task`` picks acp/a2a by the delegate's type),
-        then record the reply as the deliverable (``record_delivery`` → in_review, where
-        a human or auto-verify closes it). A dispatch failure/timeout is classified like
-        a coder failure and blocks the card for triage — a task has no model ladder to
-        climb (the assignee is fixed), so the capability-escalation edge collapses to the
-        coder path's terminal block."""
+        agent (#217/#304) — the task sibling of ``_drive``. No git, no PR: dispatch the
+        spec + acceptance criteria to the assignee delegate over its native adapter
+        (``coder_seam.dispatch_task`` picks acp/a2a by the delegate's type), then record
+        the reply as the deliverable (``record_delivery`` → in_review, where a human or
+        auto-verify closes it). A dispatch failure/timeout is classified like a coder
+        failure and blocks the card for triage — a task has no model ladder to climb (the
+        assignee is fixed), so the capability-escalation edge collapses to the coder path's
+        terminal block.
+
+        An ACP assignee is handed a scratch workdir (#654) — a worktree of the card's
+        project at its base branch, or a bare temp dir when the card has no resolvable
+        project repo — so it has a checkout to run in. That tree NEVER commits, pushes or
+        opens a PR: the deliverable stays the reply. A worktree is reaped on the task's
+        terminal edges (cancel / verify approve, by the ``feat-<id>`` naming); a temp dir is
+        removed in the ``finally`` below."""
         store = self._store()
         fid = feature["id"]
         coder_seam.note_card(fid, feature.get("title"))  # what its run is for, on the host's ledger
         prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
+        cwd, tmp_dir = await self._task_workdir(feature, delegate)
+        # Pass ``cwd`` only when a scratch dir was cut, so an A2A task / an unscoped double
+        # reaches ``dispatch_task`` with the exact pre-#654 argument list (no ``cwd`` kwarg).
+        kw: dict = {"timeout": self.coder_timeout or None}
+        if cwd is not None:
+            kw["cwd"] = cwd
+            kw["env_passthrough"] = self.env_passthrough
         try:
-            reply = await coder_seam.dispatch_task(delegate, prompt, timeout=self.coder_timeout or None)
-        except asyncio.CancelledError:
-            raise  # operator cancel / shutdown owns the edge — never a block
-        except (worktree.WorktreeError, worktree.CoderTimeout) as exc:
-            if self._shutting_down:
-                log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
+            try:
+                reply = await coder_seam.dispatch_task(delegate, prompt, **kw)
+            except asyncio.CancelledError:
+                raise  # operator cancel / shutdown owns the edge — never a block
+            except (worktree.WorktreeError, worktree.CoderTimeout) as exc:
+                if self._shutting_down:
+                    log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
+                    return
+                await self._task_dispatch_failed(store, fid, "task", f"{classify(str(exc)).category}: {exc}")
                 return
-            await self._task_dispatch_failed(store, fid, "task", f"{classify(str(exc)).category}: {exc}")
-            return
-        except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
-            log.exception("[project_board] %s task dispatch unexpected failure", fid)
-            await self._task_dispatch_failed(store, fid, "task", f"unexpected: {type(exc).__name__}: {exc}")
-            return
-        await self._record_task_reply(store, fid, reply, "task")
+            except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
+                log.exception("[project_board] %s task dispatch unexpected failure", fid)
+                await self._task_dispatch_failed(store, fid, "task", f"unexpected: {type(exc).__name__}: {exc}")
+                return
+            await self._record_task_reply(store, fid, reply, "task")
+        finally:
+            # A worktree scratch tree is left for the terminal-edge reap (cancel / verify
+            # approve, the same feat-<id> naming the health sweep uses); a bare temp dir has
+            # no card-naming to find it later, so it is removed here. Best-effort — cleanup
+            # must never turn a delivered task into a failed drive.
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def _task_workdir(self, feature: dict, delegate) -> tuple[str | None, str | None]:
+        """The scratch working directory an ACP task is dispatched into (#654), and the
+        temp dir (if any) the drive must remove afterwards. Returns ``(cwd, tmp_dir)``:
+
+        - A non-ACP (A2A) assignee, or a delegate the board can't scope (a bare test double
+          / any shape ``dataclasses.replace`` can't copy): ``(None, None)`` — it runs in its
+          own context, today's behaviour, and ``dispatch_task`` is called with no ``cwd``.
+        - A real ACP delegate whose card has a resolvable project repo: a WORKTREE of that
+          repo at its base branch, cut with the SAME ``create_worktree`` naming a coding
+          drive uses — so ``feature_worktrees`` / ``reap_feature_worktree`` / the health
+          sweep all find and reap it on the task's terminal edges. Its deps install via
+          ``_prepare_tree`` (best-effort). ``(wt, None)`` — NOT a temp dir, so the drive's
+          finally leaves it for the terminal-edge reap.
+        - A real ACP delegate whose card has NO resolvable project repo: an empty
+          ``mkdtemp`` — no card-naming can find it later, so it comes back as ``tmp_dir``
+          for the drive's finally to remove.
+
+        A worktree that can't be cut (a transient git failure) degrades to a temp dir
+        rather than failing the drive — the task still runs somewhere."""
+        import dataclasses as _dc
+        import tempfile
+
+        kind = str(getattr(delegate, "type", "") or "acp")
+        if kind != "acp" or not _dc.is_dataclass(delegate):
+            return None, None
+        fid = feature["id"]
+        repo = self._repo_for(feature)
+        if await self._is_git_repo(repo):
+            base = self._base_branch_for(feature)
+            try:
+                wt, _branch = await worktree.create_worktree(
+                    repo, base, fid, self.root, title=feature.get("title") or ""
+                )
+            except worktree.WorktreeError:
+                log.warning(
+                    "[project_board] %s task worktree could not be cut off %s@%s — using a temp dir instead",
+                    fid,
+                    repo,
+                    base,
+                    exc_info=True,
+                )
+            else:
+                await self._prepare_tree(wt, feature)  # the project's deps, before the coder
+                return wt, None
+        tmp = await asyncio.to_thread(tempfile.mkdtemp, prefix=f"pb-task-{fid}-")
+        return tmp, tmp
+
+    async def _is_git_repo(self, repo: str) -> bool:
+        """Is ``repo`` a usable git checkout a task worktree can be cut from? A board with
+        no real repo configured, or a card whose project has none, falls back to a bare
+        temp dir (#654)."""
+        if not repo or not await asyncio.to_thread(os.path.isdir, repo):
+            return False
+        rc, _out, _err = await worktree._git(repo, "rev-parse", "--is-inside-work-tree")
+        return rc == 0
 
     async def _task_dispatch_failed(self, store, fid: str, kind: str, reason: str) -> None:
         """Block a task whose dispatch failed — or answered with nothing — for triage, but

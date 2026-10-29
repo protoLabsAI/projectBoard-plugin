@@ -1330,7 +1330,14 @@ async def _dispatch_coder_tapped_legacy(
             log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
-async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) -> str:
+async def dispatch_task(
+    delegate,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    cwd: str | None = None,
+    env_passthrough: Iterable[str] = (),
+) -> str:
     """Dispatch a task-type bead's spec to its assignee sister-agent delegate and
     return the reply — the deliverable a task ships instead of a diff.
 
@@ -1341,11 +1348,20 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
     ``acp`` (the pre-#304 behaviour). Both dispatch over their native transport and
     the reply is handed straight to ``record_delivery`` by the loop.
 
-    Unlike ``dispatch_coder``/``dispatch_coder_tapped`` there is NO worktree scoping:
-    a task produces a doc/decision/artifact, not a code change, so the delegate runs
-    in its own context and its reply IS the deliverable. Same teardown discipline
-    (reap the delegate on every exit — the ``finally``) and the same error
-    normalisation as ``dispatch_coder`` — a ``DelegateError`` surfaces as
+    ``cwd`` (#654) is the scratch working directory the ACP assignee runs in — a
+    worktree of the card's project, or a bare temp dir, cut by ``_drive_task`` before
+    dispatch. When given AND the assignee is an ACP coder, its session is scoped to that
+    directory EXACTLY as ``worktree.dispatch_coder`` scopes a coder to a worktree: a
+    per-dispatch copy with ``cwd`` as the workdir (the registry delegate is untouched),
+    board-owned git (``manage_git=False``, so the ACP side never commits or opens a PR on
+    top of the task's reply deliverable), the sanitized env honoring the operator's
+    ``env_passthrough`` allowlist, and a ``session/forget`` so a
+    stale session can't answer against a freshly cut tree. The scoped copy owns its own
+    pooled client (the adapter caches on workdir), reaped in the ``finally`` like every
+    other exit. A2A ignores ``cwd`` — its agent runs in its own context — and ``cwd=None``
+    is today's behaviour EXACTLY: the delegate runs unscoped and its reply IS the
+    deliverable. Same teardown discipline (reap on every exit — the ``finally``) and the
+    same error normalisation as ``dispatch_coder`` — a ``DelegateError`` surfaces as
     ``WorktreeError`` and a timeout as ``CoderTimeout`` — so the loop's coder-failure
     classifier blocks a task-dispatch failure of either type with the identical code.
 
@@ -1353,6 +1369,8 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
     (``coder_timeout_s``, 30 minutes by default). There is no correlation-id /
     long-running task state or ingress route — leaving a task unassigned and using
     ``POST /features/{id}/deliver`` remains the separate long-running workaround."""
+    import dataclasses as _dc
+
     from plugins.delegates.adapters import ADAPTERS, DelegateError
 
     # Select the adapter by the delegate's own type (acp | a2a). ``or ADAPTERS["acp"]``
@@ -1360,9 +1378,27 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
     # unknown type) degrades to the acp path without ever touching a missing "acp" slot.
     kind = str(getattr(delegate, "type", "") or "acp")
     adapter = ADAPTERS.get(kind) or ADAPTERS["acp"]
+    # #654: scope an ACP session to its scratch workdir the same way dispatch_coder does —
+    # a per-dispatch copy, the registry delegate untouched. A2A and a no-cwd call keep the
+    # original delegate, so today's behaviour is byte-identical where ``cwd`` is absent.
+    target = delegate
+    if cwd and kind == "acp":
+        overrides: dict = {"workdir": cwd}
+        if any(f.name == "manage_git" for f in _dc.fields(delegate)):
+            overrides["manage_git"] = False
+        if any(f.name == "env" for f in _dc.fields(delegate)):
+            overrides["env"] = config.sanitized_env(env_passthrough)
+        target = _dc.replace(delegate, **overrides)
+        # Fresh-both like dispatch_coder: the scratch tree is cut fresh per dispatch, so a
+        # stale resumed session must not answer against a tree that no longer holds its
+        # memory. Best-effort — a stale session must not block the task.
+        try:
+            await adapter.forget_session(target)
+        except Exception:  # noqa: BLE001 — best-effort; a stale session must not block the task
+            log.warning("[project_board] forget_session failed for task scratch %s", cwd, exc_info=True)
     try:
         with _on_record(delegate, None):
-            coro = adapter.dispatch(delegate, prompt, timeout=timeout)
+            coro = adapter.dispatch(target, prompt, timeout=timeout)
             return await worktree.coder_bound(coro, timeout)
     except asyncio.TimeoutError:
         raise worktree.CoderTimeout(f"task delegate timed out after {timeout}s")
@@ -1370,7 +1406,7 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None) 
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     finally:
         try:
-            await adapter.teardown(delegate)
+            await adapter.teardown(target)
         except Exception:  # noqa: BLE001 — never let teardown mask the result/error
             log.warning("[project_board] task delegate teardown failed", exc_info=True)
 
