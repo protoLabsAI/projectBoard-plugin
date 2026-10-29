@@ -34,6 +34,14 @@ from project_board.loop.prompt import is_execution_task
         ({"spec": "Decide how to make the system simpler."}, False),
         ({"spec": "Discuss mypytest, run_evaluation, pythonic and remake."}, False),
         ({"title": "pytest", "spec": None, "acceptance_criteria": None}, False),
+        # Review regressions: a tool NAMED in prose, or a non-shell/example fence, is not a
+        # command to run — these used to trip the loose `\b`-anywhere / any-fence match.
+        ({"spec": "The target runtime is Python 3.12 for this service."}, False),
+        ({"spec": "Python 3.12 is the required runtime for the service."}, False),
+        ({"spec": "Document how pytest fixtures work and write up the findings."}, False),
+        ({"spec": "Make this proposal simpler and clearer."}, False),
+        ({"spec": 'Return exactly this shape:\n```json\n{"ok": true}\n```'}, False),
+        ({"spec": "Here is an illustrative snippet:\n```python\nx = compute()\n```"}, False),
     ],
 )
 def test_classifier(feature, expected):
@@ -171,6 +179,30 @@ def test_shell_prompt_only_for_execution():
     writing = loop._build_task_prompt({"spec": "Write a decision document"})
     assert "You have a shell" not in writing
     assert "There is no code change, worktree, or PR" in writing
+
+
+async def test_decompose_task_stays_self_despite_embedded_commands(monkeypatch):
+    """A #378 decompose task is self-assigned (``agent``) and embeds the oversized card's
+    spec verbatim, so its text names commands and ``is_execution_task`` fires — but it must
+    still go through ``_dispatch_self`` (it calls the board's own feature tools, which an
+    ACP coder lacks), NOT the execution-coder ladder."""
+    loop, store, drive, own = setup_routing(monkeypatch)
+    card = {
+        "id": "bd-split",
+        "assignee": "agent",
+        "title": "Decompose bd-9 — timed out 2x, too wide to build",
+        "spec": (
+            "ORIGINAL SPEC\nRun `uv run pytest -q` and report the result.\n\n"
+            "1. Create the slices with board_create_feature and leave them in backlog.\n"
+            "3. Cancel bd-9 with board_cancel_feature."
+        ),
+    }
+    assert is_execution_task(card) is True  # the embedded command WOULD route it, but…
+    assert await loop._dispatch_task(store, card) == "self"
+    await drain(loop)
+    own.assert_awaited_once_with(store, card, "agent")  # …it stays first-party
+    store.claim_task.assert_not_called()
+    drive.assert_not_awaited()
 
 
 async def test_explicit_a2a_execution_target_is_unchanged(monkeypatch):

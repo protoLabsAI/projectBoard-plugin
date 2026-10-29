@@ -1569,14 +1569,20 @@ class DriveMixin:
         work the host does itself through ``HOST.invoke`` (#311). That is detected BEFORE
         delegate resolution and delegated to ``_dispatch_self``, which can also return
         ``"self"`` (a first-party drive spawned). Execution tasks are the exception (#654):
-        self/unassigned cards use the project's opening coder rung and scratch directory.
+        a self/unassigned EXECUTION card uses the project's opening coder rung and scratch
+        directory, because it needs a shell. A #378 decompose task is NOT — it is also
+        self-assigned and its spec embeds the oversized card's commands, but its job is to
+        call the board's own feature tools over the first-party path (which an ACP coder
+        cannot do), so it stays self whatever the copied text names (``is_decompose_task``).
 
         The assignee is read from the CANDIDATE (the pre-claim projection) and passed
         back to ``claim`` so the claim preserves it — a task's assignee is its dispatch
         target, not the coder identity a coding claim stamps."""
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
-        if is_execution_task(candidate) and (not assignee or self._is_self_assignee(assignee)):
+        self_or_none = (not assignee) or self._is_self_assignee(assignee)
+        route_to_coder = self_or_none and is_execution_task(candidate) and not store_mod.is_decompose_task(candidate)
+        if route_to_coder:
             coder, delegate = await self._execution_task_coder(candidate)
             if delegate is not None:
                 assignee = coder
@@ -1586,9 +1592,9 @@ class DriveMixin:
                     "[project_board] execution task %s parked — no coder resolves under the project's routing policy",
                     cid,
                 )
+        elif self._is_self_assignee(assignee):
+            return await self._dispatch_self(store, candidate, assignee)
         else:
-            if self._is_self_assignee(assignee):
-                return await self._dispatch_self(store, candidate, assignee)
             delegate = self._resolve_task_delegate(assignee)
         # #356: claim_task, NOT claim — a task's assignee is its DISPATCH TARGET, so the
         # transition to in_progress must PRESERVE it (`br --claim` would reassign to the
