@@ -29,6 +29,8 @@ from project_board.loop.prompt import is_execution_task
         ({"spec": "make test"}, True),
         ({"spec": "Run make check"}, True),
         ({"spec": "Verify with `make check`."}, True),
+        ({"spec": "Run `pytest`."}, True),
+        ({"spec": "Execute `uv run check.py`."}, True),
         ({"spec": "Write a decision document."}, False),
         ({"spec": "Make the edits early rather than reading indefinitely."}, False),
         ({"spec": "Decide how to make the system simpler."}, False),
@@ -46,6 +48,44 @@ from project_board.loop.prompt import is_execution_task
 )
 def test_classifier(feature, expected):
     assert is_execution_task(feature) is expected
+
+
+WRITING_TOOL_MENTIONS = [
+    "Describe how the service is deployed via npm.",
+    "Describe the utility implemented via Python scripts.",
+    "Document how `pytest` fixtures work.",
+    "Document how `python` scripts work.",
+    "Document the `npm test` command.",
+    "Document how the service runs pytest.",
+    "Explain why running npm is useful.",
+    "Document `examples using pytest`.",
+]
+
+
+@pytest.mark.parametrize("text", WRITING_TOOL_MENTIONS)
+@pytest.mark.parametrize("field", ["spec", "acceptance_criteria"])
+def test_tool_mentions_remain_writing(text, field):
+    card = {field: text}
+    assert not is_execution_task(card)
+    prompt = BoardLoop({})._build_task_prompt(card)
+    assert "You have a shell" not in prompt
+    assert "There is no code change, worktree, or PR" in prompt
+
+
+@pytest.mark.parametrize("text", WRITING_TOOL_MENTIONS)
+@pytest.mark.parametrize("assignee", ["self", ""])
+async def test_tool_mentions_preserve_dispatch(monkeypatch, text, assignee):
+    loop, store, drive, own = setup_routing(monkeypatch)
+    card = {"id": "writing-654", "assignee": assignee, "spec": text}
+    assert await loop._dispatch_task(store, card) == ("self" if assignee else "parked")
+    await drain(loop)
+    drive.assert_not_awaited()
+    if assignee:
+        own.assert_awaited_once_with(store, card, assignee)
+        store.claim_task.assert_not_called()
+    else:
+        own.assert_not_awaited()
+        store.claim_task.assert_called_once_with(card["id"], assignee="")
 
 
 def setup_routing(monkeypatch, cfg=None, live=("lead", "small", "large", "sister")):
@@ -181,14 +221,13 @@ def test_shell_prompt_only_for_execution():
     assert "There is no code change, worktree, or PR" in writing
 
 
-async def test_decompose_task_stays_self_despite_embedded_commands(monkeypatch):
-    """A #378 decompose task is self-assigned (``agent``) and embeds the oversized card's
-    spec verbatim, so its text names commands and ``is_execution_task`` fires — but it must
-    still go through ``_dispatch_self`` (it calls the board's own feature tools, which an
-    ACP coder lacks), NOT the execution-coder ladder."""
+@pytest.mark.parametrize("labels", [[], ["execute"]])
+async def test_decompose_task_stays_self_despite_embedded_commands(monkeypatch, labels):
+    """Copied commands must affect neither the decompose routing nor its prompt."""
     loop, store, drive, own = setup_routing(monkeypatch)
     card = {
         "id": "bd-split",
+        "labels": labels,
         "assignee": "agent",
         "title": "Decompose bd-9 — timed out 2x, too wide to build",
         "spec": (
@@ -197,7 +236,12 @@ async def test_decompose_task_stays_self_despite_embedded_commands(monkeypatch):
             "3. Cancel bd-9 with board_cancel_feature."
         ),
     }
-    assert is_execution_task(card) is True  # the embedded command WOULD route it, but…
+    assert is_execution_task(card) is False
+    prompt = loop._build_task_prompt(card)
+    assert "You have a shell" not in prompt
+    assert "Never decline for lack of a shell" not in prompt
+    assert "There is no code change, worktree, or PR" in prompt
+    assert "board_create_feature" in prompt
     assert await loop._dispatch_task(store, card) == "self"
     await drain(loop)
     own.assert_awaited_once_with(store, card, "agent")  # …it stays first-party

@@ -45,8 +45,8 @@ def _recovery_block(feature: dict) -> str:
 
 
 # Command tokens are recognized ONLY in a command POSITION — a fenced shell block, a
-# `$ ` prompt line, an inline-code span, right after an explicit run verb, or at the very
-# start of a line — never mid-prose. A writing spec that merely NAMES a tool ("document
+# `$ ` prompt line, an inline-code span with an execution cue, right after an explicit
+# run verb, or at the very start of a line — never mid-prose. A writing spec that merely NAMES a tool ("document
 # how pytest fixtures work", "the target runtime is Python 3.12"), or that embeds another
 # card's spec verbatim (a #378 decompose task copies the oversized card's commands), must
 # stay a writing task — the loose `\b`-anywhere match flagged all of those (#654 review).
@@ -73,11 +73,16 @@ _SHELL_FENCE = re.compile(
 )
 # A shell-prompt line: `$ ` at line start (after an optional list marker).
 _SHELL_PROMPT = re.compile(rf"^[ \t]*{_BULLET}\$[ \t]", re.MULTILINE)
-# A command token inside a single-line inline-code span: `make check`, `uv run eval.py`.
-_INLINE_CMD = re.compile(rf"`[^`\n]*\b(?:{_CMD_STRICT}|{_CMD_AMBIG})\b[^`\n]*`", re.IGNORECASE)
-# A command token right after an explicit run verb: "Run pytest", "Call run_eval", "via make".
+# Backticks quote names as well as commands. Require an execution cue, and anchor the
+# command at the start of the span: "Document how `pytest` fixtures work" is writing.
+_INLINE_CMD = re.compile(
+    rf"\b(?:verify|check|test)[ \t]+with[ \t]+`(?:{_CMD_STRICT}|{_CMD_AMBIG})\b[^`\n]*`",
+    re.IGNORECASE,
+)
+# Imperative run verbs name an action; "runs", "running", and "via" also describe
+# tools in ordinary prose. Quoting the command does not change the requested action.
 _RUN_VERB_CMD = re.compile(
-    rf"\b(?:run|runs|running|execute|executes|invoke|invokes|call|calls|via)[ \t]+(?:{_CMD_STRICT}|{_CMD_AMBIG})\b",
+    rf"\b(?:run|execute|invoke|call)[ \t]+`?(?:{_CMD_STRICT}|{_CMD_AMBIG})\b",
     re.IGNORECASE,
 )
 # A non-English command token at the very start of a line (after optional list markers).
@@ -101,13 +106,16 @@ def is_execution_task(feature: dict) -> bool:
 
     True when the card carries the ``execute`` label, or its spec / acceptance criteria
     name commands to RUN in a command position (a shell fence, a ``$ `` prompt, inline
-    code, an explicit run verb, or a bare command line). A doc/decision spec that merely
+    code with an execution cue, an explicit run verb, or a bare command line). A doc/decision spec that merely
     talks about tools is False — and so is a #378 decompose task whose embedded original
-    spec happens to name commands (its title keeps it on the self-dispatch path in
-    ``_dispatch_task``; see :func:`project_board.store.is_decompose_task`).
+    spec happens to name commands (see :func:`project_board.store.is_decompose_task`).
+    That exclusion applies to both routing and prompt framing, even with an execute label.
 
-    Only the spec and acceptance criteria count, not titles or recovery metadata.
+    Command detection reads only the spec and acceptance criteria, not titles or
+    recovery metadata; the title is used only to recognize decompose tasks.
     """
+    if store_mod.is_decompose_task(feature):
+        return False
     if "execute" in (feature.get("labels") or []):
         return True
     for field in ("spec", "acceptance_criteria"):
