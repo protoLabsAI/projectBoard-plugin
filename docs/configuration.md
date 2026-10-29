@@ -664,6 +664,28 @@ coders:
   advanced: opus             # architectural starts here
 ```
 
+**The order inside a rung is not a preference.** `[codex, sonnet]` and `[sonnet, codex]`
+behave the same: each card opens on the sibling a per-process counter points at, and the
+counter advances on every dispatch across all rungs. Siblings therefore split cards roughly
+evenly, and order only decides which one goes first after a restart. To steer *which* sibling
+a card opens on, use routing instead:
+
+- `routing.headroom` / `prefer_sibling_at` move cards off a sibling that is near the end of
+  its usage window (on by default, at 90% used). See
+  [Headroom-aware sibling preference](#headroom-aware-sibling-preference).
+- `routing.usage_policy` opens cards on a named sibling once another account passes a
+  usage line. See [Usage policy](#usage-policy-keep-an-account-under-a-target-).
+- `routing.exclusive` restricts dispatches (board-wide or per project) to an allowlist of
+  delegates, which also removes the others as failover. See
+  [Strict coder routing](#strict-coder-routing).
+
+There is no "primary, then fallback" setting. To keep most work on one provider, list only
+that provider on the rungs you care about (or in a project's own `coders`), and accept that a spent quota then blocks the
+card (as `rate_limit`, which heals on its own) instead of rotating.
+
+The Configure ▸ Coder routing tab shows, for each rung, which sibling the next card will open
+on and why.
+
 Climbing a rung means "a stronger model may succeed". Rotating within one means "this
 model is fine, its provider is not" — a spent quota, or a provider that refuses the model
 outright (retired, not offered on the account's plan, or needing a newer client; #420).
