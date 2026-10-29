@@ -1937,6 +1937,7 @@ class BeadsBoard:
         assignee: str = "",
         waits_for=(),
         chain_hot_files: bool = True,
+        execute: bool = False,
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -1952,7 +1953,8 @@ class BeadsBoard:
         task rides the SAME rails but ships a deliverable instead of a PR, so it needs no
         files_to_modify (see `_prepare_ready`); `assignee` pre-assigns the bead (else it
         starts unassigned and the puller claims it). `waits_for` names publish gates
-        (gates.py grammar) that must ALL hold before the loop claims the card."""
+        (gates.py grammar) that must ALL hold before the loop claims the card.
+        `execute=True` adds the execution-task routing label."""
         # A card on a hot file is created AND chained under the chain lock (#458). Chaining
         # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
         # a racing card could chain while an older one was still invisible (or created but
@@ -1979,6 +1981,7 @@ class BeadsBoard:
                 assignee=assignee,
                 waits_for=waits_for,
                 chain_hot_files=chain_hot_files,
+                execute=execute,
             )
 
     def _names_hot_file(self, project: str, files_to_modify) -> bool:
@@ -2021,6 +2024,7 @@ class BeadsBoard:
         assignee: str,
         waits_for,
         chain_hot_files: bool,
+        execute: bool = False,
     ) -> dict:
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
@@ -2063,6 +2067,9 @@ class BeadsBoard:
             # malformed `diff:` label (an empty tier corrupts the escalation ladder).
             upd += ["--add-label", f"diff:{diff}"]
             enriched.append("difficulty")
+        if execute:
+            upd += ["--add-label", "execute"]
+            enriched.append("execute")
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")

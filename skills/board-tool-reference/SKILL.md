@@ -283,3 +283,15 @@ feature is never delivered or verified: closing code anywhere but the merge woul
   verifier matching the deliverer is recorded with a `self-verified` label, never refused.
 - Open requirements never refuse approval; the result carries a `note` ("2 requirement(s)
   still open: r2, r4").
+
+### Execution vs writing tasks
+
+An execution task runs commands (evals, live checks, release verification): the `execute`
+label or a command-bearing spec routes it to the coder ladder. Create it with
+`board_create_task(execute=true)` and leave `assignee` empty. The board's own agent must
+NEVER assign an execution task to itself. Writing-only tasks (a doc, a decision) may be
+self-assigned.
+
+Execution tasks get a scratch workdir: a worktree at the project base, reaped on
+done/cancel/verify, never a PR. The deliverable is still a report submitted with
+`board_deliver` and closed by `board_verify`.

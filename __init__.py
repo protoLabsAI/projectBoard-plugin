@@ -643,12 +643,16 @@ def _board_tools(cfg: dict, registry=None):
         source_issue: str = "",
         force: bool = False,
         waits_for: str = "",
+        execute: bool = False,
     ) -> str:
         """Create a TASK (starts in backlog): work that ships a deliverable (doc, decision, artifact
         ref) instead of a PR. Same lifecycle as a feature, but board_deliver moves it to in_review
         and board_verify closes it. Ready needs `spec` + `acceptance_criteria`, no
         `files_to_modify`. `assignee` pre-assigns; `priority` 0 = highest. The other args, the
-        dedup refusals and `force` behave as on board_create_feature."""
+        dedup refusals and `force` behave as on board_create_feature.
+        Execution tasks (evals, live checks, release verification: anything that runs commands)
+        go to a coder: pass `execute=true` and leave `assignee` empty; never assign one to yourself.
+        Writing-only tasks (a doc, a decision) may be self-assigned."""
         try:
             project = _strip_wrapping_quotes(project)
             store = get_store(**_store_kw_for(project))
@@ -679,6 +683,7 @@ def _board_tools(cfg: dict, registry=None):
                 issue_type="task",
                 assignee=assignee,
                 waits_for=waits_for,
+                execute=execute,
             )
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
