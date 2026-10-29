@@ -44,11 +44,33 @@ def _recovery_block(feature: dict) -> str:
     )
 
 
+def is_execution_task(feature: dict) -> bool:
+    """Recognize explicit execution labels and command-shaped task instructions.
+
+    ``make`` is also ordinary prose: require a command position (line start,
+    inline code, or an invocation verb) rather than matching "make the edits".
+    Only the spec and acceptance criteria count, not titles or recovery metadata.
+    """
+    if "execute" in (feature.get("labels") or []):
+        return True
+    for field in ("spec", "acceptance_criteria"):
+        text = str(feature.get(field) or "")
+        if re.search(
+            r"^\s*(?:`{3,}|~{3,}|\$ )"
+            r"|\b(?:pytest\b|run_eval\b|uv[ \t]+run\b|(?:python|npm|npx|curl)[ \t]+)"
+            r"|(?:^[ \t]*|`|\b(?:run|execute|invoke|via)[ \t]+)make[ \t]+(?!the\b|a\b|an\b|it\b|sure\b)",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        ):
+            return True
+    return False
+
+
 class PromptMixin:
-    def _build_task_prompt(self, feature: dict) -> str:
+    def _build_task_prompt(self, feature: dict, cwd: str | None = None) -> str:
         """The ``delegate_to`` prompt for a ``task`` bead (#217): the spec + acceptance
         criteria, framed as a request for a DELIVERABLE (a doc, a decision, an artifact
-        ref), NOT a code change — a task has no worktree or PR, and the delegate's reply
+        ref), NOT a code change — an execution task gets a scratch directory, and the delegate's reply
         IS the deliverable ``record_delivery`` records.
 
         With a requirement ledger (#399) it also asks for the SAME ``## Requirements``
@@ -84,16 +106,28 @@ class PromptMixin:
             if reqs
             else ""
         )
+        execution = is_execution_task(feature)
+        shell_block = (
+            "\nYou have a shell in your working directory "
+            f"({cwd or '<cwd>'} — a scratch checkout of the project at base, or an empty dir). "
+            "Run the commands this task names. Report real numbers, or an honest FAIL with "
+            "the command and its output. Never decline for lack of a shell. "
+            "Do not commit, push or open a PR.\n"
+            if execution
+            else ""
+        )
+        context = "Your reply IS the " if execution else "There is no code change, worktree, or PR: your reply IS the "
         return (
             f"You have been assigned ONE task. Complete it and reply with the "
             f"deliverable — a document, a decision, or a reference to the artifact you "
-            f"produced. There is no code change, worktree, or PR: your reply IS the "
+            f"produced. {context}"
             f"deliverable, so make it self-contained.\n\n"
             f"# {title}\n\n"
             f"{rejected_block}"
             f"{_recovery_block(feature)}"
             f"## Task\n{spec}\n"
             f"{criteria_block}"
+            f"{shell_block}"
             f"{req_block}"
         )
 

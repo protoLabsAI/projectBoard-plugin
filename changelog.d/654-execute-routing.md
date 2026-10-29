@@ -1,0 +1,1 @@
+Execution tasks labelled `execute` or naming commands now route unassigned/self cards through the project coder ladder, respecting exclusive routing and usage policy. Their prompts identify the scratch working directory and require real command results without commits, pushes, or PRs; writing-only and explicitly assigned tasks retain their dispatch behavior.

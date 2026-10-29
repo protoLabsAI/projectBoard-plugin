@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import sys
 
+from .prompt import is_execution_task
+
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction, work_location_sweep, work_location_capture
 from ..failures import PROVIDER_STALL_CLASS
@@ -1565,17 +1567,29 @@ class DriveMixin:
         A task assigned to THIS board's OWN agent (its coder name, or the reserved
         ``self``/``agent`` aliases) is NOT a sister-agent dispatch — it is first-party
         work the host does itself through ``HOST.invoke`` (#311). That is detected BEFORE
-        delegate resolution (the board's own name always means "I do it") and delegated to
-        ``_dispatch_self``, which can also return ``"self"`` (a first-party drive spawned).
+        delegate resolution and delegated to ``_dispatch_self``, which can also return
+        ``"self"`` (a first-party drive spawned). Execution tasks are the exception (#654):
+        self/unassigned cards use the project's opening coder rung and scratch directory.
 
         The assignee is read from the CANDIDATE (the pre-claim projection) and passed
         back to ``claim`` so the claim preserves it — a task's assignee is its dispatch
         target, not the coder identity a coding claim stamps."""
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
-        if self._is_self_assignee(assignee):
-            return await self._dispatch_self(store, candidate, assignee)
-        delegate = self._resolve_task_delegate(assignee)
+        if is_execution_task(candidate) and (not assignee or self._is_self_assignee(assignee)):
+            coder, delegate = await self._execution_task_coder(candidate)
+            if delegate is not None:
+                assignee = coder
+                log.info("[project_board] execution task %s → %s (not self)", cid, coder)
+            else:
+                log.info(
+                    "[project_board] execution task %s parked — no coder resolves under the project's routing policy",
+                    cid,
+                )
+        else:
+            if self._is_self_assignee(assignee):
+                return await self._dispatch_self(store, candidate, assignee)
+            delegate = self._resolve_task_delegate(assignee)
         # #356: claim_task, NOT claim — a task's assignee is its DISPATCH TARGET, so the
         # transition to in_progress must PRESERVE it (`br --claim` would reassign to the
         # actor and refuse the already-assigned bead, the livelock this fixes).
@@ -1604,6 +1618,35 @@ class DriveMixin:
         _register_drive(cid, task)  # reachable by the cancel verbs (#211)
         task.add_done_callback(self._make_drive_done_cb(cid))
         return str(getattr(delegate, "type", "") or "acp")
+
+    async def _execution_task_coder(self, feature: dict):
+        """Select the opening coder rung using the coding drive's routing helpers."""
+        coders = self._coders_for(feature)
+        exclusive = self._exclusive_for(feature)
+        tiers = store_mod.TIER_LADDER if self.escalation_on else [""]
+        for tier in tiers:
+            siblings = dispatch_rung(
+                coders, tier, escalation_on=self.escalation_on, exclusive=exclusive, base_coder=self.coder_name
+            )
+            siblings = self._live_rung(tier, siblings, coders, exclusive=exclusive)
+            siblings = [name for name in siblings if self._resolve_delegate(name, "acp") is not None]
+            if not siblings:
+                continue
+            headroom_on = self._headroom_on_for(feature)
+            prefer_at = self._prefer_sibling_at_for(feature) if headroom_on else None
+            usage = await asyncio.to_thread(self._rung_usage, siblings, on=headroom_on)
+            sib = _next_rung_cursor()
+            if headroom_on:
+                sib = prefer_headroom_sibling(siblings, sib, set(), usage, prefer_at=prefer_at)
+            else:
+                sib = prefer_live_sibling(siblings, sib, set())
+            policy = self._usage_policy_for(feature)
+            if policy:
+                usage = await asyncio.to_thread(self._policy_usage, siblings, policy, dict(usage))
+                sib, _reason = apply_usage_policy(siblings, sib, tier, usage, policy, prefer_at=prefer_at)
+            name = siblings[sib % len(siblings)]
+            return name, self._resolve_delegate(name, "acp")
+        return "", None
 
     def _is_self_assignee(self, assignee: str) -> bool:
         """True when a task's assignee names THIS board's own agent — the reserved
@@ -1738,7 +1781,6 @@ class DriveMixin:
         store = self._store()
         fid = feature["id"]
         coder_seam.note_card(fid, feature.get("title"))  # what its run is for, on the host's ledger
-        prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         cwd, tmp_dir = await self._task_workdir(feature, delegate)
         # Pass ``cwd`` only when a scratch dir was cut, so an A2A task / an unscoped double
         # reaches ``dispatch_task`` with the exact pre-#654 argument list (no ``cwd`` kwarg).
@@ -1747,6 +1789,7 @@ class DriveMixin:
             kw["cwd"] = cwd
             kw["env_passthrough"] = self.env_passthrough
         try:
+            prompt = self._build_task_prompt(feature, cwd=cwd) + work_location_capture.reporting_instructions()
             try:
                 reply = await coder_seam.dispatch_task(delegate, prompt, **kw)
             except asyncio.CancelledError:
