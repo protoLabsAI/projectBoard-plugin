@@ -1266,6 +1266,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         f = await _guard(
             lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")), by=by)
         )
+        # #654: an approved verification is the task's terminal Done edge — nothing left to
+        # build, so reap its scratch worktree, the same best-effort reap cancel/done run. An
+        # adverse verify (approved=false) requeues to ready and KEEPS the tree: the next
+        # dispatch cuts a fresh one (create_worktree cleans the stale same-name tree).
+        if approved:
+            await _reap_worktree(fid, f)
         note = open_requirements_note((f or {}).get("requirements"))
         return {**f, "note": note} if note else f
 
