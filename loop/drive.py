@@ -1745,6 +1745,7 @@ class DriveMixin:
         kw: dict = {"timeout": self.coder_timeout or None}
         if cwd is not None:
             kw["cwd"] = cwd
+            kw["env_passthrough"] = self.env_passthrough
         try:
             try:
                 reply = await coder_seam.dispatch_task(delegate, prompt, **kw)

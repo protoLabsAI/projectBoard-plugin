@@ -10,7 +10,8 @@ to run.
   `setup_cmd` installs into the worktree case (best-effort).
 - `dispatch_task` gained a `cwd` parameter: given a `cwd` and an ACP assignee, it scopes the
   session to that directory exactly as `dispatch_coder` scopes a coder to a worktree
-  (per-dispatch copy with `cwd` as the workdir, board-owned git, sanitized env, a fresh
+  (per-dispatch copy with `cwd` as the workdir, board-owned git, sanitized env honoring
+  the operator's `env_passthrough` allowlist, a fresh
   session, and teardown of the scoped client). A2A assignees ignore `cwd`, and a call with
   no `cwd` is byte-identical to before.
 - The scratch tree **never commits, pushes, or opens a PR** — the deliverable stays the

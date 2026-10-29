@@ -1330,7 +1330,14 @@ async def _dispatch_coder_tapped_legacy(
             log.warning("[project_board] coder teardown failed for %s", worktree_path, exc_info=True)
 
 
-async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None, cwd: str | None = None) -> str:
+async def dispatch_task(
+    delegate,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    cwd: str | None = None,
+    env_passthrough: Iterable[str] = (),
+) -> str:
     """Dispatch a task-type bead's spec to its assignee sister-agent delegate and
     return the reply — the deliverable a task ships instead of a diff.
 
@@ -1347,7 +1354,8 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None, 
     directory EXACTLY as ``worktree.dispatch_coder`` scopes a coder to a worktree: a
     per-dispatch copy with ``cwd`` as the workdir (the registry delegate is untouched),
     board-owned git (``manage_git=False``, so the ACP side never commits or opens a PR on
-    top of the task's reply deliverable), the sanitized env, and a ``session/forget`` so a
+    top of the task's reply deliverable), the sanitized env honoring the operator's
+    ``env_passthrough`` allowlist, and a ``session/forget`` so a
     stale session can't answer against a freshly cut tree. The scoped copy owns its own
     pooled client (the adapter caches on workdir), reaped in the ``finally`` like every
     other exit. A2A ignores ``cwd`` — its agent runs in its own context — and ``cwd=None``
@@ -1379,7 +1387,7 @@ async def dispatch_task(delegate, prompt: str, *, timeout: float | None = None, 
         if any(f.name == "manage_git" for f in _dc.fields(delegate)):
             overrides["manage_git"] = False
         if any(f.name == "env" for f in _dc.fields(delegate)):
-            overrides["env"] = config.sanitized_env()
+            overrides["env"] = config.sanitized_env(env_passthrough)
         target = _dc.replace(delegate, **overrides)
         # Fresh-both like dispatch_coder: the scratch tree is cut fresh per dispatch, so a
         # stale resumed session must not answer against a tree that no longer holds its

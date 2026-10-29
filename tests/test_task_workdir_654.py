@@ -23,6 +23,8 @@ import subprocess
 import sys
 import types
 
+import pytest
+
 from project_board import api, coder_seam, worktree
 from project_board.loop import BoardLoop
 
@@ -99,6 +101,7 @@ class _FakeACPAdapter:
             "cwd": wd,
             "exists": bool(wd) and os.path.isdir(wd),
             "manage_git": getattr(delegate, "manage_git", "<unset>"),
+            "env": getattr(delegate, "env", None),
         }
         return self.reply
 
@@ -192,6 +195,46 @@ async def test_an_acp_task_with_no_repo_runs_in_a_temp_dir_removed_after(tmp_pat
     assert os.path.basename(cwd).startswith("pb-task-bd-wk2-")  # …a bare mkdtemp, not a worktree
     assert not os.path.exists(cwd)  # …and it was removed in the drive's finally
     assert ("record_delivery", "bd-wk2", "task deliverable") in store.calls
+
+
+# ── scoped task environments honor the operator's allowlist ──────────────────────
+@pytest.mark.parametrize("passthrough", [[], ["A2A_TOKEN"]])
+async def test_acp_task_drive_honors_env_passthrough(tmp_path, monkeypatch, passthrough):
+    monkeypatch.setenv("A2A_TOKEN", "allowed-task-token")
+    monkeypatch.setenv("PROTOAGENT_HOME", "/host-only")
+    monkeypatch.setenv("PB_TASK_TEST_VALUE", "ordinary-value")
+    store = _FakeStore()
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    acp = _FakeACPAdapter()
+    _inject_task_adapters(monkeypatch, acp=acp)
+    delegate = _ACPDelegate(env={"original": "untouched"})
+    loop = BoardLoop({"coder": "proto", "repo": str(tmp_path), "env_passthrough": passthrough})
+
+    await loop._drive_task({"id": "bd-env", "title": "audit", "issue_type": "task"}, delegate)
+
+    env = acp.observed["env"]
+    assert env.get("A2A_TOKEN") == ("allowed-task-token" if passthrough else None)
+    assert "PROTOAGENT_HOME" not in env
+    assert env["PB_TASK_TEST_VALUE"] == "ordinary-value"
+    assert delegate.env == {"original": "untouched"}
+    assert os.environ["A2A_TOKEN"] == "allowed-task-token"
+    assert os.environ["PROTOAGENT_HOME"] == "/host-only"
+    assert ("record_delivery", "bd-env", "task deliverable") in store.calls
+
+
+@pytest.mark.parametrize("kind,cwd", [("acp", None), ("a2a", "/ignored")])
+async def test_unscoped_task_preserves_delegate_env(monkeypatch, kind, cwd):
+    adapter = _FakeACPAdapter()
+    _inject_task_adapters(monkeypatch, **{kind: adapter})
+    delegate = _ACPDelegate(type=kind, env={"A2A_TOKEN": "delegate-token"})
+
+    reply = await coder_seam.dispatch_task(delegate, "audit", cwd=cwd, env_passthrough=["A2A_TOKEN"])
+
+    assert reply == "task deliverable"
+    assert adapter.observed["env"] is delegate.env
+    assert adapter.observed["env"] == {"A2A_TOKEN": "delegate-token"}
+    assert adapter.forgot == []
+    assert adapter.torn_down == [delegate.workdir]
 
 
 # ── r4: a task drive never commits, pushes, or opens a PR ──────────────────────────
