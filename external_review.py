@@ -344,12 +344,14 @@ def parse_findings(body: str) -> list[dict] | None:
 
 
 def blocking(findings: list[dict]) -> list[dict]:
-    """The findings a fix round must address: blocker/major AND confirmed/verified."""
+    """The findings a fix round must address: blocker/major AND confirmed/verified,
+    excluding explicitly pre-existing findings."""
     return [
         f
         for f in findings or []
         if str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES
         and str(f.get("verdict") or "").strip().lower() in CONFIRMED_VERDICTS
+        and f.get("scope") != "pre-existing"
     ]
 
 
@@ -368,6 +370,7 @@ def render_findings(verdict: Verdict, pr_url: str = "") -> str:
     head = f"External review FAILED{said} — {verdict.reviewer or 'the QA panel'} at head {verdict.head[:12]}{where}."
     findings = parse_findings(verdict.body)
     must = blocking(findings or [])
+    advisory = [f for f in findings or [] if f.get("scope") == "pre-existing"]
     lines = [head, ""]
     if must:
         lines.append(f"Blocking findings ({len(must)}):")
@@ -385,7 +388,7 @@ def render_findings(verdict: Verdict, pr_url: str = "") -> str:
             note = str(f.get("note") or "").strip()
             if note:
                 lines.append(f"   Reviewer's note: {note[:_EVIDENCE_CHARS]}")
-        rest = len(findings or []) - len(must)
+        rest = len(findings or []) - len(must) - len(advisory)
         if rest > 0:
             lines += ["", f"({rest} other finding(s) were minor, unconfirmed or refuted — not required.)"]
     else:
@@ -394,6 +397,13 @@ def render_findings(verdict: Verdict, pr_url: str = "") -> str:
             "No blocker/major confirmed finding could be read from the review's findings JSON. The review says:"
         )
         lines += ["", text or "(empty review body)"]
+    if advisory:
+        lines += ["", "Advisory (pre-existing, not blocking):"]
+        for i, f in enumerate(advisory, 1):
+            loc = str(f.get("file") or "?")
+            if f.get("line") not in (None, ""):
+                loc += f":{f.get('line')}"
+            lines.append(f"{i}. `{loc}` {str(f.get('claim') or '').strip()}")
     return "\n".join(lines).rstrip()
 
 

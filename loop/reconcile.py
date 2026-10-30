@@ -2899,6 +2899,32 @@ class ReconcileMixin:
                 f"{pr_url}",
             )
             return True
+        findings = external_review.parse_findings(verdict.body)
+        serious = [
+            f
+            for f in findings or []
+            if str(f.get("severity") or "").strip().lower() in external_review.BLOCKING_SEVERITIES
+        ]
+        if (
+            serious
+            and all(f.get("scope") == "pre-existing" for f in serious)
+            and any(str(f.get("verdict") or "").strip().lower() in external_review.CONFIRMED_VERDICTS for f in serious)
+            and not external_review.blocking(findings or [])
+        ):
+            locations = ", ".join(
+                str(f.get("file") or "?") + (f":{f['line']}" if f.get("line") not in (None, "") else "")
+                for f in serious
+            )
+            await asyncio.to_thread(
+                self._note_external_hold,
+                store,
+                fid,
+                head,
+                f"the external review FAILED at head {short}, but its blocking findings are "
+                f"Advisory (pre-existing, not blocking): {locations}. No fix round is dispatched; "
+                f"the PR remains held until the panel passes: {pr_url}",
+            )
+            return True
         await self._record_external_bounce(
             store,
             feature,

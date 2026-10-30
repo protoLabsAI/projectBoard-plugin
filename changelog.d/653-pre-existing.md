@@ -1,0 +1,1 @@
+Pre-existing QA panel findings are advisory and rendered separately. A panel FAIL with only pre-existing blocking findings holds the PR with an advisory note instead of dispatching a fix round or spending the external review fix budget. Refs #653.
