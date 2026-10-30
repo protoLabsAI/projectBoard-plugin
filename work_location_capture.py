@@ -169,7 +169,7 @@ class Capture:
                 for path in structured_paths(event):
                     if len(self.paths) >= MAX_PATHS:
                         break
-                    if not self._is_internal(path):
+                    if not self._is_internal(path) and not sweep.coder_scratch(path):
                         self.paths.add(path)
             except Exception:  # noqa: BLE001 — a monitoring concern must never break a build
                 log.warning("[project_board] work-location observe failed (ignored)", exc_info=True)
@@ -197,6 +197,9 @@ class Capture:
         try:
             roots = sweep.approved_roots()
             self._discover_git_roots(roots)
+            # A readable plain file outside every repository is a log or note, not a work
+            # location (#650); a file inside one stays as that repo's evidence record.
+            self.paths = {p for p in self.paths if not self._loose_file(Path(p), roots)}
             if not self.paths:
                 return
             ledger = {e.get("path"): e for e in self.store.list_work_locations(self.fid).get("entries", [])}
@@ -210,6 +213,16 @@ class Capture:
                     log.warning("[project_board] work-location capture failed for %s (ignored)", path, exc_info=True)
         except Exception:  # noqa: BLE001 — the whole drain is best-effort monitoring
             log.warning("[project_board] work-location drain failed (ignored)", exc_info=True)
+
+    def _loose_file(self, path, roots):
+        if not sweep.authorized(path, roots) or not path.is_file():
+            return False
+        for parent in path.parents:
+            if not sweep.authorized(parent, roots):
+                return True
+            if (parent / ".git").exists():
+                return False
+        return True
 
     def _discover_git_roots(self, roots):
         # File locations retain their own evidence record. Discover an enclosing git root
