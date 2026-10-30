@@ -2325,8 +2325,9 @@ async def test_dispatch_coder_tapped_maps_a_seam_timeout_to_coder_timeout(monkey
         await real_asyncio.sleep(10)
         return "never"
 
-    async def _boom_wait_for(coro, timeout, *, slice_s=None):
-        coro.close()
+    async def _boom_wait_for(aw, timeout, *, slice_s=None):
+        # The activity-aware bound hands the clock a shielded future, not the coroutine.
+        aw.close() if real_asyncio.iscoroutine(aw) else aw.cancel()
         raise real_asyncio.TimeoutError()
 
     monkeypatch.setattr(sys.modules["infra.clock"], "wait_for", _boom_wait_for)

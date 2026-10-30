@@ -762,6 +762,25 @@ def _stamp_timeout(fid: str | None, gen: int, timeout) -> None:
     progress_stop_reason(fid, gen, f"{TIMED_OUT_REASON} after {timeout}s")
 
 
+def _idle_probe(fid: str | None, gen: int):
+    """Seconds since this gen's last stream event, for worktree.coder_bound's activity-aware
+    budget; None (no live buffer) keeps the plain hard bound."""
+
+    def idle_s():
+        buf = _buf(fid, gen)
+        return None if buf is None else max(0.0, _monotonic() - buf.last_event)
+
+    return idle_s
+
+
+def _timeout_message(fid: str | None, gen: int, timeout) -> str:
+    # Keeps the "coder timed out after {timeout}s" prefix failures.py and the drive parse.
+    buf = _buf(fid, gen)
+    elapsed = _monotonic() - buf.started if buf is not None else 0.0
+    extended = f" (extended to {elapsed:.0f}s while still active)" if timeout and elapsed > timeout + 1 else ""
+    return f"coder timed out after {timeout}s{extended}"
+
+
 # ── Persist finished gens to the bead (#226) ────────────────────────────────────
 # The WRITE side of the coder-monitor history (#226): when a gen finishes, its live
 # snapshot is serialized to a `coder-monitor: {…}` JSON bead comment so the drawer
@@ -1139,15 +1158,16 @@ async def _dispatch_coder_tapped(
         # **kwargs proves nothing about what the seam does with it.
         if _seam_accepts(tapped, "on_plan"):
             stream_kw["on_plan"] = _plan_cb
-        coro = tapped(scoped, prompt, timeout=timeout, **stream_kw)
-        result = await worktree.coder_bound(coro, timeout)
+        # The seam's own bound is the ceiling; the board enforces the activity-aware budget.
+        coro = tapped(scoped, prompt, timeout=worktree.coder_ceiling(timeout), **stream_kw)
+        result = await worktree.coder_bound(coro, timeout, idle_s=_idle_probe(fid, gen))
     except asyncio.CancelledError:
         # Turn stopped (operator/watchdog): the public seam already dropped the pooled
         # client + SIGKILLed the tree on its way out — nothing for the board to clean up.
         raise
     except asyncio.TimeoutError:
         _stamp_timeout(fid, gen, timeout)
-        raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
+        raise worktree.CoderTimeout(_timeout_message(fid, gen, timeout))
     except Exception as exc:  # noqa: BLE001 — normalise every below-seam failure to the
         # adapter path's contract: nothing propagates raw; a dispatch failure surfaces as
         # WorktreeError (this is error normalisation, NOT a fallback — see the seam-absent
@@ -1282,7 +1302,7 @@ async def _dispatch_coder_tapped_legacy(
     # Old adapter-path semantics: no configured timeout = UNBOUNDED dispatch. The host
     # client requires a number (it logs int(timeout)), so "unbounded" rides a 24h
     # sentinel instead of the 600s floor the first tap draft imposed (panel round 2).
-    prompt_timeout = timeout or getattr(scoped, "timeout_s", None) or 86400.0
+    prompt_timeout = worktree.coder_ceiling(timeout) or getattr(scoped, "timeout_s", None) or 86400.0
     timed_out = False
     try:
         coro = client.prompt(
@@ -1292,7 +1312,7 @@ async def _dispatch_coder_tapped_legacy(
             text_callback=_answer_cb,
             timeout=prompt_timeout,
         )
-        reply = await worktree.coder_bound(coro, timeout)
+        reply = await worktree.coder_bound(coro, timeout, idle_s=_idle_probe(fid, gen))
         progress_usage(fid, gen, getattr(client, "last_usage", None) or {})
         return reply
     except asyncio.CancelledError:
@@ -1306,7 +1326,7 @@ async def _dispatch_coder_tapped_legacy(
         raise
     except asyncio.TimeoutError:
         timed_out = True
-        raise worktree.CoderTimeout(f"coder timed out after {timeout}s")
+        raise worktree.CoderTimeout(_timeout_message(fid, gen, timeout))
     except (AcpError, DelegateError) as exc:
         raise worktree.WorktreeError(f"coder dispatch failed: {exc}")
     except Exception as exc:  # noqa: BLE001 — restore the adapter path's contract: nothing

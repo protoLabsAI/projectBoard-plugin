@@ -34,6 +34,26 @@ def authorized(path, roots):
     return path.is_absolute() and any(path.resolve().is_relative_to(root) for root in roots)
 
 
+def coder_scratch(path) -> bool:
+    """The coder's own session state, never the card's work (#650): Claude Code task output
+    under ``<tmp>/claude-*`` and the coder's home state (``~/.claude``, ``~/.codex``). A pure
+    string check — the path may sit outside every approved root, so it is never stat'ed."""
+    text = os.path.normpath(str(path))
+    home = os.path.expanduser("~")
+    for root in (os.path.join(home, ".claude"), os.path.join(home, ".codex")):
+        if text == root or text.startswith(root + os.sep):
+            return True
+    tmps = {"/tmp", "/private/tmp", os.path.normpath(tempfile.gettempdir())}
+    return any(text.startswith(os.path.join(tmp, "claude-")) for tmp in tmps)
+
+
+def _silent(risk, entry):
+    """An unreadable location with no recorded identity (no sha, branch or remote ref) has
+    nothing known to be at risk, so its authorization state alone never alerts (#650): a
+    coder's scratch log in ``/tmp`` would otherwise page the operator once per file."""
+    return set(risk) <= {"authorization required"} and not any(entry.get(k) for k in ("sha", "branch", "remote_ref"))
+
+
 def git(path, *args, deadline, alternate_objects=None, timeout=2.0):
     """REAL seam: bare-origin/clone coverage in test_work_location_sweep.py.
 
@@ -245,7 +265,12 @@ class Sweep:
                 else feature.get("work_locations") or {}
             )
             # Pathless pushed reports are remote evidence, not external checkouts.
-            entries = [entry for entry in ledger.get("entries", []) if entry.get("path", "").strip()]
+            # The coder's own session state is never work, including entries recorded before #650.
+            entries = [
+                entry
+                for entry in ledger.get("entries", [])
+                if entry.get("path", "").strip() and not coder_scratch(entry["path"])
+            ]
             if not entries or ledger.get("errors"):
                 continue
             first = self.location_offsets.get(feature["id"], 0) % len(entries)
@@ -297,7 +322,7 @@ class Sweep:
         material = transition or facts.get("status") != old.get("status") or pushed != entry.get("pushed")
         if material:
             store.record_work_location(feature["id"], state)
-        if transition:
+        if transition and not (_silent(risk, entry) and _silent(old.get("risks", []), entry)):
             incident = hashlib.sha256(json.dumps([key, cycle, risk]).encode()).hexdigest()
             notify(
                 feature["id"],

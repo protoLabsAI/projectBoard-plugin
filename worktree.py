@@ -87,7 +87,20 @@ class CoderTimeout(WorktreeError):
     on the same prompt would likely hang again)."""
 
 
-async def coder_bound(aw, timeout):
+# A coder still streaming at its budget is extended in slices of this size, up to
+# CODER_CEILING_FACTOR × the budget; one silent for CODER_IDLE_GRACE_S is not (it matches
+# the default ``provider_stall_idle_s``, so a stall killed late still reads as a stall).
+CODER_EXTEND_SLICE_S = 300.0
+CODER_CEILING_FACTOR = 2.0
+CODER_IDLE_GRACE_S = 600.0
+
+
+def coder_ceiling(timeout):
+    """The hard cap an activity-extended dispatch may run to (falsy = unbounded)."""
+    return timeout * CODER_CEILING_FACTOR if timeout else timeout
+
+
+async def coder_bound(aw, timeout, *, idle_s=None):
     """Await a coder dispatch under its ``coder_timeout_s`` bound, counting time asleep (#472).
 
     ``asyncio.wait_for`` runs on ``time.monotonic()``, which on macOS stops while the machine
@@ -95,12 +108,39 @@ async def coder_bound(aw, timeout):
     ``infra.clock.wait_for`` keeps the deadline on a clock that counts sleep; otherwise it
     behaves like ``asyncio.wait_for`` (cancels ``aw`` and raises ``TimeoutError``). A falsy
     ``timeout`` is unbounded, as before. The host import is lazy like every other host import
-    here; there is no fallback, since ``min_protoagent_version`` (0.185.0) guarantees it."""
+    here; there is no fallback, since ``min_protoagent_version`` (0.185.0) guarantees it.
+
+    ``idle_s`` (seconds since the coder's last stream event, or None when unknown) makes the
+    budget activity-aware: a coder still working when ``timeout`` runs out is given another
+    slice at a time, up to ``coder_ceiling(timeout)``, instead of being killed mid-edit. Six
+    such kills in a day had their last event 0–42s before the timeout."""
     if not timeout:
         return await aw
     from infra.clock import wait_for
 
-    return await wait_for(aw, timeout)
+    if idle_s is None:
+        return await wait_for(aw, timeout)
+    task = asyncio.ensure_future(aw)
+    ceiling, spent, budget = coder_ceiling(timeout), 0.0, timeout
+    try:
+        while True:
+            try:
+                # Shielded: a slice running out must not cancel the coder we may extend.
+                return await wait_for(asyncio.shield(task), budget)
+            except asyncio.TimeoutError:
+                spent += budget
+                idle = idle_s()
+                if spent >= ceiling or idle is None or idle >= CODER_IDLE_GRACE_S:
+                    raise
+                budget = min(CODER_EXTEND_SLICE_S, ceiling - spent)
+                log.info(
+                    "[project_board] coder still active at %.0fs (idle %.0fs) — extending %.0fs", spent, idle, budget
+                )
+    except BaseException:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise
 
 
 class WorktreeMissing(WorktreeError):

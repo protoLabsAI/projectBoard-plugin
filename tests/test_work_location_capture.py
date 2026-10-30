@@ -8,6 +8,7 @@ publishes. The drive drains at each dispatch boundary, with an outer finally as 
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -526,3 +527,25 @@ async def test_each_attempt_persists_before_next_attempt_or_hold(repos, monkeypa
         release.set()
         await task
     assert latest(store)["sha"] != entry["sha"]
+
+
+# #650: coder scratch and loose log files are not captured as work locations.
+async def test_capture_skips_coder_scratch(repos):
+    project, _, _, _ = repos
+    store = Store()
+    c = capture.Capture(store, "bd-test", project)
+    await run(c, {"locations": [{"path": "/private/tmp/claude-501/s/tasks/a.output"}]})
+    await run(c, {"input": {"file_path": os.path.expanduser("~") + "/.claude/projects/x/memory/MEMORY.md"}})
+    assert not store.comments
+
+
+async def test_capture_drops_a_readable_log_outside_any_repo(repos, tmp_path):
+    project, external, _, _ = repos
+    log_file = tmp_path / "gate.log"
+    log_file.write_text("ok")
+    store = Store()
+    await run(capture.Capture(store, "bd-test", project), {"locations": [{"path": str(log_file)}]})
+    assert not store.comments
+    # A file inside a repository still records that repo (and itself as evidence).
+    await run(capture.Capture(store, "bd-test", project), {"locations": [{"path": str(external / "evidence")}]})
+    assert str(external) in {e["path"] for e in store.list_work_locations("bd-test")["entries"]}

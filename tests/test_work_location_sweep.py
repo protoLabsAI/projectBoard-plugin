@@ -1,6 +1,7 @@
 """REAL external seam coverage: read-only probes against a bare origin and clones."""
 
 import asyncio
+import os
 import subprocess
 import threading
 import time
@@ -319,3 +320,70 @@ def test_expired_budget_resumes_at_uninspected_location(monkeypatch):
     assert seen == ["0", "1"]
     worker.check(board, lambda *a, **kw: None)
     assert seen == ["0", "1", "2", "3"]
+
+
+# #650: a coder's own session state is never work, and an unreadable location with
+# nothing recorded about it never pages the operator.
+HOME = os.path.expanduser("~")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/private/tmp/claude-501/-Users-kj-dev-protoAgent/0c1d/tasks/b9gu70zom.output",
+        "/tmp/claude-501/slug/session/tasks/x.output",
+        f"{HOME}/.claude/projects/-Users-kj-dev-protoAgent-team/memory/MEMORY.md",
+        f"{HOME}/.codex/sessions/rollout.jsonl",
+    ],
+)
+def test_coder_session_state_is_scratch(path):
+    assert sweep.coder_scratch(path)
+
+
+@pytest.mark.parametrize(
+    "path", ["/tmp/h1c-gate.log", "/tmp/scratch-repo", f"{HOME}/dev/protoAgent", f"{HOME}/.claudeX"]
+)
+def test_other_paths_are_not_scratch(path):
+    assert not sweep.coder_scratch(path)
+
+
+def _board(entry):
+    feature = {"id": "bd-1", "work_locations": {"entries": [entry]}}
+
+    def record(fid, state):
+        feature["work_locations"]["entries"] = [work_locations.validate(state)]
+
+    return SimpleNamespace(list_features=lambda: [feature], record_work_location=record), feature
+
+
+def test_unreadable_location_without_identity_does_not_alert(monkeypatch):
+    monkeypatch.setattr(sweep, "approved_roots", lambda: [])
+    board, feature = _board(work_locations.validate({"id": "log", "path": "/tmp/h1c-gate.log", "purpose": "evidence"}))
+    notices = []
+    worker = sweep.Sweep()
+    worker.check(board, lambda *a, **kw: notices.append(a))
+    worker.check(board, lambda *a, **kw: notices.append(a))
+    assert notices == []
+    # The state is still recorded, so the card's ledger shows the location as unverified.
+    assert feature["work_locations"]["entries"][0]["last_check"]["risks"] == ["authorization required"]
+
+
+def test_unreadable_location_with_a_recorded_commit_still_alerts(monkeypatch):
+    monkeypatch.setattr(sweep, "approved_roots", lambda: [])
+    entry = work_locations.validate({"id": "repo", "path": "/tmp/scratch-repo", "purpose": "work", "sha": "a" * 40})
+    board, _ = _board(entry)
+    notices = []
+    sweep.Sweep().check(board, lambda *a, **kw: notices.append(a))
+    assert len(notices) == 1 and "authorization required" in notices[0][1]
+
+
+def test_sweep_ignores_scratch_entries_recorded_before_the_fix(monkeypatch):
+    monkeypatch.setattr(sweep, "approved_roots", lambda: [])
+    probes = []
+    monkeypatch.setattr(sweep, "probe", lambda *a, **kw: probes.append(a) or {"status": "unknown", "pushed": None})
+    entry = work_locations.validate(
+        {"id": "out", "path": "/private/tmp/claude-501/s/tasks/a.output", "purpose": "evidence", "sha": "b" * 40}
+    )
+    board, _ = _board(entry)
+    sweep.Sweep().check(board, lambda *a, **kw: None)
+    assert probes == []

@@ -32,6 +32,12 @@ from project_board import coder_seam, worktree
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# The tapped paths are activity-aware: the fake clock expires every wait at once, so the
+# just-started (never idle) coder runs its budget, then extension slices up to 2 × 1800s,
+# every one of them on the host's sleep-counting clock.
+EXTENDED = [1800] + [worktree.CODER_EXTEND_SLICE_S] * 6
+
+
 @pytest.fixture
 def clock(monkeypatch):
     """Replace ``infra.clock.wait_for`` with a recorder whose deadline has always passed:
@@ -85,7 +91,7 @@ async def test_the_public_seam_dispatch_is_bounded_by_the_host_clock(clock):
         await coder_seam.dispatch_coder_tapped(
             _FakeCoder(), "/wt", "x", fid="bd-472a", gen=1, timeout=1800, _dispatch_tapped=_seam
         )
-    assert clock == [1800]
+    assert clock == EXTENDED
 
 
 async def test_the_legacy_tap_dispatch_is_bounded_by_the_host_clock(clock, monkeypatch):
@@ -93,7 +99,7 @@ async def test_the_legacy_tap_dispatch_is_bounded_by_the_host_clock(clock, monke
     _install_pre_c1_host(monkeypatch, _FakeAcpClient())
     with pytest.raises(worktree.CoderTimeout):
         await coder_seam.dispatch_coder_tapped(_FakeCoder(), "/wt", "x", fid="bd-472b", gen=1, timeout=1800)
-    assert clock == [1800]
+    assert clock == EXTENDED
 
 
 async def test_the_untapped_dispatch_is_bounded_by_the_host_clock(clock, monkeypatch):
