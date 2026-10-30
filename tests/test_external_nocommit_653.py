@@ -29,6 +29,7 @@ import project_board.loop as loop_mod
 from project_board.loop import BoardLoop
 from project_board.loop._common import (
     EXTERNAL_FINDING_DECLINED_REASON,
+    _declined_coder_reason,
     _external_bounce_head,
     _is_external_finding_block,
 )
@@ -106,6 +107,7 @@ async def test_external_bounce_no_commit_blocks_once_for_the_operator(monkeypatc
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
         dispatches.append(prompt)
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {}})
         return DECLINE
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
@@ -140,7 +142,8 @@ async def test_external_bounce_no_commit_block_omits_coder_reason_when_reply_is_
     """ "…plus the coder's reason when present": an empty reply leaves the base reason alone."""
 
     async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
-        return ""  # the coder said nothing
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {}})
+        return ""  # the coder executed but said nothing
 
     async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
         raise AssertionError("still no PR")
@@ -340,3 +343,51 @@ def test_external_finding_reason_is_the_exact_operator_marker():
     """The reason string the drive writes and the unblock reads must stay in lockstep — a
     drift would silently route the override past the out-of-scope branch."""
     assert EXTERNAL_FINDING_DECLINED_REASON == "needs operator: external finding the coder declined"
+
+
+@pytest.mark.parametrize("recovers", [False, True], ids=["retry-exhausted", "retry-executes"])
+async def test_external_bounce_without_tools_retries_before_decline(monkeypatch, recovers):
+    dispatches = []
+
+    async def _dispatch(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        dispatches.append(prompt)
+        if recovers and len(dispatches) == 2:
+            coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Read", "id": "t1", "input": {}})
+            return DECLINE
+        return ""
+
+    async def _open_pr(*args, **kwargs):
+        raise AssertionError("no commit to push")
+
+    store = _EscalatingStore(tiers=["smart"])
+    await _run_fix_round(
+        monkeypatch,
+        feature=_fix_round_feature(labels=[LABEL_IN_REVIEW, STAMP]),
+        dispatch=_dispatch,
+        open_pr=_open_pr,
+        store=store,
+    )
+    attempts = [c for c in store.calls if c[0] == "record_attempt"]
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    assert "same_tier_retry" in str(attempts[0])
+    if recovers:
+        assert len(dispatches) == 2
+        assert len(attempts) == 1
+        assert store.escalated == []
+        assert blocked[0][2].startswith(EXTERNAL_FINDING_DECLINED_REASON)
+    else:
+        assert len(dispatches) == 4  # fast and smart each get a same-tier retry
+        assert len(attempts) == 4
+        assert len(store.escalated) == 2
+        assert "empty_result:" in blocked[0][2]
+        assert "same-tier retry exhausted" in blocked[0][2]
+        assert EXTERNAL_FINDING_DECLINED_REASON not in blocked[0][2]
+
+
+def test_declined_coder_reason_uses_last_summary_and_truncates():
+    reply = "Narration\n## Summary\nOld reason\n## Summary\nFinal reason with details"
+    assert _declined_coder_reason(reply) == "## Summary\nFinal reason with details"
+    assert _declined_coder_reason(reply, limit=20) == "## Summary\nFinal rea"
+    assert _declined_coder_reason("  No summary  ") == "No summary"
+    assert _declined_coder_reason("") == ""

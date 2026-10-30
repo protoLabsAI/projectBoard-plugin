@@ -2850,48 +2850,6 @@ class DriveMixin:
                     # ladder proceeds (single coder / ladder top → blocked, reason naming
                     # the class + evidence).
                     if isinstance(exc, worktree.NoChangesError):
-                        # #653: a no-commit fix round that an EXTERNAL review bounce triggered is
-                        # the coder DECLINING the finding, not a failed attempt. The card carries
-                        # this card's `ext-review-bounced:<sha>` stamp (reconcile's
-                        # `_record_external_bounce`) for the head the round resumed (`round_start`),
-                        # and the round ended on that very head with nothing new — so the coder read
-                        # the finding and chose not to act. A stronger model would decline the same
-                        # finding, so there is no ladder to climb: block ONCE for the operator on the
-                        # FIRST occurrence — no attempt counted, no tier climb, no retry. The operator
-                        # then either pushes a fix by hand or rules the finding out of scope
-                        # (`board_unblock_feature --override-review`, audited in `unblock_side_effects`).
-                        # Internal-gate and CI-fix no-commit rounds carry no such stamp for the current
-                        # head, so they fall through and keep today's escalation ladder unchanged.
-                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
-                        if ext_head and (
-                            f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
-                            in (feature.get("labels") or [])
-                        ):
-                            pr = str(feature.get("pr_url") or pr_url or "").strip()
-                            reason = f"{EXTERNAL_FINDING_DECLINED_REASON} — {pr or '(PR url unknown)'}"
-                            coder_reason = _declined_coder_reason(result)
-                            if coder_reason:
-                                reason += f"\n\ncoder: {coder_reason}"
-                            log.warning(
-                                "[project_board] %s blocked (external finding declined — no tier climb, no retry): %s",
-                                fid,
-                                reason,
-                            )
-                            if await self._block_or_stand_aside(
-                                store,
-                                fid,
-                                reason,
-                                category="terminal",
-                                repo=repo,
-                                wt=wt,
-                                branch=branch,
-                                pr_url=pr_url,
-                            ):
-                                # Nothing new was committed, so the tree holds no unpushed work — save
-                                # first all the same (#405), then reap it like the other terminal blocks.
-                                await self._discard_tree(store, fid, repo, wt, branch, base=base)
-                                self._inflight.pop(fid, None)
-                            return
                         had_tools, stop = self._empty_result_signals(fid)
                         if not had_tools:
                             n = await self._budget_get(store, fid, "empty-result", feature) + 1
@@ -2970,6 +2928,48 @@ class DriveMixin:
                             # to take it along (#405).
                             await self._discard_tree(store, fid, repo, wt, branch, base=base)
                             self._inflight.pop(fid, None)
+                            return
+                        # #653: after tool activity, a no-commit fix round from an EXTERNAL bounce is
+                        # the coder DECLINING the finding, not a failed attempt. The card carries
+                        # this card's `ext-review-bounced:<sha>` stamp (reconcile's
+                        # `_record_external_bounce`) for the head the round resumed (`round_start`),
+                        # and the round ended on that very head with nothing new — so the coder read
+                        # the finding and chose not to act. A stronger model would decline the same
+                        # finding, so there is no ladder to climb: block ONCE for the operator on the
+                        # FIRST occurrence — no attempt counted, no tier climb, no retry. The operator
+                        # then either pushes a fix by hand or rules the finding out of scope
+                        # (`board_unblock_feature --override-review`, audited in `unblock_side_effects`).
+                        # Internal-gate and CI-fix no-commit rounds carry no such stamp for the current
+                        # head, so they fall through and keep today's escalation ladder unchanged.
+                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
+                        if ext_head and (
+                            f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
+                            in (feature.get("labels") or [])
+                        ):
+                            pr = str(feature.get("pr_url") or pr_url or "").strip()
+                            reason = f"{EXTERNAL_FINDING_DECLINED_REASON} — {pr or '(PR url unknown)'}"
+                            coder_reason = _declined_coder_reason(result)
+                            if coder_reason:
+                                reason += f"\n\ncoder: {coder_reason}"
+                            log.warning(
+                                "[project_board] %s blocked (external finding declined — no tier climb, no retry): %s",
+                                fid,
+                                reason,
+                            )
+                            if await self._block_or_stand_aside(
+                                store,
+                                fid,
+                                reason,
+                                category="terminal",
+                                repo=repo,
+                                wt=wt,
+                                branch=branch,
+                                pr_url=pr_url,
+                            ):
+                                # Nothing new was committed, so the tree holds no unpushed work — save
+                                # first all the same (#405), then reap it like the other terminal blocks.
+                                await self._discard_tree(store, fid, repo, wt, branch, base=base)
+                                self._inflight.pop(fid, None)
                             return
                     # A capability failure = the coder didn't deliver (no diff / dispatch
                     # error / timed out). Those are NOT transient-retried (re-running the

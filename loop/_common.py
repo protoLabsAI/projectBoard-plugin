@@ -1943,7 +1943,10 @@ def unblock_side_effects(
 
     ``feature_before`` is the card's projection read BEFORE ``clear_blocked`` (it still carries
     the ``in-review`` label, ``pr_url`` and ``blocked_reason`` a blocked card has). The helper
-    acts ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR (see
+    handles an external-finding-declined block with an explicit override by posting an
+    out-of-scope audit comment, preserving the bounce stamp and returning
+    ``{"review": "out-of-scope", "head": head}``. It posts no gate status or review-clean pin.
+    Otherwise it acts ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR (see
     ``_is_review_gate_block``) and that the loop is NOT still working — anything else (a hand
     block, a different failure, a card no longer blocked, or one the loop still drives) returns
     ``{"review": "n/a"}`` and does nothing. When it acts it reads the PR's LIVE head
