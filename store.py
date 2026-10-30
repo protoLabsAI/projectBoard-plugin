@@ -3903,6 +3903,12 @@ class BeadsBoard:
             return None
         if f["board_state"] != "done":
             fid = f["id"]
+            if f.get("blocked") or f["board_state"] == "blocked":
+                # The external-ref list row may omit comments; read the thread for
+                # the current blocked reason before terminal labels are stripped.
+                full = self.get_feature(fid) or f
+                reason = str(full.get("blocked_reason") or "").strip() or "no reason recorded"
+                self.comment(fid, f"Merged PR {pr_url} supersedes prior blocked reason: {reason}")
             # A merged PR is ground truth (#196): whatever blocked the card is moot once
             # its change shipped — and `br close` refuses while open blocker edges remain
             # (the #145 class cancel already handles) — so clear the blocked label and

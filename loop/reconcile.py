@@ -1154,6 +1154,12 @@ class ReconcileMixin:
             self._card_slots = asyncio.Semaphore(self.reconcile_concurrency)
         lock = self._repo_lock(repo)
         try:
+            # #653: blocked work takes only the observed MERGED edge. A leftover
+            # drive/review hold (or a busy repo's verification gate) must not hide
+            # an admin merge. No OPEN work runs on this path.
+            if f.get("board_state") == "blocked":
+                await self._reconcile_pr(store, f)
+                return
             if self._card_slots.locked() or lock.locked():
                 try:
                     state = await worktree.pr_state(f["pr_url"], cwd=repo)
@@ -1210,7 +1216,11 @@ class ReconcileMixin:
                     # ONE read for the PR's state AND the external panel's verdict (#473): the
                     # state rides the same `gh pr view` as the head, reviews and checks. Unreadable
                     # → the plain state read, and no external verdict this pass (fail open).
-                    view = None if known_state else await worktree.pr_review_state(pr_url, cwd=repo)
+                    view = (
+                        None
+                        if known_state or f.get("board_state") == "blocked"
+                        else await worktree.pr_review_state(pr_url, cwd=repo)
+                    )
                     state = (
                         known_state or str((view or {}).get("state") or "") or await worktree.pr_state(pr_url, cwd=repo)
                     )

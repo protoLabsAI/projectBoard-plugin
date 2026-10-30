@@ -1,0 +1,1 @@
+Fixed blocked cards remaining blocked after their PR was admin-merged. Reconcile now checks their PR state independently of drive/review holds and busy verification gates, closes merged work with an audit comment naming the PR and prior blocked reason, and leaves OPEN or CLOSED blocked work untouched.
