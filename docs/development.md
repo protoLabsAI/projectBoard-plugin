@@ -72,7 +72,7 @@ paper, and a regression that stops a seam issuing its `gh pr` write fails the co
 | `external_review.py` | an external QA panel's verdict on a PR (#473): its config, the FAIL-at-head judge over one `gh pr view` read, and the findings a fix round leads with |
 | `review_coverage_hold.py` | `require_complete_review`: the per-card hold while the panel's pass at the head is incomplete, and the once-per-head `@vera review` summon |
 | `retro.py` | loop-retro mining: bead attempt/outcome history → recurring failure classes (the self-improving flywheel) |
-| `subagents.py` + `skills/` | the `decompose`/`plan_antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain`, `loop-retro`, `showing-board-cards`, `card-from-chat` and `board-tool-reference` skills (the last holds the tool-description detail the `board_*` schemas leave out) |
+| `subagents.py` + `skills/` | the `decompose`/`plan_antagonist` planning layer + the `onboard-project`, `decompose-project`, `cross-repo-chain`, `loop-retro`, `showing-board-cards`, `card-from-chat` and `board-tool-reference` skills, plus the operator chat commands `standup`, `triage-github` and `grilling` (`/grill-me`) (the last holds the tool-description detail the `board_*` schemas leave out) |
 | `__init__.py` | `register()` — wires it all |
 
 Ships **disabled**; nothing runs until you enable it, declare a coder delegate and name

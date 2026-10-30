@@ -23,6 +23,12 @@ Day-to-day operation: agent tools, skills, the HTTP surface and the console view
   adversarial pipeline and populates the board.
 - **Learn from the loop:** the `loop-retro` skill turns `board_retro`'s failure classes
   into written grounding, so a recurring failure becomes a rule instead of a habit.
+- **Chat commands for the operator:** `/standup` writes a status report from the board and
+  open PRs (epics as phases, the critical path, and what needs the operator's call).
+  `/triage-github` scores an issue queue on Value, Level of Effort and Risk, skips issues
+  already on the board, and can turn chosen quick wins into cards when asked. `/grill-me`
+  stress-tests a plan one question at a time and creates nothing until the operator
+  confirms.
 - **A card from chat:** the `card-from-chat` skill. Ask for a feature and the agent
   answers at once with the board's ready-made new-card form (`board_card_form`, a frame
   component the plugin ships: Project, Title, What & why, Acceptance criteria, Priority).

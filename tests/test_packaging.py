@@ -12,6 +12,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,6 +99,23 @@ def test_decompose_skill_frontmatter():
     # It must be able to populate the board and run the per-epic human gate.
     for t in ("board_create_feature", "board_mark_ready", "request_user_input"):
         assert t in fm["tools"], f"decompose skill missing tool {t!r}"
+
+
+# ── the operator chat commands ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "folder,slash",
+    [("standup", "standup"), ("triage-github", "triage-github"), ("grilling", "grill-me")],
+)
+def test_chat_command_skills_are_user_facing(folder, slash):
+    """These ship as `/<slash>` chat commands (ADR 0052): without `user_facing` the host
+    indexes them for the model only and the chat palette never lists them."""
+    fm = yaml.safe_load((ROOT / "skills" / folder / "SKILL.md").read_text().split("---", 2)[1])
+    assert fm["name"] == folder
+    assert fm["user_facing"] is True and fm["slash"] == slash
+    # No shell on a board host: every step must go through a named tool.
+    assert fm["tools"] and all(t.startswith(("board_", "github_")) for t in fm["tools"])
 
 
 # ── the onboarding skill: registration gated on onboarding.enabled (#194) ───────
