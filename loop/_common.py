@@ -724,6 +724,26 @@ def _pr_body(result: str, feature: dict) -> str:
     return body[:4000]
 
 
+def _declined_coder_reason(result: str, *, limit: int = 800) -> str:
+    """The coder's stated reason from its final reply, for a block that quotes it (#653).
+
+    When a fix round that an EXTERNAL review bounce triggered produces no commit, the
+    coder's reply is its explanation for DECLINING the finding. Prefer the coder's own
+    ``## Summary`` section (its deliberate statement, the same one ``_pr_body`` keeps)
+    over earlier narration; fall back to the whole reply. ``""`` when the reply is empty
+    — the caller appends the reason only "when its result text has one". Truncated to
+    ``limit`` chars so a verbose reply can't bloat the block comment."""
+    text = str(result or "").strip()
+    if not text:
+        return ""
+    headings = list(_SUMMARY_HEADING_RE.finditer(text))
+    if headings:
+        summary = text[headings[-1].start() :].strip()
+        if summary:
+            text = summary
+    return text[:limit].strip()
+
+
 # The NO_TEST_NEEDED escape hatch (#264) — structural evidence, not a substring
 # scan: the marker only counts when it stands at line start inside the FINAL
 # ``## Summary`` section (the ``_pr_body`` last-occurrence discipline), which ends
@@ -1825,6 +1845,41 @@ _UNBLOCK_OVERRIDE_STATUS_DESC = "Operator override — review findings accepted 
 _REVIEW_GATE_BLOCK_MARKERS = ("fix attempt(s)", "needs human review")
 
 
+# #653: the reason a drive writes when a fix round that an EXTERNAL review bounce
+# triggered produces NO new commit — the coder ran and DECLINED the finding rather than
+# committing a change it judged out of scope. A terminal block owned by the operator: the
+# ladder is never climbed (a stronger model would decline the same finding), and the
+# operator either pushes a fix by hand or rules the finding out of scope
+# (``board_unblock_feature --override-review``), which ``unblock_side_effects`` audits. The
+# ``ext-review-bounced:<sha>`` stamp is LEFT on the head through all of this, so reconcile's
+# panel edge keeps HOLDING that head instead of dispatching another fix round for it.
+EXTERNAL_FINDING_DECLINED_REASON = "needs operator: external finding the coder declined"
+
+
+def _is_external_finding_block(feature_before: dict) -> bool:
+    """True ONLY for a card the drive terminal-blocked because a fix round an EXTERNAL
+    review bounce triggered produced no commit (#653) — the coder declined the finding.
+    Keyed off the #653 marker in the ``blocked_reason``, the same shape
+    ``_is_review_gate_block`` uses, and only while the card is still blocked (so a stale
+    reason comment on an already-unblocked card reads False)."""
+    labels = set(feature_before.get("labels") or [])
+    blocked_now = LABEL_BLOCKED in labels or feature_before.get("board_state") == "blocked"
+    reason = str(feature_before.get("blocked_reason") or "")
+    return blocked_now and EXTERNAL_FINDING_DECLINED_REASON in reason
+
+
+def _external_bounce_head(feature: dict) -> str:
+    """The short sha stamped in this card's ``ext-review-bounced:<sha>`` label (#473), or
+    ``""``. The head an external review bounced; #653 names it in the out-of-scope audit
+    comment so the trail records exactly which head the operator ruled on."""
+    prefix = store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX
+    for label in feature.get("labels") or []:
+        text = str(label)
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return ""
+
+
 def _is_review_gate_block(feature_before: dict) -> bool:
     """True ONLY for a card the in-loop review gate itself blocked by exhausting its
     review-fix budget. Requires BOTH that the card is still blocked (the projection is read
@@ -1888,7 +1943,10 @@ def unblock_side_effects(
 
     ``feature_before`` is the card's projection read BEFORE ``clear_blocked`` (it still carries
     the ``in-review`` label, ``pr_url`` and ``blocked_reason`` a blocked card has). The helper
-    acts ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR (see
+    handles an external-finding-declined block with an explicit override by posting an
+    out-of-scope audit comment, preserving the bounce stamp and returning
+    ``{"review": "out-of-scope", "head": head}``. It posts no gate status or review-clean pin.
+    Otherwise it acts ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR (see
     ``_is_review_gate_block``) and that the loop is NOT still working — anything else (a hand
     block, a different failure, a card no longer blocked, or one the loop still drives) returns
     ``{"review": "n/a"}`` and does nothing. When it acts it reads the PR's LIVE head
@@ -1911,6 +1969,26 @@ def unblock_side_effects(
     labels = set(feature_before.get("labels") or [])
     pr_url = str(feature_before.get("pr_url") or "").strip()
     in_review = LABEL_IN_REVIEW in labels or feature_before.get("board_state") == "in_review"
+    # #653: an EXTERNAL-finding-declined block is the drive's terminal hold for a no-commit
+    # fix round after an external review bounce (the coder judged the finding out of scope).
+    # It is NOT a review-gate block, so the re-arm / override-the-gate machinery below does
+    # not apply — its override meaning is the OPERATOR ruling the finding out of scope. Record
+    # that in an audit comment and stop. The ``ext-review-bounced:<sha>`` stamp is LEFT on the
+    # head on purpose: reconcile's panel edge keeps HOLDING that head, so the loop never
+    # dispatches another fix round for it. Only on an explicit override — a plain unblock of
+    # such a card asks the coder to try again, which is today's unchanged path.
+    if override_review and _is_external_finding_block(feature_before):
+        short = _external_bounce_head(feature_before)
+        result = {"review": "out-of-scope"}
+        if short:
+            result["head"] = short
+        note = f"operator ruled out of scope: external finding at head {short or '?'}"
+        try:
+            store.comment(fid, note)
+        except Exception as exc:  # noqa: BLE001 — the unblock already happened; the trail is best-effort
+            result["comment_error"] = str(exc)[:300]
+            log.warning("[project_board] %s unblock out-of-scope: audit comment not posted: %s", fid, exc)
+        return result
     # Act ONLY on a card the REVIEW GATE itself blocked while it was an in_review PR with a PR.
     # A blanket in_review+pr_url guard also re-armed a hand-blocked card, a card blocked for a
     # different reason, and (with override) a card carrying a valid review-clean verdict — each
@@ -2218,6 +2296,10 @@ __all__ = [
     "_requirement_gate_diagnostics",
     "_requirement_gate_diag_line",
     "_pr_body",
+    "_declined_coder_reason",
+    "EXTERNAL_FINDING_DECLINED_REASON",
+    "_is_external_finding_block",
+    "_external_bounce_head",
     "_NO_TEST_MARKER_RE",
     "_no_test_marker",
     "_ISSUE_URL_RE",
