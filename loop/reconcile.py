@@ -1147,18 +1147,29 @@ class ReconcileMixin:
         re-read: the snapshot it was started from may be minutes old, and in that time the
         card may have been requeued and claimed, blocked, or re-pointed at another PR. A
         stall is recorded for the next tick to end on (#404) and re-raised for an awaiting
-        caller."""
+        caller.
+
+        A ``blocked`` card is the one exception (#653): a merged PR is ground truth for it
+        too, so the MERGED edge is checked OUTSIDE the slot/lock — exactly like the queued
+        terminal fast-path below — so a stale drive/review hold or a busy repo can't hide an
+        admin merge. The one hold-gated step is the destructive worktree reap: it is passed
+        ``reap=not _card_held`` so it never runs under a live drive/review (#471); a held
+        card still closes, and the orphan sweep reaps its done tree once the hold clears.
+        No OPEN-branch gate (rebase/CI/review) ever runs on this path."""
         fid = f["id"]
         repo = self._repo_for(f)
         if self._card_slots is None:
             self._card_slots = asyncio.Semaphore(self.reconcile_concurrency)
         lock = self._repo_lock(repo)
         try:
-            # #653: blocked work takes only the observed MERGED edge. A leftover
-            # drive/review hold (or a busy repo's verification gate) must not hide
-            # an admin merge. No OPEN work runs on this path.
+            # #653: blocked work takes only the observed MERGED edge, checked here —
+            # outside the slot/lock — so a leftover drive/review hold or a busy repo
+            # can't hide an admin merge. The merge is recorded (card → done) regardless
+            # of the hold; only the destructive worktree reap is hold-gated, so it never
+            # runs under a live drive/review (#471) — the orphan sweep reaps the done
+            # card's tree once the hold clears. No OPEN-branch gate runs on this path.
             if f.get("board_state") == "blocked":
-                await self._reconcile_pr(store, f)
+                await self._reconcile_pr(store, f, reap=not self._card_held(fid))
                 return
             if self._card_slots.locked() or lock.locked():
                 try:
@@ -1201,9 +1212,14 @@ class ReconcileMixin:
             self._card_stall = exc
             raise
 
-    async def _reconcile_pr(self, store, f: dict, *, known_state: str = ""):
+    async def _reconcile_pr(self, store, f: dict, *, known_state: str = "", reap: bool = True):
         """The per-card body of ``_reconcile_prs`` (#462), unchanged: a one-card loop, so
-        its ``continue`` still means "nothing further for this card this pass"."""
+        its ``continue`` still means "nothing further for this card this pass".
+
+        ``reap=False`` records the terminal edge (the card still closes) but SKIPS the
+        destructive ``reap_feature_worktree`` — the #653 blocked path uses it so an admin
+        merge on a card a drive/review still holds closes the card without tearing the live
+        worktree out from under that round (#471); the orphan sweep reaps it later."""
         for f in (f,):  # noqa: B020 — see the docstring
             fid = f["id"]
             pr_url = f.get("pr_url")
@@ -1231,7 +1247,8 @@ class ReconcileMixin:
                         review_coverage_hold.clear_hold(fid)
                     if state == "MERGED":
                         if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
-                            await worktree.reap_feature_worktree(repo, self.root, fid)
+                            if reap:
+                                await worktree.reap_feature_worktree(repo, self.root, fid)
                             self._ci_feedback.pop(fid, None)
                             self._review_prior.pop(fid, None)
                             # Merge edge: EVERY fix budget resets — cache and the bead's

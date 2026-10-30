@@ -3903,12 +3903,20 @@ class BeadsBoard:
             return None
         if f["board_state"] != "done":
             fid = f["id"]
+            # #653: a merged PR supersedes any blocked reason — record that in the audit
+            # trail. CAPTURE the reason now (the external-ref list row may omit comments,
+            # and the strip below drops the `blocked` label get_feature reads it under), but
+            # POST the comment only AFTER the close lands: a read failure here must not stop
+            # the close, and a failed/rolled-back close must not leave a duplicate comment
+            # for the next pass to repeat. A re-read failure falls back to the list row.
+            blocked_note = ""
             if f.get("blocked") or f["board_state"] == "blocked":
-                # The external-ref list row may omit comments; read the thread for
-                # the current blocked reason before terminal labels are stripped.
-                full = self.get_feature(fid) or f
+                try:
+                    full = self.get_feature(fid) or f
+                except BoardError:
+                    full = f
                 reason = str(full.get("blocked_reason") or "").strip() or "no reason recorded"
-                self.comment(fid, f"Merged PR {pr_url} supersedes prior blocked reason: {reason}")
+                blocked_note = f"Merged PR {pr_url} supersedes prior blocked reason: {reason}"
             # A merged PR is ground truth (#196): whatever blocked the card is moot once
             # its change shipped — and `br close` refuses while open blocker edges remain
             # (the #145 class cancel already handles) — so clear the blocked label and
@@ -3931,6 +3939,10 @@ class BeadsBoard:
                         blocker_id,
                     )
             self._close_restoring_stale(fid, stale, "-r", f"merged: {pr_url}")
+            if blocked_note:
+                # Best-effort (comment() swallows br errors) and only here, past a close
+                # that landed — so the note is posted exactly once, on the pass that closes.
+                self.comment(fid, blocked_note)
         return self.get_feature(f["id"])
 
     # ── the MANUAL Done edge (#228): shipped outside the board's PR lifecycle ──

@@ -1,4 +1,10 @@
-"""A shipped PR wins over every blocked reason, including stale loop holds (#653)."""
+"""A shipped PR wins over every blocked reason, including stale loop holds (#653).
+
+bd-jq56.6 sat ``blocked`` after its PR (protoAgent#4581, a DIFFERENT repo) was admin-
+merged: the reconcile gated the whole blocked pass on ``_card_held``, so a leftover
+drive/review hold kept the card skipped forever. The merge must now close the card
+INDEPENDENTLY of the hold — but the destructive worktree reap stays hold-gated, so it
+never tears a live drive/review's tree out from under it (#471)."""
 
 import asyncio
 from copy import deepcopy
@@ -13,6 +19,12 @@ from project_board.store import BeadsBoard
 
 PR = "https://github.com/protoLabsAI/protoAgent/pull/4581"
 FID = "bd-jq56.6"
+
+# Every hold class ``_card_held`` can report, plus a busy repo (lock + no slots free).
+# A real hold means a drive/review owns the tree → close but DON'T reap; "" / "busy repo"
+# are unheld → reap too.
+HELD = ("a drive holds it", "its review gate is running", "review is no longer running")
+UNHELD = ("", "busy repo")
 
 
 class BlockedStore(BeadsBoard):
@@ -74,9 +86,7 @@ class BlockedStore(BeadsBoard):
 
 
 @pytest.mark.parametrize("block_class", ["attempt-exhausted", "terminal", "review-budget", "too-wide", "manual"])
-@pytest.mark.parametrize(
-    "hold", ["", "a drive holds it", "its review gate is running", "review is no longer running", "busy repo"]
-)
+@pytest.mark.parametrize("hold", [*UNHELD, *HELD])
 @pytest.mark.parametrize("state", ["MERGED", "OPEN", "CLOSED"])
 async def test_blocked_pr_reconciles_only_merged(monkeypatch, block_class, hold, state):
     store = BlockedStore(block_class)
@@ -110,23 +120,34 @@ async def test_blocked_pr_reconciles_only_merged(monkeypatch, block_class, hold,
         if lock.locked():
             lock.release()
     read.assert_awaited_once_with(PR, cwd="/repos/protoAgent")
-    forbidden.assert_not_awaited()
-    if state == "MERGED":
-        assert store.feature["board_state"] == "done"
-        assert not store.feature["blocked"]
-        assert "blocked" not in store.feature["labels"]
-        assert not any(label.startswith("blocked-class:") for label in store.feature["labels"])
-        assert len(store.comments) == 1
-        assert PR in store.comments[0]
-        assert before["blocked_reason"] in store.comments[0]
-        assert store.cleared == [FID]
-        reap.assert_awaited_once_with("/repos/protoAgent", loop.root, FID)
-        # Repeated reconciles and webhook delivery are idempotent.
-        await loop._reconcile_prs()
-        store.record_merge(pr_url=PR)
-        assert len(store.comments) == 1
-    else:
+    forbidden.assert_not_awaited()  # neither the review read nor any OPEN-branch gate runs
+    if state != "MERGED":
+        # OPEN / CLOSED leave a blocked card exactly as it was — no close, no reap, no
+        # comment, whatever the hold — its blocked reason is deliberate.
         assert store.feature == before
         assert store.commands == []
         assert store.cleared == []
         reap.assert_not_awaited()
+        return
+    # MERGED is ground truth regardless of the hold: the card closes done, sheds its
+    # blocked/blocked-class labels, resets budgets, and records ONE audit comment naming
+    # the PR and the prior blocked reason.
+    assert store.feature["board_state"] == "done"
+    assert not store.feature["blocked"]
+    assert "blocked" not in store.feature["labels"]
+    assert not any(label.startswith("blocked-class:") for label in store.feature["labels"])
+    assert store.cleared == [FID]
+    assert len(store.comments) == 1
+    assert PR in store.comments[0]
+    assert before["blocked_reason"] in store.comments[0]
+    # The one hold-gated step: reap the worktree only when nothing else holds the card,
+    # so an admin merge mid-drive/review closes the card WITHOUT tearing out the live tree
+    # (#471) — the orphan sweep reaps the done card's tree once the hold clears.
+    if hold in HELD:
+        reap.assert_not_awaited()
+    else:
+        reap.assert_awaited_once_with("/repos/protoAgent", loop.root, FID)
+    # Repeated reconciles and a late webhook are idempotent: no second close, no dup comment.
+    await loop._reconcile_prs()
+    store.record_merge(pr_url=PR)
+    assert len(store.comments) == 1
