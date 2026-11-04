@@ -28,6 +28,11 @@ from project_board.failures import (
         ('{"codexErrorInfo": "usageLimitExceeded"}', "rate_limit", True),
         ("fable: out of usage credits \u00b7 resets Aug 13", "rate_limit", True),
         # transient infra
+        # #672: 500 is the canonical retryable server fault and belongs with 502/503/504 — the old
+        # `\b50[234]\b` class let it fall through to terminal, wedging a card on a push that
+        # succeeds on retry. The remote often sends the phrase with no code, so both are matched.
+        ("git push failed: remote: Internal Server Error", "transient", True),
+        ("git push failed: remote: 500 Internal Server Error", "transient", True),
         ("git push failed: connection reset by peer", "transient", True),
         ("git fetch origin main timed out after 60s", "transient", True),
         ("gh pr create failed: 503 service unavailable", "transient", True),
@@ -245,3 +250,38 @@ def test_pre_model_class_is_distinct_from_every_classify_category():
 def test_pre_model_empty_message_is_not_pre_model():
     # An empty message carries no seam signature — nothing to triage as infra.
     assert is_pre_model_dispatch_failure("", model_reached=False) is False
+
+
+# ── #672: a push 500 must be retried, a real refusal must not ───────────────────────
+
+# The verbatim block reason that wedged bd-l4gx and bd-elu5 on 2026-11-04. Pushing the same
+# commit minutes later succeeded, so the card was stranded on a transient fault.
+_PUSH_500 = (
+    "git push failed: remote: Internal Server Error        \n"
+    "remote: Request ID C1B0:3E37EC:72107D:AC5760:6AEB128D        \n"
+    "remote: Time 2026-11-04T11:10:05Z\n"
+    "To https://github.com/protoLabsAI/protoAgent.git\n"
+    " ! [remote rejected]     feat/bd-elu5-feat-console-fleet-settings-group-editor"
+)
+
+
+def test_a_push_500_is_transient_so_the_card_retries():
+    policy = classify(_PUSH_500)
+    assert policy.category == "transient", policy.category
+    assert policy.retryable and policy.max_attempts >= 2
+
+
+def test_501_is_still_terminal():
+    """`\b50[02-4]\b` deliberately skips 501: Not Implemented is a contract error, not a blip,
+    and retrying it only burns the budget."""
+    assert classify("coder dispatch failed: 501 not implemented").category == "terminal"
+
+
+def test_a_bare_remote_rejection_stays_terminal():
+    """Seen beside the 500s and deliberately NOT widened: this is also what a genuine refusal looks
+    like (branch protection, a declining hook), and retrying those is wrong. Only the explicit
+    500 / Internal Server Error signal is safe."""
+    assert classify("git push failed: remote rejected (failure)").category == "terminal"
+    assert classify("git push failed: ! [remote rejected] feat/x (protected branch hook declined)").category == (
+        "terminal"
+    )

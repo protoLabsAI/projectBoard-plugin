@@ -67,8 +67,15 @@ _RULES: tuple[tuple[str, Policy], ...] = (
         Policy("rate_limit", True, 60.0, 5),
     ),
     (
+        # 500 belongs here with its neighbours (#672): the class read `\b50[234]\b`, so 502/503/504
+        # were transient but a plain 500 — the canonical retryable server fault — fell through every
+        # rule to `terminal`, which is never retried and never self-healed. A GitHub 500 on `git
+        # push` therefore wedged a card permanently on a failure that clears on retry: bd-l4gx and
+        # bd-elu5 both lost a verified build that way inside 77 minutes, and pushing the identical
+        # commit minutes later succeeded. The phrase is matched too, because the remote sends
+        # "remote: Internal Server Error" with no numeric code attached.
         r"timed out|timeout|connection|network|temporarily|econnreset|reset by peer"
-        r"|could not resolve|unavailable|\b50[234]\b",
+        r"|could not resolve|unavailable|internal server error|\b50[02-4]\b",
         Policy("transient", True, 15.0, 3),
     ),
     (
