@@ -1681,6 +1681,39 @@ FUSION_MAX_TOTAL_CHARS_DEFAULT = 16_000
 # in another live worktree (#475) before it fails — that one candidate, with the reason.
 _CANDIDATE_INDEX_TRIES = 5
 
+# A candidate's `.g<n>` worktree can vanish between the moment `_new_candidate_worktree`
+# creates it and the moment this candidate is finally DISPATCHED into it (bd-gzl4). With
+# `max_concurrent_sessions` serializing k ACP sessions, that gap is minutes, and in it a
+# LATER index's `create_worktree` cleanup (`git worktree prune` #225 + `_clear_for`'s
+# force-remove / #405 stranded-save) or a sibling's setup can remove — or never finish
+# creating — the tree. The tapped dispatch then raises `WorktreeError("coder dispatch
+# failed: workdir does not exist: …")`. These substrings identify that filesystem/worktree
+# class of failure, which is RECOVERABLE by recreating the tree once, and distinguish it
+# from a provider/rate-limit dispatch failure — the latter must still propagate so the
+# drive's provider rotation / timeout handling fire instead of being silently swallowed.
+# Deliberately WORKTREE-specific: a bare "does not exist" would also match a provider
+# refusal like "model X does not exist", which must stay a propagating capability/provider
+# failure (the drive rotates providers on it) — swallowing it as a recreate-and-retry would
+# both waste a worktree op and hide a real config error.
+_WORKTREE_MISSING_MARKERS = (
+    "workdir does not exist",
+    "worktree does not exist",
+    "is not a working tree",
+)
+
+
+def _is_worktree_missing(exc: BaseException) -> bool:
+    """Does this dispatch failure mean the candidate's worktree is GONE (not a provider
+    refusal)? Scoped narrowly on purpose — see ``_WORKTREE_MISSING_MARKERS``."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _WORKTREE_MISSING_MARKERS)
+
+
+# A short operator-visible tail of a candidate's verify output, logged per FAILED candidate
+# (bd-gzl4: the reasons candidates 1 and 2 failed verify were invisible in agent.log — only
+# the prompt-feedback accumulator and the live-board monitor saw them).
+_VERIFY_LOG_TAIL_CHARS = 600
+
 # Defense-in-depth for `generate_fusion`'s write guard: a returned file under this
 # fraction of the ORIGINAL file's size is treated as a likely-truncated rewrite,
 # not a legitimately smaller edit, and is refused. Only applies above a minimum
@@ -2232,6 +2265,14 @@ class _WorktreeSolveAdapter:
         # `_FAIL`). An oracle-timeout salvage reads this (`_pick_salvage_candidate`) so it
         # keeps the possibly-green TIMED-OUT build and never a sibling that FAILED outright.
         self._verdict_by_wt: dict[str, str] = {}
+        # bd-gzl4: candidate worktree → why it could not be DISPATCHED (its tree went missing
+        # and could not be recreated). An INFRASTRUCTURE failure of ONE candidate, never a
+        # verdict on its code — `verify()` fails it without running the oracle (its tree is
+        # empty/fresh and could otherwise PASS off base and promote a non-solution), and it
+        # never feeds the circuit breakers or sibling feedback. Scoped to the one candidate so
+        # a vanished `.g<n>` can no longer sink the whole ladder, reap its completed siblings,
+        # or escalate the tier.
+        self._infra_failed: dict[str, str] = {}
         self.verdict_cls = verdict_cls  # `plugins.coder.solve.Verdict` — passed in, never imported here
         # The gate's env_passthrough whitelist (#86), threaded from the loop so the
         # acceptance-test (verify) subprocess sees the SAME allowlist environment the
@@ -2342,39 +2383,116 @@ class _WorktreeSolveAdapter:
         return f"{own}\n\n{prior}" if own else prior
 
     async def generate(self, task: str, *, feedback: str | None = None) -> str:
-        wt, _branch = await self._new_candidate_worktree()
-        self._gen_by_wt[wt] = self._n
-        # Tapped dispatch (#84) wires the ACP client's callbacks into this gen's live
-        # buffer; it degrades to worktree.dispatch_coder when the tap can't wire.
-        # The semaphore (when set) serializes concurrent best-of-k ACP dispatches to
-        # honour max_concurrent_sessions; worktree creation above is already complete
-        # and unaffected (serialized independently by _wt_lock).
+        wt, branch = await self._new_candidate_worktree()
+        gen = self._n
+        self._gen_by_wt[wt] = gen
+        reply = await self._dispatch_candidate(wt, branch, _augment_prompt(task, self._compose_feedback(feedback)), gen)
+        if (reply or "").strip():
+            self._replies[wt] = reply
+        return wt
+
+    async def _dispatch_once(self, wt: str, prompt: str, gen: int) -> str:
+        """One tapped ACP dispatch into ``wt`` (#84), serialized on ``_session_sem`` when
+        ``max_concurrent_sessions`` is set — worktree creation already happened and is
+        unaffected (it serializes independently on ``_wt_lock``). Degrades to the untapped
+        ``worktree.dispatch_coder`` only when the tap can't wire, exactly as before."""
         if self._session_sem is not None:
             async with self._session_sem:
-                reply = await dispatch_coder_tapped(
+                return await dispatch_coder_tapped(
                     self.coder,
                     wt,
-                    _augment_prompt(task, self._compose_feedback(feedback)),
+                    prompt,
                     fid=self.progress_fid,
-                    gen=self._n,
+                    gen=gen,
                     tier=self.progress_tier,
                     timeout=self.dispatch_timeout,
                     env_passthrough=self.env_passthrough,
                 )
-        else:
-            reply = await dispatch_coder_tapped(
-                self.coder,
-                wt,
-                _augment_prompt(task, self._compose_feedback(feedback)),
-                fid=self.progress_fid,
-                gen=self._n,
-                tier=self.progress_tier,
-                timeout=self.dispatch_timeout,
-                env_passthrough=self.env_passthrough,
-            )
-        if (reply or "").strip():
-            self._replies[wt] = reply
-        return wt
+        return await dispatch_coder_tapped(
+            self.coder,
+            wt,
+            prompt,
+            fid=self.progress_fid,
+            gen=gen,
+            tier=self.progress_tier,
+            timeout=self.dispatch_timeout,
+            env_passthrough=self.env_passthrough,
+        )
+
+    async def _dispatch_candidate(self, wt: str, branch: str, prompt: str, gen: int) -> str:
+        """Dispatch the coder into this candidate's worktree, surviving a tree that went
+        MISSING between create and dispatch (bd-gzl4).
+
+        When the dispatch raises a ``WorktreeError`` that names a missing workdir
+        (``_is_worktree_missing`` — the exact ``coder dispatch failed: workdir does not
+        exist: …`` seen on bd-gzl4), recreate the tree ONCE at the same index and retry. If
+        it STILL can't dispatch, fail ONLY this candidate: record it in ``_infra_failed``
+        (``verify()`` fails it without running tests) and return no reply. The vanished tree
+        never propagates out of ``solve()`` to reap the completed siblings or escalate a tier.
+
+        Scoped narrowly on purpose. Every OTHER dispatch failure — a ``CoderTimeout`` (the
+        tree exists; the coder ran long), a provider rate-limit/outage, any non-worktree
+        error — propagates UNCHANGED, so the drive's timeout breaker, provider rotation, and
+        capability classification keep working exactly as before. Detection is by the error
+        MESSAGE, not ``tree_exists``: a timed-out coder's tree is still on disk, so an
+        on-disk probe would both misread a timeout and need every mocked tier to stub it."""
+        recreated = False
+        while True:
+            try:
+                return await self._dispatch_once(wt, prompt, gen)
+            except worktree.CoderTimeout:
+                raise  # a real attempt that ran long — the tree exists; never a missing-tree miss
+            except worktree.WorktreeError as exc:
+                if not _is_worktree_missing(exc):
+                    raise  # a provider/rate-limit/other dispatch failure — propagate as before
+                if not recreated:
+                    log.warning(
+                        "[project_board] %s candidate %s worktree missing at dispatch — "
+                        "recreating once and retrying (bd-gzl4): %s",
+                        self.fid,
+                        os.path.basename(wt),
+                        exc,
+                    )
+                    await self._recreate_candidate_worktree(wt, branch)
+                    recreated = True
+                    continue
+                # Already spent the one recreate and the tree is still unusable: this is an
+                # infrastructure failure of ONE candidate, not a verdict on anyone's code.
+                self._infra_failed[wt] = str(exc)
+                log.warning(
+                    "[project_board] %s candidate %s could not be dispatched (worktree missing after one "
+                    "recreate) — failing THIS candidate only; its siblings are untouched and the tier does "
+                    "not escalate (bd-gzl4): %s",
+                    self.fid,
+                    os.path.basename(wt),
+                    exc,
+                )
+                return ""
+
+    async def _recreate_candidate_worktree(self, wt: str, branch: str) -> None:
+        """Recreate a candidate's worktree at the SAME index after it went missing (bd-gzl4).
+        ``create_worktree`` is idempotent for this index — it recreates the tree and branch
+        off base, returning the same ``feat-<fid>.g<n>`` path — so the candidate's identity
+        in ``candidates``/``_gen_by_wt``/``_replies`` is unchanged. Serialized on ``_wt_lock``
+        like the original create: concurrent ``git worktree add`` against one repo corrupts
+        its admin dir (#225). Best-effort setup, matching ``_new_candidate_worktree``."""
+        cid = branch[len("feat/") :] if branch.startswith("feat/") else os.path.basename(wt)
+        async with self._wt_lock:
+            await worktree.create_worktree(self.repo, self.base, cid, self.root)
+        if self.setup_cmd:
+            try:
+                reason = await worktree.prepare_worktree(
+                    wt,
+                    self.setup_cmd,
+                    env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
+                    timeout=self.setup_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
+                reason = f"setup_cmd could not run: {exc}"
+            if reason:
+                log.warning(
+                    "[project_board] %s: recreated worktree setup failed, proceeding without it — %s", cid, reason
+                )
 
     async def generate_fusion(self, task: str, *, feedback: str | None = None) -> str:
         """Rung 4 (ADR 0064 P3): fusion can't tool-call, so instead of dispatching an
@@ -2481,6 +2599,33 @@ class _WorktreeSolveAdapter:
             progress_end(self.progress_fid, self._n)
 
     async def verify(self, candidate_wt: str):
+        # bd-gzl4: a candidate whose worktree went missing and could not be recreated was
+        # never dispatched — there is nothing to judge. FAIL it without running the oracle
+        # (its tree is empty/fresh and could otherwise PASS off base and be promoted as a
+        # non-solution), record the FAIL verdict so salvage (#538) never keeps it, surface
+        # it to the live monitor and agent.log, and return BEFORE the circuit breakers /
+        # sibling feedback below — those are about code/oracle, never an infra miss.
+        infra_reason = self._infra_failed.get(candidate_wt)
+        if infra_reason is not None:
+            output = f"candidate not dispatched: {infra_reason}"
+            verdict = self.verdict_cls(passed=False, total=0, failed=0, output=output)
+            self._verdict_by_wt[candidate_wt] = _VERDICT_FAIL
+            gen = self._gen_by_wt.get(candidate_wt)
+            if gen is not None and self.progress_fid:
+                progress_verify(
+                    self.progress_fid,
+                    gen,
+                    test_cmd="(not dispatched — worktree missing)",
+                    output=output,
+                    passed=False,
+                )
+            log.warning(
+                "[project_board] %s candidate %s FAILED verify — not dispatched (%s)",
+                self.fid,
+                f"g{gen}" if gen is not None else os.path.basename(candidate_wt),
+                infra_reason,
+            )
+            return verdict
         verdict = await self._run_acceptance_tests(candidate_wt)
         # #538: classify THIS candidate's outcome before any breaker raise below, so an
         # oracle-timeout salvage keeps the possibly-green TIMED-OUT build, not a sibling
@@ -2515,6 +2660,17 @@ class _WorktreeSolveAdapter:
             label = f"candidate {gen}" if gen is not None else "a prior candidate"
             ran = self._oracle_by_wt.get(candidate_wt, self.test_cmd)
             self._completed_failures.append(f"### {label} failed `{ran}`:\n{tail}".rstrip())
+            # bd-gzl4: surface WHY a candidate failed verify where an operator reading
+            # agent.log can see it — the prompt-feedback accumulator above and the live
+            # monitor (progress_verify) were the only other records, neither of which
+            # reaches agent.log. A short tail, so the log stays readable across k candidates.
+            log.warning(
+                "[project_board] %s %s FAILED verify (`%s`):\n%s",
+                self.fid,
+                f"g{gen}" if gen is not None else os.path.basename(candidate_wt),
+                ran,
+                output.strip()[-_VERIFY_LOG_TAIL_CHARS:],
+            )
             # #459: the same breaker for an oracle that TIMES OUT. The #146 signature
             # below never matches a timeout (there is no assertion), so a gate slower than
             # `coder_solve_test_timeout_s` used to fail every candidate the same way until
