@@ -997,28 +997,62 @@ def _run_label(fid: str | None) -> str:
     return f"{fid}: {title}" if fid and title else (fid or "board run")
 
 
-@contextlib.contextmanager
-def _on_record(delegate, fid: str | None):
-    """Put one dispatch to ``delegate`` on the host's delegation ledger for its duration —
-    live while it runs, one row on any exit. A no-op on a host without ``sdk.delegation``;
-    a ledger failure never touches the dispatch (the host's funnel is best-effort)."""
+def card_run_id(fid: str | None) -> str:
+    """The host ledger run one card's work is filed under: every coder run, review and
+    review-gate workflow for the card, across all its drives (protoAgent #4726)."""
+    fid = fid or _CURRENT_CARD.get()
+    return f"board:{fid}" if fid else ""
+
+
+def _host_seam(name: str):
     try:
         from graph import sdk
 
-        seam = getattr(sdk, "delegation", None)
+        return getattr(sdk, name, None)
     except Exception:  # noqa: BLE001 — host-free test env / a host predating the seam
-        seam = None
+        return None
+
+
+@contextlib.contextmanager
+def card_scope(fid: str | None):
+    """Group the ledger edges opened inside the block under the card's run, so the card's
+    coder runs and its reviews read back as one tree (``GET /api/runs/board:<fid>``) and not
+    as unrelated roots. A no-op without a card or on a host without ``sdk.run_scope``."""
+    run_id = card_run_id(fid)
+    seam = _host_seam("run_scope") if run_id else None
+    if seam is None:
+        yield
+        return
+    with seam(run_id=run_id):
+        yield
+
+
+@contextlib.contextmanager
+def _on_record(delegate, fid: str | None, *, what: str = ""):
+    """Put one dispatch to ``delegate`` on the host's delegation ledger for its duration —
+    live while it runs, one row on any exit, filed under the card's run. A no-op on a host
+    without ``sdk.delegation``; a ledger failure never touches the dispatch (the host's
+    funnel is best-effort)."""
+    seam = _host_seam("delegation")
     if seam is None:
         yield None
         return
-    with seam(
-        to_kind=str(getattr(delegate, "type", "") or "acp"),
-        to_name=str(getattr(delegate, "name", "") or ""),
-        to_instance=str(getattr(delegate, "url", "") or ""),
-        what=_run_label(fid),
-        origin="project_board",
-    ) as edge:
+    with (
+        card_scope(fid),
+        seam(
+            to_kind=str(getattr(delegate, "type", "") or "acp"),
+            to_name=str(getattr(delegate, "name", "") or ""),
+            to_instance=str(getattr(delegate, "url", "") or ""),
+            what=what or _run_label(fid),
+            origin="project_board",
+        ) as edge,
+    ):
         yield edge
+
+
+def on_record(delegate, fid: str | None, *, what: str = ""):
+    """Public name for :func:`_on_record`, for the loop's review dispatches."""
+    return _on_record(delegate, fid, what=what)
 
 
 async def dispatch_coder_tapped(
