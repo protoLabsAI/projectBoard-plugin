@@ -2351,19 +2351,29 @@ class _WorktreeSolveAdapter:
         self.candidates.append((wt, branch))
         # Outside the lock: only `worktree add` must serialize; best-of-k siblings install
         # in parallel. Best-effort, like the drive's own trees.
-        if self.setup_cmd:
-            try:
-                reason = await worktree.prepare_worktree(
-                    wt,
-                    self.setup_cmd,
-                    env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
-                    timeout=self.setup_timeout,
-                )
-            except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
-                reason = f"setup_cmd could not run: {exc}"
-            if reason:
-                log.warning("[project_board] %s: worktree setup failed, proceeding without it — %s", cid, reason)
+        await self._run_setup(wt, cid)
         return wt, branch
+
+    async def _run_setup(self, wt: str, cid: str) -> None:
+        """Run `setup_cmd` in a freshly (re)created candidate worktree, best-effort: a setup
+        hiccup must never sink the ladder, so a crash or a non-empty reason is logged and
+        swallowed. ONE copy shared by `_new_candidate_worktree` and `_recreate_candidate_worktree`
+        so the sanitized env, timeout and error handling stay identical for original AND
+        recreated trees — a later change to any of them can't silently skip recreated candidates
+        (round-1 review nit)."""
+        if not self.setup_cmd:
+            return
+        try:
+            reason = await worktree.prepare_worktree(
+                wt,
+                self.setup_cmd,
+                env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
+                timeout=self.setup_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
+            reason = f"setup_cmd could not run: {exc}"
+        if reason:
+            log.warning("[project_board] %s: worktree setup failed, proceeding without it — %s", cid, reason)
 
     def _compose_feedback(self, feedback: str | None) -> str | None:
         """Fold this tier's accumulated sibling failures (#146) below the ladder's
@@ -2446,6 +2456,7 @@ class _WorktreeSolveAdapter:
                 if not _is_worktree_missing(exc):
                     raise  # a provider/rate-limit/other dispatch failure — propagate as before
                 if not recreated:
+                    recreated = True
                     log.warning(
                         "[project_board] %s candidate %s worktree missing at dispatch — "
                         "recreating once and retrying (bd-gzl4): %s",
@@ -2453,8 +2464,29 @@ class _WorktreeSolveAdapter:
                         os.path.basename(wt),
                         exc,
                     )
-                    await self._recreate_candidate_worktree(wt, branch)
-                    recreated = True
+                    try:
+                        await self._recreate_candidate_worktree(wt, branch)
+                    except Exception as rexc:  # noqa: BLE001 — a failed recreate is still ONE candidate's infra miss
+                        # The one-time recreate ITSELF failed. `create_worktree` can raise
+                        # BranchCheckedOutError (#475), StrandedWorkError (#405) or a bare
+                        # WorktreeError("worktree add failed: …") (worktree.py), and a setup
+                        # crash would surface here too. That is STILL an infrastructure failure
+                        # of ONE candidate, never a verdict on anyone's code — it must NOT escape
+                        # generate()/solve(), or dispatch()'s `except Exception` reaps EVERY
+                        # finished sibling (including would-pass ones) and escalates the tier:
+                        # the exact bd-gzl4 regression this guard exists to stop. So we treat a
+                        # failed recreate identically to a still-missing tree — fail only THIS
+                        # candidate (verify() short-circuits it) and return no reply.
+                        self._infra_failed[wt] = f"worktree missing and could not be recreated: {rexc}"
+                        log.warning(
+                            "[project_board] %s candidate %s worktree missing AND the one-time recreate "
+                            "failed — failing THIS candidate only; its siblings are untouched and the tier "
+                            "does not escalate (bd-gzl4): %s",
+                            self.fid,
+                            os.path.basename(wt),
+                            rexc,
+                        )
+                        return ""
                     continue
                 # Already spent the one recreate and the tree is still unusable: this is an
                 # infrastructure failure of ONE candidate, not a verdict on anyone's code.
@@ -2479,20 +2511,7 @@ class _WorktreeSolveAdapter:
         cid = branch[len("feat/") :] if branch.startswith("feat/") else os.path.basename(wt)
         async with self._wt_lock:
             await worktree.create_worktree(self.repo, self.base, cid, self.root)
-        if self.setup_cmd:
-            try:
-                reason = await worktree.prepare_worktree(
-                    wt,
-                    self.setup_cmd,
-                    env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
-                    timeout=self.setup_timeout,
-                )
-            except Exception as exc:  # noqa: BLE001 — a setup hiccup must never sink the ladder
-                reason = f"setup_cmd could not run: {exc}"
-            if reason:
-                log.warning(
-                    "[project_board] %s: recreated worktree setup failed, proceeding without it — %s", cid, reason
-                )
+        await self._run_setup(wt, cid)
 
     async def generate_fusion(self, task: str, *, feedback: str | None = None) -> str:
         """Rung 4 (ADR 0064 P3): fusion can't tool-call, so instead of dispatching an

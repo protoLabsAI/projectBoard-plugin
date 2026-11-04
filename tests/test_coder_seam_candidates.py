@@ -91,6 +91,22 @@ def _make_dispatch(missing_rounds: dict[str, int]):
     return _fake, calls
 
 
+def _make_create_failing_recreate(fail_cid: str, exc: BaseException):
+    """Like `_make_create`, but the SECOND `create_worktree` for ``fail_cid`` — the one-time
+    recreate after that candidate's `.g<n>` went missing — RAISES ``exc`` (the recreate itself
+    fails). Every other create returns the STABLE per-candidate path. ``created`` records every
+    id attempted, so the failed recreate still shows as the id appearing twice."""
+    created: list[str] = []
+
+    async def _create(repo, base, cid, root, **_kw):
+        created.append(cid)
+        if cid == fail_cid and created.count(cid) >= 2:
+            raise exc
+        return (f"/wt/feat-{cid}", f"feat/{cid}")
+
+    return _create, created
+
+
 def _make_run_tests(passed_by_name: dict[str, bool]):
     """A class-level `_run_acceptance_tests` stub: pass/fail per candidate worktree basename,
     with a multi-line failing output so the per-candidate verify-tail log has something to
@@ -236,6 +252,58 @@ async def test_persistent_missing_worktree_fails_only_that_candidate(monkeypatch
     assert calls.count("feat-bd-9.g3") == 2
     assert created.count("bd-9.g3") == 2  # recreated exactly once
     # The completed sibling g1 won and was promoted; g1's tree was NOT reaped by an infra error.
+    assert promoted == [("/wt/feat-bd-9.g1", "feat/bd-9.g1", "bd-9")]
+    assert "/wt/feat-bd-9.g1" not in removed
+    assert {"/wt/feat-bd-9.g2", "/wt/feat-bd-9.g3"} <= set(removed)
+    assert (wt, branch) == ("/wt/feat-bd-9", "feat/bd-9")
+
+
+@pytest.mark.parametrize(
+    "recreate_exc",
+    [
+        worktree.BranchCheckedOutError("feat/bd-9.g3", "/wt/other-drive"),  # #475: branch taken meanwhile
+        worktree.StrandedWorkError(  # #405: the vanished path still holds uncommitted work
+            "/repo", [worktree.StrandedTree("/wt/feat-bd-9.g3", "feat/bd-9.g3", "680 lines uncommitted")]
+        ),
+        worktree.WorktreeError("worktree add failed: fatal: could not create work tree dir"),  # bare add failure
+    ],
+    ids=["branch-checked-out", "stranded-work", "worktree-add-failed"],
+)
+async def test_recreate_that_itself_fails_fails_only_that_candidate_and_never_escapes(monkeypatch, recreate_exc):
+    """The one-time recreate can ITSELF fail: `create_worktree` raises BranchCheckedOutError
+    (#475), StrandedWorkError (#405), or a bare "worktree add failed" (worktree.py). That error
+    must NOT escape `generate()`/`solve()` — if it did, `dispatch()`'s `except Exception` around
+    `solve()` would reap EVERY candidate (including completed, would-pass siblings) and escalate
+    the tier, which is the exact bd-gzl4 regression this PR exists to stop. Instead the recreate
+    failure is treated like a still-missing tree: it fails ONLY that candidate (verify() short-
+    circuits it as an infra miss), a completed sibling still wins and is promoted, and `dispatch()`
+    returns normally with no raw `coder dispatch failed` / recreate error propagating out."""
+    create_fake, created = _make_create_failing_recreate("bd-9.g3", recreate_exc)
+    dispatch_fake, calls = _make_dispatch({"feat-bd-9.g3": 1})  # g3's first dispatch 404s → triggers the recreate
+    run_tests = _make_run_tests({"feat-bd-9.g1": True, "feat-bd-9.g2": False})
+    removed, promoted = _stub(monkeypatch, dispatch_fake=dispatch_fake, run_tests=run_tests, create_fake=create_fake)
+
+    async def _fake_solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        c1 = await generate(task, feedback=None)
+        v1 = await verify(c1)
+        assert v1.passed  # a completed sibling that passed
+        c2 = await generate(task, feedback=None)
+        assert not (await verify(c2)).passed
+        # g3's tree is missing at dispatch AND its one-time recreate raises. This generate() must
+        # RETURN NORMALLY (the recreate error is swallowed), not propagate it out of solve().
+        c3 = await generate(task, feedback=None)
+        v3 = await verify(c3)
+        assert not v3.passed  # failed as an infra miss, never ran the oracle
+        assert "could not be recreated" in v3.output
+        return _FakeResult(solution=c1, passed=True, rung="best-of-k", gens_spent=3, candidates_tried=3, verdict=v1)
+
+    wt, branch, result = await dispatch(task="t", fid="bd-9", _solve=_fake_solve, **_DISPATCH_KW)
+
+    # g3 was dispatched exactly ONCE (the 404); after the recreate RAISED it was not re-dispatched.
+    assert calls.count("feat-bd-9.g3") == 1
+    # g3's create was ATTEMPTED twice (original + the one recreate that raised), then given up.
+    assert created.count("bd-9.g3") == 2
+    # The completed sibling g1 won and was promoted; g1's tree was NOT reaped by the recreate error.
     assert promoted == [("/wt/feat-bd-9.g1", "feat/bd-9.g1", "bd-9")]
     assert "/wt/feat-bd-9.g1" not in removed
     assert {"/wt/feat-bd-9.g2", "/wt/feat-bd-9.g3"} <= set(removed)
