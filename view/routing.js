@@ -127,7 +127,7 @@ function coderSection(){
     + '<p class="r-summary">'+esc(routingSummary(dels, exclusive))+'</p>'
     + '<div class="r-coders">'+dels.map(d => coderCard(d, allowed.has(d.name), allowed.size === 1, d.name === def)).join("")+'</div>'
     + msg
-    + '<p class="r-note">Covers building, CI and review fixes, and escalation. The review gate and helpers (decompose, Max-Mode judge, task assignees) keep their own delegates.</p>'
+    + '<p class="r-note">A coder limit covers only the coders that build and fix cards, including CI and review fixes, and escalation. Reviews keep using the board\'s reviewer, and helper steps like splitting big cards and judging keep using their usual agents.</p>'
     + '</section>';
 }
 

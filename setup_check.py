@@ -97,6 +97,13 @@ RELEASE_FREEZE_KEY = "release_freeze"
 # protoAgent#3692: a `coders` rung naming a delegate that no longer exists. Advisory only, and
 # never a pause: the rung degrades at dispatch. Only a missing BASE coder fails `coder`.
 CODER_RUNGS_KEY = "coder_rungs"
+# #578 follow-up: a project's coder limit (`routing.exclusive`) names a delegate that isn't set
+# up, so that project's cards can't start. A real setup gap — reported through the seam with a
+# Configure action pointing at the board's Delegates/routing settings — but NOT a pause: dispatch
+# blocks only the affected card, the loop and every other project keep running. Distinct from
+# `coder_rungs` (a deleted ladder rung) and from the review/helper coverage note, which is
+# informational and lives on the routing/effective view, never a gap.
+ROUTING_EXCLUSIVE_KEY = "routing_exclusive"
 # #456 / #459: a gate preflight that can't finish inside its timeout, and a project whose
 # coder.solve() oracle is unwinnable. Both are published by the running loop. Advisory only.
 PREFLIGHT_KEY = "preflight"
@@ -114,6 +121,7 @@ REPORT_KEYS: tuple[str, ...] = SETUP_KEYS + (
     REVIEW_STATUS_KEY,
     RELEASE_FREEZE_KEY,
     CODER_RUNGS_KEY,
+    ROUTING_EXCLUSIVE_KEY,
     PREFLIGHT_KEY,
     LEGACY_BINDING_KEY,
     CLAIM_STALL_KEY,
@@ -986,11 +994,10 @@ def setup_status(
 
     status["release_freeze_hint"] = release_freeze.unavailable_hint()
     status["coder_rungs_hint"] = coder_rungs_hint(coder["missing_rungs"])
+    # The coder-limit gap (#578 follow-up) is its OWN setup gap reported under ROUTING_EXCLUSIVE_KEY
+    # with a Configure action — never folded into coder_rungs_hint, so the informational
+    # "which paths the limit doesn't govern" note can no longer masquerade as a coder-rungs banner.
     status["routing_exclusive_hint"] = routing_exclusive_hint(cfg, delegates)
-    if status["routing_exclusive_hint"]:
-        status["coder_rungs_hint"] = " ".join(
-            filter(None, (status["coder_rungs_hint"], status["routing_exclusive_hint"]))
-        )
     from . import health  # lazy, like release_freeze
 
     # #456 / #459: a preflight that can't finish in its timeout, and a project whose
@@ -1005,30 +1012,45 @@ def setup_status(
     return status
 
 
+def _and_join(names: list[str]) -> str:
+    """``["a"] -> "a"``, ``["a", "b"] -> "a and b"``, ``["a", "b", "c"] -> "a, b and c"`` —
+    plain operator phrasing for a short delegate list (no quotes, no internal syntax)."""
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def routing_exclusive_hint(cfg: dict, delegates) -> str:
-    """Strict coder routing is advisory for helpers, and validates its own roster."""
-    entries = [("board", cfg)]
+    """The ONE real setup gap a project's coder limit (``routing.exclusive``) can create: it
+    names a delegate that isn't set up, so that project's cards can't start. One plain-worded
+    sentence per such (project, delegate), joined — no internal routing names.
+
+    The limit resolves per project exactly as ``routing.effective_routes`` does (a project's own
+    ``exclusive`` else the board default), so each affected project is named once and a board
+    default no project uses is never reported. The informational "which lifecycle paths the
+    limit does NOT govern" note is NOT a gap: it lives on the routing/effective view, never here
+    (so it is never folded into ``coder_rungs_hint`` nor raised as a setup-problem banner)."""
     try:
-        entries.extend(resolve_projects(cfg).items())
+        projects = resolve_projects(cfg)
     except Exception:  # noqa: BLE001 — the repo check owns malformed projects
-        pass
+        projects = {}
+    board_exclusive = (cfg.get("routing") or {}).get("exclusive")
     hints = []
-    active = False
-    for project, entry in entries:
-        names = _rung_names((entry.get("routing") or {}).get("exclusive"))
-        active = active or bool(names)
+    for project, entry in projects.items():
+        names = _rung_names((entry.get("routing") or {}).get("exclusive", board_exclusive))
+        if not names:
+            continue
+        listed = _and_join(names)
         for name in names:
             try:
                 found = delegates(name)
             except Exception:  # noqa: BLE001 — unavailable roster
                 found = None
             if found is None:
-                hints.append(f"routing.exclusive ({project}): delegate {name!r} is not configured/enabled.")
-    if active:
-        hints.append(
-            "not covered by routing.exclusive: review gate reviewer, review dispatch, decompose, "
-            "coder.solve offload, Max-Mode judge, task-assignee delegates."
-        )
+                hints.append(
+                    f"{project} cards can only use {listed}, but {name} isn't set up, so those "
+                    f"cards can't start. Set up {name}, or remove it from {project}'s coder limit."
+                )
     return " ".join(hints)
 
 
@@ -1135,8 +1157,10 @@ def blocker_summary(status: dict) -> str:
 CONFIG_PLUGIN_ID = "project_board"
 CONFIG_PLUGIN_LABEL = "Project Board"
 # The setup-gap keys that name a CONFIGURATION blocker the operator resolves in Project
-# Board's OWN Configure dialog — an unresolved ``coder`` and an unbound/invalid ``repo``.
-# These are the only gaps that carry the structured ``plugin_config`` action: ``br`` /
+# Board's OWN Configure dialog — an unresolved ``coder`` and an unbound/invalid ``repo`` — each
+# carrying :func:`plugin_config_action` for its own config field. (The ``routing_exclusive``
+# coder-limit gap also carries a Configure action, built by :func:`routing_exclusive_action`
+# rather than from this set, since its config field is ``routing`` not the gap key.) ``br`` /
 # ``gh`` are PATH/install faults (fixed on the shell, not in settings) and the advisories
 # (``loop`` / ``db`` / ``db_legacy`` / ``review_status``) are not config blockers, so
 # none of them gets the (misleading) "open Project Board settings" CTA (r4).
@@ -1156,6 +1180,16 @@ def plugin_config_action(key: str) -> dict:
     ``plugin_config`` action at the plugin that reported it, and drops any key outside
     that schema."""
     return {"kind": "plugin_config", "label": f"Configure {CONFIG_PLUGIN_LABEL}", "fields": [key]}
+
+
+def routing_exclusive_action() -> dict:
+    """The fix action for the coder-limit gap: a ``plugin_config`` CTA that opens Project
+    Board's settings focused on its Delegates/routing surface (``fields: ["routing"]``) — where
+    the operator either sets the named delegate up or removes it from the project's coder limit.
+    Same closed host schema as :func:`plugin_config_action`; a host that can't focus the field
+    just opens the board's settings page (the intended fallback), and a host without the
+    ``action=`` seam degrades to the plain hint, which already names both remedies."""
+    return {"kind": "plugin_config", "label": f"Open {CONFIG_PLUGIN_LABEL} settings", "fields": ["routing"]}
 
 
 def _seam_accepts_action(fn) -> bool:
@@ -1247,6 +1281,8 @@ class GapReporter:
                 msg = str((status or {}).get("release_freeze_hint") or "") or None
             elif key == CODER_RUNGS_KEY:
                 msg = str((status or {}).get("coder_rungs_hint") or "") or None
+            elif key == ROUTING_EXCLUSIVE_KEY:
+                msg = str((status or {}).get("routing_exclusive_hint") or "") or None
             elif key == PREFLIGHT_KEY:
                 msg = str((status or {}).get("preflight_hint") or "") or None
             elif key == LEGACY_BINDING_KEY:
@@ -1285,13 +1321,17 @@ class GapReporter:
 
     def _action_for(self, key: str, msg: str | None) -> dict | None:
         """The structured action for one gap: the ``plugin_config`` CTA for an ACTIVE
-        ``coder`` / ``repo`` configuration blocker, else ``None`` — a cleared gap (``msg``
-        None), or a gap Project Board's settings can't resolve (``br`` / ``gh`` /
-        advisories, r4). No coder is manufactured and no config is touched — the action
-        only opens the config surface."""
-        if msg is None or key not in CONFIG_ACTION_KEYS:
+        ``coder`` / ``repo`` configuration blocker, the coder-limit CTA for an ACTIVE
+        ``routing_exclusive`` gap, else ``None`` — a cleared gap (``msg`` None), or a gap
+        Project Board's settings can't resolve (``br`` / ``gh`` / advisories, r4). No coder is
+        manufactured and no config is touched — the action only opens the config surface."""
+        if msg is None:
             return None
-        return plugin_config_action(key)
+        if key in CONFIG_ACTION_KEYS:
+            return plugin_config_action(key)
+        if key == ROUTING_EXCLUSIVE_KEY:
+            return routing_exclusive_action()
+        return None
 
     def _emit(self, key: str, msg: str | None) -> None:
         """Forward one ``(key, message)`` to the host seam, attaching the structured

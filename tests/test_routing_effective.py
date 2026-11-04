@@ -51,12 +51,13 @@ def test_shape_lists_every_named_path_with_coverage():
     assert paths["implement"]["covered"] is True
     assert paths["fix (CI/review)"]["covered"] is True
     assert paths["escalate"]["covered"] is True
-    # review + helpers are the paths routing.exclusive does NOT govern (B2).
+    # review + helpers are the paths the coder limit does NOT govern (B2). Their rows carry the
+    # plain operator copy — no internal routing names — shown on the view, never as a setup gap.
     assert paths["review"]["covered"] is False
     assert paths["helpers"]["covered"] is False
-    assert "not covered by routing.exclusive" in paths["helpers"]["detail"]
-    for helper in routing.UNCOVERED_HELPER_PATHS:
-        assert helper in paths["helpers"]["detail"]
+    assert paths["review"]["detail"] == routing.REVIEW_PATH_NOTE
+    assert paths["helpers"]["detail"] == routing.HELPERS_PATH_NOTE
+    assert "not covered" not in paths["helpers"]["detail"]
     # The ladder names every tier, in ladder order, with the full (unfiltered) rung.
     assert [rung["tier"] for rung in proj["ladder"]] == ["standard", "reasoning", "advanced"]
     assert proj["ladder"][0]["delegates"] == ["sonnet", "codex"]

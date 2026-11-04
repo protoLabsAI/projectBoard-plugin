@@ -173,9 +173,9 @@ def routing_get():
     return effective_routing(_live_section(required=True))
 
 
-# Lifecycle paths ``routing.exclusive`` does NOT govern (#578, mirrors
-# setup_check.routing_exclusive_hint): the review gate reviewer, review dispatch, and the
-# helper delegates all run unrestricted by the strict coder set (B2).
+# Lifecycle paths the coder limit (``routing.exclusive``) does NOT govern (#578): the review
+# gate reviewer, review dispatch, and the helper delegates all run unrestricted by the strict
+# coder set (B2). Kept for reference; the operator-facing rows below use the plain copy instead.
 UNCOVERED_HELPER_PATHS = [
     "review dispatch",
     "decompose",
@@ -183,6 +183,14 @@ UNCOVERED_HELPER_PATHS = [
     "Max-Mode judge",
     "task-assignee delegates",
 ]
+
+# Operator copy shown on the routing/effective view where the coder limit is already visible
+# (#578 follow-up) — plain words, no internal routing names. The limit governs only the coders
+# that build and fix a project's cards; review and the helper steps keep their usual agents. This
+# information is NOT a setup gap: it is shown here, never raised as a setup-problem banner.
+REVIEW_PATH_NOTE = "Reviews keep using the board's reviewer. A coder limit doesn't change who reviews."
+HELPERS_PATH_NOTE = "Splitting big cards, judging and other helper steps keep using their usual agents."
+EXCLUSIVE_LIMIT_NOTE = "Only the coders that build and fix this project's cards are limited to these agents."
 
 
 def _headroom_display(snap):
@@ -415,17 +423,19 @@ def effective_routes(cfg, *, usage=None, current=None):
             {
                 "path": "review",
                 "covered": False,
-                "detail": "review gate reviewer — not covered by routing.exclusive",
+                "detail": REVIEW_PATH_NOTE,
             },
             {
                 "path": "helpers",
                 "covered": False,
-                "detail": "not covered by routing.exclusive: " + ", ".join(UNCOVERED_HELPER_PATHS),
+                "detail": HELPERS_PATH_NOTE,
             },
         ]
         out[name] = {
             "exclusive": exclusive,
             "exclusive_source": source,
+            # The one-line explanation shown next to the coder limit, only when a limit is set.
+            "exclusive_note": EXCLUSIVE_LIMIT_NOTE if exclusive else "",
             "escalation_on": escalation_on,
             "headroom_on": headroom_on,
             "prefer_sibling_at": prefer_at,
