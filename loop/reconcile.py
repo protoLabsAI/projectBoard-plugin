@@ -2416,7 +2416,9 @@ class ReconcileMixin:
 
         try:
             msg = f"Please review this PR for correctness and acceptance: {pr_url}"
-            await ADAPTERS["a2a"].dispatch(reviewer, msg)
+            # On the host ledger under the card's run, beside its coder runs (#4726).
+            with coder_seam.on_record(reviewer, fid, what=f"review of {fid}: {pr_url}"):
+                await ADAPTERS["a2a"].dispatch(reviewer, msg)
         except Exception as exc:  # noqa: BLE001 — fully best-effort: a review-dispatch
             # failure (DelegateError, httpx/connection, anything) must NEVER block a
             # feature whose PR already opened. CI + the merge webhook are the gate.
@@ -3593,6 +3595,12 @@ class ReconcileMixin:
         )
 
     async def _run_review_workflow(self, fid: str, pr_url: str) -> tuple[str | None, str | None]:
+        """:meth:`_run_review_workflow_in_card` under the card's ledger run, so the review
+        workflow's edge (or the reviewer fallback's) joins the card's coder runs (#4726)."""
+        with coder_seam.card_scope(fid):
+            return await self._run_review_workflow_in_card(fid, pr_url)
+
+    async def _run_review_workflow_in_card(self, fid: str, pr_url: str) -> tuple[str | None, str | None]:
         """Produce the raw review output for a PR: the host's workflow runner
         (``runtime.state.STATE.workflow_run`` — published by the workflows plugin,
         no plugin import needed) running ``review_workflow``, else the configured
@@ -3683,11 +3691,12 @@ class ReconcileMixin:
                 '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '
                 "No findings → an empty array []."
             )
-            output = await _within(
-                ADAPTERS["a2a"].dispatch(reviewer, msg),
-                self.review_gate_timeout,
-                on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
-            )
+            with coder_seam.on_record(reviewer, fid, what=f"review gate of {fid}: {pr_url}"):
+                output = await _within(
+                    ADAPTERS["a2a"].dispatch(reviewer, msg),
+                    self.review_gate_timeout,
+                    on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
+                )
             if output is None:
                 return None, f"reviewer {self.reviewer_name!r} returned no output"
             return output, None

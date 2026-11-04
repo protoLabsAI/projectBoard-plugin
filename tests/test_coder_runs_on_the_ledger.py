@@ -142,3 +142,75 @@ def test_the_card_title_memory_is_bounded(monkeypatch):
     for i in range(5):
         coder_seam.note_card(f"bd-{i}", f"card {i}")
     assert list(coder_seam._CARD_TITLES) == ["bd-2", "bd-3", "bd-4"]
+
+
+# ── one run per card (protoAgent #4726) ──────────────────────────────────────────────
+# A board coder run opened a root edge of its own, and the review was not on the ledger
+# at all, so a card read back as several unrelated runs. Every edge for a card now opens
+# under `sdk.run_scope(run_id="board:<fid>")`, which the host's run view looks up whole.
+
+
+@pytest.fixture
+def scoped_ledger(ledger, monkeypatch):
+    """`ledger`, plus a host `run_scope`; each open records the run it opened under."""
+    import contextvars
+
+    current = contextvars.ContextVar("run", default="")
+    sdk = sys.modules["graph.sdk"]
+    plain = sdk.delegation
+
+    @contextlib.contextmanager
+    def run_scope(*, run_id="", session_id=""):
+        token = current.set(run_id or current.get())
+        try:
+            yield
+        finally:
+            current.reset(token)
+
+    @contextlib.contextmanager
+    def delegation(**kw):
+        with plain(**kw, run=current.get()) as edge:
+            yield edge
+
+    sdk.run_scope = run_scope
+    sdk.delegation = delegation
+    return ledger
+
+
+async def test_a_coder_run_is_filed_under_its_cards_run(scoped_ledger):
+    async def _seam(delegate, prompt, *, on_tool=None, on_thought=None, on_text=None, timeout=None):
+        return _Result(reply="done")
+
+    await coder_seam.dispatch_coder_tapped(_Coder(), "/wt/c", "x", fid="bd-card", gen=1, _dispatch_tapped=_seam)
+    await coder_seam.dispatch_coder_tapped(_Coder(), "/wt/c", "x", fid="bd-card", gen=2, _dispatch_tapped=_seam)
+    runs = [kw["run"] for ev, kw in (e for e in scoped_ledger if e[0] == "open")]
+    assert runs == ["board:bd-card", "board:bd-card"]  # two gens, one run
+
+
+async def test_a_review_is_on_the_ledger_under_the_same_run_as_the_coder(scoped_ledger):
+    reviewer = types.SimpleNamespace(type="a2a", name="quinn", url="http://r/a2a")
+    with coder_seam.on_record(reviewer, "bd-card", what="review of bd-card: https://pr/1"):
+        pass
+    (_, opened), closed = scoped_ledger
+    assert (opened["to_name"], opened["what"], opened["run"]) == (
+        "quinn",
+        "review of bd-card: https://pr/1",
+        "board:bd-card",
+    )
+    assert closed == ("close", "ok")
+
+
+async def test_card_scope_falls_back_to_the_drives_card_and_wraps_other_edges(scoped_ledger):
+    coder_seam.note_card("bd-drive", "Some card")
+    sdk = sys.modules["graph.sdk"]
+    with coder_seam.card_scope(None):  # e.g. the review workflow's own edge, opened by the host
+        with sdk.delegation(to_kind="workflow", to_name="review"):
+            pass
+    assert scoped_ledger[0][1]["run"] == "board:bd-drive"
+
+
+def test_card_scope_is_a_no_op_on_a_host_without_run_scope(ledger):
+    assert not hasattr(sys.modules["graph.sdk"], "run_scope")
+    with coder_seam.card_scope("bd-x"):
+        pass
+    assert coder_seam.card_run_id("bd-x") == "board:bd-x"
