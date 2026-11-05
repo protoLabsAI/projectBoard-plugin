@@ -915,30 +915,38 @@ async def test_chat_project_settings_round_trip_and_merge(monkeypatch, tmp_path)
     tool = build_register_tool({})
     settings = {
         "require_complete_review": True,
-        "preflight_cmd": "pytest -q",
         "release_freeze": True,
         "review_summon_handle": "@reviewer",
         "coder_solve_budget": 42,
     }
     reply = await tool.ainvoke({"name": "epic", "repo": str(repo), "base_branch": "develop", "settings": settings})
     saved = json.loads(reply.split("Stored project: ")[1])
+    # Set + read back: every policy value the agent set round-trips through the echo and is
+    # live in the resolved project config.
     assert all(saved[key] == value for key, value in settings.items())
+    assert saved == _raw_projects()["epic"]  # no command text here, so the echo is the entry
     assert resolve_projects(cfg.plugin_config["project_board"])["epic"]["require_complete_review"] is True
+
+    # Merge: hand-edited and operator-only fields survive a one-setting update.
     projects = cfg.plugin_config["project_board"]["projects"]
     projects["epic"]["hand_edited"] = {"keep": [1, 2]}
-    projects["epic"]["local_gate_cmd"] = "operator gate"
+    projects["epic"]["local_gate_cmd"] = "operator gate"  # operator command text — never set by an agent
     projects["sibling"] = {"repo": "/other", "custom": True}
     before = dict(projects["epic"])
     reply = await tool.ainvoke({"name": "epic", "repo": str(repo), "settings": {"release_freeze": False}})
     saved = json.loads(reply.split("Stored project: ")[1])
-    assert saved == {**before, "release_freeze": False}
-    assert _raw_projects()["epic"] == saved
-    assert _raw_projects()["sibling"] == {"repo": "/other", "custom": True}
+    raw = _raw_projects()["epic"]
+    # The raw entry keeps every prior field (base_branch, the operator gate, the hand edit)…
+    assert raw == {**before, "release_freeze": False}
+    assert _raw_projects()["sibling"] == {"repo": "/other", "custom": True}  # untouched sibling intact
+    # …while the agent-facing echo shows the change but hides the operator's command text.
+    assert saved == {**raw, "local_gate_cmd": "(operator-configured, hidden from agents)"}
+    assert saved["release_freeze"] is False and saved["hand_edited"] == {"keep": [1, 2]}
     # A later editor PUT must also preserve all advanced settings.
     await upsert_project(
         "epic", str(repo), base_branch="develop", local_gate_cmd="operator gate", replace_optional=True
     )
-    assert _raw_projects()["epic"] == saved
+    assert _raw_projects()["epic"] == {**before, "release_freeze": False}
 
 
 @pytest.mark.parametrize(
@@ -947,6 +955,10 @@ async def test_chat_project_settings_round_trip_and_merge(monkeypatch, tmp_path)
         ({"unknown": True}, "unknown per-project settings: unknown"),
         ({"managed_project": "escape"}, "unknown per-project settings: managed_project"),
         ({"local_gate_cmd": "echo bypass"}, "explicit gate command is operator configuration"),
+        # Command settings carry text the loop runs, so the agent tool refuses them outright.
+        ({"preflight_cmd": "pytest -q"}, "not agent input: preflight_cmd"),
+        ({"setup_cmd": "npm ci", "format_cmd": "black ."}, "not agent input: format_cmd, setup_cmd"),
+        ({"coder_solve_gate_cmd": "make test"}, "not agent input: coder_solve_gate_cmd"),
     ],
 )
 async def test_chat_project_settings_refused_before_apply(monkeypatch, tmp_path, settings, message):

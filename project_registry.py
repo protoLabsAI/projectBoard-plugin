@@ -56,9 +56,9 @@ from typing import Any
 
 # This module is also used standalone by the host-free registry tools/tests.
 if __package__:
-    from .projects import TIER_ALIASES, is_project_setting, normalize_tier_config
+    from .projects import TIER_ALIASES, is_command_setting, is_project_setting, normalize_tier_config
 else:
-    from projects import TIER_ALIASES, is_project_setting, normalize_tier_config
+    from projects import TIER_ALIASES, is_command_setting, is_project_setting, normalize_tier_config
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1025,8 +1025,20 @@ async def upsert_project(
     unknown = [str(key) for key in extra if not isinstance(key, str) or not is_project_setting(key)]
     if unknown:
         raise ProjectRegistryError("unknown per-project settings: " + ", ".join(sorted(unknown)))
+    # Every per-project ``*_cmd`` is a command the loop spawns at dispatch, so agent input
+    # must never carry it (the same rule ``_validate_agent_gate`` enforces for the gate) —
+    # it is operator configuration. ``local_gate_cmd`` is the one such key the agent may
+    # name, and only as the blank/``auto`` sentinels ``_validate_agent_gate`` allows; every
+    # other command knob (``setup_cmd``, ``preflight_cmd``, ``format_cmd``, each
+    # ``coder_solve_*_cmd``) is refused here before anything is merged or run.
     if "local_gate_cmd" in extra:
         extra["local_gate_cmd"] = _validate_agent_gate(extra["local_gate_cmd"])
+    commands = sorted(key for key in extra if is_command_setting(key) and key != "local_gate_cmd")
+    if commands:
+        raise ProjectRegistryError(
+            "these per-project settings carry a command the board runs at dispatch, so they are "
+            "operator configuration (Settings ▸ Projects), not agent input: " + ", ".join(commands)
+        )
     repo = extra.pop("repo", repo)
     base_branch = extra.pop("base_branch", base_branch)
     local_gate_cmd = extra.pop("local_gate_cmd", local_gate_cmd)
@@ -1201,7 +1213,7 @@ async def _upsert(
             "created": project not in existing,
             "default_project": default,
             "managed_project": managed,
-            "stored_project": copy.deepcopy(entry),
+            "stored_project": _agent_safe_entry(copy.deepcopy(entry)),
         }
 
 
@@ -1266,6 +1278,25 @@ def _validate_agent_gate(gate: str) -> str:
     )
 
 
+#: Shown in the agent-facing stored-project echo in place of an operator's command text.
+_REDACTED_COMMAND = "(operator-configured, hidden from agents)"
+
+
+def _agent_safe_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """``entry`` as the chat tool may echo it back to the agent: every per-project ``*_cmd``
+    holding real command text is replaced by a marker. The agent can neither set nor read an
+    operator's gate/setup/preflight command (the loop executes it at dispatch), so the
+    confirmation shows the policy values the agent did set while hiding operator command
+    text. The blank/``auto`` gate sentinels — which the agent may set — pass through."""
+    view: dict[str, Any] = {}
+    for key, value in entry.items():
+        if is_command_setting(key) and str(value or "").strip() not in ("", _AGENT_GATE_SENTINEL):
+            view[key] = _REDACTED_COMMAND
+        else:
+            view[key] = value
+    return view
+
+
 def build_register_tool(cfg: dict):
     """The ``board_register_project`` tool, or ``None`` when langchain isn't importable
     (host-free test runs import this module for its pure helpers)."""
@@ -1297,10 +1328,12 @@ def build_register_tool(cfg: dict):
             repo_conventions: repo rules injected into every coder dispatch (changelog policy,
                 import rules, gate quirks). Omitting it is the most common cause of a coder
                 inventing the wrong convention.
-            settings: optional per-project overrides, including require_complete_review,
-                preflight_cmd, release_freeze and review_summon_handle. Unknown keys are refused.
-                local_gate_cmd accepts only blank or "auto". Values override named arguments;
-                omitted settings are preserved. The reply includes the stored project."""
+            settings: optional per-project policy overrides, e.g. require_complete_review,
+                release_freeze and review_summon_handle. Unknown keys are refused. Command
+                settings (preflight_cmd, setup_cmd, format_cmd, any *_cmd) are operator
+                configuration and are refused; local_gate_cmd accepts only blank or "auto".
+                Values override named arguments; omitted settings are preserved. The reply
+                echoes the stored project (operator command text hidden)."""
         try:
             if base_branch is None:
                 base_branch = "main"
