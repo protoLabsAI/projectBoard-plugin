@@ -124,6 +124,11 @@ _INHERITED_SETTING_KEYS = ("breadth_exclude", "hot_files")
 _CODER_SOLVE_PREFIX = "coder_solve_"
 
 
+def is_project_setting(key: str) -> bool:
+    """Whether a key belongs to the per-project execution settings schema."""
+    return key in _PROJECT_SETTING_KEYS or key.startswith(_CODER_SOLVE_PREFIX)
+
+
 def _copy_settings(src: dict) -> dict:
     """Lift the execution settings out of a raw entry/flat-config dict — the fixed
     keys plus every `coder_solve_*` knob."""

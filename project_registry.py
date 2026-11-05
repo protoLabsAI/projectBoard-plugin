@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import logging
 import os
 import re
@@ -55,9 +56,9 @@ from typing import Any
 
 # This module is also used standalone by the host-free registry tools/tests.
 if __package__:
-    from .projects import TIER_ALIASES, normalize_tier_config
+    from .projects import TIER_ALIASES, is_project_setting, normalize_tier_config
 else:
-    from projects import TIER_ALIASES, normalize_tier_config
+    from projects import TIER_ALIASES, is_project_setting, normalize_tier_config
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1002,6 +1003,7 @@ async def upsert_project(
     replace_optional: bool = False,
     force_gate: bool = False,
     request_id: str = "",
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Add/update one project while preserving siblings and unowned entry fields.
 
@@ -1017,6 +1019,18 @@ async def upsert_project(
     this save waited, in a way that leaves the gate unproven, the save is refused with
     ``ProjectRegistryConflict`` (409) to be retried, never applied over the change.
     ``request_id`` (the editor's own) keys this save's outcome in ``_SAVES``."""
+    extra = copy.deepcopy(settings) if settings is not None else {}
+    if not isinstance(extra, dict):
+        raise ProjectRegistryError("settings must be a mapping of per-project settings")
+    unknown = [str(key) for key in extra if not isinstance(key, str) or not is_project_setting(key)]
+    if unknown:
+        raise ProjectRegistryError("unknown per-project settings: " + ", ".join(sorted(unknown)))
+    if "local_gate_cmd" in extra:
+        extra["local_gate_cmd"] = _validate_agent_gate(extra["local_gate_cmd"])
+    repo = extra.pop("repo", repo)
+    base_branch = extra.pop("base_branch", base_branch)
+    local_gate_cmd = extra.pop("local_gate_cmd", local_gate_cmd)
+    repo_conventions = extra.pop("repo_conventions", repo_conventions)
     project = _validate_name(name)
     repo = _bounded_text(repo, "repo", 4096, required=True)
     if make_default and clear_default:
@@ -1046,6 +1060,7 @@ async def upsert_project(
             clear_default=clear_default,
             replace_optional=replace_optional,
             force_gate=force_gate,
+            settings=extra,
         )
     except asyncio.CancelledError:
         detail = (
@@ -1064,6 +1079,8 @@ async def upsert_project(
         log.warning("[project_board] register[%s]: not saved — %s", project, exc)
         raise
     status.update(state="saved", stage="", finished_at=_now_iso())
+    if settings is None:
+        result.pop("stored_project", None)
     return result
 
 
@@ -1078,6 +1095,7 @@ async def _upsert(
     clear_default: bool,
     replace_optional: bool,
     force_gate: bool,
+    settings: dict[str, Any],
 ) -> dict[str, Any]:
     """``upsert_project``'s two phases: prove the gate, then the locked read-merge-write."""
     # Phase 1, NO lock: decide whether the gate this save leaves needs proving, and prove it.
@@ -1123,6 +1141,7 @@ async def _upsert(
                 "project list and save again"
             )
         entry = _merge_entry(prior, repo_p, branch, optional, replace_optional)
+        entry.update(settings)
         gate = _explicit_gate(entry)
         if gate and not smoked and not _gate_already_proven(prior, gate, repo_p):
             raise ProjectRegistryConflict(
@@ -1182,6 +1201,7 @@ async def _upsert(
             "created": project not in existing,
             "default_project": default,
             "managed_project": managed,
+            "stored_project": copy.deepcopy(entry),
         }
 
 
@@ -1258,9 +1278,10 @@ def build_register_tool(cfg: dict):
     async def board_register_project(
         name: str,
         repo: str,
-        base_branch: str = "main",
+        base_branch: str | None = None,
         gate: str = "",
         repo_conventions: str = "",
+        settings: dict[str, Any] | None = None,
     ) -> str:
         """Register an already-cloned repo as a board project so features can be dispatched to it;
         use it after onboard_project clones the repo. Onboarding must be enabled and the repo must
@@ -1270,19 +1291,30 @@ def build_register_tool(cfg: dict):
         Args:
             name: the project key features will carry (e.g. "pr-reviewer").
             repo: path to the checkout on disk.
-            base_branch: branch worktrees are cut from.
+            base_branch: branch worktrees are cut from (main for new projects).
             gate: "" (keep/inherit the configured gate) or the literal "auto" (discover the repo's
                 own gate target). Never a command: explicit gate commands are operator config.
             repo_conventions: repo rules injected into every coder dispatch (changelog policy,
                 import rules, gate quirks). Omitting it is the most common cause of a coder
-                inventing the wrong convention."""
+                inventing the wrong convention.
+            settings: optional per-project overrides, including require_complete_review,
+                preflight_cmd, release_freeze and review_summon_handle. Unknown keys are refused.
+                local_gate_cmd accepts only blank or "auto". Values override named arguments;
+                omitted settings are preserved. The reply includes the stored project."""
         try:
+            if base_branch is None:
+                base_branch = "main"
+                if settings is not None:
+                    project = _validate_name(name)
+                    prior = _prior_entry(_projects_from_section(_live_section(required=True), required=True), project)
+                    base_branch = (prior or {}).get("base_branch", "main")
             result = await upsert_project(
                 name,
                 repo,
                 base_branch=base_branch,
                 local_gate_cmd=_validate_agent_gate(gate),
                 repo_conventions=repo_conventions,
+                settings=settings,
             )
         except ProjectRegistryError as exc:
             return f"Error: {exc}."
@@ -1304,6 +1336,11 @@ def build_register_tool(cfg: dict):
             f"{verb} board project '{project}' → {entry['repo']} (base {entry['base_branch']}, "
             f"{gate_note}, {conv}). The running board applied it live; no restart is required.{note}"
             f"{managed_note(result.get('managed_project') or {})}"
+            + (
+                "\nStored project: " + json.dumps(result["stored_project"], sort_keys=True)
+                if settings is not None
+                else ""
+            )
         )
 
     return board_register_project
