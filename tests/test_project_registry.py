@@ -282,7 +282,7 @@ def test_agent_tool_schema_carries_no_gate_command_parameter():
     tool = build_register_tool({})
     assert tool is not None
     assert "local_gate_cmd" not in tool.args
-    assert set(tool.args) == {"name", "repo", "base_branch", "gate", "repo_conventions"}
+    assert set(tool.args) == {"name", "repo", "base_branch", "gate", "repo_conventions", "settings"}
 
 
 async def test_register_with_gate_auto_persists_the_discovery_sentinel(monkeypatch, tmp_path):
@@ -901,3 +901,83 @@ async def test_drain_tail_returns_a_short_stream_whole():
     stream = _EndlessStream(100)
     out = await _drain_tail(stream, 4000)
     assert len(out) == 100
+
+
+async def test_chat_project_settings_round_trip_and_merge(monkeypatch, tmp_path):
+    import json
+
+    from projects import resolve_projects
+
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "epic")
+    cfg = _smoke_cfg(root)
+    _wire_host(monkeypatch, cfg, apply_like_host(cfg))
+    tool = build_register_tool({})
+    settings = {
+        "require_complete_review": True,
+        "release_freeze": True,
+        "review_summon_handle": "@reviewer",
+        "coder_solve_budget": 42,
+    }
+    reply = await tool.ainvoke({"name": "epic", "repo": str(repo), "base_branch": "develop", "settings": settings})
+    saved = json.loads(reply.split("Stored project: ")[1])
+    # Set + read back: every policy value the agent set round-trips through the echo and is
+    # live in the resolved project config.
+    assert all(saved[key] == value for key, value in settings.items())
+    assert saved == _raw_projects()["epic"]  # no command text here, so the echo is the entry
+    assert resolve_projects(cfg.plugin_config["project_board"])["epic"]["require_complete_review"] is True
+
+    # Merge: hand-edited and operator-only fields survive a one-setting update.
+    projects = cfg.plugin_config["project_board"]["projects"]
+    projects["epic"]["hand_edited"] = {"keep": [1, 2]}
+    projects["epic"]["local_gate_cmd"] = "operator gate"  # operator command text — never set by an agent
+    projects["sibling"] = {"repo": "/other", "custom": True}
+    before = dict(projects["epic"])
+    reply = await tool.ainvoke({"name": "epic", "repo": str(repo), "settings": {"release_freeze": False}})
+    saved = json.loads(reply.split("Stored project: ")[1])
+    raw = _raw_projects()["epic"]
+    # The raw entry keeps every prior field (base_branch, the operator gate, the hand edit)…
+    assert raw == {**before, "release_freeze": False}
+    assert _raw_projects()["sibling"] == {"repo": "/other", "custom": True}  # untouched sibling intact
+    # …while the agent-facing echo shows the change but hides the operator's command text.
+    assert saved == {**raw, "local_gate_cmd": "(operator-configured, hidden from agents)"}
+    assert saved["release_freeze"] is False and saved["hand_edited"] == {"keep": [1, 2]}
+    # A later editor PUT must also preserve all advanced settings.
+    await upsert_project(
+        "epic", str(repo), base_branch="develop", local_gate_cmd="operator gate", replace_optional=True
+    )
+    assert _raw_projects()["epic"] == {**before, "release_freeze": False}
+
+
+@pytest.mark.parametrize(
+    "settings,message",
+    [
+        ({"unknown": True}, "unknown per-project settings: unknown"),
+        ({"managed_project": "escape"}, "unknown per-project settings: managed_project"),
+        ({"local_gate_cmd": "echo bypass"}, "explicit gate command is operator configuration"),
+        # Command settings carry text the loop runs, so the agent tool refuses them outright.
+        ({"preflight_cmd": "pytest -q"}, "not agent input: preflight_cmd"),
+        ({"setup_cmd": "npm ci", "format_cmd": "black ."}, "not agent input: format_cmd, setup_cmd"),
+        ({"coder_solve_gate_cmd": "make test"}, "not agent input: coder_solve_gate_cmd"),
+    ],
+)
+async def test_chat_project_settings_refused_before_apply(monkeypatch, tmp_path, settings, message):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "epic")
+    cfg = _smoke_cfg(root)
+    applied = []
+    _wire_host(monkeypatch, cfg, _recording_apply(cfg, applied))
+    reply = await build_register_tool({}).ainvoke({"name": "epic", "repo": str(repo), "settings": settings})
+    assert reply.startswith("Error:") and message in reply
+    assert applied == []
+
+
+async def test_chat_settings_do_not_claim_success_without_readback(monkeypatch, tmp_path):
+    root = tmp_path / "dev"
+    repo = _git_repo(root / "epic")
+    cfg = _smoke_cfg(root)
+    _wire_host(monkeypatch, cfg, lambda patch: (True, []))
+    reply = await build_register_tool({}).ainvoke(
+        {"name": "epic", "repo": str(repo), "settings": {"require_complete_review": True}}
+    )
+    assert reply.startswith("Error:") and "readback failed" in reply

@@ -51,17 +51,26 @@ these can retire work.
 
 ## Registering a project
 
-`board_register_project(name, repo, base_branch, gate, repo_conventions)` (in
+`board_register_project(name, repo, base_branch, gate, repo_conventions, settings)` (in
 `project_registry.py`) adds or updates a board project inside the operator's onboarding
-space. It also registers the repo as a **read-only managed project** in the host's
-`projects:` registry (#452), unless the repo is already one, so the agent's filesystem tools
-can read the checkout its coders branch from. The entry's `github` comes from the checkout's
-`origin` remote and its `default_branch` is `base_branch`. The reply says which of these
-happened: added, already a managed project (left alone), skipped because the name is taken
-by another path, or not possible on a host without the registry. Deleting the board project
-removes the managed entry only if the registration added it, it is still read-only, and no
-other board project uses the checkout. See
-[Multi-project](configuration.md#multi-project).
+space. `base_branch` defaults to `main` for a new project, and to the project's stored
+branch when it already exists and only `settings` are being changed. `settings` is an
+optional map of per-project **policy** overrides (e.g. `require_complete_review`,
+`release_freeze`, `review_summon_handle`) that merges onto the stored entry — unlisted
+fields, including hand edits, are preserved. Unknown keys are refused, and so is any value
+that carries command text the board would run: every `*_cmd` (`preflight_cmd`, `setup_cmd`,
+`format_cmd`, each `coder_solve_*_cmd`) is operator configuration (Settings ▸ Projects), not
+agent input, and `local_gate_cmd` accepts only blank or `"auto"` — the same rule `gate`
+enforces. When `settings` is supplied the reply appends `Stored project: <json>` so the
+agent can confirm what was saved; operator command text in that echo is hidden. It also
+registers the repo as a **read-only managed project** in the host's `projects:` registry
+(#452), unless the repo is already one, so the agent's filesystem tools can read the checkout
+its coders branch from. The entry's `github` comes from the checkout's `origin` remote and
+its `default_branch` is `base_branch`. The reply says which of these happened: added, already
+a managed project (left alone), skipped because the name is taken by another path, or not
+possible on a host without the registry. Deleting the board project removes the managed entry
+only if the registration added it, it is still read-only, and no other board project uses the
+checkout. See [Multi-project](configuration.md#multi-project).
 
 ## Notes
 
