@@ -190,6 +190,10 @@ class PromptMixin:
             f"{req_block}"
         )
 
+    def _has_review_feedback(self, fid: str) -> bool:
+        """Include queued route feedback without consuming it before prompt construction."""
+        return bool(self._ci_feedback.get(fid) or _PENDING_FEEDBACK.get(fid))
+
     def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "") -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
