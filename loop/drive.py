@@ -4396,9 +4396,10 @@ class DriveMixin:
     async def _fetch_kg_lessons(self, feature: dict) -> str:
         """Query memory and legacy knowledge for lessons relevant to THIS feature.
         Builds the query from the feature's title + files, pulls the top
-        ``kg_lessons_k`` hits per store from the ``kg_lessons_domain`` bucket, and
-        merges them for ``_build_prompt``. Best-effort: a retrieval hiccup in one
-        store must neither hide the other's lessons nor block a build."""
+        ``kg_lessons_k`` hits per store (the new ``memories`` store semantically; the
+        legacy ``chunks`` store scoped to the ``kg_lessons_domain`` bucket), dedupes
+        by content, and merges them for ``_build_prompt``. Best-effort: a retrieval
+        hiccup in one store must neither hide the other's lessons nor block a build."""
         if not self.kg_lessons:
             return ""
         query = " ".join(
@@ -4418,14 +4419,23 @@ class DriveMixin:
             log.info("[project_board] kg-lessons fetch skipped (%s)", exc)
             return ""
         hits = []
-        # ADR 0125 moves agent-written lessons to memories. Keep reading chunks
-        # too: existing lessons may not have been migrated yet.
-        for name in ("memory_search", "knowledge_search"):
+        # ADR 0125 moves agent-written lessons out of the knowledge ``chunks`` table
+        # (scoped by ``domain``) and into a ``memories`` table that has NO ``domain``
+        # field — so ``memory_search`` takes only (query, k) while legacy
+        # ``knowledge_search`` still scopes by domain. Passing ``domain=`` to
+        # ``memory_search`` would raise and the per-store except would hide every
+        # migrated lesson. Read both stores: migrated lessons live in memories,
+        # un-migrated ones still live in chunks. Each store is independently best-effort.
+        stores = (
+            ("memory_search", {}),
+            ("knowledge_search", {"domain": self.kg_lessons_domain or None}),
+        )
+        for name, extra in stores:
             search = getattr(sdk, name, None)
             if search is None:
                 continue
             try:
-                hits.extend(await search(query, k=self.kg_lessons_k, domain=self.kg_lessons_domain or None) or [])
+                hits.extend(await search(query, k=self.kg_lessons_k, **extra) or [])
             except Exception as exc:  # noqa: BLE001 — each store is independently best-effort
                 log.info("[project_board] kg-lessons %s skipped (%s)", name, exc)
         lines = []

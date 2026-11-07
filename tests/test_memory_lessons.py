@@ -13,18 +13,28 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 async def test_memory_and_knowledge_lessons_merge_by_content(monkeypatch):
-    memory = AsyncMock(return_value=[{"content": " shared "}, {"content": "memory lesson"}])
+    # The post-ADR 0125 ``memories`` store has NO ``domain`` field, so ``memory_search``
+    # takes only (query, k). Use a strict signature here rather than an AsyncMock: a
+    # stray ``domain=`` must raise (which the per-store except would swallow, dropping
+    # every migrated lesson) so the regression is caught instead of silently passing.
+    memory_calls = []
+
+    async def memory_search(query, *, k):
+        memory_calls.append((query, k))
+        return [{"content": " shared "}, {"content": "memory lesson"}]
+
     knowledge = AsyncMock(
         return_value=[{"content": "shared", "preview": "different preview"}, {"preview": "legacy lesson"}]
     )
-    monkeypatch.setattr("graph.sdk.memory_search", memory, raising=False)
+    monkeypatch.setattr("graph.sdk.memory_search", memory_search, raising=False)
     monkeypatch.setattr("graph.sdk.knowledge_search", knowledge)
 
     result = await BoardLoop({"kg_lessons_k": 2})._fetch_kg_lessons(FEATURE)
 
     assert result == "- shared\n- memory lesson\n- legacy lesson"
-    for search in (memory, knowledge):
-        search.assert_awaited_once_with("Fix retry handling loop/drive.py", k=2, domain="loop-lessons")
+    # memories store queried WITHOUT domain; legacy chunks store still scoped by domain.
+    assert memory_calls == [("Fix retry handling loop/drive.py", 2)]
+    knowledge.assert_awaited_once_with("Fix retry handling loop/drive.py", k=2, domain="loop-lessons")
 
 
 async def test_legacy_sdk_keeps_query_and_formatting(monkeypatch):
@@ -66,3 +76,6 @@ def test_retro_declares_current_and_legacy_memory_tools():
     assert "memory_remember" not in skill
     assert 'kind="fact"' in skill
     assert "`subject` = the failure class" in skill
+    # The new memories store has no domain field (ADR 0125): the skill must scope a
+    # saved lesson by subject, and only the legacy memory_ingest may pass a domain.
+    assert "memories store has no domain field" in skill

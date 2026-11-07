@@ -18,10 +18,10 @@ tools:
   - read_file        # read the current PROTO.md (don't re-propose what's already grounded)
   - find_files       # locate PROTO.md / the agent-instructions file
   - write_file       # write the dated retro report (the proposal); never PROTO.md itself
-  - memory_search    # check the loop-lessons KG bucket so you don't write a duplicate
-  - memory_save      # write each NEW lesson to the KG (domain "loop-lessons") — coders read it
+  - memory_search    # dedup check: find a near-identical lesson before writing
+  - memory_save      # write each NEW lesson (kind="fact", subject=failure class) — coders read it
   - memory_recall    # pre-ADR 0125 core: memory_search
-  - memory_ingest    # pre-ADR 0125 core: memory_save
+  - memory_ingest    # pre-ADR 0125 core: memory_save (domain "loop-lessons")
   - check_inbox      # (optional) if an inbox exists, leave a note pointing at the report
 ---
 
@@ -95,13 +95,14 @@ On core versions before the ADR 0125 release (including 0.230.x), use
    interactive follow-up) applies it. (The agent has no git anyway.)
 
 6. **Write the lessons to the knowledge graph.** This is what reaches the coders —
-   the loop injects relevant `loop-lessons` chunks into each coder's prompt at build
-   time. For each NEW lesson (the step-4 bullets):
-   - **Dedup first:** `memory_search` the lesson's key phrase scoped to the
-     `loop-lessons` domain. If a near-identical chunk already exists, SKIP it.
-   - **Write it:** `memory_save` the gotcha with `domain="loop-lessons"`,
-     `kind="fact"`, `subject` = the failure class, and `heading` = the failure class.
-     With the older `memory_ingest`, use its supported domain and heading fields.
+   the loop injects relevant lessons into each coder's prompt at build time. For each
+   NEW lesson (the step-4 bullets):
+   - **Dedup first:** `memory_search` the lesson's key phrase. If a near-identical
+     lesson already exists, SKIP it. (On pre-ADR 0125 core this is `memory_recall` —
+     scope it to the `loop-lessons` domain, which the chunks store still has.)
+   - **Write it:** `memory_save` the gotcha with `kind="fact"`,
+     `subject` = the failure class, and `heading` = the failure class.
+     The memories store has no domain field (ADR 0125), so do NOT pass `domain` — `subject` is what scopes the lesson. On pre-ADR 0125 core this is `memory_ingest`: write it with `domain="loop-lessons"` and a heading instead.
      Keep the body self-contained (the failure + the fix + the file/command) — a coder sees only this chunk, not the whole report.
    Unlike PROTO.md (which a human applies), the KG write is safe to do unsupervised:
    it's additive, deduped, searchable, and decays via normal memory curation.
