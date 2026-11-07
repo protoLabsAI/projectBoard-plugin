@@ -2550,10 +2550,10 @@ class ReconcileMixin:
         blind to what it must fix. A live in-memory copy is never clobbered, and any read
         failure just leaves the levers empty (the fix round still resumes the branch, only
         without the lead-in)."""
-        if self._ci_feedback.get(fid):
+        if self._has_review_feedback(fid):
             return  # a surviving in-memory copy already leads the next dispatch
         findings = await asyncio.to_thread(self._last_review_findings, store, fid)
-        if not findings:
+        if not findings or self._has_review_feedback(fid):
             return
         self._ci_feedback[fid] = self._review_fix_feedback(fid, findings)
         try:

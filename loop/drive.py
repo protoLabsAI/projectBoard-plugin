@@ -2101,6 +2101,14 @@ class DriveMixin:
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
                 # from the KG (best-effort, async) and inject them — the flywheel READ.
+                # #651: requeue preserves changes-requested. It is the durable
+                # outstanding verdict; a spent budget alone can refer to an old round.
+                missing_review_findings = False
+                if feature.get("pr_url") and not self._has_review_feedback(fid):
+                    if store_mod.LABEL_CHANGES_REQUESTED in (feature.get("labels") or []):
+                        await self._reinject_review_feedback(store, fid, feature["pr_url"], repo)
+                    if not self._has_review_feedback(fid):
+                        missing_review_findings = await self._budget_get(store, fid, "review-fix", feature) > 0
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
                 prompt += work_location_capture.reporting_instructions()
@@ -2709,6 +2717,13 @@ class DriveMixin:
                         )
                         return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
+                    missing_findings_note = (
+                        "fix round dispatched without review findings (lost on restart?) — "
+                        if isinstance(exc, worktree.NoChangesError) and missing_review_findings
+                        else ""
+                    )
+                    if missing_findings_note:
+                        exc = worktree.NoChangesError(missing_findings_note + str(exc))
                     idle_s = self._timeout_idle_gap(fid, exc) if isinstance(exc, worktree.CoderTimeout) else None
                     if idle_s is not None:
                         exc = worktree.CoderTimeout(f"{exc}; last event {idle_s:.0f}s before timeout")
@@ -2883,7 +2898,10 @@ class DriveMixin:
                                 continue
                             # The same-tier retry also returned empty — NOW it is a coder
                             # failure: record it, then let the normal ladder climb.
-                            reason = f"empty_result: {evidence} — {n} occurrence(s), same-tier retry exhausted"
+                            reason = (
+                                missing_findings_note
+                                + f"empty_result: {evidence} — {n} occurrence(s), same-tier retry exhausted"
+                            )
                             try:
                                 await asyncio.to_thread(
                                     store.record_attempt,
@@ -2947,7 +2965,10 @@ class DriveMixin:
                             in (feature.get("labels") or [])
                         ):
                             pr = str(feature.get("pr_url") or pr_url or "").strip()
-                            reason = f"{EXTERNAL_FINDING_DECLINED_REASON} — {pr or '(PR url unknown)'}"
+                            reason = (
+                                missing_findings_note
+                                + f"{EXTERNAL_FINDING_DECLINED_REASON} — {pr or '(PR url unknown)'}"
+                            )
                             coder_reason = _declined_coder_reason(result)
                             if coder_reason:
                                 reason += f"\n\ncoder: {coder_reason}"
