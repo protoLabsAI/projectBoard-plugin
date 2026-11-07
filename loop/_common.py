@@ -755,7 +755,7 @@ def _collapse_ws(text: str) -> str:
 # #667 — a DELIBERATE coder refusal: a line that STARTS `BLOCKED-ON-<WORD>:` anywhere in
 # the final reply (multiline). The word is upper-case and may carry hyphens
 # (`BLOCKED-ON-SPEC`, `BLOCKED-ON-DEP-GRAPH`); the colon terminates it.
-_BLOCKED_ON_RE = re.compile(r"^\s*BLOCKED-ON-[A-Z][A-Z-]*:", re.MULTILINE)
+_BLOCKED_ON_RE = re.compile(r"^[ \t]*BLOCKED-ON-[A-Z][A-Z-]*:", re.MULTILINE)
 # Just the `BLOCKED-ON-<WORD>` token (no colon) for the friction summary label.
 _BLOCKED_ON_LABEL_RE = re.compile(r"BLOCKED-ON-[A-Z][A-Z-]*")
 

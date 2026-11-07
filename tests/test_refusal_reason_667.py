@@ -6,7 +6,7 @@ and open no PR because the spec is unbuildable as written — the board used to 
 sight of the reply, so a principled refusal looked identical to an empty run and the ladder
 retried it into the same wall. This fix reads the coder's reply in the NoChangesError handler:
 
-- a ``BLOCKED-ON-<WORD>:`` line (``^\\s*BLOCKED-ON-[A-Z][A-Z-]*:``, multiline) is a DELIBERATE
+- a ``BLOCKED-ON-<WORD>:`` line (``^[ \\t]*BLOCKED-ON-[A-Z][A-Z-]*:``, multiline) is a DELIBERATE
   refusal — block ONCE under the ``design`` class, no tier climb, no same-tier retry, reason =
   the marker line plus the rest of its paragraph; friction summary ``coder refused: BLOCKED-ON-<WORD>``
   at minor severity;
@@ -65,7 +65,7 @@ def ledger(monkeypatch):
     host_friction.reset()
 
 
-async def _run_no_commit_drive(monkeypatch, *, reply, store, pr_url=None, labels=None):
+async def _run_no_commit_drive(monkeypatch, *, reply, store, pr_url=None, labels=None, had_tools=True):
     """Drive ONE no-commit attempt with the worktree tier mocked. The coder returns ``reply``
     and commits nothing: a FRESH build (no ``pr_url``) reaches ``open_pr``, which raises the
     canonical NoChangesError; a FIX ROUND (``pr_url`` set) stops at ``fix_round_unchanged``
@@ -79,7 +79,8 @@ async def _run_no_commit_drive(monkeypatch, *, reply, store, pr_url=None, labels
         # Real tool activity in the gen buffer: the coder executed, it just shipped nothing —
         # so the empty-result (#198) same-tier retry never fires and the no-commit paths
         # under test are exactly what the drive takes.
-        coder_seam.progress_tool(FID, 1, {"phase": "start", "name": "Read", "id": "t1", "input": {}})
+        if had_tools:
+            coder_seam.progress_tool(FID, 1, {"phase": "start", "name": "Read", "id": "t1", "input": {}})
         return reply
 
     async def _create(repo, base, fid, root, title="", **_kw):
@@ -186,14 +187,16 @@ def test_collapse_ws_flattens_every_run():
 # ── r1: a deliberate BLOCKED-ON refusal blocks ONCE as `design`, no climb, no retry ──────
 
 
-async def test_refusal_blocks_once_as_design_no_climb_no_retry(monkeypatch):
+@pytest.mark.parametrize("had_tools", [False, True])
+@pytest.mark.parametrize("separator", ["\n\n", "\n\n\n", "\n \t\n\t\n  "])
+async def test_refusal_blocks_once_as_design_no_climb_no_retry(monkeypatch, had_tools, separator):
     reply = (
         "I analyzed the card against the kit and the acceptance criteria.\n\n"
         "The criteria reference a kit class that does not exist, so this is unbuildable as "
-        "written and I made no commit.\n\n" + REFUSAL_LINE
+        "written and I made no commit." + separator + REFUSAL_LINE
     )
     store = _EscalatingStore(tiers=["smart", "top"])  # a ladder IS available…
-    loop, dispatches = await _run_no_commit_drive(monkeypatch, reply=reply, store=store)
+    loop, dispatches = await _run_no_commit_drive(monkeypatch, reply=reply, store=store, had_tools=had_tools)
 
     # ONE dispatch; the ladder was NEVER consulted; no attempt counted.
     assert len(dispatches) == 1
@@ -286,3 +289,48 @@ def test_without_a_refusal_a_no_commit_is_the_ordinary_empty_run_summary(ledger)
         "summary": "coder produced no commits vs base (nothing to open a PR from)",
         "severity": "minor",
     }
+
+
+@pytest.mark.parametrize("separator", ["\n\n\n", "\n \t\n\t\n  "])
+def test_refusal_paragraph_ignores_preceding_blank_lines(separator):
+    reply = "Preamble" + separator + REFUSAL_LINE + "\nMore detail.\n\nUnrelated paragraph."
+    assert _coder_refusal(reply) == REFUSAL_LINE + " More detail."
+
+
+async def test_external_bounce_refusal_preserves_operator_override(monkeypatch):
+    from project_board.loop import unblock_side_effects
+    from project_board.loop._common import EXTERNAL_FINDING_DECLINED_REASON, _is_external_finding_block
+    from project_board.store import LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX, LABEL_IN_REVIEW, SHORT_SHA_LEN
+    from test_external_nocommit_653 import _FakeStore, _trap_gh
+
+    short = HEAD[:SHORT_SHA_LEN]
+    labels = [LABEL_IN_REVIEW, f"{LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{short}"]
+    store = _EscalatingStore(tiers=["smart"])
+    _, dispatches = await _run_no_commit_drive(
+        monkeypatch, reply=REFUSAL_LINE, store=store, pr_url=PR_URL, labels=labels
+    )
+    assert len(dispatches) == 1
+    assert store.escalated == []
+    assert not [c for c in store.calls if c[0] == "record_attempt"]
+    blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+    assert len(blocked) == 1
+    _, fid, reason, category = blocked[0]
+    assert category == "terminal"
+    assert EXTERNAL_FINDING_DECLINED_REASON in reason
+    assert REFUSAL_LINE in reason
+    feature = {
+        **FEATURE,
+        "board_state": "blocked",
+        "pr_url": PR_URL,
+        "labels": [*labels, "blocked", "blocked-class:terminal"],
+        "blocked_reason": reason,
+    }
+    assert _is_external_finding_block(feature)
+    gh = _trap_gh(monkeypatch)
+    audit = _FakeStore()
+    assert unblock_side_effects(fid, feature, audit, override_review=True, cwd="/repo") == {
+        "review": "out-of-scope",
+        "head": short,
+    }
+    assert audit.comments == [(fid, f"operator ruled out of scope: external finding at head {short}")]
+    assert audit.substate == [] and audit.budgets_cleared == [] and gh == []

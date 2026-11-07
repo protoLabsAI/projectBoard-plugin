@@ -2876,14 +2876,25 @@ class DriveMixin:
                     # ladder proceeds (single coder / ladder top → blocked, reason naming
                     # the class + evidence).
                     if isinstance(exc, worktree.NoChangesError):
+                        had_tools, stop = self._empty_result_signals(fid)
+                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
+                        external_decline = (
+                            had_tools
+                            and ext_head
+                            and (
+                                f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
+                                in (feature.get("labels") or [])
+                            )
+                        )
                         # #667: a DELIBERATE refusal — the coder ended with `BLOCKED-ON-<WORD>:
                         # <why>` and opened no PR, judging the spec unbuildable as written. A
                         # stronger model refuses the same gap, so there is no ladder to climb
                         # and no empty-result retry to spend: block ONCE for the operator under
                         # the `design` class (not self-healing), the reason quoting the marker
-                        # line plus the rest of its paragraph. Checked BEFORE the empty-result
-                        # and #653 paths so neither the same-tier retry nor the ladder sees it.
-                        if coder_refusal:
+                        # line plus the rest of its paragraph. Preserve #653's external-finding
+                        # decline when tools ran on the stamped head: its reason lets the operator
+                        # rule the finding out of scope with --override-review.
+                        if coder_refusal and not external_decline:
                             reason = (
                                 missing_findings_note
                                 + f"coder refused (deliberate design block, no commit, no PR): {coder_refusal}"
@@ -2909,7 +2920,7 @@ class DriveMixin:
                                 await self._discard_tree(store, fid, repo, wt, branch, base=base)
                                 self._inflight.pop(fid, None)
                             return
-                        # Not a refusal: fold the coder's final-message tail into the exc so the
+                        # Ordinary no-change or external decline: fold the reply tail into the exc so the
                         # block reason and the escalation's attempt note say what the coder
                         # actually said (the gate-red tail idiom). An EMPTY reply changes
                         # nothing — today's "coder produced no commits…" message stands verbatim.
@@ -2918,7 +2929,6 @@ class DriveMixin:
                         tail = _coder_reply_tail(result or "")
                         if tail:
                             exc = worktree.NoChangesError(f"{exc}. Coder's final message (tail): {tail}")
-                        had_tools, stop = self._empty_result_signals(fid)
                         if not had_tools:
                             n = await self._budget_get(store, fid, "empty-result", feature) + 1
                             await self._budget_set(store, fid, "empty-result", n)
@@ -3012,11 +3022,7 @@ class DriveMixin:
                         # (`board_unblock_feature --override-review`, audited in `unblock_side_effects`).
                         # Internal-gate and CI-fix no-commit rounds carry no such stamp for the current
                         # head, so they fall through and keep today's escalation ladder unchanged.
-                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
-                        if ext_head and (
-                            f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
-                            in (feature.get("labels") or [])
-                        ):
+                        if external_decline:
                             pr = str(feature.get("pr_url") or pr_url or "").strip()
                             reason = (
                                 missing_findings_note
