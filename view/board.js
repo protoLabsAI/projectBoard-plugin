@@ -293,8 +293,8 @@ function prose(s){ return s ? '<div class="tdsec md-saying" data-md="'+esc(s)+'"
 // The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
 // #drawer instead of inline on the Kanban card / list row. Renders the spec, the
 // acceptance criteria, any recorded deliverable, the requirement ledger, then the
-// state-appropriate controls (taskExtra). Everything is esc()'d — server-authored text,
-// never raw HTML.
+// state-appropriate controls (taskExtra). Server-authored text starts esc()'d; spec/AC
+// are upgraded through the guarded markdown pass.
 function taskDetail(f){
   let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
@@ -1527,7 +1527,7 @@ function collapseTools(rows){
 // syntax. The renderer (marked) loads LAZILY from CDN on the first drawer open and is
 // cached; if it never loads, the section keeps the plain esc()'d text genCard emits
 // inline (the fallback). "thinking" (thought_tail) is internal reasoning, not prose, so
-// it stays plain esc()'d text — only "saying" is upgraded.
+// it stays plain esc()'d text. Card/task spec and acceptance criteria share this pass.
 const MARKED_CDN = "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js";
 // Subresource-integrity pin for the 12.0.2 artifact (cdnjs-published sha512): the script
 // only executes if the fetched bytes match, so a tampered CDN response fails closed into
@@ -1550,15 +1550,25 @@ function loadMarked(){
   }).then((m) => (MARKED = m || null));
   return MARKED_LOAD;
 }
-// Parse markdown → HTML with a hard XSS guard: escape angle brackets in the SOURCE first,
-// so any HTML tags in the coder's text render as literal characters, never live markup
-// (marked passes source HTML through by default). Markdown syntax (#, *, `, -, [](), etc.)
-// is angle-bracket-free, so it is untouched and still renders. breaks:true keeps the
-// coder's newlines; gfm:true enables fenced code + tables.
+// Tokenize before escaping source HTML so marked handles code's escaping exactly once.
+// HTML and prose tokens still have source angle brackets escaped BEFORE parsing tokens to HTML;
+// code tokens use marked's own escaping (codespan in the lexer, code in the renderer).
+// This also preserves literal entity spellings such as `&lt;` inside code.
 function renderMarkdown(marked, src){
-  const safe = String(src).replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const parse = (marked && marked.parse) ? marked.parse : marked;   // marked.parse spans UMD versions
-  return parse(safe, {breaks: true, gfm: true});
+  const options = {breaks: true, gfm: true};
+  // Retain the older callable/parse-only UMD fallback; the pinned build has token APIs.
+  if (!marked.lexer || !marked.walkTokens || !marked.parser) {
+    const safe = String(src).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const parse = (marked && marked.parse) ? marked.parse : marked;
+    return parse(safe, options);
+  }
+  const tokens = marked.lexer(String(src), options);
+  marked.walkTokens(tokens, (token) => {
+    if (token.type === "html" || token.type === "text") {
+      token.text = token.text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  });
+  return marked.parser(tokens, options);
 }
 // Belt-and-suspenders on top of the source escape: neutralize the only attributes markdown
 // syntax can emit (link href / image src) by dropping dangerous URL schemes, and open any

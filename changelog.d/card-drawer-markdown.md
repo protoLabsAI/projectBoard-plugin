@@ -7,6 +7,9 @@ The spec/AC prose reuses the exact markdown path the coder's "saying" section al
 (bd-p87t): one shared `prose()` helper emits the `.md-saying` hook with a `data-md`
 attribute, `enhanceSaying()` upgrades the fresh nodes on every drawer repaint (card, task
 and monitor), and the esc()'d plain-text body stays as the fallback when the marked CDN
-load fails. The XSS guard is unchanged — source angle brackets are escaped before parsing,
+load fails. The XSS guard still escapes source HTML before rendering: after tokenization, HTML
+and prose angle brackets are escaped while marked escapes code exactly once. This keeps
+`Promise<void>`, `-> None`, and literal entities correct in inline and fenced code.
+The existing URL guards and CDN pin are unchanged:
 `javascript:`/`data:`/`vbscript:` hrefs are stripped, and the renderer stays pinned by
 subresource integrity — because card text is untrusted, exactly like coder output.

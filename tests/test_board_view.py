@@ -412,7 +412,7 @@ def test_markdown_renderer_loads_lazily_from_cdn_with_a_fallback():
 
 
 def test_saying_markdown_is_xss_safe():
-    """No raw HTML passthrough: the source's angle brackets are escaped BEFORE parsing so
+    """No raw HTML passthrough: HTML/prose angle brackets are escaped BEFORE rendering so
     tags render as literal text, and the only URL-bearing attributes markdown can emit are
     scrubbed of dangerous schemes."""
     assert '.replace(/</g, "&lt;").replace(/>/g, "&gt;")' in BOARD_PAGE
@@ -902,3 +902,18 @@ def test_r2_r3_self_verified_provenance_shares_the_badge_gate():
     assert 'if (!isSelfVerified(f)) return "";' in body
     # both the badge and the provenance route through the one gate
     assert BOARD_PAGE.count("isSelfVerified(f)") >= 3  # definition + badge + provenance
+
+
+def test_markdown_runtime_regressions():
+    """Run against the vendored, SRI-verified marked build; never fetch from CI."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    if shutil.which("node") is None:
+        pytest.skip("node not on PATH")
+    script = Path(__file__).parent / "node" / "board_markdown.test.cjs"
+    result = subprocess.run(["node", "--test", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
