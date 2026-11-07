@@ -1,5 +1,6 @@
 """Goal verifier contract, with the host result type supplied at its import seam."""
 
+import logging
 import sys
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
@@ -117,8 +118,15 @@ async def test_read_error(verifier, monkeypatch):
     assert "store unavailable" in result.reason
 
 
-def test_older_host():
-    project_board.register(_Registry())
+def test_older_host(caplog):
+    # A host without register_goal_verifier takes the silent AttributeError branch:
+    # register() must succeed and must NOT log the catch-all failure (that would mean
+    # the real exception path ran instead of the older-host path).
+    reg = _Registry()
+    assert not hasattr(reg, "register_goal_verifier")
+    with caplog.at_level(logging.ERROR, logger="protoagent.plugins.project_board"):
+        project_board.register(reg)
+    assert "registering card state goal verifier failed" not in caplog.text
 
 
 def test_registration_failure_logged(caplog):

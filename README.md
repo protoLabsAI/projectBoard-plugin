@@ -83,8 +83,11 @@ For example, ask the host's `create_watch` tool:
 The verifier spec is:
 
 ```json
-{"kind": "board:card_state", "args": {"feature_id": "bd-r7tqa", "state": "in_review"}}
+{"type": "plugin", "check": "board:card_state", "args": {"feature_id": "bd-r7tqa", "state": "in_review"}}
 ```
+
+The host selects a plugin verifier by `type: "plugin"` and `check`; a bare name
+runs the default LLM verifier instead and never reaches the board.
 
 `state` accepts a string or a list of `backlog`, `ready`, `in_progress`,
 `in_review`, `done`, `blocked`, and `cancelled`. Add `"merged": true` with

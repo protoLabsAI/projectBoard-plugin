@@ -55,17 +55,23 @@ def _make_card_state_verifier(cfg: dict):
     async def _card_state_verifier(spec, ctx):
         from graph.goals.types import VerifyResult
 
+        from .board_cards import STATES
         from .store import LABEL_MERGED_VERIFIED_PREFIX, get_store
 
         try:
-            args = spec.get("args", {})
+            args = spec.get("args", {}) if isinstance(spec, dict) else {}
+            if not isinstance(args, dict):
+                args = {}
             feature_id = args.get("feature_id")
             if not isinstance(feature_id, str) or not feature_id.strip():
                 return VerifyResult(met=False, reason="feature_id is required", evidence="")
             states = args.get("state")
             if isinstance(states, str):
                 states = [states]
-            allowed = {"backlog", "ready", "in_progress", "in_review", "done", "blocked", "cancelled"}
+            # Build on the board's own state list (board_cards.STATES) so a future state
+            # change can't leave this verifier silently rejecting a valid card; `cancelled`
+            # is terminal but not in STATES, so add it explicitly.
+            allowed = {*STATES, "cancelled"}
             if (
                 not isinstance(states, list)
                 or not states
