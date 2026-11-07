@@ -18,8 +18,10 @@ tools:
   - read_file        # read the current PROTO.md (don't re-propose what's already grounded)
   - find_files       # locate PROTO.md / the agent-instructions file
   - write_file       # write the dated retro report (the proposal); never PROTO.md itself
-  - memory_recall    # check the loop-lessons KG bucket so you don't write a duplicate
-  - memory_remember  # write each NEW lesson to the KG (domain "loop-lessons") — coders read it
+  - memory_search    # check the loop-lessons KG bucket so you don't write a duplicate
+  - memory_save      # write each NEW lesson to the KG (domain "loop-lessons") — coders read it
+  - memory_recall    # pre-ADR 0125 core: memory_search
+  - memory_ingest    # pre-ADR 0125 core: memory_save
   - check_inbox      # (optional) if an inbox exists, leave a note pointing at the report
 ---
 
@@ -36,6 +38,10 @@ NOT edit PROTO.md or commit anything. **You never write code.**
 > lost. Make `write_file` to `docs/dev/loop-retros/<date>.md` your deliverable; your
 > reply is just a one-line pointer ("wrote docs/dev/loop-retros/<date>.md — N classes,
 > M proposed"). If you skip the `write_file`, the retro accomplished nothing.
+
+On core versions before the ADR 0125 release (including 0.230.x), use
+`memory_recall` instead of `memory_search` and `memory_ingest` instead of
+`memory_save`. Core skips unavailable tool names in the list above.
 
 ## Procedure
 
@@ -91,11 +97,12 @@ NOT edit PROTO.md or commit anything. **You never write code.**
 6. **Write the lessons to the knowledge graph.** This is what reaches the coders —
    the loop injects relevant `loop-lessons` chunks into each coder's prompt at build
    time. For each NEW lesson (the step-4 bullets):
-   - **Dedup first:** `memory_recall` the lesson's key phrase scoped to the
+   - **Dedup first:** `memory_search` the lesson's key phrase scoped to the
      `loop-lessons` domain. If a near-identical chunk already exists, SKIP it.
-   - **Write it:** `memory_remember` the gotcha with `domain="loop-lessons"` and a
-     `heading` = the failure class. Keep the body self-contained (the failure + the
-     fix + the file/command) — a coder sees only this chunk, not the whole report.
+   - **Write it:** `memory_save` the gotcha with `domain="loop-lessons"`,
+     `kind="fact"`, `subject` = the failure class, and `heading` = the failure class.
+     With the older `memory_ingest`, use its supported domain and heading fields.
+     Keep the body self-contained (the failure + the fix + the file/command) — a coder sees only this chunk, not the whole report.
    Unlike PROTO.md (which a human applies), the KG write is safe to do unsupervised:
    it's additive, deduped, searchable, and decays via normal memory curation.
 
@@ -116,8 +123,8 @@ NOT edit PROTO.md or commit anything. **You never write code.**
 - **Self-verified closures go in the REPORT, never the KG.** A done task flagged
   `self_verified: true` (#316) is a governance observation — a deliverable that closed
   with no second pair of eyes — not a coder failure class; list it for the human reader
-  and stop there (no `memory_remember`, no PROTO.md bullet).
-- **Dedup the KG** (`memory_recall` before `memory_remember`) and **don't re-propose** an
+  and stop there (no `memory_save`, no PROTO.md bullet).
+- **Dedup the KG** (`memory_search` before `memory_save`) and **don't re-propose** an
   existing PROTO.md lesson — read both first.
 - **Name specifics** (file, command, the golden structures) — a vague gotcha is noise.
 - **Trends are the point:** a class that recurs *after* grounding is an escalation to a
