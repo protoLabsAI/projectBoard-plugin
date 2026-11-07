@@ -2766,3 +2766,50 @@ def test_update_phase_ignores_an_ended_or_foreign_call():
     p.add_tool({"phase": "end", "id": "t1", "name": "Terminal", "status": "completed"})
     p.add_tool({"phase": "update", "id": "t1", "name": "late", "input": "{}"})
     assert p.current_tool["name"] == "Terminal" and all(r["name"] == "Terminal" for r in p.recent_tools)
+
+
+# ── a persisted gen snapshot is compact and size-capped ───────────────────────────
+#
+# The live buffer keeps up to 200 tool rows (plus outputs) so the drawer can show a run as it
+# happens. Persisting all of it made every finished gen a ~10-38 KB bead comment: on
+# protoEngineer 2026-11-07 1,975 of them were 21 MB of a 30 MB issues.jsonl, which `br`
+# rewrites (and snapshots into .br_history) on EVERY board write — each `br update` took
+# 10-34s under load and the board stalled. The persisted record is a SUMMARY: bounded no
+# matter how long the run was.
+
+
+def _run_a_long_gen(cs, fid, monkeypatch, tools=500):
+    clock = [0.0]
+    monkeypatch.setattr(cs, "_monotonic", lambda: clock[0])
+    store = _FakeStore()
+    monkeypatch.setattr(cs, "_store_factory", lambda: store)
+    cs.progress_new_run(fid)
+    cs.progress_begin(fid, 1, "reasoning")
+    cs.progress_plan(fid, 1, [{"content": f"step {i} " + "x" * 300, "status": "completed"} for i in range(40)])
+    for i in range(tools):
+        cs.progress_tool(fid, 1, {"phase": "start", "id": f"t{i}", "name": "bash", "input": "y" * 900})
+        cs.progress_tool(fid, 1, {"phase": "end", "id": f"t{i}", "status": "completed", "output": "z" * 900})
+    cs.progress_answer(fid, 1, "w" * 5000)
+    cs.progress_stop_reason(fid, 1, "end_turn")
+    clock[0] = 600.0
+    cs.progress_end(fid, 1)
+    assert len(store.comments) == 1
+    return json.loads(store.comments[0][1][len("coder-monitor: ") :]), store.comments[0][1]
+
+
+def test_persisted_snapshot_is_capped_however_long_the_run(monkeypatch):
+    payload, text = _run_a_long_gen(coder_seam, "bd-cap1", monkeypatch)
+    assert len(text.encode()) <= coder_seam._PERSIST_MAX_BYTES
+    # still the summary the drawer replays
+    assert payload["tier"] == "reasoning" and payload["done"] is True
+    assert payload["stop_reason"] == "end_turn" and payload["elapsed_s"] == 600.0
+    assert payload["recent_tools"] and payload["recent_tools"][-1]["id"] == "t499"  # the LAST tools kept
+    # …and how many rows the live buffer held (it is itself capped at _RECENT_TOOLS_MAX)
+    assert payload["recent_tools_total"] == coder_seam._RECENT_TOOLS_MAX
+
+
+def test_persisted_snapshot_keeps_a_small_run_whole(monkeypatch):
+    payload, _ = _run_a_long_gen(coder_seam, "bd-cap2", monkeypatch, tools=3)
+    # a start + an end row per tool — all of them kept for a short run
+    assert list(dict.fromkeys(r["id"] for r in payload["recent_tools"])) == ["t0", "t1", "t2"]
+    assert payload["recent_tools_total"] == len(payload["recent_tools"])
