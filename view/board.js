@@ -282,13 +282,20 @@ function taskRequirements(f){
   }
   return '<div class="tdlbl">requirements'+(open ? ' — '+open+' open' : '')+'</div><ul class="treq">'+rows+'</ul>';
 }
+// Spec / acceptance-criteria prose is markdown source (headings, bold, inline/fenced
+// code, lists) — the same shape as the coder's "saying" (bd-p87t) — so it carries the
+// same markdown hook: .md-saying + a data-md holding the raw source, with the esc()'d
+// body as the fallback until enhanceSaying() upgrades it once marked loads (or forever,
+// if the CDN load fails). Card text is untrusted, exactly like coder output, so the
+// source escape + URL-scheme strip in that pass apply unchanged. The empty "—" branch
+// stays plain. One shared helper so the card drawer and the task drawer render alike.
+function prose(s){ return s ? '<div class="tdsec md-saying" data-md="'+esc(s)+'">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>'; }
 // The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
 // #drawer instead of inline on the Kanban card / list row. Renders the spec, the
 // acceptance criteria, any recorded deliverable, the requirement ledger, then the
-// state-appropriate controls (taskExtra). Everything is esc()'d — server-authored text,
-// never raw HTML.
+// state-appropriate controls (taskExtra). Server-authored text starts esc()'d; spec/AC
+// are upgraded through the guarded markdown pass.
 function taskDetail(f){
-  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
   let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
@@ -1520,7 +1527,7 @@ function collapseTools(rows){
 // syntax. The renderer (marked) loads LAZILY from CDN on the first drawer open and is
 // cached; if it never loads, the section keeps the plain esc()'d text genCard emits
 // inline (the fallback). "thinking" (thought_tail) is internal reasoning, not prose, so
-// it stays plain esc()'d text — only "saying" is upgraded.
+// it stays plain esc()'d text. Card/task spec and acceptance criteria share this pass.
 const MARKED_CDN = "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js";
 // Subresource-integrity pin for the 12.0.2 artifact (cdnjs-published sha512): the script
 // only executes if the fetched bytes match, so a tampered CDN response fails closed into
@@ -1543,15 +1550,25 @@ function loadMarked(){
   }).then((m) => (MARKED = m || null));
   return MARKED_LOAD;
 }
-// Parse markdown → HTML with a hard XSS guard: escape angle brackets in the SOURCE first,
-// so any HTML tags in the coder's text render as literal characters, never live markup
-// (marked passes source HTML through by default). Markdown syntax (#, *, `, -, [](), etc.)
-// is angle-bracket-free, so it is untouched and still renders. breaks:true keeps the
-// coder's newlines; gfm:true enables fenced code + tables.
+// Tokenize before escaping source HTML so marked handles code's escaping exactly once.
+// HTML and prose tokens still have source angle brackets escaped BEFORE parsing tokens to HTML;
+// code tokens use marked's own escaping (codespan in the lexer, code in the renderer).
+// This also preserves literal entity spellings such as `&lt;` inside code.
 function renderMarkdown(marked, src){
-  const safe = String(src).replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const parse = (marked && marked.parse) ? marked.parse : marked;   // marked.parse spans UMD versions
-  return parse(safe, {breaks: true, gfm: true});
+  const options = {breaks: true, gfm: true};
+  // Retain the older callable/parse-only UMD fallback; the pinned build has token APIs.
+  if (!marked.lexer || !marked.walkTokens || !marked.parser) {
+    const safe = String(src).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const parse = (marked && marked.parse) ? marked.parse : marked;
+    return parse(safe, options);
+  }
+  const tokens = marked.lexer(String(src), options);
+  marked.walkTokens(tokens, (token) => {
+    if (token.type === "html" || token.type === "text") {
+      token.text = token.text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  });
+  return marked.parser(tokens, options);
 }
 // Belt-and-suspenders on top of the source escape: neutralize the only attributes markdown
 // syntax can emit (link href / image src) by dropping dangerous URL schemes, and open any
@@ -1839,6 +1856,7 @@ function syncTaskDrawer(){
     ? '<div class="pl-callout pl-callout--warning"><b>Approved</b> with '+esc(VERIFY_NOTE.note)+'</div>'
     : "";
   $("drawer-body").innerHTML = err + note + taskDetail(merged);
+  enhanceSaying($("drawer-body"));   // spec / AC markdown → rendered HTML on each repaint (lazy, best-effort)
 }
 function closeMonitor(){
   MON_FID = null; TASK_FID = null; TASK_DETAIL = null; VERIFY_NOTE = null;
@@ -1986,11 +2004,11 @@ function syncCardDrawer(force){
   const body = $("drawer-body"), top = body.scrollTop;
   body.innerHTML = html;
   body.scrollTop = top;
+  enhanceSaying(body);   // spec / AC markdown → rendered HTML on each real repaint (lazy, best-effort)
 }
 // Labels the board writes for its own bookkeeping (shas, counters, the project stamp).
 const INTERNAL_LABEL = /^(project|gens|diff|merged-verified|review-clean-sha|verified):/;
 function cardDetail(f){
-  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
   const fact = (k, v) => v === "" || v == null ? "" : '<div class="cf"><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>';
   const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts) || 0;
   let h = '<div class="cflags">'+flags({...f, difficulty: ""})+'</div>'          // difficulty is a fact below

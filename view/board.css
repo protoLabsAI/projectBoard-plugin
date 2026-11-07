@@ -347,6 +347,31 @@
   .gen .md-on blockquote{margin:4px 0;padding-left:8px;border-left:2px solid var(--pl-color-border);
     color:var(--pl-color-fg-muted)}
   .gen .md-on img{max-width:100%}
+  /* Card/task drawer spec + acceptance criteria render through the SAME markdown pass as
+     "saying", but those blocks are .tdsec (not inside a .gen card), so mirror the rules
+     under .tdsec.md-on. .md-on flips OFF .tdsec's pre-wrap only once markdown is rendered,
+     so the esc()'d plain-text fallback (CDN blocked/offline) keeps its pre-wrap whitespace.
+     Headings stay compact (~13-14px) against the drawer's 12px body text. */
+  .tdsec.md-on{white-space:normal}
+  .tdsec.md-on>:first-child{margin-top:0}
+  .tdsec.md-on>:last-child{margin-bottom:0}
+  .tdsec.md-on p{margin:4px 0}
+  .tdsec.md-on h1,.tdsec.md-on h2,.tdsec.md-on h3,.tdsec.md-on h4,.tdsec.md-on h5,.tdsec.md-on h6{
+    margin:6px 0 3px;font-weight:600;color:var(--pl-color-fg);line-height:1.3}
+  .tdsec.md-on h1,.tdsec.md-on h2{font-size:14px}
+  .tdsec.md-on h3,.tdsec.md-on h4,.tdsec.md-on h5,.tdsec.md-on h6{font-size:13px}
+  .tdsec.md-on code{font-family:var(--pl-font-mono);font-size:10.5px;background:var(--pl-color-bg);
+    padding:1px 4px;border-radius:3px}
+  .tdsec.md-on pre{background:var(--pl-color-bg);border:var(--pl-border-width) solid var(--pl-color-border);
+    border-radius:var(--pl-radius);padding:6px 8px;overflow:auto;margin:4px 0}
+  .tdsec.md-on pre code{padding:0;background:none;border-radius:0}
+  .tdsec.md-on ul,.tdsec.md-on ol{margin:4px 0;padding-left:18px}
+  .tdsec.md-on li{margin:1px 0}
+  .tdsec.md-on a{color:var(--pl-color-status-info);text-decoration:none}
+  .tdsec.md-on a:hover{text-decoration:underline}
+  .tdsec.md-on blockquote{margin:4px 0;padding-left:8px;border-left:2px solid var(--pl-color-border);
+    color:var(--pl-color-fg-muted)}
+  .tdsec.md-on img{max-width:100%}
   .st-completed{color:var(--pl-color-status-success)}
   .st-failed{color:var(--pl-color-status-error)}
   .st-running{color:var(--pl-color-accent)}
