@@ -2206,6 +2206,11 @@ class DriveMixin:
                         friction=True,
                     )
                     return
+                # #667: THIS attempt's coder reply, read in the except handler below to
+                # surface a deliberate `BLOCKED-ON-<WORD>:` refusal or a bounded tail. Reset
+                # per attempt so a failure raised BEFORE dispatch (worktree creation, prepare)
+                # shows no stale reply from a prior round.
+                result = None
                 try:
                     # How this attempt gets its worktree + coder result:
                     #  • keep_wt  → REUSE the kept worktree (impl intact), one re-dispatch.
@@ -2738,9 +2743,15 @@ class DriveMixin:
                         log.info("[project_board] %s dispatch ended by operator cancel: %s", fid, exc)
                         await self._end_cancelled_drive(store, fid, repo, wt, branch)
                         return
+                    # #667: a no-commit NoChangesError carries no sight of what the coder
+                    # said, so a DELIBERATE `BLOCKED-ON-<WORD>:` refusal looked identical to
+                    # an empty run. Read the reply once here — the friction summary below
+                    # names the refusal, and the NoChangesError handler routes it to its own
+                    # `design` block (no retry, no climb) instead of the capability ladder.
+                    coder_refusal = _coder_refusal(result or "") if isinstance(exc, worktree.NoChangesError) else ""
                     # Into the host's friction ledger, whatever happens to the card next: a
                     # drive's failure happens outside any agent turn, so nothing else records it.
-                    self._friction_drive_failure(fid, exc, feature, base=base, branch=branch)
+                    self._friction_drive_failure(fid, exc, feature, base=base, branch=branch, refusal=coder_refusal)
                     if isinstance(exc, worktree.StrandedWorkError):
                         # Stranded work that could not be saved to a branch (#405). Not a
                         # failure of this build — it never started — so no retry, no tier
@@ -2866,6 +2877,58 @@ class DriveMixin:
                     # the class + evidence).
                     if isinstance(exc, worktree.NoChangesError):
                         had_tools, stop = self._empty_result_signals(fid)
+                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
+                        external_decline = (
+                            had_tools
+                            and ext_head
+                            and (
+                                f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
+                                in (feature.get("labels") or [])
+                            )
+                        )
+                        # #667: a DELIBERATE refusal — the coder ended with `BLOCKED-ON-<WORD>:
+                        # <why>` and opened no PR, judging the spec unbuildable as written. A
+                        # stronger model refuses the same gap, so there is no ladder to climb
+                        # and no empty-result retry to spend: block ONCE for the operator under
+                        # the `design` class (not self-healing), the reason quoting the marker
+                        # line plus the rest of its paragraph. Preserve #653's external-finding
+                        # decline when tools ran on the stamped head: its reason lets the operator
+                        # rule the finding out of scope with --override-review.
+                        if coder_refusal and not external_decline:
+                            reason = (
+                                missing_findings_note
+                                + f"coder refused (deliberate design block, no commit, no PR): {coder_refusal}"
+                            )
+                            log.warning(
+                                "[project_board] %s blocked (%s — coder refused, no tier climb, no retry): %s",
+                                fid,
+                                DESIGN_BLOCK_CLASS,
+                                reason,
+                            )
+                            if await self._block_or_stand_aside(
+                                store,
+                                fid,
+                                reason,
+                                category=DESIGN_BLOCK_CLASS,
+                                repo=repo,
+                                wt=wt,
+                                branch=branch,
+                                pr_url=pr_url,
+                            ):
+                                # Nothing was committed, so the tree holds no unpushed work —
+                                # save first all the same (#405), then reap like the other blocks.
+                                await self._discard_tree(store, fid, repo, wt, branch, base=base)
+                                self._inflight.pop(fid, None)
+                            return
+                        # Ordinary no-change or external decline: fold the reply tail into the exc so the
+                        # block reason and the escalation's attempt note say what the coder
+                        # actually said (the gate-red tail idiom). An EMPTY reply changes
+                        # nothing — today's "coder produced no commits…" message stands verbatim.
+                        # Done AFTER classify()/provider_failure above (which ran on the clean
+                        # message, #420) so coder prose can never be re-read into a provider class.
+                        tail = _coder_reply_tail(result or "")
+                        if tail:
+                            exc = worktree.NoChangesError(f"{exc}. Coder's final message (tail): {tail}")
                         if not had_tools:
                             n = await self._budget_get(store, fid, "empty-result", feature) + 1
                             await self._budget_set(store, fid, "empty-result", n)
@@ -2959,11 +3022,7 @@ class DriveMixin:
                         # (`board_unblock_feature --override-review`, audited in `unblock_side_effects`).
                         # Internal-gate and CI-fix no-commit rounds carry no such stamp for the current
                         # head, so they fall through and keep today's escalation ladder unchanged.
-                        ext_head = round_start[: store_mod.SHORT_SHA_LEN] if round_start else ""
-                        if ext_head and (
-                            f"{store_mod.LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX}{ext_head}"
-                            in (feature.get("labels") or [])
-                        ):
+                        if external_decline:
                             pr = str(feature.get("pr_url") or pr_url or "").strip()
                             reason = (
                                 missing_findings_note
@@ -3554,16 +3613,22 @@ class DriveMixin:
         return "" if state in ("", "in_progress") else state
 
     def _friction_drive_failure(
-        self, fid: str, exc: BaseException, feature: dict, *, base: str = "", branch=None
+        self, fid: str, exc: BaseException, feature: dict, *, base: str = "", branch=None, refusal: str = ""
     ) -> None:
         """Record a failed drive in the host's friction ledger (``host_friction``), under a
         summary that names the KIND of failure and never the card: a hung or disconnected
         coder, a worktree gone under the drive, no commits vs base, stranded work, an
-        unwinnable oracle. Each card is let through once per window per kind. Never raises."""
+        unwinnable oracle. Each card is let through once per window per kind. Never raises.
+
+        ``refusal`` (#667): the coder's ``BLOCKED-ON-<WORD>:`` line when the no-commit
+        NoChangesError was a DELIBERATE refusal — then the summary names the refusal at
+        minor severity, not "nothing to open a PR from" (a design call, not an empty run)."""
         try:
             msg = str(exc)
             low = msg.lower()
-            if isinstance(exc, worktree.WorktreeMissing):
+            if refusal:
+                summary, severity = f"coder refused: {_blocked_on_label(refusal)}", "minor"
+            elif isinstance(exc, worktree.WorktreeMissing):
                 summary, severity = "a drive's worktree went missing under it", "major"
             elif isinstance(exc, worktree.StrandedWorkError):
                 summary, severity = "stranded work in a worktree could not be saved to a branch", "major"
