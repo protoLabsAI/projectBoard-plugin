@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import hashlib
 import json
 import logging
 import re
@@ -36,6 +37,72 @@ FOCUS_EVENT = "focus"
 BOARD_VIEW = "board"
 
 
+def _board_store_kwargs(cfg: dict) -> dict:
+    """Use the same cached store configuration for tools and goal verification."""
+    from .projects import default_project, resolve_projects, store_db_path
+
+    return dict(
+        db=store_db_path(cfg),
+        repo=cfg.get("repo", "."),
+        base_branch=cfg.get("base_branch", "main"),
+        max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+        projects=resolve_projects(cfg),
+        default_project=default_project(cfg),
+    )
+
+
+def _make_card_state_verifier(cfg: dict):
+    async def _card_state_verifier(spec, ctx):
+        from graph.goals.types import VerifyResult
+
+        from .store import LABEL_MERGED_VERIFIED_PREFIX, get_store
+
+        try:
+            args = spec.get("args", {})
+            feature_id = args.get("feature_id")
+            if not isinstance(feature_id, str) or not feature_id.strip():
+                return VerifyResult(met=False, reason="feature_id is required", evidence="")
+            states = args.get("state")
+            if isinstance(states, str):
+                states = [states]
+            allowed = {"backlog", "ready", "in_progress", "in_review", "done", "blocked", "cancelled"}
+            if (
+                not isinstance(states, list)
+                or not states
+                or any(not isinstance(state, str) or state not in allowed for state in states)
+            ):
+                return VerifyResult(
+                    met=False, reason="state must be a board state or a list of board states", evidence=""
+                )
+            if "merged" in args and not isinstance(args["merged"], bool):
+                return VerifyResult(met=False, reason="merged must be a boolean", evidence="")
+            card = await asyncio.to_thread(get_store(**_board_store_kwargs(cfg)).get_feature, feature_id)
+            if card is None:
+                return VerifyResult(met=False, reason=f"unknown feature {feature_id!r}", evidence="")
+            state = card["board_state"]
+            labels = sorted(card.get("labels") or [])
+            pr_url = card.get("pr_url") or ""
+            labels_hash = hashlib.sha256(json.dumps(labels, separators=(",", ":")).encode()).hexdigest()
+            merged = (
+                state == "done"
+                and bool(pr_url)
+                and any(
+                    label.startswith(LABEL_MERGED_VERIFIED_PREFIX) and label[len(LABEL_MERGED_VERIFIED_PREFIX) :]
+                    for label in labels
+                )
+            )
+            return VerifyResult(
+                met=state in states and (not args.get("merged", False) or merged),
+                reason=f"{feature_id} is {state}",
+                evidence=f"{state}|{pr_url}|{labels_hash}",
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed read must never satisfy a watch
+            log.exception("[project_board] card state verification failed")
+            return VerifyResult(met=False, reason=f"card state verification failed: {exc}", evidence="")
+
+    return _card_state_verifier
+
+
 def register(registry) -> None:
     # Resolve `project:` against the host's ADR 0095 registry BEFORE anything reads
     # cfg — every consumer below (router, loop, tools) takes cfg from here, so this
@@ -46,6 +113,16 @@ def register(registry) -> None:
     from .projects import resolve_project_cfg
 
     cfg = resolve_project_cfg(registry.config or {})
+
+    try:
+        _card_state_verifier = _make_card_state_verifier(cfg)
+        registry.register_goal_verifier(
+            "board:card_state", _card_state_verifier, "Check a board card's current state and optional merged PR."
+        )
+    except AttributeError:  # Older hosts do not expose goal verifiers.
+        pass
+    except Exception:  # noqa: BLE001 — optional host integration must not prevent loading
+        log.exception("[project_board] registering card state goal verifier failed")
 
     # Setup preflight (v0.42.0): can this board run at all — `br` on PATH, `gh` on
     # PATH, every configured coder resolvable in the delegate roster, a bound repo?
@@ -485,7 +562,7 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
 def _board_tools(cfg: dict, registry=None):
     from .failures import PREFLIGHT_HOLD_CLASS
     from .projects import default_project as resolve_default_project
-    from .projects import rehome_hint, resolve_projects, store_db_path, unresolved_project
+    from .projects import rehome_hint, resolve_projects, unresolved_project
     from .store import (
         AGENT_HOLD_CLASS,
         MANUAL_BLOCK_CLASS,
@@ -504,18 +581,8 @@ def _board_tools(cfg: dict, registry=None):
     projects = resolve_projects(cfg)
     default_proj = resolve_default_project(cfg)
 
-    store_kw = dict(
-        # D3 (#260): the db is resolved at the config seam — an unset/blank db_path
-        # rides the ONE instance-default store (store.default_db_path), an explicit
-        # path stays the operator pin. Every per-project store below (`_store_kw_for`)
-        # shares this db while keying its own repo/base_branch.
-        db=store_db_path(cfg),
-        repo=cfg.get("repo", "."),
-        base_branch=cfg.get("base_branch", "main"),
-        max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
-        projects=projects,
-        default_project=default_proj,
-    )
+    # D3 (#260): preserve the shared default db and explicit operator pins.
+    store_kw = _board_store_kwargs(cfg)
 
     def _store_kw_for(project: str = "") -> dict:
         """store_kw whose `repo`/`base_branch` resolve to ``project``'s entry in the

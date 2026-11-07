@@ -71,6 +71,30 @@ The board checks all of this itself and says what's missing instead of booting g
 
 More in [Using the board](docs/usage.md).
 
+## Watching card transitions
+
+The `board:card_state` goal verifier reads the same store as `board_get_feature`.
+For example, ask the host's `create_watch` tool:
+
+> Create an on_change watch using `board:card_state` with args
+> `{"feature_id": "bd-r7tqa", "state": "in_review"}`. Notify me to review the PR
+> before it merges.
+
+The verifier spec is:
+
+```json
+{"kind": "board:card_state", "args": {"feature_id": "bd-r7tqa", "state": "in_review"}}
+```
+
+`state` accepts a string or a list of `backlog`, `ready`, `in_progress`,
+`in_review`, `done`, `blocked`, and `cancelled`. Add `"merged": true` with
+`"state": "done"` to require a PR URL and a stored `merged-verified:` stamp as
+well as the done state. Missing cards and failed reads never satisfy the verifier.
+Evidence includes the current state, PR URL, and a stable hash of sorted labels,
+so an `on_change` watch can detect transitions between polls. Watches notify;
+use `board_hold_merge` when review must hold the merge. Older hosts without goal
+verifier registration continue to load the plugin normally.
+
 ## Documentation
 
 | Doc | What's in it |
