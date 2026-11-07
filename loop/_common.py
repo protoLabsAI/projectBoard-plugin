@@ -64,6 +64,7 @@ from .. import gates as publish_gates
 # Shared with the solve oracle; coder_seam never imports the loop.
 from ..coder_seam import _GATE_NOT_FOUND_EXITS, _MISSING_CMD_RE, _missing_gate_command_hint
 from ..failures import (
+    DESIGN_BLOCK_CLASS,
     ORACLE_MISSING_CLASS,
     ORACLE_TIMEOUT_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
@@ -742,6 +743,64 @@ def _declined_coder_reason(result: str, *, limit: int = 800) -> str:
         if summary:
             text = summary
     return text[:limit].strip()
+
+
+def _collapse_ws(text: str) -> str:
+    """One run of ``text`` with every whitespace run — newlines included — collapsed to a
+    single space and the ends stripped. The bounded-tail idiom (#667) rides on this so a
+    block comment stays one readable clause instead of echoing the coder's raw layout."""
+    return " ".join(str(text or "").split())
+
+
+# #667 — a DELIBERATE coder refusal: a line that STARTS `BLOCKED-ON-<WORD>:` anywhere in
+# the final reply (multiline). The word is upper-case and may carry hyphens
+# (`BLOCKED-ON-SPEC`, `BLOCKED-ON-DEP-GRAPH`); the colon terminates it.
+_BLOCKED_ON_RE = re.compile(r"^\s*BLOCKED-ON-[A-Z][A-Z-]*:", re.MULTILINE)
+# Just the `BLOCKED-ON-<WORD>` token (no colon) for the friction summary label.
+_BLOCKED_ON_LABEL_RE = re.compile(r"BLOCKED-ON-[A-Z][A-Z-]*")
+
+
+def _coder_refusal(result: str, *, limit: int = 1500) -> str:
+    """The coder's DELIBERATE refusal from its final reply, or ``""`` (#667).
+
+    A card may tell the coder to end with ``BLOCKED-ON-<WORD>: <why>`` and open no PR
+    when the spec itself is unbuildable as written. When that marker line is present,
+    return it plus the rest of its paragraph (up to the next blank line), whitespace-
+    collapsed and bounded to ``limit`` — that is the operator-facing reason the block
+    quotes. ``""`` when there is no such line, so the caller treats a no-commit run as an
+    ordinary empty/no-change result, unchanged."""
+    text = str(result or "")
+    m = _BLOCKED_ON_RE.search(text)
+    if not m:
+        return ""
+    para = text[m.start() :]
+    end = re.search(r"\n[ \t]*\n", para)  # the paragraph ends at the first blank line
+    if end:
+        para = para[: end.start()]
+    return _collapse_ws(para)[:limit]
+
+
+def _blocked_on_label(refusal: str) -> str:
+    """The ``BLOCKED-ON-<WORD>`` token (no colon) from a refusal line, for the friction
+    summary (#667). ``"BLOCKED-ON"`` if the token can't be isolated — the summary stays
+    stable rather than leaking a verbose reason into the ledger key."""
+    m = _BLOCKED_ON_LABEL_RE.search(str(refusal or ""))
+    return m.group(0) if m else "BLOCKED-ON"
+
+
+def _coder_reply_tail(result: str, *, limit: int = 1500) -> str:
+    """The whitespace-collapsed TAIL (≤ ``limit`` chars) of the coder's final reply (#667).
+
+    Mirrors how the gate-red path carries the gate's output tail (``_run_local_gate``):
+    an over-long reply keeps its END — where the coder says why it stopped — and a leading
+    ``…`` marks the elided start. ``""`` when the reply is empty, so a no-commit block with
+    no reply text keeps today's message verbatim."""
+    text = _collapse_ws(result)
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = "…" + text[-(limit - 1) :]
+    return text
 
 
 # The NO_TEST_NEEDED escape hatch (#264) — structural evidence, not a substring
@@ -2228,6 +2287,7 @@ __all__ = [
     "release_freeze",
     "RELEASE_FREEZE_BLOCKER",
     "WAITING_ON_PUBLISH",
+    "DESIGN_BLOCK_CLASS",
     "ORACLE_MISSING_CLASS",
     "ORACLE_TIMEOUT_CLASS",
     "PRE_MODEL_DISPATCH_CLASS",
@@ -2297,6 +2357,10 @@ __all__ = [
     "_requirement_gate_diag_line",
     "_pr_body",
     "_declined_coder_reason",
+    "_collapse_ws",
+    "_coder_refusal",
+    "_blocked_on_label",
+    "_coder_reply_tail",
     "EXTERNAL_FINDING_DECLINED_REASON",
     "_is_external_finding_block",
     "_external_bounce_head",

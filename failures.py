@@ -167,6 +167,17 @@ ORACLE_TIMEOUT_CLASS = "oracle-timeout"
 # operator repairs the environment, then unblocks the card.
 ORACLE_MISSING_CLASS = "oracle-missing"
 
+# The `blocked-class:` of a card whose coder DELIBERATELY refused (#667): it ended its
+# reply with a `BLOCKED-ON-<WORD>:` line (e.g. `BLOCKED-ON-SPEC: …`) and opened no PR,
+# judging the spec itself unbuildable as written — a missing kit class, a contradictory
+# acceptance criterion. A principled refusal is not an empty run: a stronger model would
+# refuse the same gap, so there is no tier to climb and no empty-result retry to spend.
+# The loop blocks ONCE for the operator, who fixes the spec and requeues (or rules the
+# refusal out). The loop's own class, like the ones above; deliberately absent from the
+# self-healing set — waiting never resolves a spec gap, and a sweep requeue would only
+# refuse again.
+DESIGN_BLOCK_CLASS = "design"
+
 # The seam SHAPES — how a failure raised BELOW the model call reaches the loop. `coder_seam`
 # and `worktree` normalise every below-seam throw to a `coder dispatch failed: …`
 # WorktreeError and every watchdog kill to `coder timed out after …`, so a message that
