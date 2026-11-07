@@ -4394,12 +4394,12 @@ class DriveMixin:
         return canon_wt, canon_branch, winner_reply
 
     async def _fetch_kg_lessons(self, feature: dict) -> str:
-        """Query the knowledge graph (via graph.sdk) for lessons relevant to THIS
-        feature — the read half of the flywheel. Builds the query from the feature's
-        title + files (the area it touches), pulls the top-``kg_lessons_k`` chunks from
-        the ``kg_lessons_domain`` bucket, and returns them as a markdown bullet list for
-        ``_build_prompt`` to inject. Best-effort: returns "" if disabled, no store, no
-        SDK, or any error — a retrieval hiccup must never block a build."""
+        """Query memory and legacy knowledge for lessons relevant to THIS feature.
+        Builds the query from the feature's title + files, pulls the top
+        ``kg_lessons_k`` hits per store (the new ``memories`` store semantically; the
+        legacy ``chunks`` store scoped to the ``kg_lessons_domain`` bucket), dedupes
+        by content, and merges them for ``_build_prompt``. Best-effort: a retrieval
+        hiccup in one store must neither hide the other's lessons nor block a build."""
         if not self.kg_lessons:
             return ""
         query = " ".join(
@@ -4414,16 +4414,37 @@ class DriveMixin:
         if not query:
             return ""
         try:
-            from graph.sdk import knowledge_search
-
-            hits = await knowledge_search(query, k=self.kg_lessons_k, domain=self.kg_lessons_domain or None)
+            from graph import sdk
         except Exception as exc:  # noqa: BLE001 — retrieval is best-effort; never block a build
             log.info("[project_board] kg-lessons fetch skipped (%s)", exc)
             return ""
+        hits = []
+        # ADR 0125 moves agent-written lessons out of the knowledge ``chunks`` table
+        # (scoped by ``domain``) and into a ``memories`` table that has NO ``domain``
+        # field — so ``memory_search`` takes only (query, k) while legacy
+        # ``knowledge_search`` still scopes by domain. Passing ``domain=`` to
+        # ``memory_search`` would raise and the per-store except would hide every
+        # migrated lesson. Read both stores: migrated lessons live in memories,
+        # un-migrated ones still live in chunks. Each store is independently best-effort.
+        stores = (
+            ("memory_search", {}),
+            ("knowledge_search", {"domain": self.kg_lessons_domain or None}),
+        )
+        for name, extra in stores:
+            search = getattr(sdk, name, None)
+            if search is None:
+                continue
+            try:
+                hits.extend(await search(query, k=self.kg_lessons_k, **extra) or [])
+            except Exception as exc:  # noqa: BLE001 — each store is independently best-effort
+                log.info("[project_board] kg-lessons %s skipped (%s)", name, exc)
         lines = []
-        for h in hits or []:
+        seen = set()
+        for h in hits:
             text = (h.get("preview") or h.get("content") or "").strip()
-            if text:
+            content = (h.get("content") or text).strip()
+            if text and content not in seen:
+                seen.add(content)
                 lines.append(f"- {text}")
         return "\n".join(lines)
 

@@ -40,3 +40,11 @@ def test_decompose_skill_dispatches_the_planning_critic():
     skill = (ROOT / "skills" / "decompose-project" / "SKILL.md").read_text()
     assert "task(plan_antagonist, …)" in skill
     assert "task(antagonist," not in skill
+
+
+def test_decomposer_supports_both_core_memory_tool_names():
+    install_host_stubs()
+    registry = FakeRegistry({"br_autofetch": False}, plugin_id="project_board")
+    project_board.register(registry)
+    decomposer = next(config for config in registry.subagents if config.name == "decompose")
+    assert {"memory_search", "memory_recall"} <= set(decomposer.tools)
