@@ -282,13 +282,20 @@ function taskRequirements(f){
   }
   return '<div class="tdlbl">requirements'+(open ? ' — '+open+' open' : '')+'</div><ul class="treq">'+rows+'</ul>';
 }
+// Spec / acceptance-criteria prose is markdown source (headings, bold, inline/fenced
+// code, lists) — the same shape as the coder's "saying" (bd-p87t) — so it carries the
+// same markdown hook: .md-saying + a data-md holding the raw source, with the esc()'d
+// body as the fallback until enhanceSaying() upgrades it once marked loads (or forever,
+// if the CDN load fails). Card text is untrusted, exactly like coder output, so the
+// source escape + URL-scheme strip in that pass apply unchanged. The empty "—" branch
+// stays plain. One shared helper so the card drawer and the task drawer render alike.
+function prose(s){ return s ? '<div class="tdsec md-saying" data-md="'+esc(s)+'">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>'; }
 // The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
 // #drawer instead of inline on the Kanban card / list row. Renders the spec, the
 // acceptance criteria, any recorded deliverable, the requirement ledger, then the
 // state-appropriate controls (taskExtra). Everything is esc()'d — server-authored text,
 // never raw HTML.
 function taskDetail(f){
-  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
   let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + prose(f.spec)
     + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
@@ -1839,6 +1846,7 @@ function syncTaskDrawer(){
     ? '<div class="pl-callout pl-callout--warning"><b>Approved</b> with '+esc(VERIFY_NOTE.note)+'</div>'
     : "";
   $("drawer-body").innerHTML = err + note + taskDetail(merged);
+  enhanceSaying($("drawer-body"));   // spec / AC markdown → rendered HTML on each repaint (lazy, best-effort)
 }
 function closeMonitor(){
   MON_FID = null; TASK_FID = null; TASK_DETAIL = null; VERIFY_NOTE = null;
@@ -1986,11 +1994,11 @@ function syncCardDrawer(force){
   const body = $("drawer-body"), top = body.scrollTop;
   body.innerHTML = html;
   body.scrollTop = top;
+  enhanceSaying(body);   // spec / AC markdown → rendered HTML on each real repaint (lazy, best-effort)
 }
 // Labels the board writes for its own bookkeeping (shas, counters, the project stamp).
 const INTERNAL_LABEL = /^(project|gens|diff|merged-verified|review-clean-sha|verified):/;
 function cardDetail(f){
-  const prose = (s) => s ? '<div class="tdsec">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>';
   const fact = (k, v) => v === "" || v == null ? "" : '<div class="cf"><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>';
   const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts) || 0;
   let h = '<div class="cflags">'+flags({...f, difficulty: ""})+'</div>'          // difficulty is a fact below

@@ -438,6 +438,52 @@ def test_saying_markdown_css_scales_down_and_uses_pl_tokens():
     assert ".gen .md-on ul,.gen .md-on ol{margin:4px 0;padding-left:18px}" in BOARD_PAGE
 
 
+# ── card/task drawer renders spec + AC as markdown (bd-849cl) ─────────────────────
+#
+# The Card tab and the task detail used to show spec / acceptance criteria as raw esc()'d
+# markdown source (## Problem, **bold**, backticks, 1./- lists). They now flow through the
+# SAME lazily-loaded markdown pass as "saying" — one shared prose() helper emits the
+# .md-saying hook, enhanceSaying() upgrades it on every repaint, and the esc()'d body is
+# the fallback when the CDN load fails. Card text is untrusted, so the XSS guard is reused.
+
+
+def test_drawer_spec_and_ac_render_through_the_markdown_hook():
+    """r1/r2/r4: one shared prose() helper (card drawer + task drawer) emits the .md-saying
+    hook with a data-md holding the raw markdown and the esc()'d text as the inline body —
+    so spec / acceptance criteria upgrade to rendered markdown and keep the esc()'d fallback,
+    the same contract the "saying" section carries. The empty branch stays plain."""
+    assert "function prose(s){" in BOARD_PAGE
+    assert "'<div class=\"tdsec md-saying\" data-md=\"'+esc(s)+'\">'+esc(s)+'</div>'" in BOARD_PAGE
+    assert "'<div class=\"tdsec tdsec--empty\">—</div>'" in BOARD_PAGE
+    # both drawers route spec + acceptance criteria through the shared helper.
+    assert BOARD_PAGE.count("prose(f.spec)") == 2
+    assert BOARD_PAGE.count("prose(f.acceptance_criteria)") == 2
+
+
+def test_drawer_repaint_re_runs_the_markdown_pass_on_fresh_nodes():
+    """r5: both the card-drawer repaint (syncCardDrawer) and the task-drawer repaint
+    (syncTaskDrawer) call enhanceSaying after replacing the body's innerHTML, so a poll
+    re-render re-applies the markdown pass to the fresh nodes instead of falling back to
+    raw text. The monitor render already drives the same call."""
+    assert "enhanceSaying(body);" in BOARD_PAGE  # card drawer, after body.innerHTML = html
+    # the monitor render + the task-drawer repaint both pass the body element by id.
+    assert BOARD_PAGE.count('enhanceSaying($("drawer-body"));') == 2
+
+
+def test_drawer_markdown_css_has_a_tdsec_md_on_rule_and_keeps_the_fallback_pre_wrap():
+    """r3/r6: the rendered blocks get a parallel .tdsec.md-on block (headings stay compact
+    against the drawer's 12px body text), and .md-on flips pre-wrap off only once rendered —
+    so the plain-text .tdsec fallback keeps its pre-wrap whitespace when the CDN load fails."""
+    assert ".tdsec.md-on{white-space:normal}" in BOARD_PAGE
+    assert ".tdsec.md-on h1,.tdsec.md-on h2{font-size:14px}" in BOARD_PAGE  # compact headings
+    assert (
+        ".tdsec.md-on code{font-family:var(--pl-font-mono);font-size:10.5px;background:var(--pl-color-bg);"
+        in BOARD_PAGE
+    )
+    # the esc()'d fallback (CDN blocked/offline) keeps pre-wrap whitespace.
+    assert ".tdsec{font-size:12px;color:var(--pl-color-fg);white-space:pre-wrap;word-break:break-word}" in BOARD_PAGE
+
+
 # ── safe board hrefs + pinned marked CDN (S2/F3) ─────────────────────────────────
 #
 # The external-ref slot (projected as pr_url) renders as a live footer link, so the
