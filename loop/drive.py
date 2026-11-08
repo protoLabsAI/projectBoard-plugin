@@ -2702,9 +2702,21 @@ class DriveMixin:
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that
                     # already owns its PR (CI-fail bounce) leaves a draft alone: that is
                     # the operator's hold on the loop's own PR, not the coder's.
+                    # #691: the card's FIRST PR opens as a draft while the review gate is on;
+                    # the gate marks it ready when clean. A re-dispatch (pr_url set) leaves the
+                    # PR's draft state alone, as before.
+                    board_draft = bool(self.review_gate and self.draft_until_review and not feature.get("pr_url"))
                     pr_url = await worktree.open_pr(
-                        wt, branch, base=base, title=pr_title, body=body, promote_draft=not feature.get("pr_url")
+                        wt,
+                        branch,
+                        base=base,
+                        title=pr_title,
+                        body=body,
+                        promote_draft=not feature.get("pr_url") and not board_draft,
+                        **({"draft": True} if board_draft else {}),
                     )
+                    if board_draft:
+                        await self._note_board_draft(store, fid, pr_url, repo)
                     # …and again after: a move that landed during the push/create. A cancel
                     # closes the PR it just opened (#211); any other move keeps the PR and
                     # records it on the card, rather than handing it to open_review (#398).

@@ -2216,7 +2216,7 @@ async def open_pr(
     raise WorktreeError(f"gh pr create failed: {err.strip()[:300]}")
 
 
-async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
+async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str, adopted: bool = True) -> bool:
     """#207: the "already exists" PR we adopt may be one the CODER opened itself
     (``gh pr create --draft`` from its worktree, before the loop got here — against a
     brief that tells it to edit only and leave committing, pushing and the PR to the
@@ -2229,24 +2229,30 @@ async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
     failure logs and proceeds — ``_auto_merge_blockers``' named ``draft`` blocker is
     the backstop. A non-draft is untouched — and ``open_pr`` only calls this on the
     card's FIRST adoption (``promote_draft``), never on a re-dispatch of a card that
-    already owns its PR (an operator's draft-as-hold on the loop's own PR stays)."""
+    already owns its PR (an operator's draft-as-hold on the loop's own PR stays).
+
+    #691: the review gate also calls it (``adopted=False``) to release the draft the LOOP
+    opened while its gate ran. Returns True when the PR is ready afterwards (a non-draft
+    counts), False when ``isDraft`` could not be read or ``gh pr ready`` failed."""
     try:
         info = await pr_merge_info(pr_url, cwd=cwd)
     except WorktreeError as exc:
         log.warning("[project_board] %s: could not read isDraft for adopted PR %s: %s", branch, pr_url, exc)
-        return
+        return False
     if info.get("isDraft") is not True:
-        return
+        return True
     try:
         rc, _out, err = await _gh("pr", "ready", pr_url, cwd=cwd)
     except WorktreeError as exc:
         rc, err = 1, str(exc)
     if rc == 0:
-        log.info(
-            "[project_board] %s adopted the coder's DRAFT PR %s — marked ready (the loop owns the PR lifecycle)",
-            branch,
-            pr_url,
-        )
+        if adopted:
+            log.info(
+                "[project_board] %s adopted the coder's DRAFT PR %s — marked ready (the loop owns the PR lifecycle)",
+                branch,
+                pr_url,
+            )
+        return True
     else:
         log.warning(
             "[project_board] %s adopted the coder's DRAFT PR %s but `gh pr ready` failed (%s) — "
@@ -2256,6 +2262,7 @@ async def _promote_adopted_draft(pr_url: str, branch: str, *, cwd: str) -> None:
             (err or "").strip()[:200],
             pr_url,
         )
+    return False
 
 
 async def pr_state(pr_url: str, *, cwd: str = ".") -> str:

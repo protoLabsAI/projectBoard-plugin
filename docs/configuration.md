@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **36 of 88 keys are in this state, including `coders` and `projects`** —
+never renders it. **36 of 89 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -337,6 +337,7 @@ The gates between a green build and main.
 | `ci_rerun_max` | `1` | reload |
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
+| `draft_until_review` | `True` | reload |
 | `external_review` | `—` | reload **· YAML only** |
 | `require_complete_review` | `False` | reload **· YAML only** |
 | `review_summon_handle` | `"vera"` | reload **· YAML only** |
@@ -351,6 +352,13 @@ at the same head, the card bounces into a fix round as before. A new push is a n
 gets a fresh allowance. With no Actions run behind the red checks (only a non-Actions required
 status failed), or when `gh` refuses the rerun, the card bounces at once. Rerunning needs the
 board's `gh` token to hold `actions: write` on the repo. `0` turns reruns off.
+
+`draft_until_review` (with `review_gate` on) opens the card's first PR as a draft and marks it
+ready only when the gate's verdict is clean, or when the gate cannot judge at all. An external
+review panel that skips drafts (the fleet QA panel does) then never reviews a head the gate is
+about to send back for a fix round. Only a PR the loop drafted itself, recorded as the
+`board-draft` label, is un-drafted; a draft you set by hand stays a draft. Turn it off only if
+nothing external reviews the repo and you want the PR visible as ready while the gate runs.
 
 `review_gate_timeout_s` is a hard cap on one review-gate model call: the host workflow run,
 or the a2a reviewer fallback. The cap is the board's own, not the host model client's. That

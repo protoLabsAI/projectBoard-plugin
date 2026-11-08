@@ -61,6 +61,10 @@ config:
                             # as labels: review-pending / changes-requested. Exhausted budget →
                             # Blocked for human review; never a silent merge. Takes precedence
                             # over review_dispatch when both are on.
+  draft_until_review: true  # With review_gate on: open the card's first PR as a DRAFT and mark
+                            # it ready only when the gate is clean (#691), so an external panel
+                            # that skips drafts never reviews a head the gate is about to bounce.
+                            # Only a PR the loop drafted (`board-draft` label) is un-drafted.
   review_workflow: code-review  # the host workflow recipe the gate runs (run_workflow name)
   review_fix_max: 2         # review-bounce re-dispatches before the feature is Blocked
                             # (mirrors ci_fix_max; same-tier — findings are fixable, not a
