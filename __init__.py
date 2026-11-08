@@ -1334,7 +1334,7 @@ def _board_tools(cfg: dict, registry=None):
     @tool
     def board_concurrency_get() -> str:
         """Read how many cards the board builds at once (`max_concurrent`) and the peak coder
-        sessions that implies (max_concurrent × coder_solve_k)."""
+        sessions that implies (max_concurrent × sessions per card, where sessions per card is coder_solve_k, capped by max_concurrent_sessions when set)."""
         from .settings_api import concurrency_get
 
         try:
@@ -1351,7 +1351,7 @@ def _board_tools(cfg: dict, registry=None):
         change it on your own judgement: not for load, not to finish faster, not to drain a
         queue. If you think it should change, ask the operator and wait for their answer.
         `reason` is required and must quote or cite the operator's request. Returns the old and
-        new values and the peak coder sessions (max_concurrent × coder_solve_k).
+        new values and the peak coder sessions (max_concurrent × sessions per card; see peak_formula).
         """
         from .routing import operator_actor
         from .settings_api import concurrency_set
