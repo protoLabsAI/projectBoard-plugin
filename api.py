@@ -450,11 +450,19 @@ def store_rev(db: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
-def features_etag(body: dict) -> str:
-    """A strong ETag for a ``/features`` body: a hash of its canonical JSON, so the same
-    listing always carries the same tag and any change in any row changes it."""
-    raw = json.dumps(body, sort_keys=True, default=str, separators=(",", ":"))
-    return '"' + hashlib.sha1(raw.encode()).hexdigest()[:20] + '"'
+def _json_default(o):
+    """``json.dumps`` fallback for the rare non-JSON value in a row (a set, a datetime):
+    the FastAPI encoder's answer, so the body matches what ``JSONResponse`` would send."""
+    from fastapi.encoders import jsonable_encoder
+
+    return jsonable_encoder(o)
+
+
+def _etag_of(raw: bytes) -> str:
+    """A strong ETag for an encoded ``/features`` body: the hash of its canonical JSON
+    (sorted keys), so the same listing always carries the same tag and any change in any
+    row changes it."""
+    return '"' + hashlib.sha1(raw).hexdigest()[:20] + '"'
 
 
 def build_data_router(cfg: dict, *, gap_reporter=None):
@@ -472,9 +480,31 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     from fastapi.encoders import jsonable_encoder
     from fastapi.responses import JSONResponse, Response
 
+    from fastapi.routing import APIRoute
+
+    from . import work_snapshot
+    from .read_cache import BoardReadCache
     from .store import default_db_path
 
-    router = APIRouter()
+    class _WriteNotingRoute(APIRoute):
+        """Every non-GET route on this router is a (possible) board write: when its handler
+        finishes, successful or not, the read cache is told, so the next read reflects the
+        write and is never answered with a pre-write snapshot (see read_cache)."""
+
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            if not (set(self.methods or ()) - {"GET", "HEAD"}):
+                return handler
+
+            async def _noting(request):
+                try:
+                    return await handler(request)
+                finally:
+                    read_cache.note_write()
+
+            return _noting
+
+    router = APIRouter(route_class=_WriteNotingRoute)
     store_kw = _store_kw(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
 
@@ -517,6 +547,45 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             from .store import BoardTimeout
 
             raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
+
+    def _db_file() -> str:
+        db = store_kw.get("db") or default_db_path()
+        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
+            db = os.path.join(str(store_kw.get("repo") or "."), db)
+        return db
+
+    def _read_token():
+        # In-process writes (loop, tools, routes) bump the board revision; any writer,
+        # including one outside this process, moves the store's file stamp; a live project
+        # routing change re-projects rows. A few `stat`s and a counter — no `br`.
+        board = store()
+        routing = json.dumps(
+            [getattr(board, "projects", None), getattr(board, "default_project", None)], sort_keys=True, default=str
+        )
+        return (work_snapshot.board_revision(), store_rev(_db_file()), routing)
+
+    # The ONE board listing the read routes serve from (/features, /cards…): cached,
+    # single-flight, invalidated by writes, never queued behind the drive loop's `br` lock.
+    read_cache = BoardReadCache(
+        lambda include_archived: store().list_features(include_archived=include_archived), _read_token
+    )
+
+    def _snapshot_headers(snap) -> dict:
+        return {
+            "Cache-Control": "no-cache",
+            "X-Board-Snapshot": "stale" if snap.stale else "fresh",
+            "X-Board-Snapshot-Age": f"{snap.age_s():.1f}",
+        }
+
+    def _rows(snap, state: str | None = None, project: str = "") -> list[dict]:
+        """The snapshot's rows narrowed like ``list_features(state=…)`` and ``?project=``,
+        as shallow copies: ``annotate_next_action`` stamps top-level keys per request."""
+        rows = snap.rows
+        if state:
+            rows = [f for f in rows if f.get("board_state") == state]
+        if project:
+            rows = [f for f in rows if str(f.get("project") or "") == project]
+        return [dict(f) for f in rows]
 
     from .settings_api import capture_boot_settings
 
@@ -753,10 +822,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         whenever ANY writer touches the store (the loop, a tool, this API, or a hand-run
         ``br``), because it is the beads database's own file state, not an in-process
         counter. No ``br`` call, no store read — so it answers even while ``br`` is slow."""
-        db = store_kw.get("db") or default_db_path()
-        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
-            db = os.path.join(str(store_kw.get("repo") or "."), db)
-        return {"rev": store_rev(db)}
+        return {"rev": store_rev(_db_file())}
 
     @router.get("/features")
     async def _features(
@@ -777,22 +843,27 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # Every row carries `next_action` / `awaiting_merge` / `next_action_hint`
         # (#208) — derived from labels + the board's auto_merge/review_gate config,
         # no per-row network — so the console can chip "awaiting merge".
+        #
+        # Served from the shared read snapshot (read_cache): no `br` unless the board
+        # changed, one listing however many viewers ask at once, and never a wait on the
+        # drive loop's `br` lock once a snapshot exists. The body is encoded ONCE, off the
+        # event loop, and the ETag is the hash of exactly those bytes.
         want = str(project or "").strip()
 
-        def _list():
-            feats = store().list_features(state=state, include_archived=include_archived)
-            if want:
-                feats = [f for f in feats if str(f.get("project") or "") == want]
-            return {"features": annotate_next_action(feats, cfg or {})}
+        def _render():
+            snap = read_cache.snapshot(include_archived)
+            body = {"features": annotate_next_action(_rows(snap, state, want), cfg or {})}
+            raw = json.dumps(body, sort_keys=True, default=_json_default, separators=(",", ":")).encode()
+            return raw, _etag_of(raw), snap
 
         # An ETag over the listing, so the view's periodic full refresh of an unchanged
         # board is a 304 with no body to parse and nothing to re-render.
-        body = await _guard(_list)
-        tag = features_etag(body)
+        raw, tag, snap = await _guard(_render)
+        headers = {"ETag": tag, **_snapshot_headers(snap)}
         # A proxy may weaken the tag (W/"…"); If-None-Match uses the weak comparison.
         if tag in [t.strip().removeprefix("W/") for t in request.headers.get("if-none-match", "").split(",")]:
-            return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
-        return JSONResponse(jsonable_encoder(body), headers={"ETag": tag, "Cache-Control": "no-cache"})
+            return Response(status_code=304, headers=headers)
+        return Response(content=raw, media_type="application/json", headers=headers)
 
     @router.get("/cards")
     async def _cards():
@@ -802,19 +873,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         row is ``board_cards.card_row`` (id, title, state, blocked, next_action, PR …) — no
         spec/criteria/design. Query-free on purpose: the host serves declared read PATHS
         only (a `?` is refused), so the frame filters by project itself."""
-        from .board_cards import cards_payload
-
-        return await _guard(lambda: cards_payload(annotate_next_action(store().list_features(), cfg or {})))
+        return await _scoped_cards("open")
 
     async def _scoped_cards(state: str, project: str = ""):
+        """Every card read, from the shared read snapshot (read_cache) — no `br` per call."""
         from .board_cards import STATES, cards_payload
 
         if state != "open" and state not in STATES and state != "cancelled":
             raise HTTPException(404, f"unknown board state {state!r}")
         st = "" if state == "open" else state
-        return await _guard(
-            lambda: cards_payload(annotate_next_action(store().list_features(state=st or None), cfg or {}), st, project)
-        )
+
+        def _render():
+            snap = read_cache.snapshot()
+            return cards_payload(annotate_next_action(_rows(snap, st), cfg or {}), st, project), snap
+
+        body, snap = await _guard(_render)
+        return JSONResponse(jsonable_encoder(body), headers=_snapshot_headers(snap))
 
     @router.get("/cards/{state}")
     async def _cards_in_state(state: str):

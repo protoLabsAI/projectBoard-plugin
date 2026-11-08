@@ -489,6 +489,9 @@ async function load(){
     const res = await kit.apiFetch("/api/plugins/project_board/features",
       FEATURES_ETAG ? {headers: {"if-none-match": FEATURES_ETAG}} : undefined);
     if (seq !== LOAD_SEQ) return;
+    // The server answered from its previous snapshot because `br` was busy (its refresh
+    // is still running): forget the stamp, so the next /rev tick reads again.
+    if (res.headers.get("x-board-snapshot") === "stale") REV = null;
     if (res.status === 304){
       // Unchanged on the server — but a move may have settled since the last paint.
       const next = fromServer();
