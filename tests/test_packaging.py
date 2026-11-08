@@ -371,6 +371,8 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "review_gate_timeout_s",
         # #691: draft-until-gate is a posture with a safe default, not a dial to turn.
         "draft_until_review",
+        # pr-reviewer#318: the reviewer-of-record label is a posture with a safe default too.
+        "reviewer_of_record_label",
         "reconcile_concurrency",
         "claim_stall_ticks",
     }

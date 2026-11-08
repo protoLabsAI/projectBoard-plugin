@@ -2136,6 +2136,7 @@ async def open_pr(
     body: str = "",
     promote_draft: bool = True,
     draft: bool = False,
+    labels: tuple[str, ...] = (),
 ) -> str:
     """Commit + push the worktree's branch and open (or reuse) a PR; return its URL.
 
@@ -2154,7 +2155,12 @@ async def open_pr(
     ``draft`` opens the PR as a draft — the operator's forced salvage of a tree whose
     pre-PR gate is red (#427), which must never read as a green, mergeable PR. A PR that
     already exists for the branch is converted (``gh pr ready --undo``, best-effort — a
-    repo without draft support refuses; the caller checks ``isDraft`` and says so)."""
+    repo without draft support refuses; the caller checks ``isDraft`` and says so).
+
+    ``labels`` go on a NEW PR at create (``--label``), each first created in the repo if
+    missing (``gh label create --force``, best-effort). Labels never cost the PR: if GitHub
+    refuses one, the PR is created without them. An existing PR keeps the labels it has —
+    the loop's own PR got them when it was first opened."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
@@ -2186,6 +2192,22 @@ async def open_pr(
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
     as_draft = ("--draft",) if draft else ()
+    wanted = [str(x).strip() for x in labels if str(x).strip()]
+    for label in wanted:
+        # Idempotent (--force updates an existing label in place); a failure here only means
+        # the create below may refuse the label, which falls back to no labels.
+        await _gh(
+            "label",
+            "create",
+            label,
+            "--force",
+            "--color",
+            "5319e7",
+            "--description",
+            "Reviewed by the project board's review gate (reviewer of record)",
+            cwd=worktree,
+        )
+    as_labels = tuple(arg for label in wanted for arg in ("--label", label))
     rc, out, err = await _gh(
         "pr",
         "create",
@@ -2198,8 +2220,28 @@ async def open_pr(
         "--body",
         body or title,
         *as_draft,
+        *as_labels,
         cwd=worktree,
     )
+    refused = (err + out).lower()
+    if rc != 0 and as_labels and "label" in refused and "already exists" not in refused:
+        log.warning(
+            "[project_board] gh refused the PR label(s) %s; opening the PR without them: %s", wanted, err.strip()[:200]
+        )
+        rc, out, err = await _gh(
+            "pr",
+            "create",
+            "--head",
+            branch,
+            "--base",
+            base,
+            "--title",
+            title,
+            "--body",
+            body or title,
+            *as_draft,
+            cwd=worktree,
+        )
     if rc == 0:
         return out.strip()
     if "already exists" in err.lower() or "already exists" in out.lower():

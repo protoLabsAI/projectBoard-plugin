@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **36 of 89 keys are in this state, including `coders` and `projects`** —
+never renders it. **36 of 90 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -338,6 +338,7 @@ The gates between a green build and main.
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
 | `draft_until_review` | `True` | reload |
+| `reviewer_of_record_label` | `"reviewer-of-record:board"` | reload |
 | `external_review` | `—` | reload **· YAML only** |
 | `require_complete_review` | `False` | reload **· YAML only** |
 | `review_summon_handle` | `"vera"` | reload **· YAML only** |
@@ -359,6 +360,13 @@ review panel that skips drafts (the fleet QA panel does) then never reviews a he
 about to send back for a fix round. Only a PR the loop drafted itself, recorded as the
 `board-draft` label, is un-drafted; a draft you set by hand stays a draft. Turn it off only if
 nothing external reviews the repo and you want the PR visible as ready while the gate runs.
+
+`reviewer_of_record_label` (with `review_gate` on) is put on the card's PR when it is first opened.
+The fleet QA panel, configured with a matching `pr_reviewer.reviewers_of_record` rule, then treats
+the board's gate as the PR's reviewer of record. When `board/review-gate` is green at the head it
+posts a PASS carrying that verdict and runs no panel. While the gate is pending or failed it posts
+nothing. If no gate status ever appears on a head, it reviews that head itself. Set `""` to have
+the panel review board PRs independently, as before.
 
 `review_gate_timeout_s` is a hard cap on one review-gate model call: the host workflow run,
 or the a2a reviewer fallback. The cap is the board's own, not the host model client's. That

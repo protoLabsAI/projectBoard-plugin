@@ -279,6 +279,11 @@ async def request_dispatch() -> dict:
 
 
 class DriveMixin:
+    def _labels_as_record(self) -> bool:
+        """Label this card's PR as the board's to review (#318): only while the board's own
+        review gate is on, since the gate's verdict is what the label hands the panel."""
+        return bool(getattr(self, "review_gate", False) and getattr(self, "reviewer_of_record_label", ""))
+
     # ── lifecycle (register_surface start/stop) ───────────────────────────────
     def start(self):
         # Publish this loop into the process-stable registry BEFORE the enabled gate so
@@ -2714,6 +2719,7 @@ class DriveMixin:
                         body=body,
                         promote_draft=not feature.get("pr_url") and not board_draft,
                         **({"draft": True} if board_draft else {}),
+                        **({"labels": (self.reviewer_of_record_label,)} if self._labels_as_record() else {}),
                     )
                     if board_draft:
                         await self._note_board_draft(store, fid, pr_url, repo)
