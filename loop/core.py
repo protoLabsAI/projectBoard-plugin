@@ -93,6 +93,12 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # reads as ON. The listings and the attach verb read this knob with knob_bool, so the
         # loop used to run a gate every other surface said was off (#402 review).
         self.review_gate = knob_bool(self.cfg, "review_gate", False, strict=False)
+        # #691: with the gate on, open the card's first PR as a DRAFT and mark it ready only
+        # when the gate is clean, so the fleet QA panel (which skips drafts and reviews on
+        # `ready_for_review`) never spends a panel on a head the gate is about to bounce.
+        # Measured before: 71% of board re-pushes followed the board gate's own FAIL, ~17% of
+        # the panel's time and 45% of its superseded rounds. Inert without `review_gate`.
+        self.draft_until_review = knob_bool(self.cfg, "draft_until_review", True, strict=False)
         self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
         self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
         # Cap on consecutive UNRUNNABLE gate attempts (runner missing / workflow dying /

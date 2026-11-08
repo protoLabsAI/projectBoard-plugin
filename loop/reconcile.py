@@ -2577,6 +2577,33 @@ class ReconcileMixin:
                 return str(text).strip()
         return ""
 
+    async def _note_board_draft(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """Record that the loop holds this card's PR as a draft for its gate (#691). Reads
+        `isDraft` back rather than trusting `--draft` (#427: an adopted PR may not take it).
+        Best-effort: an unrecorded draft is only a PR the gate will not un-draft, and the
+        merge edge already names a draft as a blocker."""
+        try:
+            info = await worktree.pr_merge_info(pr_url, cwd=repo)
+            if info.get("isDraft") is True:
+                await asyncio.to_thread(store.record_board_draft, fid, True)
+        except Exception:  # noqa: BLE001 — bookkeeping must never fail the drive
+            log.warning("[project_board] %s board-draft not recorded for %s", fid, pr_url, exc_info=True)
+
+    async def _release_board_draft(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """Mark the PR ready if the LOOP drafted it (#691). Only a `board-draft` card is
+        touched, so an operator's hand-set draft (#207's hold) stays a draft. The label is
+        cleared only once GitHub reports the PR ready, so a failed `gh pr ready` retries on
+        the next clean verdict instead of stranding the PR."""
+        try:
+            feature = await asyncio.to_thread(store.get_feature, fid)
+            if store_mod.LABEL_BOARD_DRAFT not in (feature.get("labels") or []):
+                return
+            if await worktree._promote_adopted_draft(pr_url, fid, cwd=repo, adopted=False):
+                await asyncio.to_thread(store.record_board_draft, fid, False)
+                log.info("[project_board] %s review gate clean — marked PR ready for external review: %s", fid, pr_url)
+        except Exception:  # noqa: BLE001 — the verdict already landed; this is the hand-off
+            log.warning("[project_board] %s could not release the board draft %s", fid, pr_url, exc_info=True)
+
     async def _stamp_reviewed_head(self, store, fid: str, sha: str) -> None:
         """Best-effort stamp of the PR head the review verdict was rendered against
         (#328) — the ``reviewed-head:<sha>`` label the reconcile compares against the
@@ -3378,6 +3405,8 @@ class ReconcileMixin:
                 store.set_review_substate, fid, None, note="review gate: host lacks graph.review.findings — gate inert"
             )
             log.warning("[project_board] %s review gate inert (no findings parser on this host)", fid)
+            # A gate that cannot judge must not hold the PR out of external review (#691).
+            await self._release_board_draft(store, fid, pr_url, repo)
             return
         blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
         # #381: enforce the grounding ADR 0077 already promises. A blocking finding must
@@ -3487,6 +3516,7 @@ class ReconcileMixin:
                 description=f"Review gate clean — {len(findings)} finding(s), none blocking",
             )
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
+            await self._release_board_draft(store, fid, pr_url, repo)
             return
 
         rendered = self._render_findings(blocking)

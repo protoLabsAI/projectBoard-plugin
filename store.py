@@ -697,6 +697,11 @@ SHORT_SHA_LEN = 12
 # reviewed head (current — the rejection stands). Recorded SHA identity, not a timestamp
 # or the label's mere presence, so an UNCHANGED rejected head remains rejected.
 LABEL_REVIEWED_HEAD_PREFIX = "reviewed-head:"
+# The loop opened this card's PR as a DRAFT and holds it there until its own review gate is
+# clean (#691), so an external reviewer (the fleet QA panel skips drafts) never races the
+# board's gate on a head the board is about to replace. Only a PR carrying this label is
+# un-drafted by the gate: a draft the operator set by hand (#207's hold) is never touched.
+LABEL_BOARD_DRAFT = "board-draft"
 # The PR head an EXTERNAL QA-panel FAIL already bounced the card for (#473) —
 # `ext-review-bounced:<sha>`, replaced (never accumulated), SHORT for the 50-char label
 # cap. The reconcile bounces a card into a fix round the first time it sees the panel's
@@ -4574,6 +4579,19 @@ class BeadsBoard:
         if sha:
             args += ["--add-label", f"{LABEL_REVIEWED_HEAD_PREFIX}{sha}"]
         self._run(*args)
+        return self.get_feature(fid)
+
+    def record_board_draft(self, fid: str, on: bool) -> dict:
+        """Set or clear the `board-draft` label (#691): the loop opened this card's PR as a
+        draft and will mark it ready when its own review gate is clean. Fire-and-forget at
+        the call sites: a `br` hiccup leaves the PR a draft, which the merge edge already
+        names as a blocker (`draft (run gh pr ready)`), never a silent merge."""
+        f = self._require(fid)
+        has = LABEL_BOARD_DRAFT in (f.get("labels") or [])
+        if on and not has:
+            self._run("update", fid, "--add-label", LABEL_BOARD_DRAFT)
+        elif not on and has:
+            self._run("update", fid, "--remove-label", LABEL_BOARD_DRAFT)
         return self.get_feature(fid)
 
     # ── loop fix-budget persistence (#259) ────────────────────────────────────

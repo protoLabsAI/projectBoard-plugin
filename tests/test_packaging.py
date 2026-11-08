@@ -369,6 +369,8 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "health_sweep_interval_s",
         # #462: the review-call cap, the per-card reconcile bound and the stall signal.
         "review_gate_timeout_s",
+        # #691: draft-until-gate is a posture with a safe default, not a dial to turn.
+        "draft_until_review",
         "reconcile_concurrency",
         "claim_stall_ticks",
     }
