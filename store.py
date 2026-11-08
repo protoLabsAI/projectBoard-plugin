@@ -1164,6 +1164,19 @@ def _stop_br_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# `br` copies the WHOLE issues.jsonl into .br_history on every write (#686). On a busy board that
+# was ~14-30 MB per write and 1.3-2.8 GB of snapshots within hours, the disk churn that slowed
+# every `br` call. One snapshot an hour still leaves a recovery point; an operator who set the
+# variable keeps their value.
+_BR_HISTORY_MIN_INTERVAL_S = "3600"
+
+
+def _br_env() -> dict:
+    env = dict(os.environ)
+    env.setdefault("BR_HISTORY_MIN_INTERVAL_SECS", _BR_HISTORY_MIN_INTERVAL_S)
+    return env
+
+
 def _run_br_process(cmd: list[str], *, cwd: str, args: tuple[str, ...]) -> subprocess.CompletedProcess:
     """Run ONE `br` process to completion, bounded by ``_BR_TIMEOUT_S`` (#404). No stdin
     (#423: the desktop server's stdin is a pipe that never closes) and its own session, so
@@ -1172,6 +1185,7 @@ def _run_br_process(cmd: list[str], *, cwd: str, args: tuple[str, ...]) -> subpr
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
+        env=_br_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
