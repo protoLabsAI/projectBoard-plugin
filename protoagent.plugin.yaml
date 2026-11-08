@@ -21,7 +21,7 @@ description: >-
   Ships DISABLED; enable with `plugins: { enabled: [delegates, project_board] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/projectBoard-plugin
-min_protoagent_version: "0.185.0"  # infra.clock.wait_for: sleep-aware coder timeouts (#472, protoAgent #3724); callable HOST.apply_settings (#2743); settings_tabs (#3179/#3180)
+min_protoagent_version: "0.231.0"  # memory_search/memory_save (ADR 0125 renamed the memory tools); infra.clock.wait_for: sleep-aware coder timeouts (#472, protoAgent #3724); callable HOST.apply_settings (#2743); settings_tabs (#3179/#3180)
 
 # Plugin config (read from `project_board:` in langgraph-config.yaml).
 config_section: project_board
