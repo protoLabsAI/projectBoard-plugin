@@ -99,6 +99,13 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # Measured before: 71% of board re-pushes followed the board gate's own FAIL, ~17% of
         # the panel's time and 45% of its superseded rounds. Inert without `review_gate`.
         self.draft_until_review = knob_bool(self.cfg, "draft_until_review", True, strict=False)
+        # #318 (pr-reviewer): with the gate on, the board is its PRs' reviewer of record. The
+        # label tells the fleet QA panel to carry the gate's `board/review-gate` verdict instead
+        # of spending a second panel (the gate caught 16 real defects in a 24-finding sample, the
+        # panel 1 of them). "" opts out: the panel then reviews board PRs as before.
+        self.reviewer_of_record_label = str(
+            self.cfg.get("reviewer_of_record_label", "reviewer-of-record:board") or ""
+        ).strip()
         self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
         self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
         # Cap on consecutive UNRUNNABLE gate attempts (runner missing / workflow dying /

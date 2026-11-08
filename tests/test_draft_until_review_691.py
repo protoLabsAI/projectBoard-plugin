@@ -29,6 +29,7 @@ from test_loop import (  # noqa: F401 — the two autouse fixtures keep the gate
 )
 
 PR = "https://github.com/o/r/pull/9"
+_ROR = "reviewer-of-record:board"  # pr-reviewer#318: the label the gate-on PR carries
 _BLOCKER = '[{"file": "a.py", "line": 3, "severity": "blocker", "claim": "drops data", "evidence": "x", "verdict": "confirmed"}]'
 
 
@@ -181,10 +182,10 @@ async def _first_open_kwargs(monkeypatch, cfg, *, pr_url=None):
 @pytest.mark.parametrize(
     "cfg,pr_url,want",
     [
-        ({"review_gate": True}, None, {"promote_draft": False, "draft": True}),
-        ({"review_gate": True, "draft_until_review": False}, None, {"promote_draft": True}),
+        ({"review_gate": True}, None, {"promote_draft": False, "draft": True, "labels": (_ROR,)}),
+        ({"review_gate": True, "draft_until_review": False}, None, {"promote_draft": True, "labels": (_ROR,)}),
         ({}, None, {"promote_draft": True}),
-        ({"review_gate": True}, PR, {"promote_draft": False}),  # a re-dispatch leaves the PR alone
+        ({"review_gate": True}, PR, {"promote_draft": False, "labels": (_ROR,)}),  # a re-dispatch leaves the PR alone
     ],
 )
 async def test_the_first_pr_opens_as_a_draft_only_with_the_gate_on(monkeypatch, cfg, pr_url, want):

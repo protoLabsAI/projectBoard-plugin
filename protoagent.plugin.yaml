@@ -65,6 +65,9 @@ config:
                             # it ready only when the gate is clean (#691), so an external panel
                             # that skips drafts never reviews a head the gate is about to bounce.
                             # Only a PR the loop drafted (`board-draft` label) is un-drafted.
+  reviewer_of_record_label: "reviewer-of-record:board"  # With review_gate on: label the card's
+                            # PR so the fleet QA panel carries the gate's `board/review-gate`
+                            # verdict instead of reviewing it again (pr-reviewer #318). "" opts out.
   review_workflow: code-review  # the host workflow recipe the gate runs (run_workflow name)
   review_fix_max: 2         # review-bounce re-dispatches before the feature is Blocked
                             # (mirrors ci_fix_max; same-tier — findings are fixable, not a
