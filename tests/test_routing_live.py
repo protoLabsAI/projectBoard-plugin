@@ -405,3 +405,66 @@ async def test_setter_preserves_unmodified_legacy_policy_but_validates_supplied_
     with pytest.raises(ValueError, match="unknown coder tier"):
         await routing.routing_set(actor="alice", coders={"custom-tier": "sonnet"})
     assert len(calls) == len(audit.read_text().splitlines()) == 1
+
+
+# Chat-turn authority: the injected graph state's `operator_chat_turn` (core's server stamp)
+# authorizes the tool the same way host-injected `configurable.auth` does.
+def test_routing_set_keeps_state_out_of_the_model_schema():
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+    assert "state" not in setter.tool_call_schema.model_fields
+
+
+async def test_routing_set_operator_chat_turn_authorizes(host):
+    live, loop, calls, audit = host
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+    result = json.loads(await setter.ainvoke({"exclusive": ["codex"], "state": {"operator_chat_turn": True}}))
+    assert result["app"]["exclusive"] == ["codex"]
+    assert len(calls) == 1
+    assert json.loads(audit.read_text())["who"] == "operator"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [None, {}, {"operator_chat_turn": False}, {"operator_chat_turn": True, "subagent_fence": ["board_routing_set"]}],
+)
+async def test_routing_set_refuses_without_operator_chat_turn(host, state):
+    live, loop, calls, audit = host
+    before = copy.deepcopy(live.plugin_config)
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+    result = await setter.ainvoke({"exclusive": [], "state": state})
+    assert "requires operator" in result
+    assert not calls and not audit.exists() and live.plugin_config == before
+
+
+async def test_routing_set_real_tool_node_injects_state(host):
+    from typing import Annotated, TypedDict
+
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode
+
+    live, loop, calls, audit = host
+    setter = next(t for t in _board_tools({}) if t.name == "board_routing_set")
+
+    class State(TypedDict, total=False):
+        messages: Annotated[list, add_messages]
+        operator_chat_turn: bool
+        subagent_fence: list
+
+    builder = StateGraph(State)
+    builder.add_node("tools", ToolNode([setter]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+
+    async def run(extra):
+        call = {"name": "board_routing_set", "args": {"exclusive": ["codex"]}, "id": "c1", "type": "tool_call"}
+        out = await graph.ainvoke({"messages": [AIMessage(content="", tool_calls=[call])], **extra})
+        return out["messages"][-1].content
+
+    assert "requires operator" in await run({"operator_chat_turn": False})
+    assert "requires operator" in await run({"operator_chat_turn": True, "subagent_fence": ["x"]})
+    assert not calls
+    assert json.loads(await run({"operator_chat_turn": True}))["app"]["exclusive"] == ["codex"]
+    assert len(calls) == 1

@@ -107,3 +107,93 @@ def test_peak_formula_names_the_sessions_cap_when_it_binds():
     assert "max_concurrent_sessions 1" in view["peak_formula"] and "coder_solve_k 3" in view["peak_formula"]
     off = settings_api._concurrency_view({"max_concurrent": 4, "coder_solve_k": 3, "coder_solve": False})
     assert off["peak_coder_sessions"] == 4 and "coder_solve off" in off["peak_formula"]
+
+
+# Chat-turn authority (protoEngineer 2026-11-08): core never puts `configurable.auth` on a
+# chat turn's tool config; it stamps `operator_chat_turn` into graph state instead, which
+# the tool reads through InjectedState — the same check core's record_directive makes.
+CHAT_TURN = {"operator_chat_turn": True}
+
+
+def test_injected_state_stays_out_of_the_model_schema(host):
+    *_, tools = host
+    assert "state" not in tools["board_concurrency_set"].tool_call_schema.model_fields
+
+
+async def test_operator_chat_turn_state_authorizes_and_persists(host):
+    live, loop, calls, audit, tools = host
+    result = json.loads(
+        await tools["board_concurrency_set"].ainvoke(
+            {"max_concurrent": 3, "reason": "Josh: 'give me 3 coders'", "state": CHAT_TURN}
+        )
+    )
+    assert result["max_concurrent"] == 3 and loop.max_concurrent == 3
+    assert calls == [{"project_board": {"max_concurrent": 3}}]
+    assert json.loads(audit.read_text())["who"] == "operator"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        None,
+        {},
+        {"operator_chat_turn": False},
+        {"operator_chat_turn": "true"},
+        {"operator_chat_turn": True, "subagent_fence": ["board_concurrency_set"]},
+    ],
+)
+async def test_state_without_operator_chat_turn_is_refused(host, state):
+    live, loop, calls, audit, tools = host
+    result = await tools["board_concurrency_set"].ainvoke({"max_concurrent": 3, "reason": "asked", "state": state})
+    assert result.startswith("Error:") and "board_concurrency_set requires operator" in result
+    assert not calls and not audit.exists() and loop.max_concurrent == 2
+
+
+async def test_real_tool_node_injects_operator_chat_turn(host):
+    """InjectedState really reaches the tool under a LangGraph ToolNode (what create_agent
+    runs tools through), and the model's own args can't smuggle the flag in."""
+    from typing import Annotated, TypedDict
+
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode
+
+    live, loop, calls, audit, tools = host
+
+    class State(TypedDict, total=False):
+        messages: Annotated[list, add_messages]
+        operator_chat_turn: bool
+        subagent_fence: list
+
+    builder = StateGraph(State)
+    builder.add_node("tools", ToolNode([tools["board_concurrency_set"]]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+
+    async def run(value, extra=None, args=None):
+        call = {"max_concurrent": value, "reason": "Josh asked", **(args or {})}
+        out = await graph.ainvoke(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "board_concurrency_set", "args": call, "id": f"c{value}", "type": "tool_call"}
+                        ],
+                    )
+                ],
+                **(extra or {}),
+            }
+        )
+        reply = out["messages"][-1]
+        assert isinstance(reply, ToolMessage)
+        return reply.content
+
+    assert json.loads(await run(3, {"operator_chat_turn": True}))["max_concurrent"] == 3
+    assert "requires operator" in await run(4, {"operator_chat_turn": False})
+    assert "requires operator" in await run(5, {"operator_chat_turn": True, "subagent_fence": ["x"]})
+    # A model-supplied `state` arg is overwritten by the injected graph state.
+    assert "requires operator" in await run(6, {}, {"state": {"operator_chat_turn": True}})
+    assert loop.max_concurrent == 3 and len(calls) == 1
