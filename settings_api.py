@@ -371,7 +371,16 @@ def _concurrency_view(section):
         "coder_solve": solve,
         "max_concurrent_sessions": sessions,
         "peak_coder_sessions": max_concurrent * per_card,
-        "peak_formula": f"max_concurrent × coder_solve_k = {max_concurrent} × {per_card} = {max_concurrent * per_card}",
+        "peak_formula": (
+            f"max_concurrent × sessions per card = {max_concurrent} × {per_card} = {max_concurrent * per_card}"
+            + (
+                f" (sessions per card = min(coder_solve_k {k}, max_concurrent_sessions {sessions}))"
+                if solve and sessions
+                else f" (sessions per card = coder_solve_k {k})"
+                if solve
+                else " (coder_solve off: 1 session per card)"
+            )
+        ),
     }
 
 

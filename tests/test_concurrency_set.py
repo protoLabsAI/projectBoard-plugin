@@ -94,3 +94,16 @@ async def test_reason_is_required(host):
         assert result.startswith("Error:") and "reason is required" in result
     assert not calls and not audit.exists()
     assert live.plugin_config["project_board"]["max_concurrent"] == 2
+
+
+def test_peak_formula_names_the_sessions_cap_when_it_binds():
+    # protoEngineer 2026-11-08: coder_solve_k 3 with max_concurrent_sessions 1 serializes a card's
+    # candidates, so the peak is max_concurrent × 1. The formula must say why it isn't × k.
+    view = settings_api._concurrency_view(
+        {"max_concurrent": 4, "coder_solve_k": 3, "coder_solve": True, "max_concurrent_sessions": 1}
+    )
+    assert view["peak_coder_sessions"] == 4
+    assert "4 × 1 = 4" in view["peak_formula"]
+    assert "max_concurrent_sessions 1" in view["peak_formula"] and "coder_solve_k 3" in view["peak_formula"]
+    off = settings_api._concurrency_view({"max_concurrent": 4, "coder_solve_k": 3, "coder_solve": False})
+    assert off["peak_coder_sessions"] == 4 and "coder_solve off" in off["peak_formula"]
