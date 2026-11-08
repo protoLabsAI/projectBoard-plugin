@@ -803,6 +803,66 @@ def set_store_factory(fn: "Callable[[], object] | None") -> None:
     _store_factory = fn
 
 
+# A persisted gen is a SUMMARY, bounded however long the run was. The live buffer keeps up to
+# _RECENT_TOOLS_MAX tool rows so the drawer can follow a run as it happens; persisting all of
+# that made each finished gen a 10-38 KB bead comment. On protoEngineer (2026-11-07) 1,975 of
+# them were 21 MB of a 30 MB issues.jsonl — which `br` re-exports, and snapshots into
+# .br_history, on EVERY board write — so each `br update` took 10-34s under load and the
+# board stalled behind its own monitoring history.
+_PERSIST_TOOLS = 12  # the LAST tool rows a persisted gen keeps (recent_tools_total says how many ran)
+_PERSIST_TAIL = 300  # chars of answer/thought tail kept
+_PERSIST_PLAN = 20  # plan entries kept, each content clipped
+_PERSIST_FIELD = 160  # any one string inside a kept row
+_PERSIST_MAX_BYTES = 6144  # hard ceiling on the whole comment
+
+
+def _clip_str(v, n: int = _PERSIST_FIELD):
+    return v if not isinstance(v, str) or len(v) <= n else v[: n - 1] + "\u2026"
+
+
+def _clip_row(row) -> dict:
+    if not isinstance(row, dict):
+        return row
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, list):
+            out[k] = [_clip_str(x) for x in v[:3]]
+        else:
+            out[k] = _clip_str(v)
+    return out
+
+
+def _compact_snapshot(snap: dict) -> dict:
+    """The persisted form of a finished gen's snapshot: scalars as-is, the last
+    ``_PERSIST_TOOLS`` tool rows (with ``recent_tools_total``), short tails, a clipped plan,
+    and a clipped current tool — then, if it is STILL over ``_PERSIST_MAX_BYTES``, tools and
+    tails are dropped until it fits. Pure; never raises on an odd shape."""
+    out = dict(snap)
+    tools = list(snap.get("recent_tools") or [])
+    out["recent_tools_total"] = len(tools)
+    out["recent_tools"] = [_clip_row(r) for r in tools[-_PERSIST_TOOLS:]]
+    if isinstance(snap.get("current_tool"), dict):
+        out["current_tool"] = _clip_row(snap["current_tool"])
+    for k in ("answer_tail", "thought_tail"):
+        if isinstance(snap.get(k), str):
+            out[k] = snap[k][-_PERSIST_TAIL:]
+    if isinstance(snap.get("plan"), list):
+        out["plan"] = [_clip_row(e) for e in snap["plan"][:_PERSIST_PLAN]]
+    if isinstance(snap.get("verify"), dict):
+        out["verify"] = {k: _clip_str(v, 400) for k, v in snap["verify"].items()}
+
+    def size() -> int:
+        return len((_COMMENT_PREFIX + json.dumps(out, default=str)).encode())
+
+    while size() > _PERSIST_MAX_BYTES and out["recent_tools"]:
+        out["recent_tools"] = out["recent_tools"][1:]
+    for k in ("plan", "answer_tail", "thought_tail", "current_tool", "verify"):
+        if size() <= _PERSIST_MAX_BYTES:
+            break
+        out.pop(k, None)
+    return out
+
+
 def _persist_gen_snapshot(fid: str | None, gen: int) -> None:
     """Best-effort: write the just-finished gen's ``snapshot()`` as a ``coder-monitor:``
     JSON bead comment (the #226 write side). Skips silently when there's no fid, no
@@ -829,7 +889,7 @@ def _persist_gen_snapshot(fid: str | None, gen: int) -> None:
             store = _store_factory()
             if store is None:
                 return
-            payload = json.dumps(b.snapshot(), default=str)
+            payload = json.dumps(_compact_snapshot(b.snapshot()), default=str)
             store.comment(fid, _COMMENT_PREFIX + payload)
         except Exception:  # noqa: BLE001 — monitoring must never break a build
             log.debug("[project_board] persisting gen %s snapshot for %s failed", gen, fid, exc_info=True)
