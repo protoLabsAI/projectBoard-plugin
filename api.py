@@ -474,9 +474,52 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
     from .store import default_db_path
 
-    router = APIRouter()
+    from fastapi import Depends
+
+    from . import work_snapshot
+    from .read_cache import ReadCache
+
+    # Bumped around every mutating request on this router (before AND after the handler), so a
+    # listing cached while a write was in flight is never served once that write has returned.
+    write_gen = [0]
+
+    async def _invalidate_on_write(request: Request):
+        if request.method in ("GET", "HEAD"):
+            yield
+            return
+        write_gen[0] += 1
+        try:
+            yield
+        finally:
+            write_gen[0] += 1
+
+    router = APIRouter(dependencies=[Depends(_invalidate_on_write)])
     store_kw = _store_kw(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
+
+    # Listing reads are served from a revision-keyed, single-flight cache (#686 stopgap): a
+    # busy drive loop holding `br` no longer makes the board view's poll time out.
+    reads = ReadCache()
+
+    def _db_path() -> str:
+        db = store_kw.get("db") or default_db_path()
+        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
+            db = os.path.join(str(store_kw.get("repo") or "."), db)
+        return db
+
+    async def _cached_list(state, include_archived: bool):
+        """``store().list_features(state, include_archived)`` through the read cache →
+        ``(features, stale)``. The revision is read first (see read_cache)."""
+        files = await asyncio.to_thread(store_rev, _db_path())
+        rev = f"{files}:{work_snapshot.board_revision()}:{write_gen[0]}"
+        return await reads.get(
+            (state or None, bool(include_archived)),
+            rev,
+            lambda: _guard(lambda: store().list_features(state=state, include_archived=include_archived)),
+        )
+
+    def _stale_headers(stale: bool) -> dict:
+        return {"X-Board-Stale": "1"} if stale else {}
 
     def store():
         # Existing routers stay mounted across a host config reload, so their
@@ -753,10 +796,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         whenever ANY writer touches the store (the loop, a tool, this API, or a hand-run
         ``br``), because it is the beads database's own file state, not an in-process
         counter. No ``br`` call, no store read — so it answers even while ``br`` is slow."""
-        db = store_kw.get("db") or default_db_path()
-        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
-            db = os.path.join(str(store_kw.get("repo") or "."), db)
-        return {"rev": store_rev(db)}
+        return {"rev": store_rev(_db_path())}
 
     @router.get("/features")
     async def _features(
@@ -779,20 +819,23 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # no per-row network — so the console can chip "awaiting merge".
         want = str(project or "").strip()
 
+        feats, stale = await _cached_list(state, include_archived)
+
         def _list():
-            feats = store().list_features(state=state, include_archived=include_archived)
+            rows = [dict(f) for f in feats]  # annotate stamps rows; never mutate the cached ones
             if want:
-                feats = [f for f in feats if str(f.get("project") or "") == want]
-            return {"features": annotate_next_action(feats, cfg or {})}
+                rows = [f for f in rows if str(f.get("project") or "") == want]
+            return {"features": annotate_next_action(rows, cfg or {})}
 
         # An ETag over the listing, so the view's periodic full refresh of an unchanged
         # board is a 304 with no body to parse and nothing to re-render.
         body = await _guard(_list)
         tag = features_etag(body)
+        extra = _stale_headers(stale)
         # A proxy may weaken the tag (W/"…"); If-None-Match uses the weak comparison.
         if tag in [t.strip().removeprefix("W/") for t in request.headers.get("if-none-match", "").split(",")]:
-            return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
-        return JSONResponse(jsonable_encoder(body), headers={"ETag": tag, "Cache-Control": "no-cache"})
+            return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache", **extra})
+        return JSONResponse(jsonable_encoder(body), headers={"ETag": tag, "Cache-Control": "no-cache", **extra})
 
     @router.get("/cards")
     async def _cards():
@@ -804,7 +847,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         only (a `?` is refused), so the frame filters by project itself."""
         from .board_cards import cards_payload
 
-        return await _guard(lambda: cards_payload(annotate_next_action(store().list_features(), cfg or {})))
+        feats, stale = await _cached_list(None, False)
+        body = await _guard(lambda: cards_payload(annotate_next_action([dict(f) for f in feats], cfg or {})))
+        return JSONResponse(jsonable_encoder(body), headers=_stale_headers(stale))
 
     async def _scoped_cards(state: str, project: str = ""):
         from .board_cards import STATES, cards_payload
@@ -812,9 +857,11 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         if state != "open" and state not in STATES and state != "cancelled":
             raise HTTPException(404, f"unknown board state {state!r}")
         st = "" if state == "open" else state
-        return await _guard(
-            lambda: cards_payload(annotate_next_action(store().list_features(state=st or None), cfg or {}), st, project)
+        feats, stale = await _cached_list(st or None, False)
+        body = await _guard(
+            lambda: cards_payload(annotate_next_action([dict(f) for f in feats], cfg or {}), st, project)
         )
+        return JSONResponse(jsonable_encoder(body), headers=_stale_headers(stale))
 
     @router.get("/cards/{state}")
     async def _cards_in_state(state: str):

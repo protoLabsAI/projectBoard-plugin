@@ -364,6 +364,12 @@ def test_features_etag_answers_304_when_unchanged(client):
     again = c.get("/api/plugins/project_board/features", headers={"If-None-Match": tag})
     assert again.status_code == 304 and again.content == b""
     store.rows[0]["priority"] = 1
+    # A real change is always signalled: a `br` write moves the store's file stamp, and an
+    # in-process write notes itself. The listing cache (#686) keys on those, so the fake's
+    # direct row edit is signalled the way an in-process write is.
+    from project_board import work_snapshot
+
+    work_snapshot.note_board_write()
     changed = c.get("/api/plugins/project_board/features", headers={"If-None-Match": tag})
     assert changed.status_code == 200 and changed.headers["etag"] != tag
     assert changed.json()["features"][0]["priority"] == 1
