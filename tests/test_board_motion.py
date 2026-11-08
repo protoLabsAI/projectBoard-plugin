@@ -364,6 +364,9 @@ def test_features_etag_answers_304_when_unchanged(client):
     again = c.get("/api/plugins/project_board/features", headers={"If-None-Match": tag})
     assert again.status_code == 304 and again.content == b""
     store.rows[0]["priority"] = 1
+    # A real write moves the store's file stamp (br exports on every write); the read
+    # snapshot is keyed on it, so an in-memory edit alone is not a board change.
+    (_db.parent / "issues.jsonl").write_text("{}\n")
     changed = c.get("/api/plugins/project_board/features", headers={"If-None-Match": tag})
     assert changed.status_code == 200 and changed.headers["etag"] != tag
     assert changed.json()["features"][0]["priority"] == 1
