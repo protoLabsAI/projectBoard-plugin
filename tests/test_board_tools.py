@@ -487,6 +487,8 @@ _MINIMAL_ARGS = {
 _NO_STORE_ARGS = {
     "board_routing_get": {},
     "board_routing_set": {"exclusive": []},
+    "board_concurrency_get": {},
+    "board_concurrency_set": {"max_concurrent": 2, "reason": "r"},
     "board_dispatch": {},
     "board_projects": {},  # a config read, no store
     "board_card_form": {"title_hint": "Add undo"},  # a config read + a component, no store

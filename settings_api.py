@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -340,3 +342,83 @@ async def apply_setting_updates(updates, actor):
             "restart_required": [key for key in updates if key not in LIVE_KNOBS],
             "pending_restart": _pending(_live_section(required=True)),
         }
+
+
+# ── board_concurrency_get / board_concurrency_set (agent tools) ─────────────────────────
+# The agent-facing twin of the Settings "Cards building at once" stepper. It saves through
+# apply_setting_updates above — the very write the console makes — so the value persists to
+# the agent's config and the host's config reload applies it to the running loop
+# (BoardLoop.reload; `max_concurrent` is a LIVE_KNOB). The agent cap is tighter than the
+# Settings bound: a human may go higher in Settings, an agent may not.
+AGENT_MAX_CONCURRENT = 8
+
+
+def _knob(section, key):
+    value = section.get(key, _DEFAULTS.get(key))
+    return value if type(value) is int else _DEFAULTS.get(key)
+
+
+def _concurrency_view(section):
+    """The cards-at-once limit and the peak coder sessions it implies."""
+    max_concurrent = _knob(section, "max_concurrent")
+    k = max(1, _knob(section, "coder_solve_k"))
+    solve = section.get("coder_solve", _DEFAULTS.get("coder_solve", True)) is not False
+    sessions = max(0, _knob(section, "max_concurrent_sessions"))
+    per_card = (min(k, sessions) if sessions else k) if solve else 1
+    return {
+        "max_concurrent": max_concurrent,
+        "coder_solve_k": k,
+        "coder_solve": solve,
+        "max_concurrent_sessions": sessions,
+        "peak_coder_sessions": max_concurrent * per_card,
+        "peak_formula": f"max_concurrent × coder_solve_k = {max_concurrent} × {per_card} = {max_concurrent * per_card}",
+    }
+
+
+def concurrency_get():
+    return _concurrency_view(_live_section(required=True))
+
+
+async def concurrency_set(*, actor, max_concurrent, reason):
+    """Validate, persist through the Settings write, read back, and audit."""
+    from .br_fetch import data_dir
+    from .project_registry import ProjectRegistryError
+
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if not reason:
+        raise ValueError("reason is required: quote or cite the operator's request to change the coder count")
+    if type(max_concurrent) is not int or not 1 <= max_concurrent <= AGENT_MAX_CONCURRENT:
+        raise ValueError(
+            f"max_concurrent must be a whole number from 1 to {AGENT_MAX_CONCURRENT} "
+            f"(got {max_concurrent!r}); a higher limit is the operator's to set in Settings"
+        )
+    old = _concurrency_view(_live_section(required=True))
+    result = await apply_setting_updates({"max_concurrent": max_concurrent}, actor)
+    if not result.get("ok"):
+        raise ProjectRegistryError(result.get("reason") or "host refused the concurrency update")
+    new = _concurrency_view(_live_section(required=True))
+    if new["max_concurrent"] != max_concurrent:
+        raise ProjectRegistryError("concurrency readback did not match the saved value")
+    record = {
+        "who": actor,
+        "when": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "old": old["max_concurrent"],
+        "new": new["max_concurrent"],
+    }
+    path = data_dir() / "concurrency-audit.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+    log.info("[project_board] concurrency audit: %s", json.dumps(record, sort_keys=True))
+    return {
+        "old_max_concurrent": old["max_concurrent"],
+        "max_concurrent": new["max_concurrent"],
+        "live": True,
+        "note": (
+            "Saved and live: the running loop applies it on this config reload, no restart. "
+            "Cards already building keep running; new claims use the new limit."
+        ),
+        "peak_coder_sessions": new["peak_coder_sessions"],
+        "peak_formula": new["peak_formula"],
+    }

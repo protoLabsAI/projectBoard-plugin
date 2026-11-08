@@ -1332,6 +1332,37 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
+    def board_concurrency_get() -> str:
+        """Read how many cards the board builds at once (`max_concurrent`) and the peak coder
+        sessions that implies (max_concurrent × coder_solve_k)."""
+        from .settings_api import concurrency_get
+
+        try:
+            return json.dumps(concurrency_get())
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    async def board_concurrency_set(config: RunnableConfig, max_concurrent: int, reason: str) -> str:
+        """Change how many cards the board builds at once (`max_concurrent`, 1 to 8). Persists
+        like Settings ▸ Project Board and applies live. Requires host-injected operator-tier context.
+
+        ONLY call this when the operator explicitly asks you to change the coder count. Never
+        change it on your own judgement: not for load, not to finish faster, not to drain a
+        queue. If you think it should change, ask the operator and wait for their answer.
+        `reason` is required and must quote or cite the operator's request. Returns the old and
+        new values and the peak coder sessions (max_concurrent × coder_solve_k).
+        """
+        from .routing import operator_actor
+        from .settings_api import concurrency_set
+
+        try:
+            actor = operator_actor(config, "board_concurrency_set")
+            return json.dumps(await concurrency_set(actor=actor, max_concurrent=max_concurrent, reason=reason))
+        except (PermissionError, ValueError) as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_hold_merge(feature_id: str, reason: str) -> str:
         """Place the operator's auto-merge veto (`merge-hold` label) on a card: the loop never
         auto-merges it, so a human merges by hand (e.g. a change to QA first). The card still
@@ -1745,6 +1776,8 @@ def _board_tools(cfg: dict, registry=None):
         board_unblock_feature,
         board_routing_get,
         board_routing_set,
+        board_concurrency_get,
+        board_concurrency_set,
         board_hold_merge,
         board_release_merge_hold,
         board_reset_merged_verify_budget,

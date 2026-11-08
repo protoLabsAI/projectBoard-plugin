@@ -205,6 +205,9 @@ defaults to `in_review` (the "which PRs are red" query).
 
 `detail` is a one-sentence summary; `running`/`max_concurrent` show the slots.
 
+The slot count is the operator's: change it with `board_concurrency_set` ONLY when the operator
+explicitly asks (quote their request in `reason`); at capacity, report it and ask, never raise it yourself.
+
 ## Recovering a card
 
 | Situation | Verb |
