@@ -42,9 +42,10 @@ def test_decompose_skill_dispatches_the_planning_critic():
     assert "task(antagonist," not in skill
 
 
-def test_decomposer_supports_both_core_memory_tool_names():
+def test_decomposer_uses_the_current_memory_tool():
     install_host_stubs()
     registry = FakeRegistry({"br_autofetch": False}, plugin_id="project_board")
     project_board.register(registry)
     decomposer = next(config for config in registry.subagents if config.name == "decompose")
-    assert {"memory_search", "memory_recall"} <= set(decomposer.tools)
+    assert "memory_search" in decomposer.tools
+    assert "memory_recall" not in decomposer.tools  # removed in core 0.231.0 (ADR 0125)

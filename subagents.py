@@ -49,7 +49,7 @@ DECOMPOSE_CONFIG = SubagentConfig(
         "`decompose-project` skill's propose→attack→revise loop."
     ),
     model=_MODEL,
-    tools=["read_file", "list_dir", "find_files", "search_files", "memory_search", "memory_recall"],
+    tools=["read_file", "list_dir", "find_files", "search_files", "memory_search"],
     system_prompt=f"""You are protoAgent's **decompose** subagent — the proposer in an
 adversarial planning pipeline. You turn a raw idea into a clean, buildable spec tree,
 one step at a time, so an autonomous coding agent could pick up any feature cold.

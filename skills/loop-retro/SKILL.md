@@ -20,8 +20,6 @@ tools:
   - write_file       # write the dated retro report (the proposal); never PROTO.md itself
   - memory_search    # dedup check: find a near-identical lesson before writing
   - memory_save      # write each NEW lesson (kind="fact", subject=failure class) — coders read it
-  - memory_recall    # pre-ADR 0125 core: memory_search
-  - memory_ingest    # pre-ADR 0125 core: memory_save (domain "loop-lessons")
   - check_inbox      # (optional) if an inbox exists, leave a note pointing at the report
 ---
 
@@ -38,10 +36,6 @@ NOT edit PROTO.md or commit anything. **You never write code.**
 > lost. Make `write_file` to `docs/dev/loop-retros/<date>.md` your deliverable; your
 > reply is just a one-line pointer ("wrote docs/dev/loop-retros/<date>.md — N classes,
 > M proposed"). If you skip the `write_file`, the retro accomplished nothing.
-
-On core versions before the ADR 0125 release (including 0.230.x), use
-`memory_recall` instead of `memory_search` and `memory_ingest` instead of
-`memory_save`. Core skips unavailable tool names in the list above.
 
 ## Procedure
 
@@ -98,11 +92,10 @@ On core versions before the ADR 0125 release (including 0.230.x), use
    the loop injects relevant lessons into each coder's prompt at build time. For each
    NEW lesson (the step-4 bullets):
    - **Dedup first:** `memory_search` the lesson's key phrase. If a near-identical
-     lesson already exists, SKIP it. (On pre-ADR 0125 core this is `memory_recall` —
-     scope it to the `loop-lessons` domain, which the chunks store still has.)
+     lesson already exists, SKIP it.
    - **Write it:** `memory_save` the gotcha with `kind="fact"`,
      `subject` = the failure class, and `heading` = the failure class.
-     The memories store has no domain field (ADR 0125), so do NOT pass `domain` — `subject` is what scopes the lesson. On pre-ADR 0125 core this is `memory_ingest`: write it with `domain="loop-lessons"` and a heading instead.
+     The memories store has no domain field (ADR 0125), so do NOT pass `domain` — `subject` is what scopes the lesson.
      Keep the body self-contained (the failure + the fix + the file/command) — a coder sees only this chunk, not the whole report.
    Unlike PROTO.md (which a human applies), the KG write is safe to do unsupervised:
    it's additive, deduped, searchable, and decays via normal memory curation.

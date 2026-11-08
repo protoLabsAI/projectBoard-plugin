@@ -69,13 +69,16 @@ async def test_disabled_or_empty_query_never_reads_either_store(monkeypatch, con
     knowledge.assert_not_awaited()
 
 
-def test_retro_declares_current_and_legacy_memory_tools():
+def test_retro_declares_the_current_memory_tools_only():
+    # Core 0.231.0 (the plugin's floor) removed memory_recall/memory_ingest (ADR 0125).
     skill = (ROOT / "skills/loop-retro/SKILL.md").read_text()
     frontmatter = yaml.safe_load(skill.split("---", 2)[1])
-    assert {"memory_search", "memory_save", "memory_recall", "memory_ingest"} <= set(frontmatter["tools"])
+    assert {"memory_search", "memory_save"} <= set(frontmatter["tools"])
+    for removed in ("memory_recall", "memory_ingest", "forget_memory", "memory_stats"):
+        assert removed not in skill
     assert "memory_remember" not in skill
     assert 'kind="fact"' in skill
     assert "`subject` = the failure class" in skill
     # The new memories store has no domain field (ADR 0125): the skill must scope a
-    # saved lesson by subject, and only the legacy memory_ingest may pass a domain.
+    # saved lesson by subject.
     assert "memories store has no domain field" in skill
