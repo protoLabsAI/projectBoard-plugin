@@ -483,11 +483,11 @@ def _provider_usage(name):
     return snap if isinstance(snap, dict) else None
 
 
-def operator_actor(config):
+def operator_actor(config, tool="board_routing_set"):
     """Only host-injected RunnableConfig auth may authorize the tool; never tool args."""
     auth = (config or {}).get("configurable", {}).get("auth", {})
     if not isinstance(auth, dict) or auth.get("tier") != "operator":
-        raise PermissionError("board_routing_set requires operator-tier invocation context")
+        raise PermissionError(f"{tool} requires operator-tier invocation context")
     return str(auth.get("subject") or "operator")
 
 
