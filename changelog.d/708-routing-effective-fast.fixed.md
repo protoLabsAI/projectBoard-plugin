@@ -1,0 +1,1 @@
+- **Faster routing tabs:** Coders and Review & merge read each delegate's usage once per request, with a shared 1.5-second limit and unknown headroom for slow reads.

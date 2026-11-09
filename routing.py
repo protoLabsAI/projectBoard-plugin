@@ -6,7 +6,9 @@ import asyncio
 import copy
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
+from time import monotonic
 
 from .projects import (
     IMPLICIT_MARKER,
@@ -20,6 +22,8 @@ from .setup_check import _default_delegates, _rung_names as rung_delegates
 from .store import TIER_LADDER, escalation_enabled
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+EFFECTIVE_USAGE_BUDGET_SECONDS = 1.5
 
 
 def validate_routing(cfg, delegates=None, *, resolve=True, previous=None):
@@ -462,7 +466,31 @@ def routing_effective():
     guarded, so an older host degrades every delegate to "unknown", never an error)."""
     from .project_registry import _live_section
 
-    return effective_routes(_live_section(required=True), usage=_provider_usage)
+    cfg = _live_section(required=True)
+    snapshots = {}
+    # Collect through the pure routing path so policy accounts, legacy base coders,
+    # and pre-filter delegate rows use exactly the same names as the final render.
+    preview = effective_routes(cfg, usage=lambda name: snapshots.setdefault(name, None))
+    if snapshots:
+        deadline = monotonic() + EFFECTIVE_USAGE_BUDGET_SECONDS
+
+        def read(name):
+            if monotonic() >= deadline:
+                return None
+            snap = _provider_usage(name)
+            return snap if monotonic() <= deadline else None
+
+        pool = ThreadPoolExecutor(max_workers=min(4, len(snapshots)), thread_name_prefix="routing-usage")
+        try:
+            futures = {pool.submit(read, name): name for name in snapshots}
+            done, _ = wait(futures, timeout=max(0, deadline - monotonic()))
+            for future in done:
+                snapshots[futures[future]] = future.result()
+        finally:
+            # A context manager would wait for running host polls on exit. Cancel
+            # queued reads, but let running reads finish without holding the response.
+            pool.shutdown(wait=False, cancel_futures=True)
+    return effective_routes(cfg, usage=snapshots.get, current=preview["cursor"])
 
 
 def _provider_usage(name):
