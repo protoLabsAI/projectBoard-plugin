@@ -2159,8 +2159,11 @@ async def open_pr(
 
     ``labels`` go on a NEW PR at create (``--label``), each first created in the repo if
     missing (``gh label create --force``, best-effort). Labels never cost the PR: if GitHub
-    refuses one, the PR is created without them. An existing PR keeps the labels it has —
-    the loop's own PR got them when it was first opened."""
+    refuses one, the PR is created without them. A PR that already exists is labelled too
+    (``gh pr edit --add-label``, best-effort) on its FIRST adoption only (``promote_draft``
+    or ``draft``): a draft the coder opened itself is the card's PR, and without this it
+    went unlabelled for good (pr-reviewer#318). A re-dispatch of a card that already owns
+    its PR passes neither, so an operator who removed the label keeps it removed."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
@@ -2248,6 +2251,13 @@ async def open_pr(
         vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
             url = vout.strip()
+            if wanted and (draft or promote_draft):
+                for label in wanted:
+                    lrc, _lo, lerr = await _gh("pr", "edit", url, "--add-label", label, cwd=worktree)
+                    if lrc != 0:
+                        log.warning(
+                            "[project_board] could not label the adopted PR %s %s: %s", url, label, lerr.strip()[:200]
+                        )
             if draft:
                 # The PR already exists, so `--draft` never applied: convert it, best-effort.
                 # The caller reads isDraft back rather than trusting this (#427).

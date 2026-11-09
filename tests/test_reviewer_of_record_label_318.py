@@ -89,3 +89,73 @@ async def test_no_labels_makes_no_label_calls(shell):
     await worktree.open_pr("/wt", "feat/x", title="t", body="b")
     assert not [c for c in shell.calls if c[0] == "label"]
     assert "--label" not in [c for c in shell.calls if c[:2] == ("pr", "create")][0]
+
+
+class _ExistingShell(_Shell):
+    """`gh pr create` reports the PR already exists (a coder-opened draft)."""
+
+    async def gh(self, *args, cwd="."):
+        self.calls.append(args)
+        if args[:2] == ("pr", "create"):
+            return 1, "", 'a pull request for branch "feat/x" into branch "main" already exists'
+        if args[:2] == ("pr", "view"):
+            return 0, "https://github.com/o/r/pull/9\n", ""
+        return 0, "", ""
+
+
+@pytest.fixture
+def existing(monkeypatch):
+    sh = _ExistingShell()
+
+    async def _commit(wt, title):
+        return None
+
+    async def _promote(url, branch, *, cwd, adopted=True):
+        return True
+
+    monkeypatch.setattr(worktree, "commit_worktree", _commit)
+    monkeypatch.setattr(worktree, "_promote_adopted_draft", _promote)
+    monkeypatch.setattr(worktree, "_gh", sh.gh)
+    monkeypatch.setattr(worktree, "_git", sh.git)
+    return sh
+
+
+async def test_an_adopted_existing_pr_gets_the_label_on_first_adoption(existing):
+    url = await worktree.open_pr("/wt", "feat/x", title="t", body="b", labels=(ROR,))
+    assert url == "https://github.com/o/r/pull/9"
+    edits = [c for c in existing.calls if c[:2] == ("pr", "edit")]
+    assert edits == [("pr", "edit", url, "--add-label", ROR)]
+
+
+async def test_a_draft_salvage_of_an_existing_pr_is_labelled_too(existing):
+    await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, draft=True, labels=(ROR,))
+    assert [c for c in existing.calls if c[:2] == ("pr", "edit")]
+
+
+async def test_a_redispatch_never_relabels_the_cards_own_pr(existing):
+    """An operator who removed the label to ask for the panel's own review keeps it removed."""
+    await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, labels=(ROR,))
+    assert not [c for c in existing.calls if c[:2] == ("pr", "edit")]
+
+
+async def test_reconcile_publishes_a_stranded_tree_with_the_label(monkeypatch):
+    seen = []
+
+    async def fake_open_pr(wt, branch, **kwargs):
+        seen.append(kwargs)
+        return "https://github.com/o/r/pull/9"
+
+    monkeypatch.setattr(worktree, "open_pr", fake_open_pr)
+    for cfg, labelled in (({"review_gate": True}, True), ({}, False)):
+        seen.clear()
+        loop = BoardLoop(cfg)
+
+        async def no_ref(f, wt, body):
+            return body, False
+
+        monkeypatch.setattr(loop, "_with_source_issue_ref", no_ref)
+        monkeypatch.setattr(loop, "_base_branch_for", lambda f: "main")
+        await loop._open_tree_pr({"id": "bd-x", "title": "t"}, "/wt", "feat/bd-x")
+        assert ("labels" in seen[0]) is labelled
+        if labelled:
+            assert seen[0]["labels"] == (ROR,)
