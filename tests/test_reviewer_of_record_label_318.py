@@ -128,8 +128,8 @@ async def test_an_adopted_existing_pr_gets_the_label_on_first_adoption(existing)
 
 
 async def test_a_draft_salvage_of_an_existing_pr_is_labelled_too(existing):
-    await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, draft=True, labels=(ROR,))
-    assert [c for c in existing.calls if c[:2] == ("pr", "edit")]
+    url = await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, draft=True, labels=(ROR,))
+    assert [c for c in existing.calls if c[:2] == ("pr", "edit")] == [("pr", "edit", url, "--add-label", ROR)]
 
 
 async def test_a_redispatch_never_relabels_the_cards_own_pr(existing):
@@ -159,3 +159,13 @@ async def test_reconcile_publishes_a_stranded_tree_with_the_label(monkeypatch):
         assert ("labels" in seen[0]) is labelled
         if labelled:
             assert seen[0]["labels"] == (ROR,)
+        # A card that already owns its PR: neither a republish nor a red-gate salvage labels.
+        for gate_out in (None, "red gate"):
+            seen.clear()
+            await loop._open_tree_pr(
+                {"id": "bd-x", "title": "t", "pr_url": "https://github.com/o/r/pull/9"},
+                "/wt",
+                "feat/bd-x",
+                gate_out=gate_out,
+            )
+            assert "labels" not in seen[0]

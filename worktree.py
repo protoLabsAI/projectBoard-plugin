@@ -2162,8 +2162,9 @@ async def open_pr(
     refuses one, the PR is created without them. A PR that already exists is labelled too
     (``gh pr edit --add-label``, best-effort) on its FIRST adoption only (``promote_draft``
     or ``draft``): a draft the coder opened itself is the card's PR, and without this it
-    went unlabelled for good (pr-reviewer#318). A re-dispatch of a card that already owns
-    its PR passes neither, so an operator who removed the label keeps it removed."""
+    went unlabelled for good (pr-reviewer#318). Callers pass ``labels`` only for a card
+    that has no PR yet: a re-dispatch or a salvage of a card that already owns its PR
+    passes none, so an operator who removed the label keeps it removed."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the

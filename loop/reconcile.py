@@ -347,8 +347,12 @@ class ReconcileMixin:
             body=body,
             promote_draft=not f.get("pr_url") and not as_draft,
             **as_draft,
-            # pr-reviewer#318: a tree published here is the card's PR like any other.
-            **({"labels": (self.reviewer_of_record_label,)} if self._labels_as_record() else {}),
+            # pr-reviewer#318: a tree published here is the card's PR like any other. Only on
+            # the card's FIRST PR: a salvage of a card that already owns one (draft, red gate)
+            # must not re-add a label the operator removed.
+            **(
+                {"labels": (self.reviewer_of_record_label,)} if self._labels_as_record() and not f.get("pr_url") else {}
+            ),
         )
 
     async def salvage(self, fid: str, *, force: bool = False, tree: str = "") -> dict:
