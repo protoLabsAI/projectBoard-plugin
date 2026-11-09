@@ -37,16 +37,17 @@ def host(monkeypatch):
 def test_allowlist_metadata_and_masking(host):
     live, _, _ = host
     manifest = yaml.safe_load(Path(settings.__file__).with_name("protoagent.plugin.yaml").read_text())
-    # `loop_enabled` (#611), the Coders tab's nine (S3, #613) and the Review & merge tab's fifteen
-    # (S4, #614) OUTLIVE their manifest settings entries: they were dropped from the generic schema
-    # UI, but settings_api keeps them in the allowlist by hand so PUT /settings + pending_restart
-    # still cover them. Every OTHER key is still derived 1:1 from the manifest.
+    # `loop_enabled` (#611), the Coders tab's nine (S3, #613) and the Review & merge tab's sixteen
+    # (S4, #614 + draft_until_review #708) OUTLIVE their manifest settings entries: they were
+    # dropped from the generic schema UI, but settings_api keeps them in the allowlist by hand so
+    # PUT /settings + pending_restart still cover them. Every OTHER key is still derived 1:1 from
+    # the manifest.
     hand_added = {"loop_enabled"} | set(settings._PAGE_OWNED)
     assert set(settings.SETTINGS) == {entry["key"] for entry in manifest["settings"]} | hand_added
     for entry in manifest["settings"]:
         for field in ("label", "type", "minimum", "maximum", "options"):
             assert settings.SETTINGS[entry["key"]][field] == entry.get(field)
-    assert len(settings.SETTINGS) == 30  # 5 manifest settings + loop_enabled + the 24 page-owned.
+    assert len(settings.SETTINGS) == 31  # 5 manifest settings + loop_enabled + the 25 page-owned.
     live["webhook_secret"] = "never-echo-this"
     settings.capture_boot_settings(live)
     live["npm_token"] = "nor-this"
@@ -71,6 +72,7 @@ def test_allowlist_metadata_and_masking(host):
         {"max_concurrent": 0},
         {"max_concurrent": 65},
         {"auto_merge": 1},
+        {"draft_until_review": 1},
         {"coder": None},
         {"webhook_secret": {}},
         {"merge_method": "bad"},
@@ -105,6 +107,26 @@ async def test_saved_pending_revert_and_reboot(host, caplog):
     assert [p["key"] for p in result["pending_restart"]] == ["npm_token"]
     settings.capture_boot_settings(live)  # New router/process boots with the saved config.
     assert settings.settings_snapshot()["pending_restart"] == []
+
+
+async def test_draft_until_review_is_snapshotted_and_takes_a_bool(host):
+    live, _, _ = host
+    # GET /settings carries draft_until_review with its live value and a restart flag that matches
+    # the loop: core reads it once at construction and reload never re-applies it (not a LIVE_KNOB),
+    # so a saved change needs a restart — exactly what `restart = key not in LIVE_KNOBS` reports.
+    entry = settings.settings_snapshot()["settings"]["draft_until_review"]
+    assert entry["type"] == "bool"
+    assert entry["value"] == live["draft_until_review"] is True
+    assert "draft_until_review" not in LIVE_KNOBS
+    assert entry["restart"] is True
+    # A bool write validates and persists.
+    result = await settings.apply_setting_updates({"draft_until_review": False}, "alice")
+    assert result["ok"] and result["saved"] == ["draft_until_review"]
+    assert live["draft_until_review"] is False
+    assert "draft_until_review" in result["restart_required"]
+    # A non-bool is refused and nothing is saved.
+    bad = await settings.apply_setting_updates({"draft_until_review": 1}, "alice")
+    assert not bad["ok"] and bad["saved"] == [] and bad["reason"]
 
 
 async def test_every_live_knob_never_pending(host):
