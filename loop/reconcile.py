@@ -3552,9 +3552,16 @@ class ReconcileMixin:
                 # phrase "needs human review" stays so the block still classes as a
                 # review-gate block (#512); "rounds conflict — needs a design call" tells the
                 # human it's the patch-by-patch loop itself, not one stubborn finding.
+                # Name the LIVE findings, as the surviving branch above does. Without this the
+                # reason said only "new findings each round", so a human had to open the PR and
+                # diff the rounds by hand to learn which finding still stands — and earlier
+                # rounds are usually already FIXED at this head, so the common waste is
+                # re-litigating a closed one.
+                live = "; ".join(f"{f.file}:{f.line} {f.claim}" for f in blocking)
                 block_reason = (
                     f"new findings each round after {n} fix attempt(s) (rounds conflict) — "
-                    f"needs a design call; needs human review: {pr_url}"
+                    f"needs a design call; live now ({len(blocking)}): {live}; "
+                    f"needs human review: {pr_url}"
                 )
                 description = (
                     f"Review gate: new findings each round after {n} fix attempt(s) "
@@ -3562,7 +3569,9 @@ class ReconcileMixin:
                 )
                 comment = (
                     f"{rendered}\n\nEach review round raised a different finding after {n} fix attempt(s) "
-                    f"(rounds conflict) — needs a design call; needs human review: {pr_url}"
+                    f"(rounds conflict) — needs a design call. The findings above are the ones LIVE at "
+                    f"this head; earlier rounds are not repeated and are usually already fixed.\n"
+                    f"Live now: {live}\n\nneeds human review: {pr_url}"
                 )
             await asyncio.to_thread(store.set_review_substate, fid, None, note=rendered)
             # Blocked for a human, changes-requested dropped: clear the head stamp too so

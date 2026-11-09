@@ -132,6 +132,34 @@ async def test_disjoint_findings_each_round_says_rounds_conflict(monkeypatch):
     assert any("rounds conflict" in c and "needs a design call" in c for c in _COMMENTS)
 
 
+async def test_rounds_conflict_names_the_findings_live_at_this_head(monkeypatch):
+    """The rounds-conflict reason must say WHICH findings still stand, as the persist wording
+    already does. Without it the reason said only "new findings each round", so a human had to
+    open the PR and diff the rounds by hand — and since the earlier rounds are usually already
+    fixed at this head, the common waste was re-litigating a closed finding."""
+    _inject_fake_findings(monkeypatch)
+    loop = _seq_loop(
+        monkeypatch,
+        [
+            json.dumps([_finding("unlocked write races the reader", file="a.py", line=10)]),
+            json.dumps([_finding("the new lock deadlocks on reentry", file="b.py", line=22)]),
+        ],
+    )
+    store = _GateStore()
+
+    reason = await _block(loop, store)
+
+    # the LIVE one is named, with its location
+    assert "b.py:22" in reason
+    assert "the new lock deadlocks on reentry" in reason
+    assert "live now (1)" in reason
+    # the already-addressed earlier round is NOT presented as outstanding
+    assert "unlocked write races the reader" not in reason
+    # and the classification wording is unchanged, so #512's markers still read it
+    assert "rounds conflict" in reason and "needs a design call" in reason
+    assert any("live now" in c.lower() and "b.py:22" in c for c in _COMMENTS)
+
+
 async def test_both_wordings_still_class_as_a_review_gate_block(monkeypatch):
     """r3: whichever wording the gate writes, ``_is_review_gate_block`` still reads True, so
     the operator-unblock class is unchanged — and neither a transient CI block nor the
