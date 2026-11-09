@@ -130,6 +130,10 @@ const STEPS = [
       { kind: "stepper", key: "review_fix_max", dep: true,
         label: "Attempts to fix review findings",
         help: "Let the coder fix review findings this many times before blocking the card for your attention." },
+      { kind: "bool", key: "draft_until_review", dep: true,
+        label: "Open pull requests as drafts until review passes",
+        help: "Open each card's first pull request as a draft and mark it ready only once the review passes, so changes the review is about to send back are not read first.",
+        offNote: "This only applies when review is required." },
       { kind: "picker", key: "reviewer", source: "delegate", dep: false,
         label: "Agent for pull request reviews",
         choose: "Choose an agent…", typeOption: "Type an agent name…", placeholder: "agent name",
@@ -232,6 +236,9 @@ function boolSub(sub, off){
     + '<span class="pl-switch__track"><span class="pl-switch__thumb"></span></span>'
     + '<span class="pl-switch__label">' + esc(sub.label) + '</span></label>'
     + '<p class="rv-knob-help">' + esc(sub.help) + '</p>'
+    // While the step is off a dependent switch is greyed and disabled; its one-line offNote says
+    // when it would apply, so the disabled control doesn't read as simply broken.
+    + (off && sub.offNote ? '<p class="rv-knob-help">' + esc(sub.offNote) + '</p>' : '')
     + inlineMsg(SETTINGS_MSG[sub.key]) + '</div>';
 }
 function methodSelect(sub, off){

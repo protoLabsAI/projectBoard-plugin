@@ -121,6 +121,16 @@ _PAGE_OWNED = {
         "maximum": None,
         "options": None,
     },
+    # Restart knob, NOT a LIVE_KNOB: the loop reads `draft_until_review` once at construction
+    # (loop/core.py) and `reload` never re-applies it, so a saved change needs a restart — and
+    # `restart = key not in LIVE_KNOBS` reports exactly that, matching `review_gate` next to it.
+    "draft_until_review": {
+        "label": "Open pull requests as drafts until review passes",
+        "type": "bool",
+        "minimum": None,
+        "maximum": None,
+        "options": None,
+    },
     "review_workflow": {
         "label": "Workflow for required reviews",
         "type": "string",

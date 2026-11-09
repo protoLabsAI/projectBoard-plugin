@@ -23,7 +23,7 @@ VIEW = Path(__file__).resolve().parent.parent / "view"
 SETTINGS_API = "/api/plugins/project_board/settings"
 ROUTING_API = "/api/plugins/project_board/routing/effective"
 
-# The fifteen scalar knobs the Review & merge tab now owns, by raw key — used for the "no raw key
+# The sixteen scalar knobs the Review & merge tab now owns, by raw key — used for the "no raw key
 # as visible copy" sweep, never shown to an operator.
 PAGE_OWNED = (
     "review_gate",
@@ -31,6 +31,7 @@ PAGE_OWNED = (
     "reviewer",
     "review_dispatch",
     "review_fix_max",
+    "draft_until_review",
     "ci_poll",
     "ci_rerun_max",
     "ci_fix_max",
@@ -123,9 +124,10 @@ def test_boot_is_initpluginview_only_with_no_settimeout_fallback():
     assert "Reading review & merge settings…" in REVIEW_PAGE
 
 
-def test_all_fifteen_page_owned_keys_are_wired_into_the_page():
-    # Every key the tab took over from the Review schema list is handled by the page (as a step
-    # switch, stepper, picker or radio) — none silently stopped being configurable in the move.
+def test_all_sixteen_page_owned_keys_are_wired_into_the_page():
+    # Every key the tab took over from the Review schema list (plus draft_until_review, #708) is
+    # handled by the page (as a step switch, stepper, picker or radio) — none silently stopped
+    # being configurable in the move.
     for key in PAGE_OWNED:
         assert key in REVIEW_PAGE, key
 
@@ -208,6 +210,7 @@ const META = {
   reviewer: {type: 'string', restart: true, value: 'codex', label: 'Agent for pull request reviews'},
   review_dispatch: {type: 'bool', restart: true, value: false, label: 'Request an extra review on opening'},
   review_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 2, label: 'Attempts to fix review findings'},
+  draft_until_review: {type: 'bool', restart: true, value: true, label: 'Open pull requests as drafts until review passes'},
   ci_poll: {type: 'bool', restart: true, value: true, label: 'Send failed checks back to the coder'},
   ci_rerun_max: {type: 'number', minimum: 0, maximum: 5, restart: true, value: 1, label: 'Rerun failed checks before changing code'},
   ci_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 2, label: 'Attempts to fix failed checks'},
@@ -282,10 +285,17 @@ for (const key of PAGE_OWNED) assert.ok(!text.includes(key), 'raw key leaked as 
 // A dependent attempt is live while its step is on, greyed+disabled once the step goes off.
 assert.ok(markup.includes('rv-knob" data-knob="review_fix_max"'), 'review_fix_max live while Review on');
 assert.ok(!markup.includes('rv-knob--off" data-knob="review_fix_max"'), 'not greyed while on');
+// The draft-until-review switch is a dependent bool: live while Review is on, with no off-note yet.
+assert.ok(markup.includes('data-bool="draft_until_review" checked>'), 'draft switch reflects its value while Review on');
+assert.ok(!markup.includes('This only applies when review is required'), 'no off-note while Review on');
 listeners.change({target: el(['[data-step-switch]'], {dataset: {stepSwitch: 'review_gate'}, checked: false})});
 await flush();
 assert.ok(markup.includes('rv-knob--off" data-knob="review_fix_max"'), 'review_fix_max greyed when Review off');
 assert.ok(markup.includes('data-step="review_fix_max" data-dir="-1" disabled'), 'its stepper is disabled when greyed');
+// With Review off the draft switch is greyed and disabled, and its one-line off-note appears.
+assert.ok(markup.includes('rv-knob--off" data-knob="draft_until_review"'), 'draft switch greyed when Review off');
+assert.ok(markup.includes('data-bool="draft_until_review" checked disabled'), 'draft switch disabled when Review off');
+assert.ok(markup.includes('This only applies when review is required'), 'off-note shown when Review off');
 assert.ok(markup.includes('rv-knob" data-knob="reviewer"'), 'the non-dependent reviewer stays live');
 
 // Verification runs with auto-rebase even when auto-merge is off (the defaults).
@@ -353,6 +363,7 @@ const META = {
   reviewer: {type: 'string', restart: true, value: ''},
   review_dispatch: {type: 'bool', restart: true, value: false},
   review_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 2},
+  draft_until_review: {type: 'bool', restart: true, value: true},
   ci_poll: {type: 'bool', restart: true, value: true},
   ci_rerun_max: {type: 'number', minimum: 0, maximum: 5, restart: true, value: 1},
   ci_fix_max: {type: 'number', minimum: 0, maximum: 20, restart: true, value: 2},
