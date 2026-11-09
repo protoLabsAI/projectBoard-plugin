@@ -7,6 +7,9 @@ Y" reason, which must match what the loop's own prefer_live_sibling / prefer_hea
 return for the same inputs."""
 
 import copy
+import time
+from collections import Counter
+from threading import Lock
 
 import pytest
 from fastapi import FastAPI, Request
@@ -184,6 +187,62 @@ def _app(section, *, provider_usage=None, monkeypatch):
 
     app.include_router(api.build_data_router({}), prefix="/api/plugins/project_board")
     return app
+
+
+async def test_endpoint_reads_each_usage_once_per_request(monkeypatch):
+    calls = Counter()
+    lock = Lock()
+    section = {
+        "coder": "base",
+        "coders": LADDER,
+        "routing": {
+            "exclusive": ["codex"],
+            "usage_policy": [{"account": "account", "keep_under": 80, "prefer": "codex"}],
+        },
+        "projects": {
+            **{f"app{i}": {"repo": f"/app{i}"} for i in range(12)},
+            "custom": {"repo": "/custom", "coders": {"standard": ["custom"]}},
+        },
+    }
+    snap = {"usable": True, "headroom_pct": 70}
+
+    def usage(delegate):
+        with lock:
+            calls[delegate] += 1
+        return snap
+
+    app = _app(section, provider_usage=usage, monkeypatch=monkeypatch)
+    expected = routing.effective_routes(section, usage=lambda name: snap)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        client.headers["authorization"] = "Bearer operator"
+        for request_count in (1, 2):
+            response = await client.get("/api/plugins/project_board/routing/effective")
+            assert response.status_code == 200
+            assert response.json() == expected
+            assert calls == Counter(dict.fromkeys(("sonnet", "codex", "base", "account", "custom"), request_count))
+
+
+async def test_endpoint_usage_reads_share_one_deadline(monkeypatch):
+    budget = 0.08
+    monkeypatch.setattr(routing, "EFFECTIVE_USAGE_BUDGET_SECONDS", budget)
+    # More slow reads than pool workers also exercises cancellation of queued work.
+    names = ["fast", *(f"slow{i}" for i in range(8))]
+
+    def usage(delegate):
+        if delegate != "fast":
+            time.sleep(0.6)
+        return {"usable": True, "headroom_pct": 70}
+
+    app = _app({"coders": {"standard": names}}, provider_usage=usage, monkeypatch=monkeypatch)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        client.headers["authorization"] = "Bearer operator"
+        start = time.monotonic()
+        response = await client.get("/api/plugins/project_board/routing/effective")
+        elapsed = time.monotonic() - start
+    assert response.status_code == 200
+    assert elapsed < budget + 0.2
+    rows = {row["name"]: row["headroom"] for row in _project(response.json())["delegates"]}
+    assert rows == {name: 70 if name == "fast" else "unknown" for name in names}
 
 
 async def test_endpoint_returns_effective_routes_and_is_gated(monkeypatch):
