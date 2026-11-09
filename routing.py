@@ -483,12 +483,26 @@ def _provider_usage(name):
     return snap if isinstance(snap, dict) else None
 
 
-def operator_actor(config, tool="board_routing_set"):
-    """Only host-injected RunnableConfig auth may authorize the tool; never tool args."""
-    auth = (config or {}).get("configurable", {}).get("auth", {})
-    if not isinstance(auth, dict) or auth.get("tier") != "operator":
-        raise PermissionError(f"{tool} requires operator-tier invocation context")
-    return str(auth.get("subject") or "operator")
+def operator_actor(config, tool="board_routing_set", state=None):
+    """The audit actor for an operator-only tool, or ``PermissionError``.
+
+    Authority comes only from what the host injects, never from a tool argument:
+
+    * ``config["configurable"]["auth"]["tier"] == "operator"`` — a caller that injects
+      RunnableConfig auth (REST and other direct callers); the actor is its ``subject``.
+    * the injected graph state's ``operator_chat_turn is True`` with no
+      ``subagent_fence`` — how protoAgent marks a chat turn the authenticated operator
+      sent interactively (``server/turn_control.py``; core's ``record_directive`` uses
+      the same check). Core does not put ``configurable.auth`` on a chat turn's tool
+      config, so without this an operator's own chat request was always refused.
+    """
+    configurable = (config or {}).get("configurable") if isinstance(config, dict) else None
+    auth = configurable.get("auth") if isinstance(configurable, dict) else None
+    if isinstance(auth, dict) and auth.get("tier") == "operator":
+        return str(auth.get("subject") or "operator")
+    if isinstance(state, dict) and state.get("operator_chat_turn") is True and not state.get("subagent_fence"):
+        return "operator"
+    raise PermissionError(f"{tool} requires operator-tier invocation context")
 
 
 async def routing_set(*, actor, coders=None, exclusive=None, project=None):

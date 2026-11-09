@@ -800,11 +800,18 @@ a `project_board` mapping is a no-op, while an explicitly empty mapping clears b
 Writes use the host config-save/reload path and append caller, UTC time, and old/new
 routing to `routing-audit.jsonl` in the board data directory, plus a log entry.
 
-HTTP writes inherit the operator bearer gate used by the project routes. There was
-no operator-only tool guard to reuse: the setter requires the host to inject
-`RunnableConfig.configurable.auth = {"tier": "operator", "subject": "<caller>"}`.
-This context is not a tool argument. Missing or non-operator context is refused;
-hosts without this context integration must use the gated HTTP route.
+HTTP writes inherit the operator bearer gate used by the project routes. The
+`board_routing_set` and `board_concurrency_set` tools accept either of two
+host-injected signals, and never a tool argument:
+
+- the graph state's `operator_chat_turn` is `true` and it has no `subagent_fence`.
+  protoAgent sets this on a chat turn that the authenticated operator sent
+  interactively. The tool reads it through `InjectedState`, the same check core's
+  `record_directive` makes. The audit records the actor as `operator`.
+- `RunnableConfig.configurable.auth = {"tier": "operator", "subject": "<caller>"}`,
+  for hosts and callers that inject it. The audit records the `subject`.
+
+Anything else is refused, including subagent, scheduled, A2A and background turns.
 
 ### Headroom-aware sibling preference
 

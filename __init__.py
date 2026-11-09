@@ -26,8 +26,17 @@ import logging
 import re
 import subprocess
 
+from typing import Annotated, Any
+
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
+
+try:  # The host (protoAgent) always ships langgraph; ToolNode injects state for this marker.
+    from langgraph.prebuilt import InjectedState
+except ImportError:  # pragma: no cover — host-free install without langgraph
+    # Still keeps `state` out of the model-visible schema; with nothing injecting it the
+    # state arrives as None, so the operator-only tools fail closed.
+    from langchain_core.tools import InjectedToolArg as InjectedState
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1317,8 +1326,9 @@ def _board_tools(cfg: dict, registry=None):
         coders: dict | None = None,
         exclusive: list[str] | None = None,
         project: str | None = None,
+        state: Annotated[Any, InjectedState] = None,
     ) -> str:
-        """Persist and apply routing live. Requires host-injected operator-tier context.
+        """Persist and apply routing live. Works only on the operator's own chat turn (or host operator auth).
 
         Omit project for board defaults; coders replaces the ladder, and an empty
         exclusive list disables strict routing. Existing drives retain their route.
@@ -1326,7 +1336,7 @@ def _board_tools(cfg: dict, registry=None):
         from .routing import operator_actor, routing_set
 
         try:
-            actor = operator_actor(config)
+            actor = operator_actor(config, state=state)
             return json.dumps(await routing_set(actor=actor, coders=coders, exclusive=exclusive, project=project))
         except (PermissionError, ValueError) as exc:
             return f"Error: {exc}"
@@ -1343,9 +1353,14 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
-    async def board_concurrency_set(config: RunnableConfig, max_concurrent: int, reason: str) -> str:
+    async def board_concurrency_set(
+        config: RunnableConfig,
+        max_concurrent: int,
+        reason: str,
+        state: Annotated[Any, InjectedState] = None,
+    ) -> str:
         """Change how many cards the board builds at once (`max_concurrent`, 1 to 8). Persists
-        like Settings ▸ Project Board and applies live. Requires host-injected operator-tier context.
+        like Settings ▸ Project Board and applies live. Works only on the operator's own chat turn (or host operator auth).
 
         ONLY call this when the operator explicitly asks you to change the coder count. Never
         change it on your own judgement: not for load, not to finish faster, not to drain a
@@ -1357,7 +1372,7 @@ def _board_tools(cfg: dict, registry=None):
         from .settings_api import concurrency_set
 
         try:
-            actor = operator_actor(config, "board_concurrency_set")
+            actor = operator_actor(config, "board_concurrency_set", state=state)
             return json.dumps(await concurrency_set(actor=actor, max_concurrent=max_concurrent, reason=reason))
         except (PermissionError, ValueError) as exc:
             return f"Error: {exc}"

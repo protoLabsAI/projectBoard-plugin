@@ -3,6 +3,8 @@
 # no runtime pip deps (its only externals are the `br`, `git`, and `gh` CLIs).
 fastapi>=0.110
 langchain-core>=0.2
+# langgraph: the host provides it at runtime; tests run real ToolNode InjectedState injection.
+langgraph>=1.0
 pyyaml>=6
 httpx>=0.27
 pytest>=8
