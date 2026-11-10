@@ -850,8 +850,11 @@ async def test_interrupted_text_merge_without_snapshot_requires_another_edit(his
     git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
 
 
-@pytest.mark.parametrize("local_work", ["none", "edit", "commit"])
-async def test_published_recovery_remote_rewind_does_not_restore_removed_commits(history, monkeypatch, local_work):
+@pytest.mark.parametrize("local_work", ["none", "edit", "staged", "commit"])
+@pytest.mark.parametrize("rewound", [False, True])
+async def test_published_recovery_remote_rewind_does_not_restore_removed_commits(
+    history, monkeypatch, local_work, rewound
+):
     from pathlib import Path
     from unittest.mock import AsyncMock
 
@@ -872,18 +875,50 @@ async def test_published_recovery_remote_rewind_does_not_restore_removed_commits
         await worktree.open_pr(path, branch, title=title)
     assert (await worktree.recovery_context(path, branch))["published_head_sha"] == published
     remote = git(repo, "remote", "get-url", "origin")
-    git(remote, "update-ref", f"refs/heads/{branch}", original)
+    if rewound:
+        git(remote, "update-ref", f"refs/heads/{branch}", original)
     if local_work != "none":
         (Path(path) / "unique").write_text("unpublished local work\n")
+        if local_work == "staged":
+            git(path, "add", "unique")
         if local_work == "commit":
             await worktree.commit_worktree(path, "unique local work")
-        assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) == (path, branch)
+        if not rewound:
+            assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) == (path, branch)
+            await worktree.prepare_integration(path, branch, "main")
+            await worktree.finish_integration(path, branch, "main")
+            with pytest.raises(RuntimeError, match="GitHub unavailable"):
+                await worktree.open_pr(path, branch, title=title)
+            assert git(remote, "rev-parse", f"refs/heads/{branch}") == git(path, "rev-parse", "HEAD")
+            assert (Path(path) / "unique").read_text() == "unpublished local work\n"
+            return
+        local_head = git(path, "rev-parse", "HEAD")
+        local_status = git(path, "status", "--porcelain")
+        # Restart discovery and direct reuse must both refuse the stale ancestry.
+        # Repeated attempts preserve the sole copy of local work, including its index.
+        for _ in range(2):
+            with pytest.raises(worktree.IntegrationRequired, match="history was rewritten"):
+                await worktree.pending_integration(str(repo), ".worktrees", fid, title)
+            with pytest.raises(worktree.IntegrationRequired, match="history was rewritten"):
+                await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+            with pytest.raises(worktree.IntegrationRequired, match="history was rewritten"):
+                await worktree.prepare_integration(path, branch, "main")
+            assert git(path, "rev-parse", "HEAD") == local_head
+            assert git(path, "status", "--porcelain") == local_status
+        # Publication can race a remote rewind after verification, or bypass discovery.
+        # Being a descendant of the rewound remote is insufficient authorization.
+        with pytest.raises(worktree.IntegrationRequired, match="history was rewritten"):
+            await worktree.open_pr(path, branch, title=title)
+        assert git(remote, "rev-parse", f"refs/heads/{branch}") == original
+        assert (Path(path) / "unique").read_text() == "unpublished local work\n"
+        assert git(path, "merge-base", "--is-ancestor", local_head, "HEAD") == ""
+        assert (await worktree.recovery_context(path, branch))["published_head_sha"] == published
         return
     # No in-memory state survives: journal alone must distinguish publication.
     assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) is None
     path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
-    assert git(path, "rev-parse", "HEAD") == original
-    assert not (Path(path) / "resolution").exists()
+    assert git(path, "rev-parse", "HEAD") == (original if rewound else published)
+    assert (Path(path) / "resolution").exists() is not rewound
 
 
 @pytest.mark.parametrize("resolution", ["delete", "replace"])

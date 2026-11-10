@@ -2202,15 +2202,44 @@ async def _fetch_feature(path: str, branch: str) -> bool:
     return True
 
 
+async def _guard_published_rewind(path: str, context: dict, remote_head: str) -> None:
+    """Do not republish removed ancestry merely because new local work exists.
+
+    Keep the checkout intact: choosing how to replay work after an external history
+    rewrite is separate from merging a newer base. This also guards callers that
+    already hold a worktree and therefore bypass pending_integration.
+    """
+    published = context.get("published_head_sha")
+    if not published or not remote_head:
+        return
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", published, remote_head)
+    if rc == 0:
+        return
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify previously published recovery ancestry")
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", published, "HEAD")
+    if rc == 0:
+        raise IntegrationRequired(
+            f"PR history was rewritten after publication ({published} -> {remote_head}); "
+            f"local work preserved in {path}. Reconcile local work onto the current PR head "
+            "without restoring removed commits before retrying"
+        )
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify local recovery ancestry")
+
+
 async def _unpublished_recovery(path: str, branch: str) -> bool:
     context = await recovery_context(path, branch)
     if not context:
         return False
     present = await _fetch_feature(path, branch)
     # Publication is durable evidence even if the remote later rewinds or deletes
-    # the branch. Only subsequent local commits/edits still need recovery.
+    # the branch. Subsequent local commits/edits must not resurrect removed history.
     if context.get("published_head_sha") == await _git_required(path, "rev-parse", "HEAD"):
-        return bool(await _git_required(path, "status", "--porcelain"))
+        if not await _git_required(path, "status", "--porcelain"):
+            return False
+    if present:
+        await _guard_published_rewind(path, context, await _git_required(path, "rev-parse", f"origin/{branch}"))
     if not present:
         return True  # Preserve the only remaining copy of recovery work.
     rc, _, _ = await _git(path, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
@@ -2261,6 +2290,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
     if await _fetch_feature(path, branch):
         remote_head = await _git_required(path, "rev-parse", f"origin/{branch}")
     previous = await recovery_context(path, branch)
+    await _guard_published_rewind(path, previous, remote_head)
     head_sha = await _git_required(path, "rev-parse", "HEAD")
     if await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"):
         raise IntegrationRequired("Interrupted rebase preserved; board integration requires completion before dispatch")
@@ -2528,6 +2558,7 @@ async def open_pr(
         remote_head = ""
         if await _fetch_feature(worktree, branch):
             remote_head = await _git_required(worktree, "rev-parse", f"origin/{branch}")
+            await _guard_published_rewind(worktree, await recovery_context(worktree, branch), remote_head)
             rc, _, _ = await _git(worktree, "merge-base", "--is-ancestor", remote_head, "HEAD")
             if rc:
                 raise IntegrationRequired(
