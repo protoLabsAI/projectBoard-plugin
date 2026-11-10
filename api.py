@@ -1445,7 +1445,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         task = (
             f"# {f.get('title', '')}\n\n"
             f"## Task\n{f.get('spec', '')}\n\n"
-            f"## Files to create / modify\n"
+            f"## Files to start from (not a fence)\n"
             + ("\n".join(f"- {p}" for p in (f.get("files_to_modify") or [])) or "(none listed)")
             + f"\n\n## Acceptance criteria (definition of done)\n{f.get('acceptance_criteria', '')}\n"
         )

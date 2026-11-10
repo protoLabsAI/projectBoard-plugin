@@ -36,6 +36,40 @@ and the rules you must follow; this file says how the pieces fit.
 
 ## Writing a card
 
+### What a coder can build from (measured on the live board, 10-21..11-10)
+
+The Ready gate checks a card's shape; these rules decide whether it gets built in one pass.
+They come from 210 verified cards: 92% verified on the first attempt, but 36% bounced in
+review, and cross-file plus removed-behavior findings made up 45% of review findings.
+
+- **Acceptance criteria are observable behavior, and nothing else.** Each one says what the
+  system does in a situation a test can set up. Process and operator rules ("≤2 test
+  workers", "one suite at a time", "no release authorization", "add a changelog") are not
+  criteria: the coder can't show them and the requirements ledger can't close them. Put
+  standing rules in the project's `repo_conventions` (every coder gets them) or leave them
+  out.
+- **No stop clauses.** Don't write "if X can't be done, stop and request spec repair".
+  Coders took that exit and none of the stops held up: a sibling built the same spec every
+  time (bd-nfd6g.16, bd-bqyfs, bd-buhc.1/.2). The coder already knows the one sanctioned
+  exit: a `BLOCKED-ON-SPEC: <what's missing> — <what I checked>` line. The loop passes that
+  to the next attempt to check, and blocks the card for you only if every attempt agrees.
+  If you know of a real unknown, name it in `design` as a question the coder should answer
+  before it builds.
+- **`files_to_modify` is where the change starts, not a fence.** List the files the change
+  is expected to land in. When the behavior depends on shared state (a store, cache, hook,
+  query key, selector or config another module owns), name that module in `design` under
+  "Shared state to check". Don't count it against the breadth cap, and don't forbid editing
+  it. The coder prompt and the review panel both treat the list as a starting point.
+- **Don't fence callers off.** "No new prop requiring unlisted App.tsx edits"-style limits
+  forced coders into workarounds that review then rejected. If an interface must not change,
+  say which one and why; otherwise let the coder change what the behavior needs.
+- **Split at four authored files.** Cards with 4+ listed files bounced in review 42% of the
+  time, against 24% for 3 or fewer. If a feature needs four files, look for the seam that
+  splits it into two cards chained by `depends_on`.
+- **One behavior per card.** A card whose criteria pull in different directions (wire the
+  navigation AND fix reconnect AND keep scroll state) multiplies review rounds. Each finding
+  on one behavior re-opens the others.
+
 ### The Ready gate
 
 `board_mark_ready` (and the `ready_check` dry run that `board_create_feature`,
