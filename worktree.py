@@ -1070,7 +1070,7 @@ async def create_worktree(
     if (
         resume
         and os.path.exists(os.path.join(path, ".git"))
-        and (await _operation_present(path, "MERGE_HEAD") or await recovery_context(path, branch))
+        and (await _operation_present(path, "MERGE_HEAD") or await _unpublished_recovery(path, branch))
     ):
         # A recovery may hold an unfinished merge OR an unpublished resolution commit.
         # Keep both across a restart; neither can be reconstructed from the remote head.
@@ -1107,11 +1107,12 @@ async def create_worktree(
         # Best-effort: fetch the feature branch and start from it when it exists, so the
         # coder opens its own prior work instead of a clean base.
         if integrate:
-            await _git_required(repo, "fetch", "origin", branch)
+            exists = await _fetch_feature(repo, branch)
         else:
             await _git(repo, "fetch", "origin", branch)
-        rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
-        if rc == 0:
+            rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
+            exists = rc == 0
+        if exists:
             start = f"origin/{branch}"
             log.info("[project_board] %s resuming existing branch %s for a fix round", fid, branch)
         else:
@@ -2190,6 +2191,28 @@ async def _operation_present(path: str, name: str) -> bool:
     return bool(filename) and os.path.exists(os.path.join(path, filename))
 
 
+async def _fetch_feature(path: str, branch: str) -> bool:
+    """Distinguish a deleted branch from an unavailable remote, without stale refs."""
+    rc, out, err = await _git(path, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}")
+    if rc == 2:
+        return False
+    if rc:
+        raise IntegrationRequired(f"git fetch failed: {(err or out).strip()[:300]}")
+    await _git_required(path, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    return True
+
+
+async def _unpublished_recovery(path: str, branch: str) -> bool:
+    if not await recovery_context(path, branch):
+        return False
+    if not await _fetch_feature(path, branch):
+        return True  # Preserve the only remaining copy of recovery work.
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
+    # A journal is evidence, not ownership of the checkout forever. Once its
+    # commits are on the remote, a clean checkout must resume the latest PR head.
+    return bool(rc or await _git_required(path, "status", "--porcelain"))
+
+
 async def pending_integration(repo: str, root: str, fid: str, title: str) -> tuple[str, str] | None:
     path = os.path.abspath(os.path.join(repo, root, worktree_dir(fid, title)))
     if not os.path.exists(os.path.join(path, ".git")):
@@ -2199,7 +2222,7 @@ async def pending_integration(repo: str, root: str, fid: str, title: str) -> tup
     ):
         return path, branch_name(fid, title)
     branch = branch_name(fid, title)
-    if await _operation_present(path, "MERGE_HEAD") or await recovery_context(path, branch):
+    if await _operation_present(path, "MERGE_HEAD") or await _unpublished_recovery(path, branch):
         if await _git_required(path, "branch", "--show-current") == branch:
             return path, branch
     return None
@@ -2286,7 +2309,9 @@ async def _check_unmerged_edits(path: str) -> None:
         if attributes.split("\0")[2] not in ("unspecified", "set", "text"):
             text_merge = False  # Binary attributes and custom drivers may leave no markers.
         for mode, sha in stages.values():
-            if mode not in ("100644", "100755"):
+            if mode == "120000":
+                text_merge = False
+            elif mode not in ("100644", "100755"):
                 raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
             blob = await _git_required(path, "cat-file", "blob", sha)
             if "\0" in blob[:8000]:
@@ -2296,12 +2321,21 @@ async def _check_unmerged_edits(path: str) -> None:
         filename = os.path.join(path, name)
         if not os.path.lexists(filename):
             continue  # Explicit deletion of the file Git left for resolution.
-        if os.path.islink(filename) or not os.path.isfile(filename):
-            raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
-        current = await _git_required(path, "hash-object", "--", name)
-        # Binary conflicts leave ours; modify/delete leaves the surviving side.
+        # Binary/symlink conflicts leave ours; modify/delete leaves the survivor.
         original = stages.get("2", stages.get("3"))
-        if original and current == original[1]:
+        if os.path.islink(filename):
+            unchanged = False
+            if original and original[0] == "120000":
+                rc, target, err = await _git(path, "cat-file", "blob", original[1])
+                if rc:
+                    raise WorktreeError(f"Cannot read conflicted symlink: {err}")
+                unchanged = os.readlink(filename) == target
+        elif os.path.isfile(filename):
+            current = await _git_required(path, "hash-object", "--", name)
+            unchanged = original and original[0] != "120000" and current == original[1]
+        else:
+            raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+        if unchanged:
             raise IntegrationRequired(f"Unresolved markerless conflict requires an explicit resolution: {name}")
 
 
@@ -2400,7 +2434,19 @@ async def open_pr(
     #    plain push would be rejected (non-fast-forward) and the re-dispatch would
     #    never land. The branch is the loop's own throwaway; lease-guarded force is
     #    safe (and a no-op on the first push when the branch is new).
-    rc, _o, err = await _git(worktree, "push", "-u", "--force-with-lease", "origin", branch, timeout=180)
+    lease = "--force-with-lease"
+    if await recovery_context(worktree, branch):
+        remote_head = ""
+        if await _fetch_feature(worktree, branch):
+            remote_head = await _git_required(worktree, "rev-parse", f"origin/{branch}")
+            rc, _, _ = await _git(worktree, "merge-base", "--is-ancestor", remote_head, "HEAD")
+            if rc:
+                raise IntegrationRequired(
+                    "PR head advanced during recovery; preserve and integrate its commits before publishing"
+                )
+        # Pin the checked head so another fetch cannot silently widen the lease.
+        lease = f"--force-with-lease=refs/heads/{branch}:{remote_head}"
+    rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
     if rc != 0:
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
 

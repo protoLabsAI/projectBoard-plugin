@@ -379,3 +379,115 @@ async def test_resolved_merge_allows_whitespace_in_resolution_and_sibling(histor
     assert (repo / "a").read_text() == "feature coverage  \nsibling a coverage\n\n"
     assert (repo / "sibling-test").read_text() == "sibling coverage  \n\n"
     assert not git(repo, "ls-files", "--unmerged")
+
+
+@pytest.mark.parametrize("resolution", ["delete", "regular", "symlink"])
+async def test_symlink_conflict_requires_and_accepts_explicit_edit(history, resolution):
+    repo = history
+    git(repo, "checkout", "main")
+    link = repo / "link"
+    link.symlink_to("initial-target")
+    git(repo, "add", "link")
+    git(repo, "commit", "-m", "shared symlink")
+    git(repo, "checkout", "feature")
+    git(repo, "merge", "main", "-m", "shared base")
+    link.unlink()
+    link.symlink_to("feature-target")
+    git(repo, "commit", "-am", "feature target")
+    git(repo, "checkout", "main")
+    link.unlink()
+    link.symlink_to("sibling-target")
+    git(repo, "commit", "-am", "sibling target")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "feature")
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    head = git(repo, "rev-parse", "HEAD")
+    unmerged = git(repo, "ls-files", "--unmerged")
+    with pytest.raises(worktree.IntegrationRequired, match="markerless"):
+        await worktree.commit_worktree(str(repo), "untouched")
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "ls-files", "--unmerged") == unmerged
+    link.unlink()
+    if resolution == "regular":
+        # Same bytes, different type: still an explicit resolution.
+        link.write_text("feature-target")
+    elif resolution == "symlink":
+        link.symlink_to("resolved-target")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    assert not git(repo, "ls-files", "--unmerged")
+    git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
+    if resolution == "regular":
+        assert not link.is_symlink() and link.read_text() == "feature-target"
+    elif resolution == "symlink":
+        assert str(link.readlink()) == "resolved-target"
+    else:
+        assert not link.is_symlink() and not link.exists()
+
+
+async def test_published_recovery_resumes_new_remote_commits(history, monkeypatch):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    repo = history
+    fid, title = "bd-published", "Published recovery"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    (Path(path) / "resolution").write_text("unique resolution\n")
+    await worktree.finish_integration(path, branch, "main")
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title)
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(return_value=(0, "https://example/pr/1", "")))
+    await worktree.open_pr(path, branch, title=title)
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) is None
+    git(repo, "checkout", "-b", "remote-editor", f"origin/{branch}")
+    (repo / "new-test").write_text("new remote coverage\n")
+    git(repo, "add", "new-test")
+    git(repo, "commit", "-m", "new PR commit")
+    latest = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", f"HEAD:{branch}")
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) is None
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    assert git(path, "rev-parse", "HEAD") == latest
+    assert (Path(path) / "resolution").read_text() == "unique resolution\n"
+    assert (Path(path) / "new-test").read_text() == "new remote coverage\n"
+
+
+@pytest.mark.parametrize("remote_available", [True, False])
+async def test_deleted_feature_falls_back_but_failed_fetch_blocks(history, remote_available):
+    repo = history
+    fid, title = "bd-deleted", "Deleted branch"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "push", "origin", f"HEAD:{branch}")
+    # Delete directly in the bare remote, leaving a stale tracking ref locally.
+    remote = git(repo, "remote", "get-url", "origin")
+    git(remote, "update-ref", "-d", f"refs/heads/{branch}")
+    assert git(repo, "rev-parse", f"origin/{branch}")
+    if not remote_available:
+        git(repo, "remote", "set-url", "origin", str(repo / "unavailable"))
+        with pytest.raises(worktree.IntegrationRequired, match="fetch failed"):
+            await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+        return
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    assert git(path, "rev-parse", "HEAD") == git(repo, "rev-parse", "origin/main")
+    assert (await worktree.recovery_context(path, branch))["conflict_paths"] == []
+
+
+async def test_remote_advance_cannot_be_overwritten_by_unpublished_recovery(history):
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    (repo / "resolution").write_text("unpublished work\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    local = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-b", "remote-editor", "origin/feature")
+    (repo / "new-test").write_text("new remote coverage\n")
+    git(repo, "add", "new-test")
+    git(repo, "commit", "-m", "new PR commit")
+    latest = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", "HEAD:feature")
+    git(repo, "checkout", "feature")
+    with pytest.raises(worktree.IntegrationRequired, match="PR head advanced"):
+        await worktree.open_pr(str(repo), "feature", title="recovery")
+    assert git(repo, "rev-parse", "HEAD") == local
+    assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] == latest
