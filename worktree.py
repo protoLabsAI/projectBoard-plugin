@@ -2213,6 +2213,19 @@ async def _unpublished_recovery(path: str, branch: str) -> bool:
     return bool(rc or await _git_required(path, "status", "--porcelain"))
 
 
+async def recovery_round_start(path: str, branch: str) -> str:
+    """The PR head a resumed recovery round starts on (#476's ``round_start``).
+
+    A recovery checkout outlives its PR branch on purpose: ``_unpublished_recovery`` keeps
+    it when the remote branch was deleted, because it is then the only copy of the work. So
+    a deleted branch answers ``""`` (no no-change judgement) and the round continues; the
+    lease in ``open_pr`` expects the branch absent and recreates it. Only an UNREACHABLE
+    remote raises ``IntegrationRequired``: that is transient, and pushing blind is unsafe."""
+    if not await _fetch_feature(path, branch):
+        return ""
+    return await _git_required(path, "rev-parse", f"origin/{branch}")
+
+
 async def pending_integration(repo: str, root: str, fid: str, title: str) -> tuple[str, str] | None:
     path = os.path.abspath(os.path.join(repo, root, worktree_dir(fid, title)))
     if not os.path.exists(os.path.join(path, ".git")):

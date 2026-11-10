@@ -491,3 +491,69 @@ async def test_remote_advance_cannot_be_overwritten_by_unpublished_recovery(hist
         await worktree.open_pr(str(repo), "feature", title="recovery")
     assert git(repo, "rev-parse", "HEAD") == local
     assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] == latest
+
+
+@pytest.mark.parametrize("state", ["present", "deleted", "unreachable"])
+async def test_recovery_round_start_survives_a_deleted_branch(history, state):
+    repo = history
+    head = git(repo, "rev-parse", "origin/feature")
+    if state == "deleted":
+        git(git(repo, "remote", "get-url", "origin"), "update-ref", "-d", "refs/heads/feature")
+    if state == "unreachable":
+        git(repo, "remote", "set-url", "origin", str(repo / "unavailable"))
+        with pytest.raises(worktree.IntegrationRequired, match="fetch failed"):
+            await worktree.recovery_round_start(str(repo), "feature")
+        return
+    expected = head if state == "present" else ""
+    assert await worktree.recovery_round_start(str(repo), "feature") == expected
+
+
+async def test_deleted_pr_branch_recovers_preserved_work_instead_of_blocking(history, monkeypatch):
+    """PR #720 review: a recovery worktree whose remote PR branch was deleted must not
+    block every later dispatch; its preserved work continues and is published again."""
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    feature = {**FEATURE, "pr_url": "https://example/pr/9"}
+    fid, title = feature["id"], feature["title"]
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    sibling(repo, "a")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    # The coder resolved the conflict and kept unique work, but it was never published.
+    (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
+    (Path(path) / "unique").write_text("only copy\n")
+    await worktree.finish_integration(path, branch, "main")
+    git(git(repo, "remote", "get-url", "origin"), "update-ref", "-d", f"refs/heads/{branch}")
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title)
+    opened = AsyncMock(return_value=feature["pr_url"])
+    prompts = []
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+
+    async def dispatch(coder, wt, prompt, **kwargs):
+        prompts.append(prompt)
+        assert wt == path  # the preserved checkout, not a fresh tree off main
+        (Path(wt) / "more").write_text("follow-up\n")
+        return "## Summary\nContinued recovery"
+
+    loop, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        gate=AsyncMock(return_value=None),
+        cfg={"coder": "proto", "local_gate_cmd": "check"},
+    )
+    assert len(prompts) == 1
+    assert "flag_blocked" not in store.names()
+    opened.assert_awaited_once()
+    assert (Path(opened.call_args.args[0]) / "unique").read_text() == "only copy\n"

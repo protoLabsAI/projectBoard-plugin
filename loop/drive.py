@@ -2240,9 +2240,11 @@ class DriveMixin:
                         if pending:
                             wt, branch = pending
                             keep_wt = True
-                            round_start = await worktree.origin_head_sha(wt, branch)
-                            if not round_start:
-                                raise worktree.IntegrationRequired("Cannot fetch the PR head for recovery")
+                            # A deleted PR branch leaves this checkout as the only copy of
+                            # the recovery work: continue it (publishing recreates the branch)
+                            # instead of blocking every later dispatch. An unreachable remote
+                            # still raises IntegrationRequired.
+                            round_start = await worktree.recovery_round_start(wt, branch)
                     reusing = keep_wt and wt is not None
                     if not reusing:
                         round_start = ""  # a fresh tree: only a resumed checkout records one
