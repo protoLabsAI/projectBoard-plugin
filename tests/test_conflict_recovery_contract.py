@@ -301,13 +301,81 @@ async def test_failed_publication_fetch_never_pushes(history, monkeypatch):
     assert (repo / "a").read_text() == "feature coverage\nsibling a coverage\n"
 
 
-async def test_staged_markers_cannot_finish_interrupted_merge(history):
+@pytest.mark.parametrize("staged", [False, True])
+async def test_markers_cannot_finish_interrupted_merge(history, staged):
     repo = history
     sibling(repo, "a")
     await worktree.prepare_integration(str(repo), "feature", "main")
     head = git(repo, "rev-parse", "HEAD")
-    git(repo, "add", "a")
-    with pytest.raises(worktree.IntegrationRequired, match="staged merge content"):
+    with (repo / "a").open("a") as stream:
+        stream.write("whitespace error  \n")
+    if staged:
+        git(repo, "add", "a")
+    with pytest.raises(worktree.IntegrationRequired, match="merge content"):
         await worktree.commit_worktree(str(repo), "must refuse markers")
     assert git(repo, "rev-parse", "HEAD") == head
     assert (repo / ".git" / "MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("kind", ["binary", "binary-attribute", "modify-delete", "delete-modify"])
+async def test_untouched_markerless_conflict_preserves_index_and_head(history, kind):
+    repo = history
+    # Start a separate conflicting path from the shared ancestor.
+    git(repo, "checkout", "main")
+    if kind == "binary-attribute":
+        (repo / ".gitattributes").write_text("opaque binary\n")
+        git(repo, "add", ".gitattributes")
+    (repo / "opaque").write_bytes(b"initial\0bytes" if kind == "binary" else b"initial\n")
+    git(repo, "add", "opaque")
+    git(repo, "commit", "-m", "shared file")
+    git(repo, "checkout", "feature")
+    git(repo, "merge", "main", "-m", "shared base")
+    if kind == "delete-modify":
+        git(repo, "rm", "opaque")
+    else:
+        (repo / "opaque").write_bytes(b"feature\0bytes" if kind == "binary" else b"feature\n")
+    git(repo, "commit", "-am", "feature change")
+    git(repo, "checkout", "main")
+    if kind == "modify-delete":
+        git(repo, "rm", "opaque")
+    else:
+        (repo / "opaque").write_bytes(b"sibling\0bytes" if kind == "binary" else b"sibling\n")
+    git(repo, "commit", "-am", "sibling change")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "feature")
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    head = git(repo, "rev-parse", "HEAD")
+    unmerged = git(repo, "ls-files", "--unmerged")
+    contents = (repo / "opaque").read_bytes()
+    for _ in range(2):  # A retry must not silently stage the same untouched file.
+        with pytest.raises(worktree.IntegrationRequired, match="markerless conflict"):
+            await worktree.finish_integration(str(repo), "feature", "main")
+        assert git(repo, "rev-parse", "HEAD") == head
+        assert git(repo, "ls-files", "--unmerged") == unmerged
+        assert (repo / "opaque").read_bytes() == contents
+    # Edit-only resolution remains possible without changing Git metadata.
+    (repo / "opaque").write_bytes(b"feature and sibling\0bytes" if kind == "binary" else b"resolved\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
+    assert not git(repo, "ls-files", "--unmerged")
+
+
+@pytest.mark.parametrize("staged", [False, True])
+async def test_resolved_merge_allows_whitespace_in_resolution_and_sibling(history, staged):
+    repo = history
+    sibling(repo, "a")
+    git(repo, "checkout", "main")
+    (repo / "sibling-test").write_text("sibling coverage  \n\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "sibling whitespace")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "feature")
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    (repo / "a").write_text("feature coverage  \nsibling a coverage\n\n")
+    if staged:
+        git(repo, "add", "a")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
+    assert (repo / "a").read_text() == "feature coverage  \nsibling a coverage\n\n"
+    assert (repo / "sibling-test").read_text() == "sibling coverage  \n\n"
+    assert not git(repo, "ls-files", "--unmerged")

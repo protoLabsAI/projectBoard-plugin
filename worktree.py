@@ -2270,14 +2270,53 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
         raise IntegrationRequired("Unresolved index entries prevent publication")
 
 
+async def _check_unmerged_edits(path: str) -> None:
+    """Do not let add -A turn untouched markerless conflicts into resolutions."""
+    entries = await _git_required(path, "ls-files", "--unmerged", "-z")
+    conflicts: dict[str, dict[str, tuple[str, str]]] = {}
+    for entry in entries.split("\0"):
+        if not entry:
+            continue
+        info, name = entry.split("\t", 1)
+        mode, sha, stage = info.split()
+        conflicts.setdefault(name, {})[stage] = (mode, sha)
+    for name, stages in conflicts.items():
+        text_merge = set(stages) == {"1", "2", "3"}
+        attributes = await _git_required(path, "check-attr", "-z", "merge", "--", name)
+        if attributes.split("\0")[2] not in ("unspecified", "set", "text"):
+            text_merge = False  # Binary attributes and custom drivers may leave no markers.
+        for mode, sha in stages.values():
+            if mode not in ("100644", "100755"):
+                raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+            blob = await _git_required(path, "cat-file", "blob", sha)
+            if "\0" in blob[:8000]:
+                text_merge = False
+        if text_merge:
+            continue  # Git's marker check below validates ordinary text resolutions.
+        filename = os.path.join(path, name)
+        if not os.path.lexists(filename):
+            continue  # Explicit deletion of the file Git left for resolution.
+        if os.path.islink(filename) or not os.path.isfile(filename):
+            raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+        current = await _git_required(path, "hash-object", "--", name)
+        # Binary conflicts leave ours; modify/delete leaves the surviving side.
+        original = stages.get("2", stages.get("3"))
+        if original and current == original[1]:
+            raise IntegrationRequired(f"Unresolved markerless conflict requires an explicit resolution: {name}")
+
+
 async def commit_worktree(worktree: str, message: str) -> None:
     """Commit whatever the coder left uncommitted in the worktree. No-op if the
     tree is clean (the coder may have committed its own work)."""
     if await _operation_present(worktree, "rebase-merge") or await _operation_present(worktree, "rebase-apply"):
         raise IntegrationRequired("Interrupted rebase must be completed before committing or publishing")
     merging = await _operation_present(worktree, "MERGE_HEAD")
+    await _check_unmerged_edits(worktree)
+    # Disable whitespace diagnostics, retaining Git's conflict-marker detection.
+    # Whitespace in either side's changes is not an unresolved merge conflict.
+    marker_check = ("-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab", "diff")
     if merging:
-        rc, out, err = await _git(worktree, "diff", "--check")
+        rc, out, err = await _git(worktree, *marker_check, "--check")
         if rc:
             raise IntegrationRequired(f"Unresolved merge content: {(out or err).strip()[:300]}")
     _rc, out, _err = await _git(worktree, "status", "--porcelain")
@@ -2287,7 +2326,7 @@ async def commit_worktree(worktree: str, message: str) -> None:
     if rc:
         raise WorktreeError(f"staging failed: {(err or out).strip()[:200]}")
     if merging:
-        rc, out, err = await _git(worktree, "diff", "--cached", "--check")
+        rc, out, err = await _git(worktree, *marker_check, "--cached", "--check")
         if rc:
             raise IntegrationRequired(f"Unresolved staged merge content: {(out or err).strip()[:300]}")
     if await _git_required(worktree, "ls-files", "--unmerged"):
