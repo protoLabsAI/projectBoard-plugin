@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **36 of 90 keys are in this state, including `coders` and `projects`** —
+never renders it. **39 of 93 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -265,6 +265,9 @@ Generate K candidate implementations and verify each against a real test command
 | `coder_solve_fusion_max_file_chars` | `coder_seam.FUSION_MAX_FILE…` | reload **· YAML only** |
 | `coder_solve_fusion_max_total_chars` | `0` | reload |
 | `coder_solve_test_paths` | `—` | reload **· YAML only** |
+| `coder_solve_format_check_cmd` | `""` | reload **· YAML only** |
+| `coder_solve_format_fix_cmd` | `""` | reload **· YAML only** |
+| `coder_solve_format_repair_attempts` | `1` | reload **· YAML only** |
 
 **The oracle.** Each candidate is judged by `coder_solve_test_cmd`. When that is blank, it
 falls back to the project's `local_gate_cmd`. Two guards stop a slow oracle from failing
@@ -319,6 +322,35 @@ projects:
   commits, uncommitted edits, new files and deletions. A rename counts as both paths, so
   moving `src/core.py` to `docs/` still runs the `src/**` command.
 - A mapping keeps its order in YAML. A list of `[glob, command]` pairs also works.
+
+**The format stage (#719)**: repair a candidate whose only problem is formatting, instead
+of building new ones. Set both commands, per project or board-wide:
+
+```yaml
+projects:
+  protoAgent:
+    coder_solve_format_check_cmd: "ruff format --check ."
+    coder_solve_format_fix_cmd: "ruff format ."
+    coder_solve_format_repair_attempts: 1   # 0 turns the repair off; at most 3
+```
+
+- The check runs in the candidate's worktree before the oracle. If it passes, the oracle
+  runs as usual.
+- If it fails, the fix command runs in the same worktree, then the check runs again, up to
+  `coder_solve_format_repair_attempts` times. Once the check passes, the **full** oracle
+  runs, behavioral tests included. A repair is not a generation, so it never spends
+  `coder_solve_budget`. The live monitor shows the stage trail for each candidate, and the
+  solve log line counts the repairs.
+- The fix command may only change files the candidate already changed. If it touches any
+  other file, if it fails, or if the check still fails after the last attempt, the
+  candidate's files are put back exactly as the coder wrote them and the candidate fails.
+  Its verdict says the behavioral tests did not run.
+- A check or fix command the shell can't find stops the search like a missing oracle: the
+  candidate is kept and no other generation is spent.
+- Either command blank (the default) means no stage. A project that sets either command
+  owns both, so one repo's check never runs with another repo's formatter.
+- The oracle's own text is never parsed to find a format step. If your oracle also runs a
+  format check, it simply passes after the repair.
 
 ## Review and merge
 

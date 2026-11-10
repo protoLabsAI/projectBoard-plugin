@@ -2354,6 +2354,10 @@ class DriveMixin:
                                 # Each ladder candidate installs its own deps too (`setup_cmd`).
                                 setup_cmd=self._setup_cmd_for(feature),
                                 setup_timeout=self.setup_timeout,
+                                # #719: the explicit format stage + bounded in-place repair.
+                                format_check_cmd=solve["format_check_cmd"],
+                                format_fix_cmd=solve["format_fix_cmd"],
+                                format_repair_attempts=solve["format_repair_attempts"],
                                 tier=tier,  # #84: label each solve gen with the current tier
                                 # #91: persist the verified candidate on the bead at the
                                 # verify boundary, so a crash before open_pr is salvageable.

@@ -1922,8 +1922,12 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         max_concurrent_sessions=0,
         setup_cmd="",
         setup_timeout=600.0,
+        format_check_cmd="",
+        format_fix_cmd="",
+        format_repair_attempts=1,
     ):
         seen["fid"] = fid
+        seen["format_stage"] = (format_check_cmd, format_fix_cmd, format_repair_attempts)
         seen["test_paths"] = test_paths  # #459: no coder_solve_test_paths configured → []
         seen["setup_cmd"] = setup_cmd
         seen["test_cmd"] = test_cmd
@@ -1952,6 +1956,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     )
     assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
     assert seen["setup_cmd"] == "npm ci"  # every ladder candidate installs its own deps
+    assert seen["format_stage"] == ("", "", 1)  # #719: no format stage unless configured
     assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
     assert seen["commit_message"] == "feat: Add a thing"  # the verified commit keeps the PR title
     assert seen["title"] == "Add a thing"  # #227: the RAW title is threaded for the canonical slug
