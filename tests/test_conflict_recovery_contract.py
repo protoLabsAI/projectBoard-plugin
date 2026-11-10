@@ -317,6 +317,51 @@ async def test_markers_cannot_finish_interrupted_merge(history, staged):
     assert (repo / ".git" / "MERGE_HEAD").exists()
 
 
+@pytest.mark.parametrize("resolved", [(), ("ours",), ("theirs",), ("ours", "theirs")])
+@pytest.mark.parametrize("recreate_source", [False, True])
+async def test_rename_rename_requires_destination_edits_only(history, resolved, recreate_source):
+    repo = history
+    git(repo, "checkout", "main")
+    (repo / "original").write_text("shared coverage\n")
+    git(repo, "add", "original")
+    git(repo, "commit", "-m", "shared rename source")
+    git(repo, "checkout", "feature")
+    git(repo, "merge", "main", "-m", "shared base")
+    git(repo, "mv", "original", "ours")
+    git(repo, "commit", "-m", "feature rename")
+    git(repo, "checkout", "main")
+    git(repo, "mv", "original", "theirs")
+    git(repo, "commit", "-m", "sibling rename")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "feature")
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    head = git(repo, "rev-parse", "HEAD")
+    unmerged = git(repo, "ls-files", "--unmerged")
+    stages = {}
+    for entry in unmerged.splitlines():
+        info, name = entry.split("\t")
+        stages.setdefault(name, set()).add(info.split()[2])
+    assert stages == {"original": {"1"}, "ours": {"2"}, "theirs": {"3"}}
+    assert not (repo / "original").exists()
+    if recreate_source:
+        (repo / "original").write_text("recreated coverage\n")
+    for name in resolved:
+        (repo / name).write_text(f"shared coverage\nresolved {name} coverage\n")
+    if len(resolved) < 2:
+        with pytest.raises(worktree.IntegrationRequired, match="explicit resolution: (ours|theirs)"):
+            await worktree.commit_worktree(str(repo), "untouched rename destination")
+        assert git(repo, "rev-parse", "HEAD") == head
+        assert git(repo, "ls-files", "--unmerged") == unmerged
+        return
+    await worktree.commit_worktree(str(repo), "resolve rename destinations")
+    assert not git(repo, "ls-files", "--unmerged")
+    assert git(repo, "rev-parse", "HEAD^1") == head
+    assert git(repo, "rev-parse", "HEAD^2") == context["integration_sha"]
+    assert (repo / "original").exists() == recreate_source
+    for name in resolved:
+        assert (repo / name).read_text() == f"shared coverage\nresolved {name} coverage\n"
+
+
 @pytest.mark.parametrize("kind", ["binary", "binary-attribute", "modify-delete", "delete-modify"])
 async def test_untouched_markerless_conflict_preserves_index_and_head(history, kind):
     repo = history

@@ -2423,11 +2423,11 @@ async def _snapshot_conflict_output(path: str) -> dict:
 
 
 async def _check_unmerged_edits(path: str) -> None:
-    """Require every unmerged path to differ from its merge-time snapshot.
+    """Require unmerged paths with side content to differ from their snapshot.
 
     An interrupted merge without a snapshot baselines at the current tree and
-    needs one more edit per conflicted path, text files included. Failing closed
-    is intentional; Git's independent marker check still validates text edits.
+    needs one more edit per path with stage 2 or 3 content, text files included.
+    Failing closed is intentional; Git's marker check still validates text edits.
     """
     entries = await _git_required(path, "ls-files", "--unmerged", "-z")
     conflicts: dict[str, dict[str, tuple[str, str]]] = {}
@@ -2442,6 +2442,10 @@ async def _check_unmerged_edits(path: str) -> None:
         for mode, _sha in stages.values():
             if mode not in ("100644", "100755", "120000", "160000"):
                 raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+        # Both sides removed a stage-1-only path (e.g. a rename/rename source).
+        # Remaining absent is resolved; recreating it is also allowed.
+        if set(stages) == {"1"}:
+            continue
         # Stage 2 is not evidence of an edit: a failed driver may change it.
         unchanged = await _conflict_output(path, name) == outputs[name]
         if unchanged:
