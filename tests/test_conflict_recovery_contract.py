@@ -474,7 +474,8 @@ async def test_deleted_feature_falls_back_but_failed_fetch_blocks(history, remot
     assert (await worktree.recovery_context(path, branch))["conflict_paths"] == []
 
 
-async def test_remote_advance_cannot_be_overwritten_by_unpublished_recovery(history):
+@pytest.mark.parametrize("conflicting", [False, True])
+async def test_remote_advance_integrates_unpublished_recovery(history, monkeypatch, conflicting):
     repo = history
     await worktree.prepare_integration(str(repo), "feature", "main")
     (repo / "resolution").write_text("unpublished work\n")
@@ -482,15 +483,32 @@ async def test_remote_advance_cannot_be_overwritten_by_unpublished_recovery(hist
     local = git(repo, "rev-parse", "HEAD")
     git(repo, "checkout", "-b", "remote-editor", "origin/feature")
     (repo / "new-test").write_text("new remote coverage\n")
+    if conflicting:
+        (repo / "resolution").write_text("remote resolution\n")
+        git(repo, "add", "resolution")
     git(repo, "add", "new-test")
     git(repo, "commit", "-m", "new PR commit")
     latest = git(repo, "rev-parse", "HEAD")
     git(repo, "push", "origin", "HEAD:feature")
     git(repo, "checkout", "feature")
-    with pytest.raises(worktree.IntegrationRequired, match="PR head advanced"):
-        await worktree.open_pr(str(repo), "feature", title="recovery")
-    assert git(repo, "rev-parse", "HEAD") == local
-    assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] == latest
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(return_value=(0, "https://example/pr/1", "")))
+    if conflicting:
+        with pytest.raises(worktree.IntegrationRequired):
+            await worktree.open_pr(str(repo), "feature", title="recovery")
+        context = await worktree.prepare_integration(str(repo), "feature", "main")
+        assert context["conflict_paths"] == ["resolution"]
+        assert context["integration_sha"] == latest
+        # A restarted board resumes the remote-head merge; the coder only edits.
+        (repo / "resolution").write_text("unpublished work\nremote resolution\n")
+    await worktree.open_pr(str(repo), "feature", title="recovery")
+    for sha in (local, latest, git(repo, "rev-parse", "origin/main")):
+        git(repo, "merge-base", "--is-ancestor", sha, "HEAD")
+    assert "unpublished work" in (repo / "resolution").read_text()
+    assert (repo / "new-test").read_text() == "new remote coverage\n"
+    assert not git(repo, "ls-files", "--unmerged")
+    assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] == git(repo, "rev-parse", "HEAD")
 
 
 @pytest.mark.parametrize("state", ["present", "deleted", "unreachable"])
@@ -557,3 +575,91 @@ async def test_deleted_pr_branch_recovers_preserved_work_instead_of_blocking(his
     assert "flag_blocked" not in store.names()
     opened.assert_awaited_once()
     assert (Path(opened.call_args.args[0]) / "unique").read_text() == "only copy\n"
+
+
+@pytest.mark.parametrize("preserved", [False, True])
+async def test_auto_unblock_deleted_pr_branch(history, monkeypatch, preserved):
+    from pathlib import Path
+    from project_board.loop import BoardLoop
+    from tests.test_loop import _BlockedStore, _blocked
+
+    repo = history
+    fid, title = "bd-deleted-block", "Deleted blocked branch"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    if preserved:
+        (Path(path) / "unique").write_text("only copy\n")
+        await worktree.finish_integration(path, branch, "main")
+    else:
+        git(repo, "worktree", "remove", path)
+    git(git(repo, "remote", "get-url", "origin"), "update-ref", "-d", f"refs/heads/{branch}")
+    row = {**_blocked(fid, "merge-conflict", title=title), "pr_url": "https://example/pr/1"}
+    blocked = _BlockedStore([row])
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+    monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+    await loop._recover_blocked(blocked)
+    assert blocked.cleared == [fid] and blocked.requeued == [fid]
+    resumed, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    if preserved:
+        assert resumed == path
+        assert (Path(resumed) / "unique").read_text() == "only copy\n"
+    else:
+        assert git(resumed, "rev-parse", "HEAD") == git(repo, "rev-parse", "origin/main")
+
+
+async def test_pending_base_conflict_then_remote_conflict(history, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    repo = history
+    pinned_base = sibling(repo, "a")
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    other = tmp_path / "remote-editor"
+    git(repo, "worktree", "add", "-b", "remote-editor", str(other), "origin/feature")
+    (other / "b").write_text("remote coverage\n")
+    git(other, "commit", "-am", "concurrent PR edit")
+    remote_head = git(other, "rev-parse", "HEAD")
+    git(other, "push", "origin", "HEAD:feature")
+    (repo / "a").write_text("feature coverage\nsibling a coverage\n")
+    (repo / "b").write_text("feature coverage\nlocal coverage\n")
+    with pytest.raises(worktree.IntegrationRequired, match="advanced"):
+        await worktree.finish_integration(str(repo), "feature", "main")
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    assert context["base_sha"] == pinned_base
+    assert context["integration_sha"] == remote_head
+    assert context["conflict_paths"] == ["b"]
+    (repo / "b").write_text("feature coverage\nlocal coverage\nremote coverage\n")
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(return_value=(0, "https://example/pr/1", "")))
+    await worktree.open_pr(str(repo), "feature", title="recovered")
+    for sha in (pinned_base, remote_head):
+        git(repo, "merge-base", "--is-ancestor", sha, "HEAD")
+    assert (repo / "a").read_text() == "feature coverage\nsibling a coverage\n"
+    assert (repo / "b").read_text() == "feature coverage\nlocal coverage\nremote coverage\n"
+    git(repo, "merge-tree", "--write-tree", "origin/main", "HEAD")
+
+
+async def test_remote_head_race_after_integration_still_blocks_publication(history, monkeypatch):
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    (repo / "local").write_text("unpublished\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    local = git(repo, "rev-parse", "HEAD")
+    finish = worktree.finish_integration
+
+    async def advance_after_finish(path, branch, base):
+        await finish(path, branch, base)
+        git(repo, "checkout", "-b", "racing-editor", "origin/feature")
+        (repo / "remote").write_text("concurrent\n")
+        git(repo, "add", "remote")
+        git(repo, "commit", "-m", "racing remote edit")
+        git(repo, "push", "origin", "HEAD:feature")
+        git(repo, "checkout", "feature")
+
+    monkeypatch.setattr(worktree, "finish_integration", advance_after_finish)
+    with pytest.raises(worktree.IntegrationRequired, match="PR head advanced"):
+        await worktree.open_pr(str(repo), "feature", title="recovery")
+    assert git(repo, "rev-parse", "HEAD") == local
+    assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] != local

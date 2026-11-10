@@ -878,8 +878,15 @@ class ReconcileMixin:
                             if await worktree.recovery_context(repo, branch):
                                 from .prompt import integration_feedback
 
+                                pending = await worktree.pending_integration(
+                                    repo, self.root, fid, fresh.get("title") or ""
+                                )
                                 context = await worktree.refresh_integration_context(
-                                    repo, branch, self._base_branch_for(fresh), root=self.root
+                                    repo,
+                                    branch,
+                                    self._base_branch_for(fresh),
+                                    root=self.root,
+                                    recovery_path=pending[0] if pending else None,
                                 )
                                 self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
                                 self._ci_prior_diff.pop(fid, None)

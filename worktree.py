@@ -2250,19 +2250,38 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
     await _git_required(path, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
     base_sha = await _git_required(path, "rev-parse", f"origin/{base}")
     fetched_base_sha = base_sha
+    remote_head = ""
+    if await _fetch_feature(path, branch):
+        remote_head = await _git_required(path, "rev-parse", f"origin/{branch}")
+    previous = await recovery_context(path, branch)
     head_sha = await _git_required(path, "rev-parse", "HEAD")
     if await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"):
         raise IntegrationRequired("Interrupted rebase preserved; board integration requires completion before dispatch")
     if await _operation_present(path, "MERGE_HEAD"):
         # Resume the exact pinned merge first; finish_integration reconciles any newer base.
-        base_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
+        integration_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
+        base_sha = previous.get("base_sha", integration_sha)
     else:
+        integration_sha = base_sha
         rc, out, err = await _git(path, "merge", "--no-commit", "--no-ff", base_sha, timeout=120)
         if rc and not await _operation_present(path, "MERGE_HEAD"):
             raise WorktreeError(f"integration failed: {(err or out).strip()[:300]}")
     paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
+    if not paths and remote_head:
+        rc, _, _ = await _git(path, "merge-base", "--is-ancestor", remote_head, "HEAD")
+        if rc:
+            # Complete a clean merge before integrating concurrent PR work.
+            # Conflicted merges stay intact for the edit-only coder.
+            await commit_worktree(path, "Complete pinned integration before updated PR head")
+            integration_sha = remote_head
+            rc, out, err = await _git(path, "merge", "--no-commit", "--no-ff", remote_head, timeout=120)
+            if rc and not await _operation_present(path, "MERGE_HEAD"):
+                raise WorktreeError(f"PR head integration failed: {(err or out).strip()[:300]}")
+            paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
     context = {
         "kind": "merge",
+        "integration_sha": integration_sha,
+        "remote_head_sha": remote_head,
         "base": base,
         "base_sha": base_sha,
         "fetched_base_sha": fetched_base_sha,
@@ -2273,14 +2292,20 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
     return context
 
 
-async def refresh_integration_context(repo: str, branch: str, base: str, *, root: str = ".worktrees") -> dict:
-    """Refresh blocked-card evidence without changing or publishing its PR branch."""
-    await _git_required(repo, "fetch", "origin", base, branch)
+async def refresh_integration_context(
+    repo: str, branch: str, base: str, *, root: str = ".worktrees", recovery_path: str | None = None
+) -> dict:
+    """Refresh evidence from preserved work, or probe the latest available remote head."""
+    if recovery_path:
+        return await prepare_integration(recovery_path, branch, base)
+    await _git_required(repo, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    present = await _fetch_feature(repo, branch)
+    start = f"origin/{branch}" if present else f"origin/{base}"
     directory = os.path.abspath(os.path.join(repo, root))
     os.makedirs(directory, exist_ok=True)
     path = tempfile.mkdtemp(prefix=".integration-", dir=directory)
     try:
-        await _git_required(repo, "worktree", "add", "--detach", path, f"origin/{branch}")
+        await _git_required(repo, "worktree", "add", "--detach", path, start)
         return await prepare_integration(path, branch, base)
     finally:
         await _git(repo, "worktree", "remove", "--force", path)
@@ -2294,12 +2319,14 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
     if not context:
         return
     await commit_worktree(path, "Integrate current base and resolve conflicts")
-    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
+    rc, _, _ = await _git(
+        path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"
+    )
     if rc:
         raise IntegrationRequired("Candidate does not integrate the pinned base")
     context = await prepare_integration(path, branch, base)
     if context["conflict_paths"]:
-        raise IntegrationRequired("Base advanced during recovery; resolve the refreshed conflict paths")
+        raise IntegrationRequired("Base or PR head advanced during recovery; resolve the refreshed conflict paths")
     await commit_worktree(path, "Integrate updated base")
     await _git_required(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
     if await _git_required(path, "ls-files", "--unmerged"):

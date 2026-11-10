@@ -397,6 +397,7 @@ def integration_prompt(context: dict) -> str:
     return (
         "\n## Current board-prepared base integration\n"
         f"Feature head: {context['head_sha']}; pinned base: {context['base_sha']}.\n"
+        f"Pinned merge target: {context.get('integration_sha', context['base_sha'])}.\n"
         f"Actual conflict paths: {', '.join(context['conflict_paths']) or 'none'}.\n"
         "This replaces earlier conflict-path reports. The board owns the merge and Git metadata. "
         "Edit files only, resolve conflict markers, and preserve both feature and sibling behavior. "
