@@ -36,7 +36,7 @@ async def test_review_workflow_receives_the_card(monkeypatch):
     assert "Wire Work source-chat actions" in card
     assert "SHALL switch to that session" in card
     assert "- apps/web/src/work/WorkView.tsx" in card
-    assert "not a fence" in card and "out-of-scope" in card
+    assert "not a fence" in card and "beyond-card" in card
     # transient per review: nothing lingers once the gate finishes
     assert loop._review_card == {}
 

@@ -16,8 +16,9 @@
     `design` class, for the project manager (`SolveRefused`); no tier climb.
   - **The review gate gives the panel the card.** Its title, task, acceptance criteria and
     starting files go to the review workflow as a `card` input (an older recipe ignores it) and
-    into the a2a reviewer prompt. A pre-existing issue outside the change, or behavior the card
-    leaves out, is reported as a minor `out-of-scope` finding, never a blocker.
+    into the a2a reviewer prompt. A finding that only asks the PR to do more than the card asks
+    for is reported as a minor `beyond-card` finding, never a blocker; a defect in changed code
+    stays in scope whatever the card says.
   - **Card-writing guidance.** `board-tool-reference` gains "What a coder can build from":
     acceptance criteria are observable behavior only, there are no stop clauses, shared state
     goes in `design`, and cards with 4+ authored files get split. `decompose-project` and

@@ -128,10 +128,10 @@ def _review_card_text(feature: dict | None) -> str:
             "shared module these depend on is in scope):\n" + "\n".join(f"- {f}" for f in files[:40])
         )
     parts.append(
-        "Use the card to judge scope and intent. A defect in code this PR changed, or one it "
-        "causes in code it doesn't touch, is in scope whatever the card says. A problem that "
-        "predates this PR in code it doesn't touch, or behavior the card explicitly leaves out, "
-        "is out of scope: report it as `minor` with category `out-of-scope`, never as a blocker."
+        "Use the card to judge intent. A defect in code this PR changed, or one it causes in "
+        "code it doesn't touch, is in scope whatever the card says. A finding that only asks the "
+        "PR to do more than the card asks for (a feature, behavior or case the card leaves out) "
+        "is `minor` with category `beyond-card`, never a blocker."
     )
     return "\n\n".join(parts)
 
