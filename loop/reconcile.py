@@ -872,6 +872,17 @@ class ReconcileMixin:
                             reset = _recorded_reset(str(fresh.get("blocked_reason", reason) or ""))
                             if reset is not None and time.time() < reset:
                                 continue  # Quota is still down; spend no retry before its reset.
+                        if cls == "merge-conflict" and fresh.get("pr_url"):
+                            repo = self._repo_for(fresh)
+                            branch = worktree.branch_name(fid, fresh.get("title") or "")
+                            if await worktree.recovery_context(repo, branch):
+                                from .prompt import integration_feedback
+
+                                context = await worktree.refresh_integration_context(
+                                    repo, branch, self._base_branch_for(fresh), root=self.root
+                                )
+                                self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                                self._ci_prior_diff.pop(fid, None)
                         await self._budget_set(store, fid, "unblock-retry", spent + 1)
                         await asyncio.to_thread(store.clear_blocked, fid)
                         await asyncio.to_thread(store.requeue, fid)
@@ -1878,6 +1889,12 @@ class ReconcileMixin:
             )
             return False  # transient — don't burn the coder budget on an infra blip
         # outcome == "conflict": a real merge conflict only the coder can resolve.
+        self._ci_prior_diff.pop(fid, None)
+        self._ci_feedback[fid] = (
+            f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
+            f"file(s): {detail}. The board will prepare integration with `{base}` — edit files to resolve the "
+            "conflict, keeping BOTH sides' intent. Then stop."
+        )
         n = await self._budget_get(store, fid, "rebase", feature)
         if n >= self.rebase_fix_max:
             await asyncio.to_thread(
@@ -1890,12 +1907,6 @@ class ReconcileMixin:
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
             return True
         await self._budget_set(store, fid, "rebase", n + 1)
-        self._ci_prior_diff.pop(fid, None)
-        self._ci_feedback[fid] = (
-            f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
-            f"file(s): {detail}. Re-apply your change onto the latest `{base}` and resolve the "
-            "conflict, keeping BOTH sides' intent. Then stop."
-        )
         await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s rebase conflict — re-dispatch %d/%d to resolve (%s): %s",

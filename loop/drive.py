@@ -2234,6 +2234,15 @@ class DriveMixin:
                     #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
                     #    the existing diff with one coder, so it must NOT re-fan-out N.
                     #  • otherwise → one fresh worktree, one dispatch.
+                    pending = None
+                    if feature.get("pr_url") and wt is None:
+                        pending = await worktree.pending_integration(repo, self.root, fid, raw_title)
+                        if pending:
+                            wt, branch = pending
+                            keep_wt = True
+                            round_start = await worktree.origin_head_sha(wt, branch)
+                            if not round_start:
+                                raise worktree.IntegrationRequired("Cannot fetch the PR head for recovery")
                     reusing = keep_wt and wt is not None
                     if not reusing:
                         round_start = ""  # a fresh tree: only a resumed checkout records one
@@ -2281,6 +2290,13 @@ class DriveMixin:
                             # — misread as a pre-model infra failure — so say what happened.
                             raise worktree.WorktreeMissing(wt, "before its keep-worktree re-dispatch")
                         self._inflight[fid] = (repo, wt, branch)
+                        if feature.get("pr_url") and (pending or await worktree.recovery_context(wt, branch)):
+                            from .prompt import integration_feedback
+
+                            context = await worktree.prepare_integration(wt, branch, base)
+                            self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                            prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                            prompt += work_location_capture.reporting_instructions()
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
                         # keeps the prior history rather than blanking on a keep-worktree fix).
@@ -2301,7 +2317,9 @@ class DriveMixin:
                                 new_dispatch=True,
                             )
                         )
-                    elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
+                    elif (
+                        self._use_coder_solve(feature) and not self._ci_feedback.get(fid) and not feature.get("pr_url")
+                    ):
                         files_to_modify = feature.get("files_to_modify") or []
                         # #90: every solve() knob resolves from THIS feature's project.
                         solve = self._coder_solve_settings(feature)
@@ -2372,7 +2390,7 @@ class DriveMixin:
                             )
                         )
                         self._inflight[fid] = (repo, wt, branch)
-                    elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
+                    elif self.max_mode_n > 1 and not self._ci_feedback.get(fid) and not feature.get("pr_url"):
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch, result = await self._dispatch_captured(
                             self._dispatch_max_mode(feature, coder, prompt, repo, base, fid, tier)
@@ -2384,13 +2402,27 @@ class DriveMixin:
                         # the coder sees the change it is being asked to correct (#332 —
                         # three 30-minute rounds off a clean base, zero commits).
                         wt, branch = await worktree.create_worktree(
-                            repo, base, fid, self.root, title=raw_title, resume=bool(feature.get("pr_url"))
+                            repo,
+                            base,
+                            fid,
+                            self.root,
+                            title=raw_title,
+                            resume=bool(feature.get("pr_url")),
+                            integrate=bool(feature.get("pr_url")),
                         )
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                         # #476: the commit this fix round STARTS on — the PR head it resumed. A
                         # round that ends here changed nothing. Recorded now, never re-read from
                         # the live remote ref, which a coder's own push would move.
                         round_start = await worktree.checkout_head_sha(wt) if feature.get("pr_url") else ""
+                        if feature.get("pr_url"):
+                            from .prompt import integration_feedback
+
+                            context = await worktree.recovery_context(wt, branch)
+                            if context:
+                                self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                                prompt += work_location_capture.reporting_instructions()
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
                         result = await self._dispatch_captured(
                             coder_seam.dispatch_coder_tapped(
@@ -2431,6 +2463,8 @@ class DriveMixin:
                                 fid,
                                 exc_info=True,
                             )
+                    if feature.get("pr_url") and wt:
+                        await worktree.finish_integration(wt, branch, base)
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -2739,6 +2773,18 @@ class DriveMixin:
                             why="it finished and published, but the card had moved on",
                         )
                         return
+                except worktree.IntegrationRequired as exc:
+                    # Preserve the merge index and unique edits. Recovery is not a review/CI round.
+                    from .prompt import integration_feedback
+
+                    context = await worktree.recovery_context(wt, branch) if wt and branch else {}
+                    if context:
+                        self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                    await self._block_or_stand_aside(
+                        store, fid, str(exc), repo=repo, wt=wt, branch=branch, category="merge-conflict"
+                    )
+                    self._inflight.pop(fid, None)
+                    return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     missing_findings_note = (
                         "fix round dispatched without review findings (lost on restart?) — "

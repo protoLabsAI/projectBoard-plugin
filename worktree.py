@@ -1018,7 +1018,14 @@ async def prune_stale_worktrees(repo: str) -> str:
 
 
 async def create_worktree(
-    repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "", *, resume: bool = False
+    repo: str,
+    base: str,
+    fid: str,
+    root: str = ".worktrees",
+    title: str = "",
+    *,
+    resume: bool = False,
+    integrate: bool = False,
 ) -> tuple[str, str]:
     """``git worktree add <root>/feat-<id>[-<slug>] -b feat/<id>[-<slug>] <base>``.
 
@@ -1054,6 +1061,26 @@ async def create_worktree(
     branch = branch_name(fid, title)
     rel = os.path.join(root, worktree_dir(fid, title))
     path = os.path.join(repo, rel)
+    if (
+        resume
+        and os.path.exists(os.path.join(path, ".git"))
+        and (await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"))
+    ):
+        raise IntegrationRequired(f"Interrupted rebase preserved in {path}; complete it before recovery")
+    if (
+        resume
+        and os.path.exists(os.path.join(path, ".git"))
+        and (await _operation_present(path, "MERGE_HEAD") or await recovery_context(path, branch))
+    ):
+        # A recovery may hold an unfinished merge OR an unpublished resolution commit.
+        # Keep both across a restart; neither can be reconstructed from the remote head.
+        current = await _git_required(path, "branch", "--show-current")
+        if current != branch:
+            raise WorktreeError(f"Interrupted integration belongs to {current}, not {branch}")
+        await _git_required(path, "fetch", "origin")
+        if integrate:
+            await prepare_integration(path, branch, base)
+        return path, branch
     # Preventive: drop stale worktree admin entries before touching anything (#225).
     await prune_stale_worktrees(repo)
     # The cleanup below is `remove --force` + `branch -D`. On a tree whose coder died
@@ -1079,7 +1106,10 @@ async def create_worktree(
     if resume:
         # Best-effort: fetch the feature branch and start from it when it exists, so the
         # coder opens its own prior work instead of a clean base.
-        await _git(repo, "fetch", "origin", branch)
+        if integrate:
+            await _git_required(repo, "fetch", "origin", branch)
+        else:
+            await _git(repo, "fetch", "origin", branch)
         rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
         if rc == 0:
             start = f"origin/{branch}"
@@ -1145,6 +1175,8 @@ async def create_worktree(
     # node_modules in (best-effort, no-op for non-node repos) rather than a slow/offline
     # per-worktree install.
     await asyncio.to_thread(link_node_modules, repo, abspath)
+    if integrate:
+        await prepare_integration(abspath, branch, base)
     return abspath, branch
 
 
@@ -2115,13 +2147,151 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
+class IntegrationRequired(WorktreeError):
+    """The candidate must return to conflict resolution before any review."""
+
+
+async def _git_required(path: str, *args: str) -> str:
+    rc, out, err = await _git(path, *args, timeout=120)
+    if rc:
+        error = IntegrationRequired if args[0] == "fetch" else WorktreeError
+        raise error(f"git {args[0]} failed: {(err or out).strip()[:300]}")
+    return out.strip()
+
+
+async def _recovery_path(path: str, branch: str) -> str:
+    common = await _git_required(path, "rev-parse", "--git-common-dir")
+    directory = os.path.join(os.path.abspath(os.path.join(path, common)), "board-recovery")
+    return os.path.join(directory, branch.replace("/", "_") + ".json")
+
+
+async def recovery_context(path: str, branch: str) -> dict:
+    """Repository-owned journal survives worktree replacement and loop restart."""
+    if not os.path.exists(os.path.join(path, ".git")):
+        return {}
+    filename = await _recovery_path(path, branch)
+    if not os.path.exists(filename):
+        return {}
+    with open(filename) as stream:
+        return json.load(stream)
+
+
+async def _record_recovery(path: str, branch: str, context: dict) -> None:
+    filename = await _recovery_path(path, branch)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    temporary = filename + ".tmp"
+    with open(temporary, "w") as stream:
+        json.dump(context, stream)
+    os.replace(temporary, filename)
+
+
+async def _operation_present(path: str, name: str) -> bool:
+    filename = await _git_required(path, "rev-parse", "--git-path", name)
+    return bool(filename) and os.path.exists(os.path.join(path, filename))
+
+
+async def pending_integration(repo: str, root: str, fid: str, title: str) -> tuple[str, str] | None:
+    path = os.path.abspath(os.path.join(repo, root, worktree_dir(fid, title)))
+    if not os.path.exists(os.path.join(path, ".git")):
+        return None
+    if os.path.isdir(path) and (
+        await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply")
+    ):
+        return path, branch_name(fid, title)
+    branch = branch_name(fid, title)
+    if await _operation_present(path, "MERGE_HEAD") or await recovery_context(path, branch):
+        if await _git_required(path, "branch", "--show-current") == branch:
+            return path, branch
+    return None
+
+
+async def prepare_integration(path: str, branch: str, base: str) -> dict:
+    """Pin a fetched base and merge it with the feature; only the board writes Git.
+
+    Keep the real merge index/MERGE_HEAD while the coder edits ordinary files.
+    Never abort an interrupted operation or discard a previous resolution.
+    """
+    await _git_required(path, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    base_sha = await _git_required(path, "rev-parse", f"origin/{base}")
+    fetched_base_sha = base_sha
+    head_sha = await _git_required(path, "rev-parse", "HEAD")
+    if await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"):
+        raise IntegrationRequired("Interrupted rebase preserved; board integration requires completion before dispatch")
+    if await _operation_present(path, "MERGE_HEAD"):
+        # Resume the exact pinned merge first; finish_integration reconciles any newer base.
+        base_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
+    else:
+        rc, out, err = await _git(path, "merge", "--no-commit", "--no-ff", base_sha, timeout=120)
+        if rc and not await _operation_present(path, "MERGE_HEAD"):
+            raise WorktreeError(f"integration failed: {(err or out).strip()[:300]}")
+    paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
+    context = {
+        "kind": "merge",
+        "base": base,
+        "base_sha": base_sha,
+        "fetched_base_sha": fetched_base_sha,
+        "head_sha": head_sha,
+        "conflict_paths": paths.splitlines(),
+    }
+    await _record_recovery(path, branch, context)
+    return context
+
+
+async def refresh_integration_context(repo: str, branch: str, base: str, *, root: str = ".worktrees") -> dict:
+    """Refresh blocked-card evidence without changing or publishing its PR branch."""
+    await _git_required(repo, "fetch", "origin", base, branch)
+    directory = os.path.abspath(os.path.join(repo, root))
+    os.makedirs(directory, exist_ok=True)
+    path = tempfile.mkdtemp(prefix=".integration-", dir=directory)
+    try:
+        await _git_required(repo, "worktree", "add", "--detach", path, f"origin/{branch}")
+        return await prepare_integration(path, branch, base)
+    finally:
+        await _git(repo, "worktree", "remove", "--force", path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+
+
+async def finish_integration(path: str, branch: str, base: str) -> None:
+    """Complete the pinned merge, reconcile base movement, and prove ancestry."""
+    context = await recovery_context(path, branch)
+    if not context:
+        return
+    await commit_worktree(path, "Integrate current base and resolve conflicts")
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
+    if rc:
+        raise IntegrationRequired("Candidate does not integrate the pinned base")
+    context = await prepare_integration(path, branch, base)
+    if context["conflict_paths"]:
+        raise IntegrationRequired("Base advanced during recovery; resolve the refreshed conflict paths")
+    await commit_worktree(path, "Integrate updated base")
+    await _git_required(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
+    if await _git_required(path, "ls-files", "--unmerged"):
+        raise IntegrationRequired("Unresolved index entries prevent publication")
+
+
 async def commit_worktree(worktree: str, message: str) -> None:
     """Commit whatever the coder left uncommitted in the worktree. No-op if the
     tree is clean (the coder may have committed its own work)."""
+    if await _operation_present(worktree, "rebase-merge") or await _operation_present(worktree, "rebase-apply"):
+        raise IntegrationRequired("Interrupted rebase must be completed before committing or publishing")
+    merging = await _operation_present(worktree, "MERGE_HEAD")
+    if merging:
+        rc, out, err = await _git(worktree, "diff", "--check")
+        if rc:
+            raise IntegrationRequired(f"Unresolved merge content: {(out or err).strip()[:300]}")
     _rc, out, _err = await _git(worktree, "status", "--porcelain")
-    if not out.strip():
+    if not out.strip() and not merging:
         return
-    await stage_all(worktree)
+    rc, out, err = await stage_all(worktree)
+    if rc:
+        raise WorktreeError(f"staging failed: {(err or out).strip()[:200]}")
+    if merging:
+        rc, out, err = await _git(worktree, "diff", "--cached", "--check")
+        if rc:
+            raise IntegrationRequired(f"Unresolved staged merge content: {(out or err).strip()[:300]}")
+    if await _git_required(worktree, "ls-files", "--unmerged"):
+        raise IntegrationRequired("Unresolved index entries prevent commit")
     rc, o, e = await _git(worktree, "commit", "-m", message)
     if rc != 0 and "nothing to commit" not in (o + e).lower():
         raise WorktreeError(f"commit failed: {(e or o).strip()[:200]}")
@@ -2166,6 +2336,7 @@ async def open_pr(
     that has no PR yet: a re-dispatch or a salvage of a card that already owns its PR
     passes none, so an operator who removed the label keeps it removed."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
+    await finish_integration(worktree, branch, base)
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
     # same order ``create_worktree`` branches from and ``commits_ahead`` measures by. A bare
@@ -2518,6 +2689,11 @@ async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".w
         if rc != 0:
             _rc, files, _e = await _git(path, "diff", "--name-only", "--diff-filter=U")
             await _git(path, "rebase", "--abort")
+            try:
+                context = await prepare_integration(path, branch, base)
+            except WorktreeError as exc:
+                return ("error", str(exc))
+            files = "\n".join(context["conflict_paths"]) or files
             return ("conflict", files.strip() or (out or err).strip()[:300])
         rc, _o, err = await _git(path, "push", "--force-with-lease", "origin", f"HEAD:{branch}", timeout=180)
         if rc != 0:
