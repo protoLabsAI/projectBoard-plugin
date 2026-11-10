@@ -2246,6 +2246,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
 
     Keep the real merge index/MERGE_HEAD while the coder edits ordinary files.
     Never abort an interrupted operation or discard a previous resolution.
+    Pin the default merge driver to built-in text for paths without an attribute.
     """
     await _git_required(path, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
     base_sha = await _git_required(path, "rev-parse", f"origin/{base}")
@@ -2263,7 +2264,9 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         base_sha = previous.get("base_sha", integration_sha)
     else:
         integration_sha = base_sha
-        rc, out, err = await _git(path, "merge", "--no-commit", "--no-ff", base_sha, timeout=120)
+        rc, out, err = await _git(
+            path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
+        )
         if rc and not await _operation_present(path, "MERGE_HEAD"):
             raise WorktreeError(f"integration failed: {(err or out).strip()[:300]}")
     paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
@@ -2274,7 +2277,9 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
             # Conflicted merges stay intact for the edit-only coder.
             await commit_worktree(path, "Complete pinned integration before updated PR head")
             integration_sha = remote_head
-            rc, out, err = await _git(path, "merge", "--no-commit", "--no-ff", remote_head, timeout=120)
+            rc, out, err = await _git(
+                path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", remote_head, timeout=120
+            )
             if rc and not await _operation_present(path, "MERGE_HEAD"):
                 raise WorktreeError(f"PR head integration failed: {(err or out).strip()[:300]}")
             paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
@@ -2376,7 +2381,12 @@ async def _snapshot_conflict_output(path: str) -> dict:
 
 
 async def _check_unmerged_edits(path: str) -> None:
-    """Do not let add -A turn untouched markerless conflicts into resolutions."""
+    """Require every unmerged path to differ from its merge-time snapshot.
+
+    An interrupted merge without a snapshot baselines at the current tree and
+    needs one more edit per conflicted path, text files included. Failing closed
+    is intentional; Git's independent marker check still validates text edits.
+    """
     entries = await _git_required(path, "ls-files", "--unmerged", "-z")
     conflicts: dict[str, dict[str, tuple[str, str]]] = {}
     for entry in entries.split("\0"):
@@ -2387,20 +2397,9 @@ async def _check_unmerged_edits(path: str) -> None:
         conflicts.setdefault(name, {})[stage] = (mode, sha)
     outputs = await _snapshot_conflict_output(path) if conflicts else {}
     for name, stages in conflicts.items():
-        text_merge = set(stages) == {"1", "2", "3"}
-        attributes = await _git_required(path, "check-attr", "-z", "merge", "--", name)
-        if attributes.split("\0")[2] not in ("unspecified", "set", "text"):
-            text_merge = False  # Binary attributes and custom drivers may leave no markers.
-        for mode, sha in stages.values():
-            if mode == "120000":
-                text_merge = False
-            elif mode not in ("100644", "100755"):
+        for mode, _sha in stages.values():
+            if mode not in ("100644", "100755", "120000"):
                 raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
-            blob = await _git_required(path, "cat-file", "blob", sha)
-            if "\0" in blob[:8000]:
-                text_merge = False
-        if text_merge:
-            continue  # Git's marker check below validates ordinary text resolutions.
         # Stage 2 is not evidence of an edit: a failed driver may change it.
         unchanged = await _conflict_output(path, name) == outputs[name]
         if unchanged:

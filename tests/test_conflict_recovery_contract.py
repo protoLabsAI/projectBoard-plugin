@@ -679,13 +679,24 @@ async def test_remote_movement_after_verification_never_integrates_at_publicatio
     gh.assert_awaited_once()
 
 
-async def test_failed_custom_driver_requires_edit_across_restart(history):
+@pytest.mark.parametrize("driver_selection", ["attribute", "default"])
+async def test_failed_custom_driver_requires_edit_across_restart(history, driver_selection):
     repo = history
-    (repo / ".gitattributes").write_text("a merge=partial\n")
-    git(repo, "add", ".gitattributes")
-    git(repo, "commit", "-m", "custom driver")
+    if driver_selection == "attribute":
+        (repo / ".gitattributes").write_text("a merge=partial\n")
+        git(repo, "add", ".gitattributes")
+        git(repo, "commit", "-m", "custom driver")
+    else:
+        git(repo, "config", "merge.default", "partial")
     git(repo, "config", "merge.partial.driver", "printf 'partial output\\n' > %A; exit 1")
     sibling(repo, "a")
+    if driver_selection == "default":
+        # Resume a merge started before the board pinned the default driver.
+        assert not (repo / ".gitattributes").exists()
+        result = subprocess.run(
+            ["git", "-C", str(repo), "merge", "--no-commit", "--no-ff", "origin/main"], capture_output=True
+        )
+        assert result.returncode == 1
     context = await worktree.prepare_integration(str(repo), "feature", "main")
     assert context["conflict_paths"] == ["a"]
     assert (repo / "a").read_text() == "partial output\n"
@@ -785,3 +796,55 @@ async def test_remote_head_race_during_publication_still_blocks(history, monkeyp
         await worktree.open_pr(str(repo), "feature", title="recovery")
     assert git(repo, "rev-parse", "HEAD") == local
     assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] != local
+
+
+@pytest.mark.parametrize("moving_branch", ["main", "feature"])
+async def test_board_pins_text_driver_and_requires_resolution(history, moving_branch):
+    repo = history
+    git(repo, "config", "merge.default", "partial")
+    git(repo, "config", "merge.partial.driver", "printf 'partial output\\n' > %A; exit 1")
+    if moving_branch == "main":
+        sibling(repo, "a")
+    else:
+        git(repo, "checkout", "-b", "remote-editor", "origin/feature")
+        (repo / "a").write_text("remote coverage\n")
+        git(repo, "commit", "-am", "remote edit")
+        git(repo, "push", "origin", "HEAD:feature")
+        git(repo, "checkout", "feature")
+        (repo / "a").write_text("local coverage\n")
+        git(repo, "commit", "-am", "local edit")
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    assert context["conflict_paths"] == ["a"]
+    assert "<<<<<<<" in (repo / "a").read_text()
+    head = git(repo, "rev-parse", "HEAD")
+    index = git(repo, "ls-files", "--unmerged")
+    with pytest.raises(worktree.IntegrationRequired, match="explicit resolution"):
+        await worktree.commit_worktree(str(repo), "untouched text")
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "ls-files", "--unmerged") == index
+    # An edit alone is insufficient while text markers remain.
+    with (repo / "a").open("a") as stream:
+        stream.write("extra coverage\n")
+    with pytest.raises(worktree.IntegrationRequired, match="Unresolved merge content"):
+        await worktree.commit_worktree(str(repo), "still has markers")
+    (repo / "a").write_text("feature coverage\nsibling coverage\nremote coverage\nlocal coverage\n")
+    await worktree.commit_worktree(str(repo), "resolved text")
+    assert not git(repo, "ls-files", "--unmerged")
+    git(repo, "merge-base", "--is-ancestor", context["integration_sha"], "HEAD")
+
+
+async def test_interrupted_text_merge_without_snapshot_requires_another_edit(history):
+    repo = history
+    sibling(repo, "a")
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-commit", "--no-ff", "origin/main"], capture_output=True
+    )
+    assert result.returncode == 1
+    # Resolution predates the board's first snapshot and cannot be trusted yet.
+    (repo / "a").write_text("feature coverage\nsibling a coverage\n")
+    with pytest.raises(worktree.IntegrationRequired, match="explicit resolution"):
+        await worktree.commit_worktree(str(repo), "missing snapshot")
+    (repo / "a").write_text("feature coverage\nsibling a coverage\nextra coverage\n")
+    await worktree.commit_worktree(str(repo), "explicit resolution after snapshot")
+    assert not git(repo, "ls-files", "--unmerged")
+    git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
