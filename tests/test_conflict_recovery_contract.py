@@ -848,3 +848,77 @@ async def test_interrupted_text_merge_without_snapshot_requires_another_edit(his
     await worktree.commit_worktree(str(repo), "explicit resolution after snapshot")
     assert not git(repo, "ls-files", "--unmerged")
     git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD")
+
+
+@pytest.mark.parametrize("local_work", ["none", "edit", "commit"])
+async def test_published_recovery_remote_rewind_does_not_restore_removed_commits(history, monkeypatch, local_work):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    repo = history
+    fid, title = "bd-rewind", "Rewound recovery"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    original = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    (Path(path) / "resolution").write_text("published resolution\n")
+    await worktree.finish_integration(path, branch, "main")
+    published = git(path, "rev-parse", "HEAD")
+    # A successful push remains published even when subsequent GitHub work fails.
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(side_effect=RuntimeError("GitHub unavailable")))
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        await worktree.open_pr(path, branch, title=title)
+    assert (await worktree.recovery_context(path, branch))["published_head_sha"] == published
+    remote = git(repo, "remote", "get-url", "origin")
+    git(remote, "update-ref", f"refs/heads/{branch}", original)
+    if local_work != "none":
+        (Path(path) / "unique").write_text("unpublished local work\n")
+        if local_work == "commit":
+            await worktree.commit_worktree(path, "unique local work")
+        assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) == (path, branch)
+        return
+    # No in-memory state survives: journal alone must distinguish publication.
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) is None
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    assert git(path, "rev-parse", "HEAD") == original
+    assert not (Path(path) / "resolution").exists()
+
+
+@pytest.mark.parametrize("resolution", ["delete", "replace"])
+async def test_gitlink_conflict_accepts_explicit_edit_only_resolution(history, resolution):
+    repo = history
+    common = git(repo, "rev-parse", "main")
+    tree = git(repo, "rev-parse", "main^{tree}")
+    ours = git(repo, "commit-tree", tree, "-p", common, "-m", "submodule feature")
+    theirs = git(repo, "commit-tree", tree, "-p", common, "-m", "submodule sibling")
+    git(repo, "checkout", "main")
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{common},module")
+    git(repo, "commit", "-m", "shared submodule")
+    git(repo, "checkout", "feature")
+    git(repo, "merge", "main", "-m", "shared submodule")
+    git(repo, "update-index", "--cacheinfo", f"160000,{ours},module")
+    git(repo, "commit", "-m", "feature submodule")
+    git(repo, "push", "origin", "feature")
+    git(repo, "checkout", "main")
+    git(repo, "update-index", "--cacheinfo", f"160000,{theirs},module")
+    git(repo, "commit", "-m", "sibling submodule")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "feature")
+    (repo / "module").mkdir(exist_ok=True)
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    assert context["conflict_paths"] == ["module"]
+    with pytest.raises(worktree.IntegrationRequired, match="explicit resolution"):
+        await worktree.commit_worktree(str(repo), "untouched gitlink")
+    assert git(repo, "ls-files", "--unmerged")
+    (repo / "module").rmdir()
+    if resolution == "replace":
+        (repo / "module").write_text("replacement for submodule\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    assert not git(repo, "ls-files", "--unmerged")
+    assert git(repo, "merge-base", "--is-ancestor", context["base_sha"], "HEAD") == ""
+    if resolution == "delete":
+        assert not git(repo, "ls-files", "module")
+    else:
+        assert git(repo, "ls-files", "--stage", "module").startswith("100644")

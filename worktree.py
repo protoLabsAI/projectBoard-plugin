@@ -2203,9 +2203,15 @@ async def _fetch_feature(path: str, branch: str) -> bool:
 
 
 async def _unpublished_recovery(path: str, branch: str) -> bool:
-    if not await recovery_context(path, branch):
+    context = await recovery_context(path, branch)
+    if not context:
         return False
-    if not await _fetch_feature(path, branch):
+    present = await _fetch_feature(path, branch)
+    # Publication is durable evidence even if the remote later rewinds or deletes
+    # the branch. Only subsequent local commits/edits still need recovery.
+    if context.get("published_head_sha") == await _git_required(path, "rev-parse", "HEAD"):
+        return bool(await _git_required(path, "status", "--porcelain"))
+    if not present:
         return True  # Preserve the only remaining copy of recovery work.
     rc, _, _ = await _git(path, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
     # A journal is evidence, not ownership of the checkout forever. Once its
@@ -2293,6 +2299,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         "fetched_base_sha": fetched_base_sha,
         "head_sha": head_sha,
         "conflict_paths": paths.splitlines(),
+        "published_head_sha": previous.get("published_head_sha", ""),
     }
     await _record_recovery(path, branch, context)
     return context
@@ -2347,6 +2354,11 @@ async def _conflict_output(path: str, name: str) -> dict:
         return {"kind": "file", "sha": await _git_required(path, "hash-object", "--", name)}
     if not os.path.lexists(filename):
         return {"kind": "absent"}
+    if os.path.isdir(filename):
+        # Git leaves gitlink directories in place on conflict. Record them so
+        # an edit-only deletion or replacement can be distinguished from untouched
+        # merge output; directory contents alone do not resolve a gitlink.
+        return {"kind": "directory"}
     raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
 
 
@@ -2398,7 +2410,7 @@ async def _check_unmerged_edits(path: str) -> None:
     outputs = await _snapshot_conflict_output(path) if conflicts else {}
     for name, stages in conflicts.items():
         for mode, _sha in stages.values():
-            if mode not in ("100644", "100755", "120000"):
+            if mode not in ("100644", "100755", "120000", "160000"):
                 raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
         # Stage 2 is not evidence of an edit: a failed driver may change it.
         unchanged = await _conflict_output(path, name) == outputs[name]
@@ -2526,6 +2538,10 @@ async def open_pr(
     rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
     if rc != 0:
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
+    context = await recovery_context(worktree, branch)
+    if context:
+        context["published_head_sha"] = await _git_required(worktree, "rev-parse", "HEAD")
+        await _record_recovery(worktree, branch, context)
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
     as_draft = ("--draft",) if draft else ()
