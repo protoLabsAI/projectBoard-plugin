@@ -2278,6 +2278,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
             if rc and not await _operation_present(path, "MERGE_HEAD"):
                 raise WorktreeError(f"PR head integration failed: {(err or out).strip()[:300]}")
             paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
+    await _snapshot_conflict_output(path)
     context = {
         "kind": "merge",
         "integration_sha": integration_sha,
@@ -2333,6 +2334,47 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
         raise IntegrationRequired("Unresolved index entries prevent publication")
 
 
+async def _conflict_output(path: str, name: str) -> dict:
+    filename = os.path.join(path, name)
+    if os.path.islink(filename):
+        return {"kind": "symlink", "target": os.readlink(filename)}
+    if os.path.isfile(filename):
+        return {"kind": "file", "sha": await _git_required(path, "hash-object", "--", name)}
+    if not os.path.lexists(filename):
+        return {"kind": "absent"}
+    raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+
+
+async def _snapshot_conflict_output(path: str) -> dict:
+    """Keep initial merge output in worktree Git metadata across retries.
+
+    Failed custom drivers can leave arbitrary markerless bytes, not stage 2.
+    Scope the snapshot to the exact merge and index; never rebaseline coder edits.
+    An interrupted merge without a snapshot conservatively requires another edit.
+    """
+    entries = await _git_required(path, "ls-files", "--unmerged", "-z")
+    if not entries:
+        return {}
+    filename = await _git_required(path, "rev-parse", "--git-path", "board-conflict-output.json")
+    filename = os.path.join(path, filename)
+    identity = {
+        "head": await _git_required(path, "rev-parse", "HEAD"),
+        "merge": await _git_required(path, "rev-parse", "MERGE_HEAD"),
+        "entries": entries,
+    }
+    if os.path.exists(filename):
+        with open(filename) as stream:
+            previous = json.load(stream)
+        if previous["identity"] == identity:
+            return previous["outputs"]
+    names = {entry.split("\t", 1)[1] for entry in entries.split("\0") if entry}
+    outputs = {name: await _conflict_output(path, name) for name in names}
+    with open(filename + ".tmp", "w") as stream:
+        json.dump({"identity": identity, "outputs": outputs}, stream)
+    os.replace(filename + ".tmp", filename)
+    return outputs
+
+
 async def _check_unmerged_edits(path: str) -> None:
     """Do not let add -A turn untouched markerless conflicts into resolutions."""
     entries = await _git_required(path, "ls-files", "--unmerged", "-z")
@@ -2343,6 +2385,7 @@ async def _check_unmerged_edits(path: str) -> None:
         info, name = entry.split("\t", 1)
         mode, sha, stage = info.split()
         conflicts.setdefault(name, {})[stage] = (mode, sha)
+    outputs = await _snapshot_conflict_output(path) if conflicts else {}
     for name, stages in conflicts.items():
         text_merge = set(stages) == {"1", "2", "3"}
         attributes = await _git_required(path, "check-attr", "-z", "merge", "--", name)
@@ -2358,23 +2401,8 @@ async def _check_unmerged_edits(path: str) -> None:
                 text_merge = False
         if text_merge:
             continue  # Git's marker check below validates ordinary text resolutions.
-        filename = os.path.join(path, name)
-        if not os.path.lexists(filename):
-            continue  # Explicit deletion of the file Git left for resolution.
-        # Binary/symlink conflicts leave ours; modify/delete leaves the survivor.
-        original = stages.get("2", stages.get("3"))
-        if os.path.islink(filename):
-            unchanged = False
-            if original and original[0] == "120000":
-                rc, target, err = await _git(path, "cat-file", "blob", original[1])
-                if rc:
-                    raise WorktreeError(f"Cannot read conflicted symlink: {err}")
-                unchanged = os.readlink(filename) == target
-        elif os.path.isfile(filename):
-            current = await _git_required(path, "hash-object", "--", name)
-            unchanged = original and original[0] != "120000" and current == original[1]
-        else:
-            raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+        # Stage 2 is not evidence of an edit: a failed driver may change it.
+        unchanged = await _conflict_output(path, name) == outputs[name]
         if unchanged:
             raise IntegrationRequired(f"Unresolved markerless conflict requires an explicit resolution: {name}")
 
@@ -2449,7 +2477,17 @@ async def open_pr(
     that has no PR yet: a re-dispatch or a salvage of a card that already owns its PR
     passes none, so an operator who removed the label keeps it removed."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
-    await finish_integration(worktree, branch, base)
+    # Integration belongs before goal verification and local gates in the drive.
+    # Publication may fetch/check, but must never introduce unverified content.
+    if await recovery_context(worktree, branch):
+        await _git_required(worktree, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+        context = await recovery_context(worktree, branch)
+        for ref in (context.get("integration_sha", context["base_sha"]), f"origin/{base}"):
+            rc, _, _ = await _git(worktree, "merge-base", "--is-ancestor", ref, "HEAD")
+            if rc:
+                raise IntegrationRequired("Base advanced or integration incomplete; integrate and rerun verification")
+        if await _operation_present(worktree, "MERGE_HEAD") or await _git_required(worktree, "ls-files", "--unmerged"):
+            raise IntegrationRequired("Integration incomplete; resolve and rerun verification")
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
     # same order ``create_worktree`` branches from and ``commits_ahead`` measures by. A bare
