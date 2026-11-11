@@ -1265,6 +1265,18 @@ def _environment_marker(wt: str) -> str | None:
     return os.path.join(os.path.abspath(os.path.join(wt, target)), "board-environment-pending")
 
 
+def _stable_shared_dependencies(wt: str, rel: str) -> bool:
+    """Absolute links outside the moved tree keep working without reinstallation."""
+    path = os.path.join(wt, rel)
+    return (
+        os.path.basename(path) == "node_modules"
+        and os.path.islink(path)
+        and os.path.isabs(os.readlink(path))
+        and os.path.isdir(path)
+        and os.path.commonpath((os.path.realpath(wt), os.path.realpath(path))) != os.path.realpath(wt)
+    )
+
+
 def _installed_environments(wt: str) -> list[str]:
     found = []
     for root, dirs, files in os.walk(wt, followlinks=False):
@@ -1272,8 +1284,10 @@ def _installed_environments(wt: str) -> list[str]:
             found.append(os.path.relpath(root, wt))
             dirs[:] = []
             continue
-        if "node_modules" in dirs:
-            found.append(os.path.relpath(os.path.join(root, "node_modules"), wt))
+        if "node_modules" in dirs or "node_modules" in files:
+            rel = os.path.relpath(os.path.join(root, "node_modules"), wt)
+            if not _stable_shared_dependencies(wt, rel):
+                found.append(rel)
         dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
     return found
 
@@ -1291,6 +1305,8 @@ async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, t
     try:
         with open(marker) as stream:
             required = json.load(stream)["environments"]
+        # Also accept pending markers written before shared links were excluded.
+        required = [rel for rel in required if not _stable_shared_dependencies(wt, rel)]
         installed = await asyncio.to_thread(_installed_environments, wt)
         if (installed or required) and not (cmd or "").strip():
             raise EnvironmentPreparationError("configure the project's setup_cmd to reinstall dependencies")
@@ -1302,7 +1318,10 @@ async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, t
                 raise EnvironmentPreparationError(f"cannot quarantine {rel}: tracked files or unreadable index {err}")
             path = os.path.join(wt, rel)
             archive = tempfile.mkdtemp(prefix="board-old-environment-", dir=os.path.dirname(marker))
-            os.rename(path, os.path.join(archive, os.path.basename(path)))
+            # Git admin storage may be on a different filesystem. move preserves
+            # symlinks and falls back to copy/remove for EXDEV; this archive is
+            # never used as the active environment, which setup rebuilds below.
+            shutil.move(path, os.path.join(archive, os.path.basename(path)))
         reason = await prepare_worktree(wt, cmd, env=env, timeout=timeout)
         if reason:
             raise EnvironmentPreparationError(reason)

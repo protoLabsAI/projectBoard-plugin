@@ -1,6 +1,9 @@
 """Real moves and pip-installed entrypoints, through the configured board gate."""
 
 import asyncio
+import errno
+import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -173,3 +176,82 @@ async def test_retry_finishes_interrupted_branch_rename(candidate, monkeypatch):
     await worktree.promote_worktree(str(candidate[0]), str(wt), "candidate", "bd-env")
     assert git(wt, "branch", "--show-current") == "feat/bd-env"
     assert Path(worktree._environment_marker(str(wt))).exists()
+
+
+async def test_quarantine_across_filesystems_rebuilds_before_gate(candidate, monkeypatch):
+    (candidate[1] / ".venv/bin/check-link").symlink_to("feature-check")
+    wt, _ = await promote(candidate)
+    real_rename = os.rename
+    quarantined = []
+
+    def cross_device_rename(src, dst, *args, **kwargs):
+        if Path(dst).parent.name.startswith("board-old-environment-"):
+            quarantined.append(Path(dst))
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", cross_device_rename)
+    loop = BoardLoop({"setup_cmd": "exit 7", "local_gate_cmd": ".venv/bin/feature-check"})
+    with pytest.raises(worktree.EnvironmentPreparationError, match="setup_cmd exited 7"):
+        await loop._run_local_gate(str(wt))
+    assert quarantined
+    assert (quarantined[0] / "bin/feature-check").is_file()
+    assert (quarantined[0] / "bin/check-link").is_symlink()
+    assert (quarantined[0] / "bin/check-link").readlink() == Path("feature-check")
+    assert not (wt / ".venv").exists()
+    loop.setup_cmd = candidate[2]
+    assert await loop._run_local_gate(str(wt)) is None
+    assert subprocess.check_output([str(wt / ".venv/bin/feature-check")], text=True).strip() == "feature works"
+    assert git(wt, "rev-parse", "HEAD") == candidate[3]
+    assert (wt / "dirty.txt").read_text() == "keep this edit"
+    assert (wt / "requirements.lock").read_bytes() == (candidate[0] / "requirements.lock").read_bytes()
+
+
+@pytest.mark.parametrize("legacy_marker", [False, True])
+async def test_shared_node_modules_survive_promotion_without_setup(tmp_path, legacy_marker):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    (repo / ".gitignore").write_text("node_modules/\n.worktrees/\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    src = repo / ".worktrees/candidate"
+    git(repo, "worktree", "add", "-b", "candidate", str(src))
+    dependencies = ["node_modules", "packages/app/node_modules"]
+    for rel in dependencies:
+        package = repo / rel
+        package.mkdir(parents=True)
+        (package / "gate.sh").write_text("echo shared-dependencies-work\n")
+    assert worktree.link_node_modules(str(repo), str(src)) == 2
+    wt, branch = await worktree.promote_worktree(str(repo), str(src), "candidate", "bd-node")
+    marker = Path(worktree._environment_marker(wt))
+    if legacy_marker:
+        marker.write_text(json.dumps({"environments": dependencies}))
+    loop = BoardLoop({"local_gate_cmd": "sh node_modules/gate.sh && sh packages/app/node_modules/gate.sh"})
+    assert await loop._run_local_gate(wt) is None
+    assert not marker.exists()
+    for rel in dependencies:
+        assert (Path(wt) / rel).is_symlink()
+        assert (Path(wt) / rel).resolve() == repo / rel
+    assert await worktree.promote_worktree(str(repo), wt, branch, "bd-node") == (wt, branch)
+    assert await loop._run_local_gate(wt) is None
+
+
+@pytest.mark.parametrize("kind", ["local", "internal_absolute", "relative", "broken"])
+def test_path_dependent_node_dependencies_still_require_recovery(tmp_path, kind):
+    wt = tmp_path / "tree"
+    wt.mkdir()
+    dependencies = wt / "node_modules"
+    target = wt / "installed"
+    target.mkdir()
+    if kind == "local":
+        dependencies.mkdir()
+    elif kind == "internal_absolute":
+        dependencies.symlink_to(target, target_is_directory=True)
+    elif kind == "relative":
+        dependencies.symlink_to("installed", target_is_directory=True)
+    else:
+        dependencies.symlink_to(tmp_path / "missing", target_is_directory=True)
+    assert worktree._installed_environments(str(wt)) == ["node_modules"]
