@@ -322,7 +322,8 @@ class ReconcileMixin:
         ANY doubt (no record, worktree gone, branch/sha drift, gate red now, any error
         anywhere) → False, and the caller falls through to today's rebuild-fresh
         unchanged — a wrong salvage ships unverified code; a skipped one only costs a
-        rebuild."""
+        rebuild. Pending environment setup failures instead hold the existing build
+        for infrastructure recovery without clearing its verified record."""
         try:
             f = await asyncio.to_thread(store.get_feature, fid) or {}
             sha = str(f.get("verified_sha") or "").strip()
@@ -366,6 +367,17 @@ class ReconcileMixin:
             await asyncio.to_thread(self._clear_verified, store, fid)
             log.info("[project_board] %s salvaged the verified candidate → %s (no re-solve)", fid, pr_url)
             return True
+        except worktree.EnvironmentPreparationError as exc:
+            await self._block_or_stand_aside(
+                store,
+                fid,
+                str(exc),
+                category="environment-preparation",
+                repo=repo,
+                wt=wt,
+                branch=branch,
+            )
+            return True  # handled: never rebuild feature code to fix infrastructure
         except Exception:  # noqa: BLE001 — ANY doubt/error → today's rebuild-fresh path
             log.warning("[project_board] %s salvage attempt failed — rebuild fresh", fid, exc_info=True)
             return False
@@ -518,7 +530,10 @@ class ReconcileMixin:
             # The gate runs where the tree IS, before anything moves: a red gate refuses with
             # the tree where the dead coder left it — bar the formatter's fixups, which run
             # first and may already have rewritten files.
-            gate_out = await self._gate_tree(f, path)
+            try:
+                gate_out = await self._gate_tree(f, path)
+            except worktree.EnvironmentPreparationError as exc:
+                return {**rec, "outcome": "error", "detail": str(exc)}
             if gate_out is not None:
                 rec = {**rec, "gate_output": gate_out[-_SALVAGE_GATE_TAIL_CHARS:]}
                 if not force:
@@ -537,6 +552,7 @@ class ReconcileMixin:
             try:
                 wt, branch = await worktree.promote_worktree(repo, path, branch, fid, self.root, title=title)
                 rec = {**rec, "worktree": wt, "branch": branch}
+                await self._restore_promoted_environment(wt, f)
                 note = (
                     f"Salvaged from `{os.path.basename(path)}` by the operator — no coder was dispatched "
                     f"(#427). It held: {held}"
@@ -4030,6 +4046,7 @@ class ReconcileMixin:
         gate could launch, or by the time it ended (#461). That is not a gate that could
         not run; there is nothing left to publish, and "treating as pass" opened a PR
         from a deleted directory."""
+        await self._restore_promoted_environment(wt, feature)
         cmd = self._local_gate_cmd_for(feature) if feature is not None else self.local_gate_cmd
         if not cmd:
             return None

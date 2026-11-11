@@ -2533,6 +2533,7 @@ class DriveMixin:
                         # Keep durable provenance until a gate requests a repair.
                         # Restart before verification/publication still owns this candidate.
                         preserved_repair = False
+                    await self._restore_promoted_environment(wt, feature)
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -2898,6 +2899,19 @@ class DriveMixin:
                     # Into the host's friction ledger, whatever happens to the card next: a
                     # drive's failure happens outside any agent turn, so nothing else records it.
                     self._friction_drive_failure(fid, exc, feature, base=base, branch=branch, refusal=coder_refusal)
+                    if isinstance(exc, worktree.EnvironmentPreparationError):
+                        if await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            str(exc),
+                            category="environment-preparation",
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                        ):
+                            self._inflight.pop(fid, None)
+                        return
                     if isinstance(exc, worktree.StrandedWorkError):
                         # Stranded work that could not be saved to a branch (#405). Not a
                         # failure of this build — it never started — so no retry, no tier
@@ -4261,6 +4275,12 @@ class DriveMixin:
             return None
         return self._resolve_delegate(assignee, "acp") or self._resolve_delegate(assignee, "a2a")
 
+    async def _restore_promoted_environment(self, wt: str, feature: dict | None) -> None:
+        if not wt:
+            return
+        cmd = self._setup_cmd_for(feature) if feature is not None else self.setup_cmd
+        await worktree.restore_worktree_environment(wt, cmd, env=self._child_env(), timeout=self.setup_timeout)
+
     async def _prepare_tree(self, wt: str, feature: dict | None) -> str:
         """Install a fresh worktree's dependencies (the project's ``setup_cmd``) before a
         coder or a gate runs in it. Best-effort: a failed or timed-out install is logged and
@@ -4268,7 +4288,9 @@ class DriveMixin:
 
         Returns the failure reason (``""`` on success or with no ``setup_cmd``) so a caller
         that must NOT proceed on a half-installed tree can tell: the merged-state re-verify
-        skips its gate on one rather than read the toolchain's failure as the code's."""
+        skips its gate on one rather than read the toolchain's failure as the code's.
+        Pending promotion setup is strict and raises an infrastructure error first."""
+        await self._restore_promoted_environment(wt, feature)
         cmd = self._setup_cmd_for(feature) if feature is not None else self.setup_cmd
         if not cmd:
             return ""
@@ -4291,6 +4313,7 @@ class DriveMixin:
         nits would otherwise fail CI and burn a bounce/escalation. Best-effort: no command
         configured, or any error/timeout, just proceeds (CI is still the real lint gate).
         Resolves ``format_cmd`` from the feature's project when given (#90)."""
+        await self._restore_promoted_environment(wt, feature)
         cmd = self._format_cmd_for(feature) if feature is not None else self.format_cmd
         if not cmd:
             return
