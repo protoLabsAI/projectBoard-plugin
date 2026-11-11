@@ -1810,3 +1810,123 @@ async def test_recovery_journal_without_worktree():
     assert await worktree.recovery_context(None, "feature") == {}
     await worktree.request_requirement_followup(None, "feature")
     await worktree.consume_recovery_progress(None, "feature", goal_followup=True)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("repair_edits", [False, True])
+async def test_clean_base_merge_after_consumed_repair_is_not_coder_progress(
+    history, monkeypatch, committed, restart, repair_edits
+):
+    """A gate consumes the candidate; the base then advances cleanly. The board's
+    merge of that base is board output: with or without a restart while the merge
+    is pending, an edit-free reply must not mint repair provenance or publish the
+    still-failing candidate on gate-budget exhaustion. A genuine edit still counts."""
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
+
+    class ProcessStopped(BaseException):
+        pass
+
+    repo = history
+    base = sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7", "labels": []}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    remote = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    resolution = "feature coverage\nsibling a coverage\n"
+    (Path(path) / "a").write_text(resolution)
+    if committed:
+        await worktree.finish_integration(path, branch, "main")
+    store = FakeLoopStore()
+
+    def record_budget(fid, kind, n):
+        feature["labels"] = [label for label in feature["labels"] if not label.startswith(f"budget:{kind}:")]
+        feature["labels"].append(f"budget:{kind}:{n}")
+
+    monkeypatch.setattr(store, "record_budget", record_budget, raising=False)
+    advanced = []
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+
+    async def check(path, feature):
+        if (Path(path) / "gate-fix").exists():
+            return None
+        if not advanced:
+            # The base moves cleanly while the rejected candidate waits for its repair.
+            (repo / "c").write_text("clean sibling coverage\n")
+            git(repo, "add", "c")
+            git(repo, "commit", "-m", "clean sibling c")
+            git(repo, "push", "origin", "main")
+            advanced.append(git(repo, "rev-parse", "HEAD"))
+        return "Missing regression test"
+
+    gate = AsyncMock(side_effect=check)
+    attempts = []
+    consumed = []
+
+    async def dispatch(coder, resumed_path, prompt, **kwargs):
+        assert resumed_path == path
+        attempts.append(prompt)
+        if len(attempts) == 1:
+            return "## Summary\nRetained resolution"
+        # The board prepared the clean merge of the advanced base before this reply.
+        assert git(path, "rev-parse", "MERGE_HEAD") == advanced[0]
+        if len(attempts) == 2:
+            assert "Missing regression test" in prompt
+            consumed.append(await worktree.recovery_context(path, branch))
+            if restart:
+                raise ProcessStopped()
+        if repair_edits:
+            (Path(path) / "gate-fix").write_text("regression coverage\n")
+        return "## Summary\nNo further change"
+
+    async def publish(path, branch, **kwargs):
+        for ref in (remote, base, advanced[0]):
+            git(path, "merge-base", "--is-ancestor", ref, "HEAD")
+        assert (Path(path) / "a").read_text() == resolution
+        assert (Path(path) / "gate-fix").exists()
+        git(path, "push", "origin", branch)
+        return feature["pr_url"]
+
+    opened = AsyncMock(side_effect=publish)
+    kwargs = dict(
+        feature=feature,
+        store=store,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        gate=gate,
+        cfg={"coder": "proto", "local_gate_max": 1},
+    )
+    if restart:
+        with pytest.raises(ProcessStopped):
+            await _drive_with(monkeypatch, **kwargs)
+        assert "budget:gate-fix:1" in feature["labels"]
+        # A pending board merge alone is not preserved coder progress.
+        assert not await worktree.preserved_recovery_progress(path, branch)
+    await _drive_with(monkeypatch, **kwargs)
+    assert len(attempts) == (3 if restart else 2)
+    journal = await worktree.recovery_context(str(repo), branch)
+    if repair_edits:
+        assert gate.await_count == 2
+        opened.assert_awaited_once()
+        assert "open_review" in store.names()
+    else:
+        # Exhausting the gate budget must not publish the still-failing candidate.
+        gate.assert_awaited_once()
+        opened.assert_not_awaited()
+        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+        assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
+        # No repair provenance was minted for the board's merge.
+        assert journal["repair_head_sha"] == consumed[0]["repair_head_sha"]
+        assert journal.get("consumed_repair", {}).get("repair_head_sha") == consumed[0]["repair_head_sha"]

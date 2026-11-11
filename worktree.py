@@ -2367,6 +2367,32 @@ async def pending_integration(repo: str, root: str, fid: str, title: str) -> tup
     return None
 
 
+async def _board_commit(path: str, branch: str, context: dict, message: str) -> bool:
+    """Commit as the board, classifying what the commit carries; True for coder output.
+
+    The progress invariant: coder progress is only output that differs from the board's
+    own snapshot taken at the same HEAD. Every board write (base/PR-head merge, formatter
+    fixups, preservation commits) is absorbed into that snapshot, and a consumed repair
+    stays consumed across board-only commits. Only coder output mints ``repair_head_sha``.
+    """
+    journaled = bool(context)
+    baseline = context.get("prepared_edit_state")
+    state = json.loads(json.dumps(await recovery_edit_state(path)))
+    coder = bool(baseline and baseline[0] == state[0] and baseline != state)
+    tree = await _git_required(path, "rev-parse", "HEAD^{tree}")
+    await commit_worktree(path, message)
+    consumed = context.get("consumed_repair")
+    if coder:
+        context["repair_head_sha"] = await _git_required(path, "rev-parse", "HEAD")
+        context.pop("consumed_repair", None)
+    elif consumed and consumed.get("tree_sha") == tree:
+        consumed["tree_sha"] = await _git_required(path, "rev-parse", "HEAD^{tree}")
+    if journaled:
+        context["prepared_edit_state"] = await recovery_edit_state(path)
+        await _record_recovery(path, branch, context)
+    return coder
+
+
 async def prepare_integration(path: str, branch: str, base: str) -> dict:
     """Pin a fetched base and merge it with the feature; only the board writes Git.
 
@@ -2385,34 +2411,34 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
     head_sha = await _git_required(path, "rev-parse", "HEAD")
     if await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"):
         raise IntegrationRequired("Interrupted rebase preserved; board integration requires completion before dispatch")
+    fresh_merge = False
     if await _operation_present(path, "MERGE_HEAD"):
         # Resume the exact pinned merge first; finish_integration reconciles any newer base.
         integration_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
         base_sha = previous.get("base_sha", integration_sha)
     else:
         # Preserve overlapping retained edits as feature history before starting a merge.
-        baseline = previous.get("prepared_edit_state")
-        state = json.loads(json.dumps(await recovery_edit_state(path)))
-        retained_edits = bool(baseline and baseline[0] == state[0] and baseline != state)
-        await commit_worktree(path, "Preserve retained edits before base integration")
+        # Retained coder output keeps its provenance; the merge below is the board's.
+        fresh_merge = True
+        await _board_commit(path, branch, previous, "Preserve retained edits before base integration")
         head_sha = await _git_required(path, "rev-parse", "HEAD")
-        if retained_edits:
-            previous["repair_head_sha"] = head_sha
-            previous.pop("consumed_repair", None)
-            await _record_recovery(path, branch, previous)
         integration_sha = base_sha
         rc, out, err = await _git(
             path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
         )
         if rc and not await _operation_present(path, "MERGE_HEAD"):
             raise WorktreeError(f"integration failed: {(err or out).strip()[:300]}")
+        if previous:
+            # The merge is board output: the next commit must not count it as a repair.
+            previous["prepared_edit_state"] = await recovery_edit_state(path)
     paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
     if not paths and remote_head:
         rc, _, _ = await _git(path, "merge-base", "--is-ancestor", remote_head, "HEAD")
         if rc:
             # Complete a clean merge before integrating concurrent PR work.
             # Conflicted merges stay intact for the edit-only coder.
-            await commit_worktree(path, "Complete pinned integration before updated PR head")
+            await _board_commit(path, branch, previous, "Complete pinned integration before updated PR head")
+            fresh_merge = True
             integration_sha = remote_head
             rc, out, err = await _git(
                 path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", remote_head, timeout=120
@@ -2438,7 +2464,11 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
     }
     state = json.loads(json.dumps(await recovery_edit_state(path)))
     baseline = previous.get("prepared_edit_state")
-    context["prepared_edit_state"] = baseline if baseline and baseline[0] == state[0] else state
+    # A merge the board just prepared is board output: snapshot after it, so its
+    # changes can never read as coder progress. A resumed merge keeps the snapshot
+    # taken when it was prepared, so coder edits made since then stay detectable.
+    keep = not fresh_merge and baseline and baseline[0] == state[0]
+    context["prepared_edit_state"] = baseline if keep else state
     await _record_recovery(path, branch, context)
     return context
 
@@ -2469,14 +2499,7 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
     context = await recovery_context(path, branch)
     if not context:
         return
-    baseline = context.get("prepared_edit_state")
-    state = json.loads(json.dumps(await recovery_edit_state(path)))
-    repaired = bool(baseline and baseline[0] == state[0] and baseline != state)
-    await commit_worktree(path, "Integrate current base and resolve conflicts")
-    if repaired:
-        context["repair_head_sha"] = await _git_required(path, "rev-parse", "HEAD")
-        context.pop("consumed_repair", None)
-        await _record_recovery(path, branch, context)
+    await _board_commit(path, branch, context, "Integrate current base and resolve conflicts")
     rc, _, _ = await _git(
         path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"
     )
@@ -2485,7 +2508,7 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
     context = await prepare_integration(path, branch, base)
     if context["conflict_paths"]:
         raise IntegrationRequired("Base or PR head advanced during recovery; resolve the refreshed conflict paths")
-    await commit_worktree(path, "Integrate updated base")
+    await _board_commit(path, branch, context, "Integrate updated base")
     await _git_required(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
     if await _git_required(path, "ls-files", "--unmerged"):
         raise IntegrationRequired("Unresolved index entries prevent publication")

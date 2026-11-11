@@ -492,6 +492,18 @@ class ReconcileMixin:
         canon = os.path.join(repo, self.root, worktree.worktree_dir(fid, title))
         rec = {**rec, "worktree": path}
         async with worktree.hold_trees(path, canon):
+            # A preserved recovery checkout crosses the same integration boundary as a
+            # drive before verification: finish the pending merge (an edit-only
+            # resolution is committed), or refuse — `force` overrides a red gate, never
+            # unresolved conflicts or an unintegrated base.
+            try:
+                await worktree.finish_integration(path, branch, base)
+            except worktree.IntegrationRequired as exc:
+                return {
+                    **rec,
+                    "branch": branch,
+                    "detail": f"integration incomplete, so nothing was published — resolve it first: {exc}",
+                }
             # The gate runs where the tree IS, before anything moves: a red gate refuses with
             # the tree where the dead coder left it — bar the formatter's fixups, which run
             # first and may already have rewritten files.
