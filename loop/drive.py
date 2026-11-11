@@ -2084,6 +2084,7 @@ class DriveMixin:
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
         # tree records its own.
         round_start = ""
+        ledger_only_pending = False
         attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
@@ -2112,6 +2113,11 @@ class DriveMixin:
                         )
                         return
                 attempt += 1
+                # Only the explicitly requested text-only follow-up may omit edits.
+                # Consume this marker so later goal/gate/requirement fixes still
+                # have to change the implementation, even after a ledger retry.
+                ledger_only_round = ledger_only_pending
+                ledger_only_pending = False
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -2488,7 +2494,7 @@ class DriveMixin:
                             recovery_before is not None and recovery_before == await worktree.recovery_edit_state(wt)
                         )
                         await worktree.finish_integration(wt, branch, base)
-                        if recovery_unchanged:
+                        if recovery_unchanged and not ledger_only_round:
                             raise worktree.NoChangesError(
                                 "fix round produced no commit or edits beyond the board-prepared integration; "
                                 "nothing new to push or review"
@@ -2642,6 +2648,7 @@ class DriveMixin:
                                     tier or "default",
                                 )
                                 keep_wt = True
+                                ledger_only_pending = True
                                 continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:

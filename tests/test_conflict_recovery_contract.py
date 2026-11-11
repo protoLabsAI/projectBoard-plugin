@@ -1102,3 +1102,74 @@ async def test_recovery_edit_snapshot_tracks_content_and_ignores_board_scratch(h
     (repo / "untracked").write_text("first\n")
     (repo / "a").unlink()
     assert await worktree.recovery_edit_state(str(repo)) != before
+
+
+@pytest.mark.parametrize("disposition", ["done", "declined — outside scope", None])
+async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history, monkeypatch, disposition):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    sibling(repo, "a")
+    feature = {
+        **FEATURE,
+        "pr_url": "https://example/pr/7",
+        "requirements": [{"id": "r1", "text": "preserve coverage", "status": "open"}],
+    }
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    create = worktree.create_worktree
+    opened = AsyncMock(return_value=feature["pr_url"])
+    prompts = []
+    states = []
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        monkeypatch.setattr(worktree, "create_worktree", create)
+        loop._ci_feedback[feature["id"]] = "Resolve the conflict"
+
+    async def dispatch(coder, path, prompt, **kwargs):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
+        else:
+            states.append(await worktree.recovery_edit_state(path))
+            if len(prompts) == 2:
+                assert "do NOT edit" in prompt
+                if disposition:
+                    return f"## Requirements\n- r1: {disposition}\n\n## Summary\nPreserved coverage"
+            else:
+                assert "requirement items are still OPEN" in prompt
+        return "## Summary\nPreserved coverage"
+
+    _, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        cfg={"coder": "proto", "goal_fix_max": 1},
+    )
+    if disposition:
+        assert len(prompts) == 2
+        opened.assert_awaited_once()
+        path = opened.call_args.args[0]
+        assert await worktree.recovery_edit_state(path) == states[0]
+        git(path, "merge-base", "--is-ancestor", "origin/main", "HEAD")
+        git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+        assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
+        assert feature["requirements"][0]["status"] == disposition.split(" — ")[0]
+        writes = [c for c in store.calls if c[0] == "set_requirements"]
+        assert writes[-1][2] == feature["requirements"]
+        assert "open_review" in store.names()
+    else:
+        # Silence reaches the bounded completion gate; its ordinary code-fix
+        # follow-up must still be rejected when it makes no edits.
+        assert len(prompts) == 3
+        opened.assert_not_awaited()
+        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
