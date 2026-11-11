@@ -433,6 +433,14 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # candidate from the files it changed (coder_seam.select_oracle). Parsed per
         # feature, against that project's gate (`_coder_solve_oracle_for`).
         self.coder_solve_test_paths = self.cfg.get("coder_solve_test_paths")
+        # #719: the explicit format verify stage — a check run before the oracle and the
+        # trusted formatter that repairs a format-only failure in the candidate's own tree
+        # (bounded) before the full oracle runs. Either blank (default) = no stage.
+        self.coder_solve_format_check_cmd = str(self.cfg.get("coder_solve_format_check_cmd") or "").strip()
+        self.coder_solve_format_fix_cmd = str(self.cfg.get("coder_solve_format_fix_cmd") or "").strip()
+        self.coder_solve_format_repair_attempts = coder_seam.clamp_format_repair_attempts(
+            self.cfg.get("coder_solve_format_repair_attempts", coder_seam.FORMAT_REPAIR_ATTEMPTS_DEFAULT)
+        )
         # Projects whose solve oracle is known to be unwinnable (#459) → why. Set when the
         # measured gate is slower than the solve timeout, or when a card's candidates trip
         # the timeout breaker on the gate fallback. The loop then takes the plain coder path
@@ -642,6 +650,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # round N's fix silently revert round N-1's (bd-49yo / #513). Read through
         # ``_review_history`` (tolerant of a legacy single-round flat findings value).
         self._review_prior: dict[str, str] = {}
+        # fid -> the card's intent (title, task, acceptance criteria, starting files) rendered
+        # for the review gate, set by `_review_gate_run` for the duration of one review so the
+        # panel can weigh a finding against what the card asked for (not on the diff alone).
+        self._review_card: dict[str, str] = {}
         # Features whose review gate is RUNNING in this process right now (#205).
         # The gate has two call sites — the drive (PR just opened) and the
         # reconcile's resume edge (an in_review card still review-pending) — and
@@ -1037,7 +1049,25 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
                 "coder_solve_fusion_max_total_chars", self.coder_solve_fusion_max_total_chars, 1
             ),
             "max_concurrent_sessions": _int("max_concurrent_sessions", self.max_concurrent_sessions, 0),
+            # #719: the project's own format stage wins; a project that names neither
+            # command inherits the instance pair, exactly like `format_cmd`.
+            **self._coder_solve_format_for(pc),
         }
+
+    def _coder_solve_format_for(self, pc: dict) -> dict:
+        """The format verify stage (#719) for a project: ``format_check_cmd``,
+        ``format_fix_cmd`` and ``format_repair_attempts`` for ``coder_seam.dispatch``. The
+        two commands resolve as a PAIR — a project naming either one owns both, so a repo's
+        check never runs with another repo's formatter."""
+        if "coder_solve_format_check_cmd" in pc or "coder_solve_format_fix_cmd" in pc:
+            check = str(pc.get("coder_solve_format_check_cmd") or "").strip()
+            fix = str(pc.get("coder_solve_format_fix_cmd") or "").strip()
+        else:
+            check, fix = self.coder_solve_format_check_cmd, self.coder_solve_format_fix_cmd
+        attempts = self.coder_solve_format_repair_attempts
+        if "coder_solve_format_repair_attempts" in pc:
+            attempts = coder_seam.clamp_format_repair_attempts(pc.get("coder_solve_format_repair_attempts"))
+        return {"format_check_cmd": check, "format_fix_cmd": fix, "format_repair_attempts": attempts}
 
     def _all_repos(self) -> list[str]:
         """Every distinct repo root the board builds in — one per project (#90). A

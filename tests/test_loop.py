@@ -409,13 +409,13 @@ def test_build_prompt_omits_gate_files_block_when_none_configured():
 def test_gate_files_are_not_ledger_items_nor_files_to_modify():
     """Composes with #113: gate files are a prompt-assembly ADDITION, not ledger items
     and not merged into the feature's `files_to_modify` — the block is distinct from
-    the `## Files to create / modify` list and the `## Requirements ledger`."""
+    the `## Files to start from (not a fence)` list and the `## Requirements ledger`."""
     loop = BoardLoop({"gate_files": ["CHANGELOG.md"]})
     feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
     prompt = loop._build_prompt(feature)
     # gate file lands under its own heading, NOT under Files to create / modify
     # ([0] is the file list itself — everything up to the next `##` heading)
-    files_section = prompt.split("## Files to create / modify")[1].split("##")[0]
+    files_section = prompt.split("## Files to start from (not a fence)")[1].split("##")[0]
     assert "CHANGELOG.md" not in files_section
     assert "- a.py" in files_section  # sanity: this IS the file-list section
     # the standing block does not leak into / become a ledger requirement line
@@ -570,7 +570,7 @@ def test_scope_block_is_separated_from_and_does_not_disturb_existing_blocks():
     prompt = loop._build_prompt(feature, lessons="- always update the golden map")
     for heading in (
         "## Task",
-        "## Files to create / modify",
+        "## Files to start from (not a fence)",
         "## Repo standing gate files",
         "## Repo conventions",
         "## Acceptance criteria",
@@ -585,6 +585,41 @@ def test_scope_block_is_separated_from_and_does_not_disturb_existing_blocks():
     # the card's own content and the neighbouring blocks are untouched by the addition
     assert "do the thing" in prompt and "- a.py" in prompt
     assert _CONVENTIONS in prompt and "always update the golden map" in prompt
+
+
+def test_build_prompt_frames_the_file_list_as_a_start_not_a_fence():
+    """The listed files are where the change is expected to land, not a boundary: the coder
+    may edit the shared store/cache/hook a listed file depends on and names it in the summary
+    (bd-nfd6g.16: the fix lived in an unlisted shared store)."""
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    files_section = prompt.split("## Files to start from (not a fence)")[1].split("\n## ")[0]
+    assert "- a.py" in files_section and "- b.py" in files_section
+    assert "not a fence" in files_section and "name each unlisted file" in files_section
+    assert "Touch only the files this task needs" not in prompt
+    assert "the listed files exist" not in prompt
+    assert "correct for every caller and shared state" in prompt
+
+
+def test_build_prompt_always_carries_the_pre_submit_self_check():
+    """Cross-file + removed-behavior were 45% of review findings; every dispatch carries the
+    self-check (callers + shared state, stale/failed/missing paths, deleted lines) before the
+    acceptance criteria — even a bare feature."""
+    for feature in (FEATURE, {"id": "x", "title": "T", "spec": "s"}):
+        prompt = BoardLoop({})._build_prompt(feature)
+        assert "## Before you finish — check what review will check" in prompt
+        assert "callers" in prompt and "shared state" in prompt and "failed read" in prompt
+        assert prompt.index("## Before you finish") < prompt.index("## Acceptance criteria")
+
+
+def test_build_prompt_teaches_the_blocked_on_spec_marker_the_loop_parses():
+    """The loop routes a `BLOCKED-ON-<WORD>:` line (#667), so the prompt must teach that exact
+    marker; improvised wording ("request spec repair") read as an empty run."""
+    from project_board.loop._common import _coder_refusal
+
+    prompt = BoardLoop({})._build_prompt(FEATURE)
+    assert "`BLOCKED-ON-SPEC: <what is missing>" in prompt
+    # the taught shape is one the parser accepts
+    assert _coder_refusal("done.\nBLOCKED-ON-SPEC: no public nav API — checked App.tsx, nav.ts") != ""
 
 
 def test_is_test_path_classification():
@@ -1922,8 +1957,12 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
         max_concurrent_sessions=0,
         setup_cmd="",
         setup_timeout=600.0,
+        format_check_cmd="",
+        format_fix_cmd="",
+        format_repair_attempts=1,
     ):
         seen["fid"] = fid
+        seen["format_stage"] = (format_check_cmd, format_fix_cmd, format_repair_attempts)
         seen["test_paths"] = test_paths  # #459: no coder_solve_test_paths configured → []
         seen["setup_cmd"] = setup_cmd
         seen["test_cmd"] = test_cmd
@@ -1952,6 +1991,7 @@ async def test_drive_uses_coder_solve_when_available_and_records_gens(monkeypatc
     )
     assert seen["fid"] == "bd-1" and seen["test_cmd"] == "pytest -q"
     assert seen["setup_cmd"] == "npm ci"  # every ladder candidate installs its own deps
+    assert seen["format_stage"] == ("", "", 1)  # #719: no format stage unless configured
     assert "Add a thing" in seen["task"]  # the same built prompt, not a different one
     assert seen["commit_message"] == "feat: Add a thing"  # the verified commit keeps the PR title
     assert seen["title"] == "Add a thing"  # #227: the RAW title is threaded for the canonical slug

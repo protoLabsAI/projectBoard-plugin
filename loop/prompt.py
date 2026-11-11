@@ -212,6 +212,15 @@ class PromptMixin:
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
         )
+        # The list is where the card's author expects the change to land, NOT a fence. On the
+        # live board (10-21..11-10) 35% of first attempts already edited unlisted source, and a
+        # quarter of review findings were cross-file: the shared store/cache/hook a listed file
+        # reads from. Framing the list as a fence made coders stop at it (bd-nfd6g.16).
+        files_block += (
+            "\n\nStart here, but this list is not a fence. When the correct fix belongs in a shared "
+            "module these files depend on (a store, cache, hook, selector, helper or caller), edit "
+            "it there, and name each unlisted file you changed, and why, in your `## Summary`."
+        )
         # Repo standing gate files (#108): repo-wide obligations that a card's tight
         # `files_to_modify` would otherwise suppress — a card author can't enumerate
         # per-repo gates, so the loop carries them from config. Emitted as a SEPARATE
@@ -280,6 +289,23 @@ class PromptMixin:
         # naming the desktop app. Observed 2026-09-11: two coders scanning `/` for
         # `@protolabsai/ui/src`. UNCONDITIONAL, like the scope block above, so no dispatch
         # path can silently lose it.
+        # Standing pre-submit self-check: cross-file + removed-behavior findings were 45% of all
+        # review findings on the live board (367 findings, 10-21..11-10), and nothing asked the
+        # coder to look for them before stopping. UNCONDITIONAL, like the scope block.
+        self_check_block = (
+            "\n## Before you finish — check what review will check\n"
+            "Review rejects most often for defects one hop away from the edited lines. Before "
+            "your final message:\n"
+            "- For every function, component, type or state shape you changed, find its callers "
+            "and the shared state it reads or writes (stores, caches, query keys, hooks, "
+            "selectors, config). Confirm each still behaves correctly with your change.\n"
+            "- Where the change touches data that can go stale (a cache, a refetch, a "
+            "reconnect, a retry, an error path), walk that path once: stale value, failed read, "
+            "missing record.\n"
+            "- Re-read your diff's deleted and rewritten lines and confirm nothing existing "
+            "stopped working (see the scope rule above).\n"
+            "Fix what you find in the same change; don't leave it for review.\n"
+        )
         search_scope_block = (
             "\n## Search inside your worktree\n"
             "Search under your worktree — never from `/` or `~`. A file you can't find "
@@ -346,23 +372,30 @@ class PromptMixin:
             f"You are implementing ONE feature in this repository. Your working "
             f"directory is an isolated git worktree — **make all the edits here, now**. "
             f"Do not ask questions or just describe a plan; if something is ambiguous, "
-            f"make the most reasonable choice and write the code.\n\n"
+            f"make the most reasonable choice and write the code. Only if, after checking the "
+            f"existing APIs and code paths, the task is genuinely unbuildable as written, end "
+            f"your final message with a line `BLOCKED-ON-SPEC: <what is missing> — <what you "
+            f"checked>` and leave the tree unchanged. The loop routes that line to the next "
+            f"attempt or the project manager, so they can check it. Don't use it for something "
+            f"you could solve yourself.\n\n"
             f"# {feature['title']}\n\n"
             f"{_recovery_block(feature)}"
             f"{ci_block}"
             f"{lessons_block}"
             f"## Task\n{feature.get('spec', '')}\n\n"
-            f"## Files to create / modify\n{files_block}\n"
+            f"## Files to start from (not a fence)\n{files_block}\n"
             f"{gate_files_block}"
             f"{repo_conventions_block}"
             f"{design_block}\n"
             f"{preserve_scope_block}"
+            f"{self_check_block}"
             f"{search_scope_block}"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
             f"## Rules\n"
             f"- Make the edits directly in the working tree NOW — actually write the files.\n"
-            f"- Touch only the files this task needs; mirror the surrounding code's style.\n"
+            f"- Change what the behavior needs and nothing unrelated; mirror the surrounding "
+            f"code's style.\n"
             f"- **Keep a live checklist.** Before your first edit, write this task's steps as "
             f"a short to-do list in your task tool and mark each item done as you finish it — "
             f"the board shows that list to the operator live. In Claude Code that tool is "
@@ -387,8 +420,8 @@ class PromptMixin:
             f'exploration, no "I first looked at..."/"Let me...", no restating these '
             f"instructions or the acceptance criteria back. If you used scratch "
             f"reasoning to get here, leave it out of this message entirely.\n"
-            f"- You are done when the listed files exist, tests cover the change, and "
-            f"every acceptance criterion is satisfied."
+            f"- You are done when the behavior is correct for every caller and shared state "
+            f"your change touches, tests cover it, and every acceptance criterion is satisfied."
         )
 
 
