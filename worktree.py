@@ -2266,7 +2266,8 @@ async def preserved_recovery_progress(path: str, branch: str) -> bool:
 
     Divergence or a journal alone is not a repair. Uncommitted output must differ
     from the prepared snapshot on the same head; committed output must contain a
-    board-recorded repair still unpublished. Integration checks remain mandatory.
+    board-recorded repair still unpublished and not already accepted for this tree.
+    Integration checks remain mandatory.
     """
     context = await recovery_context(path, branch)
     if not context:
@@ -2279,6 +2280,11 @@ async def preserved_recovery_progress(path: str, branch: str) -> bool:
         return True
     repair = context.get("repair_head_sha")
     if not repair:
+        return False
+    if context.get("consumed_repair") == {
+        "repair_head_sha": repair,
+        "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
+    }:
         return False
     rc, _, _ = await _git(path, "merge-base", "--is-ancestor", repair, "HEAD")
     if rc:
@@ -2297,6 +2303,18 @@ async def preserved_recovery_progress(path: str, branch: str) -> bool:
     if rc != 1:
         raise IntegrationRequired("Cannot verify unpublished recovery contents")
     return True
+
+
+async def consume_recovery_progress(path: str, branch: str) -> None:
+    """Persist progress acceptance before goal/local gates can request another fix."""
+    context = await recovery_context(path, branch)
+    if not context or not context.get("repair_head_sha"):
+        return
+    context["consumed_repair"] = {
+        "repair_head_sha": context["repair_head_sha"],
+        "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
+    }
+    await _record_recovery(path, branch, context)
 
 
 async def recovery_round_start(path: str, branch: str) -> str:
@@ -2358,6 +2376,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         head_sha = await _git_required(path, "rev-parse", "HEAD")
         if retained_edits:
             previous["repair_head_sha"] = head_sha
+            previous.pop("consumed_repair", None)
             await _record_recovery(path, branch, previous)
         integration_sha = base_sha
         rc, out, err = await _git(
@@ -2391,6 +2410,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         "conflict_paths": paths.splitlines(),
         "published_head_sha": previous.get("published_head_sha", ""),
         "repair_head_sha": previous.get("repair_head_sha", ""),
+        "consumed_repair": previous.get("consumed_repair"),
     }
     state = json.loads(json.dumps(await recovery_edit_state(path)))
     baseline = previous.get("prepared_edit_state")
@@ -2431,6 +2451,7 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
     await commit_worktree(path, "Integrate current base and resolve conflicts")
     if repaired:
         context["repair_head_sha"] = await _git_required(path, "rev-parse", "HEAD")
+        context.pop("consumed_repair", None)
         await _record_recovery(path, branch, context)
     rc, _, _ = await _git(
         path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"

@@ -2521,6 +2521,7 @@ class DriveMixin:
                         # resolution cannot also satisfy a subsequent goal/gate repair;
                         # those requests require fresh edits even while HEAD is unpublished.
                         # Provider failures before this check leave the exemption intact.
+                        await worktree.consume_recovery_progress(wt, branch)
                         preserved_repair = False
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the

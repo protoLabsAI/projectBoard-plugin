@@ -1496,3 +1496,102 @@ async def test_preserved_resolution_does_not_exempt_new_gate_repair(
         assert git(repo, "show", f"{retained[0]}:a") == resolution.strip()
         git(repo, "merge-base", "--is-ancestor", remote, retained[0])
         git(repo, "merge-base", "--is-ancestor", base, retained[0])
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("repair_edits", [False, True])
+async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeypatch, committed, repair_edits):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
+
+    class ProcessStopped(BaseException):
+        pass
+
+    repo = history
+    base = sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7", "labels": []}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    remote = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    resolution = "feature coverage\nsibling a coverage\n"
+    (Path(path) / "a").write_text(resolution)
+    if committed:
+        await worktree.finish_integration(path, branch, "main")
+    store = FakeLoopStore()
+
+    def record_budget(fid, kind, n):
+        feature["labels"] = [label for label in feature["labels"] if not label.startswith(f"budget:{kind}:")]
+        feature["labels"].append(f"budget:{kind}:{n}")
+
+    monkeypatch.setattr(store, "record_budget", record_budget, raising=False)
+    loops = []
+
+    def seed(loop):
+        loops.append(loop)
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+
+    async def check(path, feature):
+        return None if (Path(path) / "gate-fix").exists() else "Missing regression test"
+
+    gate = AsyncMock(side_effect=check)
+    attempts = []
+
+    async def dispatch(coder, resumed_path, prompt, **kwargs):
+        assert resumed_path == path
+        attempts.append(prompt)
+        if len(attempts) == 2:
+            assert "Missing regression test" in prompt
+            raise ProcessStopped()
+        if len(attempts) == 3 and repair_edits:
+            (Path(path) / "gate-fix").write_text("regression coverage\n")
+        return "## Summary\nRetained resolution"
+
+    async def publish(path, branch, **kwargs):
+        git(path, "merge-base", "--is-ancestor", remote, "HEAD")
+        git(path, "merge-base", "--is-ancestor", base, "HEAD")
+        git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+        assert (Path(path) / "a").read_text() == resolution
+        assert (Path(path) / "gate-fix").exists()
+        git(path, "push", "origin", branch)
+        return feature["pr_url"]
+
+    opened = AsyncMock(side_effect=publish)
+    kwargs = dict(
+        feature=feature,
+        store=store,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        gate=gate,
+        cfg={"coder": "proto", "local_gate_max": 1},
+    )
+    with pytest.raises(ProcessStopped):
+        await _drive_with(monkeypatch, **kwargs)
+    assert "budget:gate-fix:1" in feature["labels"]
+    context = await worktree.recovery_context(path, branch)
+    assert context["consumed_repair"] == {
+        "repair_head_sha": context["repair_head_sha"],
+        "tree_sha": git(path, "rev-parse", "HEAD^{tree}"),
+    }
+    assert not await worktree.preserved_recovery_progress(path, branch)
+    opened.assert_not_awaited()
+    await _drive_with(monkeypatch, **kwargs)
+    assert loops[0] is not loops[1]
+    assert len(attempts) == 3
+    if repair_edits:
+        assert gate.await_count == 2
+        opened.assert_awaited_once()
+        assert "open_review" in store.names()
+    else:
+        gate.assert_awaited_once()
+        opened.assert_not_awaited()
+        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+        assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
