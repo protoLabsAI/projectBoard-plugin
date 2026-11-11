@@ -1987,6 +1987,16 @@ def _oracle_command_missing(returncode: int | None, output: str) -> bool:
     return _MISSING_CMD_RE.search(tail) is not None
 
 
+def _candidate_refusal(reply: str) -> str:
+    """The candidate's ``BLOCKED-ON-<WORD>:`` refusal from its final reply, or ``""`` —
+    the drive's own #667 parser, imported lazily (``loop`` imports this module)."""
+    if not (reply or "").strip():
+        return ""
+    from .loop._common import _coder_refusal
+
+    return _coder_refusal(reply)
+
+
 class SolveExhausted(worktree.WorktreeError):
     """``coder.solve()`` spent its whole generation budget against this feature's
     acceptance tests and no candidate passed. A CAPABILITY failure for the CURRENT
@@ -1994,6 +2004,23 @@ class SolveExhausted(worktree.WorktreeError):
     "no diff" — but the loop treats it exactly like ``NoChangesError``/
     ``CoderTimeout``: escalate a configured tier ladder, or block. Never opens a PR
     on an unverified best-partial (ADR 0064's honest-degrade contract)."""
+
+
+class SolveRefused(SolveExhausted):
+    """EVERY candidate ``coder.solve()`` judged ended with a deliberate
+    ``BLOCKED-ON-<WORD>:`` refusal and left no diff, AND at least one of them was dispatched
+    after a sibling's refusal was in its prompt — so the claim was cross-checked and upheld.
+    The spec itself is in question, not a model's capability: the drive blocks the card for
+    the project manager under the ``design`` class (no tier climb, no retry), quoting
+    ``refusal``. Refusals nobody cross-checked (the first concurrent best-of-k round, or
+    ``k``/``budget`` = 1) stay an ordinary :class:`SolveExhausted`, so the capability ladder
+    still climbs. On the live board every single-candidate refusal observed before this
+    existed was refuted by a sibling that built the same spec (bd-nfd6g.16, bd-bqyfs,
+    bd-buhc.1/.2), so blocking on an unchecked one would have been wrong every time."""
+
+    def __init__(self, message: str, *, refusal: str = ""):
+        super().__init__(message)
+        self.refusal = refusal
 
 
 class OracleMissingCommand(worktree.WorktreeError):
@@ -2416,11 +2443,34 @@ class _WorktreeSolveAdapter:
         # is one prior candidate's labeled verify tail; generate() folds the whole
         # accumulated list BELOW the ladder's own feedback via `_augment_prompt`.
         self._completed_failures: list[str] = []
+        # worktree_path -> the candidate's deliberate `BLOCKED-ON-<WORD>:` refusal, for a
+        # candidate that failed verify (no diff) after refusing. Turns its sibling feedback
+        # into "check this claim" rather than "no changes vs base", and lets dispatch() tell an
+        # all-refused ladder (SolveRefused → design block) from an ordinary exhaustion.
+        self._refusals: dict[str, str] = {}
+        # Candidates dispatched while at least one sibling refusal was already recorded — their
+        # prompt carried "check this claim or refute it". A unanimous refusal only becomes a
+        # design block when one of these upheld it (#721 review: the first concurrent round
+        # and k=1/budget=1 never cross-check, so they keep the ordinary exhaustion path).
+        self._cross_checked: set[str] = set()
         # #146 circuit breaker: signature (failing test node id + AssertionError line)
         # → how many candidates have failed on exactly it. When any single count hits
         # CIRCUIT_BREAKER_THRESHOLD, `verify()` short-circuits the whole ladder with
         # SolveExhausted rather than spend the rest of the budget re-failing identically.
         self._failure_signatures: dict[str, int] = {}
+
+    def unanimous_refusal(self) -> str:
+        """The refusal to quote when EVERY judged candidate refused (``""`` otherwise).
+        Infra failures (never dispatched) are not judgements and don't count either way;
+        an all-infra or empty ladder is not a refusal."""
+        judged = [wt for wt in self._verdict_by_wt if wt not in self._infra_failed]
+        if not judged or any(wt not in self._refusals for wt in judged):
+            return ""
+        if not any(wt in self._cross_checked for wt in judged):
+            return ""  # nobody checked the claim — let the capability ladder decide
+        refusals = [self._refusals[wt] for wt in judged]
+        distinct = list(dict.fromkeys(refusals))
+        return distinct[0] if len(distinct) == 1 else " | ".join(distinct)[:1500]
 
     @property
     def generations(self) -> int:
@@ -2490,6 +2540,8 @@ class _WorktreeSolveAdapter:
         wt, branch = await self._new_candidate_worktree()
         gen = self._n
         self._gen_by_wt[wt] = gen
+        if self._refusals:
+            self._cross_checked.add(wt)  # this prompt carries a sibling's refusal to check
         reply = await self._dispatch_candidate(wt, branch, _augment_prompt(task, self._compose_feedback(feedback)), gen)
         if (reply or "").strip():
             self._replies[wt] = reply
@@ -2772,7 +2824,29 @@ class _WorktreeSolveAdapter:
             tail = output[-1500:]
             label = f"candidate {gen}" if gen is not None else "a prior candidate"
             ran = self._oracle_by_wt.get(candidate_wt, self.test_cmd)
-            self._completed_failures.append(f"### {label} failed `{ran}`:\n{tail}".rstrip())
+            refusal = _candidate_refusal(self._replies.get(candidate_wt, ""))
+            if refusal:
+                # A refusal means "I changed nothing because the spec can't be built". A
+                # candidate that left a diff and then failed its tests failed like any other,
+                # whatever its reply says — keep its real output (#721 review). An unreadable
+                # tree (None) is not proof of "no diff" either.
+                changed = await worktree.changed_paths(candidate_wt, self.base)
+                if changed != []:
+                    refusal = ""
+            if refusal:
+                # A deliberate stop is a CLAIM about the spec, not a test failure: pass the
+                # reasoning on (the verify tail would only say "no changes") and ask the
+                # sibling to test it before agreeing.
+                self._refusals[candidate_wt] = refusal
+                self._completed_failures.append(
+                    f"### {label} stopped and declared the task unbuildable as written:\n{refusal}\n"
+                    "Treat this as a claim to check, not a fact — sibling refusals like it have "
+                    "usually been wrong. Look for an existing API or code path that makes the task "
+                    "buildable and build it. Only if you confirm the claim, end with your own "
+                    "`BLOCKED-ON-SPEC:` line saying what you checked."
+                )
+            else:
+                self._completed_failures.append(f"### {label} failed `{ran}`:\n{tail}".rstrip())
             # bd-gzl4: surface WHY a candidate failed verify where an operator reading
             # agent.log can see it — the prompt-feedback accumulator above and the live
             # monitor (progress_verify) were the only other records, neither of which
@@ -3139,6 +3213,19 @@ async def dispatch(
         for wt, branch in adapter.candidates:
             await worktree.remove_worktree(repo, wt, branch)
         await _sweep_candidate_branches(repo, fid)
+        refusal = adapter.unanimous_refusal()
+        if refusal:
+            log.warning(
+                "[project_board] %s coder.solve: every candidate refused (gens=%d/%d) — %s",
+                fid,
+                result.gens_spent,
+                budget,
+                refusal,
+            )
+            raise SolveRefused(
+                f"coder.solve: all {result.gens_spent} generation(s) refused the spec: {refusal}",
+                refusal=refusal,
+            )
         detail = result.verdict.feedback() if result.verdict else ""
         log.info(
             "[project_board] %s coder.solve exhausted (rung=%s, gens=%d/%d) — no candidate passed",

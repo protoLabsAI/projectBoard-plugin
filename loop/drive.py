@@ -2766,7 +2766,14 @@ class DriveMixin:
                     # an empty run. Read the reply once here — the friction summary below
                     # names the refusal, and the NoChangesError handler routes it to its own
                     # `design` block (no retry, no climb) instead of the capability ladder.
-                    coder_refusal = _coder_refusal(result or "") if isinstance(exc, worktree.NoChangesError) else ""
+                    if isinstance(exc, worktree.NoChangesError):
+                        coder_refusal = _coder_refusal(result or "")
+                    elif isinstance(exc, coder_seam.SolveRefused):
+                        # Every best-of-k candidate refused the spec and a sibling upheld it after
+                        # checking (see SolveRefused) — the same deliberate design block below.
+                        coder_refusal = exc.refusal
+                    else:
+                        coder_refusal = ""
                     # Into the host's friction ledger, whatever happens to the card next: a
                     # drive's failure happens outside any agent turn, so nothing else records it.
                     self._friction_drive_failure(fid, exc, feature, base=base, branch=branch, refusal=coder_refusal)
@@ -2863,6 +2870,34 @@ class DriveMixin:
                         log.warning("[project_board] %s blocked (worktree missing): %s", fid, exc)
                         if await self._block_or_stand_aside(
                             store, fid, str(exc), category="transient", repo=repo, wt=None, branch=branch, pr_url=pr_url
+                        ):
+                            self._inflight.pop(fid, None)
+                        return
+                    if isinstance(exc, coder_seam.SolveRefused) and coder_refusal:
+                        # Every candidate refused with no diff, and at least one did so after
+                        # being asked to check a sibling's refusal: the claim held up, so a
+                        # stronger tier would refuse the same gap. Block once for the project
+                        # manager (design class, no climb, no retry). The solve offload already
+                        # reaped its candidate trees.
+                        reason = (
+                            missing_findings_note
+                            + f"every coder attempt refused the spec (deliberate design block, no PR): {coder_refusal}"
+                        )
+                        log.warning(
+                            "[project_board] %s blocked (%s — all candidates refused, no tier climb, no retry): %s",
+                            fid,
+                            DESIGN_BLOCK_CLASS,
+                            reason,
+                        )
+                        if await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            reason,
+                            category=DESIGN_BLOCK_CLASS,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
                         ):
                             self._inflight.pop(fid, None)
                         return

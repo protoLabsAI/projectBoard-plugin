@@ -68,7 +68,10 @@ Why: <what and why>
    line). The form doesn't ask for paths, but the Ready gate needs `files_to_modify`. Work
    them out yourself with your read tools: read the project's repo and list the files the
    change touches, marking a file the card creates `(new)`. Add a `difficulty` if it's
-   obvious.
+   obvious. Keep each acceptance criterion an observable behavior (no process rules like
+   worker counts or "add a changelog"), add no "stop and ask" clauses, and name any shared
+   store, cache or hook the change depends on in `design` under "Shared state to check".
+   `board-tool-reference` → "What a coder can build from" has the reasons.
 3. **No unrequested dependencies.** Don't add dependency edges (`depends_on`, blockers) to
    other backlog cards unless the user asked for them. An edge to an unrelated, stale
    backlog chain leaves the new card waiting forever.
