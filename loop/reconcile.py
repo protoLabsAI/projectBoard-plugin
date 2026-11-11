@@ -398,7 +398,10 @@ class ReconcileMixin:
         opens it as a DRAFT whose body carries that output, so nobody takes it for a green
         PR and the auto-merge edge (which never merges a draft) leaves it for a human."""
         fid = f.get("id") or ""
-        body = _pr_body("", f) + (f"\n\n{note}" if note else "")
+        from .. import pr_description
+
+        body = await pr_description.render(wt, branch, fid, _pr_body("", f))
+        body += f"\n\n{note}" if note else ""
         if gate_out is not None:
             body += "\n\n" + _gate_failure_block(gate_out)
         body, refs_only = await self._with_source_issue_ref(f, wt, body)

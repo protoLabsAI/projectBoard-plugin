@@ -2473,6 +2473,16 @@ class DriveMixin:
                         # Reaped while the coder ran (#461): every step from here — fixups, the
                         # gate, the PR — would act on a directory that is gone. Stop now.
                         raise worktree.WorktreeMissing(wt, "removed while its coder ran")
+                    # Preserve implementation context before any gate can request a repair.
+                    from .. import pr_description
+
+                    await pr_description.record(
+                        wt,
+                        fid,
+                        _pr_body(result, feature),
+                        repair=bool(feature.get("pr_url") or self._ci_feedback.get(fid)),
+                        fallback=_pr_body("", feature),
+                    )
                     timeout_note = ""  # the dispatch that carried it has run — consumed
                     # The provider served this dispatch, so a down mark on it (#420) — set
                     # by another card, or one that was stale when every sibling was marked
@@ -2806,7 +2816,8 @@ class DriveMixin:
                                 f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
                                 "the bounce was about; nothing new to push or review"
                             )
-                    body, refs_only = await self._with_source_issue_ref(feature, wt, _pr_body(result, feature))
+                    body = await pr_description.render(wt, branch, fid, _pr_body("", feature))
+                    body, refs_only = await self._with_source_issue_ref(feature, wt, body)
                     # #533: the PR title IS the squash subject, so sanitise it with the SAME
                     # refs_only the body was stamped with (recomputed just now, not the drive-
                     # start value — a sibling may have shipped during the coding run). In

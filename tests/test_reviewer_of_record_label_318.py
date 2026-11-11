@@ -123,19 +123,21 @@ def existing(monkeypatch):
 async def test_an_adopted_existing_pr_gets_the_label_on_first_adoption(existing):
     url = await worktree.open_pr("/wt", "feat/x", title="t", body="b", labels=(ROR,))
     assert url == "https://github.com/o/r/pull/9"
-    edits = [c for c in existing.calls if c[:2] == ("pr", "edit")]
+    edits = [c for c in existing.calls if c[:2] == ("pr", "edit") and "--add-label" in c]
     assert edits == [("pr", "edit", url, "--add-label", ROR)]
 
 
 async def test_a_draft_salvage_of_an_existing_pr_is_labelled_too(existing):
     url = await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, draft=True, labels=(ROR,))
-    assert [c for c in existing.calls if c[:2] == ("pr", "edit")] == [("pr", "edit", url, "--add-label", ROR)]
+    assert [c for c in existing.calls if c[:2] == ("pr", "edit") and "--add-label" in c] == [
+        ("pr", "edit", url, "--add-label", ROR)
+    ]
 
 
 async def test_a_redispatch_never_relabels_the_cards_own_pr(existing):
     """An operator who removed the label to ask for the panel's own review keeps it removed."""
     await worktree.open_pr("/wt", "feat/x", title="t", body="b", promote_draft=False, labels=(ROR,))
-    assert not [c for c in existing.calls if c[:2] == ("pr", "edit")]
+    assert not [c for c in existing.calls if c[:2] == ("pr", "edit") and "--add-label" in c]
 
 
 async def test_reconcile_publishes_a_stranded_tree_with_the_label(monkeypatch):
