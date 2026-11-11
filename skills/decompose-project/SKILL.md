@@ -70,6 +70,11 @@ to fan out, but keep the propose→attack pairing for each.
    difficulty=…, depends_on="<blocking feature ids>", foundation=<true|false>)`.
    **`files_to_modify` is required by the Ready gate** — name the exact paths, and
    write the spec imperatively (a vague task makes a coder produce nothing).
+   - **Write it so a coder can build it in one pass.** Before creating the card, follow
+     `board-tool-reference` → "What a coder can build from": acceptance criteria are
+     observable behavior only (process rules go to `repo_conventions`), no "stop and request
+     spec repair" clauses, shared state the change depends on goes in `design` under
+     "Shared state to check", and a feature that needs 4+ authored files gets split.
    - A file the feature **creates** carries `(new)` after its path
      (`src/Badge.test.tsx (new)`, `.changeset/badge-subtle.md (new)`); every other path
      must already exist in the project's repo, or the gate refuses it.

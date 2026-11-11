@@ -92,6 +92,50 @@ async def request_salvage(fid: str, *, force: bool = False, tree: str = "") -> d
     return await loop.salvage(fid, force=force, tree=tree)
 
 
+# The card section the review gate hands the panel — bounded so a long spec never crowds out the
+# diff in the reviewers' context. Each field is capped separately so the acceptance criteria and
+# files survive a long task description.
+_REVIEW_CARD_FIELD_CAP = 2500
+
+
+def _review_card_text(feature: dict | None) -> str:
+    """The card this PR implements, rendered for the review panel (``""`` when there's nothing
+    to say). It frames intent only: scope (what the card asked for, and its starting files) and
+    the definition of done. A correctness bug in changed code is a defect whatever the card says.
+    """
+    if not isinstance(feature, dict) or not feature:
+        return ""
+
+    def _cap(text: object) -> str:
+        t = str(text or "").strip()
+        return t if len(t) <= _REVIEW_CARD_FIELD_CAP else t[:_REVIEW_CARD_FIELD_CAP].rstrip() + " …(truncated)"
+
+    title, spec, ac = _cap(feature.get("title")), _cap(feature.get("spec")), _cap(feature.get("acceptance_criteria"))
+    raw_files = feature.get("files_to_modify") or []
+    files = [str(f) for f in raw_files if str(f).strip()] if isinstance(raw_files, (list, tuple)) else []
+    if not (title or spec or ac):
+        return ""
+    parts = ["## The card this PR implements (intent, not a defect list)"]
+    if title:
+        parts.append(f"Title: {title}")
+    if spec:
+        parts.append(f"Task:\n{spec}")
+    if ac:
+        parts.append(f"Acceptance criteria:\n{ac}")
+    if files:
+        parts.append(
+            "Files the card expected to start from (a starting point, not a fence — editing a "
+            "shared module these depend on is in scope):\n" + "\n".join(f"- {f}" for f in files[:40])
+        )
+    parts.append(
+        "Use the card to judge intent. A defect in code this PR changed, or one it causes in "
+        "code it doesn't touch, is in scope whatever the card says. A finding that only asks the "
+        "PR to do more than the card asks for (a feature, behavior or case the card leaves out) "
+        "is `minor` with category `beyond-card`, never a blocker."
+    )
+    return "\n\n".join(parts)
+
+
 class ReconcileMixin:
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
     def _arm_merged_verify_exhaustion(self, store, fid: str) -> bool:
@@ -3353,7 +3397,22 @@ class ReconcileMixin:
         await self._publish_gate_verdict(
             fid, pr_url, repo, reviewed_head, state="pending", description="Review gate running…"
         )
-        output, why = await self._run_review_workflow(fid, pr_url)
+        try:
+            feature = await asyncio.to_thread(store.get_feature, fid)
+        except Exception as exc:  # noqa: BLE001 — the card is context; its absence never blocks a review
+            log.debug("[project_board] %s review gate: card unreadable for review context: %s", fid, exc)
+            feature = None
+        try:
+            card = _review_card_text(feature)
+        except Exception as exc:  # noqa: BLE001 — context only; a malformed card never blocks a review
+            log.debug("[project_board] %s review gate: card not renderable for review context: %s", fid, exc)
+            card = ""
+        if card:
+            self._review_card[fid] = card
+        try:
+            output, why = await self._run_review_workflow(fid, pr_url)
+        finally:
+            self._review_card.pop(fid, None)
         if output is None:
             # Could not review — ``why`` names the actual cause (#180: no runner +
             # no reviewer, failed panel steps, a dead call — a failed finder step is
@@ -3677,6 +3736,12 @@ class ReconcileMixin:
                 history = self._review_history(fid)
                 if history:
                     inputs["prior_findings"] = json.dumps(history)
+                # The card this PR implements: a reviewer judging the diff alone can't tell an
+                # out-of-scope finding from a defect in what was asked. The workflow engine
+                # passes undeclared inputs through, so an older recipe just ignores it.
+                card = self._review_card.get(fid, "")
+                if card:
+                    inputs["card"] = card
                 result = await _within(
                     runner(self.review_workflow, inputs),
                     self.review_gate_timeout,
@@ -3728,9 +3793,11 @@ class ReconcileMixin:
         from plugins.delegates.adapters import ADAPTERS
 
         try:
+            card = self._review_card.get(fid, "")
             msg = (
                 f"Adversarially review this pull request: {pr_url}\n\n"
-                "Read the diff, verify each suspicion against the code, and report ONLY "
+                + (f"{card}\n\n" if card else "")
+                + "Read the diff, verify each suspicion against the code, and report ONLY "
                 "evidence-backed findings as a fenced ```json array of objects "
                 '{"file", "line", "severity" (blocker|major|minor|nit), "category", '
                 '"claim", "evidence", "verdict" (confirmed|refuted|uncertain)}. '

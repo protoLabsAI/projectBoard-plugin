@@ -650,6 +650,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # round N's fix silently revert round N-1's (bd-49yo / #513). Read through
         # ``_review_history`` (tolerant of a legacy single-round flat findings value).
         self._review_prior: dict[str, str] = {}
+        # fid -> the card's intent (title, task, acceptance criteria, starting files) rendered
+        # for the review gate, set by `_review_gate_run` for the duration of one review so the
+        # panel can weigh a finding against what the card asked for (not on the diff alone).
+        self._review_card: dict[str, str] = {}
         # Features whose review gate is RUNNING in this process right now (#205).
         # The gate has two call sites — the drive (PR just opened) and the
         # reconcile's resume edge (an in_review card still review-pending) — and
