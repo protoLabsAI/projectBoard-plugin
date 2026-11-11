@@ -31,7 +31,10 @@ def setup(monkeypatch, tmp_path):
     store = Store()
     calls = []
 
-    async def run(name, prompt, *, extra_tools):
+    # Match the host's required keyword-only description; a permissive fake hid
+    # argument-binding failures before either worker could be dispatched.
+    async def run(name, prompt, *, description, extra_tools):
+        assert description and name in description
         calls.append((name, json.loads(prompt), extra_tools))
         if name == sr.NAMES[0]:
             return json.dumps(dict(proposal=[], current_behavior=[], invariants=[], missing_decisions=[]))
@@ -46,10 +49,11 @@ def setup(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(sr, "runtime", lambda: run)
-    monkeypatch.setattr(
-        "project_board.project_registry.project_registry_snapshot",
-        lambda: {"projects": [{"name": "demo", "repo": str(tmp_path)}], "default_project": "demo"},
-    )
+    from project_board.projects import default_project, resolve_projects
+
+    cfg = {"projects": {"demo": {"repo": str(tmp_path)}}}
+    store.projects = resolve_projects(cfg)
+    store.default_project = default_project(cfg)
     return store, calls
 
 
@@ -136,13 +140,67 @@ def test_stage_gaps(setup, monkeypatch, failure):
     assert len(calls) == 1 and report["persistence"] == "verified"
 
 
-def test_missing_repo(setup, monkeypatch):
+def test_missing_repo(setup):
     store, calls = setup
-    monkeypatch.setattr(
-        "project_board.project_registry.project_registry_snapshot", lambda: {"projects": [], "default_project": ""}
-    )
+    store.projects = {}
     report = asyncio.run(sr.review(store, "bd-1"))
     assert len(calls) == 1 and "repository" in report["gap"]
+
+
+@pytest.mark.parametrize(
+    "layout,project",
+    [
+        ("flat", ""),
+        ("flat", "default"),
+        ("named_flat", ""),
+        ("named_flat", "demo"),
+        ("explicit", ""),
+        ("explicit", "demo"),
+        ("multiple", "other"),
+        ("flat", "unknown"),
+        ("missing_path", ""),
+    ],
+)
+def test_tool_uses_effective_project_binding(setup, monkeypatch, tmp_path, layout, project):
+    """Real tool/config resolution and filesystem; fake SDK and comment/card store."""
+    import project_board
+
+    store, calls = setup
+    store.card["project"] = project
+    other = tmp_path / "other"
+    other.mkdir()
+    cfg = {"repo": str(tmp_path)}
+    expected = tmp_path
+    if layout == "named_flat":
+        cfg["default_project"] = "demo"
+    elif layout in {"explicit", "multiple"}:
+        cfg["projects"] = {"demo": {"repo": str(tmp_path)}}
+        if layout == "multiple":
+            cfg["projects"]["other"] = {"repo": str(other)}
+            cfg["default_project"] = "demo"
+            expected = other
+    elif layout == "missing_path":
+        cfg["repo"] = str(tmp_path / "absent")
+
+    def get_store(**kwargs):
+        store.projects = kwargs["projects"]
+        store.default_project = kwargs["default_project"]
+        return store
+
+    monkeypatch.setattr("project_board.store.get_store", get_store)
+    review_tool = next(t for t in project_board._board_tools(cfg) if t.name == "board_review_spec")
+    report = json.loads(asyncio.run(review_tool.ainvoke({"feature_id": "bd-1"})))
+    if project == "unknown" or layout == "missing_path":
+        assert len(calls) == 1
+        assert "repository" in report["gap"]
+        assert report["stages"]["readiness"]["status"] == "not_run"
+    else:
+        assert [c[0] for c in calls] == list(sr.NAMES)
+        assert report["repo"] == str(expected.resolve())
+        assert report["stages"]["readiness"]["status"] == "reported"
+        (expected / "bound.txt").write_text("selected repository")
+        assert calls[1][2][0].invoke({"path": "bound.txt"}) == "selected repository"
+    assert report["persistence"] == "verified"
 
 
 def test_read_search_boundaries(tmp_path):
@@ -181,7 +239,7 @@ def test_registered_workers_and_runtime_capability(monkeypatch):
     with pytest.raises(ValueError, match="extra_tools"):
         sr.runtime()
 
-    async def supported(name, prompt, *, extra_tools):
+    async def supported(name, prompt, *, description, extra_tools):
         return ""
 
     monkeypatch.setattr(sdk, "run_subagent", supported)

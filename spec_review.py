@@ -108,7 +108,10 @@ async def stage(run, name, payload, extra_tools):
         "metrics": {"tokens": None, "cost": None},
     }
     try:
-        raw = await asyncio.wait_for(run(name, canonical(payload), extra_tools=extra_tools), TIMEOUT)
+        raw = await asyncio.wait_for(
+            run(name, canonical(payload), description=f"Advisory spec review: {name}", extra_tools=extra_tools),
+            TIMEOUT,
+        )
         if not isinstance(raw, str) or len(raw.encode()) > MAX_OUTPUT:
             raise ValueError("worker output must be bounded JSON text")
         parsed = json.loads(raw)
@@ -181,11 +184,10 @@ async def review(store, feature_id):
         run = runtime()
         report["stages"]["comprehension"] = await stage(run, NAMES[0], {"snapshot": snap}, [])
         if report["stages"]["comprehension"]["status"] == "reported":
-            from .project_registry import project_registry_snapshot
-
-            registry = project_registry_snapshot()
-            project = snap["project"] or registry["default_project"]
-            entry = next((p for p in registry["projects"] if p["name"] == project), None)
+            # The store carries the board's effective map, including legacy flat
+            # configurations. The editor registry only exposes authored entries.
+            project = str(snap["project"] or "").strip() or store.default_project
+            entry = store.projects.get(project)
             if not entry or not entry.get("repo") or not Path(entry["repo"]).is_dir():
                 raise ValueError("missing live project repository binding/access")
             report["repo"] = str(Path(entry["repo"]).resolve())
