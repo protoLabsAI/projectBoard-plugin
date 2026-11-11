@@ -86,6 +86,7 @@ class _Gh:
         self.closed = False
         self.calls: list[tuple] = []
         self.comments: list[str] = []
+        self.body = ""
 
     def made(self, *head: str) -> list[tuple]:
         return [c for c in self.calls if c[: len(head)] == head]
@@ -101,6 +102,9 @@ class _Gh:
                 return 1, "", "GraphQL: Draft pull requests are not supported in this repository. (createPullRequest)"
             self.existing, self.is_draft = True, "--draft" in a
             return 0, self.url + "\n", ""
+        if a[:2] == ["pr", "edit"] and "--body" in a:
+            self.body = a[a.index("--body") + 1]
+            return 0, "", ""
         if a[:2] == ["pr", "view"]:
             if "url" in a:
                 return (0, self.url + "\n", "") if self.existing else (1, "", "no pull requests found")

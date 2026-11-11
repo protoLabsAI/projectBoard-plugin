@@ -481,3 +481,27 @@ def _no_review_thread_read(monkeypatch):
 
     monkeypatch.setattr(_worktree_mod, "pr_unresolved_threads", _none)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _description_io(monkeypatch, tmp_path):
+    """Fake drive paths get an isolated disk journal; GitHub is a network seam.
+
+    Real git checkouts retain the real common-directory path resolver. Tests of
+    existing bodies explicitly inject that network response.
+    """
+    from project_board import pr_description
+    import hashlib
+
+    real_path = pr_description._path
+
+    async def path(wt, fid):
+        if not wt or not os.path.exists(os.path.join(wt, ".git")):
+            return str(tmp_path / "descriptions" / (hashlib.sha256(fid.encode()).hexdigest() + ".json"))
+        return await real_path(wt, fid)
+
+    async def no_pr(wt, branch):
+        return None
+
+    monkeypatch.setattr(pr_description, "_path", path)
+    monkeypatch.setattr(pr_description, "existing_body", no_pr)

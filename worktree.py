@@ -1892,6 +1892,29 @@ async def set_aside_stranded_worktrees(
     return saved, blocking
 
 
+def _relocate_venv(path: str, old_path: str) -> None:
+    """Repair paths owned by a moved venv, without touching shared symlink targets."""
+    venv = os.path.join(path, ".venv")
+    if os.path.islink(venv):
+        return
+    bindir = os.path.join(venv, "bin")
+    if not os.path.isdir(bindir) or os.path.islink(bindir):
+        return
+    old = os.path.join(os.path.abspath(old_path), ".venv").encode()
+    new = os.path.join(os.path.abspath(path), ".venv").encode()
+    for name in os.listdir(bindir):
+        filename = os.path.join(bindir, name)
+        if os.path.islink(filename) or not os.path.isfile(filename):
+            continue
+        with open(filename, "rb") as stream:
+            data = stream.read()
+        # Console launchers (including distlib's shell wrapper) and activation
+        # scripts embed absolute paths; binaries and unrelated files stay intact.
+        if b"\0" not in data and old in data:
+            with open(filename, "wb") as stream:
+                stream.write(data.replace(old, new))
+
+
 async def promote_worktree(
     repo: str, src_wt: str, src_branch: str, fid: str, root: str = ".worktrees", title: str = ""
 ) -> tuple[str, str]:
@@ -1928,6 +1951,7 @@ async def promote_worktree(
     rc, _o, err = await _git(canon_path, "branch", "-m", src_branch, canon_branch)
     if rc != 0:
         raise WorktreeError(f"branch rename failed: {err.strip()[:200]}")
+    await asyncio.to_thread(_relocate_venv, canon_path, src_wt)
     return os.path.abspath(canon_path), canon_branch
 
 
@@ -2638,7 +2662,9 @@ async def open_pr(
     ``NoChangesError`` if the coder produced nothing (no commits vs ``base``) — the
     loop escalates that, vs a push/`gh` failure which it treats as infra → Blocked.
     Idempotent: if a PR already exists for the branch (a re-dispatch after CI fail),
-    it pushes the new commits and returns the existing PR url instead of erroring.
+    it pushes the new commits, refreshes the supplied full body, and returns the existing
+    PR url instead of erroring. Callers render the body from durable feature context and
+    the current PR text before publication, preserving operator edits and issue linkage.
 
     ``promote_draft`` (#207): when the existing PR is a DRAFT, mark it ready — meant
     for the FIRST adoption only (the card has no ``pr_url`` yet, so the draft is the
@@ -2776,6 +2802,10 @@ async def open_pr(
         vrc, vout, _ve = await _gh("pr", "view", branch, "--json", "url", "--jq", ".url", cwd=worktree)
         if vrc == 0 and vout.strip():
             url = vout.strip()
+            if body:
+                erc, _eo, eerr = await _gh("pr", "edit", url, "--body", body, cwd=worktree)
+                if erc:
+                    raise WorktreeError(f"could not refresh PR description: {eerr.strip()[:300]}")
             if wanted and (draft or promote_draft):
                 for label in wanted:
                     lrc, _lo, lerr = await _gh("pr", "edit", url, "--add-label", label, cwd=worktree)
