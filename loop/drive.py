@@ -537,6 +537,16 @@ class DriveMixin:
                 # Now its work lands on a `stranded/…` branch, the card says where, and the
                 # next boot rebuilds as before. If saving fails the tree is kept, and the
                 # card's next dispatch tries again — and blocks, naming it, if it still can't.
+                # A stranded contents-only commit cannot reconstruct a merge index or
+                # MERGE_HEAD. Restart discovery needs this exact recovery checkout.
+                if await worktree.recovery_context(wt, branch) or any(
+                    [
+                        await worktree._operation_present(wt, name)
+                        for name in ("MERGE_HEAD", "rebase-merge", "rebase-apply")
+                    ]
+                ):
+                    log.info("[project_board] recovery worktree kept on shutdown: %s", wt)
+                    continue
                 trail = await self._discard_tree(None, fid, repo, wt, branch)
                 log.info("[project_board] in-flight worktree on shutdown: %s — %s", wt, trail)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
@@ -2070,10 +2080,15 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        # Retained unpublished recovery progress survives provider retries and
+        # restart until a gate requests a repair, which needs new progress.
+        preserved_repair = False
         # #476: the commit a fix round's resumed tree started on ("" = not a resumed fix
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
         # tree records its own.
         round_start = ""
+        requirement_followup_pending = False
+        goal_followup_pending = False
         attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
@@ -2102,6 +2117,10 @@ class DriveMixin:
                         )
                         return
                 attempt += 1
+                # Scope ledger progress to the requested requirement follow-up.
+                # Later review/CI/goal/gate repairs must still change the implementation.
+                requirement_followup_round = requirement_followup_pending
+                goal_followup_round = goal_followup_pending
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -2234,8 +2253,27 @@ class DriveMixin:
                     #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
                     #    the existing diff with one coder, so it must NOT re-fan-out N.
                     #  • otherwise → one fresh worktree, one dispatch.
+                    pending = None
+                    recovery_before = None
+                    if feature.get("pr_url") and wt is None:
+                        pending = await worktree.pending_integration(repo, self.root, fid, raw_title)
+                        if pending:
+                            wt, branch = pending
+                            preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
+                            recovery = await worktree.recovery_context(wt, branch)
+                            requirement_followup_pending = bool(recovery.get("requirement_followup_pending"))
+                            requirement_followup_round = requirement_followup_pending
+                            goal_followup_pending = bool(recovery.get("goal_followup_pending"))
+                            goal_followup_round = goal_followup_pending
+                            keep_wt = True
+                            # A deleted PR branch leaves this checkout as the only copy of
+                            # the recovery work: continue it (publishing recreates the branch)
+                            # instead of blocking every later dispatch. An unreachable remote
+                            # still raises IntegrationRequired.
+                            round_start = await worktree.recovery_round_start(wt, branch)
                     reusing = keep_wt and wt is not None
                     if not reusing:
+                        preserved_repair = False
                         round_start = ""  # a fresh tree: only a resumed checkout records one
                         # A FRESH build first clears the ground, and the two halves are one
                         # rule (#405). This drive's own earlier attempt is its to throw away:
@@ -2281,6 +2319,14 @@ class DriveMixin:
                             # — misread as a pre-model infra failure — so say what happened.
                             raise worktree.WorktreeMissing(wt, "before its keep-worktree re-dispatch")
                         self._inflight[fid] = (repo, wt, branch)
+                        if feature.get("pr_url") and (pending or await worktree.recovery_context(wt, branch)):
+                            from .prompt import integration_feedback
+
+                            context = await worktree.prepare_integration(wt, branch, base)
+                            recovery_before = await worktree.recovery_edit_state(wt)
+                            self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                            prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                            prompt += work_location_capture.reporting_instructions()
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
                         # keeps the prior history rather than blanking on a keep-worktree fix).
@@ -2301,7 +2347,9 @@ class DriveMixin:
                                 new_dispatch=True,
                             )
                         )
-                    elif self._use_coder_solve(feature) and not self._ci_feedback.get(fid):
+                    elif (
+                        self._use_coder_solve(feature) and not self._ci_feedback.get(fid) and not feature.get("pr_url")
+                    ):
                         files_to_modify = feature.get("files_to_modify") or []
                         # #90: every solve() knob resolves from THIS feature's project.
                         solve = self._coder_solve_settings(feature)
@@ -2376,7 +2424,7 @@ class DriveMixin:
                             )
                         )
                         self._inflight[fid] = (repo, wt, branch)
-                    elif self.max_mode_n > 1 and not self._ci_feedback.get(fid):
+                    elif self.max_mode_n > 1 and not self._ci_feedback.get(fid) and not feature.get("pr_url"):
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch, result = await self._dispatch_captured(
                             self._dispatch_max_mode(feature, coder, prompt, repo, base, fid, tier)
@@ -2388,14 +2436,30 @@ class DriveMixin:
                         # the coder sees the change it is being asked to correct (#332 —
                         # three 30-minute rounds off a clean base, zero commits).
                         wt, branch = await worktree.create_worktree(
-                            repo, base, fid, self.root, title=raw_title, resume=bool(feature.get("pr_url"))
+                            repo,
+                            base,
+                            fid,
+                            self.root,
+                            title=raw_title,
+                            resume=bool(feature.get("pr_url")),
+                            integrate=bool(feature.get("pr_url")),
                         )
                         self._inflight[fid] = (repo, wt, branch)  # track for shutdown reaping
                         # #476: the commit this fix round STARTS on — the PR head it resumed. A
                         # round that ends here changed nothing. Recorded now, never re-read from
                         # the live remote ref, which a coder's own push would move.
                         round_start = await worktree.checkout_head_sha(wt) if feature.get("pr_url") else ""
+                        if feature.get("pr_url"):
+                            from .prompt import integration_feedback
+
+                            context = await worktree.recovery_context(wt, branch)
+                            if context:
+                                self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                                prompt += work_location_capture.reporting_instructions()
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
+                        if feature.get("pr_url") and context:
+                            recovery_before = await worktree.recovery_edit_state(wt)
                         result = await self._dispatch_captured(
                             coder_seam.dispatch_coder_tapped(
                                 coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
@@ -2422,7 +2486,15 @@ class DriveMixin:
                     # gate still checks the in-hand merged ledger), but a re-dispatch
                     # after requeue re-projects from the bead, so a lost write only
                     # costs a repeat disposition, never a false "disposed".
+                    # Consume the drive-local follow-up when a reply reaches ledger
+                    # processing. Its journal survives restart until a gate requests
+                    # new edits or publication retires it. Provider retries retain it.
+                    requirement_followup_pending = False
+                    goal_followup_pending = False
                     ledger = list(feature.get("requirements") or [])
+                    open_before = {
+                        str(i.get("id")) for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")
+                    }
                     if ledger:
                         ledger = apply_requirement_dispositions(ledger, _parse_requirements_reply(result or ""))
                         feature["requirements"] = ledger
@@ -2435,6 +2507,32 @@ class DriveMixin:
                                 fid,
                                 exc_info=True,
                             )
+                    ledger_progress = requirement_followup_round and any(
+                        str(i.get("id")) in open_before and i.get("status") in ("done", "declined") for i in ledger
+                    )
+                    # Malformed/silent follow-ups reach the bounded requirement gate;
+                    # only actual ledger progress can authorize publication.
+                    requirement_retry = requirement_followup_round and not _all_items_disposed(ledger)
+                    # A requested declaration may reach verification; the marker itself
+                    # does not satisfy the verifier or authorize publication.
+                    goal_progress = goal_followup_round and _no_test_marker(result or "") is not None
+                    if feature.get("pr_url") and wt:
+                        recovery_unchanged = (
+                            recovery_before is not None and recovery_before == await worktree.recovery_edit_state(wt)
+                        )
+                        await worktree.finish_integration(wt, branch, base)
+                        if preserved_repair:
+                            preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
+                        if recovery_unchanged and not (
+                            preserved_repair or ledger_progress or requirement_retry or goal_progress
+                        ):
+                            raise worktree.NoChangesError(
+                                "fix round produced no commit or edits beyond the board-prepared integration; "
+                                "nothing new to push or review"
+                            )
+                        # Keep durable provenance until a gate requests a repair.
+                        # Restart before verification/publication still owns this candidate.
+                        preserved_repair = False
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
@@ -2448,6 +2546,8 @@ class DriveMixin:
                             # the same tier, bounded by goal_fix_max, BEFORE escalating.
                             n = await self._budget_get(store, fid, "goal-fix", feature)
                             if n < self.goal_fix_max:
+                                await worktree.consume_recovery_progress(wt, branch, goal_followup=True)
+                                goal_followup_pending = True
                                 await self._budget_set(store, fid, "goal-fix", n + 1)
                                 # KEEP the worktree (the impl is in its files); the coder
                                 # only ADDS what the reviewer flagged. The diff is on disk,
@@ -2481,6 +2581,7 @@ class DriveMixin:
                     if gate_out is not None:
                         n = await self._budget_get(store, fid, "gate-fix", feature)
                         if n < self.local_gate_max:
+                            await worktree.consume_recovery_progress(wt, branch)
                             await self._budget_set(store, fid, "gate-fix", n + 1)
                             self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
                             self._ci_feedback[fid] = (
@@ -2584,6 +2685,8 @@ class DriveMixin:
                                     tier or "default",
                                 )
                                 keep_wt = True
+                                await worktree.request_requirement_followup(wt, branch)
+                                requirement_followup_pending = True
                                 continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
@@ -2622,6 +2725,8 @@ class DriveMixin:
                                 tier or "default",
                             )
                             keep_wt = True
+                            await worktree.request_requirement_followup(wt, branch)
+                            requirement_followup_pending = True
                             continue
                         raise worktree.WorktreeError(
                             f"requirements unresolved: {len(open_items)} item(s) still open after "
@@ -2695,7 +2800,7 @@ class DriveMixin:
                         # (NoChangesError: counted, escalated or blocked like any empty build),
                         # never "coder done", and never a re-review of the head the bounce was about.
                         still = await worktree.fix_round_unchanged(wt, round_start)
-                        if still:
+                        if still and not ledger_progress:
                             raise worktree.NoChangesError(
                                 f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
                                 "the bounce was about; nothing new to push or review"
@@ -2743,6 +2848,18 @@ class DriveMixin:
                             why="it finished and published, but the card had moved on",
                         )
                         return
+                except worktree.IntegrationRequired as exc:
+                    # Preserve the merge index and unique edits. Recovery is not a review/CI round.
+                    from .prompt import integration_feedback
+
+                    context = await worktree.recovery_context(wt, branch) if wt and branch else {}
+                    if context:
+                        self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
+                    await self._block_or_stand_aside(
+                        store, fid, str(exc), repo=repo, wt=wt, branch=branch, category="merge-conflict"
+                    )
+                    self._inflight.pop(fid, None)
+                    return
                 except (worktree.NoChangesError, worktree.WorktreeError) as exc:
                     missing_findings_note = (
                         "fix round dispatched without review findings (lost on restart?) — "

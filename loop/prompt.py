@@ -423,3 +423,24 @@ class PromptMixin:
             f"- You are done when the behavior is correct for every caller and shared state "
             f"your change touches, tests cover it, and every acceptance criterion is satisfied."
         )
+
+
+def integration_prompt(context: dict) -> str:
+    """Fresh board evidence supersedes stale conflict feedback on every dispatch."""
+    return (
+        "\n## Current board-prepared base integration\n"
+        f"Feature head: {context['head_sha']}; pinned base: {context['base_sha']}.\n"
+        f"Pinned merge target: {context.get('integration_sha', context['base_sha'])}.\n"
+        f"Actual conflict paths: {', '.join(context['conflict_paths']) or 'none'}.\n"
+        "This replaces earlier conflict-path reports. The board owns the merge and Git metadata. "
+        "Edit files only, resolve conflict markers, and preserve both feature and sibling behavior. "
+        "Do not commit, stage, abort, merge, or rebase. The board will complete and verify ancestry.\n"
+    )
+
+
+def integration_feedback(previous: str, context: dict) -> str:
+    """Replace conflict evidence without dropping unrelated review/CI findings."""
+    if previous.startswith("Your branch now CONFLICTS"):
+        previous = ""
+    previous = previous.split("\n## Current board-prepared base integration", 1)[0]
+    return previous + integration_prompt(context)

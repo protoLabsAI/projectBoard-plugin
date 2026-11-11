@@ -7,8 +7,8 @@ Y" reason, which must match what the loop's own prefer_live_sibling / prefer_hea
 return for the same inputs."""
 
 import copy
-import time
 from collections import Counter
+from concurrent.futures import Future
 from threading import Lock
 
 import pytest
@@ -222,25 +222,73 @@ async def test_endpoint_reads_each_usage_once_per_request(monkeypatch):
             assert calls == Counter(dict.fromkeys(("sonnet", "codex", "base", "account", "custom"), request_count))
 
 
-async def test_endpoint_usage_reads_share_one_deadline(monkeypatch):
-    budget = 0.08
+@pytest.mark.parametrize("submission_cost", [0.05, 0.2])
+async def test_endpoint_usage_reads_share_one_deadline(monkeypatch, submission_cost):
+    # Control scheduling and time: HTTP/thread scheduling on a busy CI runner is
+    # not part of the usage budget. Exercise the real read callback at both sides
+    # of the deadline, including a host read that completes too late.
+    budget = 1.0
+    now = 100.0
+    deadline = now + budget
     monkeypatch.setattr(routing, "EFFECTIVE_USAGE_BUDGET_SECONDS", budget)
-    # More slow reads than pool workers also exercises cancellation of queued work.
+    monkeypatch.setattr(routing, "monotonic", lambda: now)
     names = ["fast", *(f"slow{i}" for i in range(8))]
+    submitted = {}
+    calls = []
+    waits = []
+    shutdowns = []
 
     def usage(delegate):
+        nonlocal now
+        calls.append(delegate)
         if delegate != "fast":
-            time.sleep(0.6)
+            now = deadline + 1
         return {"usable": True, "headroom_pct": 70}
 
+    class Pool:
+        def __init__(self, *, max_workers, thread_name_prefix):
+            assert max_workers == 4
+
+        def submit(self, read, name):
+            nonlocal now
+            future = Future()
+            submitted[future] = (read, name)
+            if name == "fast":
+                future.set_result(read(name))
+            now += submission_cost  # submission overhead consumes the same shared budget
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            shutdowns.append((wait, cancel_futures))
+            if cancel_futures:
+                for future in submitted:
+                    if not future.done():
+                        future.cancel()
+
+    def wait_for_usage(futures, *, timeout):
+        waits.append(timeout)
+        assert set(futures) == set(submitted)
+        for future, (read, name) in submitted.items():
+            if name in ("slow0", "slow1"):
+                # With budget left, slow0 starts in time but finishes late.
+                # After expiry neither read may reach the provider.
+                # Remaining work stays queued.
+                future.set_result(read(name))
+        done = {future for future in futures if future.done()}
+        return done, set(futures) - done
+
+    monkeypatch.setattr(routing, "ThreadPoolExecutor", Pool)
+    monkeypatch.setattr(routing, "wait", wait_for_usage)
     app = _app({"coders": {"standard": names}}, provider_usage=usage, monkeypatch=monkeypatch)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         client.headers["authorization"] = "Bearer operator"
-        start = time.monotonic()
         response = await client.get("/api/plugins/project_board/routing/effective")
-        elapsed = time.monotonic() - start
     assert response.status_code == 200
-    assert elapsed < budget + 0.2
+    remaining = max(0, budget - len(names) * submission_cost)
+    assert waits == [pytest.approx(remaining)]
+    assert calls == (["fast", "slow0"] if remaining else ["fast"])
+    assert shutdowns == [(False, True)]
+    assert sum(future.cancelled() for future in submitted) == 6
     rows = {row["name"]: row["headroom"] for row in _project(response.json())["delegates"]}
     assert rows == {name: 70 if name == "fast" else "unknown" for name in names}
 

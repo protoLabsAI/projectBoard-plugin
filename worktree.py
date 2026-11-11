@@ -568,6 +568,19 @@ async def _unique_commits(where: str, branch: str = "", base: str = "", *, head:
     return len(unique)
 
 
+async def recovery_edit_state(path: str) -> tuple:
+    """Snapshot coder output without staging or completing the prepared merge."""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    head = await _git_required(path, "rev-parse", "HEAD")
+    diff = await _git_required(path, "diff", "--binary", "HEAD", "--", ".", *excludes)
+    names = await _git_required(path, "ls-files", "--others", "--exclude-standard", "-z", "--", ".", *excludes)
+    untracked = []
+    for name in names.split("\0"):
+        if name and not _is_board_link(path, name):
+            untracked.append((name, await _conflict_output(path, name)))
+    return head, diff, untracked
+
+
 async def fix_round_unchanged(path: str, start_sha: str) -> str:
     """The head a FIX ROUND ended on when it changed nothing (#476), else ``""``.
 
@@ -1018,7 +1031,14 @@ async def prune_stale_worktrees(repo: str) -> str:
 
 
 async def create_worktree(
-    repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "", *, resume: bool = False
+    repo: str,
+    base: str,
+    fid: str,
+    root: str = ".worktrees",
+    title: str = "",
+    *,
+    resume: bool = False,
+    integrate: bool = False,
 ) -> tuple[str, str]:
     """``git worktree add <root>/feat-<id>[-<slug>] -b feat/<id>[-<slug>] <base>``.
 
@@ -1054,6 +1074,26 @@ async def create_worktree(
     branch = branch_name(fid, title)
     rel = os.path.join(root, worktree_dir(fid, title))
     path = os.path.join(repo, rel)
+    if (
+        resume
+        and os.path.exists(os.path.join(path, ".git"))
+        and (await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"))
+    ):
+        raise IntegrationRequired(f"Interrupted rebase preserved in {path}; complete it before recovery")
+    if (
+        resume
+        and os.path.exists(os.path.join(path, ".git"))
+        and (await _operation_present(path, "MERGE_HEAD") or await _unpublished_recovery(path, branch))
+    ):
+        # A recovery may hold an unfinished merge OR an unpublished resolution commit.
+        # Keep both across a restart; neither can be reconstructed from the remote head.
+        current = await _git_required(path, "branch", "--show-current")
+        if current != branch:
+            raise WorktreeError(f"Interrupted integration belongs to {current}, not {branch}")
+        await _git_required(path, "fetch", "origin")
+        if integrate:
+            await prepare_integration(path, branch, base)
+        return path, branch
     # Preventive: drop stale worktree admin entries before touching anything (#225).
     await prune_stale_worktrees(repo)
     # The cleanup below is `remove --force` + `branch -D`. On a tree whose coder died
@@ -1079,9 +1119,13 @@ async def create_worktree(
     if resume:
         # Best-effort: fetch the feature branch and start from it when it exists, so the
         # coder opens its own prior work instead of a clean base.
-        await _git(repo, "fetch", "origin", branch)
-        rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
-        if rc == 0:
+        if integrate:
+            exists = await _fetch_feature(repo, branch)
+        else:
+            await _git(repo, "fetch", "origin", branch)
+            rc, _out, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
+            exists = rc == 0
+        if exists:
             start = f"origin/{branch}"
             log.info("[project_board] %s resuming existing branch %s for a fix round", fid, branch)
         else:
@@ -1145,6 +1189,8 @@ async def create_worktree(
     # node_modules in (best-effort, no-op for non-node repos) rather than a slow/offline
     # per-worktree install.
     await asyncio.to_thread(link_node_modules, repo, abspath)
+    if integrate:
+        await prepare_integration(abspath, branch, base)
     return abspath, branch
 
 
@@ -2115,13 +2161,461 @@ async def _gh(*args: str, cwd: str, timeout: float = 60) -> tuple[int, str, str]
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
+class IntegrationRequired(WorktreeError):
+    """The candidate must return to conflict resolution before any review."""
+
+
+async def _git_required(path: str, *args: str) -> str:
+    rc, out, err = await _git(path, *args, timeout=120)
+    if rc:
+        error = IntegrationRequired if args[0] == "fetch" else WorktreeError
+        raise error(f"git {args[0]} failed: {(err or out).strip()[:300]}")
+    return out.strip()
+
+
+async def _recovery_path(path: str, branch: str) -> str:
+    common = await _git_required(path, "rev-parse", "--git-common-dir")
+    directory = os.path.join(os.path.abspath(os.path.join(path, common)), "board-recovery")
+    return os.path.join(directory, branch.replace("/", "_") + ".json")
+
+
+async def recovery_context(path: str, branch: str) -> dict:
+    """Repository-owned journal survives worktree replacement and loop restart."""
+    if not path or not os.path.exists(os.path.join(path, ".git")):
+        return {}
+    filename = await _recovery_path(path, branch)
+    if not os.path.exists(filename):
+        return {}
+    with open(filename) as stream:
+        return json.load(stream)
+
+
+async def _record_recovery(path: str, branch: str, context: dict) -> None:
+    filename = await _recovery_path(path, branch)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    temporary = filename + ".tmp"
+    with open(temporary, "w") as stream:
+        json.dump(context, stream)
+    os.replace(temporary, filename)
+
+
+async def _operation_present(path: str, name: str) -> bool:
+    filename = await _git_required(path, "rev-parse", "--git-path", name)
+    return bool(filename) and os.path.exists(os.path.join(path, filename))
+
+
+async def _fetch_feature(path: str, branch: str) -> bool:
+    """Distinguish a deleted branch from an unavailable remote, without stale refs."""
+    rc, out, err = await _git(path, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}")
+    if rc == 2:
+        return False
+    if rc:
+        raise IntegrationRequired(f"git fetch failed: {(err or out).strip()[:300]}")
+    await _git_required(path, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    return True
+
+
+async def _guard_published_rewind(path: str, context: dict, remote_head: str) -> None:
+    """Do not republish removed ancestry merely because new local work exists.
+
+    Keep the checkout intact: choosing how to replay work after an external history
+    rewrite is separate from merging a newer base. This also guards callers that
+    already hold a worktree and therefore bypass pending_integration.
+    """
+    published = context.get("published_head_sha")
+    if not published or not remote_head:
+        return
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", published, remote_head)
+    if rc == 0:
+        return
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify previously published recovery ancestry")
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", published, "HEAD")
+    if rc == 0:
+        raise IntegrationRequired(
+            f"PR history was rewritten after publication ({published} -> {remote_head}); "
+            f"local work preserved in {path}. Reconcile local work onto the current PR head "
+            "without restoring removed commits before retrying"
+        )
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify local recovery ancestry")
+
+
+async def _unpublished_recovery(path: str, branch: str) -> bool:
+    context = await recovery_context(path, branch)
+    if not context:
+        return False
+    present = await _fetch_feature(path, branch)
+    # Publication is durable evidence even if the remote later rewinds or deletes
+    # the branch. Subsequent local commits/edits must not resurrect removed history.
+    if context.get("published_head_sha") == await _git_required(path, "rev-parse", "HEAD"):
+        if not await _git_required(path, "status", "--porcelain"):
+            return False
+    if present:
+        await _guard_published_rewind(path, context, await _git_required(path, "rev-parse", f"origin/{branch}"))
+    if not present:
+        return True  # Preserve the only remaining copy of recovery work.
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
+    # A journal is evidence, not ownership of the checkout forever. Once its
+    # commits are on the remote, a clean checkout must resume the latest PR head.
+    return bool(rc or await _git_required(path, "status", "--porcelain"))
+
+
+async def preserved_recovery_progress(path: str, branch: str) -> bool:
+    """Prove retained coder work against board provenance and the current PR head.
+
+    Divergence or a journal alone is not a repair. Uncommitted output must differ
+    from the prepared snapshot on the same head; committed output must contain a
+    board-recorded repair still unpublished and not already accepted for this tree.
+    Integration checks remain mandatory.
+    """
+    context = await recovery_context(path, branch)
+    if not context:
+        return False
+    remote = await recovery_round_start(path, branch)
+    await _guard_published_rewind(path, context, remote)
+    state = await recovery_edit_state(path)
+    baseline = context.get("prepared_edit_state")
+    if baseline and baseline[0] == state[0] and baseline != json.loads(json.dumps(state)):
+        return True
+    repair = context.get("repair_head_sha")
+    if not repair:
+        return False
+    if context.get("consumed_repair") == {
+        "repair_head_sha": repair,
+        "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
+    }:
+        return False
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", repair, "HEAD")
+    if rc:
+        return False
+    if not remote:
+        return True
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", repair, remote)
+    if rc != 1:
+        return False
+    # A concurrent publisher may already have supplied the same resolution under
+    # another commit. Compare against what the authoritative PR plus base contains,
+    # not just commit identity (a clean board merge alone is never a repair).
+    rc, out, _ = await _git(path, "merge-tree", "--write-tree", remote, context["base_sha"])
+    if rc == 0:
+        return out.splitlines()[0] != await _git_required(path, "rev-parse", "HEAD^{tree}")
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify unpublished recovery contents")
+    return True
+
+
+async def consume_recovery_progress(path: str, branch: str, *, goal_followup: bool = False) -> None:
+    """Persist a repair request and its optional declaration-only goal follow-up.
+
+    Record both together so a restart cannot lose the permitted non-tree response.
+    Other repair requests retire that intent along with candidate progress.
+    """
+    context = await recovery_context(path, branch)
+    if not context:
+        return
+    # Fixups run after integration and can leave edits outside HEAD. They belong
+    # to the candidate the gate rejected, not to the next coder repair. Preserve
+    # them before recording consumption, and start edit detection at this exact
+    # candidate so prepare/finish_integration cannot rediscover them as progress.
+    await commit_worktree(path, "Preserve candidate before gate repair")
+    context["prepared_edit_state"] = await recovery_edit_state(path)
+    context["requirement_followup_pending"] = False
+    context["goal_followup_pending"] = goal_followup
+    if context.get("repair_head_sha"):
+        context["consumed_repair"] = {
+            "repair_head_sha": context["repair_head_sha"],
+            "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
+        }
+    await _record_recovery(path, branch, context)
+
+
+async def request_requirement_followup(path: str, branch: str) -> None:
+    """Keep the completion gate's text-only request across process restarts."""
+    context = await recovery_context(path, branch)
+    if context:
+        context["goal_followup_pending"] = False
+        context["requirement_followup_pending"] = True
+        await _record_recovery(path, branch, context)
+
+
+async def recovery_round_start(path: str, branch: str) -> str:
+    """The PR head a resumed recovery round starts on (#476's ``round_start``).
+
+    A recovery checkout outlives its PR branch on purpose: ``_unpublished_recovery`` keeps
+    it when the remote branch was deleted, because it is then the only copy of the work. So
+    a deleted branch answers ``""`` (no no-change judgement) and the round continues; the
+    lease in ``open_pr`` expects the branch absent and recreates it. Only an UNREACHABLE
+    remote raises ``IntegrationRequired``: that is transient, and pushing blind is unsafe."""
+    if not await _fetch_feature(path, branch):
+        return ""
+    return await _git_required(path, "rev-parse", f"origin/{branch}")
+
+
+async def pending_integration(repo: str, root: str, fid: str, title: str) -> tuple[str, str] | None:
+    path = os.path.abspath(os.path.join(repo, root, worktree_dir(fid, title)))
+    if not os.path.exists(os.path.join(path, ".git")):
+        return None
+    if os.path.isdir(path) and (
+        await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply")
+    ):
+        return path, branch_name(fid, title)
+    branch = branch_name(fid, title)
+    if await _operation_present(path, "MERGE_HEAD") or await _unpublished_recovery(path, branch):
+        if await _git_required(path, "branch", "--show-current") == branch:
+            return path, branch
+    return None
+
+
+async def _board_commit(path: str, branch: str, context: dict, message: str) -> bool:
+    """Commit as the board, classifying what the commit carries; True for coder output.
+
+    The progress invariant: coder progress is only output that differs from the board's
+    own snapshot taken at the same HEAD. Every board write (base/PR-head merge, formatter
+    fixups, preservation commits) is absorbed into that snapshot, and a consumed repair
+    stays consumed across board-only commits. Only coder output mints ``repair_head_sha``.
+    """
+    journaled = bool(context)
+    baseline = context.get("prepared_edit_state")
+    state = json.loads(json.dumps(await recovery_edit_state(path)))
+    coder = bool(baseline and baseline[0] == state[0] and baseline != state)
+    tree = await _git_required(path, "rev-parse", "HEAD^{tree}")
+    await commit_worktree(path, message)
+    consumed = context.get("consumed_repair")
+    if coder:
+        context["repair_head_sha"] = await _git_required(path, "rev-parse", "HEAD")
+        context.pop("consumed_repair", None)
+    elif consumed and consumed.get("tree_sha") == tree:
+        consumed["tree_sha"] = await _git_required(path, "rev-parse", "HEAD^{tree}")
+    if journaled:
+        context["prepared_edit_state"] = await recovery_edit_state(path)
+        await _record_recovery(path, branch, context)
+    return coder
+
+
+async def prepare_integration(path: str, branch: str, base: str) -> dict:
+    """Pin a fetched base and merge it with the feature; only the board writes Git.
+
+    Keep the real merge index/MERGE_HEAD while the coder edits ordinary files.
+    Never abort an interrupted operation or discard a previous resolution.
+    Pin the default merge driver to built-in text for paths without an attribute.
+    """
+    await _git_required(path, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    base_sha = await _git_required(path, "rev-parse", f"origin/{base}")
+    fetched_base_sha = base_sha
+    remote_head = ""
+    if await _fetch_feature(path, branch):
+        remote_head = await _git_required(path, "rev-parse", f"origin/{branch}")
+    previous = await recovery_context(path, branch)
+    await _guard_published_rewind(path, previous, remote_head)
+    head_sha = await _git_required(path, "rev-parse", "HEAD")
+    if await _operation_present(path, "rebase-merge") or await _operation_present(path, "rebase-apply"):
+        raise IntegrationRequired("Interrupted rebase preserved; board integration requires completion before dispatch")
+    fresh_merge = False
+    if await _operation_present(path, "MERGE_HEAD"):
+        # Resume the exact pinned merge first; finish_integration reconciles any newer base.
+        integration_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
+        base_sha = previous.get("base_sha", integration_sha)
+    else:
+        # Preserve overlapping retained edits as feature history before starting a merge.
+        # Retained coder output keeps its provenance; the merge below is the board's.
+        fresh_merge = True
+        await _board_commit(path, branch, previous, "Preserve retained edits before base integration")
+        head_sha = await _git_required(path, "rev-parse", "HEAD")
+        integration_sha = base_sha
+        rc, out, err = await _git(
+            path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
+        )
+        if rc and not await _operation_present(path, "MERGE_HEAD"):
+            raise WorktreeError(f"integration failed: {(err or out).strip()[:300]}")
+        if previous:
+            # The merge is board output: the next commit must not count it as a repair.
+            previous["prepared_edit_state"] = await recovery_edit_state(path)
+    paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
+    if not paths and remote_head:
+        rc, _, _ = await _git(path, "merge-base", "--is-ancestor", remote_head, "HEAD")
+        if rc:
+            # Complete a clean merge before integrating concurrent PR work.
+            # Conflicted merges stay intact for the edit-only coder.
+            await _board_commit(path, branch, previous, "Complete pinned integration before updated PR head")
+            fresh_merge = True
+            integration_sha = remote_head
+            rc, out, err = await _git(
+                path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", remote_head, timeout=120
+            )
+            if rc and not await _operation_present(path, "MERGE_HEAD"):
+                raise WorktreeError(f"PR head integration failed: {(err or out).strip()[:300]}")
+            paths = await _git_required(path, "diff", "--name-only", "--diff-filter=U")
+    await _snapshot_conflict_output(path)
+    context = {
+        "kind": "merge",
+        "integration_sha": integration_sha,
+        "remote_head_sha": remote_head,
+        "base": base,
+        "base_sha": base_sha,
+        "fetched_base_sha": fetched_base_sha,
+        "head_sha": head_sha,
+        "conflict_paths": paths.splitlines(),
+        "published_head_sha": previous.get("published_head_sha", ""),
+        "repair_head_sha": previous.get("repair_head_sha", ""),
+        "consumed_repair": previous.get("consumed_repair"),
+        "goal_followup_pending": previous.get("goal_followup_pending", False),
+        "requirement_followup_pending": previous.get("requirement_followup_pending", False),
+    }
+    state = json.loads(json.dumps(await recovery_edit_state(path)))
+    baseline = previous.get("prepared_edit_state")
+    # A merge the board just prepared is board output: snapshot after it, so its
+    # changes can never read as coder progress. A resumed merge keeps the snapshot
+    # taken when it was prepared, so coder edits made since then stay detectable.
+    keep = not fresh_merge and baseline and baseline[0] == state[0]
+    context["prepared_edit_state"] = baseline if keep else state
+    await _record_recovery(path, branch, context)
+    return context
+
+
+async def refresh_integration_context(
+    repo: str, branch: str, base: str, *, root: str = ".worktrees", recovery_path: str | None = None
+) -> dict:
+    """Refresh evidence from preserved work, or probe the latest available remote head."""
+    if recovery_path:
+        return await prepare_integration(recovery_path, branch, base)
+    await _git_required(repo, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    present = await _fetch_feature(repo, branch)
+    start = f"origin/{branch}" if present else f"origin/{base}"
+    directory = os.path.abspath(os.path.join(repo, root))
+    os.makedirs(directory, exist_ok=True)
+    path = tempfile.mkdtemp(prefix=".integration-", dir=directory)
+    try:
+        await _git_required(repo, "worktree", "add", "--detach", path, start)
+        return await prepare_integration(path, branch, base)
+    finally:
+        await _git(repo, "worktree", "remove", "--force", path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+
+
+async def finish_integration(path: str, branch: str, base: str) -> None:
+    """Complete the pinned merge, reconcile base movement, and prove ancestry."""
+    context = await recovery_context(path, branch)
+    if not context:
+        return
+    await _board_commit(path, branch, context, "Integrate current base and resolve conflicts")
+    rc, _, _ = await _git(
+        path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"
+    )
+    if rc:
+        raise IntegrationRequired("Candidate does not integrate the pinned base")
+    context = await prepare_integration(path, branch, base)
+    if context["conflict_paths"]:
+        raise IntegrationRequired("Base or PR head advanced during recovery; resolve the refreshed conflict paths")
+    await _board_commit(path, branch, context, "Integrate updated base")
+    await _git_required(path, "merge-base", "--is-ancestor", context["base_sha"], "HEAD")
+    if await _git_required(path, "ls-files", "--unmerged"):
+        raise IntegrationRequired("Unresolved index entries prevent publication")
+
+
+async def _conflict_output(path: str, name: str) -> dict:
+    filename = os.path.join(path, name)
+    if os.path.islink(filename):
+        return {"kind": "symlink", "target": os.readlink(filename)}
+    if os.path.isfile(filename):
+        return {"kind": "file", "sha": await _git_required(path, "hash-object", "--", name)}
+    if not os.path.lexists(filename):
+        return {"kind": "absent"}
+    if os.path.isdir(filename):
+        # Git leaves gitlink directories in place on conflict. Record them so
+        # an edit-only deletion or replacement can be distinguished from untouched
+        # merge output; directory contents alone do not resolve a gitlink.
+        return {"kind": "directory"}
+    raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+
+
+async def _snapshot_conflict_output(path: str) -> dict:
+    """Keep initial merge output in worktree Git metadata across retries.
+
+    Failed custom drivers can leave arbitrary markerless bytes, not stage 2.
+    Scope the snapshot to the exact merge and index; never rebaseline coder edits.
+    An interrupted merge without a snapshot conservatively requires another edit.
+    """
+    entries = await _git_required(path, "ls-files", "--unmerged", "-z")
+    if not entries:
+        return {}
+    filename = await _git_required(path, "rev-parse", "--git-path", "board-conflict-output.json")
+    filename = os.path.join(path, filename)
+    identity = {
+        "head": await _git_required(path, "rev-parse", "HEAD"),
+        "merge": await _git_required(path, "rev-parse", "MERGE_HEAD"),
+        "entries": entries,
+    }
+    if os.path.exists(filename):
+        with open(filename) as stream:
+            previous = json.load(stream)
+        if previous["identity"] == identity:
+            return previous["outputs"]
+    names = {entry.split("\t", 1)[1] for entry in entries.split("\0") if entry}
+    outputs = {name: await _conflict_output(path, name) for name in names}
+    with open(filename + ".tmp", "w") as stream:
+        json.dump({"identity": identity, "outputs": outputs}, stream)
+    os.replace(filename + ".tmp", filename)
+    return outputs
+
+
+async def _check_unmerged_edits(path: str) -> None:
+    """Require unmerged paths with side content to differ from their snapshot.
+
+    An interrupted merge without a snapshot baselines at the current tree and
+    needs one more edit per path with stage 2 or 3 content, text files included.
+    Failing closed is intentional; Git's marker check still validates text edits.
+    """
+    entries = await _git_required(path, "ls-files", "--unmerged", "-z")
+    conflicts: dict[str, dict[str, tuple[str, str]]] = {}
+    for entry in entries.split("\0"):
+        if not entry:
+            continue
+        info, name = entry.split("\t", 1)
+        mode, sha, stage = info.split()
+        conflicts.setdefault(name, {})[stage] = (mode, sha)
+    outputs = await _snapshot_conflict_output(path) if conflicts else {}
+    for name, stages in conflicts.items():
+        for mode, _sha in stages.values():
+            if mode not in ("100644", "100755", "120000", "160000"):
+                raise IntegrationRequired(f"Unresolved special-file conflict: {name}")
+        # Both sides removed a stage-1-only path (e.g. a rename/rename source).
+        # Remaining absent is resolved; recreating it is also allowed.
+        if set(stages) == {"1"}:
+            continue
+        # Stage 2 is not evidence of an edit: a failed driver may change it.
+        unchanged = await _conflict_output(path, name) == outputs[name]
+        if unchanged:
+            raise IntegrationRequired(f"Unresolved markerless conflict requires an explicit resolution: {name}")
+
+
 async def commit_worktree(worktree: str, message: str) -> None:
     """Commit whatever the coder left uncommitted in the worktree. No-op if the
     tree is clean (the coder may have committed its own work)."""
+    if await _operation_present(worktree, "rebase-merge") or await _operation_present(worktree, "rebase-apply"):
+        raise IntegrationRequired("Interrupted rebase must be completed before committing or publishing")
+    merging = await _operation_present(worktree, "MERGE_HEAD")
+    await _check_unmerged_edits(worktree)
+    # Disable whitespace diagnostics, retaining Git's conflict-marker detection.
+    # Whitespace in either side's changes is not an unresolved merge conflict.
+    marker_check = ("-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab", "diff")
+    if merging:
+        rc, out, err = await _git(worktree, *marker_check, "--check")
+        if rc:
+            raise IntegrationRequired(f"Unresolved merge content: {(out or err).strip()[:300]}")
     _rc, out, _err = await _git(worktree, "status", "--porcelain")
-    if not out.strip():
+    if not out.strip() and not merging:
         return
-    await stage_all(worktree)
+    rc, out, err = await stage_all(worktree)
+    if rc:
+        raise WorktreeError(f"staging failed: {(err or out).strip()[:200]}")
+    if merging:
+        rc, out, err = await _git(worktree, *marker_check, "--cached", "--check")
+        if rc:
+            raise IntegrationRequired(f"Unresolved staged merge content: {(out or err).strip()[:300]}")
+    if await _git_required(worktree, "ls-files", "--unmerged"):
+        raise IntegrationRequired("Unresolved index entries prevent commit")
     rc, o, e = await _git(worktree, "commit", "-m", message)
     if rc != 0 and "nothing to commit" not in (o + e).lower():
         raise WorktreeError(f"commit failed: {(e or o).strip()[:200]}")
@@ -2166,6 +2660,17 @@ async def open_pr(
     that has no PR yet: a re-dispatch or a salvage of a card that already owns its PR
     passes none, so an operator who removed the label keeps it removed."""
     # 1. Commit anything left uncommitted, then guard against an empty result.
+    # Integration belongs before goal verification and local gates in the drive.
+    # Publication may fetch/check, but must never introduce unverified content.
+    if await recovery_context(worktree, branch):
+        await _git_required(worktree, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+        context = await recovery_context(worktree, branch)
+        for ref in (context.get("integration_sha", context["base_sha"]), f"origin/{base}"):
+            rc, _, _ = await _git(worktree, "merge-base", "--is-ancestor", ref, "HEAD")
+            if rc:
+                raise IntegrationRequired("Base advanced or integration incomplete; integrate and rerun verification")
+        if await _operation_present(worktree, "MERGE_HEAD") or await _git_required(worktree, "ls-files", "--unmerged"):
+            raise IntegrationRequired("Integration incomplete; resolve and rerun verification")
     await commit_worktree(worktree, title)
     # Count against ``origin/<base>`` first, the local ``<base>`` only as a fallback — the
     # same order ``create_worktree`` branches from and ``commits_ahead`` measures by. A bare
@@ -2190,9 +2695,28 @@ async def open_pr(
     #    plain push would be rejected (non-fast-forward) and the re-dispatch would
     #    never land. The branch is the loop's own throwaway; lease-guarded force is
     #    safe (and a no-op on the first push when the branch is new).
-    rc, _o, err = await _git(worktree, "push", "-u", "--force-with-lease", "origin", branch, timeout=180)
+    lease = "--force-with-lease"
+    if await recovery_context(worktree, branch):
+        remote_head = ""
+        if await _fetch_feature(worktree, branch):
+            remote_head = await _git_required(worktree, "rev-parse", f"origin/{branch}")
+            await _guard_published_rewind(worktree, await recovery_context(worktree, branch), remote_head)
+            rc, _, _ = await _git(worktree, "merge-base", "--is-ancestor", remote_head, "HEAD")
+            if rc:
+                raise IntegrationRequired(
+                    "PR head advanced during recovery; preserve and integrate its commits before publishing"
+                )
+        # Pin the checked head so another fetch cannot silently widen the lease.
+        lease = f"--force-with-lease=refs/heads/{branch}:{remote_head}"
+    rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
     if rc != 0:
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
+    context = await recovery_context(worktree, branch)
+    if context:
+        context["goal_followup_pending"] = False
+        context["published_head_sha"] = await _git_required(worktree, "rev-parse", "HEAD")
+        context["requirement_followup_pending"] = False
+        await _record_recovery(worktree, branch, context)
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
     as_draft = ("--draft",) if draft else ()
@@ -2518,6 +3042,11 @@ async def rebase_onto_base(repo: str, branch: str, base: str, *, root: str = ".w
         if rc != 0:
             _rc, files, _e = await _git(path, "diff", "--name-only", "--diff-filter=U")
             await _git(path, "rebase", "--abort")
+            try:
+                context = await prepare_integration(path, branch, base)
+            except WorktreeError as exc:
+                return ("error", str(exc))
+            files = "\n".join(context["conflict_paths"]) or files
             return ("conflict", files.strip() or (out or err).strip()[:300])
         rc, _o, err = await _git(path, "push", "--force-with-lease", "origin", f"HEAD:{branch}", timeout=180)
         if rc != 0:

@@ -208,7 +208,8 @@ class ReconcileMixin:
 
     # ── crash recovery (runs once, before the puller claims new work) ──────────
     async def _reconcile_orphan(self, fid: str):
-        """A claimed feature with no live drive: if its PR actually got opened (a crash
+        """A claimed feature with no live drive: requeue a retained PR integration
+        for the drive to verify and publish; else, if its PR actually got opened (a crash
         between ``open_pr`` and ``open_review``) adopt it → ``in_review``; else, if a
         VERIFIED candidate was recorded at coder_seam's verify boundary and still checks
         out on disk (a crash between verify and ``open_pr``), salvage it — resume at
@@ -250,6 +251,16 @@ class ReconcileMixin:
             elif self._resolve_task_delegate(assignee) is not None:
                 if await self._still_orphaned_then(store, fid, store.requeue):
                     log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
+            return
+        # An existing PR may still point at the unrepaired head. Shutdown keeps
+        # the integration checkout (including its index and recovery journal), so
+        # resume through the drive's integration/verification/publication boundary
+        # before allowing that PR back into review. Requeue preserves its PR link.
+        if feature.get("pr_url") and await worktree.pending_integration(
+            self._repo_for(feature), self.root, fid, feature.get("title") or ""
+        ):
+            if await self._still_orphaned_then(store, fid, store.requeue):
+                log.info("[project_board] %s reset to ready (retained PR integration — resume repair)", fid)
             return
         branch = worktree.branch_name(fid, feature.get("title") or "")
         with worktree.capture_gh_timeouts() as timeouts:
@@ -492,6 +503,18 @@ class ReconcileMixin:
         canon = os.path.join(repo, self.root, worktree.worktree_dir(fid, title))
         rec = {**rec, "worktree": path}
         async with worktree.hold_trees(path, canon):
+            # A preserved recovery checkout crosses the same integration boundary as a
+            # drive before verification: finish the pending merge (an edit-only
+            # resolution is committed), or refuse — `force` overrides a red gate, never
+            # unresolved conflicts or an unintegrated base.
+            try:
+                await worktree.finish_integration(path, branch, base)
+            except worktree.IntegrationRequired as exc:
+                return {
+                    **rec,
+                    "branch": branch,
+                    "detail": f"integration incomplete, so nothing was published — resolve it first: {exc}",
+                }
             # The gate runs where the tree IS, before anything moves: a red gate refuses with
             # the tree where the dead coder left it — bar the formatter's fixups, which run
             # first and may already have rewritten files.
@@ -916,6 +939,41 @@ class ReconcileMixin:
                             reset = _recorded_reset(str(fresh.get("blocked_reason", reason) or ""))
                             if reset is not None and time.time() < reset:
                                 continue  # Quota is still down; spend no retry before its reset.
+                        if cls == "merge-conflict" and fresh.get("pr_url"):
+                            try:
+                                repo = self._repo_for(fresh)
+                                branch = worktree.branch_name(fid, fresh.get("title") or "")
+                                if await worktree.recovery_context(repo, branch):
+                                    from .prompt import integration_feedback
+
+                                    pending = await worktree.pending_integration(
+                                        repo, self.root, fid, fresh.get("title") or ""
+                                    )
+                                    context = await worktree.refresh_integration_context(
+                                        repo,
+                                        branch,
+                                        self._base_branch_for(fresh),
+                                        root=self.root,
+                                        recovery_path=pending[0] if pending else None,
+                                    )
+                                    self._ci_feedback[fid] = integration_feedback(
+                                        self._ci_feedback.get(fid, ""), context
+                                    )
+                                    self._ci_prior_diff.pop(fid, None)
+                            except Exception as exc:  # noqa: BLE001 — surface failure without discarding recovery
+                                # Never dispatch stale feedback or lose this failure in
+                                # the outer log-only handler. A later sweep can retry.
+                                failure = f"{type(exc).__name__}: {exc}"
+                                await asyncio.to_thread(
+                                    self._notify_operator,
+                                    fid,
+                                    f"Board card {fid} remains blocked: merge-conflict recovery refresh failed: "
+                                    f"{failure}. Preserved recovery work; no unblock retry spent. "
+                                    f"Original block: {fresh.get('blocked_reason') or reason}",
+                                    incident=f"{cls}|{reason}|{spent}|refresh-failed|{failure}",
+                                    store=store,
+                                )
+                                continue
                         await self._budget_set(store, fid, "unblock-retry", spent + 1)
                         await asyncio.to_thread(store.clear_blocked, fid)
                         await asyncio.to_thread(store.requeue, fid)
@@ -1922,6 +1980,12 @@ class ReconcileMixin:
             )
             return False  # transient — don't burn the coder budget on an infra blip
         # outcome == "conflict": a real merge conflict only the coder can resolve.
+        self._ci_prior_diff.pop(fid, None)
+        self._ci_feedback[fid] = (
+            f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
+            f"file(s): {detail}. The board will prepare integration with `{base}` — edit files to resolve the "
+            "conflict, keeping BOTH sides' intent. Then stop."
+        )
         n = await self._budget_get(store, fid, "rebase", feature)
         if n >= self.rebase_fix_max:
             await asyncio.to_thread(
@@ -1934,12 +1998,6 @@ class ReconcileMixin:
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
             return True
         await self._budget_set(store, fid, "rebase", n + 1)
-        self._ci_prior_diff.pop(fid, None)
-        self._ci_feedback[fid] = (
-            f"Your branch now CONFLICTS with `{base}` — a sibling change merged into the same "
-            f"file(s): {detail}. Re-apply your change onto the latest `{base}` and resolve the "
-            "conflict, keeping BOTH sides' intent. Then stop."
-        )
         await asyncio.to_thread(store.requeue, fid)
         log.info(
             "[project_board] %s rebase conflict — re-dispatch %d/%d to resolve (%s): %s",

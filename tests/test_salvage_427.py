@@ -316,6 +316,47 @@ async def test_a_card_blocked_out_of_review_goes_back_to_review_on_its_own_pr(or
     assert reviews == [_URL]
 
 
+# ── a preserved conflict-recovery checkout ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("resolved", [True, False])
+async def test_salvage_finishes_a_pending_recovery_merge_before_publishing(origin, monkeypatch, resolved, force):
+    """A conflict-recovery tree whose coder resolved the merge by editing files only
+    (no `git add`, MERGE_HEAD still pending) is publishable: salvage completes the
+    board's integration, then gates and publishes it — as a draft under force-on-red.
+    Unresolved conflicts refuse publication even with force=true."""
+    board, gh, loop, fid, _ = _setup(origin, monkeypatch, gate=_RED if force else "true", gh=_Gh(existing=True))
+    board.claim(fid, assignee="proto")
+    wt = await _canonical_with_pr(origin, fid)
+    board.open_review(fid, pr_url=_URL)
+    published = _git("-C", origin.origin, "rev-parse", f"refs/heads/{_canon(fid)}")
+    Path(origin.clone, "a.py").write_text("sibling\n")
+    _git("-C", origin.clone, "commit", "-qam", "sibling change to a.py")
+    _git("-C", origin.clone, "push", "-q", "origin", origin.base)
+    base_sha = _git("-C", origin.clone, "rev-parse", "HEAD")
+    context = await worktree.prepare_integration(wt, _canon(fid), origin.base)
+    assert context["conflict_paths"] == ["a.py"]
+    board.flag_blocked(fid, "Integration incomplete; resolve and rerun verification")
+    if resolved:
+        Path(wt, "a.py").write_text("first attempt\nsibling\n")
+
+    rec = await loop.salvage(fid, force=force)
+
+    if resolved:
+        assert rec["outcome"] == "published", rec
+        assert rec["draft"] is force
+        assert origin.show(_canon(fid), "a.py") == "first attempt\nsibling\n"
+        _git("-C", origin.origin, "merge-base", "--is-ancestor", base_sha, f"refs/heads/{_canon(fid)}")
+        _git("-C", origin.origin, "merge-base", "--is-ancestor", published, f"refs/heads/{_canon(fid)}")
+        assert board.get_feature(fid)["board_state"] == "in_review"
+    else:
+        assert rec["outcome"] == "refused" and "integration incomplete" in rec["detail"], rec
+        assert _git("-C", origin.origin, "rev-parse", f"refs/heads/{_canon(fid)}") == published
+        assert gh.calls == [] and board.get_feature(fid)["blocked"]
+        assert _git("-C", wt, "rev-parse", "MERGE_HEAD") == base_sha  # the merge is preserved
+
+
 # ── a cancel during the publish ──────────────────────────────────────────────────────
 
 
