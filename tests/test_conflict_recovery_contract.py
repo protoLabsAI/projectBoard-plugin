@@ -1399,3 +1399,100 @@ async def test_requirement_progress_does_not_exempt_later_goal_repair(history, m
     assert verify.await_count == 2
     opened.assert_not_awaited()
     assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("failed_check", ["goal", "gate"])
+@pytest.mark.parametrize("repair_edits", [False, True])
+async def test_preserved_resolution_does_not_exempt_new_gate_repair(
+    history, monkeypatch, committed, failed_check, repair_edits
+):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    base = sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7"}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    remote = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    resolution = "feature coverage\nsibling a coverage\n"
+    (Path(path) / "a").write_text(resolution)
+    if committed:
+        await worktree.finish_integration(path, branch, "main")
+
+    async def check(path, feature):
+        return None if (Path(path) / "gate-fix").exists() else "Missing regression test"
+
+    gate = AsyncMock(side_effect=check if failed_check == "gate" else None, return_value=None)
+
+    async def verify_goal(feature, path, base, result):
+        return await check(path, feature) if failed_check == "goal" else None
+
+    verify = AsyncMock(side_effect=verify_goal)
+    backoff = AsyncMock()
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", backoff)
+    attempts = []
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_verify_goal", verify)
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        loop.goal_verify = True
+
+    async def dispatch(coder, resumed_path, prompt, **kwargs):
+        assert resumed_path == path
+        attempts.append(prompt)
+        if len(attempts) == 2:
+            # A provider failure during the NEW repair must not revive the
+            # exemption already consumed by the successful resumed reply.
+            raise worktree.WorktreeError("coder dispatch failed: 429 rate limit exceeded")
+        if len(attempts) > 2 and repair_edits:
+            (Path(path) / "gate-fix").write_text("regression coverage\n")
+        return "## Summary\nRetained resolution"
+
+    async def publish(path, branch, **kwargs):
+        git(path, "merge-base", "--is-ancestor", remote, "HEAD")
+        git(path, "merge-base", "--is-ancestor", base, "HEAD")
+        git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+        assert (Path(path) / "a").read_text() == resolution
+        assert (Path(path) / "gate-fix").exists()
+        git(path, "push", "origin", branch)
+        return feature["pr_url"]
+
+    opened = AsyncMock(side_effect=publish)
+    _, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        gate=gate,
+        cfg={"coder": "proto", "local_gate_max": 1, "goal_fix_max": 1},
+    )
+    assert len(attempts) == 3
+    assert "Missing regression test" in attempts[1]
+    backoff.assert_awaited()
+    if repair_edits:
+        assert (Path(path) / "a").read_text() == resolution
+        assert verify.await_count == 2
+        opened.assert_awaited_once()
+        assert "open_review" in store.names()
+    else:
+        verify.assert_awaited_once()
+        assert gate.await_count == (1 if failed_check == "gate" else 0)
+        opened.assert_not_awaited()
+        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+        assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
+        retained = git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/stranded/").splitlines()
+        assert len(retained) == 1
+        assert git(repo, "show", f"{retained[0]}:a") == resolution.strip()
+        git(repo, "merge-base", "--is-ancestor", remote, retained[0])
+        git(repo, "merge-base", "--is-ancestor", base, retained[0])

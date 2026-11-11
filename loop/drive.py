@@ -2080,8 +2080,8 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
-        # Retained unpublished recovery progress belongs to this drive's tree, not
-        # one provider attempt. Re-prove it against the remote before accepting it.
+        # Retained unpublished recovery progress survives provider retries until
+        # accepted below. Later gate repairs must supply new progress of their own.
         preserved_repair = False
         # #476: the commit a fix round's resumed tree started on ("" = not a resumed fix
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
@@ -2517,6 +2517,11 @@ class DriveMixin:
                                 "fix round produced no commit or edits beyond the board-prepared integration; "
                                 "nothing new to push or review"
                             )
+                        # This candidate has passed progress classification. Its retained
+                        # resolution cannot also satisfy a subsequent goal/gate repair;
+                        # those requests require fresh edits even while HEAD is unpublished.
+                        # Provider failures before this check leave the exemption intact.
+                        preserved_repair = False
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.
