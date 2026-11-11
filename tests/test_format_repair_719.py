@@ -392,3 +392,20 @@ def test_format_stage_is_off_by_default():
     assert s["format_check_cmd"] == "" and s["format_fix_cmd"] == ""
     assert not _adapter("/nowhere", format_check_cmd="", format_fix_cmd="").format_stage_enabled
     assert not _adapter("/nowhere", format_repair_attempts=0).format_stage_enabled
+
+
+def test_a_long_check_listing_keeps_the_not_run_signal_in_every_tail(tmp_path):
+    """#722 review: the summary is the LAST thing in the output, so the 1500-char tails the
+    live monitor and sibling feedback keep still say the behavioral tests did not run."""
+    adapter = _adapter(_repo(tmp_path / "repo"))
+    verdict = adapter._format_failed(str(tmp_path), "format check failed", "not converging", "x.py\n" * 5000)
+    for tail in (verdict.output, verdict.output[-1500:]):
+        assert "behavioral tests: not run" in tail and "not converging" in tail
+
+
+def test_progress_stages_before_a_verdict_read_as_checking_not_failed():
+    """#722 review: while a repair runs the gen's verify dict holds only `stages`. The drawer
+    must show it as in progress and render the stage trail, not a red "failed" row."""
+    js = (Path(__file__).resolve().parent.parent / "view" / "board.js").read_text(encoding="utf-8")
+    assert 'typeof g.verify.passed === "boolean"' in js
+    assert '"checking"' in js and "g.verify.stages" in js

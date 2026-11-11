@@ -3045,11 +3045,11 @@ class _WorktreeSolveAdapter:
             os.path.basename(candidate_wt),
             reason,
         )
-        output = (
-            f"format stage failed: {reason}\n"
-            "behavioral tests: not run (the required format stage failed first)\n"
-            f"--- `{self.format_check_cmd}` ---\n{check_output}"
-        )
+        # The summary goes LAST (and the check output is bounded before it): every consumer
+        # keeps a tail — 4000 chars here, 1500 for the live monitor and sibling feedback — so
+        # a long check listing must never push "tests not run" out of what gets reported.
+        summary = f"format stage failed: {reason}\nbehavioral tests: not run (the required format stage failed first)"
+        output = f"--- `{self.format_check_cmd}` ---\n{(check_output or '')[-1000:]}\n{summary}"
         return self.verdict_cls(
             passed=False,
             total=1,
