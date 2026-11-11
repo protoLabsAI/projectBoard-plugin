@@ -1281,6 +1281,21 @@ async def test_drive_restart_publishes_preserved_resolution(history, monkeypatch
                 "concurrently published equivalent resolution",
             )
             git(path, "push", "origin", f"{equivalent}:refs/heads/{branch}")
+    # The restart entry must resume this checkout before adopting the old PR.
+    from project_board.loop import BoardLoop
+    from tests.test_loop import _RecoverStore
+
+    recovery_store = _RecoverStore([feature])
+    recovery_store.get_feature = lambda _: {**feature, "board_state": "in_progress"}
+    restarted = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(restarted, "_store", lambda: recovery_store)
+    monkeypatch.setattr(restarted, "_repo_for", lambda _: str(repo))
+    lookup = AsyncMock(return_value=feature["pr_url"])
+    monkeypatch.setattr(worktree, "pr_url_for_branch", lookup)
+    await restarted._reconcile_orphan(feature["id"])
+    assert recovery_store.calls == [("requeue", feature["id"])]
+    lookup.assert_not_awaited()
+
     verify = AsyncMock(return_value=None)
     gate = AsyncMock(return_value=None)
 
@@ -2003,3 +2018,53 @@ async def test_auto_unblock_refresh_failure_alerts_and_preserves_recovery(histor
         assert fid in blocked.cleared and fid in blocked.requeued
         assert (fid, "unblock-retry", 1) in blocked.budgets
         assert "Actual conflict paths: none." in loop._ci_feedback[fid]
+
+
+@pytest.mark.parametrize("state", ["published", "attached", "read-failed"])
+async def test_restart_recovery_adoption_boundaries(history, monkeypatch, state):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from project_board.loop import BoardLoop
+    from tests.test_loop import FEATURE, _RecoverStore
+
+    repo = history
+    sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7", "board_state": "in_progress"}
+    fid, title = feature["id"], feature["title"]
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
+    await worktree.finish_integration(path, branch, "main")
+    if state == "published":
+        git(path, "push", "origin", branch)
+    elif state == "read-failed":
+        git(path, "remote", "set-url", "origin", str(repo / "missing.git"))
+
+    store = _RecoverStore([feature])
+    reads = []
+
+    def read(_):
+        reads.append(True)
+        # An operator attached the card while pending integration was read.
+        return {**feature, "board_state": "in_review" if state == "attached" and len(reads) > 1 else "in_progress"}
+
+    store.get_feature = read
+    loop = BoardLoop({})
+    monkeypatch.setattr(loop, "_store", lambda: store)
+    monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+    lookup = AsyncMock(return_value=feature["pr_url"])
+    monkeypatch.setattr(worktree, "pr_url_for_branch", lookup)
+    if state == "read-failed":
+        with pytest.raises(worktree.WorktreeError):
+            await loop._reconcile_orphan(fid)
+    else:
+        await loop._reconcile_orphan(fid)
+    if state == "published":
+        assert store.calls == [("open_review", fid, feature["pr_url"])]
+    else:
+        assert store.calls == []
+        lookup.assert_not_awaited()
+    assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"

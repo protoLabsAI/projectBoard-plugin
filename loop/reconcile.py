@@ -208,7 +208,8 @@ class ReconcileMixin:
 
     # ── crash recovery (runs once, before the puller claims new work) ──────────
     async def _reconcile_orphan(self, fid: str):
-        """A claimed feature with no live drive: if its PR actually got opened (a crash
+        """A claimed feature with no live drive: requeue a retained PR integration
+        for the drive to verify and publish; else, if its PR actually got opened (a crash
         between ``open_pr`` and ``open_review``) adopt it → ``in_review``; else, if a
         VERIFIED candidate was recorded at coder_seam's verify boundary and still checks
         out on disk (a crash between verify and ``open_pr``), salvage it — resume at
@@ -250,6 +251,16 @@ class ReconcileMixin:
             elif self._resolve_task_delegate(assignee) is not None:
                 if await self._still_orphaned_then(store, fid, store.requeue):
                     log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
+            return
+        # An existing PR may still point at the unrepaired head. Shutdown keeps
+        # the integration checkout (including its index and recovery journal), so
+        # resume through the drive's integration/verification/publication boundary
+        # before allowing that PR back into review. Requeue preserves its PR link.
+        if feature.get("pr_url") and await worktree.pending_integration(
+            self._repo_for(feature), self.root, fid, feature.get("title") or ""
+        ):
+            if await self._still_orphaned_then(store, fid, store.requeue):
+                log.info("[project_board] %s reset to ready (retained PR integration — resume repair)", fid)
             return
         branch = worktree.branch_name(fid, feature.get("title") or "")
         with worktree.capture_gh_timeouts() as timeouts:
