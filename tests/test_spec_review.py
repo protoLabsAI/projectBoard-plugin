@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import json
+import threading
+import time
 
 import pytest
 
@@ -318,3 +320,72 @@ def test_sdk_without_prompt_check_control_is_gap(setup, monkeypatch):
     assert "check_prompt_tools" in report["gap"]
     assert all(s["status"] == "not_run" for s in report["stages"].values())
     assert report["persistence"] == "verified"
+
+
+def _instrument(store, names, before=None):
+    """Wrap `store` methods to record the calling thread, optionally stalling first."""
+    seen = {}
+
+    def wrap(name, fn):
+        def call(*a, **kw):
+            seen.setdefault(name, set()).add(threading.get_ident())
+            if before is not None:
+                before()
+            return fn(*a, **kw)
+
+        return call
+
+    for name in names:
+        setattr(store, name, wrap(name, getattr(store, name)))
+    return seen
+
+
+BOARD_IO = ("get_feature", "comment", "feature_comments")
+
+
+def test_board_io_runs_off_the_event_loop(setup):
+    """`board_review_spec` is awaited on the HOST loop and every store method shells
+    out to `br`, so running them inline froze every other coroutine for as long as
+    the subprocess took (#726 review finding)."""
+    store, _ = setup
+    seen = _instrument(store, BOARD_IO)
+    loop_thread = {}
+
+    async def drive():
+        loop_thread["id"] = threading.get_ident()
+        return await sr.review(store, "bd-1")
+
+    report = asyncio.run(drive())
+    assert report["persistence"] == "verified", report
+    # Guard against a vacuous pass: all three must actually have been exercised.
+    assert set(seen) == set(BOARD_IO), sorted(seen)
+    offenders = sorted(n for n, ids in seen.items() if loop_thread["id"] in ids)
+    assert not offenders, f"board I/O ran on the event-loop thread: {offenders}"
+
+
+def test_event_loop_keeps_serving_while_the_board_stalls(setup):
+    """The user-visible property: a wedged `br` must not stop unrelated async work."""
+    store, _ = setup
+    block = 0.3
+    _instrument(store, BOARD_IO, before=lambda: time.sleep(block))
+    ticks = []
+
+    async def ticker():
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.005)
+
+    async def drive():
+        beat = asyncio.create_task(ticker())
+        try:
+            return await sr.review(store, "bd-1")
+        finally:
+            beat.cancel()
+
+    report = asyncio.run(drive())
+    assert report["persistence"] == "verified", report
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert gaps, "ticker never ran"
+    # Each of the five board ops sleeps `block`; inline, any one of them pins the
+    # loop for that whole time. Half of `block` leaves room for scheduler noise.
+    assert max(gaps) < block / 2, f"loop stalled {max(gaps):.3f}s, tolerated {block / 2:.3f}s"

@@ -163,7 +163,11 @@ async def stage(run, name, payload, extra_tools):
 
 
 async def review(store, feature_id):
-    card = store.get_feature(feature_id)
+    # Every board read/write here goes through a worker thread: `store` shells `br`, and this
+    # runs under the async `board_review_spec` tool on the HOST event loop, so a stalled
+    # subprocess would freeze every other coroutine (#726 review). Same idiom as the loop,
+    # which wraps its store calls this way throughout.
+    card = await asyncio.to_thread(store.get_feature, feature_id)
     if not card:
         return {"status": "refused", "reason": "unknown card"}
     if card.get("issue_type") != "feature" or str(card.get("difficulty", "")).lower() not in {
@@ -217,19 +221,19 @@ async def review(store, feature_id):
             )
     except Exception as exc:
         report["gap"] = str(exc)[:1000]
-    refresh(store, feature_id, report)
+    await asyncio.to_thread(refresh, store, feature_id, report)
     report["elapsed_seconds"] = round(time.monotonic() - started, 3)
     # The ledger records pending verification, never claims its own write succeeded.
     report["persistence"] = "unverified"
     encoded = canonical(report)
     try:
-        store.comment(feature_id, encoded)
-        comments = store.feature_comments(feature_id, unknown_ok=False)
+        await asyncio.to_thread(store.comment, feature_id, encoded)
+        comments = await asyncio.to_thread(store.feature_comments, feature_id, unknown_ok=False)
         report["persistence"] = "verified" if encoded in comments else "failed: run record absent on readback"
     except Exception as exc:
         report["persistence"] = f"failed: {str(exc)[:1000]}"
     # Covers edits/deletion during comment persistence as well as during either worker.
-    refresh(store, feature_id, report)
+    await asyncio.to_thread(refresh, store, feature_id, report)
     return report
 
 
