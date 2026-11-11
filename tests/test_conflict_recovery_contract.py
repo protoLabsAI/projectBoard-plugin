@@ -1109,12 +1109,15 @@ async def test_recovery_edit_snapshot_tracks_content_and_ignores_board_scratch(h
     assert await worktree.recovery_edit_state(str(repo)) != before
 
 
+@pytest.mark.parametrize("provider_retry", [None, "backoff", "rotation"])
 @pytest.mark.parametrize("partial", [False, True])
 @pytest.mark.parametrize("disposition", ["done", "declined — outside scope", None, "declined"])
-async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history, monkeypatch, disposition, partial):
+async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(
+    history, monkeypatch, disposition, partial, provider_retry
+):
     from pathlib import Path
     from unittest.mock import AsyncMock
-    from tests.test_loop import FEATURE, _drive_with
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
 
     repo = history
     sibling(repo, "a")
@@ -1134,15 +1137,26 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
     opened = AsyncMock(return_value=feature["pr_url"])
     prompts = []
     states = []
+    providers = []
+    store = FakeLoopStore()
+    monkeypatch.setattr(store, "escalate", lambda *_: None, raising=False)
+    backoff = AsyncMock()
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", backoff)
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: 0)
 
     def seed(loop):
         monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
         monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
         monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
         monkeypatch.setattr(worktree, "create_worktree", create)
+        monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
         loop._ci_feedback[feature["id"]] = "Resolve the conflict"
 
     async def dispatch(coder, path, prompt, **kwargs):
+        providers.append(coder)
+        if provider_retry and len(providers) == 2:
+            assert ("requirement items are still OPEN" if partial else "do NOT edit") in prompt
+            raise worktree.WorktreeError("coder dispatch failed: 429 rate limit exceeded")
         prompts.append(prompt)
         if len(prompts) == 1:
             (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
@@ -1159,11 +1173,24 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
     _, store = await _drive_with(
         monkeypatch,
         feature=feature,
+        store=store,
         seed=seed,
         dispatch=dispatch,
         open_pr=opened,
-        cfg={"coder": "proto", "goal_fix_max": 1},
+        cfg={
+            "coder": "proto",
+            "goal_fix_max": 1,
+            **(
+                {"coders": {"fast": ["proto", "alternate"], "reasoning": ["stronger"]}}
+                if provider_retry == "rotation"
+                else {}
+            ),
+        },
     )
+    if provider_retry:
+        assert len(providers) == len(prompts) + 1
+        assert (providers[1] != providers[2]) is (provider_retry == "rotation")
+        assert bool(backoff.await_count) is (provider_retry == "backoff")
     if disposition in ("done", "declined — outside scope"):
         assert len(prompts) == 2
         opened.assert_awaited_once()

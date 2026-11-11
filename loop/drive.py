@@ -2116,7 +2116,6 @@ class DriveMixin:
                 # Scope ledger progress to the requested requirement follow-up.
                 # Later review/CI/goal/gate repairs must still change the implementation.
                 requirement_followup_round = requirement_followup_pending
-                requirement_followup_pending = False
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -2477,6 +2476,10 @@ class DriveMixin:
                     # gate still checks the in-hand merged ledger), but a re-dispatch
                     # after requeue re-projects from the bead, so a lost write only
                     # costs a repeat disposition, never a false "disposed".
+                    # Consume the follow-up only when a coder reply reaches ledger
+                    # processing. Provider rotation/backoff must retain its purpose;
+                    # subsequent goal/CI/review repairs must not inherit it.
+                    requirement_followup_pending = False
                     ledger = list(feature.get("requirements") or [])
                     open_before = {
                         str(i.get("id")) for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")
