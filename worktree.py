@@ -2314,6 +2314,12 @@ async def consume_recovery_progress(path: str, branch: str, *, goal_followup: bo
     context = await recovery_context(path, branch)
     if not context:
         return
+    # Fixups run after integration and can leave edits outside HEAD. They belong
+    # to the candidate the gate rejected, not to the next coder repair. Preserve
+    # them before recording consumption, and start edit detection at this exact
+    # candidate so prepare/finish_integration cannot rediscover them as progress.
+    await commit_worktree(path, "Preserve candidate before gate repair")
+    context["prepared_edit_state"] = await recovery_edit_state(path)
     context["requirement_followup_pending"] = False
     context["goal_followup_pending"] = goal_followup
     if context.get("repair_head_sha"):

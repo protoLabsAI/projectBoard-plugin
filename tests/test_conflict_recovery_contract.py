@@ -1502,7 +1502,10 @@ async def test_preserved_resolution_does_not_exempt_new_gate_repair(
 
 @pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize("repair_edits", [False, True])
-async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeypatch, committed, repair_edits):
+@pytest.mark.parametrize("formatted", [False, True])
+async def test_consumed_repair_survives_restart_during_gate_fix(
+    history, monkeypatch, committed, repair_edits, formatted
+):
     from pathlib import Path
     from unittest.mock import AsyncMock
     from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
@@ -1534,8 +1537,13 @@ async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeyp
     monkeypatch.setattr(store, "record_budget", record_budget, raising=False)
     loops = []
 
+    async def fixups(path, feature):
+        if formatted:
+            (Path(path) / "b").write_text("feature coverage\nformatted\n")
+
     def seed(loop):
         loops.append(loop)
+        monkeypatch.setattr(loop, "_run_fixups", fixups)
         monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
         monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
         monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
@@ -1583,6 +1591,9 @@ async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeyp
         "repair_head_sha": context["repair_head_sha"],
         "tree_sha": git(path, "rev-parse", "HEAD^{tree}"),
     }
+    if formatted:
+        assert git(path, "show", "HEAD:b") == "feature coverage\nformatted"
+        assert not git(path, "status", "--porcelain")
     assert not await worktree.preserved_recovery_progress(path, branch)
     opened.assert_not_awaited()
     await _drive_with(monkeypatch, **kwargs)
