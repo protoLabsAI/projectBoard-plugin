@@ -332,3 +332,13 @@ self-assigned.
 Execution tasks get a scratch workdir: a worktree at the project base, reaped on
 done/cancel/verify, never a PR. The deliverable is still a report submitted with
 `board_deliver` and closed by `board_verify`.
+
+### Claim-time file overlap policy
+
+`claim_file_lock` is a per-project setting (also accepted at top level as an inherited
+fallback): `hot_only` (default) locks only overlaps matching that project's `hot_files`
+globs; `all` locks every overlapping `files_to_modify` path; `off` disables this guard.
+Add the `parallel-ok` label to a card to bypass the claim-time guard in any mode.
+Overlaps are scoped to the same project and recorded in `claim_decision.overlaps`,
+including allowed parallel claims. A protected overlap skips with `reason: "hot-file"`.
+Dependencies, hot-file auto-chaining, and ready-time shared-file checks still apply.

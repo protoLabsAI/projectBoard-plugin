@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **39 of 93 keys are in this state, including `coders` and `projects`** —
+never renders it. **40 of 94 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -181,6 +181,7 @@ What `board_mark_ready` checks before a card can be pulled, and what `board_crea
 | `max_files_by_difficulty` | `—` | reload **· YAML only** |
 | `breadth_exclude` | `DEFAULT_BREADTH_EXCLUDE` | reload **· YAML only** |
 | `hot_files` | `[]` | reload **· YAML only** |
+| `claim_file_lock` | `hot_only` | reload **· YAML only** |
 
 **`max_files_by_difficulty`** — the breadth cap: the most COUNTED `files_to_modify` a card
 of each difficulty may name (built-in `{small: 4, medium: 4, large: 6}`; `architectural`
@@ -232,6 +233,18 @@ projects:
     repo: ~/dev/protoContent
     hot_files: ["packages/*/package.json", "packages/ui/src/index.ts"]
 ```
+
+**`claim_file_lock`** — claim-time file overlap policy, per project or at top level as
+an inherited fallback. `hot_only` (default) defers a ready card only when its
+`files_to_modify` overlaps an in-flight build in the same project on a `hot_files`
+glob. `all` restores strict locking of every listed path; `off` allows all overlaps.
+The `parallel-ok` card label bypasses this guard in every mode. Allowed overlaps
+remain visible in `claim_decision.overlaps` (candidate `fid`, owner IDs in `overlaps`,
+and `files`), without a skip. Locked overlaps retain `reason: "hot-file"`.
+These settings do not bypass dependencies, auto-chaining, or the ready-time shared-file
+check below. Non-hot overlaps rely on rebase/conflict recovery. With no `hot_files`,
+the default policy imposes no claim-time file locks. Invalid modes fall back to `hot_only`
+with a warning. In YAML, quote `"off"` so it is not parsed as a boolean.
 
 The shared-file check itself needs no config. Two open cards of one project naming the same
 file must be ordered by a `depends_on` PATH, in either direction, through open cards: a

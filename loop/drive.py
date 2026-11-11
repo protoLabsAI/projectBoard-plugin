@@ -361,14 +361,21 @@ class DriveMixin:
         # reload stays a partial update: a missing key leaves the knob alone.
         plugin_config = getattr(new_config, "plugin_config", None)
         complete = isinstance(plugin_config, dict) and isinstance(plugin_config.get("project_board"), dict)
-        cleared = tuple(k for k in ("coders", "routing") if complete and k not in section and k in self.cfg)
-        if cleared or any(key in section for key in ("projects", "default_project", "coders", "routing")):
+        cleared = tuple(
+            k
+            for k in ("coders", "routing", "claim_file_lock", "hot_files")
+            if complete and k not in section and k in self.cfg
+        )
+        if cleared or any(
+            key in section
+            for key in ("projects", "default_project", "coders", "routing", "claim_file_lock", "hot_files")
+        ):
             candidate = dict(self.cfg)
             if "projects" in section:
                 candidate["projects"] = section.get("projects")
             if "default_project" in section:
                 candidate["default_project"] = section.get("default_project")
-            for key in ("coders", "routing"):
+            for key in ("coders", "routing", "claim_file_lock", "hot_files"):
                 if key in section:
                     candidate[key] = section[key]
                 elif key in cleared:
@@ -388,7 +395,7 @@ class DriveMixin:
             except Exception as exc:  # noqa: BLE001 — retain the last valid policy
                 log.warning("[project_board] reload: project routing is malformed — keeping current map: %s", exc)
             else:
-                for key in ("coders", "routing"):
+                for key in ("coders", "routing", "claim_file_lock", "hot_files"):
                     if (key in section or key in cleared) and self.cfg.get(key) != candidate.get(key):
                         changed[key] = (self.cfg.get(key), candidate.get(key))
                         if key in candidate:
@@ -978,8 +985,8 @@ class DriveMixin:
         """Claim Ready features up to the concurrency cap and spawn a drive for each,
         with two back-pressure gates: pause when too many PRs already await review
         (``max_pending_reviews``), and skip a candidate whose ``files_to_modify``
-        overlap an in-flight build (the hot-file guard — two parallel coders editing
-        the same file are a guaranteed merge conflict). Returns True if it started at
+        overlap an in-flight build on paths protected by its project's
+        ``claim_file_lock`` policy (unless labeled ``parallel-ok``). Returns True if it started at
         least one drive (so the runner stays hot). Async so every store read/claim
         rides ``asyncio.to_thread`` (#258) — the scan must not stall the event loop;
         the drives themselves are still spawned on the loop (``create_task``).
@@ -1028,12 +1035,13 @@ class DriveMixin:
         spawned = False
         # file → the in-flight (or claimed-this-tick) fid that owns it, so a hot-file
         # skip can NAME the build it collides with, not just report "some overlap".
-        file_owner: dict[str, str] = {}
+        file_owner: dict[tuple[str, str], str] = {}
         for owner_fid, owner_files in self._inflight_files.items():
             for key in owner_files:
                 file_owner.setdefault(key, owner_fid)
         busy = set(file_owner)
         selected: list[str] = []
+        overlaps: list[dict] = []  # advisory collisions, including allowed parallel work
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
         parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
         ready = await asyncio.to_thread(store.ready_queue, relaxed=self.relaxed_gate)
@@ -1104,17 +1112,25 @@ class DriveMixin:
             files = {(pname, p) for p in (candidate.get("files_to_modify") or [])}
             overlap = files & busy
             if overlap:
-                # would edit a file an in-flight build owns → defer a tick
-                owners = sorted({file_owner[k] for k in overlap})
-                skipped.append(
-                    {
-                        "fid": cid,
-                        "reason": "hot-file",
-                        "overlaps": owners,
-                        "files": sorted(path for _proj, path in overlap),
-                    }
+                evidence = {
+                    "fid": cid,
+                    "overlaps": sorted({file_owner[k] for k in overlap}),
+                    "files": sorted(path for _proj, path in overlap),
+                }
+                overlaps.append(evidence)
+                policy = self._project_cfg(candidate)
+                mode = policy.get("claim_file_lock", "hot_only")
+                if mode not in ("hot_only", "all", "off"):
+                    log.warning("[project_board] invalid claim_file_lock %r; using hot_only", mode)
+                    mode = "hot_only"
+                hot = store_mod.parse_glob_list(policy.get("hot_files"))
+                locked = mode == "all" or (
+                    mode == "hot_only"
+                    and any(store_mod.path_matches_glob(path, glob) for _, path in overlap for glob in hot)
                 )
-                continue
+                if locked and "parallel-ok" not in (candidate.get("labels") or []):
+                    skipped.append({**evidence, "reason": "hot-file"})
+                    continue
             claimed = await asyncio.to_thread(store.claim, cid, assignee=self.coder_name)
             if claimed is None:
                 skipped.append({"fid": cid, "reason": "claim-race"})  # raced / no longer ready
@@ -1133,7 +1149,7 @@ class DriveMixin:
             log.info(
                 "[project_board] claim_decision %s",
                 json.dumps(
-                    {"parked": parked, "selected": selected, "skipped": skipped},
+                    {"parked": parked, "selected": selected, "skipped": skipped, "overlaps": overlaps},
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
@@ -1143,6 +1159,7 @@ class DriveMixin:
         # dispatch_now so an empty board is distinguishable from a held/stalled one.
         self._last_claim_decision = {
             "gate": "scan",
+            "overlaps": overlaps,
             "selected": list(selected),
             "skipped": list(skipped),
             "parked": list(parked),
