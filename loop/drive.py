@@ -2769,8 +2769,8 @@ class DriveMixin:
                     if isinstance(exc, worktree.NoChangesError):
                         coder_refusal = _coder_refusal(result or "")
                     elif isinstance(exc, coder_seam.SolveRefused):
-                        # Every best-of-k candidate refused the spec (each sibling was told to
-                        # check the claim first) — the same deliberate design block below.
+                        # Every best-of-k candidate refused the spec and a sibling upheld it after
+                        # checking (see SolveRefused) — the same deliberate design block below.
                         coder_refusal = exc.refusal
                     else:
                         coder_refusal = ""
@@ -2874,10 +2874,11 @@ class DriveMixin:
                             self._inflight.pop(fid, None)
                         return
                     if isinstance(exc, coder_seam.SolveRefused) and coder_refusal:
-                        # All candidates refused, each having been asked to refute the one
-                        # before it: a stronger tier would refuse the same gap, so block once
-                        # for the project manager (design class, no climb, no retry). The solve
-                        # offload already reaped its candidate trees.
+                        # Every candidate refused with no diff, and at least one did so after
+                        # being asked to check a sibling's refusal: the claim held up, so a
+                        # stronger tier would refuse the same gap. Block once for the project
+                        # manager (design class, no climb, no retry). The solve offload already
+                        # reaped its candidate trees.
                         reason = (
                             missing_findings_note
                             + f"every coder attempt refused the spec (deliberate design block, no PR): {coder_refusal}"

@@ -7,8 +7,12 @@ siblings saw "no changes" instead of the reasoning — and every refusal observe
 
 - One refusing candidate → its refusal becomes sibling feedback asking the next candidate to
   check or refute it; the ladder carries on.
-- EVERY judged candidate refusing → `SolveRefused` (a `SolveExhausted`), which the drive blocks
-  once under the `design` class for the project manager: no tier climb, no retry.
+- EVERY judged candidate refusing with no diff, where at least one was dispatched after a sibling's
+  refusal was in its prompt → `SolveRefused` (a `SolveExhausted`), which the drive blocks once
+  under the `design` class for the project manager: no tier climb, no retry.
+- Refusals nobody cross-checked (a first concurrent round, or k=1) stay an ordinary exhaustion,
+  so the capability ladder still climbs (#721 review).
+- A "refusal" that left a diff is an ordinary failure with its real output.
 - A refusal mixed with an ordinary test failure is an ordinary exhaustion.
 """
 
@@ -26,6 +30,18 @@ from test_coder_seam_candidates import _DISPATCH_KW, _FakeResult, _FakeVerdict, 
 from test_loop import _drive_with
 
 REFUSAL = "BLOCKED-ON-SPEC: navigation intent rejects sessions absent from the local store — checked nav.ts"
+
+
+@pytest.fixture(autouse=True)
+def _diffs(monkeypatch):
+    """Which fake candidate trees changed files: none, unless a test says otherwise."""
+    changed: dict[str, list[str]] = {}
+
+    async def _changed_paths(tree, base=""):
+        return changed.get(os.path.basename(tree), [])
+
+    monkeypatch.setattr(worktree, "changed_paths", _changed_paths)
+    return changed
 
 
 def _replies(by_name: dict[str, str]):
@@ -135,3 +151,50 @@ async def test_drive_blocks_an_all_refused_solve_for_the_pm_without_climbing(mon
     assert REFUSAL in reason and "every coder attempt refused" in reason
     assert [c for c in store.calls if c[0] == "record_attempt"] == []
     assert loop._inflight == {}
+
+
+def _concurrent_solve(n: int):
+    """A first best-of-k round: every candidate is dispatched before any is verified."""
+
+    async def _solve(task, *, generate, verify, budget, k, tree_depth, fusion_generate=None, fusion_k=2):
+        wts = [await generate(task, feedback=None) for _ in range(n)]
+        last = None
+        for wt in wts:
+            last = await verify(wt)
+        return _FakeResult(
+            solution=None, passed=False, rung="best-of-k", gens_spent=n, candidates_tried=n, verdict=last
+        )
+
+    return _solve
+
+
+@pytest.mark.parametrize(
+    "solve", [_concurrent_solve(3), _sequential_solve(1, win_last=False)], ids=["concurrent-round", "k=1"]
+)
+async def test_unchecked_refusals_keep_the_capability_ladder(monkeypatch, solve):
+    dispatch_fake, _ = _replies({f"feat-bd-9.g{n}": "Can't.\n" + REFUSAL for n in (1, 2, 3)})
+    _stub(
+        monkeypatch,
+        dispatch_fake=dispatch_fake,
+        run_tests=_tests({f"feat-bd-9.g{n}": False for n in (1, 2, 3)}),
+        create_fake=_make_create()[0],
+    )
+    monkeypatch.setattr(worktree, "reap_candidate_branches", _noop_reap)
+    with pytest.raises(SolveExhausted) as ei:
+        await dispatch(task="t", fid="bd-9", _solve=solve, **_DISPATCH_KW)
+    assert not isinstance(ei.value, SolveRefused)  # nobody checked the claim → tier climb, not a PM block
+
+
+async def test_a_refusal_that_left_a_diff_is_an_ordinary_failure(monkeypatch, _diffs):
+    _diffs["feat-bd-9.g1"] = ["src/app.py"]
+    dispatch_fake, prompts = _replies({"feat-bd-9.g1": "Half done.\n" + REFUSAL})
+    _stub(
+        monkeypatch,
+        dispatch_fake=dispatch_fake,
+        run_tests=_tests({"feat-bd-9.g1": False, "feat-bd-9.g2": True}),
+        create_fake=_make_create()[0],
+    )
+    await dispatch(task="t", fid="bd-9", _solve=_sequential_solve(2, win_last=True), **_DISPATCH_KW)
+    sibling = prompts["feat-bd-9.g2"]
+    assert "stopped and declared the task unbuildable" not in sibling
+    assert "no changes vs" in sibling  # its real verify output is what the sibling learns from
