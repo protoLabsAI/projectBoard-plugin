@@ -44,6 +44,50 @@ async def test_initial_gate_environment_repair_keeps_feature(monkeypatch):
     assert "Repaired lint-imports" in bodies[0]
 
 
+@pytest.mark.parametrize("gate_repair", [False, True])
+async def test_fresh_rebuild_resets_abandoned_journal_before_gate_repair(monkeypatch, gate_repair):
+    from test_loop import FEATURE
+
+    # A previous lifecycle left durable context behind, but has no open PR.
+    await pr_description.record("/wt", FEATURE["id"], "Abandoned implementation.")
+    await pr_description.record("/wt", FEATURE["id"], "Abandoned repair.", repair=True)
+    replies = iter(["## Summary\n\nReplacement implementation.", "## Summary\n\nFixed replacement environment."])
+    gates = iter(["stale interpreter", None] if gate_repair else [None])
+    bodies = []
+
+    async def dispatch(*a, **kw):
+        return next(replies)
+
+    async def gate(*a, **kw):
+        return next(gates)
+
+    async def publish(*a, **kw):
+        bodies.append(kw["body"])
+        return "https://example/pr/1"
+
+    # A fresh BoardLoop has neither a pr_url nor CI feedback. Its initial
+    # implementation replaces stale context; the ensuing gate repair appends.
+    await _drive_with(
+        monkeypatch,
+        dispatch=dispatch,
+        gate=gate,
+        open_pr=publish,
+        cfg={"coder": "proto", "local_gate_cmd": "check", "local_gate_max": 2},
+    )
+    assert len(bodies) == 1
+    assert bodies[0].startswith("## Summary\n\nReplacement implementation.")
+    assert "Abandoned" not in bodies[0]
+    assert bodies[0].count("## Fix round") == int(gate_repair)
+    if gate_repair:
+        assert "## Fix round 1" in bodies[0]
+        assert "Fixed replacement environment." in bodies[0]
+    context = await pr_description.read("/wt", FEATURE["id"])
+    assert context["feature"] == "## Summary\n\nReplacement implementation."
+    assert context["attempts"] == (
+        [{"number": 1, "summary": "## Summary\n\nFixed replacement environment."}] if gate_repair else []
+    )
+
+
 @pytest.mark.parametrize("repair", ["CI", "review", "conflict"])
 async def test_restart_publication_preserves_operator_and_issue(tmp_path, monkeypatch, repair):
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)

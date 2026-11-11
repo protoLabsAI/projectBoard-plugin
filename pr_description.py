@@ -30,7 +30,9 @@ async def read(wt: str, fid: str) -> dict:
 async def record(wt: str, fid: str, summary: str, *, repair: bool = False, fallback: str = "") -> None:
     """Capture BEFORE any verification gate can bounce the coder or halt the process."""
     context = await read(wt, fid)
-    if not context:
+    # A fresh implementation starts a new lifecycle for this feature id (for
+    # example after requeue or tier escalation). Retain history only for repairs.
+    if not context or not repair:
         context = {"version": 1, "feature": fallback if repair else summary, "attempts": []}
         if not repair:
             summary = ""
