@@ -97,6 +97,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "_fetch_feature": "REAL",
     "_guard_published_rewind": "REAL",  # Real remote rewinds with local edits/staging/commits in the contract tests.
     "_unpublished_recovery": "REAL",
+    "preserved_recovery_progress": "REAL",  # Real-Git restart/publication cases in test_conflict_recovery_contract.py.
     "_create_stranded_ref": "REAL",
     # #475: the leftover-candidate-branch seams, against real git in
     # tests/test_stale_candidate_branch_475.py.
@@ -444,7 +445,7 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_50_real_3_exempt_0_uncovered():
+def test_worktree_coverage_contract_is_51_real_3_exempt_0_uncovered():
     """The worktree coverage contract after #361 S1/S2/S3: 50 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
@@ -478,6 +479,7 @@ def test_worktree_coverage_contract_is_50_real_3_exempt_0_uncovered():
     # The 48th–49th fetch feature refs and detect unpublished
     # recovery against real git in that same test module.
     # The 50th guards published ancestry after real remote rewinds in that module.
+    # The 51st proves preserved resolution progress against real PR history on restart.
     real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
     exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
     uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
@@ -487,7 +489,7 @@ def test_worktree_coverage_contract_is_50_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 50, f"expected 50 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 51, f"expected 51 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

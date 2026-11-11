@@ -2261,6 +2261,44 @@ async def _unpublished_recovery(path: str, branch: str) -> bool:
     return bool(rc or await _git_required(path, "status", "--porcelain"))
 
 
+async def preserved_recovery_progress(path: str, branch: str) -> bool:
+    """Prove retained coder work against board provenance and the current PR head.
+
+    Divergence or a journal alone is not a repair. Uncommitted output must differ
+    from the prepared snapshot on the same head; committed output must contain a
+    board-recorded repair still unpublished. Integration checks remain mandatory.
+    """
+    context = await recovery_context(path, branch)
+    if not context:
+        return False
+    remote = await recovery_round_start(path, branch)
+    await _guard_published_rewind(path, context, remote)
+    state = await recovery_edit_state(path)
+    baseline = context.get("prepared_edit_state")
+    if baseline and baseline[0] == state[0] and baseline != json.loads(json.dumps(state)):
+        return True
+    repair = context.get("repair_head_sha")
+    if not repair:
+        return False
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", repair, "HEAD")
+    if rc:
+        return False
+    if not remote:
+        return True
+    rc, _, _ = await _git(path, "merge-base", "--is-ancestor", repair, remote)
+    if rc != 1:
+        return False
+    # A concurrent publisher may already have supplied the same resolution under
+    # another commit. Compare against what the authoritative PR plus base contains,
+    # not just commit identity (a clean board merge alone is never a repair).
+    rc, out, _ = await _git(path, "merge-tree", "--write-tree", remote, context["base_sha"])
+    if rc == 0:
+        return out.splitlines()[0] != await _git_required(path, "rev-parse", "HEAD^{tree}")
+    if rc != 1:
+        raise IntegrationRequired("Cannot verify unpublished recovery contents")
+    return True
+
+
 async def recovery_round_start(path: str, branch: str) -> str:
     """The PR head a resumed recovery round starts on (#476's ``round_start``).
 
@@ -2313,8 +2351,14 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         base_sha = previous.get("base_sha", integration_sha)
     else:
         # Preserve overlapping retained edits as feature history before starting a merge.
+        baseline = previous.get("prepared_edit_state")
+        state = json.loads(json.dumps(await recovery_edit_state(path)))
+        retained_edits = bool(baseline and baseline[0] == state[0] and baseline != state)
         await commit_worktree(path, "Preserve retained edits before base integration")
         head_sha = await _git_required(path, "rev-parse", "HEAD")
+        if retained_edits:
+            previous["repair_head_sha"] = head_sha
+            await _record_recovery(path, branch, previous)
         integration_sha = base_sha
         rc, out, err = await _git(
             path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
@@ -2346,7 +2390,11 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         "head_sha": head_sha,
         "conflict_paths": paths.splitlines(),
         "published_head_sha": previous.get("published_head_sha", ""),
+        "repair_head_sha": previous.get("repair_head_sha", ""),
     }
+    state = json.loads(json.dumps(await recovery_edit_state(path)))
+    baseline = previous.get("prepared_edit_state")
+    context["prepared_edit_state"] = baseline if baseline and baseline[0] == state[0] else state
     await _record_recovery(path, branch, context)
     return context
 
@@ -2377,7 +2425,13 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
     context = await recovery_context(path, branch)
     if not context:
         return
+    baseline = context.get("prepared_edit_state")
+    state = json.loads(json.dumps(await recovery_edit_state(path)))
+    repaired = bool(baseline and baseline[0] == state[0] and baseline != state)
     await commit_worktree(path, "Integrate current base and resolve conflicts")
+    if repaired:
+        context["repair_head_sha"] = await _git_required(path, "rev-parse", "HEAD")
+        await _record_recovery(path, branch, context)
     rc, _, _ = await _git(
         path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"
     )

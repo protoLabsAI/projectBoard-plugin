@@ -2084,7 +2084,7 @@ class DriveMixin:
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
         # tree records its own.
         round_start = ""
-        ledger_only_pending = False
+        requirement_followup_pending = False
         attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
@@ -2113,11 +2113,10 @@ class DriveMixin:
                         )
                         return
                 attempt += 1
-                # Only the explicitly requested text-only follow-up may omit edits.
-                # Consume this marker so later goal/gate/requirement fixes still
-                # have to change the implementation, even after a ledger retry.
-                ledger_only_round = ledger_only_pending
-                ledger_only_pending = False
+                # Scope ledger progress to the requested requirement follow-up.
+                # Later review/CI/goal/gate repairs must still change the implementation.
+                requirement_followup_round = requirement_followup_pending
+                requirement_followup_pending = False
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -2252,10 +2251,12 @@ class DriveMixin:
                     #  • otherwise → one fresh worktree, one dispatch.
                     pending = None
                     recovery_before = None
+                    preserved_repair = False
                     if feature.get("pr_url") and wt is None:
                         pending = await worktree.pending_integration(repo, self.root, fid, raw_title)
                         if pending:
                             wt, branch = pending
+                            preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
                             keep_wt = True
                             # A deleted PR branch leaves this checkout as the only copy of
                             # the recovery work: continue it (publishing recreates the branch)
@@ -2477,6 +2478,9 @@ class DriveMixin:
                     # after requeue re-projects from the bead, so a lost write only
                     # costs a repeat disposition, never a false "disposed".
                     ledger = list(feature.get("requirements") or [])
+                    open_before = {
+                        str(i.get("id")) for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")
+                    }
                     if ledger:
                         ledger = apply_requirement_dispositions(ledger, _parse_requirements_reply(result or ""))
                         feature["requirements"] = ledger
@@ -2489,12 +2493,20 @@ class DriveMixin:
                                 fid,
                                 exc_info=True,
                             )
+                    ledger_progress = requirement_followup_round and any(
+                        str(i.get("id")) in open_before and i.get("status") in ("done", "declined") for i in ledger
+                    )
+                    # Malformed/silent follow-ups reach the bounded requirement gate;
+                    # only actual ledger progress can authorize publication.
+                    requirement_retry = requirement_followup_round and not _all_items_disposed(ledger)
                     if feature.get("pr_url") and wt:
                         recovery_unchanged = (
                             recovery_before is not None and recovery_before == await worktree.recovery_edit_state(wt)
                         )
                         await worktree.finish_integration(wt, branch, base)
-                        if recovery_unchanged and not ledger_only_round:
+                        if preserved_repair:
+                            preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
+                        if recovery_unchanged and not (preserved_repair or ledger_progress or requirement_retry):
                             raise worktree.NoChangesError(
                                 "fix round produced no commit or edits beyond the board-prepared integration; "
                                 "nothing new to push or review"
@@ -2648,7 +2660,7 @@ class DriveMixin:
                                     tier or "default",
                                 )
                                 keep_wt = True
-                                ledger_only_pending = True
+                                requirement_followup_pending = True
                                 continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
                         if n < self.goal_fix_max:
@@ -2687,6 +2699,7 @@ class DriveMixin:
                                 tier or "default",
                             )
                             keep_wt = True
+                            requirement_followup_pending = True
                             continue
                         raise worktree.WorktreeError(
                             f"requirements unresolved: {len(open_items)} item(s) still open after "
@@ -2760,7 +2773,7 @@ class DriveMixin:
                         # (NoChangesError: counted, escalated or blocked like any empty build),
                         # never "coder done", and never a re-review of the head the bounce was about.
                         still = await worktree.fix_round_unchanged(wt, round_start)
-                        if still:
+                        if still and not ledger_progress:
                             raise worktree.NoChangesError(
                                 f"fix round produced no commit — {branch} is still at {still[:12]}, the head "
                                 "the bounce was about; nothing new to push or review"

@@ -1050,8 +1050,9 @@ async def test_shutdown_keeps_exact_recovery_index_for_restart(history):
     assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
 
 
+@pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("edits", [False, True])
-async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatch, edits):
+async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatch, edits, restart):
     from pathlib import Path
     from unittest.mock import AsyncMock
     from tests.test_loop import FEATURE, _drive_with
@@ -1068,6 +1069,9 @@ async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatc
     git(repo, "push", "origin", "main")
     create = worktree.create_worktree
     opened = AsyncMock(return_value=feature["pr_url"])
+    if restart:
+        path, _ = await create(str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True)
+        await worktree.finish_integration(path, branch, "main")
 
     def seed(loop):
         monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
@@ -1077,7 +1081,8 @@ async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatc
         loop._ci_feedback[feature["id"]] = "Fix the rejected implementation"
 
     async def dispatch(coder, path, prompt, **kwargs):
-        assert git(path, "rev-parse", "MERGE_HEAD")
+        if not restart:
+            assert git(path, "rev-parse", "MERGE_HEAD")
         if edits:
             (Path(path) / "fix").write_text("actual fix\n")
         return "## Summary\nDone"
@@ -1104,8 +1109,9 @@ async def test_recovery_edit_snapshot_tracks_content_and_ignores_board_scratch(h
     assert await worktree.recovery_edit_state(str(repo)) != before
 
 
-@pytest.mark.parametrize("disposition", ["done", "declined — outside scope", None])
-async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history, monkeypatch, disposition):
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("disposition", ["done", "declined — outside scope", None, "declined"])
+async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history, monkeypatch, disposition, partial):
     from pathlib import Path
     from unittest.mock import AsyncMock
     from tests.test_loop import FEATURE, _drive_with
@@ -1115,7 +1121,10 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
     feature = {
         **FEATURE,
         "pr_url": "https://example/pr/7",
-        "requirements": [{"id": "r1", "text": "preserve coverage", "status": "open"}],
+        "requirements": [
+            {"id": "r1", "text": "preserve coverage", "status": "open"},
+            {"id": "r2", "text": "other coverage", "status": "open"},
+        ],
     }
     branch = worktree.branch_name(feature["id"], feature["title"])
     git(repo, "branch", "-m", branch)
@@ -1140,12 +1149,12 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
         else:
             states.append(await worktree.recovery_edit_state(path))
             if len(prompts) == 2:
-                assert "do NOT edit" in prompt
+                assert ("requirement items are still OPEN" if partial else "do NOT edit") in prompt
                 if disposition:
-                    return f"## Requirements\n- r1: {disposition}\n\n## Summary\nPreserved coverage"
+                    return f"## Requirements\n- r1: {disposition}\n- r2: done\n\n## Summary\nPreserved coverage"
             else:
                 assert "requirement items are still OPEN" in prompt
-        return "## Summary\nPreserved coverage"
+        return ("## Requirements\n- r2: done\n\n" if partial else "") + "## Summary\nPreserved coverage"
 
     _, store = await _drive_with(
         monkeypatch,
@@ -1155,7 +1164,7 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
         open_pr=opened,
         cfg={"coder": "proto", "goal_fix_max": 1},
     )
-    if disposition:
+    if disposition in ("done", "declined — outside scope"):
         assert len(prompts) == 2
         opened.assert_awaited_once()
         path = opened.call_args.args[0]
@@ -1168,8 +1177,137 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(history,
         assert writes[-1][2] == feature["requirements"]
         assert "open_review" in store.names()
     else:
-        # Silence reaches the bounded completion gate; its ordinary code-fix
-        # follow-up must still be rejected when it makes no edits.
-        assert len(prompts) == 3
+        # Invalid/repeated dispositions exhaust the requirement budget.
+        assert len(prompts) <= 4
         opened.assert_not_awaited()
-        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+        assert any(c[0] == "flag_blocked" and "requirements unresolved" in c[2] for c in store.calls)
+
+
+@pytest.mark.parametrize("committed", [False, True, "unproven", "equivalent"])
+async def test_drive_restart_publishes_preserved_resolution(history, monkeypatch, committed):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    base = sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7"}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    remote = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
+    if committed == "unproven":
+        git(path, "add", "a")
+        git(path, "commit", "-m", "arbitrary local divergence without board provenance")
+    elif committed:
+        await worktree.finish_integration(path, branch, "main")
+        if committed == "equivalent":
+            # Another publisher supplied the same resolution with a different SHA.
+            equivalent = git(
+                path,
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                remote,
+                "-p",
+                base,
+                "-m",
+                "concurrently published equivalent resolution",
+            )
+            git(path, "push", "origin", f"{equivalent}:refs/heads/{branch}")
+    verify = AsyncMock(return_value=None)
+    gate = AsyncMock(return_value=None)
+
+    async def publish(path, branch, **kwargs):
+        git(path, "merge-base", "--is-ancestor", remote, "HEAD")
+        git(path, "merge-base", "--is-ancestor", base, "HEAD")
+        git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+        assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
+        git(path, "push", "origin", branch)
+        return feature["pr_url"]
+
+    opened = AsyncMock(side_effect=publish)
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_verify_goal", verify)
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        loop.goal_verify = True
+
+    async def dispatch(*args, **kwargs):
+        return "## Summary\nRetained resolution"
+
+    _, store = await _drive_with(monkeypatch, feature=feature, seed=seed, dispatch=dispatch, open_pr=opened, gate=gate)
+    if committed in ("unproven", "equivalent"):
+        verify.assert_not_awaited()
+        gate.assert_not_awaited()
+        opened.assert_not_awaited()
+        assert "flag_blocked" in store.names()
+        retained = git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/stranded/").splitlines()
+        if committed == "unproven":
+            assert retained
+            assert git(repo, "show", f"{retained[0]}:a") == "feature coverage\nsibling a coverage"
+        return
+    verify.assert_awaited_once()
+    gate.assert_awaited_once()
+    opened.assert_awaited_once()
+    assert "open_review" in store.names()
+    assert not await worktree.preserved_recovery_progress(path, branch)
+
+
+async def test_requirement_progress_does_not_exempt_later_goal_repair(history, monkeypatch):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    feature = {
+        **FEATURE,
+        "pr_url": "https://example/pr/7",
+        "requirements": [
+            {"id": "r1", "text": "first", "status": "open"},
+            {"id": "r2", "text": "second", "status": "open"},
+        ],
+    }
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    create = worktree.create_worktree
+    opened = AsyncMock(return_value=feature["pr_url"])
+    verify = AsyncMock(side_effect=[None, "Missing test"])
+    replies = []
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(worktree, "create_worktree", create)
+        monkeypatch.setattr(loop, "_verify_goal", verify)
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        loop.goal_verify = True
+
+    async def dispatch(coder, path, prompt, **kwargs):
+        replies.append(prompt)
+        if len(replies) == 1:
+            (Path(path) / "fix").write_text("repair\n")
+            return "## Requirements\n- r1: done\n## Summary\nRepair"
+        return "## Requirements\n- r1: done\n- r2: done\n## Summary\nRepair"
+
+    _, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        cfg={"coder": "proto", "goal_fix_max": 1},
+    )
+    assert len(replies) == 3
+    assert verify.await_count == 2
+    opened.assert_not_awaited()
+    assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
