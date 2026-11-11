@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -127,7 +128,11 @@ async def stage(run, name, payload, extra_tools):
         )
         if not isinstance(raw, str) or len(raw.encode()) > MAX_OUTPUT:
             raise ValueError("worker output must be bounded JSON text")
-        parsed = json.loads(raw)
+        # run_manual_subagent returns a completion banner before the worker body;
+        # the SDK forwards it unchanged. Strip only that single transport line,
+        # not arbitrary prose around JSON. Keep the size bound on the full reply.
+        body = re.sub(r"\A\[[^\r\n]* completed: [^\r\n]*\]\r?\n", "", raw, count=1)
+        parsed = json.loads(body)
         required = (
             ("proposal", "current_behavior", "invariants", "missing_decisions")
             if name == NAMES[0]

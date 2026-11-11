@@ -104,6 +104,56 @@ def test_swallowed_write_and_read_failures(setup):
     assert "read failed" in asyncio.run(sr.review(store, "bd-1"))["persistence"]
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_host_completion_envelope_runs_both_stages(setup, monkeypatch, newline):
+    """Simulated SDK transport envelope, real orchestration; no live host/model."""
+    store, calls = setup
+    run = sr.runtime()
+
+    async def enveloped(name, prompt, **kwargs):
+        body = await run(name, prompt, **kwargs)
+        return f"[Subagent {name} completed: Advisory spec review]{newline}{newline}{body}"
+
+    monkeypatch.setattr(sr, "runtime", lambda: enveloped)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert [c[0] for c in calls] == list(sr.NAMES)
+    for key in ("comprehension", "readiness"):
+        assert report["stages"][key]["status"] == "reported"
+    assert calls[1][1]["comprehension"] == report["stages"]["comprehension"]["result"]
+    assert report["persistence"] == "verified"
+    saved = json.loads(store.comments[0])
+    assert saved["stages"] == report["stages"]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "[Subagent worker failed: provider error]\n{body}",
+        "Unexpected prose\n{body}",
+        "[Subagent worker completed: review]\nnot JSON",
+        "[Subagent worker completed: review]\n{{}}",
+        "[Subagent worker completed: review]\n{body}\ntrailing prose",
+        "[Subagent worker completed: review]\n{body}\n{{}}",
+        "[Subagent worker completed: review]\n[Subagent worker completed: review]\n{body}",
+        "[Subagent worker completed: " + "x" * sr.MAX_OUTPUT + "]\n{body}",
+    ],
+)
+def test_completion_envelope_keeps_invalid_outputs_as_gaps(setup, monkeypatch, reply):
+    store, calls = setup
+    run = sr.runtime()
+
+    async def invalid(name, prompt, **kwargs):
+        body = await run(name, prompt, **kwargs)
+        return reply.format(body=body)
+
+    monkeypatch.setattr(sr, "runtime", lambda: invalid)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert report["stages"]["comprehension"]["status"] == "gap"
+    assert report["stages"]["readiness"]["status"] == "not_run"
+    assert len(calls) == 1
+    assert report["persistence"] == "verified"
+
+
 @pytest.mark.parametrize("mutation", ["edit", "delete", "read_error"])
 def test_final_freshness(setup, mutation):
     store, _ = setup
