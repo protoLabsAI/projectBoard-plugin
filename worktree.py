@@ -1251,8 +1251,93 @@ def _unlink_board_links(worktree: str) -> int:
     return removed
 
 
+class EnvironmentPreparationError(WorktreeError):
+    """A moved tree is not ready for validation; never a coder repair request."""
+
+
+def _environment_marker(wt: str) -> str | None:
+    # Per-worktree admin storage survives moves and is never staged.
+    gitfile = os.path.join(wt, ".git")
+    if not os.path.isfile(gitfile):
+        return None
+    with open(gitfile) as stream:
+        target = stream.read().strip().removeprefix("gitdir: ")
+    return os.path.join(os.path.abspath(os.path.join(wt, target)), "board-environment-pending")
+
+
+def _stable_shared_dependencies(wt: str, rel: str) -> bool:
+    """Absolute links outside the moved tree keep working without reinstallation."""
+    path = os.path.join(wt, rel)
+    return (
+        os.path.basename(path) == "node_modules"
+        and os.path.islink(path)
+        and os.path.isabs(os.readlink(path))
+        and os.path.isdir(path)
+        and os.path.commonpath((os.path.realpath(wt), os.path.realpath(path))) != os.path.realpath(wt)
+    )
+
+
+def _installed_environments(wt: str) -> list[str]:
+    found = []
+    for root, dirs, files in os.walk(wt, followlinks=False):
+        if "pyvenv.cfg" in files:
+            found.append(os.path.relpath(root, wt))
+            dirs[:] = []
+            continue
+        if "node_modules" in dirs or "node_modules" in files:
+            rel = os.path.relpath(os.path.join(root, "node_modules"), wt)
+            if not _stable_shared_dependencies(wt, rel):
+                found.append(rel)
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+    return found
+
+
+async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, timeout: float) -> None:
+    """Complete promotion before validation using the project's exact setup command.
+
+    Quarantine installed trees in git admin storage, never rewrite launchers.
+    The marker survives errors/cancellation; retries quarantine partial installs too.
+    Feature files, commits and dependency locks remain in the working tree.
+    """
+    marker = _environment_marker(wt)
+    if not marker or not os.path.exists(marker):
+        return
+    try:
+        with open(marker) as stream:
+            required = json.load(stream)["environments"]
+        # Also accept pending markers written before shared links were excluded.
+        required = [rel for rel in required if not _stable_shared_dependencies(wt, rel)]
+        installed = await asyncio.to_thread(_installed_environments, wt)
+        if (installed or required) and not (cmd or "").strip():
+            raise EnvironmentPreparationError("configure the project's setup_cmd to reinstall dependencies")
+        for rel in installed:
+            if rel == ".":
+                raise EnvironmentPreparationError("the worktree root itself is a virtual environment")
+            rc, tracked, err = await _git(wt, "ls-files", "--", rel)
+            if rc or tracked.strip():
+                raise EnvironmentPreparationError(f"cannot quarantine {rel}: tracked files or unreadable index {err}")
+            path = os.path.join(wt, rel)
+            archive = tempfile.mkdtemp(prefix="board-old-environment-", dir=os.path.dirname(marker))
+            # Git admin storage may be on a different filesystem. move preserves
+            # symlinks and falls back to copy/remove for EXDEV; this archive is
+            # never used as the active environment, which setup rebuilds below.
+            shutil.move(path, os.path.join(archive, os.path.basename(path)))
+        reason = await prepare_worktree(wt, cmd, env=env, timeout=timeout)
+        if reason:
+            raise EnvironmentPreparationError(reason)
+        missing = [rel for rel in required if not os.path.isdir(os.path.join(wt, rel))]
+        if missing:
+            raise EnvironmentPreparationError(f"setup_cmd did not recreate environments: {missing}")
+        os.unlink(marker)
+    except (OSError, ValueError, KeyError, WorktreeError) as exc:
+        raise EnvironmentPreparationError(
+            f"environment preparation failed for {wt}: {exc}. Feature work is preserved; "
+            "repair setup_cmd and retry environment preparation before validation."
+        ) from exc
+
+
 async def prepare_worktree(worktree: str, cmd: str, *, env: dict | None, timeout: float) -> str:
-    """Install a fresh worktree's dependencies with the project's ``setup_cmd``.
+    """Install a fresh or relocated worktree's dependencies with the project's ``setup_cmd``.
 
     Returns '' on success (or when there is no command), else a one-line reason. A failed
     or hung install never raises: the coder can still work, and its brief tells it to
@@ -1909,12 +1994,23 @@ async def promote_worktree(
     preserve the dirty tree). Idempotently clears a stale canonical worktree/branch
     first so ``move`` has a free destination — after saving any work that canonical tree
     holds to a ``stranded/…`` branch, or raising ``StrandedWorkError`` before anything
-    moves if that fails (#405). A winner already at the canonical path is a no-op.
+    moves if that fails (#405). A winner already at the canonical path is a no-op; pending environment
+    preparation still requires restore_worktree_environment before validation.
     Returns (canonical_path, canonical_branch)."""
     canon_branch = branch_name(fid, title)
     canon_rel = os.path.join(root, worktree_dir(fid, title))
     canon_path = os.path.join(repo, canon_rel)
     if os.path.abspath(src_wt) == os.path.abspath(canon_path):
+        marker = _environment_marker(src_wt)
+        if marker and os.path.exists(marker):
+            # A crash can land between move and branch rename. Finish that half too.
+            rc, current, err = await _git(src_wt, "branch", "--show-current")
+            if rc:
+                raise WorktreeError(f"promoted branch read failed: {err.strip()[:200]}")
+            if current.strip() != canon_branch:
+                rc, _o, err = await _git(src_wt, "branch", "-m", canon_branch)
+                if rc:
+                    raise WorktreeError(f"branch rename failed: {err.strip()[:200]}")
         return os.path.abspath(canon_path), canon_branch
     # A canonical tree an earlier drive left mid-build is the same stranded work a dead
     # candidate is (#405): save it before the forced clear — and before the winner moves.
@@ -1922,6 +2018,11 @@ async def promote_worktree(
     # Free the destination: drop any stale canonical worktree/branch leftover.
     await _git(repo, "worktree", "remove", "--force", canon_rel)
     await _git(repo, "branch", "-D", canon_branch)
+    # Persist before moving: cancellation cannot certify a relocated environment.
+    marker = _environment_marker(src_wt)
+    if marker and not os.path.exists(marker):
+        with open(marker, "w") as stream:
+            json.dump({"source": os.path.abspath(src_wt), "environments": _installed_environments(src_wt)}, stream)
     rc, _o, err = await _git(repo, "worktree", "move", os.path.abspath(src_wt), os.path.abspath(canon_path))
     if rc != 0:
         raise WorktreeError(f"worktree move failed: {err.strip()[:200]}")
