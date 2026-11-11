@@ -537,7 +537,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self._drives: set[asyncio.Task] = set()
         self._inflight: dict[str, tuple[str, str, str]] = {}
         # files_to_modify of each in-flight feature, for the hot-file overlap guard
-        # (don't run two parallel coders that edit the same file → sure conflict).
+        # and advisory overlap reporting; project policy decides which paths lock.
         self._inflight_files: dict[str, set[tuple[str, str]]] = {}  # fid -> {(project, path)} (#197)
         # #311: at most ONE self-dispatch (a task the board runs through HOST.invoke as
         # its own agent) in flight per board — a second self-assigned task parks rather

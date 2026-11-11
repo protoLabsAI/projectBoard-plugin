@@ -3215,7 +3215,7 @@ async def test_spawn_ready_skips_a_file_conflicting_candidate(monkeypatch):
     # bd-1 + bd-2 both touch shared.py; bd-3 touches other.py.
     store = _ClaimStore([_ready("bd-1", ["shared.py"]), _ready("bd-2", ["shared.py"]), _ready("bd-3", ["other.py"])])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-    loop = BoardLoop({"max_concurrent": 3})
+    loop = BoardLoop({"max_concurrent": 3, "claim_file_lock": "all"})
     finish = await _hold_drives(loop, monkeypatch)
     try:
         await loop._spawn_ready()
@@ -3982,7 +3982,7 @@ async def test_spawn_ready_logs_the_claim_decision_with_skip_reason(monkeypatch,
     # an in-flight build; bd-lo is disjoint and gets claimed ahead of it.
     store = _ClaimStore([_ready("bd-hi", ["shared.py"]), _ready("bd-lo", ["other.py"])])
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-    loop = BoardLoop({"max_concurrent": 2})
+    loop = BoardLoop({"max_concurrent": 2, "claim_file_lock": "all"})
     # #197: guard keys are (project, path); unstamped cards resolve to "default".
     loop._inflight_files = {"bd-live": {("default", "shared.py")}}  # an in-flight build owns shared.py
     finish = await _hold_drives(loop, monkeypatch)
@@ -9661,7 +9661,7 @@ async def test_spawn_ready_does_not_collide_same_filename_across_projects(monkey
         ]
     )
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
-    loop = BoardLoop({"max_concurrent": 3})
+    loop = BoardLoop({"max_concurrent": 3, "claim_file_lock": "all"})
     monkeypatch.setattr(loop, "_project_name", lambda f: f.get("project") or "")
     finish = await _hold_drives(loop, monkeypatch)
     try:

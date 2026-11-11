@@ -113,14 +113,15 @@ _PROJECT_SETTING_KEYS = (
     "external_review",
     "breadth_exclude",
     "hot_files",
+    "claim_file_lock",
     "preflight_cmd",
     "require_complete_review",
     "review_summon_handle",
 )
-# Card-authoring policy (#455, #458) that a top-level value sets for EVERY project, an
+# Card-authoring and claim policy (#455, #458, #730) set for EVERY project by a top-level value, an
 # entry's own value overriding it — the `release_freeze` posture. (The execution keys
 # above deliberately don't inherit: a gate command or a ladder belongs to one repo.)
-_INHERITED_SETTING_KEYS = ("breadth_exclude", "hot_files")
+_INHERITED_SETTING_KEYS = ("breadth_exclude", "hot_files", "claim_file_lock")
 _CODER_SOLVE_PREFIX = "coder_solve_"
 
 
