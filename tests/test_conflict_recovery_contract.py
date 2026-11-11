@@ -1930,3 +1930,76 @@ async def test_clean_base_merge_after_consumed_repair_is_not_coder_progress(
         # No repair provenance was minted for the board's merge.
         assert journal["repair_head_sha"] == consumed[0]["repair_head_sha"]
         assert journal.get("consumed_repair", {}).get("repair_head_sha") == consumed[0]["repair_head_sha"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "detail"),
+    [("fetch", "fetch failed"), ("rebase", "Interrupted rebase"), ("rewind", "history was rewritten")],
+)
+async def test_auto_unblock_refresh_failure_alerts_and_preserves_recovery(history, monkeypatch, failure, detail):
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    from project_board.loop import BoardLoop
+    from tests.test_loop import _BlockedStore, _blocked
+
+    repo = history
+    fid, title = "bd-refresh-failure", "Preserve failed recovery"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    context = await worktree.recovery_context(path, branch)
+    context["published_head_sha"] = git(path, "rev-parse", "HEAD")
+    await worktree._record_recovery(path, branch, context)
+    remote = git(repo, "remote", "get-url", "origin")
+    if failure == "fetch":
+        git(repo, "remote", "set-url", "origin", str(repo / "missing"))
+    elif failure == "rebase":
+        (repo / "a").write_text("sibling coverage\n")
+        git(repo, "commit", "-am", "conflicting sibling")
+        git(repo, "push", "origin", "main")
+        result = subprocess.run(["git", "-C", path, "rebase", "main"], capture_output=True)
+        assert result.returncode != 0
+    else:
+        git(remote, "update-ref", f"refs/heads/{branch}", git(repo, "rev-parse", "main"))
+    (Path(path) / "unique").write_text("sole copy of recovery work\n")
+    head, status = git(path, "rev-parse", "HEAD"), git(path, "status", "--porcelain")
+    blocked = _BlockedStore(
+        [
+            {**_blocked(fid, "merge-conflict", title=title), "pr_url": "https://example/pr/1"},
+            _blocked("bd-other", "transient"),
+        ]
+    )
+    alerts = Mock()
+    # A restarted loop must report the same incident, for inbox deduplication.
+    for _ in range(2):
+        loop = BoardLoop({"coder": "proto"})
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_notify_operator", alerts)
+        loop._ci_feedback[fid] = "old conflict feedback"
+        await loop._recover_blocked(blocked)
+        assert blocked.get_feature(fid)["blocked"]
+        assert fid not in blocked.cleared and fid not in blocked.requeued
+        assert not any(item[0] == fid for item in blocked.budgets)
+        assert loop._ci_feedback[fid] == "old conflict feedback"
+        assert git(path, "rev-parse", "HEAD") == head
+        assert git(path, "status", "--porcelain") == status
+        assert (Path(path) / "unique").read_text() == "sole copy of recovery work\n"
+        if failure == "rebase":
+            assert await worktree._operation_present(path, "rebase-merge")
+    assert blocked.requeued == ["bd-other"]  # failure does not stop the sweep
+    assert alerts.call_count == 2
+    for call in alerts.call_args_list:
+        assert call.args[0] == fid
+        assert detail in call.args[1]
+        assert call.kwargs["store"] is blocked
+    assert alerts.call_args_list[0].kwargs["incident"] == alerts.call_args_list[1].kwargs["incident"]
+    if failure == "fetch":
+        git(repo, "remote", "set-url", "origin", remote)
+        await loop._recover_blocked(blocked)
+        assert fid in blocked.cleared and fid in blocked.requeued
+        assert (fid, "unblock-retry", 1) in blocked.budgets
+        assert "Actual conflict paths: none." in loop._ci_feedback[fid]

@@ -929,23 +929,40 @@ class ReconcileMixin:
                             if reset is not None and time.time() < reset:
                                 continue  # Quota is still down; spend no retry before its reset.
                         if cls == "merge-conflict" and fresh.get("pr_url"):
-                            repo = self._repo_for(fresh)
-                            branch = worktree.branch_name(fid, fresh.get("title") or "")
-                            if await worktree.recovery_context(repo, branch):
-                                from .prompt import integration_feedback
+                            try:
+                                repo = self._repo_for(fresh)
+                                branch = worktree.branch_name(fid, fresh.get("title") or "")
+                                if await worktree.recovery_context(repo, branch):
+                                    from .prompt import integration_feedback
 
-                                pending = await worktree.pending_integration(
-                                    repo, self.root, fid, fresh.get("title") or ""
+                                    pending = await worktree.pending_integration(
+                                        repo, self.root, fid, fresh.get("title") or ""
+                                    )
+                                    context = await worktree.refresh_integration_context(
+                                        repo,
+                                        branch,
+                                        self._base_branch_for(fresh),
+                                        root=self.root,
+                                        recovery_path=pending[0] if pending else None,
+                                    )
+                                    self._ci_feedback[fid] = integration_feedback(
+                                        self._ci_feedback.get(fid, ""), context
+                                    )
+                                    self._ci_prior_diff.pop(fid, None)
+                            except Exception as exc:  # noqa: BLE001 — surface failure without discarding recovery
+                                # Never dispatch stale feedback or lose this failure in
+                                # the outer log-only handler. A later sweep can retry.
+                                failure = f"{type(exc).__name__}: {exc}"
+                                await asyncio.to_thread(
+                                    self._notify_operator,
+                                    fid,
+                                    f"Board card {fid} remains blocked: merge-conflict recovery refresh failed: "
+                                    f"{failure}. Preserved recovery work; no unblock retry spent. "
+                                    f"Original block: {fresh.get('blocked_reason') or reason}",
+                                    incident=f"{cls}|{reason}|{spent}|refresh-failed|{failure}",
+                                    store=store,
                                 )
-                                context = await worktree.refresh_integration_context(
-                                    repo,
-                                    branch,
-                                    self._base_branch_for(fresh),
-                                    root=self.root,
-                                    recovery_path=pending[0] if pending else None,
-                                )
-                                self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
-                                self._ci_prior_diff.pop(fid, None)
+                                continue
                         await self._budget_set(store, fid, "unblock-retry", spent + 1)
                         await asyncio.to_thread(store.clear_blocked, fid)
                         await asyncio.to_thread(store.requeue, fid)
