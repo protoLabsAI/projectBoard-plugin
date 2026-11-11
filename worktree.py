@@ -2181,7 +2181,7 @@ async def _recovery_path(path: str, branch: str) -> str:
 
 async def recovery_context(path: str, branch: str) -> dict:
     """Repository-owned journal survives worktree replacement and loop restart."""
-    if not os.path.exists(os.path.join(path, ".git")):
+    if not path or not os.path.exists(os.path.join(path, ".git")):
         return {}
     filename = await _recovery_path(path, branch)
     if not os.path.exists(filename):
@@ -2305,12 +2305,17 @@ async def preserved_recovery_progress(path: str, branch: str) -> bool:
     return True
 
 
-async def consume_recovery_progress(path: str, branch: str) -> None:
-    """Persist a gate repair request; the accepted candidate now needs new edits."""
+async def consume_recovery_progress(path: str, branch: str, *, goal_followup: bool = False) -> None:
+    """Persist a repair request and its optional declaration-only goal follow-up.
+
+    Record both together so a restart cannot lose the permitted non-tree response.
+    Other repair requests retire that intent along with candidate progress.
+    """
     context = await recovery_context(path, branch)
     if not context:
         return
     context["requirement_followup_pending"] = False
+    context["goal_followup_pending"] = goal_followup
     if context.get("repair_head_sha"):
         context["consumed_repair"] = {
             "repair_head_sha": context["repair_head_sha"],
@@ -2323,6 +2328,7 @@ async def request_requirement_followup(path: str, branch: str) -> None:
     """Keep the completion gate's text-only request across process restarts."""
     context = await recovery_context(path, branch)
     if context:
+        context["goal_followup_pending"] = False
         context["requirement_followup_pending"] = True
         await _record_recovery(path, branch, context)
 
@@ -2421,6 +2427,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         "published_head_sha": previous.get("published_head_sha", ""),
         "repair_head_sha": previous.get("repair_head_sha", ""),
         "consumed_repair": previous.get("consumed_repair"),
+        "goal_followup_pending": previous.get("goal_followup_pending", False),
         "requirement_followup_pending": previous.get("requirement_followup_pending", False),
     }
     state = json.loads(json.dumps(await recovery_edit_state(path)))
@@ -2677,6 +2684,7 @@ async def open_pr(
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")
     context = await recovery_context(worktree, branch)
     if context:
+        context["goal_followup_pending"] = False
         context["published_head_sha"] = await _git_required(worktree, "rev-parse", "HEAD")
         context["requirement_followup_pending"] = False
         await _record_recovery(worktree, branch, context)

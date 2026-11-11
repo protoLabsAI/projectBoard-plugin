@@ -2088,6 +2088,7 @@ class DriveMixin:
         # tree records its own.
         round_start = ""
         requirement_followup_pending = False
+        goal_followup_pending = False
         attempt = 0
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
@@ -2119,6 +2120,7 @@ class DriveMixin:
                 # Scope ledger progress to the requested requirement follow-up.
                 # Later review/CI/goal/gate repairs must still change the implementation.
                 requirement_followup_round = requirement_followup_pending
+                goal_followup_round = goal_followup_pending
                 # Rebuild the prompt each attempt so a re-dispatch (CI bounce,
                 # goal-verify gap, or tier escalation) picks up the latest
                 # _ci_feedback + _ci_prior_diff. Fetch this area's distilled lessons
@@ -2261,6 +2263,8 @@ class DriveMixin:
                             recovery = await worktree.recovery_context(wt, branch)
                             requirement_followup_pending = bool(recovery.get("requirement_followup_pending"))
                             requirement_followup_round = requirement_followup_pending
+                            goal_followup_pending = bool(recovery.get("goal_followup_pending"))
+                            goal_followup_round = goal_followup_pending
                             keep_wt = True
                             # A deleted PR branch leaves this checkout as the only copy of
                             # the recovery work: continue it (publishing recreates the branch)
@@ -2486,6 +2490,7 @@ class DriveMixin:
                     # processing. Its journal survives restart until a gate requests
                     # new edits or publication retires it. Provider retries retain it.
                     requirement_followup_pending = False
+                    goal_followup_pending = False
                     ledger = list(feature.get("requirements") or [])
                     open_before = {
                         str(i.get("id")) for i in ledger if str(i.get("status", "")).lower() not in ("done", "declined")
@@ -2508,6 +2513,9 @@ class DriveMixin:
                     # Malformed/silent follow-ups reach the bounded requirement gate;
                     # only actual ledger progress can authorize publication.
                     requirement_retry = requirement_followup_round and not _all_items_disposed(ledger)
+                    # A requested declaration may reach verification; the marker itself
+                    # does not satisfy the verifier or authorize publication.
+                    goal_progress = goal_followup_round and _no_test_marker(result or "") is not None
                     if feature.get("pr_url") and wt:
                         recovery_unchanged = (
                             recovery_before is not None and recovery_before == await worktree.recovery_edit_state(wt)
@@ -2515,7 +2523,9 @@ class DriveMixin:
                         await worktree.finish_integration(wt, branch, base)
                         if preserved_repair:
                             preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
-                        if recovery_unchanged and not (preserved_repair or ledger_progress or requirement_retry):
+                        if recovery_unchanged and not (
+                            preserved_repair or ledger_progress or requirement_retry or goal_progress
+                        ):
                             raise worktree.NoChangesError(
                                 "fix round produced no commit or edits beyond the board-prepared integration; "
                                 "nothing new to push or review"
@@ -2529,7 +2539,6 @@ class DriveMixin:
                     if self.goal_verify:
                         gap = await self._verify_goal(feature, wt, base, result or "")
                         if gap:
-                            await worktree.consume_recovery_progress(wt, branch)
                             # A goal-verify gap (e.g. the coder skipped tests) is
                             # fixable by the SAME coder told what's missing — not a
                             # model-capability failure. Carry the gap (+ the rejected
@@ -2537,6 +2546,8 @@ class DriveMixin:
                             # the same tier, bounded by goal_fix_max, BEFORE escalating.
                             n = await self._budget_get(store, fid, "goal-fix", feature)
                             if n < self.goal_fix_max:
+                                await worktree.consume_recovery_progress(wt, branch, goal_followup=True)
+                                goal_followup_pending = True
                                 await self._budget_set(store, fid, "goal-fix", n + 1)
                                 # KEEP the worktree (the impl is in its files); the coder
                                 # only ADDS what the reviewer flagged. The diff is on disk,
@@ -2568,9 +2579,9 @@ class DriveMixin:
                     # local_gate_max; on exhaustion open the PR anyway (CI is the backstop).
                     gate_out = await self._run_local_gate(wt, feature)
                     if gate_out is not None:
-                        await worktree.consume_recovery_progress(wt, branch)
                         n = await self._budget_get(store, fid, "gate-fix", feature)
                         if n < self.local_gate_max:
+                            await worktree.consume_recovery_progress(wt, branch)
                             await self._budget_set(store, fid, "gate-fix", n + 1)
                             self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
                             self._ci_feedback[fid] = (

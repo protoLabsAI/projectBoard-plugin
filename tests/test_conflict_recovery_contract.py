@@ -1599,7 +1599,7 @@ async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeyp
         assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
 
 
-@pytest.mark.parametrize("stop_at", ["goal", "publication", "ledger", "requirements"])
+@pytest.mark.parametrize("stop_at", ["goal", "publication", "exhausted-gate", "ledger", "requirements"])
 async def test_restart_retains_candidate_and_requirement_followup(history, monkeypatch, stop_at):
     from pathlib import Path
     from unittest.mock import AsyncMock
@@ -1667,7 +1667,7 @@ async def test_restart_retains_candidate_and_requirement_followup(history, monke
 
     async def publish(path, branch, **kwargs):
         nonlocal stopped
-        if stop_at == "publication" and not stopped:
+        if stop_at in ("publication", "exhausted-gate") and not stopped:
             stopped = True
             raise ProcessStopped()
         git(path, "merge-base", "--is-ancestor", remote, "HEAD")
@@ -1685,7 +1685,8 @@ async def test_restart_retains_candidate_and_requirement_followup(history, monke
         seed=seed,
         dispatch=dispatch,
         open_pr=opened,
-        cfg={"coder": "proto", "goal_fix_max": 1},
+        gate=AsyncMock(return_value="Still failing" if stop_at == "exhausted-gate" else None),
+        cfg={"coder": "proto", "goal_fix_max": 1, "local_gate_max": 0},
     )
     with pytest.raises(ProcessStopped):
         await _drive_with(monkeypatch, **kwargs)
@@ -1700,3 +1701,101 @@ async def test_restart_retains_candidate_and_requirement_followup(history, monke
     assert not any(c[0] == "flag_blocked" for c in store.calls)
     if followup:
         assert feature["requirements"][0]["status"] == "declined"
+
+
+@pytest.mark.parametrize("interruption", ["none", "restart", "provider"])
+@pytest.mark.parametrize("reply_kind", ["valid", "missing", "substantive-gap", "fresh-review"])
+async def test_goal_followup_declaration(history, monkeypatch, interruption, reply_kind):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from project_board.loop import BoardLoop
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
+
+    class ProcessStopped(BaseException):
+        pass
+
+    repo = history
+    feature = {**FEATURE, "pr_url": "https://example/pr/7", "labels": [], "acceptance_criteria": "Keep behavior"}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    (Path(path) / "config.py").write_text("SETTING = True\n")
+    await worktree.finish_integration(path, branch, "main")
+    attempts = 0
+    verified = []
+    real_verify = BoardLoop._verify_goal
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        loop.goal_verify = True
+
+        async def verify(feature, wt, base, reply):
+            gap = await real_verify(loop, feature, wt, base, reply)
+            verified.append(gap)
+            return "Substantive gap remains" if reply_kind == "substantive-gap" else gap
+
+        monkeypatch.setattr(loop, "_verify_goal", verify)
+
+    async def dispatch(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return "## Summary\nUpdated constant"
+        context = await worktree.recovery_context(path, branch)
+        if attempts == 2:
+            assert context["goal_followup_pending"]
+            if reply_kind == "fresh-review":
+                await worktree.consume_recovery_progress(path, branch)
+                raise ProcessStopped()
+            if interruption == "restart":
+                raise ProcessStopped()
+            if interruption == "provider":
+                raise worktree.WorktreeError("coder dispatch failed: 429 rate limit exceeded")
+        if reply_kind == "missing":
+            return "## Summary\nUpdated constant"
+        return "## Summary\nNO_TEST_NEEDED: constant configuration adjustment only"
+
+    opened = AsyncMock(return_value=feature["pr_url"])
+    store = FakeLoopStore()
+
+    def record_budget(fid, kind, n):
+        feature["labels"] = [label for label in feature["labels"] if not label.startswith(f"budget:{kind}:")]
+        feature["labels"].append(f"budget:{kind}:{n}")
+
+    monkeypatch.setattr(store, "record_budget", record_budget, raising=False)
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", AsyncMock())
+    kwargs = dict(
+        feature=feature,
+        store=store,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        cfg={"coder": "proto", "goal_fix_max": 1},
+    )
+    if interruption == "restart" or reply_kind == "fresh-review":
+        with pytest.raises(ProcessStopped):
+            await _drive_with(monkeypatch, **kwargs)
+    await _drive_with(monkeypatch, **kwargs)
+    assert verified[0] is not None
+    if reply_kind == "valid":
+        assert verified[-1] is None
+        opened.assert_awaited_once()
+    else:
+        opened.assert_not_awaited()
+        assert any(c[0] == "flag_blocked" for c in store.calls)
+        if reply_kind in ("missing", "fresh-review"):
+            assert len(verified) == 1
+        else:
+            assert len(verified) == 2
+
+
+async def test_recovery_journal_without_worktree():
+    assert await worktree.recovery_context(None, "feature") == {}
+    await worktree.request_requirement_followup(None, "feature")
+    await worktree.consume_recovery_progress(None, "feature", goal_followup=True)
