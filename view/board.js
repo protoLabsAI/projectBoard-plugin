@@ -1667,9 +1667,15 @@ function genCard(g){
       + '<span class="mt">'+esc(fmtTok(g.usage.used))+' / '+esc(fmtTok(g.usage.size))+' tokens · '+pct+'%</span></div>';
   }
   if (g.verify){
-    h += section(gen, "verify", "Verify", "", '<div class="vrow"><span class="st st-'+(g.verify.passed ? "done" : "failed")+'"><span class="sr">'
-      + (g.verify.passed ? "passed" : "failed")+'</span></span><span class="vt">'+(g.verify.passed ? "passed" : "failed")+'</span> <code>'
-      + esc(g.verify.test_cmd||"")+'</code></div>');
+    // #719: a verify entry with no verdict yet is a format stage still running (repair in
+    // progress) — show it as checking, never as a failed row with an empty command.
+    const judged = typeof g.verify.passed === "boolean";
+    const vst = !judged ? "running" : (g.verify.passed ? "done" : "failed");
+    const vword = !judged ? "checking" : (g.verify.passed ? "passed" : "failed");
+    h += section(gen, "verify", "Verify", "", '<div class="vrow"><span class="st st-'+vst+'"><span class="sr">'
+      + vword+'</span></span><span class="vt">'+vword+'</span>'
+      + (g.verify.test_cmd ? ' <code>'+esc(g.verify.test_cmd)+'</code>' : "")+'</div>'
+      + (g.verify.stages ? '<div class="vstages">'+esc(g.verify.stages)+'</div>' : ""));
   }
   if (!body) return h + '</div>';
   // Now: the current call — its title, its file(s) unless the title names them, and ONE plain

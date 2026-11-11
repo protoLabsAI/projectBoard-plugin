@@ -485,6 +485,13 @@ spent 15 generations on "acceptance tests timed out after 300s". It was then blo
 - **Path-scoped oracles.** `coder_solve_test_paths` picks each candidate's commands from
   the files it changed. An `apps/web` card is then judged by vitest and the typecheck, not
   by a Python suite that never looks at it.
+- **The format stage (#719).** With `coder_solve_format_check_cmd` and
+  `coder_solve_format_fix_cmd` set, a candidate that fails only the format check is
+  repaired in its own worktree by that formatter (bounded), and then the full oracle runs.
+  bd-j5qr2's first candidate was correct but failed `ruff format --check` in a chained gate.
+  pytest never ran, and two fresh candidates cost 40 more minutes. A formatter that touches
+  other files, fails, or doesn't converge leaves the candidate as written, and it fails
+  with its tests reported as not run.
 
 ## The tick never waits on one card (#462)
 

@@ -105,6 +105,9 @@ project_board:
   # coder_solve_test_paths:  # per-path oracles (#459): first matching glob wins per
   #   "apps/web/**": "npm ci && npx tsc --noEmit && npx vitest run"   # changed file;
   #   "**": gate             # `gate` = local_gate_cmd. See docs/configuration.md.
+  # coder_solve_format_check_cmd: "ruff format --check ."  # #719: format stage before the
+  # coder_solve_format_fix_cmd: "ruff format ."  # oracle; a format-only failure is repaired
+  # coder_solve_format_repair_attempts: 1  # in place (bounded), then the full oracle runs.
   coder_solve_fusion_delegate: ""  # rung 4 (ADR 0064 P3), opt-in: an `openai`-type
                              # delegate name (e.g. protolabs/fusion) for the hardest
                              # features. Blank (default) = ladder stops at tree-search.

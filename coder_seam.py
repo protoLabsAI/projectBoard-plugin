@@ -739,7 +739,22 @@ def progress_usage(fid: str | None, gen: int, usage: dict) -> None:
 def progress_verify(fid: str | None, gen: int, *, test_cmd: str, output: str, passed: bool) -> None:
     b = _buf(fid, gen)
     if b is not None:
+        # #719: keep the verify STAGE trail (`progress_verify_stages`) the format stage wrote
+        # before the oracle ran, so the drawer shows whether a candidate was repaired.
+        stages = (b.verify or {}).get("stages")
         b.verify = {"test_cmd": test_cmd, "passed": bool(passed), "tail": (output or "")[-1500:]}
+        if stages:
+            b.verify["stages"] = stages
+
+
+def progress_verify_stages(fid: str | None, gen: int, stages: str) -> None:
+    """Record a candidate's verification STAGE trail (#719) — e.g. "format check failed →
+    repaired by `ruff format .` (attempt 1/1) → format check passed → full verification
+    ran" — live, while the stages run, so a same-worktree repair is visible in the drawer
+    before the oracle's own verdict lands (``progress_verify`` keeps the trail)."""
+    b = _buf(fid, gen)
+    if b is not None and stages:
+        b.verify = {**(b.verify or {}), "stages": str(stages)[:400]}
 
 
 def progress_stop_reason(fid: str | None, gen: int, reason) -> None:
@@ -2304,6 +2319,23 @@ def _failure_signature(output: str) -> str | None:
     return f"{test} :: {assertion}".strip()
 
 
+# #719: how many times the trusted formatter may repair ONE candidate before its format
+# stage fails. Bounded on purpose — a formatter that hasn't converged in a few runs is not
+# going to, and the repair must never become an open-ended loop.
+FORMAT_REPAIR_ATTEMPTS_DEFAULT = 1
+FORMAT_REPAIR_ATTEMPTS_MAX = 3
+
+
+def clamp_format_repair_attempts(value) -> int:
+    """``coder_solve_format_repair_attempts`` as a bounded int: 0 turns the repair off,
+    anything unparsable is the default, anything above the cap is the cap (#719)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return FORMAT_REPAIR_ATTEMPTS_DEFAULT
+    return max(0, min(FORMAT_REPAIR_ATTEMPTS_MAX, n))
+
+
 class _WorktreeSolveAdapter:
     """Adapts `coder.solve()`'s ``generate``/``verify`` contract onto board
     worktrees. `solve()` treats a candidate as an opaque string; here that string is
@@ -2350,9 +2382,24 @@ class _WorktreeSolveAdapter:
         max_concurrent_sessions: int = 0,
         setup_cmd: str = "",
         setup_timeout: float = 600.0,
+        format_check_cmd: str = "",
+        format_fix_cmd: str = "",
+        format_repair_attempts: int = FORMAT_REPAIR_ATTEMPTS_DEFAULT,
         _fusion_dispatch=None,
     ):
         self.repo = repo
+        # #719: the explicit FORMAT verify stage. `format_check_cmd` runs before the oracle;
+        # when it fails, the trusted `format_fix_cmd` repairs THIS candidate in its own
+        # worktree (bounded by `format_repair_attempts`) and the full oracle then runs. Both
+        # commands are operator config — nothing is inferred from the oracle's shell text.
+        # Either one blank (the default) = no stage, the oracle alone judges, as before.
+        self.format_check_cmd = (format_check_cmd or "").strip()
+        self.format_fix_cmd = (format_fix_cmd or "").strip()
+        self.format_repair_attempts = clamp_format_repair_attempts(format_repair_attempts)
+        # Repair runs spent, across every candidate — accounted separately from
+        # `generations`: a repair edits an existing candidate, it never generates one.
+        self.format_repairs = 0
+        self._stages_by_wt: dict[str, str] = {}  # candidate worktree → its verify stage trail
         # A candidate tree's own dependency install (the project's `setup_cmd`); empty =
         # borrow the checkout's, as `create_worktree` links them.
         self.setup_cmd = (setup_cmd or "").strip()
@@ -2916,6 +2963,184 @@ class _WorktreeSolveAdapter:
         cmds, note = select_oracle(self.test_paths, changed, self.test_cmd)
         return (compose_oracle(cmds) if cmds else ""), note
 
+    @property
+    def format_stage_enabled(self) -> bool:
+        return bool(self.format_check_cmd and self.format_fix_cmd and self.format_repair_attempts > 0)
+
+    def _record_stages(self, candidate_wt: str, trail: str) -> None:
+        self._stages_by_wt[candidate_wt] = trail
+        gen = self._gen_by_wt.get(candidate_wt)
+        if gen is not None and self.progress_fid:
+            progress_verify_stages(self.progress_fid, gen, trail)
+
+    async def _run_stage_cmd(self, cmd: str, candidate_wt: str) -> tuple[int | None, str]:
+        """Run one verify-stage command (#719) in the candidate's tree with the same
+        allowlist env and ``test_timeout`` cap as the oracle. ``(None, why)`` when it timed
+        out or could not launch — the caller never reads that as a pass."""
+        try:
+            proc = await worktree.spawn_shell(
+                cmd,
+                cwd=candidate_wt,
+                env=config.sanitized_env(self.env_passthrough, mode="allowlist"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except OSError as exc:
+            return None, f"could not launch: {exc}"
+        try:
+            out, _ = await worktree.communicate_or_kill(proc, timeout=self.test_timeout)
+        except asyncio.TimeoutError:
+            return None, f"timed out after {self.test_timeout:.0f}s"
+        return proc.returncode, (out or b"").decode("utf-8", "replace").strip()
+
+    @staticmethod
+    def _snapshot(candidate_wt: str, paths: list[str]) -> dict[str, tuple[str, bytes | str] | None]:
+        """The candidate's own changed files as they stand, so a rejected or nonconverging
+        repair puts back exactly what the coder wrote (#719)."""
+        snap: dict[str, tuple[str, bytes | str] | None] = {}
+        for rel in paths:
+            full = os.path.join(candidate_wt, rel)
+            if os.path.islink(full):
+                snap[rel] = ("link", os.readlink(full))
+            elif os.path.isfile(full):
+                snap[rel] = ("file", Path(full).read_bytes())
+            else:
+                snap[rel] = None  # the candidate deleted it
+        return snap
+
+    async def _restore(self, candidate_wt: str, snap: dict, expected: set[str]) -> None:
+        """Undo a repair (#719): put the candidate's own files back from ``snap`` and revert
+        any file the formatter touched OUTSIDE the candidate's change (``expected``) to the
+        candidate's HEAD — or delete it when HEAD never had it."""
+        after = await worktree.changed_paths(candidate_wt, self.base) or []
+        for rel in after:
+            if rel in expected:
+                continue
+            rc, _out, _err = await worktree._git(candidate_wt, "checkout", "HEAD", "--", rel)
+            if rc != 0:
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(candidate_wt, rel))
+        for rel, entry in snap.items():
+            full = os.path.join(candidate_wt, rel)
+            with contextlib.suppress(OSError):
+                if os.path.islink(full) or (entry is None and os.path.exists(full)):
+                    os.remove(full)
+                if entry is None:
+                    continue
+                os.makedirs(os.path.dirname(full) or candidate_wt, exist_ok=True)
+                kind, data = entry
+                if kind == "link":
+                    os.symlink(data, full)
+                else:
+                    Path(full).write_bytes(data)
+
+    def _format_failed(self, candidate_wt: str, trail: str, reason: str, check_output: str):
+        """A FAILED format stage (#719) is the candidate's verdict: the stage is required
+        once configured, so the behavioral tests are reported NOT RUN, never passed."""
+        self._oracle_by_wt[candidate_wt] = self.format_check_cmd
+        self._record_stages(candidate_wt, f"{trail} → behavioral tests not run")
+        log.warning(
+            "[project_board] %s %s: format stage failed — %s",
+            self.fid,
+            os.path.basename(candidate_wt),
+            reason,
+        )
+        # The summary goes LAST (and the check output is bounded before it): every consumer
+        # keeps a tail — 4000 chars here, 1500 for the live monitor and sibling feedback — so
+        # a long check listing must never push "tests not run" out of what gets reported.
+        summary = f"format stage failed: {reason}\nbehavioral tests: not run (the required format stage failed first)"
+        output = f"--- `{self.format_check_cmd}` ---\n{(check_output or '')[-1000:]}\n{summary}"
+        return self.verdict_cls(
+            passed=False,
+            total=1,
+            failed=1,
+            failing=[f"{self.format_check_cmd!r} (format stage)"],
+            output=output[-4000:],
+        )
+
+    async def _format_stage(self, candidate_wt: str):
+        """The explicit format stage (#719). Returns ``None`` when the full oracle should run
+        next (the check passed, a bounded same-worktree repair made it pass, or the stage
+        could not classify the candidate), else the FAILED verdict.
+
+        bd-j5qr2: a gate chaining ``ruff check && ruff format --check && pytest`` failed g1 on
+        formatting alone, pytest never ran, and solve() spent g2 and g3 (40+ minutes) on fresh
+        implementations. Here a format-only failure is repaired IN PLACE by the operator's own
+        trusted formatter and never spends a generation. The stage is classified by which
+        configured command failed — never by parsing the oracle's shell string or output.
+        Guards, each leaving the candidate exactly as the coder wrote it:
+
+        * the formatter may only touch files the candidate already changed — anything else is
+          reverted and the stage fails;
+        * a formatter that errors, times out, or doesn't converge in ``format_repair_attempts``
+          runs fails the stage;
+        * a missing formatter/check tool is an infrastructure fault (``OracleMissingCommand``),
+          like a missing oracle (#542): the candidate is kept, no generation is spent."""
+        wt, name = candidate_wt, os.path.basename(candidate_wt)
+        check, fix = self.format_check_cmd, self.format_fix_cmd
+        rc, out = await self._run_stage_cmd(check, wt)
+        if rc is None:
+            # Unclassified — not a pass: the oracle still has to judge it in full.
+            self._record_stages(wt, f"format check {out} → not classified → full verification ran")
+            return None
+        if _oracle_command_missing(rc, out):
+            raise OracleMissingCommand(test_cmd=check, returncode=rc, output=out, candidate_wt=wt)
+        if rc == 0:
+            self._record_stages(wt, "format check passed → full verification ran")
+            return None
+        before = await worktree.changed_paths(wt, self.base)
+        if before is None:
+            # Can't fence the formatter to the candidate's files, so don't run it at all.
+            return self._format_failed(
+                wt, "format check failed", "git could not list the candidate's changes, so no repair was tried", out
+            )
+        expected = set(before)
+        snap = self._snapshot(wt, before)
+        trail = "format check failed"
+        for attempt in range(1, self.format_repair_attempts + 1):
+            self.format_repairs += 1
+            trail = f"format check failed → repairing with `{fix}` (attempt {attempt}/{self.format_repair_attempts})"
+            self._record_stages(wt, trail)
+            log.info("[project_board] %s %s: format-only failure — %s", self.fid, name, trail)
+            frc, fout = await self._run_stage_cmd(fix, wt)
+            if frc is not None and _oracle_command_missing(frc, fout):
+                await self._restore(wt, snap, expected)
+                raise OracleMissingCommand(test_cmd=fix, returncode=frc, output=fout, candidate_wt=wt)
+            if frc != 0:
+                await self._restore(wt, snap, expected)
+                why = fout if frc is None else f"exited {frc}"
+                return self._format_failed(
+                    wt, f"{trail} → formatter {why}", f"formatter `{fix}` {why}; candidate restored\n{fout}", out
+                )
+            after = await worktree.changed_paths(wt, self.base)
+            unexpected = sorted(set(after) - expected) if after is not None else None
+            if unexpected is None or unexpected:
+                await self._restore(wt, snap, expected)
+                touched = "files git could not list" if unexpected is None else ", ".join(unexpected[:10])
+                return self._format_failed(
+                    wt,
+                    f"{trail} → rejected",
+                    f"formatter `{fix}` changed files outside the candidate's change ({touched}); "
+                    "repair reverted, candidate restored",
+                    out,
+                )
+            rc, out = await self._run_stage_cmd(check, wt)
+            if rc == 0:
+                self._record_stages(wt, f"{trail} → format check passed → full verification ran")
+                log.info("[project_board] %s %s: format repaired in place; running full verification", self.fid, name)
+                return None
+            if rc is not None and _oracle_command_missing(rc, out):
+                await self._restore(wt, snap, expected)
+                raise OracleMissingCommand(test_cmd=check, returncode=rc, output=out, candidate_wt=wt)
+        await self._restore(wt, snap, expected)
+        return self._format_failed(
+            wt,
+            f"{trail} → still failing",
+            f"format check still fails after {self.format_repair_attempts} repair attempt(s) with `{fix}` "
+            "(not converging); candidate restored",
+            out,
+        )
+
     async def _run_acceptance_tests(self, candidate_wt: str):
         Verdict = self.verdict_cls
         cmd, note = await self._oracle_for(candidate_wt)
@@ -2939,6 +3164,10 @@ class _WorktreeSolveAdapter:
                 output=f"passed without tests: every changed file is mapped to skip in coder_solve_test_paths — {note}",
             )
         self._oracle_by_wt[candidate_wt] = cmd
+        if self.format_stage_enabled:
+            failed = await self._format_stage(candidate_wt)  # #719
+            if failed is not None:
+                return failed
         started = time.monotonic()
         try:
             proc = await worktree.spawn_shell(
@@ -3048,6 +3277,9 @@ async def dispatch(
     max_concurrent_sessions: int = 0,
     setup_cmd: str = "",
     setup_timeout: float = 600.0,
+    format_check_cmd: str = "",
+    format_fix_cmd: str = "",
+    format_repair_attempts: int = FORMAT_REPAIR_ATTEMPTS_DEFAULT,
     _solve=None,
     _budget_cls=None,
     _verdict_cls=None,
@@ -3094,6 +3326,12 @@ async def dispatch(
     candidate is judged by the commands its changed files pick (``select_oracle``), with
     ``test_cmd`` as the default for unmatched files. An oracle that times out on two
     candidates raises :class:`OracleTimeout` rather than spending the rest of the budget.
+
+    ``format_check_cmd``/``format_fix_cmd``/``format_repair_attempts`` (#719) are the
+    project's ``coder_solve_format_*`` settings: an explicit format stage run before the
+    oracle, whose format-only failure is repaired in the candidate's own worktree by the
+    trusted formatter (bounded, never a generation) before the FULL oracle runs. Either
+    command blank ⇒ no stage. ``adapter.format_repairs`` counts the repair runs.
 
     ``env_passthrough`` (#86) is the loop's env whitelist, threaded through to the
     adapter so the acceptance-test (verify) subprocess strips the same host
@@ -3148,6 +3386,9 @@ async def dispatch(
         max_concurrent_sessions=max_concurrent_sessions,
         setup_cmd=setup_cmd,
         setup_timeout=setup_timeout,
+        format_check_cmd=format_check_cmd,
+        format_fix_cmd=format_fix_cmd,
+        format_repair_attempts=format_repair_attempts,
         _fusion_dispatch=_fusion_dispatch,
     )
     try:
@@ -3228,11 +3469,12 @@ async def dispatch(
             )
         detail = result.verdict.feedback() if result.verdict else ""
         log.info(
-            "[project_board] %s coder.solve exhausted (rung=%s, gens=%d/%d) — no candidate passed",
+            "[project_board] %s coder.solve exhausted (rung=%s, gens=%d/%d, format repairs=%d) — no candidate passed",
             fid,
             result.rung,
             result.gens_spent,
             budget,
+            adapter.format_repairs,
         )
         raise SolveExhausted(
             f"coder.solve exhausted after {result.gens_spent} generation(s) (rung={result.rung}): "
@@ -3262,11 +3504,12 @@ async def dispatch(
         if wt != win_wt:
             await worktree.remove_worktree(repo, wt, branch)
     log.info(
-        "[project_board] %s coder.solve verified by acceptance tests (rung=%s, gens=%d/%d)",
+        "[project_board] %s coder.solve verified by acceptance tests (rung=%s, gens=%d/%d, format repairs=%d)",
         fid,
         result.rung,
         result.gens_spent,
         budget,
+        adapter.format_repairs,
     )
     # The winning candidate's own reply (its clean PR summary, per the "your FINAL
     # message becomes the PR description" contract every coder dispatch is given) is

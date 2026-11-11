@@ -283,6 +283,7 @@
   .gen .st-running{background:var(--pl-color-accent);animation:pl-pulse 1.6s ease-in-out infinite}
   .gen .st-done{background:var(--pl-color-status-success)}
   .gen .st-failed{background:var(--pl-color-status-error)}
+  .gen .vstages{color:var(--pl-color-fg-muted);font-size:var(--pl-font-size-xs,0.75rem);margin-top:0.25rem;overflow-wrap:anywhere}
   @media (prefers-reduced-motion:reduce){.gen .st-running{animation:none}}
   /* Now: one compact row — title on one line, the plain-words detail clamped to two; a click
      expands it in place (the full command/args wrap instead). */
