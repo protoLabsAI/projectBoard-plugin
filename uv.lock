@@ -4,5 +4,5 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "project-board"
-version = "0.78.2"
+version = "0.79.0"
 source = { virtual = "." }
