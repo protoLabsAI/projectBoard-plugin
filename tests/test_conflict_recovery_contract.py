@@ -680,7 +680,9 @@ async def test_pending_base_conflict_then_remote_conflict(history, tmp_path, mon
     (repo / "b").write_text("feature coverage\nlocal coverage\nremote coverage\n")
     monkeypatch.setattr(worktree, "_gh", AsyncMock(return_value=(0, "https://example/pr/1", "")))
     await worktree.finish_integration(str(repo), "feature", "main")
+    await worktree.request_requirement_followup(str(repo), "feature")
     await worktree.open_pr(str(repo), "feature", title="recovered")
+    assert not (await worktree.recovery_context(str(repo), "feature"))["requirement_followup_pending"]
     for sha in (pinned_base, remote_head):
         git(repo, "merge-base", "--is-ancestor", sha, "HEAD")
     assert (repo / "a").read_text() == "feature coverage\nsibling a coverage\n"
@@ -1595,3 +1597,106 @@ async def test_consumed_repair_survives_restart_during_gate_fix(history, monkeyp
         opened.assert_not_awaited()
         assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
         assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
+
+
+@pytest.mark.parametrize("stop_at", ["goal", "publication", "ledger", "requirements"])
+async def test_restart_retains_candidate_and_requirement_followup(history, monkeypatch, stop_at):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
+
+    class ProcessStopped(BaseException):
+        pass
+
+    repo = history
+    base = sibling(repo, "a")
+    feature = {**FEATURE, "pr_url": "https://example/pr/7", "labels": []}
+    followup = stop_at in ("ledger", "requirements")
+    if followup:
+        feature["requirements"] = [{"id": "r1", "text": "optional coverage", "status": "open"}]
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    remote = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(
+        str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True
+    )
+    resolution = "feature coverage\nsibling a coverage\n"
+    (Path(path) / "a").write_text(resolution)
+    await worktree.finish_integration(path, branch, "main")
+    stopped = False
+    attempts = []
+    loops = []
+
+    async def verify(*args):
+        nonlocal stopped
+        if stop_at == "goal" and not stopped:
+            stopped = True
+            raise ProcessStopped()
+        return None
+
+    def seed(loop):
+        loops.append(loop)
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_verify_goal", verify)
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        loop.goal_verify = True
+
+    async def dispatch(coder, resumed_path, prompt, **kwargs):
+        nonlocal stopped
+        assert resumed_path == path
+        attempts.append(prompt)
+        if followup and len(attempts) == 2:
+            # Also cover journals written by the previous version, which consumed
+            # the candidate before requesting a requirement disposition.
+            context = await worktree.recovery_context(path, branch)
+            assert context["requirement_followup_pending"] is True
+            context["consumed_repair"] = {
+                "repair_head_sha": context["repair_head_sha"],
+                "tree_sha": git(path, "rev-parse", "HEAD^{tree}"),
+            }
+            await worktree._record_recovery(path, branch, context)
+            stopped = True
+            raise ProcessStopped()
+        if followup and stopped:
+            return "## Requirements\n- r1: declined — optional coverage is outside scope\n## Summary\nRetained repair"
+        heading = "## Requirements\n" if stop_at == "requirements" else ""
+        return heading + "## Summary\nRetained repair"
+
+    async def publish(path, branch, **kwargs):
+        nonlocal stopped
+        if stop_at == "publication" and not stopped:
+            stopped = True
+            raise ProcessStopped()
+        git(path, "merge-base", "--is-ancestor", remote, "HEAD")
+        git(path, "merge-base", "--is-ancestor", base, "HEAD")
+        git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+        assert (Path(path) / "a").read_text() == resolution
+        git(path, "push", "origin", branch)
+        return feature["pr_url"]
+
+    opened = AsyncMock(side_effect=publish)
+    store = FakeLoopStore()
+    kwargs = dict(
+        feature=feature,
+        store=store,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        cfg={"coder": "proto", "goal_fix_max": 1},
+    )
+    with pytest.raises(ProcessStopped):
+        await _drive_with(monkeypatch, **kwargs)
+    assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
+    if followup:
+        assert not await worktree.preserved_recovery_progress(path, branch)
+    else:
+        assert await worktree.preserved_recovery_progress(path, branch)
+    await _drive_with(monkeypatch, **kwargs)
+    assert loops[0] is not loops[1]
+    assert "open_review" in store.names()
+    assert not any(c[0] == "flag_blocked" for c in store.calls)
+    if followup:
+        assert feature["requirements"][0]["status"] == "declined"

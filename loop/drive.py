@@ -2080,8 +2080,8 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
-        # Retained unpublished recovery progress survives provider retries until
-        # accepted below. Later gate repairs must supply new progress of their own.
+        # Retained unpublished recovery progress survives provider retries and
+        # restart until a gate requests a repair, which needs new progress.
         preserved_repair = False
         # #476: the commit a fix round's resumed tree started on ("" = not a resumed fix
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
@@ -2258,6 +2258,9 @@ class DriveMixin:
                         if pending:
                             wt, branch = pending
                             preserved_repair = await worktree.preserved_recovery_progress(wt, branch)
+                            recovery = await worktree.recovery_context(wt, branch)
+                            requirement_followup_pending = bool(recovery.get("requirement_followup_pending"))
+                            requirement_followup_round = requirement_followup_pending
                             keep_wt = True
                             # A deleted PR branch leaves this checkout as the only copy of
                             # the recovery work: continue it (publishing recreates the branch)
@@ -2479,9 +2482,9 @@ class DriveMixin:
                     # gate still checks the in-hand merged ledger), but a re-dispatch
                     # after requeue re-projects from the bead, so a lost write only
                     # costs a repeat disposition, never a false "disposed".
-                    # Consume the follow-up only when a coder reply reaches ledger
-                    # processing. Provider rotation/backoff must retain its purpose;
-                    # subsequent goal/CI/review repairs must not inherit it.
+                    # Consume the drive-local follow-up when a reply reaches ledger
+                    # processing. Its journal survives restart until a gate requests
+                    # new edits or publication retires it. Provider retries retain it.
                     requirement_followup_pending = False
                     ledger = list(feature.get("requirements") or [])
                     open_before = {
@@ -2517,11 +2520,8 @@ class DriveMixin:
                                 "fix round produced no commit or edits beyond the board-prepared integration; "
                                 "nothing new to push or review"
                             )
-                        # This candidate has passed progress classification. Its retained
-                        # resolution cannot also satisfy a subsequent goal/gate repair;
-                        # those requests require fresh edits even while HEAD is unpublished.
-                        # Provider failures before this check leave the exemption intact.
-                        await worktree.consume_recovery_progress(wt, branch)
+                        # Keep durable provenance until a gate requests a repair.
+                        # Restart before verification/publication still owns this candidate.
                         preserved_repair = False
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
@@ -2529,6 +2529,7 @@ class DriveMixin:
                     if self.goal_verify:
                         gap = await self._verify_goal(feature, wt, base, result or "")
                         if gap:
+                            await worktree.consume_recovery_progress(wt, branch)
                             # A goal-verify gap (e.g. the coder skipped tests) is
                             # fixable by the SAME coder told what's missing — not a
                             # model-capability failure. Carry the gap (+ the rejected
@@ -2567,6 +2568,7 @@ class DriveMixin:
                     # local_gate_max; on exhaustion open the PR anyway (CI is the backstop).
                     gate_out = await self._run_local_gate(wt, feature)
                     if gate_out is not None:
+                        await worktree.consume_recovery_progress(wt, branch)
                         n = await self._budget_get(store, fid, "gate-fix", feature)
                         if n < self.local_gate_max:
                             await self._budget_set(store, fid, "gate-fix", n + 1)
@@ -2672,6 +2674,7 @@ class DriveMixin:
                                     tier or "default",
                                 )
                                 keep_wt = True
+                                await worktree.request_requirement_followup(wt, branch)
                                 requirement_followup_pending = True
                                 continue
                         n = await self._budget_get(store, fid, "req-fix", feature)
@@ -2711,6 +2714,7 @@ class DriveMixin:
                                 tier or "default",
                             )
                             keep_wt = True
+                            await worktree.request_requirement_followup(wt, branch)
                             requirement_followup_pending = True
                             continue
                         raise worktree.WorktreeError(

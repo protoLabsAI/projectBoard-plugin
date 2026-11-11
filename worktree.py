@@ -2306,15 +2306,25 @@ async def preserved_recovery_progress(path: str, branch: str) -> bool:
 
 
 async def consume_recovery_progress(path: str, branch: str) -> None:
-    """Persist progress acceptance before goal/local gates can request another fix."""
+    """Persist a gate repair request; the accepted candidate now needs new edits."""
     context = await recovery_context(path, branch)
-    if not context or not context.get("repair_head_sha"):
+    if not context:
         return
-    context["consumed_repair"] = {
-        "repair_head_sha": context["repair_head_sha"],
-        "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
-    }
+    context["requirement_followup_pending"] = False
+    if context.get("repair_head_sha"):
+        context["consumed_repair"] = {
+            "repair_head_sha": context["repair_head_sha"],
+            "tree_sha": await _git_required(path, "rev-parse", "HEAD^{tree}"),
+        }
     await _record_recovery(path, branch, context)
+
+
+async def request_requirement_followup(path: str, branch: str) -> None:
+    """Keep the completion gate's text-only request across process restarts."""
+    context = await recovery_context(path, branch)
+    if context:
+        context["requirement_followup_pending"] = True
+        await _record_recovery(path, branch, context)
 
 
 async def recovery_round_start(path: str, branch: str) -> str:
@@ -2411,6 +2421,7 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         "published_head_sha": previous.get("published_head_sha", ""),
         "repair_head_sha": previous.get("repair_head_sha", ""),
         "consumed_repair": previous.get("consumed_repair"),
+        "requirement_followup_pending": previous.get("requirement_followup_pending", False),
     }
     state = json.loads(json.dumps(await recovery_edit_state(path)))
     baseline = previous.get("prepared_edit_state")
@@ -2667,6 +2678,7 @@ async def open_pr(
     context = await recovery_context(worktree, branch)
     if context:
         context["published_head_sha"] = await _git_required(worktree, "rev-parse", "HEAD")
+        context["requirement_followup_pending"] = False
         await _record_recovery(worktree, branch, context)
 
     # 3. Open the PR — or recover the existing one (re-dispatch case).
