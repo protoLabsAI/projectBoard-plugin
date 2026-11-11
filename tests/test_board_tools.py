@@ -447,6 +447,7 @@ def test_board_create_feature_depends_on_open_but_not_in_review_is_allowed(monke
 # registered tool so the next unguarded one cannot ship.
 
 _MINIMAL_ARGS = {
+    "board_review_spec": {"feature_id": "bd-1"},
     "board_watch": {"feature_id": "bd-1"},
     "board_create_epic": {"title": "t"},
     "board_create_feature": {"title": "t"},

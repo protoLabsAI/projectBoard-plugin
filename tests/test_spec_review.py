@@ -1,0 +1,188 @@
+"""Fake SDK/store orchestration coverage; real temporary filesystem boundary coverage."""
+
+import asyncio
+import copy
+import json
+
+import pytest
+
+from project_board import spec_review as sr
+
+
+class Store:
+    def __init__(self):
+        self.card = dict(issue_type="feature", difficulty="medium", title="Proposal", project="demo")
+        self.comments = []
+        self.drop = False
+
+    def get_feature(self, fid):
+        return copy.deepcopy(self.card)
+
+    def comment(self, fid, text):
+        if not self.drop:
+            self.comments.append(text)
+
+    def feature_comments(self, fid, **kwargs):
+        return self.comments
+
+
+@pytest.fixture
+def setup(monkeypatch, tmp_path):
+    store = Store()
+    calls = []
+
+    async def run(name, prompt, *, extra_tools):
+        calls.append((name, json.loads(prompt), extra_tools))
+        if name == sr.NAMES[0]:
+            return json.dumps(dict(proposal=[], current_behavior=[], invariants=[], missing_decisions=[]))
+        return json.dumps(
+            dict(
+                sources=[{"path": "x.py", "line": 1, "observation": "example"}],
+                ambiguities=[],
+                simpler_alternatives=[],
+                uncertainties=[],
+                dispositions=[],
+            )
+        )
+
+    monkeypatch.setattr(sr, "runtime", lambda: run)
+    monkeypatch.setattr(
+        "project_board.project_registry.project_registry_snapshot",
+        lambda: {"projects": [{"name": "demo", "repo": str(tmp_path)}], "default_project": "demo"},
+    )
+    return store, calls
+
+
+@pytest.mark.parametrize(
+    "difficulty,kind", [("small", "feature"), ("unknown", "feature"), ("large", "task"), ("medium", "epic")]
+)
+def test_refusal(setup, difficulty, kind):
+    store, calls = setup
+    store.card.update(difficulty=difficulty, issue_type=kind)
+    assert asyncio.run(sr.review(store, "bd-1"))["status"] == "refused"
+    assert not calls and not store.comments
+    store.card = None
+    assert asyncio.run(sr.review(store, "bd-1"))["status"] == "refused"
+
+
+@pytest.mark.parametrize("difficulty", ["medium", "large", "hard"])
+def test_sequence_hash_ledger_policy(setup, difficulty):
+    store, calls = setup
+    store.card["difficulty"] = difficulty
+    before = copy.deepcopy(store.card)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert [c[0] for c in calls] == list(sr.NAMES)
+    assert calls[0][2] == [] and set(calls[0][1]) == {"snapshot"}
+    assert len(calls[1][2]) == 2 and "comprehension" in calls[1][1]
+    assert report["persistence"] == "verified" and report["freshness"] == "current"
+    assert report["input_hash"] == sr.input_hash(sr.snapshot(before))
+    assert sr.input_hash({"a": 1, "b": 2}) == sr.input_hash({"b": 2, "a": 1})
+    assert report["isolation"]["verified"] is False
+    assert report["metrics"] == {"cost": None, "tokens": None, "coverage": None}
+    assert json.loads(store.comments[0])["run_id"] == report["run_id"]
+    assert store.card == before
+
+
+def test_swallowed_write_and_read_failures(setup):
+    store, _ = setup
+    store.drop = True
+    assert asyncio.run(sr.review(store, "bd-1"))["persistence"].startswith("failed")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("read failed")
+
+    store.feature_comments = broken
+    assert "read failed" in asyncio.run(sr.review(store, "bd-1"))["persistence"]
+
+
+@pytest.mark.parametrize("mutation", ["edit", "delete", "read_error"])
+def test_final_freshness(setup, mutation):
+    store, _ = setup
+
+    def comment(fid, text):
+        store.comments.append(text)
+        if mutation == "edit":
+            store.card["design"] = "changed"
+        elif mutation == "delete":
+            store.card = None
+        else:
+
+            def fail(fid):
+                raise RuntimeError("offline")
+
+            store.get_feature = fail
+
+    store.comment = comment
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert report["freshness"] == ("unknown" if mutation == "read_error" else "stale")
+
+
+@pytest.mark.parametrize("failure", ["malformed", "timeout", "failure"])
+def test_stage_gaps(setup, monkeypatch, failure):
+    store, calls = setup
+
+    async def run(*args, **kwargs):
+        calls.append(args)
+        if failure == "timeout":
+            raise TimeoutError()
+        if failure == "failure":
+            raise RuntimeError("provider down")
+        return "{}"
+
+    monkeypatch.setattr(sr, "runtime", lambda: run)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert report["stages"]["comprehension"]["status"] == "gap"
+    assert report["stages"]["readiness"]["status"] == "not_run"
+    assert len(calls) == 1 and report["persistence"] == "verified"
+
+
+def test_missing_repo(setup, monkeypatch):
+    store, calls = setup
+    monkeypatch.setattr(
+        "project_board.project_registry.project_registry_snapshot", lambda: {"projects": [], "default_project": ""}
+    )
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert len(calls) == 1 and "repository" in report["gap"]
+
+
+def test_read_search_boundaries(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "x.py").write_text("hello\nworld")
+    outside = tmp_path / "secret"
+    outside.write_text("secret")
+    (root / "escape").symlink_to(outside)
+    read, search = sr.repo_tools(root)
+    assert read.invoke({"path": "x.py"}) == "hello\nworld"
+    assert "x.py:2" in search.invoke({"query": "world"})
+    assert "secret" not in search.invoke({"query": "secret"})
+    for path in ["../secret", "escape"]:
+        with pytest.raises(ValueError):
+            read.invoke({"path": path})
+
+
+def test_registered_workers_and_runtime_capability(monkeypatch):
+    import project_board
+    from _plugin_testkit import FakeRegistry, install_host_stubs
+
+    install_host_stubs()
+    from graph import sdk
+
+    registry = FakeRegistry({"br_autofetch": False}, plugin_id="project_board")
+    project_board.register(registry)
+    configs = [c for c in registry.subagents if c.name in sr.NAMES]
+    assert len(configs) == 2
+    assert all(c.tools == [] and c.inherit_read_tools is False for c in configs)
+
+    async def unsupported(name, prompt):
+        return ""
+
+    monkeypatch.setattr(sdk, "run_subagent", unsupported, raising=False)
+    with pytest.raises(ValueError, match="extra_tools"):
+        sr.runtime()
+
+    async def supported(name, prompt, *, extra_tools):
+        return ""
+
+    monkeypatch.setattr(sdk, "run_subagent", supported)
+    assert sr.runtime() is supported
