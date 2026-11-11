@@ -2080,6 +2080,9 @@ class DriveMixin:
         wt = branch = None
         pr_url = None  # set once open_pr returns — the cancel paths below close it (#211)
         keep_wt = False  # reuse the worktree on a goal-fix retry (keep the impl; add tests)
+        # Retained unpublished recovery progress belongs to this drive's tree, not
+        # one provider attempt. Re-prove it against the remote before accepting it.
+        preserved_repair = False
         # #476: the commit a fix round's resumed tree started on ("" = not a resumed fix
         # round, or unknown). Kept across a keep-worktree retry of the same tree; a fresh
         # tree records its own.
@@ -2250,7 +2253,6 @@ class DriveMixin:
                     #  • otherwise → one fresh worktree, one dispatch.
                     pending = None
                     recovery_before = None
-                    preserved_repair = False
                     if feature.get("pr_url") and wt is None:
                         pending = await worktree.pending_integration(repo, self.root, fid, raw_title)
                         if pending:
@@ -2264,6 +2266,7 @@ class DriveMixin:
                             round_start = await worktree.recovery_round_start(wt, branch)
                     reusing = keep_wt and wt is not None
                     if not reusing:
+                        preserved_repair = False
                         round_start = ""  # a fresh tree: only a resumed checkout records one
                         # A FRESH build first clears the ground, and the two halves are one
                         # rule (#405). This drive's own earlier attempt is its to throw away:

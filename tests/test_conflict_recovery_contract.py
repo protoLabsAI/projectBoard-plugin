@@ -1050,12 +1050,13 @@ async def test_shutdown_keeps_exact_recovery_index_for_restart(history):
     assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
 
 
+@pytest.mark.parametrize("provider_retry", [None, "backoff", "rotation"])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("edits", [False, True])
-async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatch, edits, restart):
+async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatch, edits, restart, provider_retry):
     from pathlib import Path
     from unittest.mock import AsyncMock
-    from tests.test_loop import FEATURE, _drive_with
+    from tests.test_loop import FEATURE, FakeLoopStore, _drive_with
 
     repo = history
     feature = {**FEATURE, "pr_url": "https://example/pr/7"}
@@ -1073,21 +1074,51 @@ async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatc
         path, _ = await create(str(repo), "main", feature["id"], title=feature["title"], resume=True, integrate=True)
         await worktree.finish_integration(path, branch, "main")
 
+    store = FakeLoopStore()
+    monkeypatch.setattr(store, "escalate", lambda *_: None, raising=False)
+    providers = []
+    backoff = AsyncMock()
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", backoff)
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: 0)
+
     def seed(loop):
         monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
         monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
         monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
         monkeypatch.setattr(worktree, "create_worktree", create)
+        monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
         loop._ci_feedback[feature["id"]] = "Fix the rejected implementation"
 
     async def dispatch(coder, path, prompt, **kwargs):
+        providers.append(coder)
+        if provider_retry and len(providers) == 1:
+            raise worktree.WorktreeError("coder dispatch failed: 429 rate limit exceeded")
         if not restart:
             assert git(path, "rev-parse", "MERGE_HEAD")
         if edits:
             (Path(path) / "fix").write_text("actual fix\n")
         return "## Summary\nDone"
 
-    _, store = await _drive_with(monkeypatch, feature=feature, seed=seed, dispatch=dispatch, open_pr=opened)
+    _, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        store=store,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        cfg={
+            "coder": "proto",
+            **(
+                {"coders": {"fast": ["proto", "alternate"], "reasoning": ["stronger"]}}
+                if provider_retry == "rotation"
+                else {}
+            ),
+        },
+    )
+    assert len(providers) == (2 if provider_retry else 1)
+    if provider_retry:
+        assert (providers[0] != providers[1]) is (provider_retry == "rotation")
+        assert bool(backoff.await_count) is (provider_retry == "backoff")
     assert opened.await_count == int(edits)
     assert ("open_review" in store.names()) is edits
     if not edits:
@@ -1210,8 +1241,9 @@ async def test_existing_pr_ledger_only_recovery_reaches_completion_gate(
         assert any(c[0] == "flag_blocked" and "requirements unresolved" in c[2] for c in store.calls)
 
 
+@pytest.mark.parametrize("provider_retry", [None, "backoff", "rotation"])
 @pytest.mark.parametrize("committed", [False, True, "unproven", "equivalent"])
-async def test_drive_restart_publishes_preserved_resolution(history, monkeypatch, committed):
+async def test_drive_restart_publishes_preserved_resolution(history, monkeypatch, committed, provider_retry):
     from pathlib import Path
     from unittest.mock import AsyncMock
     from tests.test_loop import FEATURE, _drive_with
@@ -1260,17 +1292,46 @@ async def test_drive_restart_publishes_preserved_resolution(history, monkeypatch
 
     opened = AsyncMock(side_effect=publish)
 
+    providers = []
+    backoff = AsyncMock()
+    monkeypatch.setattr("project_board.loop.asyncio.sleep", backoff)
+    monkeypatch.setattr("project_board.loop.drive._next_rung_cursor", lambda: 0)
+
     def seed(loop):
         monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
         monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
         monkeypatch.setattr(loop, "_verify_goal", verify)
         monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: name)
         loop.goal_verify = True
 
-    async def dispatch(*args, **kwargs):
+    async def dispatch(coder, resumed_path, *args, **kwargs):
+        assert resumed_path == path
+        providers.append(coder)
+        if provider_retry and len(providers) == 1:
+            raise worktree.WorktreeError("coder dispatch failed: 429 rate limit exceeded")
         return "## Summary\nRetained resolution"
 
-    _, store = await _drive_with(monkeypatch, feature=feature, seed=seed, dispatch=dispatch, open_pr=opened, gate=gate)
+    _, store = await _drive_with(
+        monkeypatch,
+        feature=feature,
+        seed=seed,
+        dispatch=dispatch,
+        open_pr=opened,
+        gate=gate,
+        cfg={
+            "coder": "proto",
+            **(
+                {"coders": {"fast": ["proto", "alternate"], "reasoning": ["stronger"]}}
+                if provider_retry == "rotation"
+                else {}
+            ),
+        },
+    )
+    assert len(providers) == (2 if provider_retry else 1)
+    if provider_retry:
+        assert (providers[0] != providers[1]) is (provider_retry == "rotation")
+        assert bool(backoff.await_count) is (provider_retry == "backoff")
     if committed in ("unproven", "equivalent"):
         verify.assert_not_awaited()
         gate.assert_not_awaited()
