@@ -1002,3 +1002,103 @@ async def test_gitlink_conflict_accepts_explicit_edit_only_resolution(history, r
         assert not git(repo, "ls-files", "module")
     else:
         assert git(repo, "ls-files", "--stage", "module").startswith("100644")
+
+
+@pytest.mark.parametrize("staged", [False, True])
+async def test_retained_edits_participate_in_advancing_base_merge(history, staged):
+    repo = history
+    base = sibling(repo, "a")
+    original = git(repo, "rev-parse", "HEAD")
+    (repo / "a").write_text("feature coverage\nretained coverage\n")
+    if staged:
+        git(repo, "add", "a")
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    assert context["conflict_paths"] == ["a"]
+    assert context["head_sha"] != original
+    assert git(repo, "show", "HEAD:a") == "feature coverage\nretained coverage"
+    (repo / "a").write_text("feature coverage\nretained coverage\nsibling a coverage\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    git(repo, "merge-base", "--is-ancestor", base, "HEAD")
+    git(repo, "merge-tree", "--write-tree", "origin/main", "HEAD")
+    assert "retained coverage" in (repo / "a").read_text()
+
+
+async def test_shutdown_keeps_exact_recovery_index_for_restart(history):
+    from pathlib import Path
+    from project_board.loop import BoardLoop
+
+    repo = history
+    sibling(repo, "a")
+    fid, title = "bd-stop", "Recovery shutdown"
+    branch = worktree.branch_name(fid, title)
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    path, _ = await worktree.create_worktree(str(repo), "main", fid, title=title, resume=True, integrate=True)
+    index = git(path, "ls-files", "--unmerged")
+    merge_head = git(path, "rev-parse", "MERGE_HEAD")
+    (Path(path) / "a").write_text("feature coverage\nsibling a coverage\n")
+    loop = BoardLoop({"coder": "proto"})
+    loop._inflight[fid] = (str(repo), path, branch)
+    await loop.stop()
+    assert git(path, "ls-files", "--unmerged") == index
+    assert git(path, "rev-parse", "MERGE_HEAD") == merge_head
+    assert await worktree.pending_integration(str(repo), ".worktrees", fid, title) == (path, branch)
+    await worktree.prepare_integration(path, branch, "main")
+    await worktree.finish_integration(path, branch, "main")
+    git(path, "merge-tree", "--write-tree", "origin/main", "HEAD")
+    assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
+
+
+@pytest.mark.parametrize("edits", [False, True])
+async def test_clean_board_merge_does_not_count_as_coder_fix(history, monkeypatch, edits):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_loop import FEATURE, _drive_with
+
+    repo = history
+    feature = {**FEATURE, "pr_url": "https://example/pr/7"}
+    branch = worktree.branch_name(feature["id"], feature["title"])
+    git(repo, "branch", "-m", branch)
+    git(repo, "push", "origin", branch)
+    git(repo, "checkout", "main")
+    (repo / "sibling").write_text("sibling coverage\n")
+    git(repo, "add", "sibling")
+    git(repo, "commit", "-m", "clean sibling change")
+    git(repo, "push", "origin", "main")
+    create = worktree.create_worktree
+    opened = AsyncMock(return_value=feature["pr_url"])
+
+    def seed(loop):
+        monkeypatch.setattr(loop, "_repo_for", lambda _: str(repo))
+        monkeypatch.setattr(loop, "_base_branch_for", lambda _: "main")
+        monkeypatch.setattr(loop, "_empty_result_signals", lambda _: (True, "end_turn"))
+        monkeypatch.setattr(worktree, "create_worktree", create)
+        loop._ci_feedback[feature["id"]] = "Fix the rejected implementation"
+
+    async def dispatch(coder, path, prompt, **kwargs):
+        assert git(path, "rev-parse", "MERGE_HEAD")
+        if edits:
+            (Path(path) / "fix").write_text("actual fix\n")
+        return "## Summary\nDone"
+
+    _, store = await _drive_with(monkeypatch, feature=feature, seed=seed, dispatch=dispatch, open_pr=opened)
+    assert opened.await_count == int(edits)
+    assert ("open_review" in store.names()) is edits
+    if not edits:
+        assert any(c[0] == "flag_blocked" and "fix round produced no commit" in c[2] for c in store.calls)
+
+
+async def test_recovery_edit_snapshot_tracks_content_and_ignores_board_scratch(history):
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    (repo / "untracked").write_text("first\n")
+    before = await worktree.recovery_edit_state(str(repo))
+    (repo / ".proto").mkdir()
+    (repo / ".proto" / "session").write_text("board scratch\n")
+    assert await worktree.recovery_edit_state(str(repo)) == before
+    (repo / "untracked").write_text("second\n")
+    assert await worktree.recovery_edit_state(str(repo)) != before
+    (repo / "untracked").write_text("first\n")
+    (repo / "a").unlink()
+    assert await worktree.recovery_edit_state(str(repo)) != before

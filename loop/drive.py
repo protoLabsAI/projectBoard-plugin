@@ -537,6 +537,16 @@ class DriveMixin:
                 # Now its work lands on a `stranded/…` branch, the card says where, and the
                 # next boot rebuilds as before. If saving fails the tree is kept, and the
                 # card's next dispatch tries again — and blocks, naming it, if it still can't.
+                # A stranded contents-only commit cannot reconstruct a merge index or
+                # MERGE_HEAD. Restart discovery needs this exact recovery checkout.
+                if await worktree.recovery_context(wt, branch) or any(
+                    [
+                        await worktree._operation_present(wt, name)
+                        for name in ("MERGE_HEAD", "rebase-merge", "rebase-apply")
+                    ]
+                ):
+                    log.info("[project_board] recovery worktree kept on shutdown: %s", wt)
+                    continue
                 trail = await self._discard_tree(None, fid, repo, wt, branch)
                 log.info("[project_board] in-flight worktree on shutdown: %s — %s", wt, trail)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
@@ -2235,6 +2245,7 @@ class DriveMixin:
                     #    the existing diff with one coder, so it must NOT re-fan-out N.
                     #  • otherwise → one fresh worktree, one dispatch.
                     pending = None
+                    recovery_before = None
                     if feature.get("pr_url") and wt is None:
                         pending = await worktree.pending_integration(repo, self.root, fid, raw_title)
                         if pending:
@@ -2296,6 +2307,7 @@ class DriveMixin:
                             from .prompt import integration_feedback
 
                             context = await worktree.prepare_integration(wt, branch, base)
+                            recovery_before = await worktree.recovery_edit_state(wt)
                             self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
                             prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
                             prompt += work_location_capture.reporting_instructions()
@@ -2430,6 +2442,8 @@ class DriveMixin:
                                 prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
                                 prompt += work_location_capture.reporting_instructions()
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
+                        if feature.get("pr_url") and context:
+                            recovery_before = await worktree.recovery_edit_state(wt)
                         result = await self._dispatch_captured(
                             coder_seam.dispatch_coder_tapped(
                                 coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
@@ -2470,7 +2484,15 @@ class DriveMixin:
                                 exc_info=True,
                             )
                     if feature.get("pr_url") and wt:
+                        recovery_unchanged = (
+                            recovery_before is not None and recovery_before == await worktree.recovery_edit_state(wt)
+                        )
                         await worktree.finish_integration(wt, branch, base)
+                        if recovery_unchanged:
+                            raise worktree.NoChangesError(
+                                "fix round produced no commit or edits beyond the board-prepared integration; "
+                                "nothing new to push or review"
+                            )
                     # Goal-verification gate: confirm the diff meets the acceptance
                     # criteria before opening a PR. A gap is a capability failure (the
                     # coder didn't deliver) → escalate/block, don't open the PR.

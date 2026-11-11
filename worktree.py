@@ -568,6 +568,19 @@ async def _unique_commits(where: str, branch: str = "", base: str = "", *, head:
     return len(unique)
 
 
+async def recovery_edit_state(path: str) -> tuple:
+    """Snapshot coder output without staging or completing the prepared merge."""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    head = await _git_required(path, "rev-parse", "HEAD")
+    diff = await _git_required(path, "diff", "--binary", "HEAD", "--", ".", *excludes)
+    names = await _git_required(path, "ls-files", "--others", "--exclude-standard", "-z", "--", ".", *excludes)
+    untracked = []
+    for name in names.split("\0"):
+        if name and not _is_board_link(path, name):
+            untracked.append((name, await _conflict_output(path, name)))
+    return head, diff, untracked
+
+
 async def fix_round_unchanged(path: str, start_sha: str) -> str:
     """The head a FIX ROUND ended on when it changed nothing (#476), else ``""``.
 
@@ -2299,6 +2312,9 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         integration_sha = await _git_required(path, "rev-parse", "MERGE_HEAD")
         base_sha = previous.get("base_sha", integration_sha)
     else:
+        # Preserve overlapping retained edits as feature history before starting a merge.
+        await commit_worktree(path, "Preserve retained edits before base integration")
+        head_sha = await _git_required(path, "rev-parse", "HEAD")
         integration_sha = base_sha
         rc, out, err = await _git(
             path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
