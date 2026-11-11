@@ -273,6 +273,15 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — planning layer is best-effort
         log.exception("[project_board] registering planning subagents/skill failed")
 
+    try:
+        from .subagents import SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG
+
+        if SPEC_COMPREHENSION_CONFIG is not None and SPEC_READINESS_CONFIG is not None:
+            registry.register_subagent(SPEC_COMPREHENSION_CONFIG)
+            registry.register_subagent(SPEC_READINESS_CONFIG)
+    except Exception:  # noqa: BLE001 — unsupported hosts report an advisory review gap
+        log.exception("[project_board] registering spec-review workers failed")
+
     # The board's open cards in the AGENT'S OWN working state (protoAgent ADR 0079).
     # Feature-detected: this seam is newer than the plugin's `min_protoagent_version`
     # floor, so on an older host it is simply absent and the board contributes nothing —
@@ -618,6 +627,16 @@ def _board_tools(cfg: dict, registry=None):
         if base:
             kw["base_branch"] = base
         return kw
+
+    @tool
+    async def board_review_spec(feature_id: str) -> str:
+        """Opt-in advisory spec review for medium/large coding cards (hard alias accepted)."""
+        from .spec_review import review
+
+        try:
+            return json.dumps(await review(get_store(**store_kw), feature_id))
+        except BoardError as exc:
+            return f"Error: {exc}"
 
     @tool
     def board_create_epic(title: str, description: str = "") -> str:
@@ -1768,6 +1787,7 @@ def _board_tools(cfg: dict, registry=None):
         return f"Following {fid} on the Board ({lane or 'unknown lane'}); it stays in view until it lands in done."
 
     tools = [
+        board_review_spec,
         board_create_epic,
         board_create_feature,
         board_create_task,

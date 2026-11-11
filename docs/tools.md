@@ -83,3 +83,19 @@ checkout. See [Multi-project](configuration.md#multi-project).
   wrapping quotes first, because models frequently emit `"…"` around a whole argument.
 - The board must be **set up** for these to work: `br` on PATH, a `repo`, and — for the
   dispatch verbs — a coder delegate. `GET /status` reports what is missing.
+
+### Advisory spec review
+
+`board_review_spec` (`feature_id`) explicitly reviews a medium/large coding feature
+(`hard` is also accepted). It never changes Ready, requirements, coder routing or merge
+holds. A spec-only worker runs before a separate repo-grounded worker. Unknown cards,
+noncoding tasks and other difficulties are refused without dispatch. Results are bounded,
+versioned JSON comments, bound to a canonical authoring-input hash and unique run ID;
+comment writes are read back because the store can swallow write errors.
+
+The response reports stage failures, unsupported SDK restrictions, missing repository
+access, malformed output, timeout, persistence failures and changed/deleted inputs.
+Isolation is declared, not runtime-attested; no report constitutes independent approval.
+Consumers of historical comments must compare the input hash to a fresh card snapshot:
+a recorded freshness observation is not a permanent assertion. Repository reads are live,
+partial and non-atomic. See [the prospective pilot protocol](spec-review-pilot.md).
