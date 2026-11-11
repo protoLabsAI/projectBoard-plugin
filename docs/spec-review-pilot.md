@@ -31,7 +31,10 @@ separate explicit policy decision and supporting evidence.
 
 The comprehension config declares tools=[], inherit_read_tools=False, and extra_tools=[].
 Readiness uses a separate registered worker and only injected repository-bound read/search
-tools; both calls check the SDK's explicit extra_tools parameter and effective config fields.
+tools, explicitly allowlisted as spec_review_read and spec_review_search. Both calls require
+the SDK's extra_tools and check_prompt_tools parameters and validate the config fields.
+Prompt-tool preflight is disabled because tool identifiers in snapshot text are data;
+this does not expand either worker's tool allowlist.
 These checks prove declaration support, not runtime context isolation or enforcement. Absent
 runtime attestation, reports always carry that gap and never claim independent approval.
 No conversation history is explicitly passed. The host may still supply hidden context.

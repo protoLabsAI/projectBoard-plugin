@@ -8,6 +8,8 @@ import pytest
 
 from project_board import spec_review as sr
 
+REAL_RUNTIME = sr.runtime
+
 
 class Store:
     def __init__(self):
@@ -33,7 +35,8 @@ def setup(monkeypatch, tmp_path):
 
     # Match the host's required keyword-only description; a permissive fake hid
     # argument-binding failures before either worker could be dispatched.
-    async def run(name, prompt, *, description, extra_tools):
+    async def run(name, prompt, *, description, extra_tools, check_prompt_tools=True):
+        assert check_prompt_tools is False
         assert description and name in description
         calls.append((name, json.loads(prompt), extra_tools))
         if name == sr.NAMES[0]:
@@ -230,7 +233,9 @@ def test_registered_workers_and_runtime_capability(monkeypatch):
     project_board.register(registry)
     configs = [c for c in registry.subagents if c.name in sr.NAMES]
     assert len(configs) == 2
-    assert all(c.tools == [] and c.inherit_read_tools is False for c in configs)
+    assert configs[0].tools == []
+    assert configs[1].tools == ["spec_review_read", "spec_review_search"]
+    assert all(c.inherit_read_tools is False for c in configs)
 
     async def unsupported(name, prompt):
         return ""
@@ -239,8 +244,77 @@ def test_registered_workers_and_runtime_capability(monkeypatch):
     with pytest.raises(ValueError, match="extra_tools"):
         sr.runtime()
 
-    async def supported(name, prompt, *, description, extra_tools):
+    async def supported(name, prompt, *, description, extra_tools, check_prompt_tools=True):
         return ""
 
     monkeypatch.setattr(sdk, "run_subagent", supported)
     assert sr.runtime() is supported
+
+
+def test_host_tool_filter_and_prompt_preflight(setup, monkeypatch, tmp_path):
+    """Fake host dispatch contract; real bound filesystem tools, no live host/model."""
+    from _plugin_testkit import install_host_stubs
+
+    install_host_stubs()
+    from graph import sdk
+    from project_board.subagents import SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG
+
+    store, _ = setup
+    store.card["spec"] = "Current behavior uses read_file and search_files."
+    (tmp_path / "x.py").write_text("grounded evidence\n")
+    configs = {c.name: c for c in (SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG)}
+    dispatched = []
+
+    async def host_run(name, prompt, *, description, extra_tools, check_prompt_tools=True):
+        config = configs[name]
+        # Extras enter the candidate map but still pass through the allowlist.
+        candidates = {"read_file": object(), "search_files": object(), "write_file": object()}
+        candidates.update({t.name: t for t in extra_tools})
+        bound = {key: value for key, value in candidates.items() if key in config.tools}
+        if check_prompt_tools and any(key in prompt and key not in bound for key in candidates):
+            return "Not dispatched"
+        assert config.inherit_read_tools is False
+        dispatched.append(name)
+        if name == sr.NAMES[0]:
+            assert not bound and extra_tools == []
+            return json.dumps(dict(proposal=["read_file"], current_behavior=[], invariants=[], missing_decisions=[]))
+        assert set(bound) == {"spec_review_read", "spec_review_search"}
+        assert bound["spec_review_read"].invoke({"path": "x.py"}) == "grounded evidence\n"
+        assert "x.py:1" in bound["spec_review_search"].invoke({"query": "grounded"})
+        return json.dumps(
+            dict(
+                sources=[dict(path="x.py", line=1, observation="grounded evidence")],
+                ambiguities=[],
+                simpler_alternatives=[],
+                uncertainties=[],
+                dispositions=[],
+            )
+        )
+
+    # Exercise the real capability checker as well as stage dispatch.
+    monkeypatch.setattr(sr, "runtime", REAL_RUNTIME)
+    monkeypatch.setattr(sdk, "run_subagent", host_run, raising=False)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert dispatched == list(sr.NAMES)
+    for key, config in zip(("comprehension", "readiness"), configs.values()):
+        result = report["stages"][key]
+        assert result["status"] == "reported"
+        assert result["tool_policy"]["tools"] == config.tools
+        assert result["tool_policy"]["extra_tools"] == config.tools
+    assert report["persistence"] == "verified"
+
+
+def test_sdk_without_prompt_check_control_is_gap(setup, monkeypatch):
+    from graph import sdk
+
+    store, _ = setup
+
+    async def unsupported(name, prompt, *, description, extra_tools):
+        pytest.fail("unsupported SDK must not dispatch")
+
+    monkeypatch.setattr(sr, "runtime", REAL_RUNTIME)
+    monkeypatch.setattr(sdk, "run_subagent", unsupported, raising=False)
+    report = asyncio.run(sr.review(store, "bd-1"))
+    assert "check_prompt_tools" in report["gap"]
+    assert all(s["status"] == "not_run" for s in report["stages"].values())
+    assert report["persistence"] == "verified"

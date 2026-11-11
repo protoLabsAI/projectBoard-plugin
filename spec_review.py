@@ -89,14 +89,16 @@ def repo_tools(root):
 
 def runtime():
     from graph import sdk
-    from .subagents import SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG
+    from .subagents import SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG, SPEC_READINESS_TOOLS
 
     run = sdk.run_subagent
     if "extra_tools" not in inspect.signature(run).parameters:
         raise ValueError("SDK lacks explicit extra_tools support")
-    for config in (SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG):
-        if config is None or config.tools != [] or getattr(config, "inherit_read_tools", None) is not False:
-            raise ValueError("host cannot declare tools=[] and inherit_read_tools=False")
+    if "check_prompt_tools" not in inspect.signature(run).parameters:
+        raise ValueError("SDK lacks explicit check_prompt_tools support")
+    for config, expected in ((SPEC_COMPREHENSION_CONFIG, []), (SPEC_READINESS_CONFIG, SPEC_READINESS_TOOLS)):
+        if config is None or config.tools != expected or getattr(config, "inherit_read_tools", None) is not False:
+            raise ValueError("host cannot declare explicit tool allowlists and inherit_read_tools=False")
     return run
 
 
@@ -104,12 +106,23 @@ async def stage(run, name, payload, extra_tools):
     started = time.monotonic()
     result = {
         "status": "gap",
-        "tool_policy": {"tools": [], "inherit_read_tools": False, "extra_tools": [t.name for t in extra_tools]},
+        "tool_policy": {
+            "tools": [t.name for t in extra_tools],
+            "inherit_read_tools": False,
+            "extra_tools": [t.name for t in extra_tools],
+        },
         "metrics": {"tokens": None, "cost": None},
     }
     try:
         raw = await asyncio.wait_for(
-            run(name, canonical(payload), description=f"Advisory spec review: {name}", extra_tools=extra_tools),
+            # Authoring text may mention host tools; it is data, not a request to grant them.
+            run(
+                name,
+                canonical(payload),
+                description=f"Advisory spec review: {name}",
+                extra_tools=extra_tools,
+                check_prompt_tools=False,
+            ),
             TIMEOUT,
         )
         if not isinstance(raw, str) or len(raw.encode()) > MAX_OUTPUT:
