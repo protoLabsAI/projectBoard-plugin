@@ -249,7 +249,7 @@ explicitly asks (quote their request in `reason`); at capacity, report it and as
 | Adverse review findings on an `in_review` PR | `board_requeue_feature(fid, findings=…)` — the fix round on the SAME PR; the next dispatch prompt leads with the findings. `escalate=true` climbs the model ladder (at the top the card blocks instead; no ladder = same tier). |
 | Transient failure, retry as-is | `board_requeue_feature(fid)` — back to ready, PR kept, assignee cleared, original prompt. |
 | CI bounced the PR (card `in_progress` with an open `pr_url`) | `board_requeue_ci_fix(fid, ci_failure=…)` |
-| Stuck on something external | `board_block_feature` → later `board_unblock_feature` |
+| Stuck on something external | `board_block_feature(fid, reason, owner=…)` → later `board_unblock_feature`. `owner` is REQUIRED: `agent` when you will do or finish the work yourself, or are waiting on something you will resolve (no operator alert; shown as 'agent hold'); `operator` when the next step is the operator's decision or action (alerts the operator; shown as 'needs you'). Never `operator` for a hold you set on your own work. |
 | Spec wrong | `board_update_feature` |
 | Review gate exhausted its fix budget and blocked the PR | `board_unblock_feature` re-arms the gate (fresh review of the live head, fresh budget); `override_review=True` only as a human accepting the findings |
 | Worktree holds finished work, no coder should redo it | `board_salvage_feature` |

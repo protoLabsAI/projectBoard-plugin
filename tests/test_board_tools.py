@@ -265,7 +265,11 @@ def test_board_requeue_feature_with_findings_from_non_in_review_is_an_error(make
 def test_board_block_feature_flags_blocked_and_comments_reason(make_board, monkeypatch):
     _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "blocked"})
 
-    out = json.loads(_get_tool("board_block_feature").invoke({"feature_id": "bd-1", "reason": "waiting on bd-0"}))
+    out = json.loads(
+        _get_tool("board_block_feature").invoke(
+            {"feature_id": "bd-1", "reason": "waiting on bd-0", "owner": "operator"}
+        )
+    )
 
     assert out == {"id": "bd-1", "state": "blocked"}
     (update,) = br.cmds("update")
@@ -282,7 +286,7 @@ def test_board_block_feature_flags_blocked_and_comments_reason(make_board, monke
 def test_board_block_feature_strips_wrapping_quotes_from_reason(make_board, monkeypatch):
     _, br = _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "blocked"})
 
-    _get_tool("board_block_feature").invoke({"feature_id": "bd-1", "reason": '"waiting on bd-0"'})
+    _get_tool("board_block_feature").invoke({"feature_id": "bd-1", "reason": '"waiting on bd-0"', "owner": "operator"})
 
     (comment,) = br.cmds("comments")
     assert comment == ("comments", "add", "bd-1", "blocked: waiting on bd-0")
@@ -312,7 +316,7 @@ def test_board_unblock_feature_removes_the_blocked_label(make_board, monkeypatch
         ("board_cancel_feature", {"feature_id": "bd-x"}),
         ("board_mark_done", {"feature_id": "bd-x"}),
         ("board_requeue_feature", {"feature_id": "bd-x"}),
-        ("board_block_feature", {"feature_id": "bd-x", "reason": "r"}),
+        ("board_block_feature", {"feature_id": "bd-x", "reason": "r", "owner": "operator"}),
         ("board_unblock_feature", {"feature_id": "bd-x"}),
     ],
 )
@@ -470,7 +474,7 @@ _MINIMAL_ARGS = {
     "board_verify": {"feature_id": "bd-1"},
     "board_requeue_feature": {"feature_id": "bd-1"},
     "board_requeue_ci_fix": {"feature_id": "bd-1", "ci_failure": "ci failed"},
-    "board_block_feature": {"feature_id": "bd-1", "reason": "r"},
+    "board_block_feature": {"feature_id": "bd-1", "reason": "r", "owner": "operator"},
     "board_unblock_feature": {"feature_id": "bd-1"},
     "board_hold_merge": {"feature_id": "bd-1", "reason": "r"},
     "board_release_merge_hold": {"feature_id": "bd-1"},
