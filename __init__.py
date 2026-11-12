@@ -1277,14 +1277,27 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
-    def board_block_feature(feature_id: str, reason: str, owner: str = "operator") -> str:
+    def board_block_feature(feature_id: str, reason: str, owner: str = "") -> str:
         """Flag a card blocked with a required `reason`; it stays visible and the puller skips it. Use
         it for an external stall (missing dep, open question); use board_update_feature when the
         spec needs fixing. Never cleared automatically: lift it with board_unblock_feature.
-        `owner`: `operator` (default) or `agent` (an agent-owned hold, no operator alert)."""
+        `owner` is REQUIRED — whose hold is this? `agent` when you will do or finish the work
+        yourself, or are waiting on something you will resolve (no operator alert; shown as
+        'agent hold'); `operator` when the next step is the operator's decision or action
+        (alerts the operator; shown as 'needs you')."""
         try:
+            # No usable default (bd-t3286): `operator` as the default turned an agent's
+            # self-hold into MANUAL_BLOCK_CLASS and paged the operator for work the agent was
+            # doing itself. The schema default is a sentinel only (the ci_failure idiom —
+            # a raised validation error would fail the whole turn, see the never-raise
+            # contract in tests/test_board_tools.py): an unstated owner blocks nothing.
             if owner not in ("operator", "agent"):
-                raise BoardError("owner must be one of: operator, agent")
+                raise BoardError(
+                    "owner must be one of: 'agent' (you will do or finish the work yourself, "
+                    "or will resolve the wait — no operator alert; shown as 'agent hold') or "
+                    "'operator' (the next step is the operator's decision or action — alerts "
+                    "the operator; shown as 'needs you'). Nothing was blocked."
+                )
             reason = _strip_wrapping_quotes(reason)
             # A hand-set block is a hold, never a self-healing failure (#406) — the class is
             # stated, not guessed from the reason's words. See store.MANUAL_BLOCK_CLASS.

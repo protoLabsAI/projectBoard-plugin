@@ -287,8 +287,9 @@ LABEL_BLOCKED = "blocked"
 # the `blocked:` comment. Underscores in a category are hyphenated: beads' label
 # validator takes alphanumerics and hyphens (the #101 lesson).
 LABEL_BLOCKED_CLASS_PREFIX = "blocked-class:"
-# The default class for a block set BY HAND (#406): the board_block_feature tool and
-# POST /features/{fid}/block, a person or the PM parking a card on something outside the
+# The class for an operator-owned block set BY HAND (#406): board_block_feature with
+# owner='operator' (owner is REQUIRED there, bd-t3286) and POST /features/{fid}/block's
+# default — a person or the PM parking a card on something outside the
 # board. `flag_blocked` otherwise infers a class from the reason with the coder-failure
 # classifier, and that classifier reads prose as an error message: "waiting on the network
 # team" matched `network` → transient, and the blocked sweep cleared the hold and REQUEUED

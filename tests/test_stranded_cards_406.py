@@ -145,7 +145,11 @@ async def test_a_card_blocked_to_wait_for_dependencies_is_surfaced_and_never_cle
     dep = board.create_feature("Record the origin session", spec="s")["id"]
     card = board.create_feature("Wire cleanup through DELETE", spec="s", depends_on=[dep])["id"]
     reply = _tool("board_block_feature").invoke(
-        {"feature_id": card, "reason": "shared-file gate: unblock and mark ready after the dependency merges"}
+        {
+            "feature_id": card,
+            "reason": "shared-file gate: unblock and mark ready after the dependency merges",
+            "owner": "operator",
+        }
     )
     assert json.loads(reply)["state"] == "blocked"
     alerts: list = []
@@ -181,7 +185,7 @@ async def test_a_real_external_block_is_never_auto_cleared(board, monkeypatch):
     dep = board.create_feature("Dependency", spec="s")["id"]
     card = board.create_feature("Needs the VPN route", spec="s", depends_on=[dep])["id"]
     _tool("board_block_feature").invoke(
-        {"feature_id": card, "reason": "waiting on the network team to open the VPN route"}
+        {"feature_id": card, "reason": "waiting on the network team to open the VPN route", "owner": "operator"}
     )
     _close(board, dep)
 
@@ -355,8 +359,12 @@ async def test_board_dispatch_names_what_is_held_instead_of_a_bare_empty_queue(b
     stranded_blocked = board.create_feature("Blocked to wait", spec="s", depends_on=[closed_dep])["id"]
     held_by_hand = board.create_feature("Vendor hold", spec="s")["id"]
     _close(board, closed_dep)
-    _tool("board_block_feature").invoke({"feature_id": stranded_blocked, "reason": "wait for the dependency"})
-    _tool("board_block_feature").invoke({"feature_id": held_by_hand, "reason": "vendor API access is pending"})
+    _tool("board_block_feature").invoke(
+        {"feature_id": stranded_blocked, "reason": "wait for the dependency", "owner": "operator"}
+    )
+    _tool("board_block_feature").invoke(
+        {"feature_id": held_by_hand, "reason": "vendor API access is pending", "owner": "operator"}
+    )
 
     out = await _dispatch_loop(board, monkeypatch).dispatch_now()
 

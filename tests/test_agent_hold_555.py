@@ -17,14 +17,14 @@ def _tool(name):
     return {t.name: t for t in pb._board_tools({})}[name]
 
 
-@pytest.mark.parametrize("owner,category", [(None, "terminal"), ("operator", "terminal"), ("agent", "agent-hold")])
+# A missing owner no longer falls back to operator/terminal (bd-t3286) — that default paged
+# the operator for an agent's own hold. tests/test_block_owner_required.py pins the error.
+@pytest.mark.parametrize("owner,category", [("operator", "terminal"), ("agent", "agent-hold")])
 def test_owner_dispatch_is_explicit(monkeypatch, owner, category):
     board = Mock()
     board.flag_blocked.return_value = {"id": "bd-a", "board_state": "blocked"}
     monkeypatch.setattr(store_mod, "get_store", lambda **kw: board)
-    args = {"feature_id": "bd-a", "reason": '"waiting on the network team"'}
-    if owner is not None:
-        args["owner"] = owner
+    args = {"feature_id": "bd-a", "reason": '"waiting on the network team"', "owner": owner}
     assert json.loads(_tool("board_block_feature").invoke(args))["state"] == "blocked"
     board.flag_blocked.assert_called_once_with("bd-a", "waiting on the network team", category=category)
 

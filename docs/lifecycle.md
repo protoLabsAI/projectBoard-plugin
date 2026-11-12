@@ -761,9 +761,14 @@ happens next. Every sweep, the loop walks the blocked lane:
 - **Everything else, and any card that has spent its retries**, escalates: the operator is
   told **once**, by name, with the real reason. The card stays blocked. A human decides.
 
-A block set **by hand** (`board_block_feature`, `POST …/block`) is always `terminal`, so it
-is never cleared automatically. The self-heal also **never moves a card blocked while still
-in backlog**, whatever its class, because its requeue would promote a card that never passed
+A block set **by hand** (`board_block_feature`, `POST …/block`) states its class instead of
+guessing it, and is never cleared automatically. `board_block_feature` requires `owner`:
+`operator` records the manual class (`terminal`) and alerts the operator; `agent` records an
+`agent-hold` — the agent's own parking brake, which pages nobody and waits for its author's
+explicit `board_unblock_feature`. `POST …/block` keeps `operator` as its default (a
+console/script block by hand), accepting an optional `owner: "agent"`. The self-heal also
+**never moves a card blocked while still in backlog**, whatever its class, because its
+requeue would promote a card that never passed
 the Ready gate. Only people and agents block backlog cards (the loop blocks only ready and
 in-flight ones). A hand block written before this change still carries whatever class its
 wording guessed, and it goes to a human instead. The class of a loop-set block is inferred from its reason

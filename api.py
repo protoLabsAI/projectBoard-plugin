@@ -32,6 +32,7 @@ from . import setup_check
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
 from .store import (
+    AGENT_HOLD_CLASS,
     MANUAL_BLOCK_CLASS,
     BoardError,
     annotate_next_action,
@@ -1103,8 +1104,21 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.post("/features/{fid}/block")
     async def _block(fid: str, body: dict = Body(...)):
         """Block a card by hand — a hold that is never cleared automatically (#406): the
-        class is stated, not inferred from the reason's words. See store.MANUAL_BLOCK_CLASS."""
-        return await _guard(lambda: store().flag_blocked(fid, str(body.get("reason", "")), category=MANUAL_BLOCK_CLASS))
+        class is stated, not inferred from the reason's words. See store.MANUAL_BLOCK_CLASS.
+
+        Body: ``{reason, owner?}``. ``owner`` stays OPTIONAL here, unlike the agent tool
+        (bd-t3286): this route is the console's and scripts' block-by-hand, so the default
+        ``operator`` keeps those blocks terminal and paging as today; ``owner: "agent"``
+        records an agent-owned ``agent-hold`` that pages nobody."""
+
+        def _write():
+            owner = str(body.get("owner") or "operator")
+            if owner not in ("operator", "agent"):
+                raise BoardError("owner must be one of: 'agent' or 'operator'")
+            category = AGENT_HOLD_CLASS if owner == "agent" else MANUAL_BLOCK_CLASS
+            return store().flag_blocked(fid, str(body.get("reason", "")), category=category)
+
+        return await _guard(_write)
 
     @router.post("/features/{fid}/unblock")
     async def _unblock(fid: str, body: dict = Body(default={})):
