@@ -142,6 +142,25 @@ hung install is killed, logged, and the work goes ahead without it. The merged-s
 is the exception: it skips its gate and retries next poll (see the lifecycle doc, "A broken
 dependency tree is not a failed gate").
 
+Promoted worktrees must rebuild path-dependent installed environments before validation.
+If neither project nor board supplies `setup_cmd`, promotion uses `worktree.DEFAULT_SETUP_CMD`
+from the worktree root:
+
+- `uv.lock`: `uv sync --frozen --quiet --python 3.12`, followed by
+  `uv pip install --python .venv/bin/python -r requirements-dev.txt` if that file exists.
+- Otherwise, `requirements-dev.txt`: `uv venv --python 3.12 .venv`, then
+  `uv pip install --python .venv/bin/python -r requirements-dev.txt`.
+- Independently, `pnpm-lock.yaml`: `pnpm install --frozen-lockfile`; otherwise,
+  `package-lock.json`: `npm ci --no-audit --no-fund --prefer-offline`.
+
+An explicit setup command takes precedence. Promotion quarantines old environments in git
+admin storage while setup runs. Failure, timeout, cancellation, or a successful command
+that fails to recreate a required environment restores the originals and keeps promotion
+pending; validation cannot proceed until a retry succeeds. Errors identify the command
+and any missing required environments. Successful restoration deletes the quarantine
+archives. Tracked environments and a worktree root that is itself a venv remain protected.
+The fallback applies to promotion recovery; fresh-worktree setup behavior is unchanged.
+
 **The gate preflight** smokes each project's check on its clean base checkout before any
 of that project's cards dispatch (`preflight: true`, the default). A red result holds the
 project's ready cards until the check passes again. How it runs:
