@@ -1232,6 +1232,23 @@ def link_node_modules(repo: str, worktree: str) -> int:
 # its own install instead, from the worktree's own lockfile.
 _SETUP_OUTPUT_CHARS = 600
 
+# Promotion fallback only: fresh worktrees retain their existing opt-in setup policy.
+DEFAULT_SETUP_CMD = """set -e
+if [ -f uv.lock ]; then
+    uv sync --frozen --quiet --python 3.12
+    if [ -f requirements-dev.txt ]; then
+        uv pip install --python .venv/bin/python -r requirements-dev.txt
+    fi
+elif [ -f requirements-dev.txt ]; then
+    uv venv --python 3.12 .venv
+    uv pip install --python .venv/bin/python -r requirements-dev.txt
+fi
+if [ -f pnpm-lock.yaml ]; then
+    pnpm install --frozen-lockfile
+elif [ -f package-lock.json ]; then
+    npm ci --no-audit --no-fund --prefer-offline
+fi"""
+
 
 def _unlink_board_links(worktree: str) -> int:
     """Remove the ``node_modules`` SYMLINKS ``link_node_modules`` put in ``worktree``, so an
@@ -1293,15 +1310,17 @@ def _installed_environments(wt: str) -> list[str]:
 
 
 async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, timeout: float) -> None:
-    """Complete promotion before validation using the project's exact setup command.
+    """Complete promotion using configured setup or the built-in lockfile default.
 
     Quarantine installed trees in git admin storage, never rewrite launchers.
-    The marker survives errors/cancellation; retries quarantine partial installs too.
+    Failures/cancellation restore the originals and retain the pending marker.
     Feature files, commits and dependency locks remain in the working tree.
     """
     marker = _environment_marker(wt)
     if not marker or not os.path.exists(marker):
         return
+    archives = []
+    restored = False
     try:
         with open(marker) as stream:
             required = json.load(stream)["environments"]
@@ -1309,31 +1328,56 @@ async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, t
         required = [rel for rel in required if not _stable_shared_dependencies(wt, rel)]
         installed = await asyncio.to_thread(_installed_environments, wt)
         if (installed or required) and not (cmd or "").strip():
-            raise EnvironmentPreparationError("configure the project's setup_cmd to reinstall dependencies")
+            cmd = DEFAULT_SETUP_CMD
         for rel in installed:
             if rel == ".":
                 raise EnvironmentPreparationError("the worktree root itself is a virtual environment")
             rc, tracked, err = await _git(wt, "ls-files", "--", rel)
             if rc or tracked.strip():
                 raise EnvironmentPreparationError(f"cannot quarantine {rel}: tracked files or unreadable index {err}")
+        # Check every guard before moving any environment out of the worktree.
+        for rel in installed:
             path = os.path.join(wt, rel)
             archive = tempfile.mkdtemp(prefix="board-old-environment-", dir=os.path.dirname(marker))
             # Git admin storage may be on a different filesystem. move preserves
             # symlinks and falls back to copy/remove for EXDEV; this archive is
             # never used as the active environment, which setup rebuilds below.
-            shutil.move(path, os.path.join(archive, os.path.basename(path)))
+            try:
+                shutil.move(path, os.path.join(archive, os.path.basename(path)))
+            except OSError:
+                # A failed cross-filesystem copy can leave a partial archive. The
+                # still-present source is authoritative; don't replace it with that copy.
+                if os.path.lexists(path):
+                    shutil.rmtree(archive)
+                else:
+                    archives.append((path, archive))
+                raise
+            archives.append((path, archive))
         reason = await prepare_worktree(wt, cmd, env=env, timeout=timeout)
-        if reason:
-            raise EnvironmentPreparationError(reason)
         missing = [rel for rel in required if not os.path.isdir(os.path.join(wt, rel))]
         if missing:
-            raise EnvironmentPreparationError(f"setup_cmd did not recreate environments: {missing}")
-        os.unlink(marker)
+            reason = (reason + "; " if reason else "") + f"setup_cmd did not recreate environments: {missing}"
+        if reason:
+            raise EnvironmentPreparationError(reason)
+        restored = True
     except (OSError, ValueError, KeyError, WorktreeError) as exc:
         raise EnvironmentPreparationError(
-            f"environment preparation failed for {wt}: {exc}. Feature work is preserved; "
+            f"environment preparation failed for {wt}: {exc}; command: {cmd!r}. Feature work is preserved; "
             "repair setup_cmd and retry environment preparation before validation."
         ) from exc
+    finally:
+        # Synchronous rollback also runs during cancellation, after prepare_worktree
+        # has killed/reaped setup. Never leave an old tree stranded by a failed install.
+        for path, archive in reversed(archives):
+            original = os.path.join(archive, os.path.basename(path))
+            if not restored and os.path.lexists(original):
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.unlink(path)
+                elif os.path.exists(path):
+                    shutil.rmtree(path)
+                shutil.move(original, path)
+            shutil.rmtree(archive)
+    os.unlink(marker)
 
 
 async def prepare_worktree(worktree: str, cmd: str, *, env: dict | None, timeout: float) -> str:

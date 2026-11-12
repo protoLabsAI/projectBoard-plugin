@@ -195,10 +195,10 @@ async def test_quarantine_across_filesystems_rebuilds_before_gate(candidate, mon
     with pytest.raises(worktree.EnvironmentPreparationError, match="setup_cmd exited 7"):
         await loop._run_local_gate(str(wt))
     assert quarantined
-    assert (quarantined[0] / "bin/feature-check").is_file()
-    assert (quarantined[0] / "bin/check-link").is_symlink()
-    assert (quarantined[0] / "bin/check-link").readlink() == Path("feature-check")
-    assert not (wt / ".venv").exists()
+    assert not quarantined[0].parent.exists()
+    assert (wt / ".venv/bin/feature-check").is_file()
+    assert (wt / ".venv/bin/check-link").is_symlink()
+    assert (wt / ".venv/bin/check-link").readlink() == Path("feature-check")
     loop.setup_cmd = candidate[2]
     assert await loop._run_local_gate(str(wt)) is None
     assert subprocess.check_output([str(wt / ".venv/bin/feature-check")], text=True).strip() == "feature works"
