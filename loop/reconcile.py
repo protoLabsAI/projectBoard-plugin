@@ -1507,6 +1507,9 @@ class ReconcileMixin:
                             == "in_review"
                         ):
                             await self._review_gate(store, fid, pr_url, repo)
+                        # Retry the draft hand-off after a hold is lifted, even with
+                        # auto-merge off. Polling requires a clean verdict at this head.
+                        await self._release_board_draft(store, fid, pr_url, repo, require_clean_head=True)
                         # The MERGE edge — last, so it sees this pass's rebase / verify /
                         # CI / review outcomes, and re-reads the feature rather than
                         # trusting the snapshot those gates may have changed.
@@ -2719,15 +2722,57 @@ class ReconcileMixin:
         except Exception:  # noqa: BLE001 — bookkeeping must never fail the drive
             log.warning("[project_board] %s board-draft not recorded for %s", fid, pr_url, exc_info=True)
 
-    async def _release_board_draft(self, store, fid: str, pr_url: str, repo: str) -> None:
+    async def _release_board_draft(
+        self, store, fid: str, pr_url: str, repo: str, *, require_clean_head: bool = False
+    ) -> None:
         """Mark the PR ready if the LOOP drafted it (#691). Only a `board-draft` card is
         touched, so an operator's hand-set draft (#207's hold) stays a draft. The label is
         cleared only once GitHub reports the PR ready, so a failed `gh pr ready` retries on
-        the next clean verdict instead of stranding the PR."""
+        the next clean verdict or reconcile instead of stranding the PR. A merge hold
+        keeps it drafted; polling after release requires a clean verdict at the live
+        head. Direct gate calls retain the legacy inert-gate hand-off."""
         try:
             feature = await asyncio.to_thread(store.get_feature, fid)
-            if store_mod.LABEL_BOARD_DRAFT not in (feature.get("labels") or []):
+            labels = (feature or {}).get("labels") or []
+            if store_mod.LABEL_BOARD_DRAFT not in labels:
                 return
+            if store_mod.LABEL_MERGE_HOLD in labels:
+                head = await worktree.pr_head_sha(pr_url, cwd=repo)
+                noted = getattr(self, "_draft_merge_hold_noted", None)
+                if noted is None:
+                    noted = self._draft_merge_hold_noted = {}
+                key = (pr_url, head or "unknown")
+                if noted.get(fid) != key:
+                    log.info("[project_board] %s draft kept: merge-hold (%s): %s", fid, head or "unknown", pr_url)
+                    noted[fid] = key
+                return
+            if require_clean_head:
+                # A poll is not a new verdict: absent/stale pins fail closed.
+                pinned = next(
+                    (
+                        x[len(store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX) :]
+                        for x in labels
+                        if x.startswith(store_mod.LABEL_REVIEW_CLEAN_SHA_PREFIX)
+                    ),
+                    "",
+                )
+                if (
+                    feature.get("board_state") != "in_review"
+                    or LABEL_REVIEW_CLEAN not in labels
+                    or LABEL_REVIEW_PENDING in labels
+                    or LABEL_CHANGES_REQUESTED in labels
+                    or not pinned
+                    or _loop.live_drive(fid) is not None
+                    or fid in self._inflight_files
+                ):
+                    return
+                head = await worktree.pr_head_sha(pr_url, cwd=repo)
+                if not head or head[: store_mod.SHORT_SHA_LEN] != pinned:
+                    return
+                # A hold or requeue during the GitHub read wins.
+                fresh = await asyncio.to_thread(store.get_feature, fid)
+                if not fresh or fresh.get("board_state") != "in_review" or fresh.get("labels") != labels:
+                    return
             if await worktree._promote_adopted_draft(pr_url, fid, cwd=repo, adopted=False):
                 await asyncio.to_thread(store.record_board_draft, fid, False)
                 log.info("[project_board] %s review gate clean — marked PR ready for external review: %s", fid, pr_url)
