@@ -1339,19 +1339,32 @@ async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, t
         for rel in installed:
             path = os.path.join(wt, rel)
             archive = tempfile.mkdtemp(prefix="board-old-environment-", dir=os.path.dirname(marker))
-            # Git admin storage may be on a different filesystem. move preserves
-            # symlinks and falls back to copy/remove for EXDEV; this archive is
-            # never used as the active environment, which setup rebuilds below.
+            original = os.path.join(archive, os.path.basename(path))
+            # Track copy completion separately from source removal: rmtree can
+            # fail after deleting some files, making the archive the only full copy.
             try:
-                shutil.move(path, os.path.join(archive, os.path.basename(path)))
+                os.rename(path, original)
             except OSError:
-                # A failed cross-filesystem copy can leave a partial archive. The
-                # still-present source is authoritative; don't replace it with that copy.
-                if os.path.lexists(path):
+                # Keep shutil.move's copy fallback when rename is unavailable
+                # (notably when git admin storage is on another filesystem).
+                try:
+                    if os.path.islink(path):
+                        os.symlink(os.readlink(path), original)
+                    elif os.path.isdir(path):
+                        shutil.copytree(path, original, symlinks=True)
+                    else:
+                        shutil.copy2(path, original)
+                except OSError:
+                    # Copying has not touched the source, so discard only the
+                    # incomplete archive and roll back any earlier environments.
                     shutil.rmtree(archive)
+                    raise
+                archives.append((path, archive))
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
                 else:
-                    archives.append((path, archive))
-                raise
+                    os.unlink(path)
+                continue
             archives.append((path, archive))
         reason = await prepare_worktree(wt, cmd, env=env, timeout=timeout)
         missing = [rel for rel in required if not os.path.isdir(os.path.join(wt, rel))]

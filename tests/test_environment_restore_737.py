@@ -1,6 +1,7 @@
 """Promotion transactions on real git worktrees, with offline installer executables."""
 
 import asyncio
+import errno
 import os
 from pathlib import Path
 import shlex
@@ -155,3 +156,56 @@ async def test_default_without_supported_manifest_fails_closed(promoted):
     assert "node_modules" in str(error.value)
     assert repr(worktree.DEFAULT_SETUP_CMD) in str(error.value)
     assert_transaction(promoted, pending=True)
+
+
+@pytest.mark.parametrize("failure", ["copy", "remove"])
+async def test_cross_filesystem_quarantine_failure_preserves_complete_originals(promoted, monkeypatch, failure):
+    # Fail on the second environment so rollback must also restore the first.
+    target = promoted / worktree._installed_environments(str(promoted))[-1]
+    (target / "nested").mkdir()
+    (target / "nested/preserved").write_text("original nested content")
+    (target / "link").symlink_to("nested/preserved")
+    rename = os.rename
+    copytree = worktree.shutil.copytree
+    rmtree = worktree.shutil.rmtree
+    failed = False
+
+    def cross_device(src, dst, *args, **kwargs):
+        if any(Path(p).parent.name.startswith("board-old-environment-") for p in (src, dst)):
+            raise OSError(errno.EXDEV, "cross-device move")
+        return rename(src, dst, *args, **kwargs)
+
+    def incomplete_copy(src, dst, *args, **kwargs):
+        nonlocal failed
+        if failure == "copy" and Path(src) == target and not failed:
+            failed = True
+            Path(dst).mkdir()
+            (Path(dst) / "original").write_text("incomplete copy")
+            raise worktree.shutil.Error([(str(src), str(dst), "injected copy failure")])
+        return copytree(src, dst, *args, **kwargs)
+
+    def partial_removal(path, *args, **kwargs):
+        nonlocal failed
+        if failure == "remove" and Path(path) == target and not failed:
+            failed = True
+            (target / "original").unlink()
+            rmtree(target / "nested")
+            raise OSError("injected removal failure")
+        return rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", cross_device)
+    monkeypatch.setattr(worktree.shutil, "copytree", incomplete_copy)
+    monkeypatch.setattr(worktree.shutil, "rmtree", partial_removal)
+    with pytest.raises(worktree.EnvironmentPreparationError, match="injected"):
+        await worktree.restore_worktree_environment(str(promoted), "touch setup-ran", env=None, timeout=5)
+    assert failed
+    assert not (promoted / "setup-ran").exists()
+    assert_transaction(promoted, pending=True)
+    assert (target / "nested/preserved").read_text() == "original nested content"
+    assert (target / "link").is_symlink()
+    assert os.readlink(target / "link") == "nested/preserved"
+    # The pending transaction remains usable after the failure.
+    await worktree.restore_worktree_environment(
+        str(promoted), "mkdir .venv node_modules; touch .venv/pyvenv.cfg", env=None, timeout=5
+    )
+    assert_transaction(promoted, pending=False)
