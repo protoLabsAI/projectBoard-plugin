@@ -2221,7 +2221,11 @@ let booted = false;
 function boot(){
   if (booted) return;
   booted = true;
-  load().then(pollBuilding);
+  load().then(() => {
+    const fid = new URLSearchParams(window.location.search).get("card");
+    if (fid) openCard(fid, "card");
+    return pollBuilding();
+  });
   LIVE_TIMER = setTimeout(liveTick, REV_POLL_MS);
   clockTick();
 }

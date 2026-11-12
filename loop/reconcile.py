@@ -906,6 +906,9 @@ class ReconcileMixin:
 
         Best-effort per card, exactly like the rest of the sweep: one card that fails to
         recover must never stop the pass or the loop."""
+        from .. import block_pages
+
+        await asyncio.to_thread(block_pages.sweep, store)
         try:
             blocked = await asyncio.to_thread(store.list_features, state="blocked")
         except store_mod.BoardTimeout:
