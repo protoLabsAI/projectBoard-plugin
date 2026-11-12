@@ -19,6 +19,7 @@ import sys
 from .prompt import is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
+from .. import block_pages
 from .. import host_friction, work_location_sweep, work_location_capture
 from ..failures import PROVIDER_STALL_CLASS
 
@@ -653,31 +654,14 @@ class DriveMixin:
         ``worktree`` logged when it saved the tree still names the branch."""
         await self._comment(store, fid, worktree.preserved_note(repo, saved, base=base))
 
+    @block_pages.serialized
     def _notify_operator(self, fid: str, text: str, *, incident: str = "", store=None) -> None:
         """Put ONE item in the operator's inbox for a card that has stopped moving.
 
-        Dedup is the whole difficulty here, and it is deliberately NOT solved with state
-        on our side. Earlier cuts tried a per-process memo, then a durable
-        ``notified:blocked`` label, then a rollback when a recovery raced the write, then
-        a recovery-generation counter to make the rollback safe — and review found a
-        narrower race in each. Every one of them was trying to answer "is this the same
-        incident?" by tracking OUR OWN writes across a distributed edge, which is the hard
-        version of the question.
-
-        The easy version: let the KEY answer it. ``dedup_key`` carries the incident's
-        identity — the card, its failure class and reason, and the recovery cycle it is on
-        — so the same block dedups by construction, a genuinely different block is a
-        different key and alerts, and no bead label, memo, generation or rollback exists
-        to go stale.
-
-        The recovery cycle belongs in that identity: a card that auto-healed, rebuilt and
-        failed the SAME way again is a NEW failed cycle and is news, because the self-heal
-        did not work. Keying on class+reason alone silently suppressed that for the whole
-        window — the behaviour this docstring's first draft argued was correct, and was
-        not.
-
-        The window is long (`_ALERT_DEDUP_S`) because a blocked card can sit for hours and
-        the default 300s would re-alert on every restart — the failure #341 opened with.
+        Outstanding block pages deduplicate by card, regardless of the inbox's time
+        window. The incident key remains stable across sweeps; retiring an old row
+        lets the same failure create a fresh row after an unblock. Non-block notices
+        retain their incident-based dedup and their original copy.
 
         Feature-detected: the inbox is a host module this plugin must not hard-depend on.
         A host without it still gets the WARNING below, which is strictly louder than the
@@ -689,6 +673,8 @@ class DriveMixin:
         before the inbox row the card is re-read (through ``store``, else ``self._store()``)
         and a ``done`` / ``cancelled`` card drops the alert at debug. FAIL OPEN: a read that
         raises never hides a real block — the alert still goes out with whatever is known."""
+        now = {}
+        is_block = not incident.startswith(("work-location:", "gate-override|", "external-review|"))
         try:
             now = (store or self._store()).get_feature(fid)
             state = str((now or {}).get("board_state") or "")
@@ -696,9 +682,16 @@ class DriveMixin:
             # Keep the existing stale-block guard for every other incident class.
             if state in ("done", "cancelled") and not incident.startswith("work-location:"):
                 log.debug("[project_board] %s is %s — dropping stale block alert", fid, state)
+                if is_block:
+                    block_pages.retire(now)
                 return
         except Exception:  # noqa: BLE001 — a re-read we can't make must never swallow the alert
             log.debug("[project_board] %s: could not re-read state before alerting; sending anyway", fid, exc_info=True)
+        if is_block and now and now.get("board_state") not in (None, "", "blocked"):
+            block_pages.retire(now)
+            return
+        if is_block:
+            text = block_pages.page_text(fid, now or {})
         key = f"blocked:{fid}"
         if incident.strip():
             key += ":" + hashlib.sha1(incident.encode("utf-8", "replace")).hexdigest()[:12]
@@ -708,9 +701,18 @@ class DriveMixin:
             db = _loop._inbox_db_path()
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
-            row = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S).add(
-                text, priority="now", source="project_board", dedup_key=key
-            )
+            inbox = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S)
+            if is_block and hasattr(inbox, "list"):
+                if any(block_pages.card_id(r) == fid for r in block_pages.pending(inbox)):
+                    log.debug("[project_board] %s still blocked — operator already notified of this incident", fid)
+                    return
+            row = inbox.add(text, priority="now", source="project_board", dedup_key=key)
+            if is_block and row is not None:
+                # Close the read/add race with a transition that already retired its pages.
+                try:
+                    block_pages.retire((store or self._store()).get_feature(fid), inbox=inbox)
+                except Exception:
+                    pass  # The sweep retries if the card cannot currently be read.
             if row is None:
                 # Deduped (`add` returns None): the operator already has THIS incident. The
                 # sweep re-runs every few minutes, and logging "operator notified" on each
