@@ -3126,6 +3126,11 @@ class ReconcileMixin:
         ``block_pages`` from treating it as an operator alert (so it stays out of the operator's
         Needs-you) and dedups it per card+head across restarts within the alert window.
 
+        The action named is VERDICT-APPROPRIATE: a clean PASS / non-blocking WARN offers the merge
+        (it is the agent's to make on this project), but a blocking FAIL/BLOCK/REJECT never does —
+        the panel rejected this head, the #473 edge bounces it into a fix round, and offering merge
+        on a PR the panel rejected is wrong (round-2 review). The verdict word is named either way.
+
         Returns True when the page exists after the call — freshly queued OR already there (so the
         caller's once-per-head guard is set); False only when no inbox is reachable, so an
         unreachable inbox is retried next poll. Feature-detected on the inbox exactly like
@@ -3134,10 +3139,14 @@ class ReconcileMixin:
         short = head[: store_mod.SHORT_SHA_LEN]
         title = " ".join(str(feature.get("title") or "").split())[:80]
         named = f" ({title})" if title else ""
-        text = (
-            f"QA panel {verdict} on {fid}{named} at head {short}: {pr_url}. The merge/adjudication "
-            f"is yours on this project — act on it (merge, request changes, or close)."
-        )
+        if verdict in external_review.BLOCKING_VERDICTS:
+            # The panel REJECTED this head — the #473 edge bounces it into a fix round, so the
+            # merge is not on the table. Never offer merge on a PR the panel rejected.
+            action = "The panel rejected this head — fix the findings it raised, request changes, or close the PR."
+        else:
+            # A clean PASS / non-blocking WARN — the merge/adjudication is the agent's to make here.
+            action = "The merge/adjudication is yours on this project — act on it (merge, request changes, or close)."
+        text = f"QA panel {verdict} on {fid}{named} at head {short}: {pr_url}. {action}"
         key = f"panel-verdict:{fid}:{short}"
         try:
             from inbox import InboxStore  # host module — absent on older hosts

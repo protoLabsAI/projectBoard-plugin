@@ -36,8 +36,11 @@ SHORT = store_mod.SHORT_SHA_LEN
 # ── the pure read: which verdicts are TERMINAL ───────────────────────────────────────────
 
 
-def _review(verdict, *, head=HEAD, login="protoreview", state="APPROVED", at="2026-11-12T10:00:00Z"):
-    body = f"<!-- protoagent-qa-review head={head} verdict={verdict} -->\n## QA panel — {verdict}"
+def _review(verdict, *, head=HEAD, login="protoreview", state="APPROVED", at="2026-11-12T10:00:00Z", complete=None):
+    # ``complete=False`` stamps the marker's ``complete=false`` — an incomplete pass (a finder did
+    # not run), which `evaluate` reads as `incomplete` and is NOT a terminal verdict.
+    extra = "" if complete is None else f" complete={'false' if complete is False else 'true'}"
+    body = f"<!-- protoagent-qa-review head={head} verdict={verdict}{extra} -->\n## QA panel — {verdict}"
     return {"author": {"login": login}, "body": body, "state": state, "submittedAt": at, "commit": {"oid": head}}
 
 
@@ -67,6 +70,20 @@ def test_an_incomplete_pass_is_not_a_terminal_verdict():
     neutral = [{"__typename": "CheckRun", "name": "QA panel", "conclusion": "NEUTRAL", "workflowName": ""}]
     v = external_review.evaluate(_view("", reviews=[], checks=neutral), external_review.Config())
     assert v.incomplete and v.terminal_verdict == ""
+
+
+def test_a_complete_false_pass_is_not_a_terminal_verdict():
+    """A marked PASS carrying ``complete=false`` is an incomplete pass — the panel cleared less
+    than the whole diff — so `terminal_verdict` is "", honouring 'incomplete is not terminal'. The
+    agent is never woken to merge a head the panel left half-reviewed (round-2 review)."""
+    v = external_review.evaluate(_view("", reviews=[_review("PASS", complete=False)]), external_review.Config())
+    assert v.review_verdict == "PASS" and v.incomplete and v.terminal_verdict == ""
+
+
+def test_a_complete_pass_stays_a_terminal_verdict():
+    """The guard does not swallow a genuine complete pass: ``complete=true`` is terminal."""
+    v = external_review.evaluate(_view("", reviews=[_review("PASS", complete=True)]), external_review.Config())
+    assert not v.incomplete and v.terminal_verdict == "PASS"
 
 
 def test_a_fail_known_only_from_a_red_check_is_not_a_named_verdict():
@@ -146,6 +163,27 @@ async def test_a_terminal_verdict_pages_the_agent_naming_card_pr_and_verdict(inb
     assert FID in row["text"] and PR in row["text"] and verdict in row["text"]
 
 
+@pytest.mark.parametrize("verdict", ["PASS", "WARN"])
+async def test_a_clean_head_offers_the_agent_the_merge(inbox, monkeypatch, verdict):
+    """A non-blocking verdict — the merge/adjudication is the agent's to make — offers the merge."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view(verdict)) is True
+    assert "merge" in inbox[0]["text"].lower()
+
+
+@pytest.mark.parametrize("verdict", ["FAIL", "BLOCK", "REJECT"])
+async def test_a_rejected_head_is_never_offered_the_merge(inbox, monkeypatch, verdict):
+    """On a FAIL/BLOCK/REJECT the panel rejected the head and the #473 edge bounces it into a fix
+    round — the page names the verdict and says fix/request-changes/close, never offering to MERGE
+    a PR the panel rejected (round-2 review)."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view(verdict)) is True
+    text = inbox[0]["text"]
+    assert verdict in text and "merge" not in text.lower()
+
+
 async def test_the_page_is_agent_owned_not_an_operator_block_page(inbox, monkeypatch):
     """Agent-owned: a `panel-verdict:` dedup key, never the operator `blocked:` prefix, so the
     block-page machinery never treats it as an operator alert and it stays out of Needs-you."""
@@ -185,6 +223,9 @@ async def test_a_non_terminal_or_absent_verdict_never_pages(inbox, monkeypatch):
     neutral = [{"__typename": "CheckRun", "name": "QA panel", "conclusion": "NEUTRAL", "workflowName": ""}]
     nv = _view("", reviews=[], checks=neutral)
     assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=nv) is False
+    # A marked PASS with complete=false is an incomplete pass — not a conclusion either.
+    cf = _view("", reviews=[_review("PASS", complete=False)])
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=cf) is False
     assert inbox == []
 
 

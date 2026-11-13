@@ -222,8 +222,20 @@ class Verdict:
         verdict at this head, or only an incomplete pass. On a project where the agent does the
         merge/adjudication, a terminal verdict wakes the agent to act (#5218); an incomplete or
         absent verdict never does. A FAIL known only from a red check with no marked review is
-        not named here (``review_verdict`` is ``""``), so it reads as no terminal verdict."""
-        return self.review_verdict if self.review_verdict in TERMINAL_VERDICTS else ""
+        not named here (``review_verdict`` is ``""``), so it reads as no terminal verdict.
+
+        An INCOMPLETE pass is not terminal, honouring the module's 'incomplete is not terminal'
+        contract (see :attr:`incomplete` / :func:`_judge_coverage`): a PASS/WARN whose coverage
+        this same read marked incomplete — a NEUTRAL ``QA panel`` check, or a marked review
+        carrying ``complete=false`` — reads as ``""`` here, so the agent is never woken to merge
+        a head the panel left half-reviewed. A FAIL/BLOCK/REJECT is always terminal and never
+        incomplete (``_judge_coverage`` leaves ``incomplete`` False on a failing head), so a
+        blocking verdict is unaffected by this guard."""
+        if self.review_verdict in BLOCKING_VERDICTS:
+            return self.review_verdict  # a FAIL/BLOCK/REJECT is terminal and never incomplete
+        if self.review_verdict in TERMINAL_VERDICTS and not self.incomplete:
+            return self.review_verdict  # a COMPLETE PASS/WARN
+        return ""
 
 
 def _author(r: dict) -> str:
