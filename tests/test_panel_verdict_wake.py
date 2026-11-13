@@ -92,6 +92,45 @@ def test_a_fail_known_only_from_a_red_check_is_not_a_named_verdict():
     assert v.failed and v.terminal_verdict == ""  # failed, but no marked verdict to name
 
 
+@pytest.mark.parametrize("verdict", ["PASS", "WARN"])
+def test_a_pass_a_newer_red_check_failed_is_not_a_terminal_verdict(verdict):
+    """A PASS/WARN marked review, then a NEWER red `QA panel` check `evaluate` did not let the
+    review clear (the red landed after the review): the panel FAILED this head, so `terminal_verdict`
+    is "" even though `review_verdict` is PASS/WARN. Without this guard the wake would page the agent
+    to MERGE a head the #473 edge (`_reconcile_external_review`, which holds/bounces any failed head)
+    then holds or bounces (round-3 review)."""
+    cleared = _review(verdict, at="2026-11-12T10:00:00Z")  # the marked PASS/WARN
+    red = [
+        {
+            "__typename": "CheckRun",
+            "name": "QA panel",
+            "conclusion": "FAILURE",
+            "workflowName": "",
+            "completedAt": "2026-11-12T11:00:00Z",  # NEWER than the review — not cleared by it
+        }
+    ]
+    v = external_review.evaluate(_view("", reviews=[cleared], checks=red), external_review.Config())
+    assert v.review_verdict == verdict and v.failed and not v.incomplete
+    assert v.terminal_verdict == ""  # failed head — never named as a mergeable PASS/WARN
+
+
+def test_a_pass_an_older_red_check_cleared_stays_a_terminal_verdict():
+    """The guard does not swallow a genuine pass: a PASS review submitted AFTER the red check
+    clears it (`evaluate` leaves `failed` False), so the complete PASS is still terminal."""
+    old_red = [
+        {
+            "__typename": "CheckRun",
+            "name": "QA panel",
+            "conclusion": "FAILURE",
+            "workflowName": "",
+            "completedAt": "2026-11-12T09:00:00Z",  # OLDER than the review — the review cleared it
+        }
+    ]
+    cleared = _review("PASS", at="2026-11-12T10:00:00Z")
+    v = external_review.evaluate(_view("", reviews=[cleared], checks=old_red), external_review.Config())
+    assert not v.failed and v.terminal_verdict == "PASS"
+
+
 # ── the inbox page ───────────────────────────────────────────────────────────────────────
 
 
@@ -226,6 +265,19 @@ async def test_a_non_terminal_or_absent_verdict_never_pages(inbox, monkeypatch):
     # A marked PASS with complete=false is an incomplete pass — not a conclusion either.
     cf = _view("", reviews=[_review("PASS", complete=False)])
     assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=cf) is False
+    # A PASS that a NEWER red `QA panel` check failed — the panel rejected this head and the #473
+    # edge holds/bounces it, so the agent is never paged to merge it (round-3 review).
+    red = [
+        {
+            "__typename": "CheckRun",
+            "name": "QA panel",
+            "conclusion": "FAILURE",
+            "workflowName": "",
+            "completedAt": "2026-11-12T11:00:00Z",
+        }
+    ]
+    failed_pass = _view("", reviews=[_review("PASS", at="2026-11-12T10:00:00Z")], checks=red)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=failed_pass) is False
     assert inbox == []
 
 
