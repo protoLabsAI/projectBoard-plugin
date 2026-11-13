@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import sys
 
-from .prompt import is_execution_task
+from .prompt import LEDGER_ONLY_OPENING, is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
@@ -257,10 +257,14 @@ def _ledger_only_followup(listing: str) -> str:
     It must carry the bd-bkvgk command rules itself: on that card the follow-up round
     re-ran the full suite the card's text asked for, the harness backgrounded it at the
     foreground limit, the coder ended its turn "waiting", and the board read the waiting
-    note as the final result — the identical miss the follow-up was dispatched to fix."""
+    note as the final result — the identical miss the follow-up was dispatched to fix.
+    The run-nothing rule is justified by the round's own nature (nothing here changes,
+    so nothing needs verifying), NOT by a board-runs-the-gate claim — that claim is
+    false on a project with no ``local_gate_cmd`` (#400), and this text has no feature
+    in hand to check one. Opens with ``LEDGER_ONLY_OPENING`` so ``_build_prompt``
+    recognizes the round and keeps its fix-round verify line out of the same brief."""
     return (
-        "Your implementation is COMPLETE and staying as it is — do NOT edit "
-        "code, tests, or docs this round. The ONLY thing missing is the "
+        LEDGER_ONLY_OPENING + " The ONLY thing missing is the "
         "disposition ledger, which your last reply left out entirely.\n\n"
         "Reply with TWO sections and nothing else:\n\n"
         "1. `## Requirements` — ONE line per item below, each exactly "
@@ -271,10 +275,11 @@ def _ledger_only_followup(listing: str) -> str:
         "including any `NO_TEST_NEEDED: <reason>` line it carried, "
         "verbatim. The PR body is built from this section and the pre-PR "
         "gates re-read it, so dropping it loses work you already did.\n\n"
-        "Run NO commands this round — in particular, do NOT run the repo's full test "
-        "suite (or any tests): the board runs the full gate itself. Never end your "
-        "reply while a command you started is still running: your final message is "
-        "the result the board reads.\n\n" + listing
+        "Run NO commands this round — in particular, do NOT start the repo's full "
+        "test suite (or any tests): the implementation is already complete and is "
+        "not changing, so nothing here needs verifying. Never end your reply while "
+        "a command you started is still running: your final message is the result "
+        "the board reads.\n\n" + listing
     )
 
 
