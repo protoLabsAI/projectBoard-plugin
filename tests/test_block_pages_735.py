@@ -101,9 +101,10 @@ def test_short_page_and_duplicate_across_restart(inbox):
     assert len(inbox) == 1
     text = inbox[0]["text"]
     assert len(text) <= 200
-    assert "bd-test" in text and "Fix the build" in text and "open the card" in text
-    assert "/plugins/project_board/board?card=bd-test" in text
-    assert "_finding_identity" not in text
+    assert "bd-test" in text and "Fix the build" in text
+    # The page states the ask (#gg9fa): the reason rides along, trimmed, and the link survives.
+    assert "DO NOT UNBLOCK _finding_identity" in text and "…" in text
+    assert text.endswith(" [Open the card](/plugins/project_board/board?card=bd-test)")
     assert board.get_feature("bd-test")["blocked_reason"] == board.reason
 
 

@@ -24,12 +24,32 @@ def serialized(method):
 
 def page_text(fid: str, feature: dict) -> str:
     title = " ".join(str(feature.get("title") or "Untitled card").split())[:55]
+    reason = " ".join(str(feature.get("blocked_reason") or "").split()).rstrip(".")
     link = f"/plugins/project_board/board?card={quote(fid, safe='')}"
-    action = f"is blocked; [open the card]({link}) to review the reason and choose the next step."
-    if feature.get("blocked_class") == "preflight-hold":
-        action = f"is waiting for its project check; [open the card]({link}) to review it."
-    room = max(0, 200 - len(f"{fid}:  {action}"))
-    return f"{fid}: {title[:room]} {action}"
+    hold = feature.get("blocked_class") == "preflight-hold"
+    if not reason:
+        action = f"is blocked; [open the card]({link}) to review the reason and choose the next step."
+        if hold:
+            action = f"is waiting for its project check; [open the card]({link}) to review it."
+        room = max(0, 200 - len(f"{fid}:  {action}"))
+        return f"{fid}: {title[:room]} {action}"
+    # The page states the ask itself (#gg9fa): the reason rides along in plain
+    # words so the operator never has to open the card just to learn what is
+    # needed. Budget order: the link always survives; the reason is trimmed with
+    # an ellipsis; the title is dropped only when trimming would leave almost
+    # nothing of the reason.
+    state = "is waiting for its project check" if hold else "is blocked"
+
+    def page(t: str) -> tuple[int, str]:
+        head = f"{fid}: {t} {state}: " if t else f"{fid} {state}: "
+        room = 200 - len(head) - len(f" [Open the card]({link})")
+        said = f"{reason}." if len(reason) < room else reason[: max(0, room - 1)].rstrip() + "…"
+        return room, f"{head}{said} [Open the card]({link})"
+
+    room, text = page(title)
+    if len(reason) >= room and room < 24:
+        room, text = page("")
+    return text
 
 
 def inbox_store():
