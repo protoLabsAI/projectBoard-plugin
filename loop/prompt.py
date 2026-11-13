@@ -44,6 +44,16 @@ def _recovery_block(feature: dict) -> str:
     )
 
 
+# The ledger-only follow-up (#382, drive._ledger_only_followup) rides the ordinary
+# ``_ci_feedback`` path, so ``_build_prompt`` must be able to recognize it: that round
+# runs NO commands at all, and appending the fix-round "verify with targeted tests"
+# line would contradict the very feedback it wraps (bd-cphuw review). drive builds the
+# follow-up ON this constant, so detection can never drift from the text.
+LEDGER_ONLY_OPENING = (
+    "Your implementation is COMPLETE and staying as it is — do NOT edit code, tests, or docs this round."
+)
+
+
 # Command tokens are recognized ONLY in a command POSITION — a fenced shell block, a
 # `$ ` prompt line, an inline-code span with an execution cue, right after an explicit
 # run verb, or at the very start of a line — never mid-prose. A writing spec that merely NAMES a tool ("document
@@ -231,12 +241,10 @@ class PromptMixin:
         # on a multi-repo board gets the standing obligations of the repo it builds in.
         gate_files = self._gate_files_for(feature)
         # The publish rule says what the loop really does: it runs the repo's pre-PR checks
-        # only when a gate command is configured for this project (#400).
-        checks = (
-            (", runs the repo's pre-PR checks", "those checks and in ")
-            if self._local_gate_cmd_for(feature)
-            else ("", "")
-        )
+        # only when a gate command is configured for this project (#400). `gated` also
+        # decides the test-scope wording below — same rule, same source of truth.
+        gated = bool(self._local_gate_cmd_for(feature))
+        checks = (", runs the repo's pre-PR checks", "those checks and in ") if gated else ("", "")
         gate_files_block = (
             "\n## Repo standing gate files (keep these green — repo-wide, not per-card)\n"
             + "\n".join(f"- {g}" for g in gate_files)
@@ -315,10 +323,47 @@ class PromptMixin:
             "you need and why. A filesystem-wide search burns the card's clock and makes "
             "the OS prompt your operator for access to other apps' data.\n"
         )
+        # Standing test-scope block (bd-bkvgk): a card told its coder to run the full
+        # suite; the suite outruns the foreground command limit, so the harness moved it
+        # to the background ITSELF, the coder ended its turn "waiting", and the board
+        # read that waiting note as the final result — no `## Requirements` section,
+        # ledger-only follow-up, same again, terminal. The never-end-your-turn rule is
+        # UNCONDITIONAL, like the scope block above, so no dispatch path can lose it.
+        # The full-suite scope-down is NOT: "the board runs the full gate itself" is
+        # only true when this project configures a gate (reconcile returns early with
+        # none), and the brief must not promise a check the loop will not run (#400) —
+        # on an ungated project the coder's own run is the only pre-PR suite run, so
+        # skipping it would surface regressions only in CI.
+        never_leave_running = (
+            "Never end your reply while a command you started is still running, "
+            "foreground or background: your final message is the result the board "
+            "reads, and a reply that ends 'waiting on tests' becomes your whole "
+            "answer. Wait for every command to finish — or kill it — before you write "
+            "your final message.\n"
+        )
+        test_scope_block = (
+            (
+                "\n## Run only targeted tests — and never leave a command running\n"
+                "Do NOT run the repo's full test suite (or a full lint/format sweep): the "
+                "board runs the full gate itself after you finish. When you verify your "
+                "change, run only the tests covering the files you changed — they finish "
+                "well inside one foreground command. If the card asks for a full-suite "
+                "run, run the targeted tests instead and say so in your `## Summary`.\n"
+            )
+            if gated
+            else (
+                "\n## Never leave a command running\n"
+                "No pre-PR gate is configured for this project, so the tests you run are "
+                "the only check before CI. Start with the tests covering the files you "
+                "changed; if the card asks for a full-suite run, honor it — but end your "
+                "turn only after it completes.\n"
+            )
+        ) + never_leave_running
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
-        # CI; lead with the failure so the coder FIXES it this pass (it can't run the
-        # checks itself — edit-only). Also widen scope: the fix may touch tests/files
-        # the original `files_to_modify` didn't list (the #1053 lesson).
+        # CI; lead with the failure so the coder FIXES it this pass and proves it with
+        # the targeted tests named below (still edit-only for publishing: the loop owns
+        # commit/gate/push). Also widen scope: the fix may touch tests/files the
+        # original `files_to_modify` didn't list (the #1053 lesson).
         fid = feature.get("id", "")
         # Drain any externally-queued review-bounce feedback (the /review route stashed
         # it via queue_review_feedback) into THIS run's _ci_feedback, so an operator/CI
@@ -334,6 +379,26 @@ class PromptMixin:
             if prior
             else ""
         )
+        # bd-bkvgk, restated INSIDE the fix-round brief: a coder anchored on the
+        # rejection is the one most tempted to re-run the whole gate to prove the fix.
+        # Gate-aware like the standing block above (#400), and dropped entirely when
+        # the feedback IS the ledger-only follow-up (#382): that round runs NO
+        # commands, and asking it to verify anything would contradict its own text.
+        if ci.startswith(LEDGER_ONLY_OPENING):
+            fix_cmd_rules = ""
+        elif gated:
+            fix_cmd_rules = (
+                "Verify the fix with only the tests covering the files you changed — NOT "
+                "the repo's full test suite: the board runs the full gate itself after you "
+                "finish. Never end your reply while a command you started is still running: "
+                "your final message is the result the board reads.\n"
+            )
+        else:
+            fix_cmd_rules = (
+                "Verify the fix with the tests covering the files you changed. Never end "
+                "your reply while a command you started is still running: your final "
+                "message is the result the board reads.\n"
+            )
         ci_block = (
             "\n## ⚠ Your previous attempt was REJECTED — fix it this attempt\n"
             f"{ci}\n"
@@ -341,6 +406,7 @@ class PromptMixin:
             "Address the problem above. This may require editing files beyond the list "
             "below — e.g. ADD the missing tests, or update an e2e/unit test that assumed "
             "the old behavior.\n"
+            f"{fix_cmd_rules}"
             if ci
             else ""
         )
@@ -390,6 +456,7 @@ class PromptMixin:
             f"{preserve_scope_block}"
             f"{self_check_block}"
             f"{search_scope_block}"
+            f"{test_scope_block}"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
             f"## Rules\n"

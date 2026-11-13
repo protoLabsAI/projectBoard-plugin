@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import sys
 
-from .prompt import is_execution_task
+from .prompt import LEDGER_ONLY_OPENING, is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
@@ -248,6 +248,39 @@ def _held_sentence(held: dict) -> str:
         more = ", …" if group["count"] > len(group["ids"]) else ""
         parts.append(f"{group['count']} {label} ({', '.join(group['ids'])}{more})")
     return "; ".join(parts)
+
+
+def _ledger_only_followup(listing: str) -> str:
+    """The #382 ledger-only re-prompt: the implementation stays on disk and the coder is
+    asked for the disposition ledger ALONE. Module-level so tests pin its text directly.
+
+    It must carry the bd-bkvgk command rules itself: on that card the follow-up round
+    re-ran the full suite the card's text asked for, the harness backgrounded it at the
+    foreground limit, the coder ended its turn "waiting", and the board read the waiting
+    note as the final result — the identical miss the follow-up was dispatched to fix.
+    The run-nothing rule is justified by the round's own nature (nothing here changes,
+    so nothing needs verifying), NOT by a board-runs-the-gate claim — that claim is
+    false on a project with no ``local_gate_cmd`` (#400), and this text has no feature
+    in hand to check one. Opens with ``LEDGER_ONLY_OPENING`` so ``_build_prompt``
+    recognizes the round and keeps its fix-round verify line out of the same brief."""
+    return (
+        LEDGER_ONLY_OPENING + " The ONLY thing missing is the "
+        "disposition ledger, which your last reply left out entirely.\n\n"
+        "Reply with TWO sections and nothing else:\n\n"
+        "1. `## Requirements` — ONE line per item below, each exactly "
+        "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
+        "item needs a line; silence is not a disposition. Mark an item "
+        "`done` if the work already in the worktree satisfies it.\n"
+        "2. `## Summary` — RE-EMIT your previous summary of this work, "
+        "including any `NO_TEST_NEEDED: <reason>` line it carried, "
+        "verbatim. The PR body is built from this section and the pre-PR "
+        "gates re-read it, so dropping it loses work you already did.\n\n"
+        "Run NO commands this round — in particular, do NOT start the repo's full "
+        "test suite (or any tests): the implementation is already complete and is "
+        "not changing, so nothing here needs verifying. Never end your reply while "
+        "a command you started is still running: your final message is the result "
+        "the board reads.\n\n" + listing
+    )
 
 
 # ── on-demand queue dispatch diagnostic (board_dispatch, #390) ────────────────────
@@ -2678,20 +2711,7 @@ class DriveMixin:
                             if m < _LEDGER_ONLY_MAX:
                                 await self._budget_set(store, fid, "ledger-only", m + 1)
                                 self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
-                                self._ci_feedback[fid] = (
-                                    "Your implementation is COMPLETE and staying as it is — do NOT edit "
-                                    "code, tests, or docs this round. The ONLY thing missing is the "
-                                    "disposition ledger, which your last reply left out entirely.\n\n"
-                                    "Reply with TWO sections and nothing else:\n\n"
-                                    "1. `## Requirements` — ONE line per item below, each exactly "
-                                    "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
-                                    "item needs a line; silence is not a disposition. Mark an item "
-                                    "`done` if the work already in the worktree satisfies it.\n"
-                                    "2. `## Summary` — RE-EMIT your previous summary of this work, "
-                                    "including any `NO_TEST_NEEDED: <reason>` line it carried, "
-                                    "verbatim. The PR body is built from this section and the pre-PR "
-                                    "gates re-read it, so dropping it loses work you already did.\n\n" + listing
-                                )
+                                self._ci_feedback[fid] = _ledger_only_followup(listing)
                                 try:
                                     await asyncio.to_thread(
                                         store.comment,
