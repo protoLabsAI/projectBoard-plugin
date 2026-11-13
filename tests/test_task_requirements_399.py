@@ -36,6 +36,7 @@ import project_board as pb
 from project_board import api, coder_seam
 from project_board import store as store_mod
 from project_board.loop import BoardLoop, _parse_requirements_reply
+from project_board.loop.drive import _ledger_only_followup
 from project_board.store import BeadsBoard, BoardError
 
 requires_br = pytest.mark.skipif(
@@ -222,3 +223,60 @@ def test_the_verify_route_carries_the_same_note_and_none_when_all_are_closed(boa
 
     complete = client.post(f"/api/plugins/project_board/features/{done}/verify", json={"approved": True}).json()
     assert complete["board_state"] == "done" and "note" not in complete
+
+
+# ── bd-bkvgk: command discipline in every coder-facing brief ──────────────────────────
+#
+# A card's requirement told the coder to run `ruff check . && ruff format --check . &&
+# pytest -q`. The full suite outruns the foreground command limit, so the harness moved
+# it to the background ITSELF; the coder ended its turn "waiting", and the board read
+# the waiting note as the final result — no `## Requirements` heading, ledger-only
+# follow-up, same again, terminal (~14 sessions on a three-line version bump). Every
+# brief a coder can act on must therefore say BOTH: the board runs the full gate itself
+# (run only the tests covering the changed files), and never end a reply while a
+# command is still running. These anchors are the exact phrases the briefs carry.
+
+FULL_GATE = "the board runs the full gate itself"
+TARGETED_TESTS = "only the tests covering the files you changed"
+NO_RUNNING_COMMAND = "Never end your reply while a command you started is still running"
+FINAL_IS_RESULT = "your final message is the result the board reads"
+
+
+def test_the_build_brief_scopes_test_runs_and_forbids_leaving_a_command_running():
+    """Attempt 1's brief: no full suite (the board's gate runs it), targeted tests only,
+    and the reply may not end while a command is still running."""
+    prompt = BoardLoop({})._build_prompt(
+        {"title": "Bump the version", "spec": "Three lines.", "acceptance_criteria": "- bumped"}
+    )
+
+    for anchor in (FULL_GATE, TARGETED_TESTS, NO_RUNNING_COMMAND, FINAL_IS_RESULT):
+        assert anchor in prompt
+    assert "Do NOT run the repo's full test suite" in prompt
+
+
+def test_the_fix_round_brief_carries_both_instructions_itself():
+    """The rejected-attempt block is where a coder decides how to PROVE its fix — the
+    instructions sit inside that block, not only in the standing section below it."""
+    loop = BoardLoop({})
+    loop._ci_feedback["bd-bkvgk-fix"] = "CI failed: test_version_bump"
+    prompt = loop._build_prompt({"id": "bd-bkvgk-fix", "title": "Bump the version", "spec": "Three lines."})
+
+    fix_brief = prompt.split("## ⚠ Your previous attempt was REJECTED", 1)[1].split("## Task", 1)[0]
+    assert "CI failed: test_version_bump" in fix_brief
+    for anchor in (FULL_GATE, TARGETED_TESTS, NO_RUNNING_COMMAND, FINAL_IS_RESULT):
+        assert anchor in fix_brief
+
+
+def test_the_ledger_only_followup_carries_both_instructions_too():
+    """The re-prompt that asks for the ledger ALONE: on bd-bkvgk it re-ran the suite the
+    card named and repeated the identical miss, so it forbids commands outright."""
+    listing = "- r1: say the thing"
+    followup = _ledger_only_followup(listing)
+
+    for anchor in (FULL_GATE, NO_RUNNING_COMMAND, FINAL_IS_RESULT):
+        assert anchor in followup
+    assert "full test suite" in followup
+    # The pre-existing shape is intact: ledger + re-emitted summary, items listed last.
+    assert "do NOT edit" in followup and "## Requirements" in followup
+    assert "## Summary" in followup and "NO_TEST_NEEDED" in followup
+    assert followup.rstrip().endswith(listing)

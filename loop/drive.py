@@ -250,6 +250,34 @@ def _held_sentence(held: dict) -> str:
     return "; ".join(parts)
 
 
+def _ledger_only_followup(listing: str) -> str:
+    """The #382 ledger-only re-prompt: the implementation stays on disk and the coder is
+    asked for the disposition ledger ALONE. Module-level so tests pin its text directly.
+
+    It must carry the bd-bkvgk command rules itself: on that card the follow-up round
+    re-ran the full suite the card's text asked for, the harness backgrounded it at the
+    foreground limit, the coder ended its turn "waiting", and the board read the waiting
+    note as the final result — the identical miss the follow-up was dispatched to fix."""
+    return (
+        "Your implementation is COMPLETE and staying as it is — do NOT edit "
+        "code, tests, or docs this round. The ONLY thing missing is the "
+        "disposition ledger, which your last reply left out entirely.\n\n"
+        "Reply with TWO sections and nothing else:\n\n"
+        "1. `## Requirements` — ONE line per item below, each exactly "
+        "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
+        "item needs a line; silence is not a disposition. Mark an item "
+        "`done` if the work already in the worktree satisfies it.\n"
+        "2. `## Summary` — RE-EMIT your previous summary of this work, "
+        "including any `NO_TEST_NEEDED: <reason>` line it carried, "
+        "verbatim. The PR body is built from this section and the pre-PR "
+        "gates re-read it, so dropping it loses work you already did.\n\n"
+        "Run NO commands this round — in particular, do NOT run the repo's full test "
+        "suite (or any tests): the board runs the full gate itself. Never end your "
+        "reply while a command you started is still running: your final message is "
+        "the result the board reads.\n\n" + listing
+    )
+
+
 # ── on-demand queue dispatch diagnostic (board_dispatch, #390) ────────────────────
 async def request_dispatch() -> dict:
     """Ask the RUNNING board loop to evaluate its ready queue immediately and return its
@@ -2678,20 +2706,7 @@ class DriveMixin:
                             if m < _LEDGER_ONLY_MAX:
                                 await self._budget_set(store, fid, "ledger-only", m + 1)
                                 self._ci_prior_diff.pop(fid, None)  # impl is on disk; don't echo it back
-                                self._ci_feedback[fid] = (
-                                    "Your implementation is COMPLETE and staying as it is — do NOT edit "
-                                    "code, tests, or docs this round. The ONLY thing missing is the "
-                                    "disposition ledger, which your last reply left out entirely.\n\n"
-                                    "Reply with TWO sections and nothing else:\n\n"
-                                    "1. `## Requirements` — ONE line per item below, each exactly "
-                                    "`- <id>: done` or `- <id>: declined — <concrete reason>`. Every "
-                                    "item needs a line; silence is not a disposition. Mark an item "
-                                    "`done` if the work already in the worktree satisfies it.\n"
-                                    "2. `## Summary` — RE-EMIT your previous summary of this work, "
-                                    "including any `NO_TEST_NEEDED: <reason>` line it carried, "
-                                    "verbatim. The PR body is built from this section and the pre-PR "
-                                    "gates re-read it, so dropping it loses work you already did.\n\n" + listing
-                                )
+                                self._ci_feedback[fid] = _ledger_only_followup(listing)
                                 try:
                                     await asyncio.to_thread(
                                         store.comment,

@@ -315,6 +315,26 @@ class PromptMixin:
             "you need and why. A filesystem-wide search burns the card's clock and makes "
             "the OS prompt your operator for access to other apps' data.\n"
         )
+        # Standing test-scope block (bd-bkvgk): a card told its coder to run the full
+        # suite; the suite outruns the foreground command limit, so the harness moved it
+        # to the background ITSELF, the coder ended its turn "waiting", and the board
+        # read that waiting note as the final result — no `## Requirements` section,
+        # ledger-only follow-up, same again, terminal. The board's own gate runs the
+        # full suite after the coder finishes, so the coder never needs to.
+        # UNCONDITIONAL, like the scope block above, so no dispatch path can lose it.
+        test_scope_block = (
+            "\n## Run only targeted tests — and never leave a command running\n"
+            "Do NOT run the repo's full test suite (or a full lint/format sweep): the "
+            "board runs the full gate itself after you finish. Run only the tests "
+            "covering the files you changed — they finish well inside one foreground "
+            "command. If the card asks for a full-suite run, run the targeted tests "
+            "instead and say so in your `## Summary`.\n"
+            "Never end your reply while a command you started is still running, "
+            "foreground or background: your final message is the result the board "
+            "reads, and a reply that ends 'waiting on tests' becomes your whole "
+            "answer. Wait for every command to finish — or kill it — before you write "
+            "your final message.\n"
+        )
         # CI-feedback re-dispatch (closed-loop verify): a prior attempt's PR failed
         # CI; lead with the failure so the coder FIXES it this pass (it can't run the
         # checks itself — edit-only). Also widen scope: the fix may touch tests/files
@@ -341,6 +361,12 @@ class PromptMixin:
             "Address the problem above. This may require editing files beyond the list "
             "below — e.g. ADD the missing tests, or update an e2e/unit test that assumed "
             "the old behavior.\n"
+            # bd-bkvgk, restated INSIDE the fix-round brief: a coder anchored on the
+            # rejection is the one most tempted to re-run the whole gate to prove the fix.
+            "Verify the fix with only the tests covering the files you changed — NOT "
+            "the repo's full test suite: the board runs the full gate itself after you "
+            "finish. Never end your reply while a command you started is still running: "
+            "your final message is the result the board reads.\n"
             if ci
             else ""
         )
@@ -390,6 +416,7 @@ class PromptMixin:
             f"{preserve_scope_block}"
             f"{self_check_block}"
             f"{search_scope_block}"
+            f"{test_scope_block}"
             f"## Acceptance criteria (definition of done)\n{feature.get('acceptance_criteria', '')}\n"
             f"{req_block}\n"
             f"## Rules\n"
