@@ -1407,6 +1407,17 @@ class ReconcileMixin:
                         await self._budget_reset(store, fid)
                         log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                     elif state == "OPEN":
+                        # A terminal QA-panel verdict (PASS/WARN/FAIL) at this PR's current head,
+                        # on a project where the AGENT does the merge/adjudication (``auto_merge``
+                        # off), wakes the agent to act on it (#5218 / protoAgent#5218): three PRs
+                        # reached a panel PASS with green checks and a clean merge state and nothing
+                        # woke the agent — the cards sat in_review until an operator sent an inbox
+                        # nudge by hand, and a dependent card stayed blocked meanwhile. With
+                        # ``auto_merge`` ON the board merges the PR (or bounces a FAIL) itself, so it
+                        # never pages. Runs BEFORE the #473 FAIL edge so a FAIL pages too; purely
+                        # additive — it changes no edge below.
+                        if not self.auto_merge:
+                            await self._page_agent_panel_verdict(store, f, pr_url, repo, view=view)
                         # FIRST (#473): has the repo's own QA panel FAILED this PR at its current
                         # head? Then the PR cannot merge as it stands, whatever the board's own gate
                         # said. Bounce it into a fix round (or hold it for a human), and skip every
@@ -3061,6 +3072,96 @@ class ReconcileMixin:
         except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
             log.warning("[project_board] %s external-review hold comment failed", fid, exc_info=True)
         self._notify_operator(fid, f"Board card {fid} is held: {why}", incident=f"external-review|{head}", store=store)
+
+    async def _page_agent_panel_verdict(
+        self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
+    ) -> bool:
+        """Wake the agent on a TERMINAL QA-panel verdict at the PR's current head, when the
+        merge/adjudication is the agent's job on this project — i.e. ``auto_merge`` is off, so the
+        board neither merges nor adjudicates here (the caller gates on that). Without this a card
+        sat ``in_review`` after a panel PASS with green checks and a clean merge state until an
+        operator sent an inbox nudge by hand, and a dependent card stayed blocked meanwhile (#5218
+        / protoAgent#5218).
+
+        The pass's ``view`` is judged by ``external_review.evaluate``; a terminal verdict
+        (PASS/WARN/FAIL — not an incomplete pass, nor an absent one) queues ONE agent-owned inbox
+        page naming the card, PR and verdict (``_queue_agent_page``), deduped per card+head both
+        in-process (once per head per process) and durably (the inbox's dedup key + window). The
+        page is agent-owned: it is NOT routed through the operator block-page machinery (a distinct
+        ``panel-verdict:`` dedup key, never ``blocked:``), so it fires the agent's Activity turn and
+        never shows in the operator's Needs-you.
+
+        Fails OPEN: no ``external_review`` config, an unreadable panel, or a non-terminal verdict
+        queues nothing and returns False. Returns whether a page was queued (or already present)."""
+        cfg = self._external_review_cfg_for(feature)
+        if cfg is None:
+            return False
+        if view is None:  # not handed the pass's read (a direct call): read it, as the #473 edge does
+            view = await worktree.pr_review_state(pr_url, cwd=repo)
+        verdict = external_review.evaluate(view, cfg) if view else None
+        if verdict is None:
+            return False
+        said = verdict.terminal_verdict
+        if not said:
+            return False
+        fid = feature["id"]
+        head = verdict.head
+        # Once per (card, head) per process — the file's own hold-memory idiom (see
+        # ``_note_external_hold``). The durable inbox dedup key backs it across a restart; this
+        # keeps a 30-second poll from re-queueing while the earlier page is still being delivered.
+        paged = getattr(self, "_verdict_paged", None)
+        if paged is None:
+            paged = self._verdict_paged = {}
+        if paged.get(fid) == head:
+            return False
+        if await asyncio.to_thread(self._queue_agent_page, feature, pr_url, head, said):
+            paged[fid] = head
+            return True
+        return False
+
+    def _queue_agent_page(self, feature: dict, pr_url: str, head: str, verdict: str) -> bool:
+        """Put ONE agent-owned page in the inbox for a terminal panel verdict at a card's PR head
+        (#5218). Priority ``now`` so the host fires an Activity turn and the agent acts; the
+        ``panel-verdict:<fid>:<head>`` dedup key — never the operator's ``blocked:`` prefix — keeps
+        ``block_pages`` from treating it as an operator alert (so it stays out of the operator's
+        Needs-you) and dedups it per card+head across restarts within the alert window.
+
+        Returns True when the page exists after the call — freshly queued OR already there (so the
+        caller's once-per-head guard is set); False only when no inbox is reachable, so an
+        unreachable inbox is retried next poll. Feature-detected on the inbox exactly like
+        ``_notify_operator``; a host without one gets the loud log line instead."""
+        fid = feature["id"]
+        short = head[: store_mod.SHORT_SHA_LEN]
+        title = " ".join(str(feature.get("title") or "").split())[:80]
+        named = f" ({title})" if title else ""
+        text = (
+            f"QA panel {verdict} on {fid}{named} at head {short}: {pr_url}. The merge/adjudication "
+            f"is yours on this project — act on it (merge, request changes, or close)."
+        )
+        key = f"panel-verdict:{fid}:{short}"
+        try:
+            from inbox import InboxStore  # host module — absent on older hosts
+
+            db = _loop._inbox_db_path()
+            if db is None:
+                raise RuntimeError("no resolvable inbox store for this instance")
+            inbox = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S)
+            row = inbox.add(text, priority="now", source="project_board", dedup_key=key)
+            if row is None:
+                log.debug("[project_board] %s panel %s at %s already paged — not re-paging", fid, verdict, short)
+            else:
+                log.info("[project_board] %s panel %s at %s — agent paged to act: %s", fid, verdict, short, pr_url)
+            return True
+        except Exception:  # noqa: BLE001 — no inbox seam, or it refused; say so loudly anyway
+            log.warning(
+                "[project_board] %s panel %s at %s but NO agent inbox reachable to page: %s",
+                fid,
+                verdict,
+                short,
+                pr_url,
+                exc_info=True,
+            )
+            return False
 
     async def _reconcile_external_review(
         self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
