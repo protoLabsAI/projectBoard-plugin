@@ -65,6 +65,12 @@ _FAILED_CHECK = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED"})
 _FAILED_STATUS = frozenset({"FAILURE", "ERROR"})
 # The marker verdicts that reject a head — protoAgent's `review_at_head.BLOCKING_VERDICTS`.
 BLOCKING_VERDICTS = frozenset({"FAIL", "BLOCK", "REJECT"})
+# The marker verdicts that are TERMINAL: the panel reached a conclusion at this head — a clear
+# PASS, a non-blocking WARN, or a blocking FAIL/BLOCK/REJECT. Distinct from an incomplete pass (a
+# NEUTRAL check / a `complete=false` review) or no verdict at all, neither of which is terminal.
+# A project where the AGENT does the merge/adjudication is woken on a terminal verdict (#5218,
+# `loop/reconcile.py`); an incomplete or absent verdict never pages.
+TERMINAL_VERDICTS = frozenset({"PASS", "WARN"}) | BLOCKING_VERDICTS
 # The panel's check-run conclusion for an incomplete pass at an OPEN PR's head (pr-reviewer
 # `checks.py`, HOLD_INCOMPLETE → "Incomplete pass — not blocking"). GitHub reads it as passing.
 _INCOMPLETE_CHECK = "NEUTRAL"
@@ -208,6 +214,40 @@ class Verdict:
     def has_findings_review(self) -> bool:
         """A FAIL review at this head exists — something a fix round can act on."""
         return self.review_verdict in BLOCKING_VERDICTS and bool(self.body)
+
+    @property
+    def terminal_verdict(self) -> str:
+        """The panel's TERMINAL verdict at this head — ``PASS`` / ``WARN`` / ``FAIL`` (or FAIL's
+        ``BLOCK`` / ``REJECT`` synonyms) — or ``""`` when the panel has reached none: no marked
+        verdict at this head, only an incomplete pass, or a non-blocking marked verdict the panel
+        nonetheless FAILED at this head. On a project where the agent does the merge/adjudication,
+        a terminal verdict wakes the agent to act (#5218); an incomplete, absent or failed-but-
+        -unnamed verdict never does. A FAIL known only from a red check with no marked review is
+        not named here (``review_verdict`` is ``""``), so it reads as no terminal verdict.
+
+        An INCOMPLETE pass is not terminal, honouring the module's 'incomplete is not terminal'
+        contract (see :attr:`incomplete` / :func:`_judge_coverage`): a PASS/WARN whose coverage
+        this same read marked incomplete — a NEUTRAL ``QA panel`` check, or a marked review
+        carrying ``complete=false`` — reads as ``""`` here, so the agent is never woken to merge
+        a head the panel left half-reviewed.
+
+        A head the panel FAILED (``failed``) is likewise not named as a non-blocking terminal
+        verdict: a red ``QA panel`` check NEWER than a PASS/WARN marked review (so ``evaluate``
+        did not let the review clear it) leaves ``review_verdict`` PASS/WARN but ``failed`` True —
+        the panel rejected this head, and ``_reconcile_external_review`` (#473) holds or bounces
+        any failed head. Returning PASS/WARN here would page the agent to MERGE a head that same
+        pass then holds/bounces (round-3 review), so a failed head reads as ``""`` unless its
+        verdict is itself a blocking FAIL/BLOCK/REJECT, which is terminal in its own right. A
+        blocking marked review always sets ``failed`` and is never incomplete (``_judge_coverage``
+        leaves ``incomplete`` False on a failing head), so it is named before the ``failed`` guard
+        below."""
+        if self.review_verdict in BLOCKING_VERDICTS:
+            return self.review_verdict  # a FAIL/BLOCK/REJECT is terminal and never incomplete
+        if self.failed:
+            return ""  # the panel failed this head (e.g. a red check newer than a PASS) — #473 owns it
+        if self.review_verdict in TERMINAL_VERDICTS and not self.incomplete:
+            return self.review_verdict  # a COMPLETE PASS/WARN the panel did not fail
+        return ""
 
 
 def _author(r: dict) -> str:
