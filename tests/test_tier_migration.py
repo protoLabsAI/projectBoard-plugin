@@ -80,7 +80,7 @@ async def test_save_migrates_raw_yaml_through_host_merge_and_round_trips(monkeyp
         (["tier:standard", "tier:opus"], "small", "advanced", None),
         (["tier:nonsense"], "", "standard", "reasoning"),
         ([], "architectural", "advanced", None),
-        (["tier:nonsense"], "medium", "reasoning", "advanced"),
+        (["tier:nonsense"], "medium", "standard", "reasoning"),
     ],
 )
 def test_labels_preserve_rung_priority_without_rewriting(monkeypatch, labels, difficulty, current, next_tier):
@@ -97,7 +97,7 @@ def test_ladder_and_new_attempt_labels(monkeypatch):
     assert store.TIER_LADDER == ["standard", "reasoning", "advanced"]
     assert store.DIFFICULTY_TIER == {
         "small": "standard",
-        "medium": "reasoning",
+        "medium": "standard",
         "large": "reasoning",
         "architectural": "advanced",
     }

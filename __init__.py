@@ -55,6 +55,7 @@ def _board_store_kwargs(cfg: dict) -> dict:
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),
         max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+        difficulty_tiers=cfg.get("difficulty_tiers"),
         projects=resolve_projects(cfg),
         default_project=default_project(cfg),
     )
@@ -255,6 +256,7 @@ def register(registry) -> None:
             repo=cfg.get("repo", "."),
             base_branch=cfg.get("base_branch", "main"),
             max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+            difficulty_tiers=cfg.get("difficulty_tiers"),
             projects=_resolve_projects(cfg),
             default_project=_resolve_default_project(cfg),
         )

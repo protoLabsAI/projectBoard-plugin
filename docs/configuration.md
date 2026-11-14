@@ -739,10 +739,27 @@ limit or on a provider that can't serve its model:
 
 ```yaml
 coders:
-  standard: [codex, sonnet]   # small/unset difficulty starts here
-  reasoning: opus            # medium/large start here
+  standard: [codex, sonnet]   # small/medium/unset difficulty starts here
+  reasoning: opus            # large starts here
   advanced: opus             # architectural starts here
 ```
+
+The difficulty → starting-rung map is `{small: standard, medium: standard, large: reasoning,
+architectural: advanced}` — Sonnet handles small and medium, Opus the larger cards whose
+reasoning earns it. Override it per board with `difficulty_tiers` (YAML only; an override may
+name only the keys it changes, a missing key keeps the default, and an unknown difficulty or
+tier is rejected at load):
+
+```yaml
+difficulty_tiers:
+  small: standard
+  medium: standard
+  large: reasoning
+  architectural: advanced
+```
+
+This changes only the STARTING rung; escalation is unchanged, so a medium card Sonnet can't
+land still climbs standard → reasoning → advanced and reaches Opus.
 
 **The order inside a rung is not a preference.** `[codex, sonnet]` and `[sonnet, codex]`
 behave the same: each card opens on the sibling a per-process counter points at, and the
@@ -797,7 +814,9 @@ A raw error that is not a board error keeps the old "no diff" verdict. Only a fa
 at least one candidate ran and came back with nothing is guaranteed to be a capability failure
 that climbs. A climb after a timeout is a fresh build, so the stronger rung fans out again.
 
-A card's STARTING rung comes from its difficulty, so a `medium` card never touches rung 1.
+A card's STARTING rung comes from its difficulty (`difficulty_tiers`): `small`/`medium` open
+on `standard`, `large` on `reasoning`, `architectural` on `advanced`. A `large` card therefore
+never touches rung 1, while a `medium` one starts there and only climbs if it fails.
 
 Rotation needs escalation on, and escalation needs at least two DISTINCT rungs — a map with
 a single rung (`coders: {standard: [codex, sonnet]}`) runs as a one-coder board using `coder`.
