@@ -389,13 +389,9 @@ async def test_find_marked_comment_absent_marker_returns_empty(gh_fixture):
 async def test_marked_comment_creation_time_distinguishes_absent_from_unreadable(gh_fixture):
     """An absent summon permits posting; an unreadable PR must hold recovery."""
     marker = "<!-- project-board:requires_gh-absent-probe -->"
-    assert await worktree.marked_pr_comment_created_at(
-        gh_fixture.url, marker, cwd=gh_fixture.repo_dir
-    ) == ""
+    assert await worktree.marked_pr_comment_created_at(gh_fixture.url, marker, cwd=gh_fixture.repo_dir) == ""
     missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
-    assert await worktree.marked_pr_comment_created_at(
-        missing, marker, cwd=gh_fixture.repo_dir
-    ) is None
+    assert await worktree.marked_pr_comment_created_at(missing, marker, cwd=gh_fixture.repo_dir) is None
 
 
 @requires_gh_write
@@ -434,12 +430,16 @@ async def test_post_or_update_pr_comment_is_idempotent_and_marked(gh_fixture):
     assert cid_again == cid, "a re-post created a duplicate comment instead of updating in place"
 
     # Updating the body must retain creation time: an edit is not a new summon.
-    assert await worktree.post_or_update_pr_comment(
-        gh_fixture.url, body + " Updated.", marker=TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
-    ) is True
-    assert await worktree.marked_pr_comment_created_at(
-        gh_fixture.url, TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
-    ) == created_at
+    assert (
+        await worktree.post_or_update_pr_comment(
+            gh_fixture.url, body + " Updated.", marker=TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
+        )
+        is True
+    )
+    assert (
+        await worktree.marked_pr_comment_created_at(gh_fixture.url, TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir)
+        == created_at
+    )
 
     # An unparseable url posts nothing.
     assert (
