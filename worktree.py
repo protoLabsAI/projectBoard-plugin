@@ -2604,6 +2604,14 @@ async def prepare_integration(path: str, branch: str, base: str) -> dict:
         fresh_merge = True
         await _board_commit(path, branch, previous, "Preserve retained edits before base integration")
         head_sha = await _git_required(path, "rev-parse", "HEAD")
+        if remote_head:
+            # Adopt an already integrated PR before merging its base separately.
+            # Fast-forward only: retained edits/commits must never be replaced.
+            base_rc, _, _ = await _git(path, "merge-base", "--is-ancestor", base_sha, remote_head)
+            head_rc, _, _ = await _git(path, "merge-base", "--is-ancestor", head_sha, remote_head)
+            if base_rc == 0 and head_rc == 0 and head_sha != remote_head:
+                await _git_required(path, "merge", "--ff-only", remote_head)
+                head_sha = remote_head
         integration_sha = base_sha
         rc, out, err = await _git(
             path, "-c", "merge.default=text", "merge", "--no-commit", "--no-ff", base_sha, timeout=120
@@ -2686,7 +2694,19 @@ async def finish_integration(path: str, branch: str, base: str) -> None:
         path, "merge-base", "--is-ancestor", context.get("integration_sha", context["base_sha"]), "HEAD"
     )
     if rc:
-        raise IntegrationRequired("Candidate does not integrate the pinned base")
+        # A rebased authoritative PR can supersede a journal's old merge target.
+        # Content equality is insufficient: both current remote ancestries must
+        # be proven before prepare_integration may replace that durable evidence.
+        await _git_required(path, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+        if not await _fetch_feature(path, branch):
+            raise IntegrationRequired("Candidate does not integrate the pinned base")
+        remote_head = await _git_required(path, "rev-parse", f"origin/{branch}")
+        base_sha = await _git_required(path, "rev-parse", f"origin/{base}")
+        await _guard_published_rewind(path, context, remote_head)
+        for ancestor, descendant in ((base_sha, remote_head), (remote_head, "HEAD")):
+            rc, _, _ = await _git(path, "merge-base", "--is-ancestor", ancestor, descendant)
+            if rc:
+                raise IntegrationRequired("Candidate does not integrate the pinned base")
     context = await prepare_integration(path, branch, base)
     if context["conflict_paths"]:
         raise IntegrationRequired("Base or PR head advanced during recovery; resolve the refreshed conflict paths")
@@ -2880,6 +2900,7 @@ async def open_pr(
     #    never land. The branch is the loop's own throwaway; lease-guarded force is
     #    safe (and a no-op on the first push when the branch is new).
     lease = "--force-with-lease"
+    unchanged_head = False
     if await recovery_context(worktree, branch):
         remote_head = ""
         if await _fetch_feature(worktree, branch):
@@ -2892,6 +2913,16 @@ async def open_pr(
                 )
         # Pin the checked head so another fetch cannot silently widen the lease.
         lease = f"--force-with-lease=refs/heads/{branch}:{remote_head}"
+        unchanged_head = remote_head == await _git_required(worktree, "rev-parse", "HEAD")
+    # Recheck an unchanged candidate, but retain the exact checked-head lease
+    # below: the server can advance after this read, too. An up-to-date push
+    # preserves the existing SHA without creating commits or updating the ref.
+    if unchanged_head:
+        rc, out, err = await _git(worktree, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}")
+        if rc or out.split() != [remote_head, f"refs/heads/{branch}"]:
+            raise IntegrationRequired(
+                "PR head changed or could not be verified before publication; refresh and rerun verification"
+            )
     rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
     if rc != 0:
         raise WorktreeError(f"git push failed: {err.strip()[:300]}")

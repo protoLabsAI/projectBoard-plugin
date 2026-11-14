@@ -2068,3 +2068,206 @@ async def test_restart_recovery_adoption_boundaries(history, monkeypatch, state)
         assert store.calls == []
         lookup.assert_not_awaited()
     assert (Path(path) / "a").read_text() == "feature coverage\nsibling a coverage\n"
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+async def test_external_rebase_refreshes_stale_pin_without_empty_commits(history, monkeypatch, dirty):
+    from unittest.mock import AsyncMock
+
+    repo = history
+    old = git(repo, "rev-parse", "HEAD")
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    # A prior recovery pinned the then-authoritative PR head as its merge target.
+    context["integration_sha"] = old
+    await worktree._record_recovery(str(repo), "feature", context)
+    git(repo, "checkout", "main")
+    (repo / "new-base").write_text("current main\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "advance main")
+    git(repo, "push", "origin", "main")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "feature")
+    git(repo, "rebase", "main")
+    git(repo, "push", "--force", "origin", "feature")
+    head = git(repo, "rev-parse", "HEAD")
+    if dirty:
+        (repo / "retained").write_text("unique local work\n")
+    real_git = worktree._git
+    pushes = []
+
+    async def spy(path, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+        return await real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree, "_git", spy)
+    monkeypatch.setattr(worktree, "_gh", AsyncMock(return_value=(0, "https://example/pr/953", "")))
+    await worktree.finish_integration(str(repo), "feature", "main")
+    refreshed = await worktree.recovery_context(str(repo), "feature")
+    assert refreshed["integration_sha"] == refreshed["base_sha"] == base
+    assert refreshed["remote_head_sha"] == head
+    assert git(repo, "rev-list", "--count", f"{head}..HEAD") == ("1" if dirty else "0")
+    await worktree.open_pr(str(repo), "feature", title="Recovered PR")
+    # Publication still performs a leased no-op when clean, without changing
+    # the remote SHA or generating another commit (and resetting head-based QA).
+    assert len(pushes) == 1
+    assert f"--force-with-lease=refs/heads/feature:{head}" in pushes[0]
+    assert git(repo, "rev-parse", "HEAD") == git(repo, "rev-parse", "origin/feature")
+    published = (await worktree.recovery_context(str(repo), "feature"))["published_head_sha"]
+    assert published == git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0]
+    if not dirty:
+        assert published == head
+    if dirty:
+        assert (repo / "retained").read_text() == "unique local work\n"
+
+
+async def test_equal_tree_still_requires_base_ancestry(history):
+    repo = history
+    git(repo, "checkout", "main")
+    git(repo, "commit", "--allow-empty", "-m", "required base ancestry")
+    git(repo, "push", "origin", "main")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "feature")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+    assert git(repo, "merge-base", "--is-ancestor", base, "HEAD") == ""
+    assert len(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+
+
+@pytest.mark.parametrize("failure", ["fetch", "deleted", "missing-base", "advanced-pr"])
+async def test_stale_pin_requires_authoritative_ancestry(history, failure):
+    repo = history
+    context = await worktree.prepare_integration(str(repo), "feature", "main")
+    # An unrelated old target must not be forgotten on the strength of equal trees.
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    context["integration_sha"] = git(repo, "commit-tree", tree, "-m", "obsolete recovery target")
+    await worktree._record_recovery(str(repo), "feature", context)
+    if failure == "fetch":
+        git(repo, "remote", "set-url", "origin", str(repo / "missing"))
+    elif failure == "deleted":
+        git(repo, "push", "origin", "--delete", "feature")
+    else:
+        target = "main" if failure == "missing-base" else "feature"
+        git(repo, "checkout", "--detach", f"origin/{target}")
+        git(repo, "commit", "--allow-empty", "-m", "remote ancestry advanced")
+        git(repo, "push", "origin", f"HEAD:{target}")
+        git(repo, "checkout", "feature")
+    (repo / "retained").write_text("sole local copy\n")
+    with pytest.raises(worktree.IntegrationRequired):
+        await worktree.finish_integration(str(repo), "feature", "main")
+    assert (await worktree.recovery_context(str(repo), "feature"))["integration_sha"] == context["integration_sha"]
+    assert git(repo, "show", "HEAD:retained") == "sole local copy"
+
+
+async def test_recovery_publication_lease_rejects_race_after_fetch(history, monkeypatch):
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    (repo / "retained").write_text("local repair\n")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    candidate = git(repo, "rev-parse", "HEAD")
+    remote = git(repo, "rev-parse", "origin/feature")
+    rival = git(repo, "commit-tree", git(repo, "rev-parse", f"{remote}^{{tree}}"), "-p", remote, "-m", "rival")
+    real_git = worktree._git
+
+    async def race(path, *args, **kwargs):
+        if args[0] == "push":
+            git(repo, "push", "origin", f"{rival}:feature")
+        return await real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree, "_git", race)
+    with pytest.raises(worktree.WorktreeError, match="git push failed"):
+        await worktree.open_pr(str(repo), "feature", title="recovery")
+    assert git(repo, "rev-parse", "HEAD") == candidate
+    assert git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0] == rival
+    assert (repo / "retained").read_text() == "local repair\n"
+
+
+@pytest.mark.parametrize("movement", ["advanced", "deleted", "unavailable"])
+@pytest.mark.parametrize("boundary", ["after-fetch", "after-read"])
+async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(history, monkeypatch, movement, boundary):
+    from unittest.mock import AsyncMock
+
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    candidate = git(repo, "rev-parse", "HEAD")
+    context = await worktree.recovery_context(str(repo), "feature")
+    context["goal_followup_pending"] = True
+    context["requirement_followup_pending"] = True
+    await worktree._record_recovery(str(repo), "feature", context)
+    remote_path = git(repo, "remote", "get-url", "origin")
+    rival = git(repo, "commit-tree", git(repo, "rev-parse", "HEAD^{tree}"), "-p", candidate, "-m", "rival")
+    real_fetch = worktree._fetch_feature
+    real_git = worktree._git
+    pushes = []
+    fetched = False
+
+    def move_remote():
+        # Change only the server: the tracking ref still says the candidate is
+        # current, just as with a concurrent external actor.
+        if movement == "advanced":
+            git(repo, "push", "origin", f"{rival}:refs/heads/rival")
+            git(remote_path, "update-ref", "refs/heads/feature", rival)
+        elif movement == "deleted":
+            git(remote_path, "update-ref", "-d", "refs/heads/feature")
+        else:
+            git(repo, "remote", "set-url", "origin", str(repo / "missing"))
+
+    async def race(path, branch):
+        nonlocal fetched
+        present = await real_fetch(path, branch)
+        fetched = True
+        if boundary == "after-fetch":
+            move_remote()
+        return present
+
+    async def spy(path, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+        result = await real_git(path, *args, **kwargs)
+        if boundary == "after-read" and fetched and args[0] == "ls-remote":
+            assert result[0] == 0
+            assert result[1].split() == [candidate, "refs/heads/feature"]
+            move_remote()
+        return result
+
+    gh = AsyncMock()
+    monkeypatch.setattr(worktree, "_fetch_feature", race)
+    monkeypatch.setattr(worktree, "_git", spy)
+    monkeypatch.setattr(worktree, "_gh", gh)
+    error = worktree.IntegrationRequired if boundary == "after-fetch" else worktree.WorktreeError
+    message = "PR head.*publication" if boundary == "after-fetch" else "git push failed"
+    with pytest.raises(error, match=message):
+        await worktree.open_pr(str(repo), "feature", title="recovery")
+    assert await worktree.recovery_context(str(repo), "feature") == context
+    assert git(repo, "rev-parse", "HEAD") == candidate
+    assert git(repo, "rev-parse", "origin/feature") == candidate
+    if boundary == "after-fetch":
+        assert pushes == []
+    else:
+        assert len(pushes) == 1
+        assert f"--force-with-lease=refs/heads/feature:{candidate}" in pushes[0]
+    gh.assert_not_awaited()
+    if movement == "advanced":
+        assert git(remote_path, "rev-parse", "refs/heads/feature") == rival
+
+
+async def test_prepare_adopts_already_integrated_pr_without_two_merges(history, monkeypatch):
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    local = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    git(repo, "commit", "--allow-empty", "-m", "new base ancestry")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "-b", "external", "feature")
+    git(repo, "merge", "--no-ff", "-m", "external integration", "main")
+    integrated = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", "HEAD:feature")
+    git(repo, "checkout", "feature")
+    assert git(repo, "rev-parse", "HEAD") == local
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    assert git(repo, "rev-parse", "HEAD") == integrated
+    assert not git(repo, "status", "--porcelain")
