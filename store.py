@@ -57,7 +57,7 @@ from urllib.request import urlopen
 from . import _TERMINAL_STATES, br_fetch, work_locations, work_snapshot
 from . import gates as publish_gates
 from . import merge_state_hold, release_freeze, review_coverage_hold
-from .projects import canonical_tier, normalize_coder_tiers
+from .projects import IMPLICIT_MARKER, canonical_tier, normalize_coder_tiers
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1732,14 +1732,54 @@ class BeadsBoard:
         # difficulty. Threaded from the `difficulty_tiers` config key (store_kw); an override
         # is merged onto the built-in DIFFICULTY_TIER and VALIDATED here, so a typo'd
         # difficulty or tier fails fast at load rather than silently mis-routing cards. A
-        # None/empty override keeps the default map.
+        # None/empty override keeps the default map. LIVE: reconfigure_difficulty_tiers
+        # replaces it in place on a config reload (bd-l8sqf) — the cache is keyed by beads
+        # workspace, not tier policy, so a reload must mutate the shared object, not rebuild.
         self.difficulty_tiers = resolve_difficulty_tiers(difficulty_tiers)
+        # Per-PROJECT difficulty→tier overrides (bd-l8sqf): a `projects.<name>.difficulty_tiers`
+        # entry wins over the board-level map for that project's cards. Pre-resolved + validated
+        # HERE (and on reconfigure_projects) so a per-project typo fails fast at load like the
+        # board-level key, not at dispatch. Only projects that DECLARE an override get an entry.
+        self._project_difficulty_tiers = self._resolve_project_difficulty_tiers(self.projects)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
         # Serialises hot-file creates through their chain's read-tail → add-edge (#458):
         # two racing creates must not both chain onto the same tail, or onto each other.
         # Reentrant: a hot-file create holds it from `br create` through the chain step,
         # which takes it again (see create_feature).
         self._chain_lock = threading.RLock()
+
+    def _resolve_project_difficulty_tiers(self, projects: dict | None) -> dict:
+        """Pre-resolve each project's own `difficulty_tiers` override into a full validated
+        map (bd-l8sqf). A per-project override is merged onto the built-in default exactly like
+        the board-level key, so a missing difficulty still falls back to the default and a typo
+        fails fast at load — not at the dispatch of that project's first card. Only projects that
+        DECLARE an override appear here; every other project reads the board-level map at
+        dispatch time (see ``_difficulty_tiers``)."""
+        resolved: dict[str, dict] = {}
+        for name, entry in (projects or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            # The implicit single project IS the board (synthesized from the flat top-level keys —
+            # see projects._synthesize_implicit_project), so its `difficulty_tiers` is a copy of the
+            # BOARD-LEVEL map, not a per-project override. Pinning it here would shadow the live
+            # board-level map and make a difficulty_tiers reload never reach default-project or
+            # unlabeled cards (which resolve through this project). Skip it — `_difficulty_tiers`
+            # then falls through to the live ``self.difficulty_tiers`` for those cards (bd-l8sqf).
+            if entry.get(IMPLICIT_MARKER):
+                continue
+            override = entry.get("difficulty_tiers")
+            # An absent OR empty-dict override inherits the live board-level map (bd-l8sqf): skip it
+            # so `_difficulty_tiers` falls through to ``self.difficulty_tiers`` for this project's
+            # cards and a board-level reload still reaches them. Pinning `{}` to the resolved default
+            # here would freeze the project against future reloads, contrary to the docs' "inherits
+            # the board-level map" wording. A non-dict (e.g. a list) is still validated below.
+            if override is None or override == {}:
+                continue
+            try:
+                resolved[name] = resolve_difficulty_tiers(override)
+            except BoardError as exc:
+                raise BoardError(f"project {name!r} difficulty_tiers: {exc}") from exc
+        return resolved
 
     def reconfigure_projects(self, projects: dict | None, default_project: str = "") -> None:
         """Replace the live multi-project routing map without rebuilding the board.
@@ -1748,11 +1788,33 @@ class BeadsBoard:
         config reload must update the shared object in place: loop, API, and tools all
         retain references to this instance. Existing in-flight drives have already
         resolved their repo/base; subsequent ready gates and dispatches use this map.
+        A per-project `difficulty_tiers` override rides the project entry, so re-resolve
+        the per-project tier map here too (bd-l8sqf) — the next dispatch's starting rung
+        honors a project's edited override without a restart.
         """
         resolved = dict(projects or {})
         default = str(default_project or "").strip() or (next(iter(resolved)) if len(resolved) == 1 else "")
+        # Resolve + VALIDATE the per-project tier overrides FIRST, before any shared attribute
+        # is mutated (bd-l8sqf): a malformed projects[].difficulty_tiers raises here, so the board
+        # keeps its last good routing map in full rather than half-applying a new `projects` over a
+        # stale tier map. api.store() and drive.reload both resolve `projects` inside a guarded
+        # region that falls back to the last good unit, so this raise is caught there too.
+        project_tiers = self._resolve_project_difficulty_tiers(resolved)
         self.projects = resolved
         self.default_project = default
+        self._project_difficulty_tiers = project_tiers
+
+    def reconfigure_difficulty_tiers(self, override: dict | None) -> None:
+        """Replace the live board-level difficulty→tier map without rebuilding the board.
+
+        Same rationale as reconfigure_projects: the board cache is keyed by its beads
+        workspace, not by tier policy, so a config reload must update the shared object in
+        place (bd-l8sqf). The override is merged onto the built-in DIFFICULTY_TIER and
+        VALIDATED exactly like construction, so a bad map raises here and the caller keeps
+        the current one; the next dispatch's ``current_tier``/``initial_tier`` read the new
+        map, so changing the mapping needs no plugin update and no restart. Per-project
+        overrides are unaffected — they ride the projects map (reconfigure_projects)."""
+        self.difficulty_tiers = resolve_difficulty_tiers(override)
 
     # ── workspace pin (ADR 0055 P0, #48; instance-default store D3, #260) ─────
     def _ensure_workspace(self) -> None:
@@ -4492,16 +4554,26 @@ class BeadsBoard:
     #    are configured. With a single coder these are simply never called, so a
     #    one-ACP-agent setup writes no tier/attempt labels (difficulty stays purely
     #    optional metadata). ───────────────────────────────────────────────────────
-    def _difficulty_tiers(self) -> dict:
-        """The instance's resolved difficulty→tier map, defaulting to the module default.
-        ``__init__`` always sets ``difficulty_tiers``; the ``getattr`` only matters for a
-        board built via ``object.__new__`` (a test idiom that skips ``__init__``), which
-        before this map lived on the instance read the module global directly."""
+    def _difficulty_tiers(self, feature: dict | None = None) -> dict:
+        """The resolved difficulty→tier map that applies to ``feature``.
+
+        A `projects.<name>.difficulty_tiers` override wins over the board-level map for that
+        project's cards (bd-l8sqf): when ``feature`` names a project that declared one, its
+        pre-resolved map is returned; otherwise the board-level ``difficulty_tiers`` applies.
+        Both are already merged onto the built-in DIFFICULTY_TIER, so the result always covers
+        every difficulty. ``__init__`` always sets both attributes; the ``getattr`` fallbacks
+        only matter for a board built via ``object.__new__`` (a test idiom that skips
+        ``__init__``), which before these maps lived on the instance read the module global."""
+        per_project = getattr(self, "_project_difficulty_tiers", None) or {}
+        if feature is not None and per_project:
+            name = str(feature.get("project") or "").strip() or getattr(self, "default_project", "")
+            if name in per_project:
+                return per_project[name]
         return getattr(self, "difficulty_tiers", None) or DIFFICULTY_TIER
 
     def initial_tier(self, fid: str) -> str:
         f = self._require(fid)
-        return self._difficulty_tiers().get(f.get("difficulty", ""), "standard")
+        return self._difficulty_tiers(f).get(f.get("difficulty", ""), "standard")
 
     def current_tier(self, fid: str) -> str:
         """The highest tier this feature has been tried at (from `tier:` labels),
@@ -4509,7 +4581,7 @@ class BeadsBoard:
         f = self._require(fid)
         present = [canonical_tier(l.split(":", 1)[1]) for l in f.get("labels") or [] if l.startswith("tier:")]
         idxs = [TIER_LADDER.index(t) for t in present if t in TIER_LADDER]
-        return TIER_LADDER[max(idxs)] if idxs else self._difficulty_tiers().get(f.get("difficulty", ""), "standard")
+        return TIER_LADDER[max(idxs)] if idxs else self._difficulty_tiers(f).get(f.get("difficulty", ""), "standard")
 
     def escalate(self, fid: str, reason: str) -> str | None:
         """Record the failed attempt at the current tier and advance to the next
@@ -6239,15 +6311,22 @@ def get_store(db: str | None = None, **kw) -> BeadsBoard:
     return board
 
 
+# Sentinel for reconfigure_cached_store: distinguishes "leave this knob alone" from an
+# explicit `None`/`{}` that CLEARS it — a difficulty_tiers reload must not wipe the live
+# project map (and vice versa), so an omitted knob is skipped rather than applied as None.
+_RECONFIG_UNSET = object()
+
+
 def reconfigure_cached_store(
     db: str | None = None,
     *,
     repo: str = ".",
     base_branch: str = "main",
-    projects: dict | None = None,
+    projects=_RECONFIG_UNSET,
     default_project: str = "",
+    difficulty_tiers=_RECONFIG_UNSET,
 ) -> bool:
-    """Apply project routing to an existing shared board, if one exists.
+    """Apply project routing and/or the difficulty→tier map to an existing shared board.
 
     Reload must not call :func:`get_store`: constructing a board can probe/fetch
     ``br`` while the host is synchronously applying Settings. The loop only needs
@@ -6255,9 +6334,16 @@ def reconfigure_cached_store(
     receives the new routing through its normal constructor kwargs. A blank ``db``
     resolves through the same instance default as :func:`get_store`, so a loop
     configured without db_path finds the board get_store built.
+
+    Each knob is applied only when the caller passes it (bd-l8sqf): a projects reload and a
+    `difficulty_tiers` reload fire independently, so a difficulty-tier change must not wipe
+    the live project map, nor the reverse. An omitted knob is left exactly as it is.
     """
     board = _BOARDS.get((db or default_db_path(), repo, base_branch))
     if board is None:
         return False
-    board.reconfigure_projects(projects, default_project)
+    if projects is not _RECONFIG_UNSET:
+        board.reconfigure_projects(projects, default_project)
+    if difficulty_tiers is not _RECONFIG_UNSET:
+        board.reconfigure_difficulty_tiers(difficulty_tiers)
     return True

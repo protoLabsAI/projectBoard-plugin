@@ -101,6 +101,7 @@ from ..store import (
     merge_posture,
     parse_requirement_dispositions,
     reconfigure_cached_store,
+    resolve_difficulty_tiers,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -2317,6 +2318,7 @@ __all__ = [
     "knob_bool",
     "merge_posture",
     "reconfigure_cached_store",
+    "resolve_difficulty_tiers",
     "log",
     "_MERGED_VERIFIED_SHA_LEN",
     "_MERGED_VERIFY_INFRA_MAX",

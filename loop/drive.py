@@ -494,6 +494,30 @@ class DriveMixin:
                     changed["projects"] = (tuple(old_projects), tuple(projects))
                     if old_default != default:
                         changed["default_project"] = (old_default, default)
+        # difficulty_tiers (bd-l8sqf): the difficulty→starting-tier map is LIVE like project
+        # routing — a save reconfigures the shared board in place so the NEXT dispatch's
+        # current_tier reads the new map, no restart and no plugin update. Validated like
+        # construction; a malformed map logs a warning and keeps the current one (a typo in
+        # Settings must not stall the loop mid-drive). A reload that omits the key leaves it
+        # alone. Per-project overrides ride the `projects:` map and are applied above.
+        if "difficulty_tiers" in section:
+            override = section.get("difficulty_tiers")
+            try:
+                resolve_difficulty_tiers(override)  # validate only; raises on a bad map
+            except BoardError as exc:
+                log.warning("[project_board] reload: difficulty_tiers is malformed — keeping current map: %s", exc)
+            else:
+                if override != self.cfg.get("difficulty_tiers"):
+                    old = self.cfg.get("difficulty_tiers")
+                    self.cfg["difficulty_tiers"] = override
+                    self._store_kw["difficulty_tiers"] = override
+                    _loop.reconfigure_cached_store(
+                        db=self._store_kw["db"],
+                        repo=self._store_kw["repo"],
+                        base_branch=self._store_kw["base_branch"],
+                        difficulty_tiers=override,
+                    )
+                    changed["difficulty_tiers"] = (old, override)
         for key in LIVE_KNOBS:
             if key not in section:
                 continue

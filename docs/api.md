@@ -122,10 +122,13 @@ the public `/plugins/project_board` router.
 
 GET returns `{settings: {key: {value, boot_value, label, type, minimum, maximum,
 options, restart}}, pending_restart}` with `Cache-Control: no-store`. The explicit
-allowlist covers all 30 currently declared manifest settings (including both
+allowlist covers all 35 currently declared manifest settings (including both
 secrets) and is retained as Configure pages take over those fields. Defaults come
 from the manifest. Secret `value` and `boot_value` contain only `{set: boolean}`.
-`restart` is false exactly for `loop/_common.py`'s `LIVE_KNOBS`.
+`restart` is false for the live settings: `loop/_common.py`'s `LIVE_KNOBS`, plus the
+four `difficulty_tier_*` pickers, which `settings_api` folds into the one nested
+`difficulty_tiers` config key and re-applies on config reload (its liveness check is
+`settings_api._is_live`).
 
 PUT accepts a flat object, for example `{"max_concurrent": 4, "review_fix_max": 3}`.
 The complete batch is validated before one `HOST.apply_settings` callable/save;

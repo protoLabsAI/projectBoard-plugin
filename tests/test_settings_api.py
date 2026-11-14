@@ -47,7 +47,8 @@ def test_allowlist_metadata_and_masking(host):
     for entry in manifest["settings"]:
         for field in ("label", "type", "minimum", "maximum", "options"):
             assert settings.SETTINGS[entry["key"]][field] == entry.get(field)
-    assert len(settings.SETTINGS) == 31  # 5 manifest settings + loop_enabled + the 25 page-owned.
+    # 9 manifest settings (5 + the 4 difficulty-tier pickers) + loop_enabled + the 25 page-owned.
+    assert len(settings.SETTINGS) == 35
     live["webhook_secret"] = "never-echo-this"
     settings.capture_boot_settings(live)
     live["npm_token"] = "nor-this"
@@ -55,7 +56,9 @@ def test_allowlist_metadata_and_masking(host):
     assert set(snapshot["settings"]) == set(settings.SETTINGS)
     for key, entry in snapshot["settings"].items():
         assert {"value", "boot_value", "type", "minimum", "maximum", "options", "restart"} <= entry.keys()
-        assert entry["restart"] == (key not in LIVE_KNOBS)
+        # The difficulty-tier pickers are live-via-reload (not scalar LIVE_KNOBS), so `restart`
+        # tracks `_is_live`, not raw LIVE_KNOBS membership (bd-l8sqf).
+        assert entry["restart"] == (not settings._is_live(key))
     assert snapshot["settings"]["webhook_secret"]["value"] == {"set": True}
     assert snapshot["settings"]["npm_token"]["boot_value"] == {"set": False}
     assert "never-echo-this" not in json.dumps(snapshot)

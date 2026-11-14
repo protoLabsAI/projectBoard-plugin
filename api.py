@@ -40,6 +40,7 @@ from .store import (
     get_store,
     knob_bool,
     open_requirements_note,
+    resolve_difficulty_tiers,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -521,6 +522,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         # constructed (and reconfigure an existing shared store). Boot-only
         # db/repo/base remain pinned in `store_kw` as promised by the manifest.
         current = dict(store_kw)
+        difficulty_tiers_live = False
         try:
             from .project_registry import _live_section
 
@@ -532,13 +534,26 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 candidate["default_project"] = live.get("default_project")
             current["projects"] = resolve_projects(candidate)
             current["default_project"] = resolve_default_project(candidate)
+            # difficulty_tiers is live too (bd-l8sqf): resolve it afresh so the /ci escalation
+            # path's board starts cards on the operator's current mapping after a reload, not
+            # the boot value. Validated here (like projects) so a malformed map retains the last
+            # good one. A per-project override rides the resolved `projects` above.
+            if "difficulty_tiers" in live:
+                resolve_difficulty_tiers(live.get("difficulty_tiers"))  # validate; raises on a bad map
+                current["difficulty_tiers"] = live.get("difficulty_tiers")
+                difficulty_tiers_live = True
         except Exception:  # noqa: BLE001 — retain the last validated routing unit
             pass
         board = get_store(**current)
         reconfigure = getattr(board, "reconfigure_projects", None)
         if callable(reconfigure):
             reconfigure(current["projects"], current["default_project"])
+        reconfigure_tiers = getattr(board, "reconfigure_difficulty_tiers", None)
+        if difficulty_tiers_live and callable(reconfigure_tiers):
+            reconfigure_tiers(current["difficulty_tiers"])
         store_kw.update(projects=current["projects"], default_project=current["default_project"])
+        if difficulty_tiers_live:
+            store_kw.update(difficulty_tiers=current["difficulty_tiers"])
         return board
 
     async def _guard(fn):

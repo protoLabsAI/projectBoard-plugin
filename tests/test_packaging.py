@@ -302,6 +302,7 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     scalar says restart. Structural and internal tuning are an explicit file-only
     allowlist, so adding a config default forces an expose/hide decision."""
     from project_board.loop import LIVE_BOOL_KNOBS, LIVE_KNOBS, LIVE_STR_KNOBS
+    from project_board.settings_api import _DIFFICULTY_TIER_PICKERS, _is_live
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     fields = {s["key"]: s for s in m["settings"]}
@@ -376,7 +377,15 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "reconcile_concurrency",
         "claim_stall_ticks",
     }
-    assert set(fields) | hidden == set(m["config"])
+    # The difficulty-tier pickers (bd-l8sqf) are SYNTHETIC: four `select` settings that edit the
+    # ONE nested `difficulty_tiers` config key (settings_api folds them in), so they carry no flat
+    # `project_board.<key>` default and are LIVE via settings_api._is_live, not scalar LIVE_KNOBS
+    # membership. Account for them apart from the flat scalar fields below.
+    tier_pickers = {key: fields.pop(key) for key in list(_DIFFICULTY_TIER_PICKERS) if key in fields}
+    assert set(tier_pickers) == set(_DIFFICULTY_TIER_PICKERS)  # the manifest exposes exactly the folded keys
+    # Their one backing config key is exposed through those pickers — neither a flat field nor hidden.
+    assert "difficulty_tiers" not in fields and "difficulty_tiers" not in hidden
+    assert set(fields) | hidden | {"difficulty_tiers"} == set(m["config"])
     assert set(fields).isdisjoint(hidden)
     # Every LIVE knob is turnable by a human — as a generic manifest field, or on the page that
     # now owns it (the four page-owned LIVE knobs live on the Coders tab, tested in test_coders_view).
@@ -388,6 +397,16 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     for key in set(LIVE_KNOBS) & set(fields):
         want = "bool" if key in LIVE_BOOL_KNOBS else ("string" if key in LIVE_STR_KNOBS else "number")
         assert fields[key]["type"] == want, key
+    # The synthetic pickers carry no restart badge (live via settings_api._is_live, not a static
+    # manifest flag), each has a label + one-line help text, and their choices are the configured
+    # tier names (the default map's values are a subset of each picker's ladder options).
+    tier_names = set(m["config"]["difficulty_tiers"].values())
+    for key, spec in tier_pickers.items():
+        assert not spec.get("restart", False), key  # live → no restart badge in the manifest
+        assert _is_live(key), key  # ...and settings_api folds it into the live map
+        assert spec["label"] and spec["description"], key
+        assert spec["type"] == "select", key
+        assert tier_names <= set(spec["options"]), key
 
 
 def test_manifest_declares_the_ordered_tabbed_config_contract():
