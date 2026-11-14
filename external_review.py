@@ -346,9 +346,7 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
     return verdict
 
 
-def _judge_coverage(
-    verdict: Verdict, latest_check: dict | None, review_complete: bool, review_pending: bool
-) -> None:
+def _judge_coverage(verdict: Verdict, latest_check: dict | None, review_complete: bool, review_pending: bool) -> None:
     """Set ``verdict.incomplete``: is the panel's newest word at this head an incomplete pass?
 
     * The newest App ``QA panel`` check run concluded ``neutral`` — unless a COMPLETE marked

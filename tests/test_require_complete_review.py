@@ -314,7 +314,9 @@ def test_the_hold_only_replaces_auto_merge_pending():
     assert row["next_action"] == "review in progress"
 
 
-@pytest.mark.parametrize("outcome", ["incomplete", "complete", "new-head", "pending-review", "running-check", "check-only"])
+@pytest.mark.parametrize(
+    "outcome", ["incomplete", "complete", "new-head", "pending-review", "running-check", "check-only"]
+)
 async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outcome):
     """Only a completed result AFTER the durable summon can exhaust recovery."""
     loop = _edge(
