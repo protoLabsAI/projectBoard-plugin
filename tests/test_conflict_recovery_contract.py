@@ -2108,8 +2108,15 @@ async def test_external_rebase_refreshes_stale_pin_without_empty_commits(history
     assert refreshed["remote_head_sha"] == head
     assert git(repo, "rev-list", "--count", f"{head}..HEAD") == ("1" if dirty else "0")
     await worktree.open_pr(str(repo), "feature", title="Recovered PR")
-    assert len(pushes) == int(dirty)
+    # Publication still performs a leased no-op when clean, without changing
+    # the remote SHA or generating another commit (and resetting head-based QA).
+    assert len(pushes) == 1
+    assert f"--force-with-lease=refs/heads/feature:{head}" in pushes[0]
     assert git(repo, "rev-parse", "HEAD") == git(repo, "rev-parse", "origin/feature")
+    published = (await worktree.recovery_context(str(repo), "feature"))["published_head_sha"]
+    assert published == git(repo, "ls-remote", "origin", "refs/heads/feature").split()[0]
+    if not dirty:
+        assert published == head
     if dirty:
         assert (repo / "retained").read_text() == "unique local work\n"
 
@@ -2178,7 +2185,8 @@ async def test_recovery_publication_lease_rejects_race_after_fetch(history, monk
 
 
 @pytest.mark.parametrize("movement", ["advanced", "deleted", "unavailable"])
-async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(history, monkeypatch, movement):
+@pytest.mark.parametrize("boundary", ["after-fetch", "after-read"])
+async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(history, monkeypatch, movement, boundary):
     from unittest.mock import AsyncMock
 
     repo = history
@@ -2194,11 +2202,11 @@ async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(histor
     real_fetch = worktree._fetch_feature
     real_git = worktree._git
     pushes = []
+    fetched = False
 
-    async def race(path, branch):
-        present = await real_fetch(path, branch)
-        # Advance only the server after the fetch: the tracking ref still says
-        # the candidate is current, just as with a concurrent external actor.
+    def move_remote():
+        # Change only the server: the tracking ref still says the candidate is
+        # current, just as with a concurrent external actor.
         if movement == "advanced":
             git(repo, "push", "origin", f"{rival}:refs/heads/rival")
             git(remote_path, "update-ref", "refs/heads/feature", rival)
@@ -2206,23 +2214,41 @@ async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(histor
             git(remote_path, "update-ref", "-d", "refs/heads/feature")
         else:
             git(repo, "remote", "set-url", "origin", str(repo / "missing"))
+
+    async def race(path, branch):
+        nonlocal fetched
+        present = await real_fetch(path, branch)
+        fetched = True
+        if boundary == "after-fetch":
+            move_remote()
         return present
 
     async def spy(path, *args, **kwargs):
         if args[0] == "push":
             pushes.append(args)
-        return await real_git(path, *args, **kwargs)
+        result = await real_git(path, *args, **kwargs)
+        if boundary == "after-read" and fetched and args[0] == "ls-remote":
+            assert result[0] == 0
+            assert result[1].split() == [candidate, "refs/heads/feature"]
+            move_remote()
+        return result
 
     gh = AsyncMock()
     monkeypatch.setattr(worktree, "_fetch_feature", race)
     monkeypatch.setattr(worktree, "_git", spy)
     monkeypatch.setattr(worktree, "_gh", gh)
-    with pytest.raises(worktree.IntegrationRequired, match="PR head.*publication"):
+    error = worktree.IntegrationRequired if boundary == "after-fetch" else worktree.WorktreeError
+    message = "PR head.*publication" if boundary == "after-fetch" else "git push failed"
+    with pytest.raises(error, match=message):
         await worktree.open_pr(str(repo), "feature", title="recovery")
     assert await worktree.recovery_context(str(repo), "feature") == context
     assert git(repo, "rev-parse", "HEAD") == candidate
     assert git(repo, "rev-parse", "origin/feature") == candidate
-    assert pushes == []
+    if boundary == "after-fetch":
+        assert pushes == []
+    else:
+        assert len(pushes) == 1
+        assert f"--force-with-lease=refs/heads/feature:{candidate}" in pushes[0]
     gh.assert_not_awaited()
     if movement == "advanced":
         assert git(remote_path, "rev-parse", "refs/heads/feature") == rival

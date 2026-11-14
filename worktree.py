@@ -2914,19 +2914,18 @@ async def open_pr(
         # Pin the checked head so another fetch cannot silently widen the lease.
         lease = f"--force-with-lease=refs/heads/{branch}:{remote_head}"
         unchanged_head = remote_head == await _git_required(worktree, "rev-parse", "HEAD")
-    # An unchanged candidate needs no push, but the fetched ref can already be
-    # stale. Recheck the server at the publication boundary before recording
-    # success; changed candidates use the exact checked-head lease instead.
+    # Recheck an unchanged candidate, but retain the exact checked-head lease
+    # below: the server can advance after this read, too. An up-to-date push
+    # preserves the existing SHA without creating commits or updating the ref.
     if unchanged_head:
         rc, out, err = await _git(worktree, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}")
         if rc or out.split() != [remote_head, f"refs/heads/{branch}"]:
             raise IntegrationRequired(
                 "PR head changed or could not be verified before publication; refresh and rerun verification"
             )
-    else:
-        rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
-        if rc != 0:
-            raise WorktreeError(f"git push failed: {err.strip()[:300]}")
+    rc, _o, err = await _git(worktree, "push", "-u", lease, "origin", branch, timeout=180)
+    if rc != 0:
+        raise WorktreeError(f"git push failed: {err.strip()[:300]}")
     context = await recovery_context(worktree, branch)
     if context:
         context["goal_followup_pending"] = False
