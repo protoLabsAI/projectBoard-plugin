@@ -57,7 +57,7 @@ from urllib.request import urlopen
 from . import _TERMINAL_STATES, br_fetch, work_locations, work_snapshot
 from . import gates as publish_gates
 from . import merge_state_hold, release_freeze, review_coverage_hold
-from .projects import canonical_tier, normalize_coder_tiers
+from .projects import IMPLICIT_MARKER, canonical_tier, normalize_coder_tiers
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -1757,7 +1757,17 @@ class BeadsBoard:
         dispatch time (see ``_difficulty_tiers``)."""
         resolved: dict[str, dict] = {}
         for name, entry in (projects or {}).items():
-            override = entry.get("difficulty_tiers") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict):
+                continue
+            # The implicit single project IS the board (synthesized from the flat top-level keys —
+            # see projects._synthesize_implicit_project), so its `difficulty_tiers` is a copy of the
+            # BOARD-LEVEL map, not a per-project override. Pinning it here would shadow the live
+            # board-level map and make a difficulty_tiers reload never reach default-project or
+            # unlabeled cards (which resolve through this project). Skip it — `_difficulty_tiers`
+            # then falls through to the live ``self.difficulty_tiers`` for those cards (bd-l8sqf).
+            if entry.get(IMPLICIT_MARKER):
+                continue
+            override = entry.get("difficulty_tiers")
             if override is None:
                 continue
             try:
@@ -1779,9 +1789,15 @@ class BeadsBoard:
         """
         resolved = dict(projects or {})
         default = str(default_project or "").strip() or (next(iter(resolved)) if len(resolved) == 1 else "")
+        # Resolve + VALIDATE the per-project tier overrides FIRST, before any shared attribute
+        # is mutated (bd-l8sqf): a malformed projects[].difficulty_tiers raises here, so the board
+        # keeps its last good routing map in full rather than half-applying a new `projects` over a
+        # stale tier map. api.store() and drive.reload both resolve `projects` inside a guarded
+        # region that falls back to the last good unit, so this raise is caught there too.
+        project_tiers = self._resolve_project_difficulty_tiers(resolved)
         self.projects = resolved
         self.default_project = default
-        self._project_difficulty_tiers = self._resolve_project_difficulty_tiers(resolved)
+        self._project_difficulty_tiers = project_tiers
 
     def reconfigure_difficulty_tiers(self, override: dict | None) -> None:
         """Replace the live board-level difficulty→tier map without rebuilding the board.

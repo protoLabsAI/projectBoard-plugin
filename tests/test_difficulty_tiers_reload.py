@@ -122,6 +122,75 @@ def test_difficulty_tiers_reconfigure_leaves_the_project_map_intact(monkeypatch)
     assert board.default_project == "web"
 
 
+def test_board_level_reload_reaches_default_project_cards_when_cfg_carried_the_key(monkeypatch):
+    """Regression (bd-l8sqf): when the boot cfg carries a flat `difficulty_tiers`, resolve_projects
+    lifts that map onto the synthesized IMPLICIT default project. It must NOT be pinned as a
+    per-project override, or it would shadow the LIVE board-level map and a reload would never reach
+    the default project's cards — nor unlabeled cards, which resolve through that project."""
+    from project_board.projects import resolve_projects
+
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    cfg = {"repo": "/repo", "difficulty_tiers": {"medium": "standard"}}
+    b = store.BeadsBoard(
+        db=None,
+        repo="/repo",
+        difficulty_tiers=cfg["difficulty_tiers"],
+        projects=resolve_projects(cfg),  # the implicit "default" entry carries difficulty_tiers
+        default_project="default",
+    )
+    monkeypatch.setattr(b, "_run", lambda *a, **k: None)
+    assert b._project_difficulty_tiers == {}  # the implicit project is not a per-project pin
+
+    for require in (
+        lambda fid: _feature(fid, difficulty="medium"),  # unlabeled → default project
+        lambda fid: _feature(fid, difficulty="medium", project="default"),  # the default project
+    ):
+        monkeypatch.setattr(b, "_require", require)
+        assert b.initial_tier("x") == "standard"
+
+    b.reconfigure_difficulty_tiers({"medium": "reasoning"})  # a live board-level reload
+
+    for require in (
+        lambda fid: _feature(fid, difficulty="medium"),
+        lambda fid: _feature(fid, difficulty="medium", project="default"),
+    ):
+        monkeypatch.setattr(b, "_require", require)
+        assert b.initial_tier("x") == "reasoning"  # the reload reaches default/unlabeled cards
+
+
+async def test_api_store_resolves_difficulty_tiers_live_on_the_cached_board(monkeypatch):
+    """The data-router store() path resolves `difficulty_tiers` live like project routing (bd-l8sqf):
+    a store touch after a reload reconfigures the shared cached board in place, so the /ci escalation
+    path starts the next card on the operator's current mapping, not the boot value."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from project_board import api, project_registry
+
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    monkeypatch.setattr(store, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    monkeypatch.setattr(store, "_BOARDS", {})
+
+    cfg = {"repo": "/instance"}  # boot cfg carries no difficulty_tiers → the default map
+    board = store.BeadsBoard(repo="/instance", difficulty_tiers=cfg.get("difficulty_tiers"))
+    key = ("/inst/project_board/.beads/beads.db", "/instance", "main")
+    monkeypatch.setitem(store._BOARDS, key, board)
+    monkeypatch.setattr(board, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(board, "get_feature", lambda fid: _feature(fid, difficulty="medium"))
+    monkeypatch.setattr(api, "annotate_next_action", lambda feats, _cfg: feats)
+    # what the operator saved since boot: medium now starts on reasoning.
+    monkeypatch.setattr(project_registry, "_live_section", lambda **kw: {"difficulty_tiers": {"medium": "reasoning"}})
+    assert board.difficulty_tiers["medium"] == "standard"
+
+    app = FastAPI()
+    app.include_router(api.build_data_router(cfg), prefix="/api/plugins/project_board")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/api/plugins/project_board/features/bd-1")
+
+    assert resp.status_code == 200, resp.text
+    assert board.difficulty_tiers["medium"] == "reasoning"  # the cached board picked up the live map
+
+
 # ── r2: per-project override wins, and is live ───────────────────────────────────
 
 
@@ -205,11 +274,54 @@ def test_projects_resolution_carries_difficulty_tiers():
     assert resolved["web"]["difficulty_tiers"] == {"medium": "advanced"}
 
 
+def test_resolve_projects_rejects_a_bad_per_project_override():
+    """Regression (bd-l8sqf): resolve_projects validates a project's difficulty_tiers at config
+    RESOLUTION, so the guarded reload/boot regions (api.store(), drive.reload) that resolve the
+    routing unit inside a try catch a malformed map and keep the last good one — rather than passing
+    it through to board construction/reconfigure, where it would raise out of a live board route."""
+    from project_board.projects import resolve_projects
+
+    with pytest.raises(ValueError, match="project 'web' difficulty_tiers"):
+        resolve_projects({"projects": {"web": {"repo": "/web", "difficulty_tiers": {"huge": "x"}}}})
+    # a VALID override still resolves — the validation is not over-eager.
+    ok = resolve_projects({"projects": {"web": {"repo": "/web", "difficulty_tiers": {"medium": "advanced"}}}})
+    assert ok["web"]["difficulty_tiers"] == {"medium": "advanced"}
+
+
+def test_reconfigure_projects_keeps_the_last_good_map_on_a_bad_per_project_override(monkeypatch):
+    """Regression (bd-l8sqf): reconfigure_projects validates the per-project tier overrides BEFORE
+    mutating any shared attribute, so a malformed projects[].difficulty_tiers leaves the live board
+    whole — projects, default_project AND the per-project map — not a new `projects` half-applied
+    over a stale tier map. Every board route keeps answering on the last good routing unit."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    b = store.BeadsBoard(
+        db=None,
+        repo="/repo",
+        projects={"web": {"repo": "/web", "difficulty_tiers": {"medium": "advanced"}}},
+        default_project="web",
+    )
+    assert b._project_difficulty_tiers["web"]["medium"] == "advanced"
+
+    with pytest.raises(store.BoardError, match="project 'web' difficulty_tiers"):
+        b.reconfigure_projects({"web": {"repo": "/web2", "difficulty_tiers": {"huge": "x"}}}, "web")
+
+    # nothing applied: the board still routes with the OLD map, not a half-updated one.
+    assert b.projects == {"web": {"repo": "/web", "difficulty_tiers": {"medium": "advanced"}}}
+    assert b.default_project == "web"
+    assert b._project_difficulty_tiers["web"]["medium"] == "advanced"
+    monkeypatch.setattr(b, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(b, "_require", lambda fid: _feature(fid, difficulty="medium", project="web"))
+    assert b.initial_tier("x") == "advanced"  # still the last good override
+
+
 # ── r3: manifest schema + the Settings pickers ───────────────────────────────────
 
 
 def test_manifest_config_schema_declares_the_default_map():
     assert _manifest()["config"]["difficulty_tiers"] == DEFAULT_MAP
+    # The manifest default (the Settings picker's fallback) and the store's DIFFICULTY_TIER
+    # constant (its own fallback) must not drift apart — pin them to the same map.
+    assert store.DIFFICULTY_TIER == DEFAULT_MAP
 
 
 def test_manifest_exposes_one_picker_per_difficulty():

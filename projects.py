@@ -180,6 +180,18 @@ def _resolve_project_entry(name: str, settings) -> dict:
             f"project {name!r} has no `repo` — every project entry must declare the repo it "
             "builds in (the board creates worktrees, branches and PRs there); add `repo:`."
         )
+    # Validate a per-project difficulty_tiers override HERE, at config RESOLUTION (bd-l8sqf), so a
+    # malformed map fails inside the guarded reload/boot regions that resolve_projects runs in
+    # (api.store(), drive.reload) — which then keep the last good routing unit — rather than only
+    # surfacing later at board construction/reconfigure, where it would raise out of a live board
+    # route. Mirrors the board-level key's load-time validation; a bad map names the project.
+    if "difficulty_tiers" in entry:
+        from .store import BoardError, resolve_difficulty_tiers
+
+        try:
+            resolve_difficulty_tiers(entry["difficulty_tiers"])
+        except BoardError as exc:
+            raise ValueError(f"project {name!r} difficulty_tiers: {exc}") from exc
     entry = _expand_paths(entry)
     entry["name"] = name
     return entry
