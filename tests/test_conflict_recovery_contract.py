@@ -2177,6 +2177,57 @@ async def test_recovery_publication_lease_rejects_race_after_fetch(history, monk
     assert (repo / "retained").read_text() == "local repair\n"
 
 
+@pytest.mark.parametrize("movement", ["advanced", "deleted", "unavailable"])
+async def test_unchanged_recovery_publication_rechecks_remote_after_fetch(history, monkeypatch, movement):
+    from unittest.mock import AsyncMock
+
+    repo = history
+    await worktree.prepare_integration(str(repo), "feature", "main")
+    await worktree.finish_integration(str(repo), "feature", "main")
+    candidate = git(repo, "rev-parse", "HEAD")
+    context = await worktree.recovery_context(str(repo), "feature")
+    context["goal_followup_pending"] = True
+    context["requirement_followup_pending"] = True
+    await worktree._record_recovery(str(repo), "feature", context)
+    remote_path = git(repo, "remote", "get-url", "origin")
+    rival = git(repo, "commit-tree", git(repo, "rev-parse", "HEAD^{tree}"), "-p", candidate, "-m", "rival")
+    real_fetch = worktree._fetch_feature
+    real_git = worktree._git
+    pushes = []
+
+    async def race(path, branch):
+        present = await real_fetch(path, branch)
+        # Advance only the server after the fetch: the tracking ref still says
+        # the candidate is current, just as with a concurrent external actor.
+        if movement == "advanced":
+            git(repo, "push", "origin", f"{rival}:refs/heads/rival")
+            git(remote_path, "update-ref", "refs/heads/feature", rival)
+        elif movement == "deleted":
+            git(remote_path, "update-ref", "-d", "refs/heads/feature")
+        else:
+            git(repo, "remote", "set-url", "origin", str(repo / "missing"))
+        return present
+
+    async def spy(path, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+        return await real_git(path, *args, **kwargs)
+
+    gh = AsyncMock()
+    monkeypatch.setattr(worktree, "_fetch_feature", race)
+    monkeypatch.setattr(worktree, "_git", spy)
+    monkeypatch.setattr(worktree, "_gh", gh)
+    with pytest.raises(worktree.IntegrationRequired, match="PR head.*publication"):
+        await worktree.open_pr(str(repo), "feature", title="recovery")
+    assert await worktree.recovery_context(str(repo), "feature") == context
+    assert git(repo, "rev-parse", "HEAD") == candidate
+    assert git(repo, "rev-parse", "origin/feature") == candidate
+    assert pushes == []
+    gh.assert_not_awaited()
+    if movement == "advanced":
+        assert git(remote_path, "rev-parse", "refs/heads/feature") == rival
+
+
 async def test_prepare_adopts_already_integrated_pr_without_two_merges(history, monkeypatch):
     repo = history
     await worktree.prepare_integration(str(repo), "feature", "main")
