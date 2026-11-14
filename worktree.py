@@ -2918,9 +2918,7 @@ async def open_pr(
     # stale. Recheck the server at the publication boundary before recording
     # success; changed candidates use the exact checked-head lease instead.
     if unchanged_head:
-        rc, out, err = await _git(
-            worktree, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}"
-        )
+        rc, out, err = await _git(worktree, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}")
         if rc or out.split() != [remote_head, f"refs/heads/{branch}"]:
             raise IntegrationRequired(
                 "PR head changed or could not be verified before publication; refresh and rerun verification"
