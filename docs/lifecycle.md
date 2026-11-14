@@ -927,3 +927,29 @@ per repo type and a worked example.
 - [`docs/tools.md`](tools.md) — `board_block_feature`, `board_unblock_feature`,
   `board_requeue_feature`, `board_reset_merged_verify_budget`.
 - [`docs/adr/0326-merged-verify-exhaustion-auto-merge-hold.md`](adr/0326-merged-verify-exhaustion-auto-merge-hold.md).
+
+### Execution tasks blocked by claim ownership (#760)
+
+An execution task assigned to `agent`, `self`, or the board's own coder name can
+run through a Codex-only route while keeping its stored owner. The claim uses
+that owner; the resolved coder is only the execution destination. An unassigned
+execution task acquires the selected coder as owner. Concurrent reassignment
+still prevents dispatch.
+
+For cards terminal-blocked by the old `agent` → `codex` claim mismatch, recover
+only after the fixed plugin is available and the specific card has been inspected:
+
+1. Read the card, comments, work locations and budgets, and verify that no live
+   worker owns unfinished execution. Preserve any scratch work and deliverables;
+   an `in_progress` card with live work must not be requeued.
+2. Confirm the block is the ownership-related ready-queue livelock, the card is
+   still open with `ready`, and the existing owner and Codex-only route are correct.
+3. Use `board_unblock_feature(feature_id)` to clear that terminal block. For this
+   terminal class, clearing the block retains stored ownership, unfinished work,
+   and persisted retry budgets. Do not use reset/requeue, clear the assignee,
+   raise skip limits, or enable Claude. A card in a different state or with a
+   different block needs its own diagnosis before any recovery action.
+4. Check that the next dispatch reaches Codex once and the card becomes
+   `in_progress`. If ownership rejection persists, inspect the logged owner,
+   claim actor, destination and br error before another retry. The bounded skip
+   guard remains active; unblocking is not a grant of extra execution retries.

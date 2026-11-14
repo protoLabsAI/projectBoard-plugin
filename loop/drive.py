@@ -1163,8 +1163,8 @@ class DriveMixin:
                     spawned = True
                 elif outcome == "parked":
                     parked.append(cid)
-                else:  # "race" — lost the atomic claim, still ready for the next tick
-                    skipped.append({"fid": cid, "reason": "claim-race"})
+                else:  # Preserve ownership diagnostics; all repeated skips remain bounded.
+                    skipped.append({"fid": cid, "reason": "claim-race" if outcome == "race" else outcome})
                 continue
             # #197: key by (project, path) — bare paths false-collide across projects
             # (every repo has PROTO.md); an unstamped card ("" project) behaves as before.
@@ -1654,6 +1654,7 @@ class DriveMixin:
           ``in_progress`` and left there to await async delivery (API/chat). No drive,
           no slot held.
         - ``"race"`` — the atomic claim was lost (someone else took it); still ready.
+        - ``"claim-ownership-rejected"`` — unchanged ownership was rejected by br; inspect the claim diagnostic.
 
         A task assigned to THIS board's OWN agent (its coder name, or the reserved
         ``self``/``agent`` aliases) is NOT a sister-agent dispatch — it is first-party
@@ -1667,8 +1668,8 @@ class DriveMixin:
         cannot do), so it stays self whatever the copied text names (``is_decompose_task``).
 
         The assignee is read from the CANDIDATE (the pre-claim projection) and passed
-        back to ``claim`` so the claim preserves it — a task's assignee is its dispatch
-        target, not the coder identity a coding claim stamps."""
+        as the expected claim owner, separately from the resolved execution destination.
+        Routing must not turn an alias into a different owner for the guarded claim."""
         cid = candidate["id"]
         assignee = str(candidate.get("assignee") or "").strip()
         self_or_none = (not assignee) or self._is_self_assignee(assignee)
@@ -1690,7 +1691,14 @@ class DriveMixin:
         # #356: claim_task, NOT claim — a task's assignee is its DISPATCH TARGET, so the
         # transition to in_progress must PRESERVE it (`br --claim` would reassign to the
         # actor and refuse the already-assigned bead, the livelock this fixes).
-        claimed = await asyncio.to_thread(store.claim_task, cid, assignee=assignee)
+        try:
+            claim_options = (
+                {"expected_assignee": str(candidate.get("assignee") or "").strip()} if route_to_coder else {}
+            )
+            claimed = await asyncio.to_thread(store.claim_task, cid, assignee=assignee, **claim_options)
+        except store_mod.TaskClaimOwnershipError as exc:
+            log.warning("[project_board] %s", exc)
+            return "claim-ownership-rejected"
         if claimed is None:
             return "race"
         if delegate is None:

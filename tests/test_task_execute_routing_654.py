@@ -112,7 +112,7 @@ async def test_execution_goes_to_first_rung(monkeypatch, assignee, caplog):
         result = await loop._dispatch_task(store, {"id": "exec-654", "assignee": assignee, "spec": "uv run eval.py"})
     await drain(loop)
     assert result == "acp"
-    store.claim_task.assert_called_once_with("exec-654", assignee="small")
+    store.claim_task.assert_called_once_with("exec-654", assignee="small", expected_assignee=assignee.strip())
     assert drive.await_args.args[1].name == "small"
     own.assert_not_awaited()
     assert "execution task exec-654 → small (not self)" in caplog.text
@@ -166,7 +166,7 @@ async def test_project_exclusive_and_policy(monkeypatch):
     monkeypatch.setattr(loop, "_policy_usage", lambda *args: {"sister": {"headroom_pct": 10}})
     assert await loop._dispatch_task(store, {"id": "project-654", "project": "other", "labels": ["execute"]}) == "acp"
     await drain(loop)
-    store.claim_task.assert_called_once_with("project-654", assignee="sister")
+    store.claim_task.assert_called_once_with("project-654", assignee="sister", expected_assignee="")
     assert drive.await_args.args[1].name == "sister"
     own.assert_not_awaited()
 
@@ -193,7 +193,7 @@ async def test_no_eligible_coder_parks_and_never_invokes_self(monkeypatch, caplo
             await loop._dispatch_task(store, {"id": "missing-654", "assignee": "self", "labels": ["execute"]})
             == "parked"
         )
-    store.claim_task.assert_called_once_with("missing-654", assignee="self")
+    store.claim_task.assert_called_once_with("missing-654", assignee="self", expected_assignee="self")
     drive.assert_not_awaited()
     own.assert_not_awaited()
     assert "no coder resolves" in caplog.text
@@ -274,3 +274,124 @@ async def test_drive_prompt_uses_the_allocated_workdir(monkeypatch):
     await loop._drive_task(feature, delegate)
     assert "(/scratch/actual —" in dispatch.await_args.args[1]
     assert dispatch.await_args.kwargs["cwd"] == "/scratch/actual"
+
+
+@pytest.fixture
+def execution_board(tmp_path):
+    import shutil
+
+    from project_board import store as store_mod
+
+    if not shutil.which(store_mod.BR):
+        pytest.skip("real br required for claim ownership regression")
+    return store_mod.BeadsBoard(repo=str(tmp_path), actor="test")
+
+
+def ready_execution(board, assignee):
+    task = board.create_feature(
+        "Execution claim identity",
+        spec="Run pytest -q",
+        acceptance_criteria="Report the result",
+        issue_type="task",
+        assignee=assignee,
+        execute=True,
+    )
+    return board.mark_ready(task["id"])
+
+
+def codex_routing(monkeypatch):
+    return setup_routing(
+        monkeypatch,
+        {"coder": "lead", "coders": {"standard": "codex", "advanced": "lead"}, "routing": {"exclusive": ["codex"]}},
+        live=("codex",),
+    )
+
+
+@pytest.mark.parametrize("owner", ["agent", "self", "lead", "LEAD", ""])
+async def test_real_execution_claim_preserves_owner_and_dispatches_once(monkeypatch, execution_board, owner):
+    loop, _, drive, own = codex_routing(monkeypatch)
+    card = ready_execution(execution_board, owner)
+    assert await loop._dispatch_task(execution_board, card) == "acp"
+    await drain(loop)
+    assert await loop._dispatch_task(execution_board, card) == "race"
+    drive.assert_awaited_once()
+    assert drive.await_args.args[1].name == "codex"
+    stored = execution_board.get_feature(card["id"])
+    assert stored["assignee"] == (owner or "codex")
+    assert stored["board_state"] == "in_progress"
+    own.assert_not_awaited()
+
+
+@pytest.mark.parametrize("owner", ["agent", ""])
+@pytest.mark.parametrize("timing", ["before_read", "at_claim"])
+async def test_real_execution_claim_rejects_concurrent_reassignment(monkeypatch, execution_board, owner, timing):
+    loop, _, drive, _ = codex_routing(monkeypatch)
+    card = ready_execution(execution_board, owner)
+    run = execution_board._run
+    if timing == "before_read":
+        run("update", card["id"], "--assignee", "operator")
+    else:
+
+        def race(*args, **kwargs):
+            if "--claim" in args:
+                run("update", card["id"], "--assignee", "operator")
+            return run(*args, **kwargs)
+
+        monkeypatch.setattr(execution_board, "_run", race)
+    assert await loop._dispatch_task(execution_board, card) == "race"
+    drive.assert_not_awaited()
+    stored = execution_board.get_feature(card["id"])
+    assert stored["assignee"] == "operator"
+    assert stored["board_state"] == "ready"
+
+
+async def test_unchanged_owner_rejection_has_diagnostic(monkeypatch, execution_board, caplog):
+    from project_board.store import BoardError
+
+    loop, _, drive, _ = codex_routing(monkeypatch)
+    card = ready_execution(execution_board, "agent")
+    run = execution_board._run
+
+    def reject(*args, **kwargs):
+        if "--claim" in args:
+            raise BoardError(f"claim: issue {card['id']} already assigned to agent")
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(execution_board, "_run", reject)
+    assert await loop._dispatch_task(execution_board, card) == "claim-ownership-rejected"
+    assert "owner='agent', claim actor='agent', destination='codex'" in caplog.text
+    assert "Inspect the stored owner and routing" in caplog.text
+    assert drive_mod._is_livelock_skip_reason("claim-ownership-rejected")
+    drive.assert_not_awaited()
+
+
+@pytest.mark.parametrize("state", [None, "in_progress"])
+def test_execution_claim_missing_or_claimed_card_does_not_write(monkeypatch, state):
+    from project_board.store import BeadsBoard
+
+    board = BeadsBoard(repo="/unused", actor="test")
+    card = None if state is None else {"board_state": state, "assignee": "agent"}
+    monkeypatch.setattr(board, "get_feature", Mock(return_value=card))
+    run = Mock()
+    monkeypatch.setattr(board, "_run", run)
+    assert board.claim_task("exec-760", assignee="codex", expected_assignee="agent") is None
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("edge", ["read", "claim", "diagnostic_read"])
+def test_execution_claim_timeout_is_not_a_race(monkeypatch, edge):
+    from project_board.store import BeadsBoard, BoardError, BoardTimeout
+
+    board = BeadsBoard(repo="/unused", actor="test")
+    card = {"board_state": "ready", "assignee": "agent"}
+    read = Mock(return_value=card)
+    run = Mock(side_effect=BoardTimeout("store unavailable"))
+    if edge == "read":
+        read.side_effect = BoardTimeout("store unavailable")
+    elif edge == "diagnostic_read":
+        run.side_effect = BoardError("already assigned to agent")
+        read.side_effect = [card, BoardTimeout("store unavailable")]
+    monkeypatch.setattr(board, "get_feature", read)
+    monkeypatch.setattr(board, "_run", run)
+    with pytest.raises(BoardTimeout):
+        board.claim_task("exec-760", assignee="codex", expected_assignee="agent")

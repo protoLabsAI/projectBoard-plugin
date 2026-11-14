@@ -1134,6 +1134,10 @@ class BoardError(Exception):
     """A rejected op (bad gate, unknown feature, `br` failure). Caller → 4xx / tool error."""
 
 
+class TaskClaimOwnershipError(BoardError):
+    """The task owner stayed unchanged but br rejected its ownership claim."""
+
+
 class BoardNotFound(BoardError):
     """`br` resolved the command but the id does not exist (ISSUE_NOT_FOUND, exit 3).
 
@@ -3523,60 +3527,48 @@ class BeadsBoard:
             self._run("update", fid, "--assignee", assignee)
         return self.get_feature(fid)
 
-    def claim_task(self, fid: str, assignee: str = "") -> dict | None:
-        """Transition a ready TASK bead → `in_progress` while PRESERVING its existing
-        assignee/dispatch target (#356) — the task sibling of ``claim``.
+    def claim_task(self, fid: str, assignee: str = "", *, expected_assignee: str | None = None) -> dict | None:
+        """Conditionally claim a ready task, preserving stored ownership.
 
-        A task's ``assignee`` is its DISPATCH TARGET (a sister agent, or the
-        ``self``/``agent`` aliases / the board's own name for first-party work —
-        #333/#334), NOT the claim marker the board actor stamps. The generic ``claim``
-        above runs ``br update --claim`` AS THE BOARD ACTOR, which reassigns the bead to
-        the actor AND refuses a bead already carrying a foreign assignee — so every ready
-        task assigned to any target OTHER than the actor was rejected and retried forever
-        as a lost claim race (the #356 livelock).
+        Legacy callers supply their candidate's owner as ``assignee``. Execution
+        routing supplies the resolved destination there and the candidate's stored
+        owner in ``expected_assignee`` (including empty for unassigned tasks).
+        Check that snapshot before claiming AS its owner; only an unassigned task
+        acquires the resolved destination as owner. Never adopt a newly read owner:
+        it may represent a concurrent reassignment away from this dispatch.
 
-        This claims AS THE DISPATCH TARGET (``--actor target``) instead: the SAME atomic,
-        write-locked ``br --claim`` compare-and-swap the coding claim relies on, but the
-        owner it stamps IS the dispatch target — so the target survives the transition
-        exactly (r1), and neither of ``--claim``'s two board-actor failure modes fires (it
-        assigns to the target, and a bead already assigned to the target is claimable BY
-        that target). The caller's target-resolution path (ACP / A2A / self / park) then
-        drives it unchanged. This is why the transition still goes through ``--claim`` and
-        not a bare ``--status`` write: the write must be a conditional CAS, not an
-        unconditional stomp (the previous cut's bug).
-
-        Atomic / state-race safe like ``claim`` (r3): re-reads the bead and only
-        transitions FROM ``ready`` (returns None if it already left the ready lane —
-        claimed, moved, or gone), and the ``--claim`` itself REFUSES (BoardError → None →
-        retry) if a concurrent actor reassigned the bead to a DIFFERENT owner between the
-        re-read and the claim, so a stale or hijacked ready card is never stomped. (beads
-        has no status-level CAS, and a bead pre-assigned to a shared target cannot be
-        claimed to a per-loop-unique owner — two loop instances both claiming AS the same
-        target is the irreducible residual the #356 ready-queue skip bound is the backstop
-        for, exactly as a shared board actor is for the coding ``claim``.)
-
-        The dispatch target is the caller's resolved ``assignee``, else whatever the bead
-        already carries, else the store actor — so a truly-unassigned task falls back to a
-        clean board-actor ``--claim`` (the SAME owned in_progress the old park produced for
-        it), while a named target is preserved."""
+        The write remains br's atomic ``--claim``, protecting against reassignment
+        after the read too. As with the shared actor feature claim, br's ownership
+        check cannot distinguish simultaneous claims by the same owner (#356).
+        """
         f = self.get_feature(fid)
         if f is None or f["board_state"] != "ready":
             return None
-        target = str(assignee or "").strip() or str(f.get("assignee") or "").strip() or self.actor
+        owner = str(f.get("assignee") or "").strip()
+        if expected_assignee is not None and owner != expected_assignee.strip():
+            log.info("[project_board] %s task owner changed before claim; leaving it for a fresh routing pass", fid)
+            return None
+        target = str(assignee or "").strip() or owner or self.actor
+        if expected_assignee is not None:
+            target = owner or target
         try:
-            # Atomic `--claim` (write-locked CAS) AS the dispatch target — stamps the target
-            # as owner + status=in_progress and drops the `ready` label so it projects
-            # in_progress. `actor=target` keeps the dispatch target instead of the board
-            # actor AND lets the claim pass (a target claiming its own bead is not refused).
             self._run("update", fid, "--claim", "--remove-label", LABEL_READY, actor=target)
         except BoardTimeout:
             raise  # a stall, not a lost race — see `claim` (#404)
         except BoardError as exc:
-            # The bead was reassigned to a DIFFERENT owner (operator triage / requeue) or
-            # otherwise moved under us, so `--claim` refused it: not claimable → retry. This
-            # is the conditional guard the coding claim gets for free — the transition never
-            # stomps a card a concurrent actor has taken.
-            log.info("[project_board] %s task not claimable (raced or reassigned under us): %s", fid, exc)
+            if expected_assignee is not None and "already assigned" in str(exc).lower():
+                current = self.get_feature(fid)
+                if (
+                    current
+                    and current["board_state"] == "ready"
+                    and str(current.get("assignee") or "").strip() == owner
+                ):
+                    raise TaskClaimOwnershipError(
+                        f"Task {fid} cannot start: ownership claim rejected (owner={owner!r}, "
+                        f"claim actor={target!r}, destination={assignee!r}). "
+                        f"Inspect the stored owner and routing before retrying; preserve existing work. br: {exc}"
+                    ) from exc
+            log.info("[project_board] %s task claim rejected; inspect current ownership before retrying: %s", fid, exc)
             return None
         return self.get_feature(fid)
 
