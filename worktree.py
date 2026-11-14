@@ -3924,6 +3924,32 @@ async def _find_marked_comment(repo_slug: str, number: str, marker: str, *, cwd:
     return "", ""
 
 
+async def marked_pr_comment_created_at(pr_url: str, marker: str, *, cwd: str = ".") -> str | None:
+    """Durable summon time: empty means absent, None means unreadable/unknown.
+
+    Unlike the best-effort posting lookup, an outage must never authorize another
+    summon or count as evidence that recovery ran. Read all pages for old summons.
+    """
+    repo_slug, number = _parse_pr(pr_url)
+    if not repo_slug or not number:
+        return None
+    try:
+        rc, out, _err = await _gh_read(
+            _gh("api", "--paginate", f"/repos/{repo_slug}/issues/{number}/comments", cwd=cwd)
+        )
+        if rc != 0:
+            return None
+        comments = json.loads(out)
+        if not isinstance(comments, list):
+            return None
+        for comment in comments:
+            if isinstance(comment, dict) and marker in str(comment.get("body") or ""):
+                return str(comment.get("created_at") or "") or None
+        return ""
+    except (WorktreeError, ValueError):
+        return None
+
+
 async def post_or_update_pr_comment(
     pr_url: str, body: str, *, marker: str = REVIEW_COMMENT_MARKER, cwd: str = "."
 ) -> bool:

@@ -209,6 +209,10 @@ class Verdict:
     # merge on it.
     incomplete: bool = False
     incomplete_signals: list[str] = field(default_factory=list)
+    # Completed incomplete evidence: review submission or completed check START.
+    # A late completion of the original check is not proof of a new review.
+    incomplete_result_at: str = ""
+    coverage_running: bool = False  # informational; unrelated runs cannot veto completed evidence
 
     @property
     def has_findings_review(self) -> bool:
@@ -285,6 +289,7 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
     # Chronological. `gh` returns them in submission order; sort anyway (stable), so a
     # reordered payload can't promote an older verdict over a newer one.
     reviews.sort(key=lambda r: str(r.get("submittedAt") or ""))
+    review_pending = False
     review_complete = True  # the latest marked review at this head did not say complete=false
     for r in reviews:
         if str(r.get("state") or "").upper() == "DISMISSED" or not cfg.is_reviewer(_author(r)):
@@ -292,6 +297,9 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
         attrs = parse_marker(str(r.get("body") or ""), cfg.marker)
         if not attrs or not head_matches(attrs.get("head", ""), head):
             continue
+        review_pending = str(r.get("state") or "").upper() == "PENDING"
+        if review_pending:
+            verdict.coverage_running = True
         verdict.review_verdict = str(attrs.get("verdict") or "").strip().upper()
         review_complete = str(attrs.get("complete") or "").strip().lower() != "false"
         verdict.review_at = str(r.get("submittedAt") or "")
@@ -313,6 +321,8 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
                 # A GitHub Actions job of that name (it names its workflow), or an entry we
                 # cannot tell apart from one (an older `gh` omits the key): not the App's check.
                 continue
+            if str(c.get("status") or "").upper() in ("QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"):
+                verdict.coverage_running = True
             state, at, label = str(c.get("conclusion") or "").upper(), str(c.get("completedAt") or ""), "check run"
             name = c.get("name")
             if latest_check is None or at >= str(latest_check.get("completedAt") or ""):
@@ -332,11 +342,11 @@ def evaluate(view: dict, cfg: Config) -> Verdict | None:
             continue
         verdict.signals.append(f"{label} `{name}` {state}")
     verdict.failed = bool(verdict.signals)
-    _judge_coverage(verdict, latest_check, review_complete)
+    _judge_coverage(verdict, latest_check, review_complete, review_pending)
     return verdict
 
 
-def _judge_coverage(verdict: Verdict, latest_check: dict | None, review_complete: bool) -> None:
+def _judge_coverage(verdict: Verdict, latest_check: dict | None, review_complete: bool, review_pending: bool) -> None:
     """Set ``verdict.incomplete``: is the panel's newest word at this head an incomplete pass?
 
     * The newest App ``QA panel`` check run concluded ``neutral`` — unless a COMPLETE marked
@@ -366,6 +376,15 @@ def _judge_coverage(verdict: Verdict, latest_check: dict | None, review_complete
                 f"review by {verdict.reviewer}: verdict={verdict.review_verdict} complete=false at {verdict.head[:12]}"
             )
     verdict.incomplete = bool(verdict.incomplete_signals)
+    # Completion belongs to each selected result, not to the whole PR: an older or
+    # concurrent pending run must not hide a completed incomplete re-review.
+    if verdict.incomplete:
+        completed = []
+        if check_state == _INCOMPLETE_CHECK and str((latest_check or {}).get("status") or "").upper() == "COMPLETED":
+            completed.append(str((latest_check or {}).get("startedAt") or ""))
+        if not review_pending and not review_complete and verdict.review_verdict in TERMINAL_VERDICTS:
+            completed.append(review_at)
+        verdict.incomplete_result_at = max(completed, default="")
 
 
 def parse_findings(body: str) -> list[dict] | None:

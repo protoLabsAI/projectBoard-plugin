@@ -45,6 +45,8 @@ atomically: the seam runs for real (on every path, under a token that cannot mer
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import os
 import re
 
@@ -383,6 +385,15 @@ async def test_find_marked_comment_absent_marker_returns_empty(gh_fixture):
     assert (found_id, found_body) == ("", "")
 
 
+@requires_gh
+async def test_marked_comment_creation_time_distinguishes_absent_from_unreadable(gh_fixture):
+    """An absent summon permits posting; an unreadable PR must hold recovery."""
+    marker = "<!-- project-board:requires_gh-absent-probe -->"
+    assert await worktree.marked_pr_comment_created_at(gh_fixture.url, marker, cwd=gh_fixture.repo_dir) == ""
+    missing = f"https://github.com/{gh_fixture.slug}/pull/999999999"
+    assert await worktree.marked_pr_comment_created_at(missing, marker, cwd=gh_fixture.repo_dir) is None
+
+
 @requires_gh_write
 async def test_post_or_update_pr_comment_is_idempotent_and_marked(gh_fixture):
     """``post_or_update_pr_comment`` posts — or idempotently UPDATES in place — a single
@@ -402,6 +413,12 @@ async def test_post_or_update_pr_comment_is_idempotent_and_marked(gh_fixture):
     assert cid, "the marked comment was not found after posting"
     assert TEST_COMMENT_MARKER in cbody and body in cbody
 
+    created_at = await worktree.marked_pr_comment_created_at(
+        gh_fixture.url, TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
+    )
+    assert created_at, "the durable summon timestamp must be readable after posting"
+    assert datetime.fromisoformat(created_at.replace("Z", "+00:00")).tzinfo is not None
+
     # Re-post identical: idempotent no-op (byte-identical body → no PATCH), same comment id.
     ok_again = await worktree.post_or_update_pr_comment(
         gh_fixture.url, body, marker=TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
@@ -411,6 +428,18 @@ async def test_post_or_update_pr_comment_is_idempotent_and_marked(gh_fixture):
         gh_fixture.slug, gh_fixture.number, TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
     )
     assert cid_again == cid, "a re-post created a duplicate comment instead of updating in place"
+
+    # Updating the body must retain creation time: an edit is not a new summon.
+    assert (
+        await worktree.post_or_update_pr_comment(
+            gh_fixture.url, body + " Updated.", marker=TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir
+        )
+        is True
+    )
+    assert (
+        await worktree.marked_pr_comment_created_at(gh_fixture.url, TEST_COMMENT_MARKER, cwd=gh_fixture.repo_dir)
+        == created_at
+    )
 
     # An unparseable url posts nothing.
     assert (

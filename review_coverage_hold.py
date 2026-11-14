@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import types
+from datetime import datetime
 
 NEXT_ACTION = "awaiting complete review (panel pass was incomplete)"
 # The hidden marker that names the summon comment for one head. ``worktree.
@@ -100,3 +101,13 @@ def mark_summoned(fid: str, head: str) -> None:
 def clear_hold(fid: str) -> dict | None:
     with _LOCK:
         return _HOLDS.pop(fid, None)
+
+
+def completed_after(completed: str, summoned_at: str) -> bool:
+    """Unknown/malformed timestamps cannot prove a new completed review."""
+    try:
+        end = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+        start = datetime.fromisoformat(summoned_at.replace("Z", "+00:00"))
+        return bool(end.tzinfo and start.tzinfo and end > start)
+    except (ValueError, TypeError):
+        return False
