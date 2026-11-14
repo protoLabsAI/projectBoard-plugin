@@ -99,12 +99,14 @@ knob lists itself in the pending-restart banner.
 The **Maintenance** tab is the last tab, and nothing on it is needed to get a board started.
 It folds the old Automation and Security tabs into one place for the things you reach for
 only now and then: whether the board downloads its own card-database tool (`br`), whether it
-keeps board-owned checkouts current, the check command run before a pull request opens, and
-the two secrets — the GitHub webhook secret and the private-npm read token. The secrets are
+keeps board-owned checkouts current, the check command run before a pull request opens, the
+four **Starting model by card size** pickers (the difficulty → starting-tier map), and the
+two secrets — the GitHub webhook secret and the private-npm read token. The secrets are
 **type secret**: stored through the host's secret settings path and never returned to the
 browser, so their values are never shown; a blank secret simply leaves its route or sign-in
-off. `br_autofetch` applies to the running loop on save; the other three are persisted
-immediately and take effect after the member restarts, and each says so.
+off. `br_autofetch` and the four starting-model pickers apply to the running loop on save; the
+other three are persisted immediately and take effect after the member restarts, and each
+says so.
 
 ## Not exposed in the console
 
@@ -229,6 +231,44 @@ status. Off = no fetch, no fast-forward.
 
 Fast lint/typecheck/unit command run before a PR opens. Project-specific values in the
 Projects tab override it. Blank disables the default gate.
+
+### Starting model for small cards (`difficulty_tier_small`)
+
+| Label | Help |
+|---|---|
+| Starting model for small cards | Pick the model tier a small card opens on; it still climbs to a stronger model if it fails there. |
+
+One of four pickers for the difficulty → starting-tier map. The choices are the ladder's
+rungs (standard → reasoning → advanced); a card that fails at its starting rung still climbs
+from there. Applies to the next dispatch on save, no restart; a project may override it under
+`projects.<name>.difficulty_tiers`.
+
+### Starting model for medium cards (`difficulty_tier_medium`)
+
+| Label | Help |
+|---|---|
+| Starting model for medium cards | Pick the model tier a medium card opens on; it still climbs to a stronger model if it fails there. |
+
+The medium rung of the difficulty → starting-tier map; defaults to standard (Sonnet handles
+small and medium). Applies to the next dispatch on save, no restart.
+
+### Starting model for large cards (`difficulty_tier_large`)
+
+| Label | Help |
+|---|---|
+| Starting model for large cards | Pick the model tier a large card opens on; it still climbs to a stronger model if it fails there. |
+
+The large rung of the difficulty → starting-tier map; defaults to reasoning (Opus). Applies to
+the next dispatch on save, no restart.
+
+### Starting model for architectural cards (`difficulty_tier_architectural`)
+
+| Label | Help |
+|---|---|
+| Starting model for architectural cards | Pick the model tier an architectural card opens on; it still climbs to a stronger model if it fails there. |
+
+The architectural rung of the difficulty → starting-tier map; defaults to advanced. Applies to
+the next dispatch on save, no restart.
 
 ### Try solutions until tests pass (`coder_solve`)
 

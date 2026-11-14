@@ -48,6 +48,16 @@ config:
   #   standard: proto       # rungs are standard → reasoning → advanced (store.TIER_LADDER);
   #   reasoning: proto-smart  # with `coder:` set it is the fallback for an unmapped rung,
   #   advanced: claude-acp  # with `coder:` blank every rung must be mapped.
+  difficulty_tiers:         # difficulty → the starting rung a card of that size opens on. small
+    small: standard         # and medium start on `standard` (Sonnet handles both), large on
+    medium: standard        # `reasoning` (Opus), architectural on `advanced`. A card that fails
+    large: reasoning        # at its start still climbs standard → reasoning → advanced. LIVE: a
+    architectural: advanced # save (or a YAML reload) applies to the NEXT dispatch — no restart,
+                            # no plugin update. An override may name only the keys it changes (a
+                            # missing one keeps the default); an unknown difficulty/tier is refused
+                            # at load. A project may override it under
+                            # projects.<name>.difficulty_tiers, which wins for that project's cards.
+                            # The Maintenance tab's four pickers edit this map from the console.
   reviewer: quinn           # a2a delegate for explicit PR review (review_dispatch, and the
                             # review_gate's fallback when the host has no workflow runner)
   review_dispatch: false    # OPT-IN, advisory. Off = rely on the fleet PR-review pipeline (it
@@ -340,6 +350,20 @@ settings:
       description: "Keep board-owned checkouts up to date before builds, or turn this off when you update those working copies yourself." }
   - { key: local_gate_cmd, label: "Checks before opening a pull request", type: string, group: "Project Board", tab: maintenance, restart: true,
       description: "Set the lint and test command to run before each pull request opens, or leave it blank when a project defines its own checks." }
+
+  # Starting model by card size: the four pickers of the `difficulty_tiers` map (one per card
+  # size). Choices are the ladder's rungs (standard → reasoning → advanced); a card that fails at
+  # its starting rung still climbs from there. LIVE — a change applies to the next dispatch, no
+  # restart. settings_api folds these four keys into the one nested `difficulty_tiers` config key;
+  # a project may override any of them under projects.<name>.difficulty_tiers.
+  - { key: difficulty_tier_small, label: "Starting model for small cards", type: select, options: [standard, reasoning, advanced], group: "Starting model by card size", tab: maintenance,
+      description: "Pick the model tier a small card opens on; it still climbs to a stronger model if it fails there." }
+  - { key: difficulty_tier_medium, label: "Starting model for medium cards", type: select, options: [standard, reasoning, advanced], group: "Starting model by card size", tab: maintenance,
+      description: "Pick the model tier a medium card opens on; it still climbs to a stronger model if it fails there." }
+  - { key: difficulty_tier_large, label: "Starting model for large cards", type: select, options: [standard, reasoning, advanced], group: "Starting model by card size", tab: maintenance,
+      description: "Pick the model tier a large card opens on; it still climbs to a stronger model if it fails there." }
+  - { key: difficulty_tier_architectural, label: "Starting model for architectural cards", type: select, options: [standard, reasoning, advanced], group: "Starting model by card size", tab: maintenance,
+      description: "Pick the model tier an architectural card opens on; it still climbs to a stronger model if it fails there." }
 
   # The Review & merge pipeline (auto_merge, merged_verify_max, merge_method, review_gate,
   # review_workflow, reviewer, review_dispatch, review_fix_max, merge_poll, ci_poll, ci_fix_max,

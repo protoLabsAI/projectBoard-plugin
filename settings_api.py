@@ -236,11 +236,47 @@ for _key, _meta in _PAGE_OWNED.items():
 _DEFAULTS = _MANIFEST["config"]
 _boot_values: dict | None = None
 
+# The four Settings pickers that edit the ONE nested `difficulty_tiers` config key (bd-l8sqf).
+# The console shows difficulty→starting-tier as a picker per card size, but the store reads a
+# single nested map — so these picker keys are SYNTHETIC: they have no flat `project_board.<key>`
+# of their own. settings_api maps each to `difficulty_tiers[<difficulty>]`, reading the
+# per-difficulty value for the snapshot and folding a saved picker back into the nested map (see
+# `_read_setting` and `apply_setting_updates`). They are LIVE on reload — the loop re-applies
+# `difficulty_tiers` alongside project routing — so they are never pending-restart even though
+# they are not scalar LIVE_KNOBS (see `_is_live`).
+_DIFFICULTY_TIER_PICKERS = {
+    "difficulty_tier_small": "small",
+    "difficulty_tier_medium": "medium",
+    "difficulty_tier_large": "large",
+    "difficulty_tier_architectural": "architectural",
+}
+
+
+def _is_live(key):
+    """Whether a saved key reaches the running loop without a restart: the scalar LIVE_KNOBS
+    plus the difficulty-tier pickers (folded into `difficulty_tiers`, which the loop re-applies
+    on config reload alongside project routing — bd-l8sqf)."""
+    return key in LIVE_KNOBS or key in _DIFFICULTY_TIER_PICKERS
+
+
+def _read_setting(section, key):
+    """The stored value of one setting. The four difficulty-tier pickers read from the nested
+    `difficulty_tiers` map (they have no flat key of their own), falling back to the manifest
+    default for any difficulty the map omits; every other key is a flat `project_board.<key>`."""
+    difficulty = _DIFFICULTY_TIER_PICKERS.get(key)
+    if difficulty is not None:
+        default_map = _DEFAULTS.get("difficulty_tiers") or {}
+        tiers = section.get("difficulty_tiers")
+        if isinstance(tiers, dict) and difficulty in tiers:
+            return tiers.get(difficulty)
+        return default_map.get(difficulty)
+    return section.get(key, _DEFAULTS.get(key))
+
 
 def capture_boot_settings(cfg):
     """Capture before the loop starts; reload mutates the shared cfg in place."""
     global _boot_values
-    _boot_values = {key: copy.deepcopy(cfg.get(key, _DEFAULTS.get(key))) for key in SETTINGS}
+    _boot_values = {key: copy.deepcopy(_read_setting(cfg, key)) for key in SETTINGS}
 
 
 def _boot():
@@ -254,7 +290,7 @@ def _pending(live):
     return [
         {"key": key, "label": meta["label"]}
         for key, meta in SETTINGS.items()
-        if key not in LIVE_KNOBS and live.get(key, _DEFAULTS.get(key)) != boot[key]
+        if not _is_live(key) and _read_setting(live, key) != boot[key]
     ]
 
 
@@ -264,7 +300,7 @@ def settings_snapshot():
     boot = _boot()
     settings = {}
     for key, meta in SETTINGS.items():
-        value = live.get(key, _DEFAULTS.get(key))
+        value = _read_setting(live, key)
         boot_value = boot[key]
         if meta["type"] == "secret":
             value, boot_value = {"set": bool(value)}, {"set": bool(boot_value)}
@@ -272,7 +308,7 @@ def settings_snapshot():
             **copy.deepcopy(meta),
             "value": value,
             "boot_value": boot_value,
-            "restart": key not in LIVE_KNOBS,
+            "restart": not _is_live(key),
         }
     return {"settings": settings, "pending_restart": _pending(live)}
 
@@ -328,11 +364,25 @@ async def apply_setting_updates(updates, actor):
                 "pending_restart": [],
             }
 
+        # The difficulty-tier pickers fold into the ONE nested `difficulty_tiers` config key
+        # (bd-l8sqf): read the live map once, under the lock, so a saved picker merges onto it
+        # and an untouched difficulty is preserved rather than dropped to the default.
+        live_now = _live_section(required=True)
+
         def compute(live):
             # Only the allowlisted scalar patch crosses the host save boundary.
             # The host routes manifest-declared secrets to its secret store.
             _validate(updates)
-            return {"project_board": updates}
+            patch = {k: v for k, v in updates.items() if k not in _DIFFICULTY_TIER_PICKERS}
+            picker = {_DIFFICULTY_TIER_PICKERS[k]: v for k, v in updates.items() if k in _DIFFICULTY_TIER_PICKERS}
+            if picker:
+                merged = dict(_DEFAULTS.get("difficulty_tiers") or {})
+                current = live_now.get("difficulty_tiers")
+                if isinstance(current, dict):
+                    merged.update({d: t for d, t in current.items() if d in merged})
+                merged.update(picker)
+                patch["difficulty_tiers"] = merged
+            return {"project_board": patch}
 
         try:
             ok, _messages = await asyncio.to_thread(HOST.apply_settings, compute)
@@ -349,7 +399,7 @@ async def apply_setting_updates(updates, actor):
         return {
             "ok": True,
             "saved": list(updates),
-            "restart_required": [key for key in updates if key not in LIVE_KNOBS],
+            "restart_required": [key for key in updates if not _is_live(key)],
             "pending_restart": _pending(_live_section(required=True)),
         }
 

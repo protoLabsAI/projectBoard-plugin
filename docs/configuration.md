@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **40 of 94 keys are in this state, including `coders` and `projects`** —
+never renders it. **40 of 95 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -47,6 +47,7 @@ You cannot dispatch a card without these.
 | `base_branch` | `"main"` | **restart** |
 | `coder` | `—` | live |
 | `coders` | `—` | live |
+| `difficulty_tiers` | `{small: standard, medium: standard, large: reasoning, architectural: advanced}` | reload |
 | `db_path` | `—` | **restart** |
 | `br_autofetch` | `True` | live |
 
@@ -746,9 +747,9 @@ coders:
 
 The difficulty → starting-rung map is `{small: standard, medium: standard, large: reasoning,
 architectural: advanced}` — Sonnet handles small and medium, Opus the larger cards whose
-reasoning earns it. Override it per board with `difficulty_tiers` (YAML only; an override may
-name only the keys it changes, a missing key keeps the default, and an unknown difficulty or
-tier is rejected at load):
+reasoning earns it. Override it per board with `difficulty_tiers`; an override may name only
+the keys it changes (a missing key keeps the default), and an unknown difficulty or tier is
+rejected at load:
 
 ```yaml
 difficulty_tiers:
@@ -760,6 +761,28 @@ difficulty_tiers:
 
 This changes only the STARTING rung; escalation is unchanged, so a medium card Sonnet can't
 land still climbs standard → reasoning → advanced and reaches Opus.
+
+**It applies on reload, not just at start.** `difficulty_tiers` is `reload`: a config reload
+(`POST /api/config`, which a Settings save triggers) hands the new map to the running board in
+place, and the NEXT card dispatched reads it. Changing which model a card size opens on needs
+no restart and no plugin update. The Maintenance tab exposes the map as four pickers — one per
+card size (small, medium, large, architectural) — whose choices are the ladder's rungs
+(`standard` → `reasoning` → `advanced`); editing a picker writes this same `difficulty_tiers`
+key.
+
+**A project may override it.** A `projects:` entry may carry its own `difficulty_tiers`, which
+wins over the board-level map for that project's cards (a project omits it to inherit the
+board-level map). Like the board-level key, a per-project override is merged onto the default
+(a missing difficulty falls back) and validated at load, and it too applies on reload:
+
+```yaml
+projects:
+  web:
+    repo: ~/dev/web
+    difficulty_tiers: { medium: reasoning }   # this project opens medium cards on Opus
+  api:
+    repo: ~/dev/api                           # inherits the board-level map
+```
 
 **The order inside a rung is not a preference.** `[codex, sonnet]` and `[sonnet, codex]`
 behave the same: each card opens on the sibling a per-process counter points at, and the

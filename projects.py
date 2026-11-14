@@ -103,6 +103,7 @@ _PROJECT_SETTING_KEYS = (
     "local_gate_cmd",
     "coders",
     "routing",
+    "difficulty_tiers",
     "gate_files",
     "repo_conventions",
     "worktrees_root",
