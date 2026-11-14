@@ -314,7 +314,7 @@ def test_the_hold_only_replaces_auto_merge_pending():
     assert row["next_action"] == "review in progress"
 
 
-@pytest.mark.parametrize("outcome", ["incomplete", "complete", "new-head"])
+@pytest.mark.parametrize("outcome", ["incomplete", "complete", "new-head", "pending-review", "running-check", "check-only"])
 async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outcome):
     """Only a completed result AFTER the durable summon can exhaust recovery."""
     loop = _edge(
@@ -402,6 +402,15 @@ async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outc
         reviews=[_review("WARN", complete=False, at="2026-10-08T13:00:00Z")],
         checks=[_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z")],
     )
+    if outcome == "pending-review":
+        loop.view["reviews"].append(dict(_review("WARN", complete=False, at=""), state="PENDING"))
+    if outcome in ("running-check", "check-only"):
+        loop.view["statusCheckRollup"].append(
+            dict(_panel_check(""), status="IN_PROGRESS", startedAt="2026-10-08T12:00:00Z", completedAt="")
+        )
+    if outcome == "check-only":
+        loop.view["reviews"] = []
+        loop.view["statusCheckRollup"][0]["startedAt"] = "2026-10-08T13:00:00Z"
     await poll()
     assert store.block and len(pages) == 1
     assert block_pages.card_id(pages[0]) == "bd-1"
@@ -411,6 +420,35 @@ async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outc
     review_coverage_hold.reset_state()
     await poll()
     assert len(pages) == 1 and len(loop.posts) == 1 and loop.merges == []
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"])
+@pytest.mark.parametrize("started", ["2026-10-08T12:00:00Z", "2026-10-08T13:02:00Z"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_running_check_does_not_veto_completed_check(status, started, reverse):
+    checks = [
+        dict(_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z"), startedAt="2026-10-08T13:00:00Z"),
+        dict(_panel_check(""), status=status, startedAt=started, completedAt=""),
+    ]
+    if reverse:
+        checks.reverse()
+    ext = external_review.evaluate(_view(reviews=[], checks=checks), external_review.Config())
+    assert ext.incomplete and ext.coverage_running
+    assert ext.incomplete_result_at == "2026-10-08T13:00:00Z"
+
+
+@pytest.mark.parametrize("pending_at", ["", "2026-10-08T12:00:00Z"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_older_pending_review_does_not_veto_submitted_review(pending_at, reverse):
+    reviews = [
+        dict(_review("WARN", complete=False, at=pending_at), state="PENDING"),
+        _review("WARN", complete=False, at="2026-10-08T13:00:00Z"),
+    ]
+    if reverse:
+        reviews.reverse()
+    ext = external_review.evaluate(_view(reviews=reviews, checks=[]), external_review.Config())
+    assert ext.incomplete and ext.coverage_running
+    assert ext.incomplete_result_at == "2026-10-08T13:00:00Z"
 
 
 @pytest.mark.parametrize(
@@ -428,7 +466,7 @@ async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outc
         (
             [_review("WARN", complete=False, at="2026-10-08T13:00:00Z")],
             [dict(_panel_check(""), status="IN_PROGRESS", completedAt="")],
-            False,
+            True,  # another unfinished run cannot erase a submitted review
         ),
     ],
 )
