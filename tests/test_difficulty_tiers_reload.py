@@ -225,6 +225,28 @@ def test_per_project_override_wins_over_board_level(monkeypatch):
     assert b.initial_tier("x") == "advanced"
 
 
+def test_empty_per_project_override_inherits_and_follows_board_reloads(monkeypatch):
+    """Regression (bd-l8sqf): a project declaring an EMPTY `difficulty_tiers: {}` inherits the live
+    board-level map rather than being pinned to the resolved default — so it stays out of the
+    per-project map and a later board-level reload still reaches its cards (pinning `{}` to the
+    default would freeze the project against reloads, contrary to the docs' "inherits" wording)."""
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    b = store.BeadsBoard(
+        db=None,
+        repo="/repo",
+        difficulty_tiers={"medium": "reasoning"},  # board level: medium → reasoning
+        projects={"web": {"repo": "/web", "difficulty_tiers": {}}},  # empty → inherit, do not pin
+        default_project="web",
+    )
+    assert "web" not in b._project_difficulty_tiers  # empty map is not a per-project pin
+    monkeypatch.setattr(b, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(b, "_require", lambda fid: _feature(fid, difficulty="medium", project="web"))
+    assert b.initial_tier("x") == "reasoning"  # inherits the live board-level map
+
+    b.reconfigure_difficulty_tiers({"medium": "advanced"})  # a live board-level reload
+    assert b.initial_tier("x") == "advanced"  # the reload reaches web's cards (would be frozen if pinned)
+
+
 def test_per_project_override_climbs_the_same_ladder(monkeypatch):
     """The override only moves the STARTING rung; escalation is unchanged, so a per-project
     medium card that fails still advances up TIER_LADDER."""

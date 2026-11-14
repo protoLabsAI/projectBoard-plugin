@@ -1768,7 +1768,12 @@ class BeadsBoard:
             if entry.get(IMPLICIT_MARKER):
                 continue
             override = entry.get("difficulty_tiers")
-            if override is None:
+            # An absent OR empty-dict override inherits the live board-level map (bd-l8sqf): skip it
+            # so `_difficulty_tiers` falls through to ``self.difficulty_tiers`` for this project's
+            # cards and a board-level reload still reaches them. Pinning `{}` to the resolved default
+            # here would freeze the project against future reloads, contrary to the docs' "inherits
+            # the board-level map" wording. A non-dict (e.g. a list) is still validated below.
+            if override is None or override == {}:
                 continue
             try:
                 resolved[name] = resolve_difficulty_tiers(override)
