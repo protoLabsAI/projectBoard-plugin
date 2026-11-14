@@ -104,6 +104,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "_checked_out_branches": "REAL",
     "reap_candidate_branches": "REAL",
     "_find_marked_comment": "REAL",
+    "marked_pr_comment_created_at": "REAL",  # Durable summon timestamp: tests/test_worktree_gh.py.
     "_promote_adopted_draft": (
         "EXEMPT: promotes a real adopted draft PR to ready — REAL coverage would need a disposable "
         "sandbox repo to hold that PR lifecycle state (operator chose not to provision one now). "
@@ -446,8 +447,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_52_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 52 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_53_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 53 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -482,6 +483,7 @@ def test_worktree_coverage_contract_is_52_real_3_exempt_0_uncovered():
     # The 50th guards published ancestry after real remote rewinds in that module.
     # The 51st proves preserved resolution progress against real PR history on restart.
     # The 52nd restores promoted environments with real Git index checks and setup commands.
+    # The 53rd reads durable summon creation times against real GitHub in test_worktree_gh.py.
     real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
     exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
     uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
@@ -491,7 +493,7 @@ def test_worktree_coverage_contract_is_52_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 52, f"expected 52 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 53, f"expected 53 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

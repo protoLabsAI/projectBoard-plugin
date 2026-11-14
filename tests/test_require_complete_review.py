@@ -20,7 +20,13 @@ GitHub is faked at the ``worktree.pr_review_state`` / ``post_or_update_pr_commen
 
 from __future__ import annotations
 
-from project_board import external_review, review_coverage_hold, worktree
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+import project_board.loop as loop_mod
+from project_board import block_pages, external_review, review_coverage_hold, worktree
 from project_board import projects as projects_mod
 from project_board.loop import BoardLoop
 from project_board.store import annotate_next_action
@@ -165,6 +171,10 @@ def _edge(monkeypatch, cfg=None, *, view=None, post_ok=True):
     async def _noop(*a, **k):
         return True
 
+    async def _summon_time(url, marker, **kwargs):
+        return "2026-10-08T12:30:00Z" if post_ok and any(m == marker for _, _, m in loop.posts) else ""
+
+    monkeypatch.setattr(worktree, "marked_pr_comment_created_at", _summon_time)
     monkeypatch.setattr(loop, "_auto_merge_blockers", _no_blockers)
     monkeypatch.setattr(worktree, "pr_review_state", _review_state)
     monkeypatch.setattr(worktree, "merge_pr", _merge)
@@ -302,3 +312,220 @@ def test_the_hold_only_replaces_auto_merge_pending():
     card = {"id": "bd-1", "board_state": "in_review", "labels": ["review-pending"], "pr_url": PR}
     (row,) = annotate_next_action([card], {"auto_merge": True, "review_gate": True})
     assert row["next_action"] == "review in progress"
+
+
+@pytest.mark.parametrize(
+    "outcome", ["incomplete", "complete", "new-head", "pending-review", "running-check", "check-only"]
+)
+async def test_completed_rereview_exhaustion_through_reconcile(monkeypatch, outcome):
+    """Only a completed result AFTER the durable summon can exhaust recovery."""
+    loop = _edge(
+        monkeypatch, {"require_complete_review": True, "auto_rebase": False, "ci_poll": False, "review_gate": False}
+    )
+    store = _Store()
+    store.block = None
+    original_get = store.get_feature
+
+    def get_feature(fid):
+        row = original_get(fid)
+        if store.block:
+            row.update(board_state="blocked", blocked_class="needs-review", blocked_reason=store.block)
+        return row
+
+    def flag_blocked(fid, reason, **kwargs):
+        assert kwargs["category"] == "needs-review"
+        store.block = reason
+        return get_feature(fid)
+
+    async def noop(*args, **kwargs):
+        return False
+
+    async def summon_time(*args, **kwargs):
+        return "2026-10-08T12:30:00Z" if loop.posts else ""
+
+    async def pr_state(*args, **kwargs):
+        return "OPEN"
+
+    pages = []
+
+    class Inbox:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def list(self, **kwargs):
+            return pages
+
+        def add(self, text, **kwargs):
+            row = dict(id=len(pages) + 1, text=text, **kwargs)
+            pages.append(row)
+            return row
+
+    monkeypatch.setitem(sys.modules, "inbox", SimpleNamespace(InboxStore=Inbox))
+    monkeypatch.setattr(loop_mod, "_inbox_db_path", lambda: "/unused")
+    monkeypatch.setattr(store, "get_feature", get_feature)
+    monkeypatch.setattr(store, "flag_blocked", flag_blocked, raising=False)
+    monkeypatch.setattr(worktree, "marked_pr_comment_created_at", summon_time, raising=False)
+    monkeypatch.setattr(worktree, "pr_state", pr_state)
+    monkeypatch.setattr(loop, "_reconcile_review_threads", noop)
+    monkeypatch.setattr(loop, "_release_board_draft", noop)
+
+    async def poll():
+        await loop._reconcile_pr(store, store.get_feature("bd-1"))
+
+    await poll()  # initial incomplete review: summon only
+    await poll()  # the same result is NOT a second review
+    review_coverage_hold.reset_state()  # restart: recover the summon from GitHub
+    await poll()
+    assert not pages and not store.block
+    assert len(loop.posts) == 1
+    loop.view = _view(checks=[dict(_panel_check(""), status="IN_PROGRESS", completedAt="")])
+    await poll()
+    assert not pages and not store.block
+    if outcome == "complete":
+        loop.view = _complete_view()
+        await poll()
+        assert not pages and not store.block and loop.merges == [PR]
+        return
+    if outcome == "new-head":
+        loop.view = _view(head=NEW_HEAD)
+
+        # The old head's summon is not evidence about this head.
+        async def new_head_summon_time(url, marker, **kwargs):
+            return "2026-10-08T12:30:00Z" if any(m == marker for _, _, m in loop.posts) else ""
+
+        monkeypatch.setattr(worktree, "marked_pr_comment_created_at", new_head_summon_time)
+        await poll()
+        await poll()
+        assert not pages and not store.block and not loop.merges
+        assert len(loop.posts) == 2
+        assert review_coverage_hold.hold_for("bd-1")["head"] == NEW_HEAD
+        return
+    loop.view = _view(
+        reviews=[_review("WARN", complete=False, at="2026-10-08T13:00:00Z")],
+        checks=[_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z")],
+    )
+    if outcome == "pending-review":
+        loop.view["reviews"].append(dict(_review("WARN", complete=False, at=""), state="PENDING"))
+    if outcome in ("running-check", "check-only"):
+        loop.view["statusCheckRollup"].append(
+            dict(_panel_check(""), status="IN_PROGRESS", startedAt="2026-10-08T12:00:00Z", completedAt="")
+        )
+    if outcome == "check-only":
+        loop.view["reviews"] = []
+        loop.view["statusCheckRollup"][0]["startedAt"] = "2026-10-08T13:00:00Z"
+    await poll()
+    assert store.block and len(pages) == 1
+    assert block_pages.card_id(pages[0]) == "bd-1"
+    for value in ("bd-1", PR, HEAD, "incomplete"):
+        assert value in store.block and value in pages[0]["text"]
+    await poll()
+    review_coverage_hold.reset_state()
+    await poll()
+    assert len(pages) == 1 and len(loop.posts) == 1 and loop.merges == []
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"])
+@pytest.mark.parametrize("started", ["2026-10-08T12:00:00Z", "2026-10-08T13:02:00Z"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_running_check_does_not_veto_completed_check(status, started, reverse):
+    checks = [
+        dict(_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z"), startedAt="2026-10-08T13:00:00Z"),
+        dict(_panel_check(""), status=status, startedAt=started, completedAt=""),
+    ]
+    if reverse:
+        checks.reverse()
+    ext = external_review.evaluate(_view(reviews=[], checks=checks), external_review.Config())
+    assert ext.incomplete and ext.coverage_running
+    assert ext.incomplete_result_at == "2026-10-08T13:00:00Z"
+
+
+@pytest.mark.parametrize("pending_at", ["", "2026-10-08T12:00:00Z"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_older_pending_review_does_not_veto_submitted_review(pending_at, reverse):
+    reviews = [
+        dict(_review("WARN", complete=False, at=pending_at), state="PENDING"),
+        _review("WARN", complete=False, at="2026-10-08T13:00:00Z"),
+    ]
+    if reverse:
+        reviews.reverse()
+    ext = external_review.evaluate(_view(reviews=reviews, checks=[]), external_review.Config())
+    assert ext.incomplete and ext.coverage_running
+    assert ext.incomplete_result_at == "2026-10-08T13:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "reviews,checks,expected",
+    [
+        (
+            [],
+            [dict(_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z"), startedAt="2026-10-08T12:00:00Z")],
+            False,
+        ),  # original run completed late
+        ([], [dict(_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z"), startedAt="2026-10-08T13:00:00Z")], True),
+        ([], [_panel_check("NEUTRAL", completed="2026-10-08T13:01:00Z")], False),  # unknown run
+        ([_review("WARN", complete=False, at="2026-10-08T13:00:00Z")], [], True),
+        ([dict(_review("WARN", complete=False, at="2026-10-08T13:00:00Z"), state="PENDING")], [], False),
+        (
+            [_review("WARN", complete=False, at="2026-10-08T13:00:00Z")],
+            [dict(_panel_check(""), status="IN_PROGRESS", completedAt="")],
+            True,  # another unfinished run cannot erase a submitted review
+        ),
+    ],
+)
+def test_only_completed_new_evidence_exhausts(reviews, checks, expected):
+    ext = external_review.evaluate(_view(reviews=reviews, checks=checks), external_review.Config())
+    assert review_coverage_hold.completed_after(ext.incomplete_result_at, "2026-10-08T12:30:00Z") is expected
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        ((0, "[]", ""), ""),
+        ((1, "", "failed"), None),
+        ((0, "not-json", ""), None),
+        ((0, "{}", ""), None),
+        ((0, '[{"body":"marker"}]', ""), None),
+        ((0, '[{"body":"marker", "created_at":"2026-10-08T12:30:00Z"}]', ""), "2026-10-08T12:30:00Z"),
+    ],
+)
+async def test_durable_summon_read_distinguishes_missing_from_unknown(monkeypatch, response, expected):
+    async def gh(*args, **kwargs):
+        assert "--paginate" in args
+        return response
+
+    monkeypatch.setattr(worktree, "_gh", gh)
+    assert await worktree.marked_pr_comment_created_at(PR, "marker") == expected
+
+
+async def test_unreadable_summon_never_reposts_or_exhausts(monkeypatch):
+    loop = _edge(monkeypatch, {"require_complete_review": True})
+
+    async def unreadable(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(worktree, "marked_pr_comment_created_at", unreadable)
+    assert not await loop._maybe_auto_merge(_Store(), "bd-1", PR, "/repo", view=loop.view)
+    assert loop.posts == [] and loop.merges == []
+
+
+@pytest.mark.parametrize("change", ["head", "unreadable", "missing-card", "complete"])
+async def test_stale_exhaustion_read_does_not_block(monkeypatch, change):
+    loop = _edge(monkeypatch, {"require_complete_review": True})
+    store = _Store()
+    await loop._maybe_auto_merge(store, "bd-1", PR, "/repo", view=loop.view)
+    loop.view = _view(reviews=[_review("WARN", complete=False, at="2026-10-08T13:00:00Z")])
+
+    async def moved(*args, **kwargs):
+        if change == "head":
+            loop.view = _view(head=NEW_HEAD)
+        elif change == "unreadable":
+            loop.view = None
+        elif change == "complete":
+            loop.view = _complete_view()
+        else:
+            monkeypatch.setattr(store, "get_feature", lambda fid: None)
+        return "2026-10-08T12:30:00Z"
+
+    monkeypatch.setattr(worktree, "marked_pr_comment_created_at", moved)
+    assert not await loop._maybe_auto_merge(store, "bd-1", PR, "/repo", view=loop.view)
+    assert loop.merges == []  # _Store has no block method: attempting to block fails this test

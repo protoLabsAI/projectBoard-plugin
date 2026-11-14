@@ -26,6 +26,11 @@ def page_text(fid: str, feature: dict) -> str:
     title = " ".join(str(feature.get("title") or "Untitled card").split())[:55]
     reason = " ".join(str(feature.get("blocked_reason") or "").split()).rstrip(".")
     link = f"/plugins/project_board/board?card={quote(fid, safe='')}"
+    if feature.get("blocked_class") == "needs-review" and reason.startswith(
+        "Incomplete review coverage after re-review:"
+    ):
+        # Recovery evidence must retain the PR and exact head, even on long URLs.
+        return f"{fid} is blocked: {reason}. [Open the card]({link})"
     hold = feature.get("blocked_class") == "preflight-hold"
     if not reason:
         action = f"is blocked; [open the card]({link}) to review the reason and choose the next step."

@@ -480,7 +480,12 @@ as passing, so without this setting an incomplete pass merges. The read is the s
 card stays `in_review` reading `awaiting complete review (panel pass was incomplete)` (a bead
 comment records it once per head), and the board posts one PR comment,
 `@<review_summon_handle> review — <reason>`, once per head. The comment carries a hidden
-per-head marker, so neither a 30-second tick nor a restart posts it twice. When a complete
+per-head marker, so neither a 30-second tick nor a restart posts it twice. If a new
+completed review after that summon still has incomplete coverage at the same head, the
+board blocks the card as `needs-review` and alerts the operator with the PR, exact head
+and recovery action. Repeated polls, unfinished runs and unreadable timestamps do not
+exhaust recovery. The operator repairs coverage, requests a complete review and unblocks
+the card. When a complete
 pass clears the head, or a push moves it, the normal merge path proceeds. An unreadable panel
 holds that pass only. Set it in a `projects:` entry (a project's value wins) or at the top
 level. It needs `external_review` on; with the panel check off there is nothing to read and
