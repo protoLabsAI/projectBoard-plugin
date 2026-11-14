@@ -146,3 +146,51 @@ def test_current_tier_reads_the_highest_tier_label(make_board, monkeypatch):
         b, "_require", lambda fid: _feature(fid, difficulty="medium", labels=["tier:reasoning", "attempt:1"])
     )
     assert b.current_tier("bd-1") == "reasoning"
+
+
+# ── the override reaches the loop + API store construction (r1, r2) ───────────────
+# These guard the config→store WIRING, not just BeadsBoard(difficulty_tiers=...) in
+# isolation. The loop and the /ci API each build their own store_kw, and get_store caches
+# a board by (db, repo, base_branch) alone — so an override dropped from EITHER builder is
+# silently ignored whenever that builder is the first to construct the shared board.
+
+
+def test_loop_store_kw_threads_the_difficulty_tiers_override():
+    """The loop hands its board the `difficulty_tiers` config key (beside
+    max_files_by_difficulty); an absent key stays None so the board keeps the default."""
+    from project_board.loop import BoardLoop
+
+    override = {"small": "standard", "medium": "standard", "large": "reasoning", "architectural": "advanced"}
+    assert BoardLoop({"difficulty_tiers": override})._store_kw["difficulty_tiers"] == override
+    assert BoardLoop({})._store_kw["difficulty_tiers"] is None
+
+
+def test_api_store_kw_threads_the_difficulty_tiers_override():
+    """api._store_kw (the kwargs BOTH routers build stores with — including the /ci
+    escalation path) carries the `difficulty_tiers` override; an absent key stays None,
+    so the board keeps the default map."""
+    from project_board import api
+
+    override = {"medium": "reasoning"}
+    assert api._store_kw({"difficulty_tiers": override})["difficulty_tiers"] == override
+    assert api._store_kw({})["difficulty_tiers"] is None
+    assert api._store_kw(None)["difficulty_tiers"] is None
+
+
+def test_loop_store_kw_override_reaches_a_freshly_constructed_board(monkeypatch):
+    """End-to-end through the real get_store seam the loop dispatches on: a board built from
+    the loop's store_kw honors the per-board override (medium opts back into reasoning),
+    while an unset key leaves the board on the new default (medium → standard). Proves the
+    config value survives the (db, repo, base_branch)-keyed cache, not just BeadsBoard."""
+    from project_board.loop import BoardLoop
+
+    monkeypatch.setattr(store.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
+    monkeypatch.setattr(store, "default_db_path", lambda: "/inst/project_board/.beads/beads.db")
+    monkeypatch.setattr(store, "_BOARDS", {})
+
+    overridden = store.get_store(**BoardLoop({"difficulty_tiers": {"medium": "reasoning"}})._store_kw)
+    assert overridden.difficulty_tiers["medium"] == "reasoning"
+
+    monkeypatch.setattr(store, "_BOARDS", {})
+    default = store.get_store(**BoardLoop({})._store_kw)
+    assert default.difficulty_tiers["medium"] == "standard"
