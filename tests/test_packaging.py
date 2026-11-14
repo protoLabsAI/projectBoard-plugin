@@ -403,7 +403,7 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
     tier_names = set(m["config"]["difficulty_tiers"].values())
     for key, spec in tier_pickers.items():
         assert not spec.get("restart", False), key  # live → no restart badge in the manifest
-        assert _is_live(key), key                    # ...and settings_api folds it into the live map
+        assert _is_live(key), key  # ...and settings_api folds it into the live map
         assert spec["label"] and spec["description"], key
         assert spec["type"] == "select", key
         assert tier_names <= set(spec["options"]), key
