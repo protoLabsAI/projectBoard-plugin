@@ -1046,9 +1046,45 @@ def _listing_task_signal(f: dict) -> None:
         f["last_deliverable_preview"] = flat
 
 
-# difficulty → initial model tier (the escalation ladder's first rung, D10).
-DIFFICULTY_TIER = {"small": "standard", "medium": "reasoning", "large": "reasoning", "architectural": "advanced"}
+# difficulty → initial model tier (the escalation ladder's first rung, D10). Small AND
+# medium cards start on `standard` (Sonnet handles both); only `large` opens on `reasoning`
+# and `architectural` on `advanced`. This is only the STARTING rung — a card that fails at
+# its tier still climbs standard→reasoning→advanced (see escalate/current_tier), so a hard
+# medium card Sonnet can't land still reaches Opus. Overridable per board via the
+# `difficulty_tiers` config key (threaded to BeadsBoard through store_kw, beside
+# max_files_by_difficulty); a None/empty override keeps this default. See
+# resolve_difficulty_tiers for the merge/validation.
+DIFFICULTY_TIER = {"small": "standard", "medium": "standard", "large": "reasoning", "architectural": "advanced"}
 TIER_LADDER = ["standard", "reasoning", "advanced"]
+
+
+def resolve_difficulty_tiers(override: dict | None) -> dict:
+    """Merge a per-board `difficulty_tiers` override onto the built-in DIFFICULTY_TIER map.
+
+    An override may name only the keys it wants to change — a missing key falls back to the
+    default tier for that difficulty, so the returned map always covers every difficulty.
+    Every named difficulty must be a known one (a key of DIFFICULTY_TIER) and every tier a
+    known rung (a member of TIER_LADDER, after legacy-alias canonicalization); anything else
+    is rejected HERE, at store construction (config load), with a clear error naming the bad
+    key/value — a silently-dropped typo would quietly send a whole difficulty to the wrong
+    model. A None/empty override keeps the default unchanged. The result is a fresh dict so a
+    caller's config can't mutate the policy under us."""
+    merged = dict(DIFFICULTY_TIER)
+    if not override:
+        return merged
+    if not isinstance(override, dict):
+        raise BoardError(f"difficulty_tiers must be a mapping of difficulty→tier, got {type(override).__name__}")
+    known_difficulties = ", ".join(sorted(DIFFICULTY_TIER))
+    known_tiers = ", ".join(TIER_LADDER)
+    for difficulty, tier in override.items():
+        if difficulty not in DIFFICULTY_TIER:
+            raise BoardError(f"difficulty_tiers: unknown difficulty {difficulty!r} (known: {known_difficulties})")
+        canon = canonical_tier(str(tier))
+        if canon not in TIER_LADDER:
+            raise BoardError(f"difficulty_tiers[{difficulty!r}]: unknown tier {tier!r} (known: {known_tiers})")
+        merged[difficulty] = canon
+    return merged
+
 
 # A plan-item `depends_on` entry that is a plain integer is a 0-based INDEX into the
 # plan. STRICT — a single optional leading '-' only. The old `lstrip('-').isdigit()`
@@ -1661,6 +1697,7 @@ class BeadsBoard:
         repo: str = ".",
         base_branch: str = "main",
         max_files_by_difficulty: dict | None = None,
+        difficulty_tiers: dict | None = None,
         projects: dict | None = None,
         default_project: str = "",
     ):
@@ -1691,6 +1728,12 @@ class BeadsBoard:
         # empty override falls back to the built-in default. Copied so a caller's dict can't
         # mutate the policy under us.
         self.max_files_by_difficulty = dict(max_files_by_difficulty or MAX_FILES_BY_DIFFICULTY)
+        # Difficulty → initial model-tier map (#D10): the escalation ladder's first rung per
+        # difficulty. Threaded from the `difficulty_tiers` config key (store_kw); an override
+        # is merged onto the built-in DIFFICULTY_TIER and VALIDATED here, so a typo'd
+        # difficulty or tier fails fast at load rather than silently mis-routing cards. A
+        # None/empty override keeps the default map.
+        self.difficulty_tiers = resolve_difficulty_tiers(difficulty_tiers)
         self._workspace_ready = False  # lazily pinned on first _run (see _ensure_workspace)
         # Serialises hot-file creates through their chain's read-tail → add-edge (#458):
         # two racing creates must not both chain onto the same tail, or onto each other.
@@ -4449,9 +4492,16 @@ class BeadsBoard:
     #    are configured. With a single coder these are simply never called, so a
     #    one-ACP-agent setup writes no tier/attempt labels (difficulty stays purely
     #    optional metadata). ───────────────────────────────────────────────────────
+    def _difficulty_tiers(self) -> dict:
+        """The instance's resolved difficulty→tier map, defaulting to the module default.
+        ``__init__`` always sets ``difficulty_tiers``; the ``getattr`` only matters for a
+        board built via ``object.__new__`` (a test idiom that skips ``__init__``), which
+        before this map lived on the instance read the module global directly."""
+        return getattr(self, "difficulty_tiers", None) or DIFFICULTY_TIER
+
     def initial_tier(self, fid: str) -> str:
         f = self._require(fid)
-        return DIFFICULTY_TIER.get(f.get("difficulty", ""), "standard")
+        return self._difficulty_tiers().get(f.get("difficulty", ""), "standard")
 
     def current_tier(self, fid: str) -> str:
         """The highest tier this feature has been tried at (from `tier:` labels),
@@ -4459,7 +4509,7 @@ class BeadsBoard:
         f = self._require(fid)
         present = [canonical_tier(l.split(":", 1)[1]) for l in f.get("labels") or [] if l.startswith("tier:")]
         idxs = [TIER_LADDER.index(t) for t in present if t in TIER_LADDER]
-        return TIER_LADDER[max(idxs)] if idxs else DIFFICULTY_TIER.get(f.get("difficulty", ""), "standard")
+        return TIER_LADDER[max(idxs)] if idxs else self._difficulty_tiers().get(f.get("difficulty", ""), "standard")
 
     def escalate(self, fid: str, reason: str) -> str | None:
         """Record the failed attempt at the current tier and advance to the next

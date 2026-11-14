@@ -82,6 +82,11 @@ def _store_kw(cfg: dict) -> dict:
         repo=cfg.get("repo", "."),
         base_branch=cfg.get("base_branch", "main"),
         max_files_by_difficulty=cfg.get("max_files_by_difficulty"),
+        # bd-xqypj: thread the per-board difficulty→starting-tier override (beside
+        # max_files_by_difficulty) so the /ci escalation path's board honors it when this
+        # route is the first caller to construct the cached board — get_store keys only on
+        # (db, repo, base_branch), so a later caller's kwargs can't retrofit it.
+        difficulty_tiers=cfg.get("difficulty_tiers"),
         projects=resolve_projects(cfg),
         default_project=resolve_default_project(cfg),
     )

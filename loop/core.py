@@ -523,6 +523,11 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             repo=self.cfg.get("repo", "."),
             base_branch=self.cfg.get("base_branch", "main"),
             max_files_by_difficulty=self.cfg.get("max_files_by_difficulty"),
+            # bd-xqypj: thread the per-board difficulty→starting-tier override (beside
+            # max_files_by_difficulty) so the loop's shared board honors it when IT is the
+            # first caller to construct the cached board — get_store keys only on
+            # (db, repo, base_branch), so a later caller's kwargs can't retrofit it.
+            difficulty_tiers=self.cfg.get("difficulty_tiers"),
             # #90: hand the store the same resolved map, so its own per-feature reads
             # (the Ready gate's `_repo_for`) resolve to the same project the loop does.
             projects=self._projects,

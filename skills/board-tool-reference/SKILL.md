@@ -104,7 +104,8 @@ The card is created whether or not `ready_check.ok`; fix what it lists, then
 ### Fields
 
 - `parent`: the epic/milestone id. `priority`: 0 = highest. `difficulty`
-  (small|medium|large) seeds the model tier.
+  (small|medium|large) seeds the STARTING model tier — small/medium open on `standard`
+  (Sonnet), large on `reasoning` (Opus); a failing card still climbs the ladder.
 - `depends_on`: comma-separated blocker ids on THIS board. On update it ADDS edges;
   `board_remove_dependency` tears them down.
 - `foundation=True`: a card others build on. Dependents gate on its MERGE, never its
