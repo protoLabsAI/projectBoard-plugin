@@ -1924,7 +1924,9 @@ class ReconcileMixin:
         under a per-head marker. Two layers keep it to one per head: the hold remembers the
         head it summoned for (a 30-second tick never re-posts), and the marker lets a
         restarted process find the earlier comment (an unchanged body is a no-op, never a
-        PATCH). A failed post is retried on the next merge poll."""
+        PATCH). A failed post is retried on the next merge poll. The comment's creation
+        time distinguishes a completed re-review from the original incomplete result;
+        exhausted recovery becomes an operator-owned needs-review block and alert."""
         fid = feature["id"]
         head = ext.head
         signals = list(ext.incomplete_signals)
@@ -1948,7 +1950,41 @@ class ReconcileMixin:
             except Exception:  # noqa: BLE001 — bookkeeping must not break the reconcile
                 log.warning("[project_board] %s incomplete-review hold comment failed", fid, exc_info=True)
         handle = self._review_summon_handle_for(feature)
-        if not handle or review_coverage_hold.summoned(fid, head):
+        if not handle:
+            return
+        summoned_at = await worktree.marked_pr_comment_created_at(
+            pr_url, review_coverage_hold.summon_marker(head), cwd=repo
+        )
+        if summoned_at is None:
+            return  # failed read / unknown creation time: neither resummon nor exhaust
+        if summoned_at:
+            review_coverage_hold.mark_summoned(fid, head)
+            if review_coverage_hold.completed_after(ext.incomplete_result_at, summoned_at):
+                # Recheck both identities after the comment read. A stale result must
+                # not park a new head or a card that moved while GitHub was queried.
+                fresh = await asyncio.to_thread(store.get_feature, fid)
+                current = await worktree.pr_review_state(pr_url, cwd=repo)
+                cfg = self._external_review_cfg_for(fresh or {})
+                latest = external_review.evaluate(current, cfg) if current and cfg else None
+                if (
+                    fresh
+                    and fresh.get("board_state") == "in_review"
+                    and fresh.get("pr_url") == pr_url
+                    and self._require_complete_review_for(fresh)
+                    and latest
+                    and latest.head == head
+                    and latest.incomplete
+                    and review_coverage_hold.completed_after(latest.incomplete_result_at, summoned_at)
+                ):
+                    reason = (
+                        f"Incomplete review coverage after re-review: card {fid}, PR {pr_url}, head {head}. "
+                        f"Completed re-review still incomplete: {'; '.join(latest.incomplete_signals)}. "
+                        "Operator: restore panel coverage and request a complete review, then unblock the card."
+                    )
+                    await asyncio.to_thread(self._flag_blocked, store, fid, reason, category="needs-review")
+                    await asyncio.to_thread(self._notify_operator, fid, reason, store=store)
+            return
+        if review_coverage_hold.summoned(fid, head):
             return
         posted = await worktree.post_or_update_pr_comment(
             pr_url,
