@@ -864,6 +864,25 @@ def _all_items_disposed(items) -> bool:
     return all(str(i.get("status", "")).strip().lower() in REQ_CLOSED_STATUSES for i in items or ())
 
 
+def _all_items_declined(items) -> bool:
+    """True only when the ledger is NON-EMPTY and EVERY item is `declined` (#715) — the
+    all-declined publication-gate predicate, read beside ``_all_items_disposed``.
+
+    An all-declined ledger PASSES ``_all_items_disposed`` (declined is a closed status)
+    yet represents NOTHING built: a coder that declined every requirement and shipped no
+    change must not open a ``Fixes #N`` PR that auto-merge would close with the source
+    issue unaddressed (protoAgent#4953: six declines, one docs file, the PR still said
+    `Fixes #4725`). The drive blocks such a card for the operator and the PR opener
+    references rather than closes the issue.
+
+    Vacuously FALSE with no items — the OPPOSITE of ``_all_items_disposed``'s vacuous
+    True: with no ledger there is nothing to judge all-declined, so the gate is inert and
+    an unledgered card publishes exactly as before. One `done` (or any non-declined
+    status) makes it False — a partial delivery is a real delivery."""
+    items = list(items or ())
+    return bool(items) and all(str(i.get("status", "")).strip().lower() == "declined" for i in items)
+
+
 def apply_requirement_dispositions(items, dispositions) -> list[dict]:
     """Merge one coder round's per-item dispositions into the requirement ledger.
 

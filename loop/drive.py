@@ -2814,6 +2814,41 @@ class DriveMixin:
                             f"requirements unresolved: {len(open_items)} item(s) still open after "
                             f"{n} fix round(s): " + ", ".join(str(i.get("id")) for i in open_items)
                         )
+                    # #715 publication gate: the disposition gate above passed, but a CODING
+                    # card whose coder DECLINED every requirement built NOTHING — `declined`
+                    # is a closed status, so an all-declined ledger is "disposed" yet has no
+                    # delivery behind it. Opening a normal PR here would stamp `Fixes #N` and,
+                    # once reviewed and auto-merged, CLOSE the source issue with the work
+                    # undone: on protoAgent#4953 the coder declined all six requirements,
+                    # shipped one docs file, and the PR still said `Fixes #4725`. So do NOT
+                    # open a ready PR — block the card for the OPERATOR (a terminal,
+                    # owner=operator hold the sweep never lifts, mapping `terminal` →
+                    # MANUAL_BLOCK_CLASS like the #166 source-issue-closed guard just below)
+                    # to decide whether to accept a scope reduction, and KEEP the worktree
+                    # (no `_discard_tree`, no reap) so the coder's prerequisite report
+                    # survives for that decision. Tasks never reach this seam (they drive
+                    # through `_drive_task`); the issue_type guard states the coding-only
+                    # intent explicitly. A partial delivery (any `done`) is NOT all-declined,
+                    # so it publishes exactly as today.
+                    if ledger and _all_items_declined(ledger) and feature.get("issue_type") != LABEL_TASK:
+                        declines = "; ".join(
+                            f"{i.get('id')}: {str(i.get('decline_reason') or '').strip() or 'no reason given'}"
+                            for i in ledger
+                        )
+                        reason = (
+                            "all requirements declined — nothing built; operator decides whether to accept a "
+                            f"scope reduction. Decline reasons: {declines}"
+                        )
+                        log.warning(
+                            "[project_board] %s all %d requirement(s) declined — blocking for operator, keeping worktree",
+                            fid,
+                            len(ledger),
+                        )
+                        if await self._block_or_stand_aside(
+                            store, fid, reason, repo=repo, wt=wt, branch=branch, category="terminal"
+                        ):
+                            self._inflight.pop(fid, None)
+                        return
                     # Is the card still this drive's to publish for (#398, and the #211
                     # operator cancel before it)? Re-read right before any edge that would act
                     # on it. A card held, marked done, cancelled or taken into review elsewhere
@@ -4120,7 +4155,13 @@ class DriveMixin:
             return body, False
         issue_slug, n = parsed
         target_repo = await worktree.repo_slug(cwd=wt)
-        refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, self._store(), feature)
+        # #715: an all-declined card that an operator later unblocks or salvages must
+        # REFERENCE, never CLOSE, its source issue — the work was declined, so a merged
+        # `Fixes #N` would close the issue with nothing built. OR it into refs_only so the
+        # body AND the title (the drive sanitises it with this same flag) both say `Refs #N`.
+        refs_only = await asyncio.to_thread(
+            _source_issue_has_open_sibling, self._store(), feature
+        ) or _all_items_declined(feature.get("requirements") or [])
         return _inject_source_issue_line(body, issue_slug, n, target_repo, refs_only=refs_only), refs_only
 
     # ── helpers ───────────────────────────────────────────────────────────────
