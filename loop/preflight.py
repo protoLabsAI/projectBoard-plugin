@@ -1034,10 +1034,13 @@ class PreflightMixin:
         * anything else — not board-owned, dirty, or holding unpushed commits — is left
           untouched and the operator is paged ONCE for that branch.
 
-        A git failure (``off["error"]``) is uncertain evidence: nothing is switched, nobody
-        is paged, and the counter is left as it was. Returns ``{"switched", "detail"}``;
-        ``detail`` is the off-base reason for /status."""
-        passes = self.__dict__.setdefault("_off_base_passes", {})  # realpath -> {branch, count, acted}
+        A git failure is uncertain evidence and NEVER switches or pages (AC4): whether it is
+        the off-base check (``off["error"]``) or ``git switch`` itself refusing, nothing is
+        moved, nobody is paged, and — because a plain ``git switch`` is idempotent and
+        lossless — the lossless case is simply retried on the next pass rather than being
+        marked done. Only the page is spent once per branch. Returns ``{"switched",
+        "detail"}``; ``detail`` is the off-base reason for /status."""
+        passes = self.__dict__.setdefault("_off_base_passes", {})  # realpath -> {branch, count, paged}
         key = os.path.realpath(repo)
         if off.get("error"):
             log.debug("[project_board] off-base check for %s skipped (uncertain): %s", name, off["error"])
@@ -1048,15 +1051,26 @@ class PreflightMixin:
         branch = off.get("branch") or "an unknown branch"
         st = passes.get(key)
         if not st or st.get("branch") != branch:
-            st = {"branch": branch, "count": 0, "acted": False}  # new or changed branch — reset
+            st = {"branch": branch, "count": 0, "paged": False}  # new or changed branch — reset
         st["count"] += 1
         passes[key] = st
         detail = f"HEAD is on {branch!r}, not the base branch {base!r}"
-        if st["count"] < 2 or st["acted"]:
-            return {"switched": False, "detail": detail}  # first pass changes nothing; act once
-        st["acted"] = True
+        if st["count"] < 2:
+            return {"switched": False, "detail": detail}  # first pass changes nothing
         if owned and not off.get("dirty") and not off.get("unpushed"):
-            result = await worktree.switch_base_checkout(repo, base)
+            # Lossless: a clean board-owned checkout whose branch holds no commit a remote
+            # lacks. A `git switch` is a checkout mutation, so take the SAME registration
+            # smoke lock _refresh_one holds — a gate smoke and a checkout mutation must never
+            # run under each other (#452 review M2). A smoke running in it right now defers
+            # the switch to the next pass. The branch it leaves keeps every commit.
+            from ..project_registry import _SMOKE_LOCKS
+
+            lock = _SMOKE_LOCKS.setdefault(str(Path(repo).expanduser().resolve()), asyncio.Lock())
+            if lock.locked():
+                log.debug("[project_board] off-base switch for %s deferred — a gate smoke is running in it", repo)
+                return {"switched": False, "detail": detail}
+            async with lock:  # uncontended: acquired without yielding, so nothing slips in between
+                result = await worktree.switch_base_checkout(repo, base)
             if result.get("state") == "switched":
                 passes.pop(key, None)  # on base now — reset
                 log.warning(
@@ -1067,13 +1081,22 @@ class PreflightMixin:
                     base,
                 )
                 return {"switched": True, "detail": ""}
-            log.warning(
-                "[project_board] base checkout %s could not be switched back to %r (%s) — paging the operator",
+            # git refused or could not run: uncertain evidence, the same class as
+            # ``off["error"]``. Switch nothing, page no one (AC4). Leave the counter so the
+            # NEXT pass tries the lossless switch again — a plain ``git switch`` is
+            # idempotent, so a transient refusal self-heals without an operator page.
+            log.debug(
+                "[project_board] base checkout %s not switched back to %r yet (%s) — retrying next pass",
                 repo,
                 base,
                 result.get("detail"),
             )
-        await self._page_off_base(name, repo, base, branch, off)
+            return {"switched": False, "detail": detail}
+        # Not a lossless case — not board-owned, dirty, or holding unpushed commits. The
+        # board must not move it; page the operator ONCE for this branch.
+        if not st["paged"]:
+            st["paged"] = True
+            await self._page_off_base(name, repo, base, branch, off)
         return {"switched": False, "detail": detail}
 
     async def _page_off_base(self, name: str, repo: str, base: str, branch: str, off: dict) -> None:
@@ -1098,8 +1121,12 @@ class PreflightMixin:
             f"{name}'s base checkout {repo} is on {branch}, not {base}, so the board is skipping {cards}. "
             f"It {why}, so the board will not switch it automatically — switch it back to {base} to resume."
         )
+        # This page holds no single card (it is a whole project's queue), so the ``fid`` slot
+        # carries the stable incident id, not a card id or a filesystem path: the stale-card
+        # re-read in _notify_operator then finds nothing to resolve and fails open, and the
+        # dedup key stays stable per (repo, branch) across passes.
         incident = f"base-checkout:{os.path.realpath(repo)}|{branch}"
-        await asyncio.to_thread(self._notify_operator, repo, text, incident=incident)
+        await asyncio.to_thread(self._notify_operator, incident, text, incident=incident)
 
     async def _off_base_held_cards(self, name: str) -> list[str]:
         """The ready cards in project ``name`` an off-base checkout is holding — the ones the

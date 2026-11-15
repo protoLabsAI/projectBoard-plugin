@@ -15,6 +15,7 @@ the whole point of the seam is what git does to a working tree, which no fake ca
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -278,6 +279,71 @@ async def test_a_git_failure_switches_nothing_and_pages_nothing(origin, monkeypa
     await lp._refresh_base_checkouts()
     assert pages == []  # uncertain evidence never pages
     assert _branch(origin.clone) == "prepare-release/v1"  # …and never switches
+
+
+async def test_a_refused_switch_pages_nothing_and_is_retried_next_pass(origin, monkeypatch):
+    # The lossless case — a clean, board-owned, fully-pushed off-base checkout — but `git
+    # switch` is REFUSED on the pass that first acts. A refused switch is uncertain evidence,
+    # the same class as an off-base-check error: it must page NO ONE (AC4). And because a
+    # plain `git switch` is idempotent, the board simply retries it on the next pass rather
+    # than latching 'acted' and paging — the regression that round 1 rejected.
+    origin.park("prepare-release/v1", push=True, commit=True)
+    new = origin.release()
+    lp = _loop({"web": {"repo": origin.clone, "base_refresh": True}})
+    lp._store = lambda: _Ready([{"id": "bd-1", "project": "web"}])  # held cards, in case it paged
+    pages = _capture_pages(lp)
+
+    real_switch = worktree.switch_base_checkout
+    calls = {"n": 0}
+
+    async def _flaky_switch(repo, base):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"state": "unknown", "detail": "git switch refused (transient)"}
+        return await real_switch(repo, base)
+
+    monkeypatch.setattr(worktree, "switch_base_checkout", _flaky_switch)
+
+    await lp._refresh_base_checkouts()  # pass 1: nothing; switch not even attempted
+    assert calls["n"] == 0 and pages == [] and _branch(origin.clone) == "prepare-release/v1"
+
+    await lp._refresh_base_checkouts()  # pass 2: acts, switch REFUSED → no page, untouched
+    assert calls["n"] == 1
+    assert pages == []  # a refused switch never pages
+    assert _branch(origin.clone) == "prepare-release/v1"  # left exactly as it was
+    assert health.base_checkouts_snapshot()["web"]["state"] == "stale"  # still visible on /status
+
+    await lp._refresh_base_checkouts()  # pass 3: RETRIED (not latched) → switched + fast-forwarded
+    assert calls["n"] == 2
+    assert pages == []
+    assert _branch(origin.clone) == "main"
+    assert origin.head() == new
+
+
+async def test_a_running_gate_smoke_defers_the_switch_and_pages_nothing(origin):
+    # A `git switch` is a checkout mutation, so it must never run under a registration gate
+    # smoke (#452 review M2) — the same lock `_refresh_one` honours. While the smoke holds the
+    # checkout's lock the lossless switch is deferred, not forced and not paged; once the smoke
+    # releases, the next pass switches it back.
+    from project_board.project_registry import _SMOKE_LOCKS
+
+    origin.park("prepare-release/v1", push=True, commit=True)
+    new = origin.release()
+    lp = _loop({"web": {"repo": origin.clone, "base_refresh": True}})
+    pages = _capture_pages(lp)
+
+    lock = _SMOKE_LOCKS.setdefault(str(Path(origin.clone).expanduser().resolve()), asyncio.Lock())
+    await lock.acquire()  # a registration gate smoke is running in the checkout right now
+    try:
+        await lp._refresh_base_checkouts()  # pass 1
+        await lp._refresh_base_checkouts()  # pass 2: would switch, but the smoke holds the lock
+        assert _branch(origin.clone) == "prepare-release/v1"  # deferred, not switched
+        assert pages == []  # a lossless case is never an operator page
+    finally:
+        lock.release()
+
+    await lp._refresh_base_checkouts()  # smoke done: the switch is retried and succeeds
+    assert _branch(origin.clone) == "main" and origin.head() == new and pages == []
 
 
 async def test_a_branch_change_resets_the_consecutive_count(origin):
