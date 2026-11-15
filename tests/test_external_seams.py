@@ -261,6 +261,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_pr_url": "REAL",  # #398: through real `br` in tests/test_requeue_under_drive_398.py
     "record_review_bounce": "REAL",  # #473: the head stamp + comment, real `br` in tests/test_external_review_473.py
     "record_ci_rerun": "REAL",  # #487: the rerun stamp, real `br` in tests/test_ci_rerun_487.py
+    "record_external_result": "REAL",  # #767: the signed-result stamp, real `br` in tests/test_external_result_stamp_767.py
     "record_reviewed_head": "UNCOVERED",
     "record_board_draft": "REAL",  # #691: set/clear through real `br` in tests/test_draft_until_review_691.py
     "request_decomposition": "REAL",

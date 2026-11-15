@@ -364,7 +364,15 @@ def build_router(cfg: dict):
     ext_lock = threading.Lock()
 
     async def _external_head(fid: str, kind: str, body: dict) -> tuple[str, dict | None]:
-        """``(live_head, None)`` when the result may apply, else ``("", ignored_reply)``."""
+        """``(live_head, None)`` when the result may apply, else ``("", ignored_reply)``.
+
+        A card the loop is still working is refused first (400, #398), exactly as before
+        this check existed: that is "retry after the round", not "ignored"."""
+        from .loop import requeue_refusal
+
+        refusal = requeue_refusal(fid)
+        if refusal:
+            raise HTTPException(400, refusal)
         given = str(body.get("head_sha") or "").strip().lower()
         if not given:
             return "", _ignored(fid, kind, "no head_sha: the reconcile poll reads the PR's live state instead")
