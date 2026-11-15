@@ -15,7 +15,22 @@ VERSION = 1
 MAX_RECORD_BYTES = 16384
 MAX_ENTRIES = 100
 MAX_REVISIONS = 1000
-FIELDS = {"id", "path", "repo", "branch", "sha", "pushed", "purpose", "remote_ref", "session_id", "last_check"}
+FIELDS = {
+    "id",
+    "path",
+    "repo",
+    "branch",
+    "sha",
+    "pushed",
+    "retired",
+    "purpose",
+    "remote_ref",
+    "session_id",
+    "last_check",
+}
+
+# Terminal board states whose recorded work no longer needs recovery once a card closes.
+TERMINAL_STATES = frozenset({"done", "cancelled"})
 
 
 def text(value, name: str, limit: int, *, required: bool = False) -> str:
@@ -51,6 +66,11 @@ def validate(entry: dict) -> dict:
     if pushed is not None and type(pushed) is not bool:
         raise ValueError("pushed must be true, false or null (unknown)")
     result["pushed"] = pushed
+    retired = entry.get("retired")
+    if retired is not None and type(retired) is not bool:
+        raise ValueError("retired must be true or false when present")
+    if retired:
+        result["retired"] = True
     if not result["path"].strip() and not (pushed is True and (result["sha"] or result["branch"].strip())):
         raise ValueError("path is required unless a git identity is explicitly reported pushed=true")
     for key in ("remote_ref", "session_id"):
@@ -66,6 +86,21 @@ def validate(entry: dict) -> dict:
     if len(json.dumps(result).encode()) > MAX_RECORD_BYTES - 1024:
         raise ValueError("entry is too large; shorten path, purpose or git references")
     return result
+
+
+def skip_recovery(entry: dict, board_state: str = "") -> bool:
+    """Whether the location sweep and recovery view ignore this recorded entry entirely.
+
+    Pure policy over recorded facts (no IO, no probe): a ``retired`` entry is always
+    ignored, and every entry on a terminal (done/cancelled) card is ignored too — EXCEPT
+    real unpushed work (``pushed`` false with a recorded ``sha``), whose sole local copy
+    still needs recovery and must keep alerting.
+    """
+    if entry.get("retired"):
+        return True
+    if str(board_state or "") in TERMINAL_STATES:
+        return not (entry.get("pushed") is False and entry.get("sha"))
+    return False
 
 
 def record(entry: dict, actor: str) -> dict:

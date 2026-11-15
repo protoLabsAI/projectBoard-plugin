@@ -180,7 +180,14 @@ def probe(entry, roots, deadline, *, local_only=False):
             if not authorized(local, roots):
                 raise ValueError("upstream requires filesystem authorization or an HTTPS remote")
             url = str(local.resolve())
-        advertised = run("ls-remote", "--exit-code", "--refs", "--", url, ref).splitlines()
+        try:
+            advertised = run("ls-remote", "--exit-code", "--refs", "--", url, ref).splitlines()
+        except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as exc:
+            # A merged/deleted upstream or an unreachable remote (ls-remote exit 2/128) is a probe
+            # error: the remote status stays UNKNOWN and pushed stays None. Never read a failed
+            # advertisement as unpushed local work.
+            facts["error"] = str(exc)[:300]
+            return facts
         matches = [line.split()[0] for line in advertised if line.split()[1:] == [ref]]
         if len(matches) != 1:
             raise ValueError("upstream ref absent or ambiguous")
@@ -271,6 +278,18 @@ class Sweep:
                 for entry in ledger.get("entries", [])
                 if entry.get("path", "").strip() and not coder_scratch(entry["path"])
             ]
+            # Retired entries, and the work of terminal (done/cancelled) cards, no longer need
+            # recovery (#755): don't probe them, raise no risk, and drop any cached probe so a
+            # closed card with only such entries stops showing a recovery row. Real unpushed work
+            # (pushed=false with a sha) on a terminal card is the one exception — it still alerts.
+            state = feature.get("board_state")
+            kept = []
+            for entry in entries:
+                if work_locations.skip_recovery(entry, state):
+                    work_snapshot.drop_location(feature["id"], entry.get("id"))
+                else:
+                    kept.append(entry)
+            entries = kept
             if not entries or ledger.get("errors"):
                 continue
             first = self.location_offsets.get(feature["id"], 0) % len(entries)
