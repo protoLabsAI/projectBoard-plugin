@@ -253,13 +253,15 @@ async def test_missing_tree_retirement_preserves_unpushed_recovery(tmp_path, pus
     _git("-C", tree, "commit", "-m", "unpublished work")
     sha = _git("-C", tree, "rev-parse", "HEAD")
     store = FakeStore(
-        locations=[{
-            "id": "tree",
-            "path": tree,
-            "purpose": "unpublished work",
-            "pushed": pushed,
-            "sha": sha if has_sha else "",
-        }]
+        locations=[
+            {
+                "id": "tree",
+                "path": tree,
+                "purpose": "unpublished work",
+                "pushed": pushed,
+                "sha": sha if has_sha else "",
+            }
+        ]
     )
     original = deepcopy(store._locations["tree"])
     # Simulate removal outside the save-before-reap path, before merge is observed.
