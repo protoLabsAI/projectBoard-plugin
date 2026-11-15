@@ -1723,10 +1723,27 @@ async def test_restart_retains_candidate_and_requirement_followup(history, monke
         assert await worktree.preserved_recovery_progress(path, branch)
     await _drive_with(monkeypatch, **kwargs)
     assert loops[0] is not loops[1]
-    assert "open_review" in store.names()
-    assert not any(c[0] == "flag_blocked" for c in store.calls)
     if followup:
+        from project_board.store import MANUAL_BLOCK_CLASS
+
         assert feature["requirements"][0]["status"] == "declined"
+        opened.assert_not_awaited()
+        assert "open_review" not in store.names()
+        blocked = [c for c in store.calls if c[0] == "flag_blocked"]
+        assert len(blocked) == 1
+        assert blocked[0][3] == MANUAL_BLOCK_CLASS
+        assert "all requirements declined" in blocked[0][2]
+        assert "optional coverage is outside scope" in blocked[0][2]
+        # The resumed disposition closes the ledger without delivering any work.
+        # Keep the recovered candidate intact for the operator's scope decision.
+        assert store.reaps == [] and store.removes == []
+        assert (Path(path) / "a").read_text() == resolution
+        git(path, "merge-base", "--is-ancestor", remote, "HEAD")
+        git(path, "merge-base", "--is-ancestor", base, "HEAD")
+        assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == remote
+    else:
+        assert "open_review" in store.names()
+        assert not any(c[0] == "flag_blocked" for c in store.calls)
 
 
 @pytest.mark.parametrize("interruption", ["none", "restart", "provider"])
