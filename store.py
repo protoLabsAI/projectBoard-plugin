@@ -34,6 +34,7 @@ Notes on `br` quirks pinned down empirically (br 0.1.x):
 from __future__ import annotations
 
 from .block_pages import after_transition
+from .link_events import after_terminal
 
 import asyncio
 import contextlib
@@ -4034,6 +4035,7 @@ class BeadsBoard:
 
     # ── the ONE Done edge for coding features (invariant #2) ──────────────────
     @after_transition
+    @after_terminal
     def record_merge(self, *, pr_url: str) -> dict | None:
         """Close the feature whose PR merged — the ONLY path to `done` for a coding
         feature (task-type beads close via record_verification, #217). Idempotent;
@@ -4087,6 +4089,7 @@ class BeadsBoard:
 
     # ── the MANUAL Done edge (#228): shipped outside the board's PR lifecycle ──
     @after_transition
+    @after_terminal
     def mark_done(self, fid: str, *, reason: str = "") -> dict:
         """Mark a feature `done` by hand — for work that shipped OUTSIDE the board's
         PR lifecycle (a change landed via another repo/tool, a feature completed
@@ -4144,6 +4147,7 @@ class BeadsBoard:
     # ── the task Done edge (#217): verify, not merge ──────────────────────────
     @_task_edge
     @after_transition
+    @after_terminal
     def record_verification(self, fid: str, approved: bool = True, feedback: str = "", by: str = "") -> dict:
         """The task-type Done edge (#217) — record_merge's verify sibling, and
         DELIBERATELY a second `br close` edge beside it (the cancel_feature
@@ -4200,6 +4204,7 @@ class BeadsBoard:
 
     # ── the second terminal edge: cancel (not merge) ──────────────────────────
     @after_transition
+    @after_terminal
     def cancel_feature(self, fid: str, reason: str = "") -> dict:
         """Cancel a feature created in error (bad decomposition, duplicate, scope cut).
 
