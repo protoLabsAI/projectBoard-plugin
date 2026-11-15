@@ -897,6 +897,19 @@ async def checkout_head_sha(repo: str) -> str:
     return out.strip() if rc == 0 else ""
 
 
+async def checkout_branch(repo: str) -> str:
+    """The branch ``repo``'s main checkout has checked out (``git rev-parse --abbrev-ref
+    HEAD``) — ``"main"``, a feature branch, or ``"HEAD"`` when the HEAD is detached; ``""``
+    only when git cannot say (no repo, no commits, git missing). Local only: no fetch, no
+    network. The off-base recovery sweep reads this to tell an off-base checkout from one on
+    its base branch, and to name the branch it was left on. Never raises."""
+    try:
+        rc, out, _err = await _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    except Exception:  # noqa: BLE001 — an unavailable git is "unknown", never an error
+        return ""
+    return out.strip() if rc == 0 else ""
+
+
 async def changed_paths(tree: str, base: str = "") -> list[str] | None:
     """The repo-relative paths a worktree changes against the point it forked from
     ``base``: commits made since then, uncommitted edits to tracked files, and new untracked
@@ -1013,6 +1026,92 @@ async def refresh_base_checkout(repo: str, base: str) -> dict:
         return {"state": "fast_forwarded", "behind": behind, "detail": ""}
     except Exception as exc:  # noqa: BLE001 — a refresh problem is reported, never raised into the sweep
         return {"state": "unknown", "behind": 0, "detail": f"base refresh failed: {exc}"}
+
+
+async def off_base_checkout(repo: str, base: str) -> dict:
+    """The facts the off-base recovery sweep needs about ``repo``'s MAIN checkout — whether
+    it sits on ``base``, and if not, whether it can be switched back safely (bd-z4jw6).
+
+    ``refresh_base_checkout`` fast-forwards a checkout ONLY while it is on its base branch, so
+    one left on another branch (an operator's release branch after a release ship) is never
+    moved and its project's cards sit unclaimed. This reports what a recovery pass must know
+    before it may act:
+
+    ``{"branch", "off_base", "dirty", "unpushed", "error"}`` —
+      * ``branch`` — the current branch (``checkout_branch``), ``"HEAD"`` when detached; ``""``
+        only when git could not say.
+      * ``off_base`` — ``True`` when HEAD is not on ``base``, ``False`` when it is, ``None`` on
+        an error.
+      * ``dirty`` — ``True`` when the tree has uncommitted TRACKED changes. Untracked files
+        never count (build output and scratch dirs live in every working checkout), the same
+        rule as :func:`base_checkout_dirt`.
+      * ``unpushed`` — how many commits the current branch holds that ``origin/<base>`` and
+        the branch's own upstream lack (0 when everything is published; :func:`_unique_commits`).
+      * ``error`` — non-empty when ANY check git needs for the decision failed. The caller
+        must then do NOTHING (never switch, never page): this may only ever downgrade to
+        uncertain, never invent a verdict.
+
+    Local git only — it reads remote-tracking refs already on disk, it never fetches. Never
+    raises."""
+    base = str(base or "").strip() or "main"
+    branch = await checkout_branch(repo)
+    if not branch:
+        return {"branch": "", "off_base": None, "dirty": False, "unpushed": 0, "error": "git could not read HEAD"}
+    if branch == base:
+        return {"branch": branch, "off_base": False, "dirty": False, "unpushed": 0, "error": ""}
+    # Off base. Read tracked-only dirt with a raw status so a git FAILURE (rc != 0) is told
+    # apart from a clean tree — base_checkout_dirt() collapses both to "", which a switch
+    # must never read as "clean".
+    try:
+        rc, out, err = await _git(repo, "status", "--porcelain", "--untracked-files=no")
+    except WorktreeError as exc:
+        return {"branch": branch, "off_base": True, "dirty": False, "unpushed": 0, "error": f"git status failed: {exc}"}
+    if rc != 0:
+        return {
+            "branch": branch,
+            "off_base": True,
+            "dirty": False,
+            "unpushed": 0,
+            "error": f"git status failed: {(err or out).strip()[:160]}",
+        }
+    dirty = bool(out.strip())
+    try:
+        # A detached HEAD is not a branch head, so it has no ref name to exclude.
+        unpushed = await _unique_commits(repo, branch=branch if branch != "HEAD" else "", base=base)
+    except WorktreeError as exc:
+        return {
+            "branch": branch,
+            "off_base": True,
+            "dirty": dirty,
+            "unpushed": 0,
+            "error": f"cannot tell if its commits are pushed: {exc}",
+        }
+    return {"branch": branch, "off_base": True, "dirty": dirty, "unpushed": unpushed, "error": ""}
+
+
+async def switch_base_checkout(repo: str, base: str) -> dict:
+    """Switch ``repo``'s MAIN checkout back onto its ``base`` branch with ``git switch
+    <base>`` (bd-z4jw6). The off-base recovery sweep calls this ONLY after it has confirmed
+    the checkout is board-owned, has no uncommitted tracked changes, and holds no commits a
+    remote lacks — so the switch loses nothing.
+
+    It never stashes, resets, force-switches or deletes a branch: a plain ``git switch``
+    refuses rather than overwrite local work, and the branch it leaves keeps every commit it
+    had. Sits next to :func:`refresh_base_checkout`, which fast-forwards the checkout once it
+    is back on base.
+
+    Returns ``{"state", "detail"}``: ``switched`` (now on ``base``), or ``unknown`` (git
+    refused or could not run — ``detail`` says why, and the checkout is left exactly as it
+    was). Never raises."""
+    base = str(base or "").strip() or "main"
+    try:
+        rc, out, err = await _git(repo, "switch", base)
+    except WorktreeError as exc:
+        return {"state": "unknown", "detail": f"git switch {base} failed: {exc}"}
+    if rc != 0:
+        return {"state": "unknown", "detail": f"git switch {base} refused: {(err or out).strip()[:200]}"}
+    log.info("[project_board] base checkout %s switched back to %s", repo, base)
+    return {"state": "switched", "detail": ""}
 
 
 async def prune_stale_worktrees(repo: str) -> str:
