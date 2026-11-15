@@ -1663,6 +1663,25 @@ def _is_test_rung(wt_id: str, fid: str) -> bool:
     return bool(re.search(r"\.test(?:\.|$)", wt_id[len(fid) :]))
 
 
+def feature_tree_for_path(repo: str, worktrees_root: str, fid: str, path: str) -> str | None:
+    """Containing feature tree, including missing trees, for a recorded location.
+
+    Use the same canonical, slugged and candidate naming as the reap. Looking at
+    the tree root (not the recorded file) distinguishes a removed tree from a kept
+    candidate whose recorded output file is missing.
+    """
+    base = os.path.abspath(os.path.join(repo, worktrees_root))
+    relative = os.path.relpath(os.path.abspath(path), base)
+    name = relative.split(os.sep)[0]
+    if (
+        name == f"feat-{fid}"
+        or name.startswith(f"feat-{fid}-")
+        or (name.startswith(f"feat-{fid}.") and parent_feature_id(name[len("feat-") :]) == fid)
+    ):
+        return os.path.join(base, name)
+    return None
+
+
 def _feature_tree_names(base: str, fid: str, *, test_rung: bool = True) -> tuple[list[str], list[str]]:
     """The on-disk worktree dirs under ``base`` that feature ``fid`` owns BY SCAN, as
     ``(slugged canonical names, candidate names)``, sorted. The bare ``feat-<fid>`` is

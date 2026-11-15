@@ -76,9 +76,35 @@ crosses a fail-closed HMAC boundary (`X-Hub-Signature-256`) before touching the 
 | `GET` | `/config/projects` | Public page chrome for the sandboxed Configure tab. |
 | `GET` | `/config/routing` | Public page chrome for the sandboxed Configure ▸ Coder routing tab. |
 | `GET` | `/config/review` | Public page chrome for the Review & merge Configure tab (S4, #614). It holds no board data: the Review→CI→Rebase→Merge step switches, their attempts steppers, the workflow/reviewer/merge-method pickers and the dependent-cards radio all read and write through the gated `settings` route (and `routing/effective` for the delegate picker) via the authenticated plugin-kit fetch. |
-| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false`: - with an escalation ladder → record + climb a tier and **requeue** to ready (the puller… 400 while the loop is still working the card, a live drive or review gate (#398). |
-| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR — the review sibling of `/ci` fail. Records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), feeds them into the next di… 400 while the loop is still working the card, a live drive or review gate (#398). |
+| `POST` | `/features/{fid}/ci` | CI result for the feature's PR. Body: `{passed: bool, head_sha: str, reason?: str}`. `passed: true` is a no-op (merge sets done, via the webhook). `passed: false` at the PR's live head (see [Head SHA](#head-sha-on-signed-results)): with an escalation ladder, record + climb a tier and **requeue** to ready (Blocked when the ladder is exhausted); with a single coder, bounce to `in_progress` for the operator. 400 while the loop is still working the card, a live drive or review gate (#398). |
+| `POST` | `/features/{fid}/review` | Adverse code-review bounce for the feature's open PR, the review sibling of `/ci` fail. Body: `{findings: str, head_sha: str, escalate?: bool=false}`. At the PR's live head (see [Head SHA](#head-sha-on-signed-results)) it records the `findings` as a DISTINCT review-bounce comment on the bead (≠ ci-fail), leads the next dispatch prompt with them, and requeues onto the SAME open PR; `escalate: true` climbs the model ladder (Blocked at its top). 400 unless the card is `in_review`, and while the loop is still working the card, a live drive or review gate (#398). |
 | `POST` | `/webhook/pr` | GitHub PR webhook — the SINGLE Done edge. On a `closed` event with `merged: true` it sets the matching feature `done` (nothing else does) and reaps its worktree. The raw body is HMAC-verified against… |
+
+### Head SHA on signed results
+
+A signed `/ci` failure or `/review` bounce must say which PR head it is about, in
+`head_sha` (7 to 40 hex characters; a short sha matches by prefix). The board compares it
+with the PR's live `headRefOid` before it changes anything, and applies **one result of
+each kind per head** (#767). Every case that does not apply returns
+`200 {"ok": true, "ignored": "<why>"}` and leaves the card as it was:
+
+| Case | Reply |
+|---|---|
+| No `head_sha` | `ignored`: the reconcile poll reads the PR's live state on its next tick instead |
+| `head_sha` is not the PR's live head (a late or redelivered result) | `ignored`: stale head |
+| The card has no PR, or the live head cannot be read from GitHub | `ignored` |
+| A result of the same kind was already applied at this head | `ignored`: already applied |
+| `head_sha` is not hex | `400` |
+
+The applied head is stamped on the card (`ext-ci:<sha>` / `ext-rv:<sha>`), so a restart
+cannot apply it again, and a new push re-arms it. If the result is refused before it
+changes the card (for example the card is no longer `in_review`), the stamp is cleared so
+the same result can be sent again. If it fails part-way, after an earlier write landed
+(the tier climbed, then the requeue failed), the stamp stays: a resend is ignored rather
+than climbing the ladder a second time, and the reconcile poll settles the card.
+
+The operator twin of `/review` under `/api` takes no `head_sha`: an operator acts on what
+they see, not on a delivered payload.
 
 ## Long saves
 

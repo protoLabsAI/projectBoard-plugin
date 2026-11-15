@@ -23,6 +23,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import threading
 from typing import Literal
 
 from fastapi import Request  # module-level so the webhook's stringized annotation resolves
@@ -44,6 +46,9 @@ from .store import (
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
+
+#: A signed result's ``head_sha`` (#767): an abbreviated or full git sha.
+_HEAD_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
 class ProjectUpsertBody(BaseModel):
@@ -349,19 +354,123 @@ def build_router(cfg: dict):
     # HMAC, not the operator bearer), /features/{fid}/ci, and /review. Every POST
     # below crosses the same fail-closed HMAC boundary before touching the store.
 
+    # ── signed external results: one per PR head (#767) ───────────────────────
+    # A result names the head it was computed for (`head_sha`). It applies only when that
+    # is the PR's LIVE head and no result of the same kind was applied at that head yet.
+    # Anything else is a hint, not evidence: it is acknowledged (200, `ignored`) and left
+    # to the reconcile poll, which reads the PR's real state on its next tick. So a late
+    # or redelivered result for head A can never bounce a card already at head B, and a
+    # replay at the same head can never climb the ladder twice.
+    # One lock per card, not one for the board: the check-stamp-apply for a card must not
+    # interleave with another result for the SAME card, but results for different cards
+    # are independent, so a slow `br` write on one never holds up the rest.
+    ext_locks: dict[str, threading.Lock] = {}
+    ext_locks_guard = threading.Lock()
+
+    def _card_lock(fid: str) -> threading.Lock:
+        with ext_locks_guard:
+            return ext_locks.setdefault(fid, threading.Lock())
+
+    async def _external_head(fid: str, kind: str, body: dict) -> tuple[str, dict | None]:
+        """``(live_head, None)`` when the result may apply, else ``("", ignored_reply)``.
+
+        A card the loop is still working is refused first (400, #398), exactly as before
+        this check existed: that is "retry after the round", not "ignored"."""
+        from .loop import requeue_refusal
+
+        refusal = requeue_refusal(fid)
+        if refusal:
+            raise HTTPException(400, refusal)
+        given = str(body.get("head_sha") or "").strip().lower()
+        if not given:
+            return "", _ignored(fid, kind, "no head_sha: the reconcile poll reads the PR's live state instead")
+        if not _HEAD_SHA_RE.fullmatch(given):
+            raise HTTPException(400, "head_sha must be 7-40 hex characters")
+        feature = await _guard(lambda: store().get_feature(fid))
+        if feature is None:
+            raise HTTPException(404, f"no feature {fid}")
+        pr_url = str(feature.get("pr_url") or "").strip()
+        if not pr_url:
+            return "", _ignored(fid, kind, "the card has no PR")
+        from . import worktree
+
+        live = (await worktree.pr_head_sha(pr_url, cwd=repo_for_feature(feature, store_kw))).strip().lower()
+        if not live:
+            return "", _ignored(fid, kind, "could not read the PR's live head; the reconcile poll retries")
+        if not live.startswith(given):
+            return "", _ignored(fid, kind, f"stale head: result is for {given[:12]}, the PR is at {live[:12]}")
+        return live, None
+
+    def _ignored(fid: str, kind: str, why: str) -> dict:
+        log.info("[project_board] signed %s result for %s ignored: %s", kind, fid, why)
+        return {"ok": True, "ignored": why}
+
+    def _card_moved(before: dict, after: dict | None) -> bool:
+        """Whether the card changed between two reads, ignoring the #767 stamps: its
+        status, or any label (an escalation tier, a bounce, a requeue, a block)."""
+        from .store import LABEL_EXTERNAL_RESULT_PREFIX
+
+        stamps = tuple(LABEL_EXTERNAL_RESULT_PREFIX.values())
+
+        def shape(f: dict) -> tuple:
+            labels = sorted(str(lab) for lab in f.get("labels") or [] if not str(lab).startswith(stamps))
+            return (f.get("bead_status"), f.get("board_state"), labels)
+
+        return after is None or shape(before) != shape(after)
+
+    def _apply_once(fid: str, kind: str, live: str, apply):
+        """Run ``apply`` at most once per (card, kind, head): stamp the head first. If
+        ``apply`` fails before changing the card (a refusal), clear the stamp so the
+        result can be resent. If it fails part-way, after an earlier write landed (the
+        tier climbed, then the requeue raised), KEEP the stamp: a resend would repeat
+        that write, so it is ignored and the reconcile poll settles the card instead."""
+        from .store import SHORT_SHA_LEN, external_result_head
+
+        with _card_lock(fid):
+            s = store()
+            f = s.get_feature(fid)
+            if f is None:
+                raise BoardError(f"no feature {fid}")
+            if external_result_head(f.get("labels"), kind) == live[:SHORT_SHA_LEN]:
+                return _ignored(fid, kind, f"a {kind} result was already applied at {live[:12]}")
+            s.record_external_result(fid, kind, live)
+            try:
+                return apply()
+            except Exception:
+                try:
+                    if _card_moved(f, s.get_feature(fid)):
+                        log.warning(
+                            "[project_board] %s: %s result failed part-way at %s; keeping the stamp so a "
+                            "resend can't repeat what already landed",
+                            fid,
+                            kind,
+                            live[:12],
+                        )
+                    else:
+                        s.record_external_result(fid, kind, "")
+                except BoardError:
+                    log.warning("[project_board] %s: could not settle the %s stamp", fid, kind, exc_info=True)
+                raise
+
     @router.post("/features/{fid}/ci")
     async def _ci(fid: str, request: Request):
         """CI result for the feature's PR. ``passed: true`` is a no-op (merge sets
-        done, via the webhook). ``passed: false``:
+        done, via the webhook). ``passed: false`` with a ``head_sha`` that is the PR's
+        live head, applied at most once per head (#767):
           - with an escalation ladder → record + climb a tier and **requeue** to
             ready (the puller re-dispatches at the higher tier, pushing to the same
             PR); when the ladder is exhausted → Blocked.
           - with a single coder → bounce to in_progress for the operator (no auto-
-            requeue, so a persistently-failing coder can't loop forever)."""
+            requeue, so a persistently-failing coder can't loop forever).
+        A failure without ``head_sha``, for a stale head, or repeated at a head already
+        acted on is acknowledged with ``ignored`` and changes nothing."""
         body = await _signed_json(request)
         if bool(body.get("passed")):
             return {"ok": True, "note": "CI green — done is set by the merge webhook, not CI"}
         reason = str(body.get("reason", ""))
+        live, ignored = await _external_head(fid, "ci", body)
+        if ignored:
+            return ignored
 
         def _handle():
             # Never under a live round (#398) — both branches below move the card.
@@ -383,7 +492,7 @@ def build_router(cfg: dict):
                 }
             return {"requeued": True, "escalated": True, "next_tier": nxt, "feature": s.requeue(fid)}
 
-        return await _guard(_handle)
+        return await _guard(lambda: _apply_once(fid, "ci", live, _handle))
 
     @router.post("/features/{fid}/review")
     async def _review(fid: str, request: Request):
@@ -394,15 +503,28 @@ def build_router(cfg: dict):
         SAME open PR** (``pr_url`` preserved via external_ref). Works from
         ``in_review``.
 
-        Body: ``{findings: str, escalate: bool=false}``. ``escalate=true`` climbs the
-        model ladder (like ``/ci``); the default keeps the same tier. With escalation
-        enabled and the ladder already at the top, an escalated bounce → Blocked
-        (never a silent re-loop)."""
+        Body: ``{findings: str, head_sha: str, escalate: bool=false}``. ``head_sha`` must
+        be the PR's live head, and one bounce applies per head (#767); otherwise the
+        reply is ``ignored`` and nothing changes. ``escalate=true`` climbs the model
+        ladder (like ``/ci``); the default keeps the same tier. With escalation enabled
+        and the ladder already at the top, an escalated bounce → Blocked (never a silent
+        re-loop)."""
         body = await _signed_json(request)
         findings = str(body.get("findings", ""))
         escalate = bool(body.get("escalate", False))
-        # The operator twin on the data router (#473) runs the same bounce.
-        return await _guard(lambda: review_bounce(store(), fid, findings, escalate=escalate, escalate_on=escalate_on))
+        live, ignored = await _external_head(fid, "review", body)
+        if ignored:
+            return ignored
+        # The operator twin on the data router (#473) runs the same bounce, without the
+        # head check: an operator acts on what they see, not on a delivered payload.
+        return await _guard(
+            lambda: _apply_once(
+                fid,
+                "review",
+                live,
+                lambda: review_bounce(store(), fid, findings, escalate=escalate, escalate_on=escalate_on),
+            )
+        )
 
     # ── the ONE Done edge: merge webhook ──────────────────────────────────────
     @router.post("/webhook/pr")

@@ -732,6 +732,15 @@ class ReconcileMixin:
         # project's repo, and a worktree resolved in repo A must be reaped in repo A.
         for repo in self._all_repos():
             await self._sweep_worktrees(store, repo)
+        # A deferred drive can remove its own tree before the orphan scan sees it.
+        # Revisit done PR cards from the store, including after a restart or a failed
+        # ledger write. Existing trees (especially stranded candidates) stay active.
+        for f in await self._list_for_pass(store, "done", "merged work-location retirement"):
+            if f.get("pr_url") and not self._reap_held_by_drive(f["id"]):
+                try:
+                    await self._retire_merged_work_locations(store, f["id"], self._repo_for(f))
+                except Exception:  # noqa: BLE001 — e.g. a project's checkout no longer resolves
+                    log.warning("[project_board] %s could not retire merged work locations", f["id"], exc_info=True)
         # (a2) bring each board-owned base checkout up to origin/<base> where that is safe,
         # and report the ones that can't be (#452). Its own task: network-bound, so it must
         # never hold the tick (#462). Never touches the board store.
@@ -1128,6 +1137,8 @@ class ReconcileMixin:
                         continue
                     self._busy_keeps.pop(wtid, None)
                     reaped = await self._reap_feature_worktree(repo, wtid)
+                    if f is not None and f["board_state"] == "done" and f.get("pr_url"):
+                        await self._retire_merged_work_locations(store, fid, repo)
                     if reaped:
                         self._reap_failures.pop(wtid, None)
                         log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
@@ -1281,7 +1292,7 @@ class ReconcileMixin:
         reconcile reap sites called ``reap_feature_worktree`` directly, with no liveness
         check. The drive reaps its own tree when it ends (its cancel / terminal edge), so a
         deferred reap is picked up by a later pass once the drive is gone."""
-        return _loop.live_drive(fid) is not None
+        return _loop.live_drive(worktree.parent_feature_id(fid)) is not None
 
     async def _reap_feature_worktree(self, repo: str, fid: str) -> bool:
         """The single gate EVERY reconcile worktree reap goes through (#752), so no site can
@@ -1301,18 +1312,6 @@ class ReconcileMixin:
         self._reap_deferred.discard(fid)
         return await worktree.reap_feature_worktree(repo, self.root, fid)
 
-    def _under_feature_tree(self, path: str, repo: str, fid: str) -> bool:
-        """Does the recorded work-location ``path`` lie inside one of ``fid``'s worktree
-        directories (#752)? The feature's trees are ``<repo>/<root>/feat-<fid>`` and its
-        slugged/candidate variants (``feat-<fid>-<slug>`` #227, ``feat-<fid>.<suffix>``); a
-        path counts when it is that stem or sits under it at a tree boundary (``-`` slug,
-        ``.`` candidate, or a path separator). Boundary-checked so ``feat-<fid>`` never
-        matches another card's ``feat-<fid>2`` tree. Pure path policy — no disk read, so it
-        still classifies entries after the tree is already gone."""
-        stem = os.path.abspath(os.path.join(repo, self.root, f"feat-{fid}"))
-        target = os.path.abspath(path)
-        return target == stem or any(target.startswith(stem + boundary) for boundary in (os.sep, "-", "."))
-
     async def _retire_merged_work_locations(self, store, fid: str, repo: str) -> None:
         """A merged card's tree was just reaped (#752): re-record each of its work-location
         entries that pointed INTO that tree with ``retired: true`` (the field bd-uu9z6 adds),
@@ -1320,6 +1319,8 @@ class ReconcileMixin:
         paths this close just deleted. Entries elsewhere — a scratch repo, a pushed branch —
         are left untouched. Best-effort throughout: any failure (an unreadable or malformed
         ledger, a failed re-record) is logged and never blocks the close."""
+        if self._reap_held_by_drive(fid):
+            return
         try:
             ledger = await asyncio.to_thread(store.list_work_locations, fid)
         except Exception:  # noqa: BLE001 — retirement is best-effort; a close must never hinge on it
@@ -1333,7 +1334,10 @@ class ReconcileMixin:
             if entry.get("retired"):
                 continue
             path = entry.get("path") or ""
-            if not path or not self._under_feature_tree(path, repo, fid):
+            tree = worktree.feature_tree_for_path(repo, self.root, fid, path) if path else None
+            # The reap's boolean only describes canonical/slugged trees. Candidates
+            # with unsaved work may remain, even when their recorded file is missing.
+            if tree is None or os.path.lexists(tree):
                 continue
             revision = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
             revision["retired"] = True
@@ -1455,9 +1459,8 @@ class ReconcileMixin:
                         review_coverage_hold.clear_hold(fid)
                     if state == "MERGED":
                         if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
-                            if reap and await self._reap_feature_worktree(repo, fid):
-                                # The tree is gone: retire the card's work locations that pointed
-                                # into it, so the sweep stops flagging the deleted paths (#752).
+                            if reap:
+                                await self._reap_feature_worktree(repo, fid)
                                 await self._retire_merged_work_locations(store, fid, repo)
                             self._ci_feedback.pop(fid, None)
                             self._review_prior.pop(fid, None)

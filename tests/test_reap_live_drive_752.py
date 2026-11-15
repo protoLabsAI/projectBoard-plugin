@@ -237,3 +237,108 @@ async def test_retire_failure_never_blocks_the_close(tmp_path):
     assert store.cleared, "budgets reset → the close completed past the failed retire"
     assert not os.path.exists(tree)
     assert "retired" not in store._locations["intree"]  # the failed re-record left it as it was
+
+
+async def test_deferred_merge_is_retired_by_orphan_sweep(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore(locations=[{"id": "tree", "path": tree, "purpose": "build"}])
+    loop = _loop(repo)
+    monkeypatch.setattr(worktree, "processes_in_trees", AsyncMock(return_value={}))
+    drive = asyncio.create_task(asyncio.Event().wait())
+    _drive_slot().drives[FID] = drive
+    try:
+        await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
+        assert store.feature["board_state"] == "done"
+        assert "retired" not in store._locations["tree"]
+    finally:
+        drive.cancel()
+        await asyncio.gather(drive, return_exceptions=True)
+        _drive_slot().drives.pop(FID, None)
+
+    # No second merge poll: done cards leave that lane. The orphan sweep owns retry.
+    await loop._sweep_worktrees(store, repo.clone)
+    assert not os.path.exists(tree)
+    assert store._locations["tree"]["retired"] is True
+
+
+async def test_kept_candidate_locations_remain_active_until_candidate_reaped(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    candidate = repo.make_tree(FID + ".g1")
+    Path(candidate, "unique.txt").write_text("sole copy of work")
+    store = FakeStore(locations=[
+        {"id": "canonical", "path": tree, "purpose": "build"},
+        {"id": "candidate", "path": candidate + "/missing-output", "purpose": "candidate"},
+    ])
+    loop = _loop(repo)
+    discard = worktree.discard_worktree
+
+    async def cannot_save(repo, path, branch, **kwargs):
+        if path == candidate:
+            return False, worktree.StrandedTree(path, branch, "save failed")
+        return await discard(repo, path, branch, **kwargs)
+
+    monkeypatch.setattr(worktree, "discard_worktree", cannot_save)
+    await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
+    assert not os.path.exists(tree)
+    assert Path(candidate, "unique.txt").read_text() == "sole copy of work"
+    assert store._locations["canonical"]["retired"] is True
+    assert "retired" not in store._locations["candidate"]
+
+    monkeypatch.setattr(worktree, "discard_worktree", discard)
+    monkeypatch.setattr(worktree, "processes_in_trees", AsyncMock(return_value={}))
+    await loop._sweep_worktrees(store, repo.clone)
+    assert not os.path.exists(candidate)
+    assert store._locations["candidate"]["retired"] is True
+
+
+async def test_health_sweep_retries_retirement_after_tree_already_gone(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore(
+        locations=[{"id": "tree", "path": tree, "purpose": "build"}], fail_record_for={"tree"}
+    )
+    loop = _loop(repo)
+    await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
+    assert not os.path.exists(tree)
+    assert "retired" not in store._locations["tree"]
+    store.fail_record_for.clear()
+
+    # A new loop proves retry is durable, with no pending-reap memory or on-disk tree.
+    loop = _loop(repo)
+    monkeypatch.setattr(loop, "_store", lambda: store)
+    monkeypatch.setattr(loop, "_all_repos", lambda: [repo.clone])
+    monkeypatch.setattr(store, "list_features", lambda *, state: [store.feature] if state == "done" else [], raising=False)
+    monkeypatch.setattr(store, "archive_stale", lambda days: 0, raising=False)
+    monkeypatch.setattr(loop, "_start_base_refresh", lambda: None)
+    monkeypatch.setattr(loop, "_publish_orphaned_cards", AsyncMock())
+    monkeypatch.setattr(loop, "_recover_blocked", AsyncMock())
+    monkeypatch.setattr(loop, "_publish_work_snapshot", AsyncMock())
+    await loop._sweep()
+    assert store._locations["tree"]["retired"] is True
+
+
+def test_recorded_path_matches_only_feature_tree_names(tmp_path):
+    base = tmp_path / ".worktrees"
+    for name in (f"feat-{FID}", f"feat-{FID}-slug", f"feat-{FID}.g1", f"feat-{FID}.test.g2"):
+        tree = str(base / name)
+        assert worktree.feature_tree_for_path(str(tmp_path), ".worktrees", FID, tree + "/file") == tree
+    for name in (f"feat-{FID}2", f"feat-{FID}.gx", f"feat-{FID}.other", "elsewhere"):
+        assert worktree.feature_tree_for_path(str(tmp_path), ".worktrees", FID, str(base / name)) is None
+    assert worktree.feature_tree_for_path(str(tmp_path), ".worktrees", FID, str(tmp_path / f"feat-{FID}")) is None
+
+
+async def test_candidate_reap_checks_parent_drive(tmp_path):
+    repo = _Repo(tmp_path)
+    candidate = repo.make_tree(FID + ".c1")
+    loop = _loop(repo)
+    drive = asyncio.create_task(asyncio.Event().wait())
+    _drive_slot().drives[FID] = drive
+    try:
+        assert not await loop._reap_feature_worktree(repo.clone, FID + ".c1")
+        assert os.path.isdir(candidate)
+    finally:
+        drive.cancel()
+        await asyncio.gather(drive, return_exceptions=True)
+        _drive_slot().drives.pop(FID, None)

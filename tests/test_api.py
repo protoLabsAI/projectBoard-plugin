@@ -24,6 +24,7 @@ import types
 from collections import OrderedDict
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -34,6 +35,20 @@ from project_board.store import BoardError
 ROOT = Path(__file__).resolve().parent.parent
 
 
+#: The PR every FakeStore card carries, and its live head (#767: a signed /ci or /review
+#: result applies only for the PR's live head; ``_live_head`` below serves it).
+PR_URL = "https://github.com/org/repo/pull/1"
+HEAD = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _live_head(monkeypatch):
+    async def _head(pr_url, *, cwd="."):
+        return HEAD
+
+    monkeypatch.setattr("project_board.worktree.pr_head_sha", _head)
+
+
 class FakeStore:
     """Records calls; returns minimal feature dicts. ``escalate``/``record_merge``
     returns are configurable so the /ci and /webhook branches can be steered."""
@@ -42,6 +57,7 @@ class FakeStore:
         self.calls = []
         self._escalate_to = escalate_to
         self._merged = merged
+        self.labels: dict[str, list[str]] = {}
 
     def _rec(self, name, *a, **k):
         self.calls.append((name, a, k))
@@ -53,7 +69,20 @@ class FakeStore:
 
     def get_feature(self, fid):
         self.calls.append(("get_feature", (fid,), {}))
-        return None if fid == "missing" else {"id": fid, "board_state": "ready"}
+        if fid == "missing":
+            return None
+        row = {"id": fid, "board_state": "ready", "labels": list(self.labels.get(fid, []))}
+        # bd-1 (the signed /ci and /review tests' card) has an open PR; other cards have none.
+        return {**row, "pr_url": PR_URL} if fid == "bd-1" else row
+
+    def record_external_result(self, fid, kind, head=""):
+        # The #767 per-head stamp, as the real store keeps it: one replaced label per kind.
+        from project_board.store import LABEL_EXTERNAL_RESULT_PREFIX, SHORT_SHA_LEN
+
+        prefix = LABEL_EXTERNAL_RESULT_PREFIX[kind]
+        kept = [lab for lab in self.labels.get(fid, []) if not lab.startswith(prefix)]
+        self.labels[fid] = kept + ([f"{prefix}{head[:SHORT_SHA_LEN]}"] if head else [])
+        return self.get_feature(fid)
 
     def create_epic(self, *a):
         return self._rec("create_epic", *a)
@@ -950,7 +979,9 @@ def test_ci_pass_is_a_noop(monkeypatch):
 def test_ci_fail_with_a_ladder_escalates_and_requeues(monkeypatch):
     store = FakeStore(escalate_to="smart")
     c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
-    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "boom"})
+    r = _external_post(
+        c, "/plugins/project_board/features/bd-1/ci", {"head_sha": HEAD, "passed": False, "reason": "boom"}
+    )
     body = r.json()
     assert body["requeued"] is True and body["escalated"] is True and body["next_tier"] == "smart"
     assert any(call[0] == "requeue" for call in store.calls)
@@ -959,7 +990,7 @@ def test_ci_fail_with_a_ladder_escalates_and_requeues(monkeypatch):
 def test_ci_fail_at_the_top_of_the_ladder_blocks(monkeypatch):
     store = FakeStore(escalate_to=None)  # ladder exhausted
     c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
-    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False})
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"head_sha": HEAD, "passed": False})
     body = r.json()
     assert body["exhausted"] is True and body["requeued"] is False
     assert any(call[0] == "block_from_review" for call in store.calls)
@@ -968,10 +999,127 @@ def test_ci_fail_at_the_top_of_the_ladder_blocks(monkeypatch):
 def test_ci_fail_with_a_single_coder_bounces_to_in_progress(monkeypatch):
     store = FakeStore()
     c = _client(monkeypatch, store, cfg=_external_cfg())  # no coders map → no escalation
-    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "x"})
+    r = _external_post(c, "/plugins/project_board/features/bd-1/ci", {"head_sha": HEAD, "passed": False, "reason": "x"})
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is False
     assert any(call[0] == "bounce_ci_fail" for call in store.calls)
+
+
+# ── #767: a signed result applies only at the PR's live head, once per head ──────
+
+_MOVES = ("escalate", "requeue", "bounce_ci_fail", "block_from_review", "record_review_bounce")
+_SIGNED = {
+    "ci": ("/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "boom"}),
+    "review": ("/plugins/project_board/features/bd-1/review", {"findings": "null guard", "escalate": True}),
+}
+
+
+def _moved(store):
+    return [call[0] for call in store.calls if call[0] in _MOVES]
+
+
+@pytest.mark.parametrize("kind", ["ci", "review"])
+def test_signed_result_for_a_stale_head_does_not_move_the_card(monkeypatch, kind):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED[kind]
+    r = _external_post(c, path, {**body, "head_sha": "b" * 40})  # the PR is at HEAD (a…)
+    assert r.status_code == 200 and r.json()["ignored"].startswith("stale head")
+    assert _moved(store) == []
+
+
+@pytest.mark.parametrize("kind", ["ci", "review"])
+def test_signed_result_without_a_head_is_left_to_the_reconcile_poll(monkeypatch, kind):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED[kind]
+    r = _external_post(c, path, body)
+    assert r.status_code == 200 and "no head_sha" in r.json()["ignored"]
+    assert _moved(store) == []
+
+
+@pytest.mark.parametrize("kind", ["ci", "review"])
+def test_redelivered_result_at_the_same_head_applies_once(monkeypatch, kind):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED[kind]
+    first = _external_post(c, path, {**body, "head_sha": HEAD})
+    assert first.json()["escalated"] is True
+    escalations = _moved(store).count("escalate")
+    again = _external_post(c, path, {**body, "head_sha": HEAD[:12]})  # a short sha names the same head
+    assert "already applied" in again.json()["ignored"]
+    assert _moved(store).count("escalate") == escalations == 1
+
+
+def test_a_new_head_re_arms_the_signed_result(monkeypatch):
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED["ci"]
+    _external_post(c, path, {**body, "head_sha": HEAD})
+    new_head = "c" * 40
+
+    async def _moved_head(pr_url, *, cwd="."):
+        return new_head
+
+    monkeypatch.setattr("project_board.worktree.pr_head_sha", _moved_head)
+    r = _external_post(c, path, {**body, "head_sha": new_head})
+    assert r.json()["escalated"] is True
+    assert _moved(store).count("escalate") == 2
+
+
+def test_a_refused_result_clears_its_stamp_so_it_can_be_resent(monkeypatch):
+    class WrongState(FakeStore):
+        def record_review_bounce(self, fid, findings=""):
+            raise BoardError("review bounce expects in_review, got 'in_progress'")
+
+    store = WrongState()
+    c = _client(monkeypatch, store, cfg=_external_cfg())
+    path, body = _SIGNED["review"]
+    assert _external_post(c, path, {**body, "head_sha": HEAD}).status_code == 400
+    assert store.labels.get("bd-1") == []  # the stamp was rolled back
+
+
+def test_a_result_that_fails_part_way_keeps_its_stamp(monkeypatch):
+    """The tier climbed, then the requeue raised: a resend at the same head must not climb
+    it again, so the stamp stays and the resend is ignored (QA finding on #771)."""
+
+    class HalfApplied(FakeStore):
+        def escalate(self, fid, reason):
+            self.labels.setdefault(fid, []).append("tier:smart")  # the climb landed
+            return super().escalate(fid, reason)
+
+        def requeue(self, fid):
+            raise BoardError("br update timed out")
+
+    store = HalfApplied(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED["ci"]
+    assert _external_post(c, path, {**body, "head_sha": HEAD}).status_code == 400
+    assert any(lab.startswith("ext-ci:") for lab in store.labels["bd-1"])  # stamp kept
+    again = _external_post(c, path, {**body, "head_sha": HEAD})
+    assert "already applied" in again.json()["ignored"]
+    assert _moved(store).count("escalate") == 1
+
+
+def test_signed_result_when_the_live_head_cannot_be_read_changes_nothing(monkeypatch):
+    async def _unreadable(pr_url, *, cwd="."):
+        return ""
+
+    monkeypatch.setattr("project_board.worktree.pr_head_sha", _unreadable)
+    store = FakeStore(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED["ci"]
+    r = _external_post(c, path, {**body, "head_sha": HEAD})
+    assert "could not read" in r.json()["ignored"]
+    assert _moved(store) == []
+
+
+def test_signed_result_with_a_malformed_head_is_a_400(monkeypatch):
+    store = FakeStore()
+    c = _client(monkeypatch, store, cfg=_external_cfg())
+    path, body = _SIGNED["ci"]
+    assert _external_post(c, path, {**body, "head_sha": "not-a-sha"}).status_code == 400
+    assert _moved(store) == []
 
 
 # ── /features/{fid}/review — the adverse-review bounce (bd-171) ─────────────────
@@ -989,7 +1137,7 @@ def test_review_bounce_requeues_and_records_a_distinct_comment(monkeypatch):
     r = _external_post(
         c,
         "/plugins/project_board/features/bd-1/review",
-        {"findings": "auth check missing a null guard"},
+        {"head_sha": HEAD, "findings": "auth check missing a null guard"},
     )
     assert r.status_code == 200
     body = r.json()
@@ -1007,14 +1155,18 @@ def test_review_findings_reach_the_loop_feedback_bridge(monkeypatch):
 
     loop_mod._PENDING_FEEDBACK.clear()
     c = _client(monkeypatch, FakeStore(), cfg=_external_cfg())
-    _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "missing a null guard"})
+    _external_post(
+        c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "missing a null guard"}
+    )
     assert "missing a null guard" in loop_mod._PENDING_FEEDBACK.get("bd-1", "")
 
 
 def test_review_escalate_true_climbs_the_ladder(monkeypatch):
     store = FakeStore(escalate_to="smart")
     c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
-    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": True})
+    r = _external_post(
+        c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x", "escalate": True}
+    )
     body = r.json()
     assert body["escalated"] is True and body["next_tier"] == "smart" and body["requeued"] is True
     assert any(call[0] == "escalate" for call in store.calls)
@@ -1024,7 +1176,9 @@ def test_review_escalate_true_climbs_the_ladder(monkeypatch):
 def test_review_escalate_false_keeps_the_same_tier(monkeypatch):
     store = FakeStore(escalate_to="smart")
     c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))  # a ladder exists…
-    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": False})
+    r = _external_post(
+        c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x", "escalate": False}
+    )
     body = r.json()
     assert body["escalated"] is False and body["requeued"] is True
     assert not any(call[0] == "escalate" for call in store.calls)  # …but the default doesn't climb it
@@ -1034,7 +1188,9 @@ def test_review_escalate_false_keeps_the_same_tier(monkeypatch):
 def test_review_escalate_exhausted_blocks(monkeypatch):
     store = FakeStore(escalate_to=None)  # ladder already at the top
     c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
-    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x", "escalate": True})
+    r = _external_post(
+        c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x", "escalate": True}
+    )
     body = r.json()
     assert body["exhausted"] is True and body["requeued"] is False
     assert any(call[0] == "block_from_review" for call in store.calls)
@@ -1043,7 +1199,12 @@ def test_review_escalate_exhausted_blocks(monkeypatch):
 def test_review_is_public_hmac_authenticated_and_has_an_operator_twin(monkeypatch):
     c = _client(monkeypatch, FakeStore(), cfg=_external_cfg())
     # served on the public prefix behind its own HMAC boundary: unsigned is refused there…
-    assert _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"}).status_code == 200
+    assert (
+        _external_post(
+            c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x"}
+        ).status_code
+        == 200
+    )
     assert c.post("/plugins/project_board/features/bd-1/review", json={"findings": "x"}).status_code == 401
     # …and, since #473, on the gated /api prefix too, where the host's operator bearer is the
     # boundary instead of the webhook secret (tests/test_external_review_473.py).
@@ -1056,7 +1217,7 @@ def test_review_from_a_non_in_review_state_surfaces_as_400(monkeypatch):
             raise BoardError("review bounce expects in_review, got 'in_progress'")
 
     c = _client(monkeypatch, WrongState(), cfg=_external_cfg())
-    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"})
+    r = _external_post(c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x"})
     assert r.status_code == 400 and "in_review" in r.json()["detail"]
 
 
@@ -2311,8 +2472,10 @@ def test_every_data_and_ingress_route_offloads_its_store_calls(monkeypatch):
         c.post("/api/plugins/project_board/features/bd-1/deliver", json={"text": "t"}),
         c.post("/api/plugins/project_board/features/bd-1/verify", json={"approved": True}),
         c.request("DELETE", "/api/plugins/project_board/features/bd-1", json={"reason": "r"}),
-        _external_post(c, "/plugins/project_board/features/bd-1/ci", {"passed": False, "reason": "x"}),
-        _external_post(c, "/plugins/project_board/features/bd-1/review", {"findings": "x"}),
+        _external_post(
+            c, "/plugins/project_board/features/bd-1/ci", {"head_sha": HEAD, "passed": False, "reason": "x"}
+        ),
+        _external_post(c, "/plugins/project_board/features/bd-1/review", {"head_sha": HEAD, "findings": "x"}),
     ]
     raw = _merge_body()
     sweep.append(
