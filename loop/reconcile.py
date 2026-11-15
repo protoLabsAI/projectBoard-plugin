@@ -1333,6 +1333,11 @@ class ReconcileMixin:
         for entry in ledger.get("entries", []):
             if entry.get("retired"):
                 continue
+            # A missing tree is not evidence that its work was saved. Preserve the
+            # terminal recovery policy for recorded unpushed commits, including
+            # when a later health sweep retries after external tree removal.
+            if not work_locations.skip_recovery(entry, "done"):
+                continue
             path = entry.get("path") or ""
             tree = worktree.feature_tree_for_path(repo, self.root, fid, path) if path else None
             # The reap's boolean only describes canonical/slugged trees. Candidates

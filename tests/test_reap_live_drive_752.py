@@ -241,6 +241,46 @@ async def test_retire_failure_never_blocks_the_close(tmp_path):
     assert "retired" not in store._locations["intree"]  # the failed re-record left it as it was
 
 
+@pytest.mark.parametrize(
+    ("pushed", "has_sha", "retires"),
+    [(False, True, False), (False, False, True), (True, True, True), (None, True, True)],
+)
+async def test_missing_tree_retirement_preserves_unpushed_recovery(tmp_path, pushed, has_sha, retires):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    Path(tree, "unique.txt").write_text("unpublished work\n")
+    _git("-C", tree, "add", "unique.txt")
+    _git("-C", tree, "commit", "-m", "unpublished work")
+    sha = _git("-C", tree, "rev-parse", "HEAD")
+    store = FakeStore(
+        locations=[{
+            "id": "tree",
+            "path": tree,
+            "purpose": "unpublished work",
+            "pushed": pushed,
+            "sha": sha if has_sha else "",
+        }]
+    )
+    original = deepcopy(store._locations["tree"])
+    # Simulate removal outside the save-before-reap path, before merge is observed.
+    _git("-C", repo.clone, "worktree", "remove", tree)
+    loop = _loop(repo)
+    await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
+    assert store.feature["board_state"] == "done"
+    assert bool(store._locations["tree"].get("retired")) is retires
+
+    # A fresh loop retry (as used by health sweeps) must preserve the same policy.
+    await _loop(repo)._retire_merged_work_locations(store, FID, repo.clone)
+    entry = store._locations["tree"]
+    assert work_locations.skip_recovery(entry, "done") is retires
+    if not retires:
+        assert entry == original
+        # A subsequent affirmative publication report permits retirement on retry.
+        store.record_work_location(FID, {**entry, "pushed": True})
+        await loop._retire_merged_work_locations(store, FID, repo.clone)
+        assert store._locations["tree"]["retired"] is True
+
+
 async def test_deferred_merge_is_retired_by_orphan_sweep(tmp_path, monkeypatch):
     repo = _Repo(tmp_path)
     tree = repo.make_tree()
