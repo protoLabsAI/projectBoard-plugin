@@ -9278,7 +9278,7 @@ def _reviewed(**over):
     return f
 
 
-def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True, draft=False):
+def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merge_ok=True, draft=False, reap_ok=True):
     calls = {"merge": []}
 
     async def _head(repo, ref):
@@ -9298,6 +9298,11 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
     async def _state(pr_url, *, cwd="."):
         return "MERGED" if (merge_ok or calls.get("landed_anyway")) else "OPEN"
 
+    async def _reap(repo, root, fid):
+        # /repo is fictional: model the cleanup result instead of running real git.
+        calls.setdefault("reaped", []).append((repo, root, fid))
+        return reap_ok
+
     async def _delete(repo, branch):
         calls.setdefault("deleted", []).append(branch)
         return True
@@ -9308,6 +9313,7 @@ def _merge_env(monkeypatch, *, head="abcdef123456" + "0" * 28, mss="CLEAN", merg
     monkeypatch.setattr(worktree, "merge_pr", _merge)
     monkeypatch.setattr(worktree, "pr_state", _state)
     monkeypatch.setattr(worktree, "delete_remote_branch", _delete)
+    monkeypatch.setattr(worktree, "reap_feature_worktree", _reap)
     return calls
 
 
@@ -9575,6 +9581,19 @@ async def test_auto_merge_deletes_the_remote_branch_after_a_clean_merge(monkeypa
     store = _MergeStore(_reviewed(labels=["in-review", "merged-verified:abcdef123456"]))
     assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
     assert calls["deleted"] == ["feat/bd-1"]
+
+
+@pytest.mark.parametrize("merge_ok", [False, True])
+async def test_auto_merge_keeps_remote_branch_when_reap_fails(monkeypatch, merge_ok):
+    calls = _merge_env(monkeypatch, merge_ok=merge_ok, reap_ok=False)
+    calls["landed_anyway"] = True
+    loop = BoardLoop({"auto_merge": True, "review_gate": True})
+    store = _MergeStore(_reviewed())
+
+    assert await loop._maybe_auto_merge(store, "bd-1", "https://github.com/o/r/pull/1", "/repo") is True
+    assert calls["reaped"] == [("/repo", loop.root, "bd-1")]
+    assert calls.get("deleted", []) == []  # retain the published ref for a later reap
+    assert loop._auto_merge_failures.get("bd-1", 0) == 0
 
 
 async def test_auto_merge_honours_merge_method(monkeypatch):
