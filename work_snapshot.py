@@ -51,6 +51,8 @@ import time
 import types
 from datetime import datetime, timezone
 
+from . import work_locations
+
 log = logging.getLogger("protoagent.plugins.project_board")
 
 # Board states worth showing as "open work": everything the board still owes an outcome on.
@@ -263,6 +265,16 @@ def cache_location(feature_id: str, entry: dict, facts: dict) -> None:
         state.omitted_locations = getattr(state, "omitted_locations", 0) + 1
 
 
+def drop_location(feature_id: str, entry_id) -> None:
+    """Forget the cached probe for an entry the sweep now skips (retired, or the closed work
+    of a terminal card, #755), so it stops surfacing as a recovery row. Idempotent and silent
+    when nothing was cached, so a steady state never churns the board revision."""
+    state = _state()
+    locations = getattr(state, "locations", None)
+    if locations and locations.pop((feature_id, entry_id), None) is not None:
+        note_board_write()
+
+
 def _risk(entry: dict) -> int:
     check = entry.get("last_check")
     check = check if isinstance(check, dict) else {}
@@ -289,6 +301,10 @@ def recovery_context(feature: dict, *, cached_only: bool = False) -> dict:
     cache = dict(getattr(_state(), "locations", {}))
     if cached_only and not entries:
         entries = [dict(e) for (fid, _), (e, _) in cache.items() if fid == feature.get("id")]
+    # Retired entries and a terminal card's closed work are no longer recoverable (#755); drop
+    # them so a done/cancelled card with only such entries shows no recovery row.
+    state = feature.get("board_state")
+    entries = [e for e in entries if not work_locations.skip_recovery(e, state)]
     for entry in entries:
         cached = cache.get((feature.get("id"), entry.get("id")))
         if cached and all(cached[0].get(k) == entry.get(k) for k in ("path", "repo", "branch", "sha", "at")):

@@ -187,6 +187,24 @@ def test_changed_identity_is_not_pushed(repo, tmp_path):
     assert facts["status"] == "identity-changed" and facts["pushed"] is None
 
 
+def test_ls_remote_failure_is_unknown_not_unpushed(repo, tmp_path, monkeypatch):
+    # #755: a merged/deleted upstream or unreachable remote (ls-remote exit 2/128) is a probe
+    # error — the status stays unknown and pushed stays None. It is never read as unpushed work.
+    clone, _ = repo
+    real = sweep.git
+
+    def flaky(path, *args, **kw):
+        if args and args[0] == "ls-remote":
+            raise ValueError("git ls-remote failed (128)")
+        return real(path, *args, **kw)
+
+    monkeypatch.setattr(sweep, "git", flaky)
+    facts = sweep.probe({"path": str(clone)}, [tmp_path], time.monotonic() + 10)
+    assert facts["status"] == "unknown" and facts["pushed"] is None
+    assert facts.get("ahead", 0) == 0
+    assert "unpushed" not in " ".join(sweep.risks(facts))
+
+
 def test_host_roots_respect_fence_and_disabled(monkeypatch, tmp_path):
     host = SimpleNamespace(
         filesystem_enabled=True,
