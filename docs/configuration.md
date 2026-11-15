@@ -613,11 +613,23 @@ starts a refresh pass as its own task, off the tick, so it never delays claims o
 reconciles. The pass fetches the base of every owned checkout concurrently, under one
 120-second budget for the whole pass, and runs `merge --ff-only --no-overwrite-ignore` on the
 checkout. It does this only when the checkout is clean, on the base branch, and has no local
-commits the remote lacks. The board never resets, stashes, rebases or switches branches, and
-never overwrites an ignored local file that upstream has started tracking. Any other checkout
+commits the remote lacks. The board never resets, stashes, rebases, deletes a branch, or
+overwrites an ignored local file that upstream has started tracking. Any other checkout
 is left exactly as it is and listed under `stale_base_checkouts` on `GET /status`, with the
 reason. The refresh holds the checkout's registration gate-smoke lock, so the two never run
 together.
+
+**A checkout left on another branch is recovered or paged, never skipped silently** (bd-z4jw6).
+A base checkout parked on another branch (an operator's `prepare-release/*` branch after a
+release ship, say) is never fast-forwarded, so the gate preflight gets no verdict and the
+project's ready cards sit unclaimed. The sweep counts the consecutive passes a checkout is off
+its base branch, keyed on `(repo, branch)` and reset the moment it is back on base or its branch
+changes. On the SECOND consecutive pass it acts: a clean, board-owned checkout whose branch
+holds no commit a remote lacks is switched back with a plain `git switch <base>` (lossless — the
+branch it leaves keeps every commit, and the next pass fast-forwards it), logged at WARNING;
+anything else — not board-owned, dirty, or holding unpushed commits — is left untouched and the
+operator is paged ONCE (naming the repo, branch, base and held cards). A git failure, whether
+checking or switching, switches nothing and pages no one — it is retried on the next pass.
 
 **Only board-owned checkouts are moved.** A checkout is board-owned when it sits under the
 host's onboarding root (where onboarding and board registration clone), or when the board

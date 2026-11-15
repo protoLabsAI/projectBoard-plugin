@@ -731,7 +731,7 @@ class DriveMixin:
         and a ``done`` / ``cancelled`` card drops the alert at debug. FAIL OPEN: a read that
         raises never hides a real block — the alert still goes out with whatever is known."""
         now = {}
-        is_block = not incident.startswith(("work-location:", "gate-override|", "external-review|"))
+        is_block = not incident.startswith(("work-location:", "gate-override|", "external-review|", "base-checkout:"))
         try:
             now = (store or self._store()).get_feature(fid)
             state = str((now or {}).get("board_state") or "")

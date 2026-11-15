@@ -963,6 +963,22 @@ class PreflightMixin:
                 continue  # no checkout: the repo setup check owns that
             where[name] = (repo, base)
             owned, why = self._base_refresh_owned(name, repo)
+            # A checkout left on another branch is never fast-forwarded, so its project's
+            # cards sit unclaimed (the gate preflight gets no verdict off base). Count the
+            # consecutive passes it is off base and, on the second, switch a clean board-owned
+            # one back or page the operator (bd-z4jw6).
+            off = await worktree.off_base_checkout(repo, base)
+            recovery = await self._recover_off_base(name, repo, base, owned, off)
+            if recovery["switched"]:
+                # Back on base now — let the normal refresh fast-forward it this same pass.
+                jobs.setdefault((os.path.realpath(repo), base), []).append(name)
+                continue
+            if off.get("off_base") and not off.get("error"):
+                # Off base and not (yet) recovered. Say so on /status — refreshing a non-base
+                # checkout only reports it, it cannot move it — and don't let behind==0 read
+                # as a healthy `current`.
+                results[name] = {"state": "stale", "behind": 0, "detail": recovery["detail"]}
+                continue
             if not owned:
                 results[name] = {"state": "skipped", "behind": 0, "detail": why}
                 continue
@@ -1003,6 +1019,125 @@ class PreflightMixin:
             repo, base = where[name]
             row.update(repo=repo, base=base, checked_at=stamp)
         health.publish_base_checkouts(results)
+
+    async def _recover_off_base(self, name: str, repo: str, base: str, owned: bool, off: dict) -> dict:
+        """Count the consecutive passes project ``name``'s base checkout is off its base
+        branch and, on the SECOND, get the board building again — without ever discarding
+        work (bd-z4jw6).
+
+        The count is keyed on (repo, branch) and reset the moment the checkout is back on
+        base or its branch changes. The first off-base pass changes nothing. On the second:
+
+        * a board-owned checkout with no uncommitted tracked changes whose branch holds no
+          commit a remote lacks is switched back with ``git switch <base>`` (lossless — the
+          branch it leaves keeps its commits), logged at WARNING;
+        * anything else — not board-owned, dirty, or holding unpushed commits — is left
+          untouched and the operator is paged ONCE for that branch.
+
+        A git failure is uncertain evidence and NEVER switches or pages (AC4): whether it is
+        the off-base check (``off["error"]``) or ``git switch`` itself refusing, nothing is
+        moved, nobody is paged, and — because a plain ``git switch`` is idempotent and
+        lossless — the lossless case is simply retried on the next pass rather than being
+        marked done. Only the page is spent once per branch. Returns ``{"switched",
+        "detail"}``; ``detail`` is the off-base reason for /status."""
+        passes = self.__dict__.setdefault("_off_base_passes", {})  # realpath -> {branch, count, paged}
+        key = os.path.realpath(repo)
+        if off.get("error"):
+            log.debug("[project_board] off-base check for %s skipped (uncertain): %s", name, off["error"])
+            return {"switched": False, "detail": ""}
+        if not off.get("off_base"):
+            passes.pop(key, None)  # on base — reset
+            return {"switched": False, "detail": ""}
+        branch = off.get("branch") or "an unknown branch"
+        st = passes.get(key)
+        if not st or st.get("branch") != branch:
+            st = {"branch": branch, "count": 0, "paged": False}  # new or changed branch — reset
+        st["count"] += 1
+        passes[key] = st
+        detail = f"HEAD is on {branch!r}, not the base branch {base!r}"
+        if st["count"] < 2:
+            return {"switched": False, "detail": detail}  # first pass changes nothing
+        if owned and not off.get("dirty") and not off.get("unpushed"):
+            # Lossless: a clean board-owned checkout whose branch holds no commit a remote
+            # lacks. A `git switch` is a checkout mutation, so take the SAME registration
+            # smoke lock _refresh_one holds — a gate smoke and a checkout mutation must never
+            # run under each other (#452 review M2). A smoke running in it right now defers
+            # the switch to the next pass. The branch it leaves keeps every commit.
+            from ..project_registry import _SMOKE_LOCKS
+
+            lock = _SMOKE_LOCKS.setdefault(str(Path(repo).expanduser().resolve()), asyncio.Lock())
+            if lock.locked():
+                log.debug("[project_board] off-base switch for %s deferred — a gate smoke is running in it", repo)
+                return {"switched": False, "detail": detail}
+            async with lock:  # uncontended: acquired without yielding, so nothing slips in between
+                result = await worktree.switch_base_checkout(repo, base)
+            if result.get("state") == "switched":
+                passes.pop(key, None)  # on base now — reset
+                log.warning(
+                    "[project_board] base checkout %s was left on %r, not %r — switched it back so the "
+                    "board can resume building (its commits are all on a remote; nothing discarded)",
+                    repo,
+                    branch,
+                    base,
+                )
+                return {"switched": True, "detail": ""}
+            # git refused or could not run: uncertain evidence, the same class as
+            # ``off["error"]``. Switch nothing, page no one (AC4). Leave the counter so the
+            # NEXT pass tries the lossless switch again — a plain ``git switch`` is
+            # idempotent, so a transient refusal self-heals without an operator page.
+            log.debug(
+                "[project_board] base checkout %s not switched back to %r yet (%s) — retrying next pass",
+                repo,
+                base,
+                result.get("detail"),
+            )
+            return {"switched": False, "detail": detail}
+        # Not a lossless case — not board-owned, dirty, or holding unpushed commits. The
+        # board must not move it; page the operator ONCE for this branch.
+        if not st["paged"]:
+            st["paged"] = True
+            await self._page_off_base(name, repo, base, branch, off)
+        return {"switched": False, "detail": detail}
+
+    async def _page_off_base(self, name: str, repo: str, base: str, branch: str, off: dict) -> None:
+        """Raise ONE operator page for a base checkout left off base that the board must not
+        move itself (bd-z4jw6): it names the repo, the branch it is on, the base branch and
+        the ready cards it is holding. Deduped by an incident key on (repo, branch), so later
+        passes for the same branch never page again."""
+        held = await self._off_base_held_cards(name)
+        if held:
+            shown = ", ".join(held[:4])
+            cards = f"{len(held)} ready card(s) ({shown}{f', +{len(held) - 4} more' if len(held) > 4 else ''})"
+        else:
+            cards = "its ready cards"
+        why = (
+            "has uncommitted changes"
+            if off.get("dirty")
+            else "holds commits no remote has"
+            if off.get("unpushed")
+            else "is not a board-owned checkout"
+        )
+        text = (
+            f"{name}'s base checkout {repo} is on {branch}, not {base}, so the board is skipping {cards}. "
+            f"It {why}, so the board will not switch it automatically — switch it back to {base} to resume."
+        )
+        # This page holds no single card (it is a whole project's queue), so the ``fid`` slot
+        # carries the stable incident id, not a card id or a filesystem path: the stale-card
+        # re-read in _notify_operator then finds nothing to resolve and fails open, and the
+        # dedup key stays stable per (repo, branch) across passes.
+        incident = f"base-checkout:{os.path.realpath(repo)}|{branch}"
+        await asyncio.to_thread(self._notify_operator, incident, text, incident=incident)
+
+    async def _off_base_held_cards(self, name: str) -> list[str]:
+        """The ready cards in project ``name`` an off-base checkout is holding — the ones the
+        claim scan skips as ``preflight-pending``. Best-effort: a store it cannot read names
+        none (the page still goes out)."""
+        try:
+            store = self._store()
+            feats = await asyncio.to_thread(store.list_features, state="ready")
+        except Exception:  # noqa: BLE001 — the page is worth sending even without the card ids
+            return []
+        return [f["id"] for f in feats if self._project_name(f) == name]
 
     async def _publish_orphaned_cards(self, store) -> None:
         """Publish the live cards whose project label no longer resolves (#454) for
