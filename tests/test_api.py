@@ -1079,6 +1079,28 @@ def test_a_refused_result_clears_its_stamp_so_it_can_be_resent(monkeypatch):
     assert store.labels.get("bd-1") == []  # the stamp was rolled back
 
 
+def test_a_result_that_fails_part_way_keeps_its_stamp(monkeypatch):
+    """The tier climbed, then the requeue raised: a resend at the same head must not climb
+    it again, so the stamp stays and the resend is ignored (QA finding on #771)."""
+
+    class HalfApplied(FakeStore):
+        def escalate(self, fid, reason):
+            self.labels.setdefault(fid, []).append("tier:smart")  # the climb landed
+            return super().escalate(fid, reason)
+
+        def requeue(self, fid):
+            raise BoardError("br update timed out")
+
+    store = HalfApplied(escalate_to="smart")
+    c = _client(monkeypatch, store, cfg=_external_cfg(ESCALATION_CFG))
+    path, body = _SIGNED["ci"]
+    assert _external_post(c, path, {**body, "head_sha": HEAD}).status_code == 400
+    assert any(lab.startswith("ext-ci:") for lab in store.labels["bd-1"])  # stamp kept
+    again = _external_post(c, path, {**body, "head_sha": HEAD})
+    assert "already applied" in again.json()["ignored"]
+    assert _moved(store).count("escalate") == 1
+
+
 def test_signed_result_when_the_live_head_cannot_be_read_changes_nothing(monkeypatch):
     async def _unreadable(pr_url, *, cwd="."):
         return ""

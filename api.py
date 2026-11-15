@@ -397,9 +397,25 @@ def build_router(cfg: dict):
         log.info("[project_board] signed %s result for %s ignored: %s", kind, fid, why)
         return {"ok": True, "ignored": why}
 
+    def _card_moved(before: dict, after: dict | None) -> bool:
+        """Whether the card changed between two reads, ignoring the #767 stamps: its
+        status, or any label (an escalation tier, a bounce, a requeue, a block)."""
+        from .store import LABEL_EXTERNAL_RESULT_PREFIX
+
+        stamps = tuple(LABEL_EXTERNAL_RESULT_PREFIX.values())
+
+        def shape(f: dict) -> tuple:
+            labels = sorted(str(lab) for lab in f.get("labels") or [] if not str(lab).startswith(stamps))
+            return (f.get("bead_status"), f.get("board_state"), labels)
+
+        return after is None or shape(before) != shape(after)
+
     def _apply_once(fid: str, kind: str, live: str, apply):
-        """Run ``apply`` at most once per (card, kind, head): stamp the head first, and
-        clear the stamp again if ``apply`` fails, so a refused result can be resent."""
+        """Run ``apply`` at most once per (card, kind, head): stamp the head first. If
+        ``apply`` fails before changing the card (a refusal), clear the stamp so the
+        result can be resent. If it fails part-way, after an earlier write landed (the
+        tier climbed, then the requeue raised), KEEP the stamp: a resend would repeat
+        that write, so it is ignored and the reconcile poll settles the card instead."""
         from .store import SHORT_SHA_LEN, external_result_head
 
         with ext_lock:
@@ -414,9 +430,18 @@ def build_router(cfg: dict):
                 return apply()
             except Exception:
                 try:
-                    s.record_external_result(fid, kind, "")
+                    if _card_moved(f, s.get_feature(fid)):
+                        log.warning(
+                            "[project_board] %s: %s result failed part-way at %s; keeping the stamp so a "
+                            "resend can't repeat what already landed",
+                            fid,
+                            kind,
+                            live[:12],
+                        )
+                    else:
+                        s.record_external_result(fid, kind, "")
                 except BoardError:
-                    log.warning("[project_board] %s: could not clear the %s stamp", fid, kind, exc_info=True)
+                    log.warning("[project_board] %s: could not settle the %s stamp", fid, kind, exc_info=True)
                 raise
 
     @router.post("/features/{fid}/ci")
