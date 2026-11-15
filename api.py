@@ -361,7 +361,15 @@ def build_router(cfg: dict):
     # to the reconcile poll, which reads the PR's real state on its next tick. So a late
     # or redelivered result for head A can never bounce a card already at head B, and a
     # replay at the same head can never climb the ladder twice.
-    ext_lock = threading.Lock()
+    # One lock per card, not one for the board: the check-stamp-apply for a card must not
+    # interleave with another result for the SAME card, but results for different cards
+    # are independent, so a slow `br` write on one never holds up the rest.
+    ext_locks: dict[str, threading.Lock] = {}
+    ext_locks_guard = threading.Lock()
+
+    def _card_lock(fid: str) -> threading.Lock:
+        with ext_locks_guard:
+            return ext_locks.setdefault(fid, threading.Lock())
 
     async def _external_head(fid: str, kind: str, body: dict) -> tuple[str, dict | None]:
         """``(live_head, None)`` when the result may apply, else ``("", ignored_reply)``.
@@ -418,7 +426,7 @@ def build_router(cfg: dict):
         that write, so it is ignored and the reconcile poll settles the card instead."""
         from .store import SHORT_SHA_LEN, external_result_head
 
-        with ext_lock:
+        with _card_lock(fid):
             s = store()
             f = s.get_feature(fid)
             if f is None:

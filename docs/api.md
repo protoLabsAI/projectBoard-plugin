@@ -101,8 +101,10 @@ cannot apply it again, and a new push re-arms it. If the result is refused befor
 changes the card (for example the card is no longer `in_review`), the stamp is cleared so
 the same result can be sent again. If it fails part-way, after an earlier write landed
 (the tier climbed, then the requeue failed), the stamp stays: a resend is ignored rather
-than climbing the ladder a second time, and the reconcile poll settles the card. The operator twin of `/review` under `/api` takes no `head_sha`: an operator acts
-on what they see, not on a delivered payload.
+than climbing the ladder a second time, and the reconcile poll settles the card.
+
+The operator twin of `/review` under `/api` takes no `head_sha`: an operator acts on what
+they see, not on a delivered payload.
 
 ## Long saves
 
