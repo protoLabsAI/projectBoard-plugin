@@ -1954,10 +1954,12 @@ class ReconcileMixin:
             # `origin/<branch>` tracking ref too, and that ref is how the reap knows the
             # tree's commits are published — without it a squash-merged card's commits
             # look like nobody's and get saved to a `stranded/` branch for nothing (#405).
-            await self._reap_feature_worktree(repo, fid)
-            branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
-            if not await worktree.delete_remote_branch(repo, branch):
-                log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
+            # A live drive can start while the merge is in flight. Keep the published
+            # ref when reaping is deferred or fails so later cleanup still sees it (#752).
+            if await self._reap_feature_worktree(repo, fid):
+                branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
+                if not await worktree.delete_remote_branch(repo, branch):
+                    log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
             return True
         n = await self._budget_get(store, fid, "auto-merge", feature) + 1
         await self._budget_set(store, fid, "auto-merge", n)

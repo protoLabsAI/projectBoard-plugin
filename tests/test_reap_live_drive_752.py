@@ -29,6 +29,8 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
+
 from project_board import work_locations, worktree
 from project_board.loop import BoardLoop, _drive_slot
 
@@ -344,3 +346,61 @@ async def test_candidate_reap_checks_parent_drive(tmp_path):
         drive.cancel()
         await asyncio.gather(drive, return_exceptions=True)
         _drive_slot().drives.pop(FID, None)
+
+
+@pytest.mark.parametrize("reap_succeeds", [False, True])
+async def test_auto_merge_deletes_remote_branch_only_after_successful_reap(tmp_path, monkeypatch, reap_succeeds):
+    repo = _Repo(tmp_path)
+    store = FakeStore()
+    loop = _loop(repo)
+    monkeypatch.setattr(loop, "_auto_merge_blockers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(worktree, "merge_pr", AsyncMock(return_value=(True, "")))
+    events = []
+
+    async def reap(*args):
+        events.append("reap")
+        return reap_succeeds
+
+    async def delete(*args):
+        events.append("delete")
+        return True
+
+    monkeypatch.setattr(loop, "_reap_feature_worktree", reap)
+    monkeypatch.setattr(worktree, "delete_remote_branch", delete)
+    assert await loop._maybe_auto_merge(store, FID, PR, repo.clone) is True
+    assert events == (["reap", "delete"] if reap_succeeds else ["reap"])
+
+
+async def test_drive_starting_during_auto_merge_keeps_tree_and_published_ref(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    branch = worktree.branch_name(FID)
+    _git("-C", tree, "push", "-u", "origin", branch)
+    store = FakeStore()
+    loop = _loop(repo)
+    monkeypatch.setattr(loop, "_auto_merge_blockers", AsyncMock(return_value=[]))
+    drive = None
+
+    async def merge(*args, **kwargs):
+        nonlocal drive
+        # The pre-merge liveness check passed; a drive arrives during the GitHub call.
+        drive = asyncio.create_task(asyncio.Event().wait())
+        _drive_slot().drives[FID] = drive
+        return True, ""
+
+    monkeypatch.setattr(worktree, "merge_pr", merge)
+    try:
+        assert await loop._maybe_auto_merge(store, FID, PR, repo.clone) is True
+        assert os.path.isdir(tree)
+        assert _git("-C", repo.clone, "rev-parse", f"refs/remotes/origin/{branch}")
+        assert _git("-C", repo.origin, "rev-parse", f"refs/heads/{branch}")
+    finally:
+        if drive is not None:
+            drive.cancel()
+            await asyncio.gather(drive, return_exceptions=True)
+        _drive_slot().drives.pop(FID, None)
+
+    # The normal MERGED poll can now reap, with the published ref still available.
+    await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
+    assert store.feature["board_state"] == "done"
+    assert not os.path.exists(tree)
