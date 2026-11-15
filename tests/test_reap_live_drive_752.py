@@ -267,10 +267,12 @@ async def test_kept_candidate_locations_remain_active_until_candidate_reaped(tmp
     tree = repo.make_tree()
     candidate = repo.make_tree(FID + ".g1")
     Path(candidate, "unique.txt").write_text("sole copy of work")
-    store = FakeStore(locations=[
-        {"id": "canonical", "path": tree, "purpose": "build"},
-        {"id": "candidate", "path": candidate + "/missing-output", "purpose": "candidate"},
-    ])
+    store = FakeStore(
+        locations=[
+            {"id": "canonical", "path": tree, "purpose": "build"},
+            {"id": "candidate", "path": candidate + "/missing-output", "purpose": "candidate"},
+        ]
+    )
     loop = _loop(repo)
     discard = worktree.discard_worktree
 
@@ -296,9 +298,7 @@ async def test_kept_candidate_locations_remain_active_until_candidate_reaped(tmp
 async def test_health_sweep_retries_retirement_after_tree_already_gone(tmp_path, monkeypatch):
     repo = _Repo(tmp_path)
     tree = repo.make_tree()
-    store = FakeStore(
-        locations=[{"id": "tree", "path": tree, "purpose": "build"}], fail_record_for={"tree"}
-    )
+    store = FakeStore(locations=[{"id": "tree", "path": tree, "purpose": "build"}], fail_record_for={"tree"})
     loop = _loop(repo)
     await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
     assert not os.path.exists(tree)
@@ -309,7 +309,9 @@ async def test_health_sweep_retries_retirement_after_tree_already_gone(tmp_path,
     loop = _loop(repo)
     monkeypatch.setattr(loop, "_store", lambda: store)
     monkeypatch.setattr(loop, "_all_repos", lambda: [repo.clone])
-    monkeypatch.setattr(store, "list_features", lambda *, state: [store.feature] if state == "done" else [], raising=False)
+    monkeypatch.setattr(
+        store, "list_features", lambda *, state: [store.feature] if state == "done" else [], raising=False
+    )
     monkeypatch.setattr(store, "archive_stale", lambda days: 0, raising=False)
     monkeypatch.setattr(loop, "_start_base_refresh", lambda: None)
     monkeypatch.setattr(loop, "_publish_orphaned_cards", AsyncMock())
