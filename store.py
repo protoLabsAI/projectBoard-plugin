@@ -721,6 +721,13 @@ LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX = "ext-review-bounced:"
 # had. On the bead, not in memory, so a restart can't rerun a head the last process already
 # reran. A new push is a new head, which re-arms the allowance; a green rollup clears it.
 LABEL_CI_RERUN_PREFIX = "ci-rerun:"
+# The PR head a SIGNED external result was already applied at (#767) — `ext-ci:<sha>` for a
+# `POST /features/{fid}/ci` failure, `ext-rv:<sha>` for a `POST /features/{fid}/review`
+# bounce. Replaced (never accumulated), SHORT for the 50-char label cap. It makes those
+# routes apply ONE result per head: a redelivered or repeated result for a head the card
+# already acted on is ignored instead of climbing the ladder (or bouncing) a second time.
+# A new push is a new head, which re-arms it. On the bead, so a restart can't re-apply.
+LABEL_EXTERNAL_RESULT_PREFIX = {"ci": "ext-ci:", "review": "ext-rv:"}
 # The ORIGINATING GitHub issue (#97) — a structured `source-issue: owner/repo#N`
 # metadata line in the bead `notes` field, beside the files_to_modify path lines.
 # NOT a label: beads' label validator only allows alphanumeric/hyphen/underscore/
@@ -774,6 +781,16 @@ def budgets_from_labels(labels) -> dict[str, int]:
         if kind and num.isdigit():
             out[kind] = int(num)
     return out
+
+
+def external_result_head(labels, kind: str) -> str:
+    """The short PR head a signed external ``kind`` (``ci`` / ``review``) result was last
+    applied at (#767), or ``""`` when none was."""
+    prefix = LABEL_EXTERNAL_RESULT_PREFIX[kind]
+    for label in labels or []:
+        if str(label).startswith(prefix):
+            return str(label)[len(prefix) :]
+    return ""
 
 
 def ci_rerun_from_labels(labels) -> tuple[str, int]:
@@ -4703,6 +4720,25 @@ class BeadsBoard:
             )
         else:
             args = [a for l in labels if str(l).startswith(LABEL_CI_RERUN_PREFIX) for a in ("--remove-label", str(l))]
+        if not args:
+            return f
+        self._run("update", fid, *args)
+        return self.get_feature(fid)
+
+    # ── signed external result stamp (#767) ───────────────────────────────────
+    def record_external_result(self, fid: str, kind: str, head: str = "") -> dict:
+        """Stamp the PR head a signed ``/ci`` or ``/review`` result was applied at (#767)
+        — a single, replaced ``ext-ci:<sha>`` / ``ext-rv:<sha>`` label. ``head=""`` CLEARS
+        it (the result was stamped but then could not be applied). No-op when nothing
+        changes."""
+        prefix = LABEL_EXTERNAL_RESULT_PREFIX[kind]
+        f = self._require(fid)
+        labels = f.get("labels") or []
+        short = str(head or "").strip()[:SHORT_SHA_LEN]
+        if short:
+            args = replace_prefixed_label_args(labels, prefix, f"{prefix}{short}")
+        else:
+            args = [a for l in labels if str(l).startswith(prefix) for a in ("--remove-label", str(l))]
         if not args:
             return f
         self._run("update", fid, *args)
