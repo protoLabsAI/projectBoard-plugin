@@ -119,6 +119,18 @@ def _no_real_br_version(monkeypatch, tmp_path_factory):
     monkeypatch.setenv(br_fetch.ENV_DATA_DIR, str(tmp_path_factory.mktemp("pb-data")))
     monkeypatch.delenv(br_fetch.ENV_BR_BIN, raising=False)
     br_fetch.reset_state()
+
+    # #765: the link backfill reads the HOST's task store. Never open a real one from the
+    # unit tier (a dev box with protoAgent on the path would read the live instance), and
+    # never publish onto a host bus; tests that exercise it inject both seams.
+    from project_board import link_events
+
+    def _no_host_tasks():
+        raise ImportError("unit tier: no host task store")
+
+    monkeypatch.setattr(link_events, "_default_tasks_store", _no_host_tasks)
+    monkeypatch.setattr(link_events, "_default_publish", lambda: None)
+    monkeypatch.setattr(link_events, "_last_sweep", 0.0)
     yield
     setup_check._BR_VERSION_CACHE.clear()
     setup_check._REVIEW_STATUS_CACHE.clear()
