@@ -142,11 +142,17 @@ def inbox(monkeypatch, tmp_path):
         def __init__(self, path, **kwargs):
             pass
 
-        def add(self, text, *, priority="next", source="", dedup_key="", now=None):
+        def add(self, text, *, priority="next", source="", dedup_key="", now=None, origin_session=""):
             if any(r["dedup_key"] == dedup_key and r["delivered_at"] is None for r in rows):
                 return None
             row = dict(
-                id=len(rows) + 1, text=text, source=source, priority=priority, dedup_key=dedup_key, delivered_at=None
+                id=len(rows) + 1,
+                text=text,
+                source=source,
+                priority=priority,
+                dedup_key=dedup_key,
+                origin_session=origin_session,
+                delivered_at=None,
             )
             rows.append(row)
             return row.copy()
@@ -173,7 +179,15 @@ class _Store:
         self.comments: list[str] = []
 
     def _feature(self):
-        return {"id": FID, "board_state": self.state, "labels": list(self.labels), "pr_url": PR, "title": TITLE}
+        return {
+            "id": FID,
+            "board_state": self.state,
+            "labels": list(self.labels),
+            "pr_url": PR,
+            "title": TITLE,
+            # The chat the card was created from (ADR 0131 P2b-3).
+            "origin_session": "chat-a",
+        }
 
     def get_feature(self, fid):
         return self._feature()
@@ -221,6 +235,15 @@ async def test_a_rejected_head_is_never_offered_the_merge(inbox, monkeypatch, ve
     assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view(verdict)) is True
     text = inbox[0]["text"]
     assert verdict in text and "merge" not in text.lower()
+
+
+async def test_the_agent_page_routes_to_the_cards_origin_session(inbox, monkeypatch):
+    """ADR 0131 P2b-3: the agent-verdict page passes the card's recorded origin as
+    InboxStore.add's ``origin_session``, so it routes back to the chat the card came from."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view("PASS")) is True
+    assert inbox[0]["origin_session"] == "chat-a"
 
 
 async def test_the_page_is_agent_owned_not_an_operator_block_page(inbox, monkeypatch):

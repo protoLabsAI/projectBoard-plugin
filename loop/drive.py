@@ -763,7 +763,18 @@ class DriveMixin:
                 if any(block_pages.card_id(r) == fid for r in block_pages.pending(inbox)):
                     log.debug("[project_board] %s still blocked — operator already notified of this incident", fid)
                     return
-            row = inbox.add(text, priority="now", source="project_board", dedup_key=key)
+            # Route the alert back to the chat that caused the card (ADR 0131 P2b-3): the
+            # origin the create tool bound it to, projected onto the card and passed as
+            # InboxStore.add's `origin_session` (core P2a-1). "" for a card with no recorded
+            # origin (an older create, or a host that had no resolver) — the add then behaves
+            # exactly as before.
+            row = inbox.add(
+                text,
+                priority="now",
+                source="project_board",
+                dedup_key=key,
+                origin_session=str((now or {}).get("origin_session") or ""),
+            )
             if is_block and row is not None:
                 # Close the read/add race with a transition that already retired its pages.
                 try:
