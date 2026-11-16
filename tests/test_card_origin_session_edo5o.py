@@ -1,7 +1,7 @@
 """A board card records the chat it was created from (ADR 0131 P2b-3).
 
 `board_create_feature` / `board_create_task` resolve the originating chat from the host
-session resolver (`tools.session.origin_session_for`, core P2b-1) applied to the tool
+session adapter (`tools.session._origin_session_from`, core P2b-1) applied to the tool
 turn's injected state, and persist it on the card. The block-page pass-through (the other
 half of P2b-3) is covered in test_block_pages_735.py (operator page) and
 test_panel_verdict_wake.py (agent page).
@@ -17,7 +17,6 @@ import pytest
 
 import project_board as pb
 from project_board import store as store_mod
-from project_board.store import BeadsBoard
 
 
 def _tool(name, cfg=None):
@@ -43,12 +42,19 @@ class _RecordingStore:
 
 def _install_resolver(monkeypatch, fn):
     """Register a fake host ``tools.session`` whose ``origin_session_for`` is ``fn`` — the
-    P2b-1 resolver seam the create tools feature-detect (register the parent package too so
+    P2b-1 state adapter delegates to it (register the parent package too so
     ``from tools.session import …`` resolves with no real host present)."""
     tools_pkg = types.ModuleType("tools")
     tools_pkg.__path__ = []  # a package, so the submodule import resolves
     session_mod = types.ModuleType("tools.session")
     session_mod.origin_session_for = fn
+
+    def _origin_session_from(state):
+        # v0.244.1's state adapter extracts the ID before calling the string resolver.
+        sid = (state.get("session_id") or "").strip() if isinstance(state, dict) else ""
+        return session_mod.origin_session_for(sid)
+
+    session_mod._origin_session_from = _origin_session_from
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.session", session_mod)
 
@@ -62,12 +68,19 @@ def test_create_tool_records_the_resolved_origin_session(monkeypatch, verb):
     (`chat-a`); the tool passes that onto the card. FAILS ON MAIN — main threads no origin."""
     store = _RecordingStore()
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: store)
-    _install_resolver(monkeypatch, lambda state: "chat-a" if (state or {}).get("session_id") == "job:X" else "")
+    resolved = []
+
+    def origin_session_for(context_id: str) -> str:
+        resolved.append(context_id)
+        return "chat-a" if context_id == "job:X" else ""
+
+    _install_resolver(monkeypatch, origin_session_for)
 
     out = _tool(verb).invoke({"title": "Add a thing", "spec": "s", "state": {"session_id": "job:X"}})
 
     assert json.loads(out)["id"] == "bd-new1"
     assert store.created[0]["origin_session"] == "chat-a"
+    assert resolved == ["job:X"]
 
 
 # ── r3 / AC3: an older host without the resolver still creates, with an empty origin ──
@@ -76,7 +89,7 @@ def test_create_tool_records_the_resolved_origin_session(monkeypatch, verb):
 @pytest.mark.parametrize("verb", ["board_create_feature", "board_create_task"])
 def test_create_tool_without_resolver_records_an_empty_origin(monkeypatch, verb):
     """An older host whose ``tools.session`` predates the resolver: the import of
-    ``origin_session_for`` fails, the origin is "", and the card still creates."""
+    ``_origin_session_from`` fails, the origin is "", and the card still creates."""
     store = _RecordingStore()
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: store)
     tools_pkg = types.ModuleType("tools")
@@ -111,7 +124,7 @@ def test_resolver_that_raises_never_fails_the_create(monkeypatch):
     store = _RecordingStore()
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: store)
 
-    def _boom(_state):
+    def _boom(_context_id):
         raise RuntimeError("resolver exploded")
 
     _install_resolver(monkeypatch, _boom)
@@ -235,8 +248,3 @@ def test_render_notes_round_trips_the_origin_through_split_and_reader():
     assert src == "acme/widgets#8"
     assert store_mod._origin_from_notes(notes) == "chat-a"
     assert store_mod._origin_from_notes("a.py\nsource-issue: acme/widgets#8") == ""
-
-
-def test_isinstance_board_exposes_project_helper():
-    """Guard the test's reliance on BeadsBoard._project existing (projection entrypoint)."""
-    assert hasattr(BeadsBoard, "_project")

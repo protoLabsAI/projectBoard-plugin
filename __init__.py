@@ -431,7 +431,7 @@ def _find_open_pr_for_issue(source_issue: str) -> dict | None:
 
 def _resolve_origin_session(state) -> str:
     """The originating chat for a card being created, resolved from the host's session
-    resolver (``origin_session_for``, core ADR 0131 P2b-1) applied to this tool turn's
+    state adapter (``_origin_session_from``, core ADR 0131 P2b-1) applied to this tool turn's
     injected graph state — so a card minted on a cron or inbox turn binds to the chat
     that caused it (ADR 0131 P2b-3). The recorded origin later routes a block page back
     to that chat (loop/drive._notify_operator).
@@ -441,11 +441,11 @@ def _resolve_origin_session(state) -> str:
     still creates). A resolver that raises is likewise swallowed — resolving the origin
     is best-effort provenance and must never fail a create."""
     try:
-        from tools.session import origin_session_for  # host module — absent on older hosts
+        from tools.session import _origin_session_from  # host module — absent on older hosts
     except ImportError:
         return ""
     try:
-        return str(origin_session_for(state) or "")
+        return str(_origin_session_from(state) or "")
     except Exception:  # noqa: BLE001 — provenance is best-effort; never fail the create on it
         return ""
 
