@@ -497,3 +497,66 @@ async def test_retirement_timeout_remains_best_effort_at_merge_close(tmp_path, m
     assert store.feature["board_state"] == "done"
     assert store.cleared
     assert not os.path.exists(tree)
+
+
+def _webhook_client(monkeypatch, repo, store):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from project_board import api
+
+    monkeypatch.setattr(api, "get_store", lambda **kwargs: store)
+    app = FastAPI()
+    app.include_router(api.build_router({"repo": repo.clone, "worktrees_root": repo.root, "webhook_secret": "test"}))
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+async def _post_merge(client):
+    import hashlib
+    import hmac
+    import json
+
+    raw = json.dumps({"action": "closed", "pull_request": {"merged": True, "html_url": PR}}).encode()
+    signature = hmac.new(b"test", raw, hashlib.sha256).hexdigest()
+    response = await client.post("/webhook/pr", content=raw, headers={"X-Hub-Signature-256": "sha256=" + signature})
+    assert response.status_code == 200
+    assert response.json()["feature"]["board_state"] == "done"
+
+
+async def test_webhook_live_drive_defers_cleanup_until_orphan_sweep(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore(locations=[{"id": "tree", "path": tree, "purpose": "build"}])
+    drive = asyncio.create_task(asyncio.Event().wait())
+    _drive_slot().drives[FID] = drive
+    try:
+        async with _webhook_client(monkeypatch, repo, store) as client:
+            await _post_merge(client)
+        assert os.path.isdir(tree)
+        assert "retired" not in store._locations["tree"]
+    finally:
+        drive.cancel()
+        await asyncio.gather(drive, return_exceptions=True)
+        _drive_slot().drives.pop(FID, None)
+
+    monkeypatch.setattr(worktree, "processes_in_trees", AsyncMock(return_value={}))
+    await _loop(repo)._sweep_worktrees(store, repo.clone)
+    assert not os.path.exists(tree)
+    assert store._locations["tree"]["retired"] is True
+
+
+@pytest.mark.parametrize("fail_retirement", [False, True])
+async def test_webhook_reaps_and_retires_locations_best_effort(tmp_path, monkeypatch, fail_retirement):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore(
+        locations=[
+            {"id": "tree", "path": tree + "/output", "purpose": "build"},
+            {"id": "outside", "path": str(tmp_path / "scratch"), "purpose": "scratch"},
+        ],
+        fail_record_for={"tree"} if fail_retirement else (),
+    )
+    async with _webhook_client(monkeypatch, repo, store) as client:
+        await _post_merge(client)
+    assert not os.path.exists(tree)
+    assert bool(store._locations["tree"].get("retired")) is not fail_retirement
+    assert "retired" not in store._locations["outside"]

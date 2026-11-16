@@ -228,6 +228,9 @@ def build_router(cfg: dict):
     from .review_view import REVIEW_PAGE
     from .routing_view import ROUTING_PAGE
 
+    from .loop.reconcile import WorktreeCleanup
+
+    cleanup = WorktreeCleanup((cfg or {}).get("worktrees_root", ".worktrees"))
     router = APIRouter()
 
     # ── console view (ADR 0026) — the Kanban/list page the left-rail icon iframes.
@@ -299,7 +302,6 @@ def build_router(cfg: dict):
 
     store_kw = _store_kw(cfg)
     escalate_on = escalation_enabled(cfg)
-    worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
     # Shared external-ingress secret (HMAC-SHA256). GitHub supplies the signature for
     # /webhook/pr; CI/review callers sign their exact JSON bytes the same way. Blank
     # fails CLOSED: these public routes mutate board state and cannot have a dev-mode
@@ -547,9 +549,9 @@ def build_router(cfg: dict):
         # #262: under ITS project's repo — a project-B feature's worktree lives in B's
         # checkout, not the board default's.
         try:
-            from . import worktree
-
-            await worktree.reap_feature_worktree(repo_for_feature(f, store_kw), worktrees_root, f["id"])
+            repo = repo_for_feature(f, store_kw)
+            if await cleanup._reap_feature_worktree(repo, f["id"]):
+                await cleanup._retire_merged_work_locations(store(), f["id"], repo)
         except Exception:  # noqa: BLE001 — reaping is best-effort; done is already set
             log.warning("[project_board] worktree reap for %s failed", f["id"], exc_info=True)
         log.info("[project_board] merge webhook → done: %s (%s)", f["id"], pr_url)
