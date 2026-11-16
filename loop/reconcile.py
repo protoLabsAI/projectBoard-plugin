@@ -225,6 +225,7 @@ class WorktreeCleanup:
                     exc_info=True,
                 )
 
+
 class ReconcileMixin(WorktreeCleanup):
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
     def _arm_merged_verify_exhaustion(self, store, fid: str) -> bool:
