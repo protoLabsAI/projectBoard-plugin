@@ -190,6 +190,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # merged-state re-verify stops re-running it until the command or timeout changes.
         self._slow_gates: dict[str, dict] = {}
         self._busy_keeps: dict[str, int] = {}  # wtid → sweeps kept for a live process in the tree
+        # fid or candidate tree id → reconcile reap skipped under a live drive (#752), logged once
+        self._reap_deferred: set[str] = set()
         # Claim-stall health signal (#462): ready work, a free slot, and no claim scan
         # finished for this many ticks → a setup/health gap on /status naming the phase the
         # tick is stuck in. 0 turns the signal off.

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from .. import external_review, merge_state_hold, review_coverage_hold
+from .. import external_review, merge_state_hold, review_coverage_hold, work_locations
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction
 from .drive import _recorded_reset
@@ -136,7 +136,97 @@ def _review_card_text(feature: dict | None) -> str:
     return "\n\n".join(parts)
 
 
-class ReconcileMixin:
+class WorktreeCleanup:
+    """Shared cleanup policy for reconcile and API merge edges.
+
+    The drive registry is process-stable, so API cleanup also respects drives when
+    the router has no running BoardLoop instance. Keep deferred logging per caller.
+    """
+
+    def __init__(self, root: str = ".worktrees"):
+        self.root = root
+        self._reap_deferred: set[str] = set()
+
+    def _reap_held_by_drive(self, fid: str) -> bool:
+        """A LIVE coder drive still owns ``fid``'s worktree, so a reconcile reap must NOT
+        remove it (#752). Reuses the SAME in-flight drive registry ``board_requeue_feature``
+        refuses on (``worked_by_the_loop`` → ``live_drive``, the process-stable drive-task
+        slot): friction f53268e9 saw a worktree vanish under a live drive because the many
+        reconcile reap sites called ``reap_feature_worktree`` directly, with no liveness
+        check. The drive reaps its own tree when it ends (its cancel / terminal edge), so a
+        deferred reap is picked up by a later pass once the drive is gone."""
+        return _loop.live_drive(worktree.parent_feature_id(fid)) is not None
+
+    async def _reap_feature_worktree(self, repo: str, fid: str) -> bool:
+        """The single gate EVERY reconcile worktree reap goes through (#752), so no site can
+        tear a tree out from under a live drive. Skips the reap (logged once at info; a later
+        pass retries) while ``_reap_held_by_drive`` holds; otherwise reaps via
+        ``worktree.reap_feature_worktree`` and returns whether the canonical tree is gone
+        after the call (False when the reap was skipped or could not remove the tree)."""
+        if self._reap_held_by_drive(fid):
+            if fid not in self._reap_deferred:
+                self._reap_deferred.add(fid)
+                log.info(
+                    "[project_board] %s worktree reap deferred — a live drive still owns the tree; "
+                    "a later pass reaps it once the drive ends (#752)",
+                    fid,
+                )
+            return False
+        self._reap_deferred.discard(fid)
+        return await worktree.reap_feature_worktree(repo, self.root, fid)
+
+    async def _retire_merged_work_locations(self, store, fid: str, repo: str, *, stall_ends_tick: bool = False) -> None:
+        """A merged card's tree was just reaped (#752): re-record each of its work-location
+        entries that pointed INTO that tree with ``retired: true`` (the field bd-uu9z6 adds),
+        so the location sweep stops raising ``[recovery] Recorded work needs recovery`` for
+        paths this close just deleted. Entries elsewhere — a scratch repo, a pushed branch —
+        are left untouched. Best-effort throughout: any failure (an unreadable or malformed
+        ledger, a failed re-record) is logged and never blocks the close. Sweep callers set
+        ``stall_ends_tick`` so a store timeout ends the pass instead of stalling once per
+        remaining entry or card."""
+        if self._reap_held_by_drive(fid):
+            return
+        try:
+            ledger = await asyncio.to_thread(store.list_work_locations, fid)
+        except Exception as exc:  # noqa: BLE001 — retirement is best-effort; a close must never hinge on it
+            if stall_ends_tick and isinstance(exc, store_mod.BoardTimeout):
+                raise
+            log.warning("[project_board] %s could not read work locations to retire after merge", fid, exc_info=True)
+            return
+        if ledger.get("errors"):
+            # A malformed history would make record_work_location refuse anyway; leave it for repair.
+            log.warning("[project_board] %s work-location history is malformed — not retiring after merge", fid)
+            return
+        for entry in ledger.get("entries", []):
+            if entry.get("retired"):
+                continue
+            # A missing tree is not evidence that its work was saved. Preserve the
+            # terminal recovery policy for recorded unpushed commits, including
+            # when a later health sweep retries after external tree removal.
+            if not work_locations.skip_recovery(entry, "done"):
+                continue
+            path = entry.get("path") or ""
+            tree = worktree.feature_tree_for_path(repo, self.root, fid, path) if path else None
+            # The reap's boolean only describes canonical/slugged trees. Candidates
+            # with unsaved work may remain, even when their recorded file is missing.
+            if tree is None or os.path.lexists(tree):
+                continue
+            revision = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
+            revision["retired"] = True
+            try:
+                await asyncio.to_thread(store.record_work_location, fid, revision)
+            except Exception as exc:  # noqa: BLE001 — one entry's failure must not stop the others or the close
+                if stall_ends_tick and isinstance(exc, store_mod.BoardTimeout):
+                    raise
+                log.warning(
+                    "[project_board] %s could not retire work location %s after merge",
+                    fid,
+                    entry.get("id"),
+                    exc_info=True,
+                )
+
+
+class ReconcileMixin(WorktreeCleanup):
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
     def _arm_merged_verify_exhaustion(self, store, fid: str) -> bool:
         """Persist the ONE-TIME exhaustion sentinel `budget:merged-verify:<max+1>` — the
@@ -732,6 +822,17 @@ class ReconcileMixin:
         # project's repo, and a worktree resolved in repo A must be reaped in repo A.
         for repo in self._all_repos():
             await self._sweep_worktrees(store, repo)
+        # A deferred drive can remove its own tree before the orphan scan sees it.
+        # Revisit done PR cards from the store, including after a restart or a failed
+        # ledger write. Existing trees (especially stranded candidates) stay active.
+        for f in await self._list_for_pass(store, "done", "merged work-location retirement"):
+            if f.get("pr_url") and not self._reap_held_by_drive(f["id"]):
+                try:
+                    await self._retire_merged_work_locations(store, f["id"], self._repo_for(f), stall_ends_tick=True)
+                except store_mod.BoardTimeout:
+                    raise  # stop after one stalled store call, rather than retrying for every done card
+                except Exception:  # noqa: BLE001 — e.g. a project's checkout no longer resolves
+                    log.warning("[project_board] %s could not retire merged work locations", f["id"], exc_info=True)
         # (a2) bring each board-owned base checkout up to origin/<base> where that is safe,
         # and report the ones that can't be (#452). Its own task: network-bound, so it must
         # never hold the tick (#462). Never touches the board store.
@@ -1127,7 +1228,9 @@ class ReconcileMixin:
                         )
                         continue
                     self._busy_keeps.pop(wtid, None)
-                    reaped = await worktree.reap_feature_worktree(repo, self.root, wtid)
+                    reaped = await self._reap_feature_worktree(repo, wtid)
+                    if f is not None and f["board_state"] == "done" and f.get("pr_url"):
+                        await self._retire_merged_work_locations(store, fid, repo, stall_ends_tick=True)
                     if reaped:
                         self._reap_failures.pop(wtid, None)
                         log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
@@ -1146,6 +1249,8 @@ class ReconcileMixin:
                                 wtid,
                                 n,
                             )
+            except store_mod.BoardTimeout:
+                raise  # a stalled store ends the sweep, including retirement reads and writes
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
@@ -1382,7 +1487,8 @@ class ReconcileMixin:
                     if state == "MERGED":
                         if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                             if reap:
-                                await worktree.reap_feature_worktree(repo, self.root, fid)
+                                await self._reap_feature_worktree(repo, fid)
+                                await self._retire_merged_work_locations(store, fid, repo)
                             self._ci_feedback.pop(fid, None)
                             self._review_prior.pop(fid, None)
                             # Merge edge: EVERY fix budget resets — cache and the bead's
@@ -1403,7 +1509,7 @@ class ReconcileMixin:
                         await asyncio.to_thread(
                             self._flag_blocked, store, fid, f"PR closed without merging — needs triage: {pr_url}"
                         )
-                        await worktree.reap_feature_worktree(repo, self.root, fid)
+                        await self._reap_feature_worktree(repo, fid)
                         self._ci_feedback.pop(fid, None)
                         self._review_prior.pop(fid, None)
                         # Closed-unmerged is the other terminal edge: same full reset,
@@ -1875,10 +1981,12 @@ class ReconcileMixin:
             # `origin/<branch>` tracking ref too, and that ref is how the reap knows the
             # tree's commits are published — without it a squash-merged card's commits
             # look like nobody's and get saved to a `stranded/` branch for nothing (#405).
-            await worktree.reap_feature_worktree(repo, self.root, fid)
-            branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
-            if not await worktree.delete_remote_branch(repo, branch):
-                log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
+            # A live drive can start while the merge is in flight. Keep the published
+            # ref when reaping is deferred or fails so later cleanup still sees it (#752).
+            if await self._reap_feature_worktree(repo, fid):
+                branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
+                if not await worktree.delete_remote_branch(repo, branch):
+                    log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
             return True
         n = await self._budget_get(store, fid, "auto-merge", feature) + 1
         await self._budget_set(store, fid, "auto-merge", n)
@@ -2070,7 +2178,7 @@ class ReconcileMixin:
                 fid,
                 f"rebase conflict with {base} after {n} attempt(s) — needs a manual rebase: {pr_url}",
             )
-            await worktree.reap_feature_worktree(repo, self.root, fid)
+            await self._reap_feature_worktree(repo, fid)
             log.warning("[project_board] %s blocked (rebase conflict, %d attempt(s)): %s", fid, n, detail)
             return True
         await self._budget_set(store, fid, "rebase", n + 1)
@@ -2335,7 +2443,7 @@ class ReconcileMixin:
             f"gate FAILED on the merged state (branch + {base}@{short}) — the PR merges clean "
             f"but the RESULT is broken; needs triage: {pr_url}\n{failure}",
         )
-        await worktree.reap_feature_worktree(repo, self.root, fid)
+        await self._reap_feature_worktree(repo, fid)
         log.warning("[project_board] %s blocked (merged-state gate failed against %s@%s)", fid, base, short)
         return True
 
@@ -2482,7 +2590,7 @@ class ReconcileMixin:
                 await _block(
                     f"CI failing at the top model tier after {attempts} same-tier fix(es) — needs triage: {pr_url}"
                 )
-                await worktree.reap_feature_worktree(repo, self.root, fid)
+                await self._reap_feature_worktree(repo, fid)
                 log.warning("[project_board] reconcile → blocked (CI fails at top tier): %s", fid)
                 return
             await self._budget_reset(store, fid, "ci-fix")  # fresh same-tier budget at the new rung
@@ -2491,7 +2599,7 @@ class ReconcileMixin:
             return
 
         await _block(f"CI still failing after {attempts} fix attempt(s) — needs triage: {pr_url}")
-        await worktree.reap_feature_worktree(repo, self.root, fid)
+        await self._reap_feature_worktree(repo, fid)
         log.warning("[project_board] reconcile → blocked (CI fails, %d attempt(s) exhausted): %s", attempts, fid)
 
     async def _rerun_ci_once(self, store, fid: str, pr_url: str, repo: str, feature: dict | None, summary: str) -> bool:
