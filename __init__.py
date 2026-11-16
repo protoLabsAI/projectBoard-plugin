@@ -429,6 +429,27 @@ def _find_open_pr_for_issue(source_issue: str) -> dict | None:
     return None
 
 
+def _resolve_origin_session(state) -> str:
+    """The originating chat for a card being created, resolved from the host's session
+    state adapter (``_origin_session_from``, core ADR 0131 P2b-1) applied to this tool turn's
+    injected graph state — so a card minted on a cron or inbox turn binds to the chat
+    that caused it (ADR 0131 P2b-3). The recorded origin later routes a block page back
+    to that chat (loop/drive._notify_operator).
+
+    Feature-detected exactly like the inbox seam: a host that predates the resolver has
+    no ``tools.session`` module, so the import raises and the origin is "" (the card
+    still creates). A resolver that raises is likewise swallowed — resolving the origin
+    is best-effort provenance and must never fail a create."""
+    try:
+        from tools.session import _origin_session_from  # host module — absent on older hosts
+    except ImportError:
+        return ""
+    try:
+        return str(_origin_session_from(state) or "")
+    except Exception:  # noqa: BLE001 — provenance is best-effort; never fail the create on it
+        return ""
+
+
 def _strip_wrapping_quotes(s: str) -> str:
     """Peel ONE symmetric layer of literal wrapping double quotes off a string arg.
 
@@ -665,6 +686,7 @@ def _board_tools(cfg: dict, registry=None):
         source_issue: str = "",
         project: str = "",
         waits_for: str = "",
+        state: Annotated[Any, InjectedState] = None,
     ) -> str:
         """Create a coding feature (starts in backlog). Ready needs a self-sufficient `spec`,
         testable `acceptance_criteria` and `files_to_modify`: comma-separated paths that exist in
@@ -728,6 +750,7 @@ def _board_tools(cfg: dict, registry=None):
                 source_issue=source_issue,
                 project=project,
                 waits_for=waits_for,
+                origin_session=_resolve_origin_session(state),
             )
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
@@ -747,6 +770,7 @@ def _board_tools(cfg: dict, registry=None):
         force: bool = False,
         waits_for: str = "",
         execute: bool = False,
+        state: Annotated[Any, InjectedState] = None,
     ) -> str:
         """Create a TASK (starts in backlog): work that ships a deliverable (doc, decision, artifact
         ref) instead of a PR. Same lifecycle as a feature, but board_deliver moves it to in_review
@@ -787,6 +811,7 @@ def _board_tools(cfg: dict, registry=None):
                 assignee=assignee,
                 waits_for=waits_for,
                 execute=execute,
+                origin_session=_resolve_origin_session(state),
             )
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:

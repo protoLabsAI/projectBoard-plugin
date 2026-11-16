@@ -55,8 +55,8 @@ def _install_inbox(monkeypatch, tmp_path):
         def __init__(self, db_path, *, dedup_window_s=300):
             pass
 
-        def add(self, text, *, priority="next", source="", dedup_key=""):
-            added.append({"text": text, "key": dedup_key, "priority": priority})
+        def add(self, text, *, priority="next", source="", dedup_key="", origin_session=""):
+            added.append({"text": text, "key": dedup_key, "priority": priority, "origin_session": origin_session})
             return {"id": len(added), "text": text}
 
     fake.InboxStore = _Inbox

@@ -19,11 +19,17 @@ def inbox(monkeypatch, tmp_path):
         def __init__(self, path, **kwargs):
             pass
 
-        def add(self, text, *, priority="next", source="", dedup_key=""):
+        def add(self, text, *, priority="next", source="", dedup_key="", origin_session=""):
             if any(r["dedup_key"] == dedup_key and not r["delivered_at"] for r in rows):
                 return None
             row = dict(
-                id=len(rows) + 1, text=text, source=source, priority=priority, dedup_key=dedup_key, delivered_at=None
+                id=len(rows) + 1,
+                text=text,
+                source=source,
+                priority=priority,
+                dedup_key=dedup_key,
+                origin_session=origin_session,
+                delivered_at=None,
             )
             rows.append(row)
             return row.copy()
@@ -64,6 +70,9 @@ class Board(BeadsBoard):
             blocked="blocked" in self.bead["labels"],
             blocked_reason=self.reason,
             blocked_class="terminal",
+            # The chat the card was created from (ADR 0131 P2b-3) — the block page routes
+            # its alert back to it via InboxStore.add's origin_session.
+            origin_session="chat-a",
         )
 
     def _run(self, *args, **kwargs):
@@ -91,6 +100,15 @@ def notify(board):
     BoardLoop({"coder": "proto"})._notify_operator(
         "bd-test", board.reason, incident="terminal|same failure|0", store=board
     )
+
+
+def test_block_page_routes_to_the_cards_origin_session(inbox):
+    """ADR 0131 P2b-3: the operator block page passes the card's recorded origin (the
+    chat it was created from) as InboxStore.add's ``origin_session``, so the alert routes
+    back to that chat. It is read off the re-read feature projection (Board.get_feature)."""
+    board = Board()
+    notify(board)
+    assert inbox[-1]["origin_session"] == "chat-a"
 
 
 def test_short_page_and_duplicate_across_restart(inbox):

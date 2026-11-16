@@ -10760,7 +10760,7 @@ def _use_fake_inbox(monkeypatch, tmp_path):
         def __init__(self, db_path, *, dedup_window_s=300):
             self.path = db_path
 
-        def add(self, text, *, priority="next", source="", dedup_key=""):
+        def add(self, text, *, priority="next", source="", dedup_key="", origin_session=""):
             added.append((text, priority, dedup_key))
 
     fake.InboxStore = _Inbox
@@ -10782,7 +10782,7 @@ def _spy_inbox(monkeypatch, tmp_path, added):
         def __init__(self, db_path, *, dedup_window_s=300):
             self.window = dedup_window_s
 
-        def add(self, text, *, priority="next", source="", dedup_key=""):
+        def add(self, text, *, priority="next", source="", dedup_key="", origin_session=""):
             added.append({"key": dedup_key, "priority": priority, "text": text, "window": self.window})
 
     fake.InboxStore = _Inbox
@@ -10822,7 +10822,7 @@ async def test_the_log_says_notified_only_when_the_inbox_took_the_alert(monkeypa
         def __init__(self, db_path, *, dedup_window_s=300):
             pass
 
-        def add(self, text, *, priority="next", source="", dedup_key=""):
+        def add(self, text, *, priority="next", source="", dedup_key="", origin_session=""):
             if dedup_key in seen_keys:
                 return None
             seen_keys.add(dedup_key)

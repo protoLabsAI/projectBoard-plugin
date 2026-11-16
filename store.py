@@ -761,6 +761,14 @@ NOTES_REQ_PREFIX = "req:"
 # `@`, spaces and `<`, which the label validator would refuse on its own. The notes
 # field has none of those limits and already carries structured lines.
 NOTES_WAITS_PREFIX = "waits-for:"
+# The originating chat for the card (ADR 0131 P2b-3): the chat session the create tool
+# resolved from its turn's injected state (``origin_session_for``, core P2b-1) — so a card
+# minted on a cron/inbox turn binds to the chat that caused it, and a later block page can
+# route back to it (loop/drive._notify_operator passes it as InboxStore.add's
+# ``origin_session``, core P2a-1). NOT a label: a session id can carry characters (and a
+# length) the label validator refuses, and it is single-valued metadata exactly like the
+# `source-issue:` line, so it rides the same notes field.
+NOTES_ORIGIN_PREFIX = "origin-session:"
 REQ_CLOSED_STATUSES = ("done", "declined")
 # A markdown bullet (-/*/+ or `1.`/`1)`) opens a new requirement item; anything else
 # is a continuation of the current one (or, with no bullets at all, plain prose = ONE item).
@@ -1513,12 +1521,14 @@ def validate_priority(raw) -> int:
     return priority
 
 
-def _render_notes(files, source_issue: str = "", requirements=(), waits_for=()) -> str:
+def _render_notes(files, source_issue: str = "", requirements=(), waits_for=(), origin_session: str = "") -> str:
     """Serialize the bead `notes` field: one files_to_modify path per line, one
     `req: {…json…}` requirement-item line per ledger entry (#113), plus a trailing
-    `source-issue: owner/repo#N` metadata line when set — the single shared home
-    for all three (labels can't carry `/`/`#`, see NOTES_SOURCE_PREFIX; the ledger
-    rides the same structured-lines path to avoid a schema migration)."""
+    `source-issue: owner/repo#N` and `origin-session: <chat>` metadata line when set
+    — the single shared home for all of them (labels can't carry `/`/`#`, see
+    NOTES_SOURCE_PREFIX; the ledger rides the same structured-lines path to avoid a
+    schema migration). Every caller that rewrites notes must carry the origin forward
+    (see NOTES_ORIGIN_PREFIX): `br update --notes` replaces the WHOLE field."""
     lines = [str(p).strip() for p in files or () if str(p).strip()]
     for item in requirements or ():
         lines.append(f"{NOTES_REQ_PREFIX} {json.dumps(item, ensure_ascii=False, sort_keys=True)}")
@@ -1527,6 +1537,8 @@ def _render_notes(files, source_issue: str = "", requirements=(), waits_for=()) 
             lines.append(f"{NOTES_WAITS_PREFIX} {str(spec).strip()}")
     if source_issue:
         lines.append(f"{NOTES_SOURCE_PREFIX} {source_issue}")
+    if str(origin_session or "").strip():
+        lines.append(f"{NOTES_ORIGIN_PREFIX} {str(origin_session).strip()}")
     return "\n".join(lines)
 
 
@@ -1549,6 +1561,8 @@ def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
             continue
         if s.startswith(NOTES_WAITS_PREFIX):
             continue  # a publish gate, read by _waits_from_notes — never a file path
+        if s.startswith(NOTES_ORIGIN_PREFIX):
+            continue  # the originating chat, read by _origin_from_notes — never a file path
         if s.startswith(NOTES_REQ_PREFIX):
             try:
                 item = json.loads(s[len(NOTES_REQ_PREFIX) :].strip())
@@ -1573,6 +1587,17 @@ def _waits_from_notes(notes) -> list[str]:
     return out
 
 
+def _origin_from_notes(notes) -> str:
+    """The originating chat (`origin-session:` metadata line) in the bead ``notes`` field,
+    or "" when unset — the inverse of the origin line ``_render_notes`` writes (ADR 0131
+    P2b-3). The FIRST metadata line wins (single-valued, the `source-issue:` convention)."""
+    for line in str(notes or "").splitlines():
+        s = line.strip()
+        if s.startswith(NOTES_ORIGIN_PREFIX):
+            return s[len(NOTES_ORIGIN_PREFIX) :].strip()
+    return ""
+
+
 def _normalize_waits(raw) -> list[str]:
     """Validate + canonicalize ``waits_for`` (comma-separated text or a list) BEFORE
     anything is written — an unparseable spec refuses the write with a named error
@@ -1589,7 +1614,7 @@ def _refuse_structured_paths(files) -> None:
     wrote (#457 review). Refuse it by name."""
     for f in files or ():
         s = str(f).strip()
-        for prefix in (NOTES_WAITS_PREFIX, NOTES_SOURCE_PREFIX, NOTES_REQ_PREFIX):
+        for prefix in (NOTES_WAITS_PREFIX, NOTES_SOURCE_PREFIX, NOTES_REQ_PREFIX, NOTES_ORIGIN_PREFIX):
             if s.startswith(prefix):
                 raise BoardError(
                     f"files_to_modify entry {s!r} starts with {prefix!r}, which the board reserves for card "
@@ -2106,6 +2131,7 @@ class BeadsBoard:
         waits_for=(),
         chain_hot_files: bool = True,
         execute: bool = False,
+        origin_session: str = "",
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -2122,7 +2148,9 @@ class BeadsBoard:
         files_to_modify (see `_prepare_ready`); `assignee` pre-assigns the bead (else it
         starts unassigned and the puller claims it). `waits_for` names publish gates
         (gates.py grammar) that must ALL hold before the loop claims the card.
-        `execute=True` adds the execution-task routing label."""
+        `execute=True` adds the execution-task routing label. `origin_session` records the
+        originating chat the create tool resolved from its turn (ADR 0131 P2b-3) — "" when
+        the host has no resolver; it rides the bead `notes` (see NOTES_ORIGIN_PREFIX)."""
         # A card on a hot file is created AND chained under the chain lock (#458). Chaining
         # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
         # a racing card could chain while an older one was still invisible (or created but
@@ -2150,6 +2178,7 @@ class BeadsBoard:
                 waits_for=waits_for,
                 chain_hot_files=chain_hot_files,
                 execute=execute,
+                origin_session=origin_session,
             )
 
     def _names_hot_file(self, project: str, files_to_modify) -> bool:
@@ -2193,11 +2222,13 @@ class BeadsBoard:
         waits_for,
         chain_hot_files: bool,
         execute: bool = False,
+        origin_session: str = "",
     ) -> dict:
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
         src = normalize_source_issue(source_issue) if str(source_issue or "").strip() else ""
         waits = _normalize_waits(waits_for)
+        origin = str(origin_session or "").strip()
         _refuse_structured_paths(files_to_modify)
         proj = normalize_project(project or self.default_project)
         fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec)
@@ -2217,18 +2248,21 @@ class BeadsBoard:
             upd += [f"--design={design}"]
             enriched.append("design")
         files = [str(p).strip() for p in files_to_modify or () if str(p).strip()]
-        if files or src or waits:
+        if files or src or waits or origin:
             # files_to_modify + the source-issue record SHARE the bead `notes` field
             # (one path per line, the metadata line last — see _render_notes): the
             # source can't be a label (its `/`/`#` fail beads' label validator, #101),
-            # and neither can a publish gate (length + charset, see NOTES_WAITS_PREFIX).
-            upd += [f"--notes={_render_notes(files, src, (), waits)}"]
+            # and neither can a publish gate (length + charset, see NOTES_WAITS_PREFIX),
+            # and neither can the originating chat (see NOTES_ORIGIN_PREFIX).
+            upd += [f"--notes={_render_notes(files, src, (), waits, origin)}"]
             if files:
                 enriched.append("files_to_modify")
             if src:
                 enriched.append("source_issue")
             if waits:
                 enriched.append("waits_for")
+            if origin:
+                enriched.append("origin_session")
         diff = difficulty.strip().lower()
         if diff:
             # normalize first, then guard: a whitespace-only difficulty must NOT stamp a
@@ -2737,7 +2771,9 @@ class BeadsBoard:
                 src = normalize_source_issue(source_issue) if set_source else str(f.get("source_issue") or "")
             waits = new_waits if new_waits is not None else list(f.get("waits_for") or [])
             ledger = new_ledger if new_ledger is not None else (f.get("requirements") or [])
-            args += [f"--notes={_render_notes(files, src, ledger, waits)}"]
+            # `br update --notes` replaces the WHOLE field, so carry the originating chat
+            # (ADR 0131 P2b-3) forward — a files/source/ledger edit must never drop it.
+            args += [f"--notes={_render_notes(files, src, ledger, waits, f.get('origin_session') or '')}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
@@ -3357,7 +3393,11 @@ class BeadsBoard:
                     fid,
                     "--notes="
                     + _render_notes(
-                        f.get("files_to_modify"), str(f.get("source_issue") or ""), items, f.get("waits_for") or ()
+                        f.get("files_to_modify"),
+                        str(f.get("source_issue") or ""),
+                        items,
+                        f.get("waits_for") or (),
+                        f.get("origin_session") or "",
                     ),
                 )
 
@@ -4851,7 +4891,11 @@ class BeadsBoard:
             fid,
             "--notes="
             + _render_notes(
-                f.get("files_to_modify"), str(f.get("source_issue") or ""), items, f.get("waits_for") or ()
+                f.get("files_to_modify"),
+                str(f.get("source_issue") or ""),
+                items,
+                f.get("waits_for") or (),
+                f.get("origin_session") or "",
             ),
         )
         return self.get_feature(fid)
@@ -5576,6 +5620,10 @@ class BeadsBoard:
             # Publish gates (`waits_for`, gates.py): external conditions the loop checks
             # before it claims the card. [] for an ungated card.
             "waits_for": _waits_from_notes(bead.get("notes")),
+            # The originating chat (ADR 0131 P2b-3): the chat the create tool bound the card
+            # to — "" when the card predates the field or the host had no resolver. A block
+            # page reads it to route the alert back to that chat (loop/drive._notify_operator).
+            "origin_session": _origin_from_notes(bead.get("notes")),
             "project": project,
             "labels": labels,
             "repo": self.repo,

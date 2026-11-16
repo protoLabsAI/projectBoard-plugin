@@ -3303,7 +3303,16 @@ class ReconcileMixin(WorktreeCleanup):
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
             inbox = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S)
-            row = inbox.add(text, priority="now", source="project_board", dedup_key=key)
+            # Route the page back to the chat the card was created from (ADR 0131 P2b-3) —
+            # the card's recorded origin, passed as InboxStore.add's `origin_session` (core
+            # P2a-1). "" for a card with no recorded origin, so the add is unchanged there.
+            row = inbox.add(
+                text,
+                priority="now",
+                source="project_board",
+                dedup_key=key,
+                origin_session=str(feature.get("origin_session") or ""),
+            )
             if row is None:
                 log.debug("[project_board] %s panel %s at %s already paged — not re-paging", fid, verdict, short)
             else:
