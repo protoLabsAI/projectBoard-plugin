@@ -616,6 +616,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     from . import work_snapshot
     from .read_cache import BoardReadCache
     from .store import default_db_path
+    from .loop.reconcile import WorktreeCleanup
 
     class _WriteNotingRoute(APIRoute):
         """Every non-GET route on this router is a (possible) board write: when its handler
@@ -638,6 +639,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     router = APIRouter(route_class=_WriteNotingRoute)
     store_kw = _store_kw(cfg)
     worktrees_root = (cfg or {}).get("worktrees_root", ".worktrees")
+    # The terminal-edge reaps (cancel/delete/manual-done) go through the SAME live-drive
+    # guard the merge webhook uses (#752), so a running drive's tree is never torn out on
+    # these paths either; a deferred reap is picked up by the orphan sweep once the drive ends.
+    cleanup = WorktreeCleanup(worktrees_root)
 
     def store():
         # Existing routers stay mounted across a host config reload, so their
@@ -932,17 +937,16 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         }
 
     async def _reap_worktree(fid: str, feature: dict | None = None) -> None:
-        """Reap the feature's worktree at a terminal edge (cancel/delete) — the same
-        best-effort pattern as the merge webhook's Done-edge reap (``build_router``).
-        ``feature`` is the edge's projection: its project label resolves the repo the
-        worktree actually lives in (#262 — the loop's ``_repo_for`` order), so a
-        project-B card reaps under B's checkout, not the board default's. The bead is
-        already closed, so a reap failure must never raise into the response; the
-        health sweep stays the crash backstop for anything missed."""
+        """Reap the feature's worktree at a terminal edge (cancel/delete/manual-done) —
+        through the SAME ``WorktreeCleanup`` live-drive guard the merge webhook's Done-edge
+        reap uses (#752), so a running drive's tree is never torn out here either; a deferred
+        reap is picked up by the orphan sweep once the drive ends. ``feature`` is the edge's
+        projection: its project label resolves the repo the worktree actually lives in (#262
+        — the loop's ``_repo_for`` order), so a project-B card reaps under B's checkout, not
+        the board default's. The bead is already closed, so a reap failure must never raise
+        into the response; the health sweep stays the crash backstop for anything missed."""
         try:
-            from . import worktree
-
-            await worktree.reap_feature_worktree(repo_for_feature(feature, store_kw), worktrees_root, fid)
+            await cleanup._reap_feature_worktree(repo_for_feature(feature, store_kw), fid)
         except Exception:  # noqa: BLE001 — reaping is best-effort; the edge is already closed
             log.warning("[project_board] worktree reap for %s failed", fid, exc_info=True)
 

@@ -102,6 +102,10 @@ class FakeStore:
         self.feature["board_state"] = "done"
         return deepcopy(self.feature)
 
+    def cancel_feature(self, fid, reason=""):
+        self.feature["board_state"] = "cancelled"
+        return deepcopy(self.feature)
+
     def get_feature(self, fid):
         return deepcopy(self.feature)
 
@@ -560,3 +564,54 @@ async def test_webhook_reaps_and_retires_locations_best_effort(tmp_path, monkeyp
     assert not os.path.exists(tree)
     assert bool(store._locations["tree"].get("retired")) is not fail_retirement
     assert "retired" not in store._locations["outside"]
+
+
+# ── the API terminal edges (cancel/delete/manual-done) share the SAME guard ──────────────
+
+
+def _data_client(monkeypatch, repo, store):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from project_board import api
+    from project_board import loop as loop_pkg
+
+    monkeypatch.setattr(api, "get_store", lambda **kwargs: store)
+    # The cancel edge closes an open PR / stops a drive out-of-band — no network in the test.
+    monkeypatch.setattr(loop_pkg, "cancel_side_effects", lambda *a, **k: {}, raising=False)
+    app = FastAPI()
+    app.include_router(api.build_data_router({"repo": repo.clone, "worktrees_root": repo.root}))
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+async def test_cancel_edge_defers_reap_while_a_drive_is_live_then_reaps(tmp_path, monkeypatch):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore()
+    drive = asyncio.create_task(asyncio.Event().wait())
+    _drive_slot().drives[FID] = drive
+    try:
+        async with _data_client(monkeypatch, repo, store) as client:
+            resp = await client.post(f"/features/{FID}/cancel", json={"reason": "dupe"})
+            assert resp.status_code == 200
+            assert resp.json()["board_state"] == "cancelled"
+        # The cancel edge's reap goes through the live-drive guard, so the tree survives.
+        assert os.path.isdir(tree), "a live drive's tree must survive the cancel-edge reap (#752)"
+    finally:
+        drive.cancel()
+        await asyncio.gather(drive, return_exceptions=True)
+        _drive_slot().drives.pop(FID, None)
+
+    # Once the drive ends, the same terminal-edge reap removes the now-unowned tree.
+    async with _data_client(monkeypatch, repo, store) as client:
+        resp = await client.post(f"/features/{FID}/cancel", json={"reason": "dupe"})
+        assert resp.status_code == 200
+    assert not os.path.exists(tree)
+
+
+def test_no_api_reap_site_bypasses_the_guard():
+    """Structural guard (#752): every api.py terminal-edge/webhook reap goes through the
+    shared ``WorktreeCleanup`` wrapper, never ``worktree.reap_feature_worktree`` directly, so
+    no API path (merge webhook or cancel/delete/manual-done) can tear out a live drive's tree."""
+    src = (Path(__file__).resolve().parent.parent / "api.py").read_text()
+    assert "worktree.reap_feature_worktree(" not in src, "an api.py reap bypasses the live-drive guard"
+    assert "cleanup._reap_feature_worktree(" in src
