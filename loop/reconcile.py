@@ -1316,9 +1316,7 @@ class ReconcileMixin:
         self._reap_deferred.discard(fid)
         return await worktree.reap_feature_worktree(repo, self.root, fid)
 
-    async def _retire_merged_work_locations(
-        self, store, fid: str, repo: str, *, stall_ends_tick: bool = False
-    ) -> None:
+    async def _retire_merged_work_locations(self, store, fid: str, repo: str, *, stall_ends_tick: bool = False) -> None:
         """A merged card's tree was just reaped (#752): re-record each of its work-location
         entries that pointed INTO that tree with ``retired: true`` (the field bd-uu9z6 adds),
         so the location sweep stops raising ``[recovery] Recorded work needs recovery`` for

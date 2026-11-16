@@ -454,10 +454,12 @@ async def test_drive_starting_during_auto_merge_keeps_tree_and_published_ref(tmp
 async def test_retirement_timeout_stops_sweep_after_first_store_stall(tmp_path, monkeypatch, operation, orphan):
     repo = _Repo(tmp_path)
     tree = repo.make_tree() if orphan else os.path.join(repo.clone, repo.root, f"feat-{FID}")
-    store = FakeStore(locations=[
-        {"id": "first", "path": tree, "purpose": "build"},
-        {"id": "second", "path": tree + "/output", "purpose": "output"},
-    ])
+    store = FakeStore(
+        locations=[
+            {"id": "first", "path": tree, "purpose": "build"},
+            {"id": "second", "path": tree + "/output", "purpose": "output"},
+        ]
+    )
     store.feature["board_state"] = "done"
     loop = _loop(repo)
     monkeypatch.setattr(loop, "_store", lambda: store)
