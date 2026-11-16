@@ -738,7 +738,9 @@ class ReconcileMixin:
         for f in await self._list_for_pass(store, "done", "merged work-location retirement"):
             if f.get("pr_url") and not self._reap_held_by_drive(f["id"]):
                 try:
-                    await self._retire_merged_work_locations(store, f["id"], self._repo_for(f))
+                    await self._retire_merged_work_locations(store, f["id"], self._repo_for(f), stall_ends_tick=True)
+                except store_mod.BoardTimeout:
+                    raise  # stop after one stalled store call, rather than retrying for every done card
                 except Exception:  # noqa: BLE001 — e.g. a project's checkout no longer resolves
                     log.warning("[project_board] %s could not retire merged work locations", f["id"], exc_info=True)
         # (a2) bring each board-owned base checkout up to origin/<base> where that is safe,
@@ -1138,7 +1140,7 @@ class ReconcileMixin:
                     self._busy_keeps.pop(wtid, None)
                     reaped = await self._reap_feature_worktree(repo, wtid)
                     if f is not None and f["board_state"] == "done" and f.get("pr_url"):
-                        await self._retire_merged_work_locations(store, fid, repo)
+                        await self._retire_merged_work_locations(store, fid, repo, stall_ends_tick=True)
                     if reaped:
                         self._reap_failures.pop(wtid, None)
                         log.info("[project_board] sweep: reaped orphaned worktree feat-%s", wtid)
@@ -1157,6 +1159,8 @@ class ReconcileMixin:
                                 wtid,
                                 n,
                             )
+            except store_mod.BoardTimeout:
+                raise  # a stalled store ends the sweep, including retirement reads and writes
             except Exception:  # noqa: BLE001
                 log.warning("[project_board] sweep reap for %s failed", wtid, exc_info=True)
 
@@ -1312,18 +1316,24 @@ class ReconcileMixin:
         self._reap_deferred.discard(fid)
         return await worktree.reap_feature_worktree(repo, self.root, fid)
 
-    async def _retire_merged_work_locations(self, store, fid: str, repo: str) -> None:
+    async def _retire_merged_work_locations(
+        self, store, fid: str, repo: str, *, stall_ends_tick: bool = False
+    ) -> None:
         """A merged card's tree was just reaped (#752): re-record each of its work-location
         entries that pointed INTO that tree with ``retired: true`` (the field bd-uu9z6 adds),
         so the location sweep stops raising ``[recovery] Recorded work needs recovery`` for
         paths this close just deleted. Entries elsewhere — a scratch repo, a pushed branch —
         are left untouched. Best-effort throughout: any failure (an unreadable or malformed
-        ledger, a failed re-record) is logged and never blocks the close."""
+        ledger, a failed re-record) is logged and never blocks the close. Sweep callers set
+        ``stall_ends_tick`` so a store timeout ends the pass instead of stalling once per
+        remaining entry or card."""
         if self._reap_held_by_drive(fid):
             return
         try:
             ledger = await asyncio.to_thread(store.list_work_locations, fid)
-        except Exception:  # noqa: BLE001 — retirement is best-effort; a close must never hinge on it
+        except Exception as exc:  # noqa: BLE001 — retirement is best-effort; a close must never hinge on it
+            if stall_ends_tick and isinstance(exc, store_mod.BoardTimeout):
+                raise
             log.warning("[project_board] %s could not read work locations to retire after merge", fid, exc_info=True)
             return
         if ledger.get("errors"):
@@ -1348,7 +1358,9 @@ class ReconcileMixin:
             revision["retired"] = True
             try:
                 await asyncio.to_thread(store.record_work_location, fid, revision)
-            except Exception:  # noqa: BLE001 — one entry's failure must not stop the others or the close
+            except Exception as exc:  # noqa: BLE001 — one entry's failure must not stop the others or the close
+                if stall_ends_tick and isinstance(exc, store_mod.BoardTimeout):
+                    raise
                 log.warning(
                     "[project_board] %s could not retire work location %s after merge",
                     fid,

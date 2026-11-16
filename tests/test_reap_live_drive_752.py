@@ -27,11 +27,12 @@ import re
 import subprocess
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from project_board import work_locations, worktree
+from project_board.store import BoardTimeout
 from project_board.loop import BoardLoop, _drive_slot
 
 
@@ -445,4 +446,52 @@ async def test_drive_starting_during_auto_merge_keeps_tree_and_published_ref(tmp
     # The normal MERGED poll can now reap, with the published ref still available.
     await loop._reconcile_pr(store, _merged(store), known_state="MERGED")
     assert store.feature["board_state"] == "done"
+    assert not os.path.exists(tree)
+
+
+@pytest.mark.parametrize("operation", ["list_work_locations", "record_work_location"])
+@pytest.mark.parametrize("orphan", [False, True])
+async def test_retirement_timeout_stops_sweep_after_first_store_stall(tmp_path, monkeypatch, operation, orphan):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree() if orphan else os.path.join(repo.clone, repo.root, f"feat-{FID}")
+    store = FakeStore(locations=[
+        {"id": "first", "path": tree, "purpose": "build"},
+        {"id": "second", "path": tree + "/output", "purpose": "output"},
+    ])
+    store.feature["board_state"] = "done"
+    loop = _loop(repo)
+    monkeypatch.setattr(loop, "_store", lambda: store)
+    monkeypatch.setattr(loop, "_all_repos", lambda: [repo.clone])
+    monkeypatch.setattr(worktree, "processes_in_trees", AsyncMock(return_value={}))
+    cards = [store.feature, {**store.feature, "id": "bd-next"}]
+    monkeypatch.setattr(store, "list_features", lambda *, state: cards if state == "done" else [], raising=False)
+    reads = Mock(wraps=store.list_work_locations)
+    writes = Mock(wraps=store.record_work_location)
+    monkeypatch.setattr(store, "list_work_locations", reads)
+    monkeypatch.setattr(store, "record_work_location", writes)
+    stalled = reads if operation == "list_work_locations" else writes
+    stalled.side_effect = BoardTimeout("store stalled")
+    later_phase = Mock()
+    monkeypatch.setattr(loop, "_start_base_refresh", later_phase)
+
+    with pytest.raises(BoardTimeout, match="store stalled"):
+        await loop._sweep()
+
+    reads.assert_called_once_with(FID)
+    assert stalled.call_count == 1
+    assert writes.call_count == (operation == "record_work_location")
+    later_phase.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["list_work_locations", "record_work_location"])
+async def test_retirement_timeout_remains_best_effort_at_merge_close(tmp_path, monkeypatch, operation):
+    repo = _Repo(tmp_path)
+    tree = repo.make_tree()
+    store = FakeStore(locations=[{"id": "tree", "path": tree, "purpose": "build"}])
+    monkeypatch.setattr(store, operation, Mock(side_effect=BoardTimeout("store stalled")))
+
+    await _loop(repo)._reconcile_pr(store, _merged(store), known_state="MERGED")
+
+    assert store.feature["board_state"] == "done"
+    assert store.cleared
     assert not os.path.exists(tree)
