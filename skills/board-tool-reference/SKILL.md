@@ -101,6 +101,19 @@ suggested_edges}`. `refusals` items are `{gate, message, fix}`. `advisories` ref
 (e.g. a `depends_on` edge onto a cancelled card). `breadth` is the counted total, the cap,
 and the files `breadth_exclude` left out.
 
+The `dependency-no-shared-file` advisory flags an open → open dependency when both
+cards list files but share none (ignoring `(new)` markers and leading `./`). It never
+refuses readiness. Keep the edge if it builds on named code; otherwise remove it.
+
+Create/update replies include `ready_check.graph`, and mark-ready replies include
+`graph`, only when the card's project has at least two open cards with dependencies.
+The summary contains `startable_now` (ids whose dependencies are all terminal),
+`longest_chain` (open ids in prerequisite-first order), and `no_shared_file_edges`
+(`{feature_id, depends_on}` pairs using the same advisory comparison). Missing
+blockers do not count as terminal. Only cards in this project appear in the graph;
+terminal cards are excluded. Cycles cannot hang the summary: back edges are skipped
+when finding a chain. Graph read failures omit the summary without failing the reply.
+
 The card is created whether or not `ready_check.ok`; fix what it lists, then
 `board_mark_ready`. Only `ready` cards are pulled.
 

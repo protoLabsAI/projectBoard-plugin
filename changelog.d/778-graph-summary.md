@@ -1,0 +1,1 @@
+Ready replies now summarize the project dependency graph: startable cards, the longest open chain, and edges without shared files. Reuses the dependency advisory comparison and safely omits graph advice on read failures. Closes #778.

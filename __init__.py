@@ -513,6 +513,14 @@ def _ready_dry_run(store, fid: str) -> dict:
         out["breadth"] = breadth
     if res.get("note"):
         out["note"] = res["note"]
+    try:
+        current = store.get_feature(fid)
+        if current is not None:
+            graph = store.graph_summary(str(current.get("project") or ""), current=current)
+            if graph is not None:
+                out["graph"] = graph
+    except Exception:  # noqa: BLE001 — graph advice must not fail an already-saved card
+        pass
     return out
 
 
@@ -1092,8 +1100,13 @@ def _board_tools(cfg: dict, registry=None):
         another open card names with no depends_on path between them. Only `ready`
         features are pulled. board_check_ready asks the same question without promoting."""
         try:
-            f = get_store(**store_kw).mark_ready(feature_id)
-            return json.dumps({"id": f["id"], "state": f["board_state"]})
+            store = get_store(**store_kw)
+            f = store.mark_ready(feature_id)
+            out = {"id": f["id"], "state": f["board_state"]}
+            dry = _ready_dry_run(store, f["id"])
+            if "graph" in dry:
+                out["graph"] = dry["graph"]
+            return json.dumps(out)
         except BoardError as exc:
             return f"Error: {exc}"
 

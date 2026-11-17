@@ -490,6 +490,66 @@ _GLOB_DEFAULTS_TOKENS = ("defaults", "default")
 _NEW_MARKER_RE = re.compile(r"\s*\(new\)\s*", re.IGNORECASE)
 
 
+def _files_are_disjoint(a: dict, b: dict) -> bool:
+    """The #778 comparison: both cards name files, with no shared path."""
+    left = {strip_new_marker(p) for p in a.get("files_to_modify") or [] if str(p).strip()}
+    right = {strip_new_marker(p) for p in b.get("files_to_modify") or [] if str(p).strip()}
+    return bool(left and right and not left & right)
+
+
+def _graph_summary(project: str, rows: list[dict]) -> dict | None:
+    """Pure snapshot summary with id ordering for stable ties.
+
+    Longest paths are exact for a DAG. For corrupt cycles, ignore DFS back edges
+    and report a simple path. Iterative traversal also handles deep chains.
+    """
+    by_id = {r["id"]: r for r in rows}
+    opened = {
+        fid: row
+        for fid, row in sorted(by_id.items())
+        if row.get("board_state") not in _TERMINAL_STATES and str(row.get("project") or "") == project
+    }
+    if sum(bool(row.get("depends_on")) for row in opened.values()) < 2:
+        return None
+    deps = {fid: sorted(set(row.get("depends_on") or []) & opened.keys()) for fid, row in opened.items()}
+    paths: dict[str, list[str]] = {}
+    active: set[str] = set()
+    for root in opened:
+        if root in paths:
+            continue
+        active.add(root)
+        stack = [(root, iter(deps[root]), [])]
+        while stack:
+            fid, pending, best = stack[-1]
+            dep = next(pending, None)
+            if dep is None:
+                paths[fid] = best + [fid]
+                active.remove(fid)
+                stack.pop()
+                if stack and len(paths[fid]) > len(stack[-1][2]):
+                    stack[-1][2][:] = paths[fid]
+            elif dep in paths:
+                if len(paths[dep]) > len(best):
+                    best[:] = paths[dep]
+            elif dep not in active:
+                active.add(dep)
+                stack.append((dep, iter(deps[dep]), []))
+    return {
+        "startable_now": [
+            fid
+            for fid, row in opened.items()
+            if all(by_id.get(dep, {}).get("board_state") in _TERMINAL_STATES for dep in row.get("depends_on") or [])
+        ],
+        "longest_chain": max(paths.values(), key=len, default=[]),
+        "no_shared_file_edges": [
+            {"feature_id": fid, "depends_on": dep}
+            for fid in opened
+            for dep in deps[fid]
+            if _files_are_disjoint(opened[fid], opened[dep])
+        ],
+    }
+
+
 def strip_new_marker(path) -> str:
     """``path`` without its ``(new)`` marker (#110) or a leading ``./``, trimmed — the file
     itself, so `./shared.py` and `shared.py (new)` compare as the same file."""
@@ -2963,6 +3023,16 @@ class BeadsBoard:
             remaining = [p for p in remaining if p not in on_branch]
         return remaining, advisories
 
+    def graph_summary(self, project: str, *, current: dict | None = None) -> dict | None:
+        """Read-only graph advice, including archived terminal blockers.
+
+        Overlay the just-read card rather than an older listing's copy.
+        """
+        rows = {r["id"]: r for r in self.list_features(include_archived=True)}
+        if current is not None:
+            rows[current["id"]] = current
+        return _graph_summary(project, list(rows.values()))
+
     def _ready_findings(self, f: dict, rows: list[dict] | None = None) -> dict:
         """Every Ready-gate check that can be judged from the card and the board alone, ALL
         of them, never stopping at the first (#455). Pure: it reads, it never writes.
@@ -3194,13 +3264,11 @@ class BeadsBoard:
         # overlap. `(new)` markers are stripped the same way the shared-file check normalises,
         # so `a.py (new)` and `a.py` count as the same file.
         if f.get("board_state") not in _TERMINAL_STATES:
-            mine_norm = {strip_new_marker(p) for p in f.get("files_to_modify") or [] if str(p).strip()}
             for dep in f.get("depends_on") or []:
                 row = by_id.get(dep)
                 if row is None or row.get("board_state") in _TERMINAL_STATES:
                     continue
-                dep_norm = {strip_new_marker(p) for p in row.get("files_to_modify") or [] if str(p).strip()}
-                if not mine_norm or not dep_norm or (mine_norm & dep_norm):
+                if not _files_are_disjoint(f, row):
                     continue
                 advisories.append(
                     {
