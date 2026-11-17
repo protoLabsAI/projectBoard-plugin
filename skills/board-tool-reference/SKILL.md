@@ -65,7 +65,8 @@ review, and cross-file plus removed-behavior findings made up 45% of review find
   say which one and why; otherwise let the coder change what the behavior needs.
 - **Split at four authored files.** Cards with 4+ listed files bounced in review 42% of the
   time, against 24% for 3 or fewer. If a feature needs four files, look for the seam that
-  splits it into two cards chained by `depends_on`.
+  splits it into two cards. Chain the halves with `depends_on` only if they share a file
+  or one builds on code the other adds; otherwise leave them parallel.
 - **One behavior per card.** A card whose criteria pull in different directions (wire the
   navigation AND fix reconnect AND keep scroll state) multiplies review rounds. Each finding
   on one behavior re-opens the others.
@@ -92,6 +93,8 @@ naming EVERY failure at once with its fix:
   PATH (a chain counts: C → B → A orders A and C too). A project's `hot_files` are chained
   for you at create. `ready_check.suggested_edges` (earliest-created first) lists the edges
   that would serialise every unserialised pair.
+
+An edge needs a reason: the two cards touch the same file, or one builds on named code the other adds. Say which on the card. A phase-level 'after X' in a brief or design doc is not a reason by itself; check it card by card.
 
 `board_check_ready` returns `{id, state, ok, refusals, advisories, breadth, unserialised,
 suggested_edges}`. `refusals` items are `{gate, message, fix}`. `advisories` refuse nothing
