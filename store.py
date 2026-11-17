@@ -3183,6 +3183,37 @@ class BeadsBoard:
                     }
                 )
 
+        # DEPENDENCY no-shared-file (#778, advisory): an edge between two OPEN cards that
+        # modify no file in common is almost never a real build-on — a 12-card batch boarded
+        # as one chain had four cards waiting on work they shared no file with, and every
+        # create returned ready_check ok. The shared-file gate reports the opposite case (an
+        # overlap with NO edge); this nudges the author to drop an edge the files don't force,
+        # so independent cards can run in parallel. Advisory only — never a refusal, never
+        # changes `ok`. Skipped when the blocker is terminal (the cancelled case keeps its own
+        # advisory above) or either card names no files (a task), and silent when the files
+        # overlap. `(new)` markers are stripped the same way the shared-file check normalises,
+        # so `a.py (new)` and `a.py` count as the same file.
+        if f.get("board_state") not in _TERMINAL_STATES:
+            mine_norm = {strip_new_marker(p) for p in f.get("files_to_modify") or [] if str(p).strip()}
+            for dep in f.get("depends_on") or []:
+                row = by_id.get(dep)
+                if row is None or row.get("board_state") in _TERMINAL_STATES:
+                    continue
+                dep_norm = {strip_new_marker(p) for p in row.get("files_to_modify") or [] if str(p).strip()}
+                if not mine_norm or not dep_norm or (mine_norm & dep_norm):
+                    continue
+                advisories.append(
+                    {
+                        "gate": "dependency-no-shared-file",
+                        "message": f"feature {fid!r} depends on {dep!r}, but they share no file in files_to_modify",
+                        "fix": (
+                            f"keep this edge only if {fid} builds on code {dep} adds, and say which on the "
+                            f"card; otherwise remove it with board_remove_dependency(feature_id={fid!r}, "
+                            f"depends_on={dep!r})."
+                        ),
+                    }
+                )
+
         # SHARED-FILE overlap (#143, #458): two open cards naming the same file must be
         # SERIALISED — a depends_on PATH between them, in either direction, over the board's
         # open cards (the transitive closure: a chain A <- B <- C orders A and C too).
