@@ -1,0 +1,1 @@
+Clarified dependency guidance across board authoring skills: split cards remain parallel unless they share a file or build on code the other adds, and each edge needs a reason recorded on the card. The planning critic now checks for needless dependency serialization. Refs #778.

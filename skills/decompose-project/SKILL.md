@@ -85,6 +85,7 @@ to fan out, but keep the propose→attack pairing for each.
    - Features that edit the **same file** must be ordered by a `depends_on` path. Chain
      them in the order they should land (B depends on A, C on B); a chain orders every
      pair on it, so N features need N-1 edges.
+   - An edge needs a reason: the two cards touch the same file, or one builds on named code the other adds. Say which on the card. A phase-level 'after X' in a brief or design doc is not a reason by itself; check it card by card.
    - **Read the reply's `ready_check`.** It dry-runs every Ready check now. If `ok` is
      false, `will_be_refused_at_ready` lists every failure with its fix and
      `suggested_edges` the missing chain edges. Repair them with `board_update_feature`

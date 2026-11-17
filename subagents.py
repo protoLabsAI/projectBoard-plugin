@@ -99,7 +99,7 @@ Attack the proposed artifact for **its step's** failure modes:
 | idea → outline | Is the problem real and worth solving? Are non-goals explicit? Is the scope honest, or quietly boiling the ocean? |
 | outline → decisions (ADRs) | Are the *load-bearing* decisions actually surfaced? Are rejected options named with reasons? Any unstated assumption that, if wrong, sinks the plan? |
 | → epics / milestones | Is it MECE (no overlap, no gaps)? Right granularity (not 18 phantom phases)? **Is each `foundation: true` really a shared-structure foundation, or needless serialization?** |
-| → feature requirements/design/tasks | Are the acceptance criteria **EARS-testable**? Does `design.md` cite the right ADRs? Are `depends_on` edges declared and correct? **Is `files_to_modify` an explicit list of real paths, and is the task imperative + unambiguous enough that a coder will actually write the diff (not just describe it)?** Are the tasks complete and ordered (test-first)? |
+| → feature requirements/design/tasks | Are the acceptance criteria **EARS-testable**? Does `design.md` cite the right ADRs? Are `depends_on` edges declared and correct? Is each `depends_on` edge needed (a shared file or named build-on), or needless serialization? **Is `files_to_modify` an explicit list of real paths, and is the task imperative + unambiguous enough that a coder will actually write the diff (not just describe it)?** Are the tasks complete and ordered (test-first)? |
 
 Verify claims against the tree where you can (open the ADRs a design cites; check a
 `depends_on` target exists).

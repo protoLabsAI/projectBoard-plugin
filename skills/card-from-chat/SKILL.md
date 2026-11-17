@@ -75,6 +75,7 @@ Why: <what and why>
 3. **No unrequested dependencies.** Don't add dependency edges (`depends_on`, blockers) to
    other backlog cards unless the user asked for them. An edge to an unrelated, stale
    backlog chain leaves the new card waiting forever.
+   An edge needs a reason: the two cards touch the same file, or one builds on named code the other adds. Say which on the card. A phase-level 'after X' in a brief or design doc is not a reason by itself; check it card by card.
 4. **Ready.** The build loop only claims cards that are **ready** (on deck), never backlog
    ones. If the create reply's `ready_check` is ok, call `board_mark_ready`. If not, fix
    each listed failure with `board_update_feature` (`board_check_ready` re-checks), then
