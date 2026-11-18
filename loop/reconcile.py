@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from .. import external_review, merge_state_hold, review_coverage_hold, work_locations
+from .. import block_pages, external_review, merge_state_hold, review_coverage_hold, work_locations
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction
 from .drive import _recorded_reset
@@ -1525,6 +1525,10 @@ class ReconcileMixin(WorktreeCleanup):
                     if state in ("MERGED", "CLOSED"):
                         merge_state_hold.clear_hold(fid)  # #495: a finished PR holds nothing
                         review_coverage_hold.clear_hold(fid)
+                        # #786: nothing is left to merge or adjudicate, so the card's pending
+                        # "merge is yours" pages leave Needs-you. Best-effort — the block-page
+                        # sweep retries a retirement that fails here.
+                        await asyncio.to_thread(self._retire_agent_pages, fid)
                     if state == "MERGED":
                         if await asyncio.to_thread(store.record_merge, pr_url=pr_url):
                             if reap:
@@ -1548,7 +1552,10 @@ class ReconcileMixin(WorktreeCleanup):
                             log.info("[project_board] reconcile → done: %s (%s)", fid, pr_url)
                     elif state == "CLOSED":
                         await asyncio.to_thread(
-                            self._flag_blocked, store, fid, f"PR closed without merging — needs triage: {pr_url}"
+                            self._flag_blocked,
+                            store,
+                            fid,
+                            f"{block_pages.PR_CLOSED_REASON} — needs triage: {pr_url}",
                         )
                         await self._reap_feature_worktree(repo, fid)
                         self._ci_feedback.pop(fid, None)
@@ -3274,11 +3281,12 @@ class ReconcileMixin(WorktreeCleanup):
 
         The pass's ``view`` is judged by ``external_review.evaluate``; a terminal verdict
         (PASS/WARN/FAIL — not an incomplete pass, nor an absent one) queues ONE agent-owned inbox
-        page naming the card, PR and verdict (``_queue_agent_page``), deduped per card+head both
-        in-process (once per head per process) and durably (the inbox's dedup key + window). The
-        page is agent-owned: it is NOT routed through the operator block-page machinery (a distinct
-        ``panel-verdict:`` dedup key, never ``blocked:``), so it fires the agent's Activity turn and
-        never shows in the operator's Needs-you.
+        page naming the card, PR and verdict (``_queue_agent_page``), deduped per card+head
+        in-process (once per head per process) and kept to ONE pending item per card durably
+        (#786: a per-card ``panel-verdict:<fid>`` key; a new head's page retires the earlier one,
+        and the MERGED/CLOSED edge retires them all). The page is agent-owned: it is NOT routed
+        through the operator block-page machinery (a distinct ``panel-verdict:`` dedup key, never
+        ``blocked:``), so it fires the agent's Activity turn.
 
         Fails OPEN: no ``external_review`` config, an unreadable panel, or a non-terminal verdict
         queues nothing and returns False. Returns whether a page was queued (or already present)."""
@@ -3308,12 +3316,17 @@ class ReconcileMixin(WorktreeCleanup):
             return True
         return False
 
+    @block_pages.serialized
     def _queue_agent_page(self, feature: dict, pr_url: str, head: str, verdict: str) -> bool:
         """Put ONE agent-owned page in the inbox for a terminal panel verdict at a card's PR head
         (#5218). Priority ``now`` so the host fires an Activity turn and the agent acts; the
-        ``panel-verdict:<fid>:<head>`` dedup key — never the operator's ``blocked:`` prefix — keeps
-        ``block_pages`` from treating it as an operator alert (so it stays out of the operator's
-        Needs-you) and dedups it per card+head across restarts within the alert window.
+        ``panel-verdict:<fid>`` dedup key — never the operator's ``blocked:`` prefix — keeps
+        ``block_pages`` from treating it as an operator block page.
+
+        ONE pending page per CARD (#786): the key is per card and the head rides in the text. A
+        page for a new head first retires the card's earlier pending pages (per-card and legacy
+        per-head keys), so a re-reviewed card shows once, naming the newest head; a page already
+        pending for this same head is kept and not re-added.
 
         The action named is VERDICT-APPROPRIATE: a clean PASS / non-blocking WARN offers the merge
         (it is the agent's to make on this project), but a blocking FAIL/BLOCK/REJECT never does —
@@ -3336,7 +3349,8 @@ class ReconcileMixin(WorktreeCleanup):
             # A clean PASS / non-blocking WARN — the merge/adjudication is the agent's to make here.
             action = "The merge/adjudication is yours on this project — act on it (merge, request changes, or close)."
         text = f"QA panel {verdict} on {fid}{named} at head {short}: {pr_url}. {action}"
-        key = f"panel-verdict:{fid}:{short}"
+        key = block_pages.verdict_key(fid)
+        legacy = f"{key}:{short}"
         try:
             from inbox import InboxStore  # host module — absent on older hosts
 
@@ -3344,6 +3358,32 @@ class ReconcileMixin(WorktreeCleanup):
             if db is None:
                 raise RuntimeError("no resolvable inbox store for this instance")
             inbox = InboxStore(str(db), dedup_window_s=_ALERT_DEDUP_S)
+            # #786: ONE pending page per card. Retire the card's earlier pending pages (the
+            # per-card key and the legacy per-head one) before adding this head's, so the newest
+            # head is the only item. A page already pending for THIS head is kept, not re-added
+            # (a restart must not re-page the same head).
+            try:
+                mine = [r for r in block_pages.pending(inbox) if block_pages.verdict_card_id(r) == fid]
+                keep = [
+                    r
+                    for r in mine
+                    if str(r.get("dedup_key") or "") == legacy or f" at head {short}: " in str(r.get("text") or "")
+                ][-1:]
+                retired = block_pages.retire_verdict_pages(
+                    fid, inbox=inbox, rows=mine, keep=tuple(r["id"] for r in keep)
+                )
+            except Exception:  # noqa: BLE001 — an inbox that cannot list still takes the page
+                log.warning("[project_board] %s: could not read earlier panel-verdict pages", fid, exc_info=True)
+                keep, retired = [], False
+            if keep:
+                log.debug("[project_board] %s panel %s at %s already paged — not re-paging", fid, verdict, short)
+                return True
+            if not retired:
+                # The earlier page could not be retired, so the per-card key would dedup this
+                # head's page against it and the new head would never be paged. Fall back to
+                # the per-head key: a duplicate item beats a lost page, and the next page or
+                # the sweep retires it.
+                key = legacy
             # Route the page back to the chat the card was created from (ADR 0131 P2b-3) —
             # the card's recorded origin, passed as InboxStore.add's `origin_session` (core
             # P2a-1). "" for a card with no recorded origin, so the add is unchanged there.
@@ -3369,6 +3409,15 @@ class ReconcileMixin(WorktreeCleanup):
                 exc_info=True,
             )
             return False
+
+    @block_pages.serialized
+    def _retire_agent_pages(self, fid: str) -> bool:
+        """Retire the card's pending panel-verdict pages once its PR merged or closed (#786),
+        and forget the in-process once-per-head guard so a reopened card pages afresh."""
+        paged = getattr(self, "_verdict_paged", None)
+        if paged:
+            paged.pop(fid, None)
+        return block_pages.retire_verdict_pages(fid)
 
     async def _reconcile_external_review(
         self, store, feature: dict, pr_url: str, repo: str, *, view: dict | None = None
