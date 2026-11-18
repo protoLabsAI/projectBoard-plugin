@@ -26,7 +26,7 @@ from _host_apply import HostConfig, apply_updates, resolve_patch, wire_host
 
 from project_board import worktree
 from project_board.projects import parse_github_remote
-from project_board.project_registry import build_register_tool, delete_project, upsert_project
+from project_board.project_registry import build_register_tool, delete_project, managed_note, upsert_project
 
 
 def _checkout(path: Path, remote: str | None = "https://github.com/protoLabsAI/design-system-plugin.git") -> Path:
@@ -86,7 +86,12 @@ async def test_register_adds_a_read_only_managed_project_in_the_same_patch(monke
 
     result = await upsert_project("design-system-plugin", str(repo), base_branch="main")
 
-    assert result["managed_project"] == {"action": "added", "name": "design-system-plugin", "detail": ""}
+    assert result["managed_project"] == {
+        "action": "added",
+        "name": "design-system-plugin",
+        "detail": "",
+        "write": False,
+    }
     assert len(host.patches) == 1  # ONE apply: one reload, one outcome
     assert _registry(host) == [
         {
@@ -232,6 +237,9 @@ async def test_the_register_tool_says_what_it_did(monkeypatch, tmp_path):
     reply = await build_register_tool({}).ainvoke({"name": "web", "repo": str(repo), "repo_conventions": "x"})
     assert "Registered board project 'web'" in reply
     assert "read-only managed project 'web'" in reply and "filesystem tools" in reply
+    assert "coders can't be dispatched" in reply
+    assert "register_local_project with write=true" in reply
+    assert "approval card" in reply and "Settings ▸ Projects" in reply
 
 
 async def test_a_readback_that_misses_the_managed_entry_is_not_reported_as_success(monkeypatch, tmp_path):
@@ -274,7 +282,7 @@ async def test_moving_onto_an_already_managed_checkout_drops_the_board_entry(mon
     host.doc["projects"].append(dict(onboarded))
 
     result = await upsert_project("web", str(new))
-    assert result["managed_project"] == {"action": "present", "name": "web-onboarded", "detail": ""}
+    assert result["managed_project"] == {"action": "present", "name": "web-onboarded", "detail": "", "write": True}
     assert _registry(host) == [onboarded]  # one entry per checkout, and it isn't the board's
     assert "managed_project" not in host.doc["project_board"]["projects"]["web"]
     assert (await delete_project("web"))["managed_project"]["action"] == "none"
@@ -363,7 +371,7 @@ async def test_a_checkout_the_fence_already_lists_gets_no_second_name(monkeypatc
     host = _host(tmp_path, filesystem={"projects": [{"name": "my-web", "path": str(repo), "write": True}]})
     wire_host(monkeypatch, host)
     result = await upsert_project("web", str(repo))
-    assert result["managed_project"] == {"action": "present", "name": "my-web", "detail": ""}
+    assert result["managed_project"] == {"action": "present", "name": "my-web", "detail": "", "write": True}
     assert _registry(host) == []
 
 
@@ -375,3 +383,65 @@ def test_the_host_floor_has_the_locked_callable_apply():
 
     m = yaml.safe_load((Path(__file__).resolve().parent.parent / "protoagent.plugin.yaml").read_text())
     assert tuple(int(x) for x in str(m["min_protoagent_version"]).split(".")) >= (0, 164, 0)
+
+
+@pytest.mark.parametrize("source", ["registry", "fence"])
+@pytest.mark.parametrize("write,effective", [(False, False), (True, True), ("false", False), (None, False)])
+async def test_present_reply_reports_effective_write_mode(monkeypatch, tmp_path, source, write, effective):
+    repo = _checkout(tmp_path / "workspace" / "web")
+    entry = {"name": "existing", "path": str(repo)}
+    if write is not None:
+        entry["write"] = write
+    doc = {"projects": [entry]} if source == "registry" else {"filesystem": {"projects": [entry]}}
+    host = _host(tmp_path, **doc)
+    wire_host(monkeypatch, host)
+    result = await upsert_project("web", str(repo))
+    assert result["managed_project"]["write"] is effective
+    reply = await build_register_tool({}).ainvoke({"name": "web", "repo": str(repo), "repo_conventions": "x"})
+    assert "It is already the managed project 'existing', which was left as it is." in reply
+    assert ("coders can't be dispatched" in reply) is (not effective)
+
+
+@pytest.mark.parametrize("branch,action", [("main", "unchanged"), ("develop", "updated")])
+@pytest.mark.parametrize("write", [False, True])
+async def test_owned_entry_reply_uses_operator_write_mode(monkeypatch, tmp_path, branch, action, write):
+    host = _host(tmp_path)
+    repo = _checkout(tmp_path / "workspace" / "web")
+    wire_host(monkeypatch, host)
+    await upsert_project("web", str(repo))
+    host.doc["projects"][0]["write"] = write
+    result = await upsert_project("web", str(repo), base_branch=branch)
+    managed = result["managed_project"]
+    assert managed["action"] == action
+    assert managed["write"] is write
+    assert ("coders can't be dispatched" in managed_note(managed)) is (not write)
+    reply = await build_register_tool({}).ainvoke(
+        {"name": "web", "repo": str(repo), "base_branch": branch, "repo_conventions": "x"}
+    )
+    assert ("coders can't be dispatched" in reply) is (not write)
+    assert host.doc["projects"][0]["write"] is write
+
+
+@pytest.mark.parametrize("action", ["skipped", "unsupported"])
+async def test_no_managed_entry_preserves_reply(monkeypatch, tmp_path, action):
+    host = _host(tmp_path)
+    repo = _checkout(tmp_path / "workspace" / "web")
+    if action == "skipped":
+        host.doc["projects"] = [{"name": "web", "path": "/elsewhere", "write": False}]
+    else:
+        host.registry = False
+    wire_host(monkeypatch, host)
+    result = await upsert_project("web", str(repo))
+    managed = result["managed_project"]
+    assert managed["action"] == action
+    assert managed["write"] is None
+    detail = managed["detail"]
+    expected = (
+        f" NOT registered as a managed project: {detail} — the filesystem tools can't read it by that name."
+        if action == "skipped"
+        else f" Not registered as a managed project: {detail}."
+    )
+    assert managed_note(managed) == expected
+    reply = await build_register_tool({}).ainvoke({"name": "web", "repo": str(repo), "repo_conventions": "x"})
+    assert expected in reply
+    assert "coders can't be dispatched" not in reply
