@@ -83,6 +83,61 @@ def card_id(row):
     return key.split(":")[1]
 
 
+VERDICT_PREFIX = "panel-verdict:"
+# The reason the reconcile's CLOSED edge blocks a card with (loop/reconcile.py).
+PR_CLOSED_REASON = "PR closed without merging"
+
+
+def verdict_key(fid: str) -> str:
+    """The per-card dedup key of a "merge is yours" panel-verdict page (#786)."""
+    return f"{VERDICT_PREFIX}{fid}"
+
+
+def verdict_card_id(row):
+    """The card a panel-verdict page is about, else None. Matches the per-card key
+    ``panel-verdict:<fid>`` and the legacy per-head ``panel-verdict:<fid>:<head>`` (#786)."""
+    key = str(row.get("dedup_key") or "")
+    if row.get("source") != "project_board" or not key.startswith(VERDICT_PREFIX):
+        return None
+    return key[len(VERDICT_PREFIX) :].split(":")[0] or None
+
+
+def retire_verdict_pages(fid, *, inbox=None, rows=None, keep=()) -> bool:
+    """Mark the card's still-pending panel-verdict pages delivered — the host lists only
+    undelivered rows, so a delivered page leaves Needs-you (#786). ``keep`` names row ids to
+    leave pending. True when none (other than ``keep``) is left pending; False when the inbox
+    could not be read or written, so the caller can retry or fall back. Never raises."""
+    try:
+        inbox = inbox or inbox_store()
+        if inbox is None:
+            return False
+        ids = [
+            r["id"]
+            for r in (pending(inbox) if rows is None else rows)
+            if verdict_card_id(r) == fid and r["id"] not in keep
+        ]
+        if ids:
+            inbox.mark_delivered(ids)
+            log.info("[project_board] %s: retired %d panel-verdict page(s)", fid, len(ids))
+        return True
+    except ImportError:
+        return False  # Host without an inbox.
+    except Exception:
+        log.warning("[project_board] could not retire panel-verdict pages for %s; sweep will retry", fid, exc_info=True)
+        return False
+
+
+def verdict_settled(feature) -> bool:
+    """Whether the card's PR is known merged or closed, so nothing is left for its
+    panel-verdict page to ask. A missing record or failed read is not evidence."""
+    if not feature:
+        return False
+    state = feature.get("board_state")
+    if state == "done":
+        return True
+    return state == "blocked" and str(feature.get("blocked_reason") or "").startswith(PR_CLOSED_REASON)
+
+
 def retire(feature, *, inbox=None, rows=None):
     if not feature or not feature.get("board_state") or feature.get("board_state") == "blocked":
         return
@@ -136,6 +191,14 @@ def sweep(store):
                 retire(feature, inbox=inbox, rows=rows)
             except Exception:
                 log.debug("[project_board] cannot check block page for %s", fid, exc_info=True)
+        # #786: panel-verdict pages whose PR merged or closed — a retirement the reconcile
+        # edge could not complete, or a page left by a card finished before this existed.
+        for fid in {verdict_card_id(r) for r in rows} - {None}:
+            try:
+                if verdict_settled(store.get_feature(fid)):
+                    retire_verdict_pages(fid, inbox=inbox, rows=rows)
+            except Exception:
+                log.debug("[project_board] cannot check panel-verdict page for %s", fid, exc_info=True)
     except ImportError:
         pass  # Host without an inbox.
     except Exception:

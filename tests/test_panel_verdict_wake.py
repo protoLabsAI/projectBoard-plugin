@@ -170,6 +170,10 @@ def inbox(monkeypatch, tmp_path):
     return rows
 
 
+def _row(rid, key, text, *, source="project_board"):
+    return dict(id=rid, text=text, source=source, priority="now", dedup_key=key, origin_session="", delivered_at=None)
+
+
 class _Store:
     """One in_review card and the store surface the PR reconcile touches."""
 
@@ -254,9 +258,14 @@ async def test_the_page_is_agent_owned_not_an_operator_block_page(inbox, monkeyp
     assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view("PASS")) is True
     row = inbox[0]
     assert row["source"] == "project_board"
-    assert row["dedup_key"] == f"panel-verdict:{FID}:{HEAD[:SHORT]}"
+    assert row["dedup_key"] == f"panel-verdict:{FID}"  # per card (#786); the head is in the text
+    assert HEAD[:SHORT] in row["text"]
     assert not row["dedup_key"].startswith("blocked:")
     assert block_pages.card_id(row) is None  # the operator block-page lifecycle ignores it
+
+
+def _pending(rows):
+    return [r for r in rows if r["delivered_at"] is None]
 
 
 async def test_deduped_per_card_and_head_but_a_new_head_re_arms_it(inbox, monkeypatch):
@@ -271,6 +280,63 @@ async def test_deduped_per_card_and_head_but_a_new_head_re_arms_it(inbox, monkey
     # A push is a new head — a fresh verdict there pages again.
     assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS", head=NEW_HEAD)) is True
     assert len(inbox) == 2
+    assert inbox[1]["dedup_key"] == f"panel-verdict:{FID}"
+
+
+async def test_a_second_pass_on_a_new_head_leaves_one_pending_item_naming_it(inbox, monkeypatch):
+    """#786 (ds-efi showed two items 13 minutes apart): the re-review's page replaces the
+    earlier head's, so Needs-you holds exactly one item per card — the newest head."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    f = store._feature()
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS")) is True
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS", head=NEW_HEAD)) is True
+    pending = _pending(inbox)
+    assert len(pending) == 1
+    assert NEW_HEAD[:SHORT] in pending[0]["text"] and HEAD[:SHORT] not in pending[0]["text"]
+    assert inbox[0]["delivered_at"] is not None  # the earlier head's page was retired, not left
+
+
+async def test_a_legacy_per_head_item_is_retired_by_the_new_heads_page(inbox, monkeypatch):
+    """Rows written before #786 carry `panel-verdict:<fid>:<head>`; they are the card's too.
+    Another card's page — and an operator block page for this card — are left alone."""
+    inbox.extend(
+        [
+            _row(1, f"panel-verdict:{FID}:{HEAD[:SHORT]}", f"QA panel PASS on {FID} at head {HEAD[:SHORT]}: {PR}."),
+            _row(2, "panel-verdict:bd-10:abc1234", "QA panel PASS on bd-10 at head abc1234: other."),
+            _row(3, f"blocked:{FID}:x", f"{FID} is blocked: something."),
+        ]
+    )
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    f = store._feature()
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS", head=NEW_HEAD)) is True
+    assert [r["id"] for r in _pending(inbox)] == [2, 3, 4]
+    assert inbox[3]["dedup_key"] == f"panel-verdict:{FID}" and NEW_HEAD[:SHORT] in inbox[3]["text"]
+
+
+@pytest.mark.parametrize("key", [f"panel-verdict:{FID}", f"panel-verdict:{FID}:{HEAD[:SHORT]}"])
+async def test_a_restart_does_not_re_page_a_head_whose_page_is_still_pending(inbox, monkeypatch, key):
+    """A fresh process has no in-memory guard: the pending page for this same head (per-card or
+    legacy key) is kept as the one item — neither retired nor doubled."""
+    inbox.append(_row(1, key, f"QA panel PASS on {FID} at head {HEAD[:SHORT]}: {PR}. act"))
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view("PASS")) is True
+    assert len(inbox) == 1 and inbox[0]["delivered_at"] is None
+
+
+async def test_a_new_head_is_still_paged_when_the_earlier_page_cannot_be_retired(inbox, monkeypatch):
+    """The page for a new head is never lost: if the earlier item cannot be retired, the per-card
+    key would dedup the new page against it, so it goes out under the per-head key instead."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    f = store._feature()
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS")) is True
+    cls = sys.modules["inbox"].InboxStore
+    monkeypatch.setattr(cls, "mark_delivered", lambda *a: (_ for _ in ()).throw(OSError("busy")))
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS", head=NEW_HEAD)) is True
+    assert len(inbox) == 2 and NEW_HEAD[:SHORT] in inbox[1]["text"]
     assert inbox[1]["dedup_key"] == f"panel-verdict:{FID}:{NEW_HEAD[:SHORT]}"
 
 
@@ -356,3 +422,74 @@ async def test_no_page_when_the_board_merges_the_pr_itself(inbox, monkeypatch):
     loop = _driven_loop(monkeypatch, store, _view("PASS"), auto_merge=True)
     await loop._reconcile_prs()
     assert inbox == []  # auto_merge on: the board merges, so the agent is never paged
+
+
+# ── retired when the PR merges or closes (#786) ──────────────────────────────────────────
+
+
+def _finished_loop(monkeypatch, store, state):
+    """A loop whose PR reconcile observes ``state`` (MERGED / CLOSED) for the card's PR, with
+    the terminal edge's side effects (worktree reap, budget reset, block flag) stubbed."""
+    loop = _driven_loop(monkeypatch, store, {**_view("PASS"), "state": state}, auto_merge=False)
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(loop, "_reap_feature_worktree", _noop)
+    monkeypatch.setattr(loop, "_retire_merged_work_locations", _noop)
+    monkeypatch.setattr(loop, "_budget_reset", _noop)
+    monkeypatch.setattr(loop, "_flag_blocked", lambda *a, **k: None)
+    store.record_merge = lambda pr_url: True
+    return loop
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+async def test_a_merged_or_closed_pr_leaves_no_pending_item(inbox, monkeypatch, state):
+    """The PR landed (or was closed): nothing is left for the operator, so the card's items —
+    per-card and legacy per-head — leave Needs-you. Another card's item stays."""
+    store = _Store()
+    loop = _loop(monkeypatch, store)
+    assert await loop._page_agent_panel_verdict(store, store._feature(), PR, "/repo", view=_view("PASS")) is True
+    inbox.append(_row(2, f"panel-verdict:{FID}:{NEW_HEAD[:SHORT]}", "legacy per-head row"))
+    inbox.append(_row(3, "panel-verdict:bd-10", "QA panel PASS on bd-10 at head abc1234: other."))
+    await _finished_loop(monkeypatch, store, state)._reconcile_prs()
+    assert [r["id"] for r in _pending(inbox)] == [3]
+
+
+async def test_a_reopened_card_is_paged_again_at_the_same_head(inbox, monkeypatch):
+    """The finished edge also forgets the in-process once-per-head guard, so the retired page
+    does not silence a later verdict on the same head (e.g. a closed PR reopened)."""
+    store = _Store()
+    loop = _finished_loop(monkeypatch, store, "CLOSED")
+    f = store._feature()
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS")) is True
+    await loop._reconcile_prs()
+    assert _pending(inbox) == []
+    assert await loop._page_agent_panel_verdict(store, f, PR, "/repo", view=_view("PASS")) is True
+    assert len(_pending(inbox)) == 1
+
+
+def test_the_sweep_retires_pages_of_cards_finished_earlier(inbox):
+    """Items left by PRs that merged or closed before #786 (or whose retirement failed at the
+    edge) are retired by the block-page sweep; an open card's item and an unreadable card's stay."""
+    inbox.extend(
+        [
+            _row(1, "panel-verdict:bd-done:abc1234", "merged long ago"),
+            _row(2, "panel-verdict:bd-closed", "closed"),
+            _row(3, "panel-verdict:bd-open", "still in review"),
+            _row(4, "panel-verdict:bd-held", "blocked for another reason"),
+            _row(5, "panel-verdict:bd-gone", "no record"),
+        ]
+    )
+    cards = {
+        "bd-done": {"id": "bd-done", "board_state": "done"},
+        "bd-closed": {
+            "id": "bd-closed",
+            "board_state": "blocked",
+            "blocked_reason": f"PR closed without merging — needs triage: {PR}",
+        },
+        "bd-open": {"id": "bd-open", "board_state": "in_review"},
+        "bd-held": {"id": "bd-held", "board_state": "blocked", "blocked_reason": "merge state unknown"},
+    }
+    block_pages.sweep(SimpleNamespace(get_feature=cards.get))
+    assert [r["id"] for r in _pending(inbox)] == [3, 4, 5]
