@@ -407,6 +407,8 @@
     border:var(--pl-border-width) solid var(--pl-color-border);
     background:var(--pl-color-bg-raised);color:var(--pl-color-fg)}
   .tbtn:hover{border-color:var(--pl-color-accent)}
+  .tbtn:disabled{cursor:default;opacity:.55}
+  .tbtn:disabled:hover{border-color:var(--pl-color-border)}
   .tbtn--primary{background:var(--pl-color-accent);color:var(--pl-color-bg);border-color:var(--pl-color-accent)}
   .tbtn--danger{background:var(--pl-color-status-error);color:var(--pl-color-bg);border-color:var(--pl-color-status-error)}
   .terr{color:var(--pl-color-status-error);font-size:10.5px;margin-top:2px;white-space:pre-wrap;word-break:break-word}

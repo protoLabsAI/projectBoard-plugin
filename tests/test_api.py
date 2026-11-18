@@ -1400,6 +1400,145 @@ def test_deliver_and_verify_are_operator_gated_not_public(monkeypatch):
     assert c.post("/plugins/project_board/features/bd-1/verify", json={}).status_code == 404
 
 
+# ── #791: an approval answers when the card closes, and a repeat approval is not an error ──
+# Four POST …/verify for one task: the first closed the card, then held its response open
+# while it reaped the worktree; the board kept listing the card in review, so the operator
+# approved again and the other three were refused with "record_verification expects
+# in_review, got 'done'". These run the REAL store edge (its card lock and its idempotence)
+# behind the route, over a `br` fake that keeps one card's state.
+
+
+def _verification_board(make_board, monkeypatch, *, issue_type="task", state="in_review", verified_by="", close_s=0.0):
+    """A real ``BeadsBoard`` holding one card, ``bd-t``. ``br close`` moves it to done with
+    the verifier from the close reason, as the projection would read it back. Returns
+    ``(board, br_calls)``."""
+    import time
+
+    card = {
+        "id": "bd-t",
+        "title": "T",
+        "priority": 2,
+        "issue_type": issue_type,
+        "board_state": state,
+        "delivered_by": "human",
+        "verified_by": verified_by,
+    }
+    calls = []
+
+    def run(*args, want_json=False, with_has_more=False):
+        calls.append(args)
+        if args and args[0] == "close":
+            time.sleep(close_s)  # hold the card lock long enough for a second request to queue
+            card.update(board_state="done", verified_by=args[-1].split(":", 1)[1].strip())
+        val = [] if want_json else ""
+        return (val, None) if with_has_more else val
+
+    board = make_board(run)
+    monkeypatch.setattr(board, "get_feature", lambda fid: dict(card) if fid == card["id"] else None)
+    monkeypatch.setattr(board, "list_features", lambda state=None, include_archived=False: [dict(card)])
+    return board, calls
+
+
+_VERIFY_T = "/api/plugins/project_board/features/bd-t/verify"
+
+
+def test_two_concurrent_approvals_both_succeed_and_close_the_card_once(make_board, monkeypatch):
+    """Two approvals of one in-review task at the same time: both are answered 200 with the
+    done card, and the card is closed ONCE — one `br close` carrying the one `verified:`
+    record, no second label or comment write."""
+    reaped = _stub_reap(monkeypatch)
+    board, br_calls = _verification_board(make_board, monkeypatch, close_s=0.2)
+    c = _client(monkeypatch, board, cfg={"repo": "/repo", "worktrees_root": ".wt"})
+    start = threading.Barrier(2)
+    responses = []
+
+    def approve():
+        start.wait(timeout=10)
+        responses.append(c.post(_VERIFY_T, json={"approved": True}))
+
+    threads = [threading.Thread(target=approve) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
+    assert all(r.json()["board_state"] == "done" for r in responses)
+    assert all(r.json()["verified_by"] == "operator" for r in responses)
+    assert [a for a in br_calls if a[0] == "close"] == [("close", "bd-t", "-r", "verified: operator")]
+    assert [a for a in br_calls if a[0] in ("comments", "update", "reopen")] == []
+    assert reaped and set(reaped) == {("/repo", ".wt", "bd-t")}
+
+
+def test_features_shows_the_card_done_while_the_approvals_reap_is_still_running(make_board, monkeypatch):
+    """The read cache hears about the approval when the store write returns, not when the
+    handler is over: a GET /features issued while the worktree reap is still running lists
+    the card as done, so the operator is not looking at an in-review card they already
+    approved."""
+    reap_started, release_reap = threading.Event(), threading.Event()
+
+    async def _slow_reap(repo, root, fid):
+        reap_started.set()
+        await asyncio.to_thread(release_reap.wait, 30)
+
+    monkeypatch.setattr("project_board.worktree.reap_feature_worktree", _slow_reap)
+    board, _ = _verification_board(make_board, monkeypatch)
+    c = _client(monkeypatch, board)
+
+    def listed_state():
+        r = c.get("/api/plugins/project_board/features")
+        assert r.status_code == 200
+        body = r.json()
+        rows = body["features"] if isinstance(body, dict) else body
+        return next(f for f in rows if f["id"] == "bd-t")["board_state"]
+
+    assert listed_state() == "in_review"  # the pre-approval listing is now the cached snapshot
+    responses = []
+    approving = threading.Thread(target=lambda: responses.append(c.post(_VERIFY_T, json={"approved": True})))
+    approving.start()
+    try:
+        assert reap_started.wait(timeout=30), "the approval never reached its worktree reap"
+        assert listed_state() == "done"  # read DURING the reap
+    finally:
+        release_reap.set()
+        approving.join(timeout=30)
+    assert responses[0].status_code == 200 and responses[0].json()["board_state"] == "done"
+
+
+def test_approving_a_task_already_closed_by_verification_returns_the_card(make_board, monkeypatch):
+    """A repeat approval (a retry, a second tab) of a task verification already closed is
+    the same decision: 200 with the card, and nothing is written again."""
+    _stub_reap(monkeypatch)
+    board, br_calls = _verification_board(make_board, monkeypatch, state="done", verified_by="operator")
+    c = _client(monkeypatch, board)
+    r = c.post(_VERIFY_T, json={"approved": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == "bd-t" and r.json()["board_state"] == "done"
+    assert br_calls == []  # no second close, label or comment
+
+
+def test_a_real_verify_refusal_is_still_an_error(make_board, monkeypatch):
+    """The idempotence covers ONLY an approval of a verification-closed task. A rejection
+    of a done card, an approval of a card closed some other way (no `verified:` reason),
+    and any verify of a non-task card are still refused with the store's message."""
+    _stub_reap(monkeypatch)
+    board, br_calls = _verification_board(make_board, monkeypatch, state="done", verified_by="operator")
+    r = _client(monkeypatch, board).post(_VERIFY_T, json={"approved": False, "feedback": "reopen this"})
+    assert r.status_code == 400 and "expects in_review, got 'done'" in r.json()["detail"]
+
+    hand_closed, _ = _verification_board(make_board, monkeypatch, state="done")  # manual done: no verifier
+    r = _client(monkeypatch, hand_closed).post(_VERIFY_T, json={"approved": True})
+    assert r.status_code == 400 and "expects in_review, got 'done'" in r.json()["detail"]
+
+    for state, verified_by in (("in_review", ""), ("done", "operator")):
+        feature, _ = _verification_board(
+            make_board, monkeypatch, issue_type="feature", state=state, verified_by=verified_by
+        )
+        for approved in (True, False):
+            r = _client(monkeypatch, feature).post(_VERIFY_T, json={"approved": approved})
+            assert r.status_code == 400 and "task-only" in r.json()["detail"], (state, approved)
+    assert br_calls == []  # a refused rejection wrote no feedback comment and requeued nothing
+
+
 # ── /features/{fid}/test-rung — operator-only diagnostic (ADR 0064) ─────────────
 # No @tool wrapper anywhere in coder_seam.py/api.py exposes this to the board's
 # own lead agent — these tests only exercise the HTTP route directly, mirroring
