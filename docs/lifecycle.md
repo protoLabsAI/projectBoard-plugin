@@ -496,8 +496,11 @@ spent 15 generations on "acceptance tests timed out after 300s". It was then blo
 ## The tick never waits on one card (#462)
 
 Each tick runs four phases in order: the PR reconcile, the health sweep, the gate
-preflight, then the claim scan. The PR reconcile used to do every `in_review` card's
-work **inline**: the rebase, the merged-state gate (a repo's own suite, up to
+preflight, then the claim scan. The first two only **start** work and move on. The PR
+reconcile starts a task per card (below). The health sweep phase starts the sweep as one
+task of its own, when it is due, and waits at most 5 s for it (#794, further down). So the
+gate preflight and the claim scan are never held by either. The PR reconcile used to do
+every `in_review` card's work **inline**: the rebase, the merged-state gate (a repo's own suite, up to
 `local_gate_timeout_s`), the CI check, the review gate (an in-process model call) and
 auto-merge. So one slow card held every claim behind it. On 2026-09-27 a 600 s gate and a
 review call whose stream had hung kept a board with 32 ready cards and 0 in progress from
@@ -530,6 +533,38 @@ stuck in. The snapshot refresher raises it, so a stuck tick can't hide its own s
 
 The gate preflight still runs inside the tick, ahead of the claim scan. It is fail-closed per
 project, and its timeout is its own subject (#456).
+
+### The health sweep is off the tick too (#794)
+
+The sweep ran inline until 2026-11-18. That day it held the claim scan twice, for 303 s and
+for 528 s, with ready cards and free drive slots. Each of its GitHub calls is bounded (a
+`gh pr merge` has 120 s), but several in a row add up, and the log said nothing for the
+whole of it.
+
+Now the health sweep phase starts the sweep as its own task and waits 5 s:
+
+- A sweep that ends inside 5 s is that tick's phase, exactly as before: a failure is logged
+  by phase and the tick goes on, and a stalled store ends the tick (#404).
+- A slower sweep keeps running and the tick goes on to the gate preflight and the claim
+  scan. When it ends, a failure is logged the same way. A stalled store ends that sweep and
+  the **next** tick, as a card reconcile's stall does.
+- One sweep runs at a time. The cadence is unchanged (`health_sweep_interval_s`, measured
+  from one start to the next), and a sweep still running when the next is due delays it
+  until the first due tick after it ends.
+- The work-location sweep starts when the health sweep ends, whichever way it ran.
+- Shutdown cancels a running sweep.
+
+A sweep running beside the claim scan can't undo a claim. Every card move the sweep makes
+takes the claim lock and re-reads the card first (#402), and the claim scan registers the
+card's drive before it releases that lock. So a card claimed after the sweep listed it
+reads as held, and is left alone. The worktree reap skips every tree a drive, a reconcile
+or a review holds (#461).
+
+Each step of the sweep is timed. A step that takes more than 5 s logs one line,
+`sweep step <name> took <N>s`, and the name carries the card or the repo: `orphan reconcile
+bd-x`, `worktree reap <repo>`, `blocked recovery bd-x`. While a sweep runs, the
+`claim_stall` gap names the step it is in (`the health sweep is in its <step> step for
+<N>s`), so a slow sweep says which call is slow.
 
 ## A card moved under its build (#398)
 

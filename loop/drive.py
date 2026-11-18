@@ -571,6 +571,7 @@ class DriveMixin:
             self._snapshot_task,
             getattr(self, "_base_refresh_task", None),
             getattr(self, "_location_sweep_task", None),
+            getattr(self, "_sweep_task", None),  # a health sweep that outlived its tick (#794)
         ):
             if task:
                 task.cancel()
@@ -900,13 +901,18 @@ class DriveMixin:
         # full timeout per call, while holding the single-flight lock every board read
         # queues behind (a wedged store made seven stalled calls in one tick). So the first
         # stall ends the tick, logged as a stall, and the next tick tries again.
+        #
+        # The health sweep phase only STARTS the sweep and waits `sweep_tick_budget_s` for it
+        # (#794). A slower sweep finishes as its own task while this tick goes on to claim.
         sweep_before = self._last_sweep
         status = "ok"
         for phase, step in (("PR reconcile", self._maybe_reconcile), ("health sweep", self._maybe_sweep)):
             status, _ = await self._tick_phase(phase, step)
             if status == "stalled":
                 break
-        if status != "stalled" and self._last_sweep != sweep_before:
+        sweep = getattr(self, "_sweep_task", None)
+        if status != "stalled" and self._last_sweep != sweep_before and (sweep is None or sweep.done()):
+            # After the sweep, as before. One that outlived this tick starts it when it ends (#794).
             self._start_location_sweep()
         # Preserve the phase-failure guard: a failed preflight evaluation stops this
         # tick's claim scan, as it does in dispatch_now. A successfully evaluated scan
@@ -1026,6 +1032,13 @@ class DriveMixin:
             if where
             else "the tick is not reaching its claim scan"
         )
+        # A sweep in flight names its step (#794): "the health sweep phase" told nobody which
+        # of its GitHub or store calls was the slow one. It replaces the phase when the tick
+        # is waiting on the sweep (or on nothing it can name), and follows any other phase.
+        step = getattr(self, "_sweep_step_now", None)
+        if step:
+            sweeping = f"the health sweep is in its {step[0]} step for {int(now - step[1])}s"
+            stuck = sweeping if not where or where[0] == "health sweep" else f"{stuck}; {sweeping}"
         return (
             f"no claim decision for {int(idle)}s (> {self.claim_stall_ticks} ticks) with {ready} ready card(s) "
             f"and {len(self._drives)}/{self.max_concurrent} drive slot(s) in use — {stuck}"

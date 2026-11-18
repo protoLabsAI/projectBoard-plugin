@@ -825,15 +825,115 @@ class ReconcileMixin(WorktreeCleanup):
             return []
 
     # ── periodic health sweep (self-heal during the run) ───────────────────────
+    #: How long a tick waits on the sweep it started before going on without it (#794). A
+    #: sweep that ends inside this is the tick's own phase, as it always was. A slower one
+    #: keeps running as its own task and the tick moves on to the preflight and the claim scan.
+    sweep_tick_budget_s = 5.0
+    #: A sweep step slower than this is logged by name with its elapsed seconds (#794).
+    sweep_step_slow_s = 5.0
+
     async def _maybe_sweep(self):
-        """Run the health sweep at most once per ``health_sweep_interval`` (0 = off)."""
-        if not self.sweep_interval:
+        """Start the health sweep at most once per ``health_sweep_interval`` (0 = off), and
+        wait for it only ``sweep_tick_budget_s`` (#794).
+
+        The sweep is its own single-flight task, like the base refresh and the work-location
+        sweep. Run inline, its bounded GitHub calls added up: on 2026-11-18 one sweep held the
+        claim scan for 528 s with 7 ready cards and every slot free. A sweep that ends inside
+        the budget is reported here exactly as the inline one was — its failure or its store
+        stall is this phase's. A slower one is left running: the tick goes on, and
+        ``_sweep_ended_off_tick`` logs how it ended. Its card moves take the claim lock and
+        re-read the card first (``_still_orphaned_then``, ``_recover_blocked``), so a claim
+        made meanwhile is never undone.
+
+        A store stall in a sweep that had left the tick ends the NEXT tick here, as a card
+        reconcile's does (#404). While a sweep is still running no second one starts, and the
+        cadence clock is left alone, so the next one starts on the first due tick after it."""
+        stall, self._sweep_stall = getattr(self, "_sweep_stall", None), None
+        if stall is not None:
+            raise stall
+        if not self.sweep_interval or self._shutting_down:
+            return
+        running = getattr(self, "_sweep_task", None)
+        if running is not None and not running.done():
             return
         now = time.monotonic()
         if now - self._last_sweep < self.sweep_interval:
             return
         self._last_sweep = now
-        await self._sweep()
+        task = self._sweep_task = asyncio.create_task(self._sweep(), name="pb-health-sweep")
+        done, _ = await asyncio.wait({task}, timeout=self.sweep_tick_budget_s)
+        if done:
+            return task.result()  # its failure or stall is this phase's, as inline
+        step = getattr(self, "_sweep_step_now", None)
+        log.info(
+            "[project_board] health sweep is still running after %gs (%s) — the tick goes on to the claim "
+            "scan and the sweep finishes on its own",
+            self.sweep_tick_budget_s,
+            f"in its {step[0]} step" if step else "between steps",
+        )
+        task.add_done_callback(self._sweep_ended_off_tick)
+
+    def _sweep_ended_off_tick(self, task: asyncio.Task) -> None:
+        """How a sweep that outlived its tick ended (#794): the same isolation and the same
+        log lines ``_tick_phase`` gives an inline phase. A store stall is kept for the next
+        tick to end on. Any other ending starts the work-location sweep, as the tick does
+        after a sweep it waited for. Never raises."""
+        if task.cancelled():
+            return  # shutdown
+        exc = task.exception()
+        if isinstance(exc, store_mod.BoardTimeout):
+            log.warning(
+                "[project_board] health sweep stalled on the board store — the sweep ends here, the next tick "
+                "ends on it, and the sweep runs again on its normal cadence: %s",
+                exc,
+            )
+            self._sweep_stall = exc
+            return
+        if isinstance(exc, BoardError):
+            log.warning("[project_board] health sweep failed, and runs again on its normal cadence: %s", exc)
+            host_friction.record("board loop phase failed on a board store error: health sweep", str(exc)[:500])
+        elif exc is not None:
+            log.error(
+                "[project_board] health sweep failed, and runs again on its normal cadence",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            host_friction.record(
+                f"board loop phase crashed: health sweep ({type(exc).__name__})", str(exc)[:500], severity="major"
+            )
+        try:
+            self._start_location_sweep()
+        except Exception:  # noqa: BLE001 — a done-callback must never raise
+            log.warning("[project_board] work-location sweep could not start", exc_info=True)
+
+    async def _sweep_step(self, name: str, step):
+        """Await one step of the sweep, recorded on the loop while it runs (#794).
+
+        ``_sweep_step_now`` is ``(name, since)`` for the step in flight. The claim-stall
+        signal names it, so a slow sweep says WHICH step is slow. On 2026-11-18 the log was
+        silent for eight minutes of one. A step over ``sweep_step_slow_s`` logs one INFO line
+        when it ends, however it ends; a fast step logs nothing."""
+        self._sweep_step_now = (name, time.monotonic())
+        try:
+            return await step
+        finally:
+            self._sweep_step_done()
+
+    def _sweep_step_enter(self, name: str) -> None:
+        """Move the sweep step in flight on to ``name``: a per-card part of a step that walks
+        many cards, so the card is named instead of the whole pass. The part it leaves is
+        timed and logged like a step. Does nothing outside a sweep step."""
+        if getattr(self, "_sweep_step_now", None) is None:
+            return
+        self._sweep_step_done()
+        self._sweep_step_now = (name, time.monotonic())
+
+    def _sweep_step_done(self) -> None:
+        now, self._sweep_step_now = getattr(self, "_sweep_step_now", None), None
+        if now is None:
+            return
+        took = time.monotonic() - now[1]
+        if took > self.sweep_step_slow_s:
+            log.info("[project_board] sweep step %s took %ds", now[0], int(took))
 
     async def _sweep(self):
         """Self-heal: (a) reset ``in_progress`` features that no live drive owns (a
@@ -845,15 +945,17 @@ class ReconcileMixin(WorktreeCleanup):
         it publishes the agent's working-state snapshot, which names any card stranded
         outside the ready lane with every dependency closed (#406) — surfaced, never moved.
         Best-effort; a per-item failure never stops the sweep or the loop. A stalled store
-        ends the sweep, and the tick with it (#404)."""
+        ends the sweep, and the tick with it (#404) — or the next tick, when the sweep had
+        outlived its own (#794). Every step runs through ``_sweep_step``, which times it."""
+        step = self._sweep_step
         store = self._store()
-        for f in await self._list_for_pass(store, "in_progress", "health sweep"):
+        for f in await step("in_progress read", self._list_for_pass(store, "in_progress", "health sweep")):
             fid = f["id"]
             if fid in self._inflight_files:
                 continue  # a live drive owns it
             try:
                 log.info("[project_board] sweep: %s in_progress with no live drive", fid)
-                await self._reconcile_orphan(fid)
+                await step(f"orphan reconcile {fid}", self._reconcile_orphan(fid))
             except store_mod.BoardTimeout:
                 raise  # a stalled store, not one card's failure: stop, don't try the next card on it
             except Exception:  # noqa: BLE001
@@ -862,14 +964,17 @@ class ReconcileMixin(WorktreeCleanup):
         # instance default — a multi-repo board holds feat-<id> worktrees under each
         # project's repo, and a worktree resolved in repo A must be reaped in repo A.
         for repo in self._all_repos():
-            await self._sweep_worktrees(store, repo)
+            await step(f"worktree reap {repo}", self._sweep_worktrees(store, repo))
         # A deferred drive can remove its own tree before the orphan scan sees it.
         # Revisit done PR cards from the store, including after a restart or a failed
         # ledger write. Existing trees (especially stranded candidates) stay active.
-        for f in await self._list_for_pass(store, "done", "merged work-location retirement"):
+        for f in await step("done read", self._list_for_pass(store, "done", "merged work-location retirement")):
             if f.get("pr_url") and not self._reap_held_by_drive(f["id"]):
                 try:
-                    await self._retire_merged_work_locations(store, f["id"], self._repo_for(f), stall_ends_tick=True)
+                    await step(
+                        f"merged work-location retirement {f['id']}",
+                        self._retire_merged_work_locations(store, f["id"], self._repo_for(f), stall_ends_tick=True),
+                    )
                 except store_mod.BoardTimeout:
                     raise  # stop after one stalled store call, rather than retrying for every done card
                 except Exception:  # noqa: BLE001 — e.g. a project's checkout no longer resolves
@@ -879,17 +984,17 @@ class ReconcileMixin(WorktreeCleanup):
         # never hold the tick (#462). Never touches the board store.
         self._start_base_refresh()
         # (a3) cards whose project no longer resolves (#454), for /status.
-        await self._publish_orphaned_cards(store)
+        await step("orphaned cards publish", self._publish_orphaned_cards(store))
         # (b2) the blocked lane: self-heal what can be, and TELL THE OPERATOR about what
         # cannot — a blocked card used to leave the queue with only a log line, so
         # dependents sat `ready` waiting on a blocker that would never arrive.
-        await self._recover_blocked(store)
+        await step("blocked recovery", self._recover_blocked(store))
         # (c) the archive pass (#115): age done/cancelled features out of the live
         # view so the Done column doesn't bury recent work — a label write only. Runs
         # ONCE per sweep (project-independent — the board db is shared), after the
         # per-repo worktree reap above.
         try:
-            archived = await asyncio.to_thread(store.archive_stale, self.archive_after_days)
+            archived = await step("archive", asyncio.to_thread(store.archive_stale, self.archive_after_days))
             if archived:
                 log.info(
                     "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
@@ -903,7 +1008,7 @@ class ReconcileMixin(WorktreeCleanup):
         # sweep had just moved in the state it had left, for a whole interval (#401). The
         # refresher would pick those writes up within seconds anyway; publishing here makes
         # the sweep's result current the moment it ends. Its stall is the sweep's stall.
-        await self._publish_work_snapshot(stall_ends_tick=True)
+        await step("work snapshot publish", self._publish_work_snapshot(stall_ends_tick=True))
 
     # ── the host's <working_state> snapshot (ADR 0079 Observe, #401) ──────────
     def _take_work_snapshot(self, store) -> None:
@@ -1064,6 +1169,7 @@ class ReconcileMixin(WorktreeCleanup):
             return
         for f in blocked:
             fid = f["id"]
+            self._sweep_step_enter(f"blocked recovery {fid}")  # a slow sweep names the card (#794)
             if fid in self._inflight_files:
                 continue  # reserved — an operator salvage is publishing it (#427); leave it be
             try:
