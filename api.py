@@ -27,7 +27,7 @@ import re
 import threading
 from typing import Literal
 
-from fastapi import Request  # module-level so the webhook's stringized annotation resolves
+from fastapi import BackgroundTasks, Request  # module-level so stringized route annotations resolve
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import setup_check
@@ -621,7 +621,12 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     class _WriteNotingRoute(APIRoute):
         """Every non-GET route on this router is a (possible) board write: when its handler
         finishes, successful or not, the read cache is told, so the next read reflects the
-        write and is never answered with a pre-write snapshot (see read_cache)."""
+        write and is never answered with a pre-write snapshot (see read_cache).
+
+        That note lands only when the WHOLE handler is over. A route with slow work after
+        its store write (a worktree reap, a PR close) runs its write through
+        ``_guard_noting`` instead of ``_guard``, so a read during that work already sees
+        the write (#791); this note then repeats, which costs at most one more listing."""
 
         def get_route_handler(self):
             handler = super().get_route_handler()
@@ -697,6 +702,16 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             from .store import BoardTimeout
 
             raise HTTPException(503 if isinstance(e, BoardTimeout) else 400, str(e))
+
+    async def _guard_noting(fn):
+        """``_guard`` for a write whose route keeps working after it (#791): the read cache
+        is told as soon as the store call returns, not when the handler ends, so a
+        ``GET /features`` issued during the route's slow tail is answered with the write.
+        Noted on failure too — a failed write may still have landed (``note_write``)."""
+        try:
+            return await _guard(fn)
+        finally:
+            read_cache.note_write()
 
     def _db_file() -> str:
         db = store_kw.get("db") or default_db_path()
@@ -949,6 +964,22 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             await cleanup._reap_feature_worktree(repo_for_feature(feature, store_kw), fid)
         except Exception:  # noqa: BLE001 — reaping is best-effort; the edge is already closed
             log.warning("[project_board] worktree reap for %s failed", fid, exc_info=True)
+
+    # Cards whose after-response reap is running (#791). Touched only on the event loop.
+    reaping: set[str] = set()
+
+    async def _reap_worktree_after_response(fid: str, feature: dict | None = None) -> None:
+        """``_reap_worktree`` as a background task: it runs once the response is sent, so
+        the caller is answered when the card closes, not when the tree is gone. A repeat
+        request for a card whose reap is still running does not start a second one over
+        the same tree."""
+        if fid in reaping:
+            return
+        reaping.add(fid)
+        try:
+            await _reap_worktree(fid, feature)
+        finally:
+            reaping.discard(fid)
 
     # ── hierarchy (epic → milestone → feature) ────────────────────────────────
     @router.post("/epics")
@@ -1479,7 +1510,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         )
 
     @router.post("/features/{fid}/verify")
-    async def _verify(fid: str, body: dict = Body(default={})):
+    async def _verify(fid: str, background: BackgroundTasks, body: dict = Body(default={})):
         """The task-type Done edge (#217) — ``record_merge``'s verify sibling. Body:
         ``{approved?: bool=true, feedback?, by?}``. ``approved=true`` closes the task
         with a `verified: <by>` reason; ``approved=false`` records the ``feedback`` as a
@@ -1495,19 +1526,26 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         Still-open requirement-ledger items ride back as ``note`` — "2 requirement(s)
         still open: r2, r4" — beside the feature (#399). Surfaced, never enforced: the
-        approval stands and the human decides, the same as board_verify."""
+        approval stands and the human decides, the same as board_verify.
+
+        The card is closed when the store call returns (#791): the read cache is told then
+        (``_guard_noting``) and the reap runs after the response, so the operator sees the
+        card close at once instead of waiting on the reap and approving again. A repeat
+        approval of a task already closed by verification returns the card (the store's
+        edge is idempotent, like ``record_merge``)."""
         body = body or {}
         approved = bool(body.get("approved", True))
         by = str(body.get("by") or "operator")
-        f = await _guard(
+        f = await _guard_noting(
             lambda: store().record_verification(fid, approved=approved, feedback=str(body.get("feedback", "")), by=by)
         )
         # #654: an approved verification is the task's terminal Done edge — nothing left to
         # build, so reap its scratch worktree, the same best-effort reap cancel/done run. An
         # adverse verify (approved=false) requeues to ready and KEEPS the tree: the next
         # dispatch cuts a fresh one (create_worktree cleans the stale same-name tree).
+        # #791: after the response, so a slow reap never holds the approval's answer open.
         if approved:
-            await _reap_worktree(fid, f)
+            background.add_task(_reap_worktree_after_response, fid, f)
         note = open_requirements_note((f or {}).get("requirements"))
         return {**f, "note": note} if note else f
 

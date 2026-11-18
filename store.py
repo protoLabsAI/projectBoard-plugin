@@ -4314,6 +4314,14 @@ class BeadsBoard:
         requeues the bead back to `ready`. Expects `in_review` — the state
         record_delivery/open_review left it in.
 
+        IDEMPOTENT ON APPROVAL (#791), the way record_merge is: approving a task this edge
+        already closed (`done`, with a `verified:` close reason) returns the card and writes
+        nothing — no second close, label or comment. A double-click, a retry, or a second
+        approval that waited on the card lock behind the first is the same decision, not
+        an error. Everything else out of `in_review` is still refused: a REJECTION of a done
+        card (nothing to requeue), and an approval of a card closed any other way (manual
+        done, cancel) or not yet delivered.
+
         SELF-VERIFICATION (#316 S2): on approval, the verifier's identity is compared
         (casefolded + stripped) against the projected `delivered_by`. A MATCH flags the
         close with the `self-verified` label and appends `(self-verified)` to the reason
@@ -4338,6 +4346,8 @@ class BeadsBoard:
                 f"record_verification is task-only — issue_type {f.get('issue_type')!r} closes via record_merge"
             )
         if f["board_state"] != "in_review":
+            if approved and f["board_state"] == "done" and str(f.get("verified_by") or "").strip():
+                return f
             raise BoardError(f"record_verification expects in_review, got {f['board_state']!r}")
         if not approved:
             # Through `_run`, not the best-effort `comment()`: a feedback line that silently

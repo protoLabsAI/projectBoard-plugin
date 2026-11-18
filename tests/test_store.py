@@ -4519,6 +4519,25 @@ def test_record_verification_rejects_a_non_in_review_state(make_board, monkeypat
         b.record_verification("bd-t", approved=True)
 
 
+def test_record_verification_approval_of_a_verified_task_is_idempotent(make_board, monkeypatch):
+    """#791: approving a task this edge already closed returns the card and writes nothing
+    (record_merge's idempotence). A rejection of it, and an approval of a card that is done
+    without a `verified:` reason, are still refused."""
+    br = Br()
+    b = make_board(br)
+    done = {"id": "bd-t", "board_state": "done", "issue_type": "task", "verified_by": "operator"}
+    monkeypatch.setattr(b, "_require", lambda fid: dict(done))
+    monkeypatch.setattr(b, "get_feature", lambda fid: dict(done))
+    assert b.record_verification("bd-t", approved=True, by="someone-else") == done
+    assert br.calls == []
+    with pytest.raises(BoardError, match="record_verification expects in_review, got 'done'"):
+        b.record_verification("bd-t", approved=False, feedback="reopen")
+    done["verified_by"] = ""  # closed by hand / by merge: not this edge's close
+    with pytest.raises(BoardError, match="record_verification expects in_review, got 'done'"):
+        b.record_verification("bd-t", approved=True)
+    assert br.calls == []
+
+
 def test_record_verification_rejects_a_coding_feature(make_board, monkeypatch):
     """A coding feature closed here would dodge record_merge — the ONE Done edge
     for code (invariant #2) with its idempotency and `merged:` audit reason. The

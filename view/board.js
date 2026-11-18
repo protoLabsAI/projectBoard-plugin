@@ -225,6 +225,21 @@ function selfVerifiedProvenance(f){
 // Which in_review task cards have their reject-feedback form expanded — module-scoped
 // so the 10s auto-reload re-render keeps it open (same pattern as COLLAPSED/DONE_ALL).
 const REJECT_OPEN = new Set();
+// Which task cards have a verify request in flight (#791). Approve, Reject and Send
+// rejection are disabled for those cards: the approval closes the card on the server
+// before the response arrives, so a second click used to be answered with an error for
+// an approval that had worked. Module-scoped so a poll re-render mid-request keeps the
+// buttons disabled.
+const VERIFYING = new Set();
+// Disable (or re-enable) the verdict buttons already on screen for one card. The render
+// path reads VERIFYING too; this covers the time before the next render. The feedback
+// textarea is left alone, so a rejection that fails keeps what was typed.
+function setVerifyBusy(fid, busy){
+  busy ? VERIFYING.add(fid) : VERIFYING.delete(fid);
+  for (const attr of ["data-approve", "data-reject", "data-reject-toggle"])
+    for (const b of document.querySelectorAll("["+attr+"]"))
+      if (b.getAttribute(attr) === fid) b.disabled = busy;
+}
 function toggleReject(fid){ REJECT_OPEN.has(fid) ? REJECT_OPEN.delete(fid) : REJECT_OPEN.add(fid); render(); }
 
 // The task's action block — the board's first mutation UI. Lives in the shared
@@ -247,13 +262,16 @@ function taskExtra(f){
       + '<div class="terr" id="terr-'+id+'"></div></div>';
   }
   if (f.state === "in_review"){
+    // #791: while this card's verify request is in flight, every verdict control is
+    // disabled — a second click would be a second verify of an approval already under way.
+    const busy = VERIFYING.has(f.id) ? " disabled" : "";
     let acts = '<div class="tact">'
-      + '<button class="tbtn tbtn--primary" data-approve="'+id+'">Approve</button>'
-      + '<button class="tbtn tbtn--danger" data-reject-toggle="'+id+'">Reject</button></div>';
+      + '<button class="tbtn tbtn--primary" data-approve="'+id+'"'+busy+'>Approve</button>'
+      + '<button class="tbtn tbtn--danger" data-reject-toggle="'+id+'"'+busy+'>Reject</button></div>';
     if (REJECT_OPEN.has(f.id)){
       acts += '<div class="tform tact">'
         + '<textarea class="tarea" id="trtext-'+id+'" placeholder="Feedback — what needs to change (re-dispatched to the assignee)"></textarea>'
-        + '<div class="trow"><button class="tbtn tbtn--danger" data-reject="'+id+'">Send rejection</button>'
+        + '<div class="trow"><button class="tbtn tbtn--danger" data-reject="'+id+'"'+busy+'>Send rejection</button>'
         + '<button class="tbtn" data-reject-toggle="'+id+'">Cancel</button></div></div>';
     }
     return acts + '<div class="terr" id="terr-'+id+'"></div>';
@@ -323,19 +341,25 @@ async function submitDeliver(fid){
 // every 10s poll re-render) keeps it. Shape: {fid, note}; null when there is nothing to say.
 let VERIFY_NOTE = null;
 async function approveTask(fid){
+  if (VERIFYING.has(fid)) return;                                 // #791: one verify at a time per card
+  setVerifyBusy(fid, true);
   try {
     const r = await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: true});
     VERIFY_NOTE = r && r.note ? {fid: fid, note: String(r.note)} : null;
     await load(); await fetchTaskDetail(fid);
   }
   catch (e) { taskErr(fid, e); }
+  finally { setVerifyBusy(fid, false); }
 }
 async function rejectTask(fid){
+  if (VERIFYING.has(fid)) return;                                 // #791: one verify at a time per card
   const feedback = ($("trtext-"+fid) || {}).value || "";
+  setVerifyBusy(fid, true);
   try {
     await apiPost(FEAT+encodeURIComponent(fid)+"/verify", {approved: false, feedback: feedback});
     REJECT_OPEN.delete(fid); await load(); await fetchTaskDetail(fid);
   } catch (e) { taskErr(fid, e); }
+  finally { setVerifyBusy(fid, false); }
 }
 
 // State → DS dot variant (for the list view chip).

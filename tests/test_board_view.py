@@ -224,6 +224,36 @@ def test_approve_posts_verify_with_approved_true():
     assert '"/verify", {approved: true}' in BOARD_PAGE
 
 
+def test_approve_and_reject_are_disabled_while_a_verify_request_is_in_flight():
+    """#791: the approval closes the card on the server before its response arrives, so a
+    second click was answered with an error for an approval that had worked. While a
+    card's verify request is in flight its Approve, Reject and Send-rejection buttons are
+    disabled — in the DOM at once, and in every re-render until the request settles —
+    and a second call for the same card does nothing. A failed request re-enables them."""
+
+    def fn(name):
+        start = BOARD_PAGE.index(f"function {name}(")
+        return BOARD_PAGE[start : BOARD_PAGE.index("\n}\n", start)]
+
+    assert "const VERIFYING = new Set();" in BOARD_PAGE
+    busy = fn("setVerifyBusy")
+    assert "busy ? VERIFYING.add(fid) : VERIFYING.delete(fid);" in busy
+    assert 'for (const attr of ["data-approve", "data-reject", "data-reject-toggle"])' in busy
+    assert "if (b.getAttribute(attr) === fid) b.disabled = busy;" in busy
+    for name in ("approveTask", "rejectTask"):
+        src = fn(name)
+        guard, on, post = "if (VERIFYING.has(fid)) return;", "setVerifyBusy(fid, true);", "await apiPost(FEAT+"
+        assert src.index(guard) < src.index(on) < src.index(post), name  # disabled BEFORE the request
+        assert "finally { setVerifyBusy(fid, false); }" in src, name  # success or failure
+        assert src.index("taskErr(fid, e)") < src.index("finally { setVerifyBusy(fid, false); }"), name
+    extra = fn("taskExtra")
+    assert 'const busy = VERIFYING.has(f.id) ? " disabled" : "";' in extra
+    assert """data-approve="'+id+'"'+busy+'>Approve</button>""" in extra
+    assert """data-reject-toggle="'+id+'"'+busy+'>Reject</button>""" in extra
+    assert """data-reject="'+id+'"'+busy+'>Send rejection</button>""" in extra
+    assert ".tbtn:disabled{" in BOARD_PAGE  # a disabled verdict button looks disabled
+
+
 def test_reject_opens_feedback_and_posts_verify_approved_false_with_feedback():
     """Reject expands a feedback textarea (its open-state lives in a module-scoped Set
     so the 10s auto-reload keeps it open); sending POSTs approved=false + feedback and
