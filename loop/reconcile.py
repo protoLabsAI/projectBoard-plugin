@@ -29,6 +29,47 @@ _SALVAGE_GATE_TAIL_CHARS = 3000
 # The PR comment a forced salvage posts the gate output in, updated in place on a repeat.
 _SALVAGE_GATE_MARKER = "<!-- project-board:salvage-gate -->"
 
+# #727: how alike two review claims must be to count as the SAME finding in two rounds —
+# the Jaccard overlap of their word tokens (case-folded, stop-words dropped, a plain
+# inflection suffix stripped). Reviewer claims are re-worded between rounds and a fix round
+# relocates the code, so exact (file, claim) equality read a persisting defect as a new one
+# every round. Measured on the bd-j5qr2 / #720 rounds: the re-worded pair scores 0.42, and
+# the DIFFERENT findings raised on the same card score 0.14–0.21.
+_CLAIM_SIMILARITY_THRESHOLD = 0.33
+# …and how many tokens the two claims must share before that ratio means anything. A claim
+# of two or three words has too few tokens for an overlap to be evidence ("bug A" and
+# "bug B" overlap by half on one shared word), so short claims match by exact identity only.
+_CLAIM_SIMILARITY_MIN_SHARED = 3
+_CLAIM_STOP_WORDS = frozenset(
+    "a an and are as at be been but by for from has have in is it its not of on or so that the their "
+    "then this to was when which while with after before during still can could may will would".split()
+)
+
+
+def _claim_tokens(claim: str) -> frozenset[str]:
+    """The word tokens two review claims are compared on (#727): case-folded, stop-words
+    dropped, and a plain inflection suffix stripped so "consumed"/"consumes" and
+    "allowing"/"allows" are one token. Punctuation splits, so "edit-free" is two tokens."""
+    out = set()
+    for tok in re.findall(r"[a-z0-9_]+", (claim or "").casefold()):
+        if tok in _CLAIM_STOP_WORDS:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if tok.endswith(suffix) and len(tok) - len(suffix) >= 4:
+                tok = tok[: -len(suffix)]
+                break
+        out.add(tok)
+    return frozenset(out)
+
+
+def _claim_similarity(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard overlap of two claims' token sets, or 0.0 when they share fewer than
+    ``_CLAIM_SIMILARITY_MIN_SHARED`` tokens (too little text to call them the same)."""
+    shared = len(a & b)
+    if shared < _CLAIM_SIMILARITY_MIN_SHARED:
+        return 0.0
+    return shared / len(a | b)
+
 
 async def _within(coro, timeout: float, *, on_abandon=None):
     """Await ``coro`` for at most ``timeout`` seconds, then give up on it — HARD (#462).
@@ -3984,12 +4025,13 @@ class ReconcileMixin(WorktreeCleanup):
             # ordinary "a human finishes this fix" review; the second is rounds fighting
             # each other — round N's fix reopening round N-1's finding, bd-49yo — which no
             # further patch resolves, so it needs a design call, not another round. Compare
-            # the current blocking set against the per-round history (slice 1) by identity;
-            # the current round is the last one appended above.
+            # the current blocking set against the per-round history (slice 1) by identity,
+            # then by claim similarity (#727: a re-worded or relocated finding is the SAME
+            # finding, and persists); the current round is the last one appended above.
             history = self._review_history(fid)
             surviving = self._surviving_review_findings(history, blocking)
             if surviving:
-                named = "; ".join(f"{f.file}:{f.line} {f.claim}" for f in surviving)
+                named = "; ".join(self._name_surviving_finding(history, f) for f in surviving)
                 # KEEP the "review findings persist after … needs human review" wording:
                 # both phrases are read by ``_REVIEW_GATE_BLOCK_MARKERS`` to class this as a
                 # review-gate block (#512), and the operator unblock keys off that class.
@@ -4270,22 +4312,62 @@ class ReconcileMixin(WorktreeCleanup):
             path = path[2:]
         return (" ".join(path.split()).casefold(), " ".join((claim or "").split()).casefold())
 
+    def _earlier_round_match(self, history: list[dict], finding) -> tuple[dict, bool] | None:
+        """The earlier-round finding that ``finding`` (a current blocking finding) repeats,
+        as ``(earlier finding, exact)`` — or None when no earlier round raised it.
+
+        An exact (normalized file, claim) repeat matches first (#514, ``exact`` True).
+        Otherwise the CLAIM is compared by similarity (#727): the most similar earlier claim
+        at or above ``_CLAIM_SIMILARITY_THRESHOLD`` matches, wherever it was reported — the
+        file is never required to match, because a fix round relocates code (bd-j5qr2 moved
+        loop/drive.py → worktree.py). The file only breaks a tie between equally similar
+        earlier claims; a remaining tie goes to the latest round. The matched dict carries
+        the ``round`` it was raised in."""
+        identity = self._finding_identity(finding.file, finding.claim)
+        tokens = _claim_tokens(finding.claim)
+        best: tuple[float, bool, int] | None = None
+        match: dict | None = None
+        for i, rnd in enumerate(history[:-1]):
+            for f in rnd.get("findings") or []:
+                if not isinstance(f, dict):
+                    continue
+                earlier = {**f, "round": rnd.get("round", i + 1)}
+                other = self._finding_identity(f.get("file", ""), f.get("claim", ""))
+                if other == identity:
+                    return earlier, True
+                score = _claim_similarity(tokens, _claim_tokens(f.get("claim", "")))
+                if score < _CLAIM_SIMILARITY_THRESHOLD:
+                    continue
+                rank = (score, other[0] == identity[0], i)
+                if best is None or rank > best:
+                    best, match = rank, earlier
+        return (match, False) if match is not None else None
+
     def _surviving_review_findings(self, history: list[dict], blocking: list) -> list:
-        """The current blocking findings whose identity (normalized file + claim) ALSO
-        appeared in an EARLIER round (#514). Non-empty → the same finding survived the fix
-        attempts (a "persist" block); empty when ≥2 rounds are on record → every round
-        raised a different finding, i.e. the rounds conflict and a human must make a design
-        call. With fewer than two rounds there is nothing earlier to compare against, so
-        every current finding counts as surviving — the pre-#514 "persist" reading, kept
-        unchanged for that degenerate case."""
+        """The current blocking findings that an EARLIER round also raised (#514). Non-empty
+        → the same finding survived the fix attempts (a "persist" block); empty when ≥2
+        rounds are on record → every round raised a different finding, i.e. the rounds
+        conflict and a human must make a design call. "Also raised" is an exact normalized
+        (file, claim) repeat, or a claim similar enough to an earlier one whatever file it
+        was reported in (#727, ``_earlier_round_match``) — a re-worded or relocated finding
+        is still the same finding. With fewer than two rounds there is nothing earlier to
+        compare against, so every current finding counts as surviving — the pre-#514
+        "persist" reading, kept unchanged for that degenerate case."""
         if len(history) < 2:
             return list(blocking)
-        earlier = {
-            self._finding_identity(f.get("file", ""), f.get("claim", ""))
-            for rnd in history[:-1]
-            for f in (rnd.get("findings") or [])
-        }
-        return [f for f in blocking if self._finding_identity(f.file, f.claim) in earlier]
+        return [f for f in blocking if self._earlier_round_match(history, f) is not None]
+
+    def _name_surviving_finding(self, history: list[dict], finding) -> str:
+        """How the persist block names one surviving finding: ``file:line claim``, plus —
+        when it was matched to an earlier round by claim similarity rather than an exact
+        repeat (#727) — which round and location it was first matched at, so the operator
+        can check the two wordings really are one defect."""
+        name = f"{finding.file}:{finding.line} {finding.claim}"
+        found = self._earlier_round_match(history, finding) if len(history) >= 2 else None
+        if found is None or found[1]:
+            return name
+        earlier = found[0]
+        return f"{name} [re-worded since round {earlier['round']}, was {earlier.get('file', '')}:{earlier.get('line', '')}]"
 
     def _review_fix_feedback(self, fid: str, blocking: str) -> str:
         """Keep historical context separate from the gate's authoritative fix set.
