@@ -554,6 +554,10 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self._self_inflight: bool = False
         self._last_poll = 0.0  # monotonic ts of the last merge poll
         self._last_sweep = 0.0  # monotonic ts of the last health sweep
+        # The sweep is its own single-flight task (#794): the tick waits on it only briefly.
+        self._sweep_task: asyncio.Task | None = None
+        self._sweep_step_now: tuple[str, float] | None = None  # (step, since) while a sweep step runs
+        self._sweep_stall: Exception | None = None  # an off-tick sweep's store stall, for the next tick
         # CI-feedback state (in-memory, per run): fid → last failing-CI summary (fed
         # into the re-dispatch prompt) and fid → count of CI-fix re-dispatches so far.
         # The counter dicts below (every `_BUDGET_KINDS` entry) are CACHES over the
