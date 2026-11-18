@@ -1393,6 +1393,38 @@ def _stable_shared_dependencies(wt: str, rel: str) -> bool:
     )
 
 
+# Files and directories only a package manager's install writes at the top of `node_modules`.
+_NODE_MANAGER_ENTRIES = frozenset(
+    {".modules.yaml", ".pnpm", ".package-lock.json", ".yarn-state.yml", ".yarn-integrity", ".bin"}
+)
+_stray_node_modules_logged: set[str] = set()
+
+
+def _stray_node_modules(wt: str, rel: str) -> bool:
+    """A real ``node_modules`` directory no package manager manages (#785): a tool's cache
+    drop (``node_modules/.cache/…``) in a directory that is not a package root. No install
+    put it there, so ``setup_cmd`` cannot be asked to recreate it. Stray means all of: a
+    real directory (a link is path-dependent and still needs recovery), no package-manager
+    state inside it, no ``package.json`` beside it, and nothing in it but hidden entries.
+    Anything unreadable, empty or holding a package stays an environment."""
+    path = os.path.join(wt, rel)
+    if os.path.basename(path) != "node_modules" or os.path.islink(path) or not os.path.isdir(path):
+        return False
+    if os.path.lexists(os.path.join(os.path.dirname(path), "package.json")):
+        return False
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    if not entries or any(name in _NODE_MANAGER_ENTRIES or not name.startswith(".") for name in entries):
+        return False
+    key = os.path.abspath(path)
+    if key not in _stray_node_modules_logged:
+        _stray_node_modules_logged.add(key)
+        log.info("[project_board] ignoring stray node_modules %s: no package manager manages it (#785)", key)
+    return True
+
+
 def _installed_environments(wt: str) -> list[str]:
     found = []
     for root, dirs, files in os.walk(wt, followlinks=False):
@@ -1402,7 +1434,7 @@ def _installed_environments(wt: str) -> list[str]:
             continue
         if "node_modules" in dirs or "node_modules" in files:
             rel = os.path.relpath(os.path.join(root, "node_modules"), wt)
-            if not _stable_shared_dependencies(wt, rel):
+            if not _stable_shared_dependencies(wt, rel) and not _stray_node_modules(wt, rel):
                 found.append(rel)
         dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
     return found
@@ -1425,6 +1457,8 @@ async def restore_worktree_environment(wt: str, cmd: str, *, env: dict | None, t
             required = json.load(stream)["environments"]
         # Also accept pending markers written before shared links were excluded.
         required = [rel for rel in required if not _stable_shared_dependencies(wt, rel)]
+        # Nor may a marker naming a stray cache directory block: no install recreates it (#785).
+        required = [rel for rel in required if not _stray_node_modules(wt, rel)]
         installed = await asyncio.to_thread(_installed_environments, wt)
         if (installed or required) and not (cmd or "").strip():
             cmd = DEFAULT_SETUP_CMD
