@@ -668,15 +668,17 @@ def _plan_managed_upsert(
     Returns the ``_apply_registry`` plan outcome: ``host_updates`` (the complete top-level
     ``projects`` list, and ``filesystem.projects`` when an explicit fence override is in
     force; ``{}`` when nothing changes), ``projects`` (``board`` with this entry's ownership
-    markers set), ``managed`` (``{action, name, detail}``) and the readback's
+    markers set), ``managed`` (``{action, name, detail, write}``) and the readback's
     ``present`` / ``absent``."""
     board = copy.deepcopy(board)
     entry = board[project]
     out: dict[str, Any] = {"host_updates": {}, "projects": board, "present": None, "absent": None}
 
-    def done(action: str, name: str, detail: str = "", markers: dict[str, Any] | None = None) -> dict[str, Any]:
+    def done(
+        action: str, name: str, detail: str = "", markers: dict[str, Any] | None = None, write: bool | None = None
+    ) -> dict[str, Any]:
         _set_markers(entry, markers if markers is not None else _no_markers())
-        out["managed"] = {"action": action, "name": name, "detail": detail}
+        out["managed"] = {"action": action, "name": name, "detail": detail, "write": write}
         return out
 
     registry_raw = getattr(live, "projects", None) if live is not None else None
@@ -713,7 +715,7 @@ def _plan_managed_upsert(
         changed = {k: v for k, v in desired.items() if current.get(k) != v}
         markers = {_MANAGED_MARKER: owned_name, _MANAGED_FENCE_MARKER: True if fence_owned else None}
         if not changed:
-            return done("unchanged", owned_name, "", markers)
+            return done("unchanged", owned_name, "", markers, write=not _falsey(current.get("write")))
         other = next(
             (e for i, e in enumerate(registry) if i != owned_idx and _same_path(e.get("path"), repo)),
             None,
@@ -727,7 +729,7 @@ def _plan_managed_upsert(
             out["absent"] = (owned_name, str(prior_repo or ""))
             if fence_owned:
                 out["host_updates"]["filesystem"] = {"projects": _drop_owned_fence(fence)}
-            return done("present", str(other.get("name") or ""))
+            return done("present", str(other.get("name") or ""), write=not _falsey(other.get("write")))
         current.update(changed)
         out["host_updates"]["projects"] = registry
         out["present"] = (owned_name, str(repo))
@@ -742,7 +744,7 @@ def _plan_managed_upsert(
                     if github:
                         f["github"] = github
             out["host_updates"]["filesystem"] = {"projects": fence}
-        return done("updated", owned_name, ", ".join(sorted(changed)), markers)
+        return done("updated", owned_name, ", ".join(sorted(changed)), markers, write=not _falsey(current.get("write")))
 
     # Already reachable by path — through the registry (onboard_project, the operator) or an
     # explicit fence entry (#452 review m6). Not the board's to change, or to remove later.
@@ -750,7 +752,7 @@ def _plan_managed_upsert(
         (f for f in fence if _same_path(f.get("path"), repo)), None
     )
     if present is not None:
-        return done("present", str(present.get("name") or ""))
+        return done("present", str(present.get("name") or ""), write=not _falsey(present.get("write")))
     clash = next((e for e in registry if str(e.get("name") or "") == project), None)
     if clash is not None:
         return done("skipped", project, f"a managed project named {project!r} already points at {clash.get('path')!r}")
@@ -771,7 +773,7 @@ def _plan_managed_upsert(
         detail = (
             "the filesystem tools are switched off on this host, so they can't read it until filesystem.enabled is on"
         )
-    return done("added", project, detail, markers)
+    return done("added", project, detail, markers, write=False)
 
 
 def _plan_managed_removal(live: Any, board: dict[str, Any], prior: Any) -> dict[str, Any]:
@@ -854,23 +856,30 @@ def _assert_host_superset(live: Any, host_updates: dict[str, Any], dropped: Any 
 
 
 def managed_note(managed: dict[str, Any]) -> str:
-    """One sentence for the register reply on what happened to the managed-project half."""
+    """Describe managed registration and whether coders can be dispatched."""
     action, name, detail = managed.get("action"), managed.get("name") or "", managed.get("detail") or ""
     tail = f" ({detail})" if detail else ""
+    note = ""
     if action == "added":
-        return (
+        note = (
             f" Also registered it as read-only managed project '{name}', so your filesystem tools "
             f"(list_projects, read_file) can read the checkout{tail}."
         )
-    if action == "updated":
-        return f" Updated the managed project '{name}' the board registered ({detail})."
-    if action == "present":
-        return f" It is already the managed project '{name}', which was left as it is."
-    if action == "skipped":
-        return f" NOT registered as a managed project: {detail} — the filesystem tools can't read it by that name."
-    if action == "unsupported":
-        return f" Not registered as a managed project: {detail}."
-    return ""
+    elif action == "updated":
+        note = f" Updated the managed project '{name}' the board registered ({detail})."
+    elif action == "present":
+        note = f" It is already the managed project '{name}', which was left as it is."
+    elif action == "skipped":
+        note = f" NOT registered as a managed project: {detail} — the filesystem tools can't read it by that name."
+    elif action == "unsupported":
+        note = f" Not registered as a managed project: {detail}."
+    if managed.get("write") is False:
+        note += (
+            " It is read-only, so the board can plan cards here but coders can't be dispatched into it "
+            "until the operator makes it read-write (onboard_project or register_local_project with write=true "
+            "asks them with an approval card, or Settings ▸ Projects)."
+        )
+    return note
 
 
 def _verify_managed(present: tuple[str, str] | None = None, absent: tuple[str, str] | None = None) -> list[str]:
